@@ -69,7 +69,22 @@ from oci.inference.frozen_extraction_cache_overlay import (
     sha256_file,
 )
 from oci.inference.staged_all_evidence_fusion_agent import StagedAllEvidenceFusionAgent
+from oci.inference.tfidf_orphan_evidence_adapter import (
+    OrphanNgramEvidenceAdapterConfig,
+)
 from oci.inference.tfidf_topic_discovery import HANDOFF_SCHEMA_VERSION, row_set_fingerprint
+
+
+def _orphan_adapter_config() -> OrphanNgramEvidenceAdapterConfig:
+    return OrphanNgramEvidenceAdapterConfig(
+        min_abs_fit_score=2.0,
+        lexical_overlap_threshold=0.5,
+        max_candidates=None,
+        max_clusters=None,
+        max_terms_per_cluster=None,
+        max_term_chars=None,
+        max_ngram_tokens=None,
+    )
 
 
 def test_exact_inner_recurrence_preserves_more_than_legacy_term_cap():
@@ -111,6 +126,8 @@ def test_runner_defaults_to_strict_two_round_review_and_manifest_identity():
     assert config.require_final_upstream_neural_query_inputs is True
     assert config.require_final_causal_forest is True
     assert config.allow_degraded_review_without_all_upstream is False
+    assert config.include_tfidf_orphan_ngrams is False
+    assert config.orphan_ngram_adapter is None
 
     strict_manifest_identity = fusion_runner_module._content_sha256(
         fusion_runner_module.asdict(config)
@@ -122,6 +139,22 @@ def test_runner_defaults_to_strict_two_round_review_and_manifest_identity():
         fusion_runner_module.asdict(explicitly_nonadaptive)
     )
     assert strict_manifest_identity != nonadaptive_manifest_identity
+
+
+def test_runner_requires_explicit_orphan_adapter_config_when_enabled():
+    with pytest.raises(
+        ValueError,
+        match="requires an explicit OrphanNgramEvidenceAdapterConfig",
+    ):
+        AllEvidenceFusionRunnerConfig(include_tfidf_orphan_ngrams=True)
+
+    with pytest.raises(
+        ValueError,
+        match="must be null when TF-IDF orphan adaptation is disabled",
+    ):
+        AllEvidenceFusionRunnerConfig(
+            orphan_ngram_adapter=_orphan_adapter_config(),
+        )
 
 
 def test_runner_default_fails_closed_without_exact_causal_forest_runtime(tmp_path):
@@ -5568,8 +5601,7 @@ def test_runner_freezes_oracle_free_predictions_and_train_only_encoder_state(tmp
     assert fold_one["query_evidence"]["source_family"] == "sparse_query_moments"
     assert fold_one["query_evidence"]["model_inference_performed"] is False
     assert (
-        fold_one["tfidf_orphan_ngram_evidence"]["status"]
-        == "not_available_no_effect_ngram_registration"
+        fold_one["tfidf_orphan_ngram_evidence"]["status"] == "disabled_by_config"
     )
 
     frozen_sha = result.prediction_sha256
@@ -5911,6 +5943,8 @@ def test_runner_adds_default_full_outer_orphan_source_and_manifest_audit(tmp_pat
             post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
+            include_tfidf_orphan_ngrams=True,
+            orphan_ngram_adapter=_orphan_adapter_config(),
         ),
     ).run()
 
@@ -5971,7 +6005,9 @@ def test_runner_registry_repairs_nonportable_per_fold_orphan_paths(tmp_path):
             post_extraction_review_rounds=0,
             interaction_inner_folds=2,
             regularization_grid=(0.1, 1.0),
+            include_tfidf_orphan_ngrams=True,
             require_tfidf_orphan_ngrams=True,
+            orphan_ngram_adapter=_orphan_adapter_config(),
         ),
     ).run()
 

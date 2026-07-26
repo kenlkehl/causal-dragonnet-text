@@ -1,10 +1,10 @@
-"""Physically isolated inputs for one clustered-embedding preflight scope.
+"""Row-restricted inputs for one clustered-embedding preflight scope.
 
 The clustered preflight is label-dependent.  A process evaluating one scope
-therefore receives only that scope's fit text/labels and a cache view whose
-non-fit rows contain no chunks or embeddings.  This module publishes and
-authenticates those capabilities without exposing the prepared cohort or the
-global embedding-cache path in a worker payload.
+therefore receives only that scope's fit text/labels and a capability that
+refuses every non-fit cache row.  All scopes share one immutable, read-only
+embedding cache.  Scope artifacts contain only row/view metadata: embedding
+arrays and chunk texts are never copied into them.
 """
 
 from __future__ import annotations
@@ -13,10 +13,10 @@ import copy
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -32,7 +32,6 @@ from .production_stage1_config_wire import (
     production_stage1_effective_config_payload,
 )
 from .production_stage1_legacy_scope_adapter import (
-    _RestrictedLogicalIdentityEmbeddingCache,
     _closed_tree_inventory,
     _file_registration,
     _read_exact_parquet,
@@ -40,20 +39,43 @@ from .production_stage1_legacy_scope_adapter import (
     _validate_registration,
     _write_json,
     _write_parquet,
-    _write_private_embedding_cache,
+)
+from .review_spent_evidence_provider import (
+    BoundSpentFrozenChunkEmbeddingProvider,
+    SpentOnlyFrozenChunkEmbeddingCache,
 )
 
-PREFLIGHT_SCOPE_INPUT_SCHEMA = "production_stage1_preflight_scope_input_v3"
-PREFLIGHT_SCOPE_INPUT_SET_SCHEMA = "production_stage1_preflight_scope_input_set_v3"
+PREFLIGHT_SCOPE_INPUT_SCHEMA = "production_stage1_preflight_scope_input_v4"
+PREFLIGHT_SCOPE_INPUT_SET_SCHEMA = "production_stage1_preflight_scope_input_set_v4"
 PREFLIGHT_ONE_SCOPE_AUTHORITY_SCHEMA = "production_stage1_preflight_one_scope_authority_v1"
+PREFLIGHT_SHARED_CACHE_REFERENCE_SCHEMA = (
+    "production_stage1_preflight_shared_embedding_cache_reference_v1"
+)
+PREFLIGHT_SCOPED_CACHE_VIEW_SCHEMA = (
+    "production_stage1_preflight_scoped_embedding_cache_view_v1"
+)
 PREFLIGHT_SCOPE_INPUT_MANIFEST = "preflight_scope_input_manifest.json"
 PREFLIGHT_SCOPE_INPUT_SET_MANIFEST = "preflight_scope_input_set_manifest.json"
+PREFLIGHT_SHARED_CACHE_REFERENCE = "shared_embedding_cache_reference.json"
 
 _CONFIG_FILE = "effective_config.json"
 _SEMANTIC_WITNESS_CONFIG_FILE = "semantic_witness_scientific_config.json"
 _SCOPE_AUTHORITY_FILE = "one_scope_authority.json"
 _MODELING_FILE = "fit_only_modeling.parquet"
 _HEX = frozenset("0123456789abcdef")
+_CACHE_FILES = (
+    "metadata.json",
+    "chunk_embeddings.npy",
+    "offsets.npy",
+    "chunk_texts.jsonl",
+)
+_CACHE_DIGEST_FIELD = {
+    "metadata.json": "metadata_sha256",
+    "chunk_embeddings.npy": "embeddings_sha256",
+    "offsets.npy": "offsets_sha256",
+    "chunk_texts.jsonl": "chunk_texts_sha256",
+}
+_SHARED_CACHE_HANDLES: dict[str, SpentOnlyFrozenChunkEmbeddingCache] = {}
 
 
 def _canonical_json(value: Any) -> str:
@@ -81,6 +103,631 @@ def _scope_value(scope: Mapping[str, Any], key: str) -> Any:
     if key not in scope:
         raise ValueError(f"preflight scope lacks {key}")
     return scope[key]
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _source_stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    """Match ``SpentOnlyFrozenChunkEmbeddingCache._file_stats``."""
+
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _authenticated_cache_identity(cache: Any) -> Mapping[str, Any]:
+    getter = getattr(cache, "authenticated_snapshot_identity", None)
+    if not callable(getter):
+        raise TypeError(
+            "shared preflight cache must expose an already-authenticated identity"
+        )
+    identity = getter()
+    if not isinstance(identity, Mapping):
+        raise TypeError("shared preflight cache identity must be one mapping")
+    return copy.deepcopy(dict(identity))
+
+
+def _validated_line_spans(
+    value: Any,
+    *,
+    row_count: int,
+    file_size: int,
+) -> tuple[tuple[int, int], ...]:
+    if not isinstance(value, (list, tuple)) or len(value) != int(row_count):
+        raise ValueError(
+            "shared preflight cache line-span index does not match row count"
+        )
+    spans: list[tuple[int, int]] = []
+    expected_start = 0
+    for raw in value:
+        if (
+            not isinstance(raw, (list, tuple))
+            or len(raw) != 2
+            or any(
+                isinstance(item, bool) or not isinstance(item, (int, np.integer))
+                for item in raw
+            )
+        ):
+            raise ValueError("shared preflight cache line-span index is malformed")
+        start, stop = map(int, raw)
+        if start != expected_start or stop <= start or stop > int(file_size):
+            raise ValueError(
+                "shared preflight cache line-span index is not contiguous"
+            )
+        spans.append((start, stop))
+        expected_start = stop
+    if expected_start != int(file_size):
+        raise ValueError(
+            "shared preflight cache line-span index does not cover its exact file"
+        )
+    return tuple(spans)
+
+
+def _cache_file_rows(
+    *,
+    cache_dir: Path,
+    logical_identity: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    observed = {child.name for child in cache_dir.iterdir()}
+    if observed != set(_CACHE_FILES):
+        raise ValueError(
+            "shared preflight embedding cache must contain exactly four files"
+        )
+    rows: list[dict[str, Any]] = []
+    for name in _CACHE_FILES:
+        path = cache_dir / name
+        state = os.lstat(path)
+        digest_field = _CACHE_DIGEST_FIELD[name]
+        if (
+            stat.S_ISLNK(state.st_mode)
+            or not stat.S_ISREG(state.st_mode)
+            or int(state.st_nlink) != 1
+            or digest_field not in logical_identity
+        ):
+            raise ValueError(
+                f"shared preflight embedding cache file is invalid: {name}"
+            )
+        rows.append(
+            {
+                "name": name,
+                "size_bytes": int(state.st_size),
+                "stat_identity": list(_stat_identity(state)),
+                "sha256": _require_sha256(
+                    logical_identity[digest_field],
+                    label=f"shared preflight {name} SHA",
+                ),
+            }
+        )
+    return tuple(rows)
+
+
+def _build_shared_cache_reference(
+    *,
+    embedding_cache: Any,
+    embedding_cache_identity: Mapping[str, Any],
+    global_embedding_cache_path: Path,
+) -> dict[str, Any]:
+    logical_identity = json.loads(_canonical_json(dict(embedding_cache_identity)))
+    if _authenticated_cache_identity(embedding_cache) != logical_identity:
+        raise ValueError(
+            "shared preflight cache differs from its authenticated logical identity"
+        )
+    supplied = Path(global_embedding_cache_path)
+    cache_dir = Path(embedding_cache.cache_dir)
+    if (
+        not supplied.is_absolute()
+        or not cache_dir.is_absolute()
+        or supplied.is_symlink()
+        or cache_dir.is_symlink()
+        or supplied.resolve(strict=True) != cache_dir.resolve(strict=True)
+    ):
+        raise ValueError(
+            "shared preflight cache locator differs from its authenticated handle"
+        )
+    cache_dir = cache_dir.resolve(strict=True)
+    cache_state = os.lstat(cache_dir)
+    if stat.S_ISLNK(cache_state.st_mode) or not stat.S_ISDIR(cache_state.st_mode):
+        raise ValueError("shared preflight cache root is invalid")
+    file_rows = _cache_file_rows(
+        cache_dir=cache_dir,
+        logical_identity=logical_identity,
+    )
+
+    operator_proof = getattr(
+        embedding_cache,
+        "operator_trusted_read_proof",
+        None,
+    )
+    if operator_proof is not None:
+        from .operator_trusted_embedding_cache_reader import (
+            validate_operator_trusted_cache_read_proof,
+        )
+
+        validated_proof = validate_operator_trusted_cache_read_proof(
+            operator_proof,
+            cache_dir=cache_dir,
+        )
+        if validated_proof["provider_identity"] != logical_identity:
+            raise ValueError(
+                "shared preflight operator proof has another logical cache identity"
+            )
+        reader_mode = "operator_trusted_stat_continuity_v1"
+        proof_payload: Mapping[str, Any] | None = validated_proof
+    else:
+        source_stats = getattr(embedding_cache, "_file_stats", None)
+        if not isinstance(source_stats, Mapping) or set(source_stats) != set(
+            _CACHE_FILES
+        ):
+            raise TypeError(
+                "shared preflight cache lacks a reusable authenticated stat inventory"
+            )
+        for name in _CACHE_FILES:
+            if tuple(source_stats[name]) != _source_stat_identity(
+                os.lstat(cache_dir / name)
+            ):
+                raise RuntimeError(
+                    "shared preflight cache changed after parent authentication: "
+                    f"{name}"
+                )
+        reader_mode = "parent_authenticated_stat_continuity_v1"
+        proof_payload = None
+
+    raw_spans = getattr(embedding_cache, "_line_spans", None)
+    chunk_size = next(
+        row["size_bytes"] for row in file_rows if row["name"] == "chunk_texts.jsonl"
+    )
+    row_count = int(logical_identity.get("row_count", -1))
+    spans = _validated_line_spans(
+        raw_spans,
+        row_count=row_count,
+        file_size=int(chunk_size),
+    )
+    body = {
+        "schema_version": PREFLIGHT_SHARED_CACHE_REFERENCE_SCHEMA,
+        "reader_mode": reader_mode,
+        "cache_dir": str(cache_dir),
+        "cache_dir_stat_identity": list(_stat_identity(cache_state)),
+        "cache_files": list(file_rows),
+        "logical_identity": logical_identity,
+        "logical_identity_sha256": _sha256_json(logical_identity),
+        "chunk_text_line_spans": [list(span) for span in spans],
+        "operator_trusted_read_proof": (
+            None
+            if proof_payload is None
+            else json.loads(_canonical_json(dict(proof_payload)))
+        ),
+        "one_physical_cache_shared_across_scopes": True,
+        "embedding_arrays_copied_into_scope_inputs": False,
+        "chunk_texts_copied_into_scope_inputs": False,
+        "treatment_or_outcome_supplied": False,
+        "payload_bytes_reauthenticated_during_publication": False,
+        "global_release_certified": False,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
+
+
+def _validate_shared_cache_reference(
+    *,
+    path: Path | str,
+    expected_content_sha256: str | None = None,
+    expected_reference: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    reference_path = Path(path).absolute()
+    if (
+        reference_path.name != PREFLIGHT_SHARED_CACHE_REFERENCE
+        or reference_path.is_symlink()
+        or not reference_path.is_file()
+    ):
+        raise ValueError("shared preflight cache reference path is invalid")
+    reference = _read_json(
+        reference_path,
+        label="shared preflight cache reference",
+    )
+    required = {
+        "schema_version",
+        "reader_mode",
+        "cache_dir",
+        "cache_dir_stat_identity",
+        "cache_files",
+        "logical_identity",
+        "logical_identity_sha256",
+        "chunk_text_line_spans",
+        "operator_trusted_read_proof",
+        "one_physical_cache_shared_across_scopes",
+        "embedding_arrays_copied_into_scope_inputs",
+        "chunk_texts_copied_into_scope_inputs",
+        "treatment_or_outcome_supplied",
+        "payload_bytes_reauthenticated_during_publication",
+        "global_release_certified",
+        "content_sha256",
+    }
+    body = {
+        key: copy.deepcopy(value)
+        for key, value in reference.items()
+        if key != "content_sha256"
+    }
+    logical_identity = reference.get("logical_identity")
+    if (
+        set(reference) != required
+        or reference.get("schema_version")
+        != PREFLIGHT_SHARED_CACHE_REFERENCE_SCHEMA
+        or reference.get("reader_mode")
+        not in {
+            "operator_trusted_stat_continuity_v1",
+            "parent_authenticated_stat_continuity_v1",
+        }
+        or reference.get("content_sha256") != _sha256_json(body)
+        or (
+            expected_content_sha256 is not None
+            and reference.get("content_sha256") != expected_content_sha256
+        )
+        or not isinstance(logical_identity, Mapping)
+        or reference.get("logical_identity_sha256")
+        != _sha256_json(logical_identity)
+        or reference.get("one_physical_cache_shared_across_scopes") is not True
+        or reference.get("embedding_arrays_copied_into_scope_inputs") is not False
+        or reference.get("chunk_texts_copied_into_scope_inputs") is not False
+        or reference.get("treatment_or_outcome_supplied") is not False
+        or reference.get("payload_bytes_reauthenticated_during_publication")
+        is not False
+        or reference.get("global_release_certified") is not False
+    ):
+        raise ValueError("shared preflight cache reference is invalid")
+    _require_sha256(
+        reference["content_sha256"],
+        label="shared preflight cache reference SHA",
+    )
+    _require_sha256(
+        reference["logical_identity_sha256"],
+        label="shared preflight cache logical identity SHA",
+    )
+    cache_dir = Path(str(reference.get("cache_dir") or ""))
+    if (
+        not cache_dir.is_absolute()
+        or cache_dir.is_symlink()
+        or not cache_dir.is_dir()
+        or cache_dir.resolve(strict=True) != cache_dir
+        or _stat_identity(os.lstat(cache_dir))
+        != tuple(reference.get("cache_dir_stat_identity") or ())
+    ):
+        raise ValueError("shared preflight cache root changed")
+    rows = reference.get("cache_files")
+    if not isinstance(rows, list) or len(rows) != len(_CACHE_FILES):
+        raise ValueError("shared preflight cache file inventory is incomplete")
+    observed_names = {child.name for child in cache_dir.iterdir()}
+    if observed_names != set(_CACHE_FILES):
+        raise ValueError("shared preflight cache file inventory changed")
+    for expected_name, row in zip(_CACHE_FILES, rows):
+        if (
+            not isinstance(row, Mapping)
+            or set(row)
+            != {"name", "size_bytes", "stat_identity", "sha256"}
+            or row.get("name") != expected_name
+            or not isinstance(row.get("size_bytes"), int)
+            or int(row["size_bytes"]) <= 0
+            or not isinstance(row.get("stat_identity"), list)
+            or len(row["stat_identity"]) != 7
+            or _stat_identity(os.lstat(cache_dir / expected_name))
+            != tuple(row["stat_identity"])
+            or int(os.lstat(cache_dir / expected_name).st_size)
+            != int(row["size_bytes"])
+            or row.get("sha256")
+            != logical_identity.get(_CACHE_DIGEST_FIELD[expected_name])
+        ):
+            raise ValueError(
+                "shared preflight cache file inventory changed: "
+                f"{expected_name}"
+            )
+        _require_sha256(
+            row["sha256"],
+            label=f"shared preflight {expected_name} SHA",
+        )
+    row_count = int(logical_identity.get("row_count", -1))
+    chunk_size = int(rows[-1]["size_bytes"])
+    _validated_line_spans(
+        reference.get("chunk_text_line_spans"),
+        row_count=row_count,
+        file_size=chunk_size,
+    )
+    proof = reference.get("operator_trusted_read_proof")
+    if reference["reader_mode"] == "operator_trusted_stat_continuity_v1":
+        if not isinstance(proof, Mapping):
+            raise ValueError(
+                "shared preflight operator-trusted reference lacks its proof"
+            )
+        from .operator_trusted_embedding_cache_reader import (
+            validate_operator_trusted_cache_read_proof,
+        )
+
+        validated_proof = validate_operator_trusted_cache_read_proof(
+            proof,
+            cache_dir=cache_dir,
+        )
+        if validated_proof["provider_identity"] != logical_identity:
+            raise ValueError(
+                "shared preflight operator proof logical identity changed"
+            )
+    elif proof is not None:
+        raise ValueError(
+            "parent-authenticated shared preflight reference contains an "
+            "operator proof"
+        )
+    if expected_reference is not None and reference != dict(expected_reference):
+        raise ValueError(
+            "existing shared preflight cache reference differs from this request"
+        )
+    return copy.deepcopy(reference)
+
+
+class _ParentAuthenticatedSharedEmbeddingCache(
+    SpentOnlyFrozenChunkEmbeddingCache
+):
+    """Direct read-only cache handle guarded by a parent-authenticated stat set."""
+
+    def __init__(self, reference: Mapping[str, Any]) -> None:
+        from .operator_trusted_embedding_cache_reader import (
+            _load_readonly_mmap,
+            _open_readonly_nofollow,
+        )
+
+        cache_dir = Path(str(reference["cache_dir"]))
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise RuntimeError("shared preflight cache requires POSIX O_NOFOLLOW")
+        root_flags = os.O_RDONLY | os.O_NOFOLLOW
+        if hasattr(os, "O_DIRECTORY"):
+            root_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_CLOEXEC"):
+            root_flags |= os.O_CLOEXEC
+        root_fd = os.open(cache_dir, root_flags)
+        rows = {
+            str(row["name"]): row
+            for row in reference["cache_files"]
+        }
+        try:
+            if _stat_identity(os.fstat(root_fd)) != tuple(
+                reference["cache_dir_stat_identity"]
+            ):
+                raise ValueError(
+                    "shared preflight cache root changed while opening"
+                )
+            handles = {
+                name: _open_readonly_nofollow(
+                    root_fd=root_fd,
+                    name=name,
+                    expected_stat=tuple(rows[name]["stat_identity"]),
+                )
+                for name in _CACHE_FILES
+            }
+        except BaseException:
+            os.close(root_fd)
+            raise
+        self.cache_dir = cache_dir
+        self._cache_root_fd = root_fd
+        self._snapshot_files = handles
+        self._shared_reference = copy.deepcopy(dict(reference))
+        metadata_size = int(rows["metadata.json"]["size_bytes"])
+        metadata_bytes = os.pread(
+            handles["metadata.json"].fileno(),
+            metadata_size,
+            0,
+        )
+        if len(metadata_bytes) != metadata_size:
+            raise RuntimeError("shared preflight cache metadata ended unexpectedly")
+        try:
+            metadata = json.loads(metadata_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "shared preflight cache metadata is invalid JSON"
+            ) from exc
+        if not isinstance(metadata, dict):
+            raise ValueError("shared preflight cache metadata must be one object")
+        self._metadata = metadata
+        self._embeddings = _load_readonly_mmap(
+            handles["chunk_embeddings.npy"],
+            name="chunk_embeddings",
+        )
+        self._offsets = _load_readonly_mmap(
+            handles["offsets.npy"],
+            name="offsets",
+        )
+        row_count = int(metadata.get("num_samples", -1))
+        hidden_size = int(metadata.get("hidden_size", -1))
+        if (
+            row_count < 1
+            or self._embeddings.ndim != 2
+            or self._offsets.ndim != 1
+            or len(self._offsets) != row_count + 1
+            or not np.issubdtype(self._offsets.dtype, np.integer)
+            or int(self._offsets[-1]) != int(self._embeddings.shape[0])
+            or hidden_size != int(self._embeddings.shape[1])
+        ):
+            raise ValueError("shared preflight cache arrays are inconsistent")
+        logical = reference["logical_identity"]
+        if (
+            int(logical.get("row_count", -1)) != row_count
+            or int(logical.get("chunk_count", -1))
+            != int(self._embeddings.shape[0])
+        ):
+            raise ValueError(
+                "shared preflight cache shape differs from logical identity"
+            )
+        self._chunk_text_snapshot = handles["chunk_texts.jsonl"]
+        self._line_spans = _validated_line_spans(
+            reference["chunk_text_line_spans"],
+            row_count=row_count,
+            file_size=int(rows["chunk_texts.jsonl"]["size_bytes"]),
+        )
+        self._identity = copy.deepcopy(dict(logical))
+        self._assert_shared_files_unchanged()
+
+    def _assert_shared_files_unchanged(self) -> None:
+        reference = self._shared_reference
+        if _stat_identity(os.fstat(self._cache_root_fd)) != tuple(
+            reference["cache_dir_stat_identity"]
+        ):
+            raise RuntimeError("shared preflight cache root changed during use")
+        rows = {
+            str(row["name"]): row
+            for row in reference["cache_files"]
+        }
+        for name in _CACHE_FILES:
+            expected = tuple(rows[name]["stat_identity"])
+            try:
+                descriptor_state = _stat_identity(
+                    os.fstat(self._snapshot_files[name].fileno())
+                )
+                path_state = _stat_identity(os.lstat(self.cache_dir / name))
+            except OSError as exc:
+                raise RuntimeError(
+                    f"shared preflight cache path changed during use: {name}"
+                ) from exc
+            if descriptor_state != expected or path_state != expected:
+                raise RuntimeError(
+                    f"shared preflight cache file changed during use: {name}"
+                )
+        if {child.name for child in self.cache_dir.iterdir()} != set(
+            _CACHE_FILES
+        ):
+            raise RuntimeError(
+                "shared preflight cache inventory changed during use"
+            )
+
+    def authenticated_snapshot_identity(self) -> Mapping[str, Any]:
+        self._assert_shared_files_unchanged()
+        return copy.deepcopy(self._identity)
+
+    def identity(self) -> Mapping[str, Any]:
+        self._assert_shared_files_unchanged()
+        return copy.deepcopy(self._identity)
+
+
+def _load_shared_cache(
+    reference: Mapping[str, Any],
+) -> SpentOnlyFrozenChunkEmbeddingCache:
+    content_sha = str(reference["content_sha256"])
+    cached = _SHARED_CACHE_HANDLES.get(content_sha)
+    if cached is not None:
+        if _authenticated_cache_identity(cached) != reference["logical_identity"]:
+            raise RuntimeError(
+                "memoized shared preflight cache identity changed"
+            )
+        return cached
+    if reference["reader_mode"] == "operator_trusted_stat_continuity_v1":
+        from .operator_trusted_embedding_cache_reader import (
+            OperatorTrustedSpentOnlyFrozenChunkEmbeddingCache,
+        )
+
+        cache = OperatorTrustedSpentOnlyFrozenChunkEmbeddingCache(
+            reference["cache_dir"],
+            proof=reference["operator_trusted_read_proof"],
+            authenticated_line_spans=reference["chunk_text_line_spans"],
+        )
+    else:
+        cache = _ParentAuthenticatedSharedEmbeddingCache(reference)
+    if _authenticated_cache_identity(cache) != reference["logical_identity"]:
+        raise ValueError("opened shared preflight cache has another identity")
+    _SHARED_CACHE_HANDLES[content_sha] = cache
+    return cache
+
+
+class ScopedEmbeddingView:
+    """A logical cache facade that refuses every row outside one fit scope."""
+
+    def __init__(
+        self,
+        *,
+        shared_cache: SpentOnlyFrozenChunkEmbeddingCache,
+        logical_identity: Mapping[str, Any],
+        allowed_row_ids: Sequence[int],
+        shared_reference_content_sha256: str,
+    ) -> None:
+        allowed = tuple(map(int, allowed_row_ids))
+        if (
+            not allowed
+            or len(allowed) != len(set(allowed))
+            or min(allowed) < 0
+            or max(allowed) >= int(shared_cache.row_count)
+        ):
+            raise ValueError("scoped embedding view row authority is invalid")
+        if _authenticated_cache_identity(shared_cache) != dict(logical_identity):
+            raise ValueError(
+                "scoped embedding view logical identity differs from shared cache"
+            )
+        self._cache = shared_cache
+        self.cache_dir = shared_cache.cache_dir
+        self._logical_identity = copy.deepcopy(dict(logical_identity))
+        self._allowed_row_ids = frozenset(allowed)
+        self._allowed_row_order = allowed
+        self.shared_reference_content_sha256 = _require_sha256(
+            shared_reference_content_sha256,
+            label="scoped embedding view shared-reference SHA",
+        )
+        self._metadata = shared_cache._metadata
+        self._embeddings = shared_cache._embeddings
+        self._offsets = shared_cache._offsets
+
+    @property
+    def row_count(self) -> int:
+        return int(self._cache.row_count)
+
+    @property
+    def metadata(self) -> Mapping[str, Any]:
+        return copy.deepcopy(self._metadata)
+
+    @property
+    def allowed_row_ids(self) -> tuple[int, ...]:
+        return self._allowed_row_order
+
+    def identity(self) -> Mapping[str, Any]:
+        if _authenticated_cache_identity(self._cache) != self._logical_identity:
+            raise RuntimeError("shared embedding cache identity changed during use")
+        return copy.deepcopy(self._logical_identity)
+
+    def authenticated_snapshot_identity(self) -> Mapping[str, Any]:
+        return self.identity()
+
+    def _cached_chunks(self, row_id: int) -> tuple[str, ...]:
+        value = int(row_id)
+        if value not in self._allowed_row_ids:
+            raise ValueError(
+                "scoped embedding view refuses a non-fit row"
+            )
+        return self._cache._cached_chunks(value)
+
+    def bind_spent(
+        self,
+        row_ids: Sequence[int],
+        texts: Sequence[str],
+    ) -> BoundSpentFrozenChunkEmbeddingProvider:
+        requested = tuple(map(int, row_ids))
+        if not set(requested).issubset(self._allowed_row_ids):
+            raise ValueError(
+                "scoped embedding view refuses a non-fit row"
+            )
+        physical = self._cache.bind_spent(
+            requested,
+            tuple(texts),
+        )
+        return BoundSpentFrozenChunkEmbeddingProvider(
+            cache=self,
+            row_ids=physical.row_ids,
+            cached_by_row=physical.cached_by_row,
+            token_bounded_row_ids=physical.token_bounded_row_ids,
+        )
 
 
 def _private_config_payload(
@@ -126,7 +773,9 @@ class AuthenticatedPreflightScopeInput:
     config: AppliedInferenceConfig
     scope_authority: Mapping[str, Any]
     scope: Mapping[str, Any]
-    embedding_cache: _RestrictedLogicalIdentityEmbeddingCache
+    embedding_cache: ScopedEmbeddingView
+    shared_cache_reference_path: Path
+    shared_cache_reference: Mapping[str, Any]
     semantic_witness_scientific_config: Any
 
     @property
@@ -139,10 +788,16 @@ class AuthenticatedPreflightScopeInput:
 
     def worker_payload(self) -> dict[str, Any]:
         return {
-            "schema_version": "production_stage1_preflight_worker_payload_v1",
+            "schema_version": "production_stage1_preflight_worker_payload_v2",
             "scope_id": self.scope_id,
             "manifest_path": str(self.manifest_path),
             "manifest_content_sha256": str(self.manifest["content_sha256"]),
+            "shared_cache_reference_path": str(
+                self.shared_cache_reference_path
+            ),
+            "shared_cache_reference_content_sha256": str(
+                self.shared_cache_reference["content_sha256"]
+            ),
         }
 
 
@@ -151,6 +806,8 @@ class AuthenticatedPreflightScopeInputSet:
     root: Path
     manifest: Mapping[str, Any]
     scopes: Mapping[str, AuthenticatedPreflightScopeInput]
+    shared_cache_reference_path: Path
+    shared_cache_reference: Mapping[str, Any]
 
     def worker_payloads(self) -> tuple[Mapping[str, Any], ...]:
         return tuple(scope.worker_payload() for scope in self.scopes.values())
@@ -167,7 +824,7 @@ class AuthenticatedPreflightScopeInputSet:
             else []
         )
         body = {
-            "schema_version": "production_stage1_preflight_scope_input_set_identity_v1",
+            "schema_version": "production_stage1_preflight_scope_input_set_identity_v2",
             "root": str(self.root),
             "manifest_path": str(self.root / PREFLIGHT_SCOPE_INPUT_SET_MANIFEST),
             "manifest": manifest_registration,
@@ -177,6 +834,15 @@ class AuthenticatedPreflightScopeInputSet:
                 scope_id: str(scope.manifest["content_sha256"])
                 for scope_id, scope in self.scopes.items()
             },
+            "shared_cache_reference": _file_registration(
+                self.shared_cache_reference_path,
+                self.root,
+            ),
+            "shared_cache_reference_content_sha256": str(
+                self.shared_cache_reference["content_sha256"]
+            ),
+            "per_scope_embedding_arrays_copied": False,
+            "per_scope_chunk_texts_copied": False,
             "attempt_root": str(attempt_root),
             "preserved_incomplete_attempts": attempts,
             "scope_inputs_outside_terminal_scientific_artifact": True,
@@ -189,8 +855,8 @@ def _write_scope(
     root: Path,
     modeling_data: pd.DataFrame,
     config: AppliedInferenceConfig,
-    embedding_cache: Any,
     embedding_cache_identity: Mapping[str, Any],
+    shared_cache_reference_content_sha256: str,
     registry_content_sha256: str,
     scope: Mapping[str, Any],
     forbidden_paths: Sequence[Path],
@@ -201,24 +867,6 @@ def _write_scope(
     row_count = len(modeling_data)
     if not fit_rows or min(fit_rows) < 0 or max(fit_rows) >= row_count:
         raise ValueError("preflight scope fit rows are invalid")
-    fit_texts = tuple(
-        str(value)
-        for value in modeling_data.iloc[list(fit_rows)][config.text_column].tolist()
-    )
-    parent_binding = embedding_cache.bind_spent(fit_rows, fit_texts)
-    token_bounded = getattr(parent_binding, "token_bounded_row_ids", None)
-    if not isinstance(token_bounded, tuple) or any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 0
-        for value in token_bounded
-    ):
-        raise ValueError(
-            f"embedding cache binding is malformed in {scope['scope_id']}"
-        )
-    if token_bounded:
-        raise ValueError(
-            "embedding cache binding used token-bounded text reconciliation in "
-            f"{scope['scope_id']}"
-        )
     private = pd.DataFrame(
         {
             config.text_column: np.full(row_count, "", dtype=object),
@@ -288,19 +936,6 @@ def _write_scope(
             "content_sha256": _sha256_json(authority_body),
         },
     )
-    prepared = SimpleNamespace(
-        embedding_cache=embedding_cache,
-        embedding_cache_identity=copy.deepcopy(dict(embedding_cache_identity)),
-    )
-    scope_object = SimpleNamespace(
-        scope_id=str(scope["scope_id"]),
-        fit_row_ids=fit_rows,
-    )
-    private_cache = _write_private_embedding_cache(
-        root=root,
-        prepared=prepared,
-        scope=scope_object,
-    )
     files = {
         "effective_config": _file_registration(root / _CONFIG_FILE, root),
         "semantic_witness_scientific_config": _file_registration(
@@ -312,6 +947,23 @@ def _write_scope(
             root,
         ),
         "fit_only_modeling": _file_registration(root / _MODELING_FILE, root),
+    }
+    cache_view = {
+        "schema_version": PREFLIGHT_SCOPED_CACHE_VIEW_SCHEMA,
+        "shared_cache_reference_content_sha256": _require_sha256(
+            shared_cache_reference_content_sha256,
+            label="shared preflight cache reference SHA",
+        ),
+        "logical_identity": json.loads(
+            _canonical_json(dict(embedding_cache_identity))
+        ),
+        "logical_identity_sha256": _sha256_json(embedding_cache_identity),
+        "allowed_row_ids": list(fit_rows),
+        "allowed_row_order_sha256": _sha256_json(list(fit_rows)),
+        "allowed_row_count": len(fit_rows),
+        "peer_row_access_allowed": False,
+        "embedding_array_payload_count": 0,
+        "chunk_text_payload_count": 0,
     }
     body = {
         "schema_version": PREFLIGHT_SCOPE_INPUT_SCHEMA,
@@ -330,7 +982,7 @@ def _write_scope(
             config.outcome_column,
         ],
         "files": files,
-        "embedding_cache": private_cache,
+        "embedding_cache_view": cache_view,
         "semantic_witness_scientific_config_sha256": (
             semantic_witness_scientific_config.identity_sha256
         ),
@@ -374,6 +1026,12 @@ def publish_preflight_scope_inputs(
         raise ValueError("preflight scope IDs must be unique and nonempty")
     if _sha256_json(registry) != str(registry_content_sha256):
         raise ValueError("preflight parent registry differs from its content identity")
+    shared_reference = _build_shared_cache_reference(
+        embedding_cache=embedding_cache,
+        embedding_cache_identity=embedding_cache_identity,
+        global_embedding_cache_path=global_embedding_cache_path,
+    )
+    shared_reference_path = root / PREFLIGHT_SHARED_CACHE_REFERENCE
     terminal_manifest = root / PREFLIGHT_SCOPE_INPUT_SET_MANIFEST
     if terminal_manifest.is_file():
         return validate_preflight_scope_input_set(
@@ -384,6 +1042,7 @@ def publish_preflight_scope_inputs(
             parent_config=config,
             parent_embedding_cache=embedding_cache,
             parent_embedding_cache_identity=embedding_cache_identity,
+            expected_shared_cache_reference=shared_reference,
             expected_semantic_witness_scientific_config=(
                 semantic_witness_scientific_config
             ),
@@ -395,10 +1054,21 @@ def publish_preflight_scope_inputs(
     root.mkdir(exist_ok=True)
     if root.resolve(strict=True) != root:
         raise ValueError("preflight scope-input root is not canonical")
-    allowed_entries = set(scope_ids)
+    allowed_entries = {
+        *scope_ids,
+        PREFLIGHT_SHARED_CACHE_REFERENCE,
+    }
     observed_entries = {entry.name for entry in os.scandir(root)}
     if not observed_entries.issubset(allowed_entries):
         raise ValueError("incomplete preflight scope-input root contains unknown entries")
+    if shared_reference_path.exists():
+        _validate_shared_cache_reference(
+            path=shared_reference_path,
+            expected_content_sha256=str(shared_reference["content_sha256"]),
+            expected_reference=shared_reference,
+        )
+    else:
+        _write_json(shared_reference_path, shared_reference)
     attempt_root = root.parent / f".{root.name}.scope_attempts"
     if attempt_root.is_symlink():
         raise ValueError("preflight scope-input attempt root cannot be a symlink")
@@ -416,6 +1086,10 @@ def publish_preflight_scope_inputs(
                 parent_config=config,
                 parent_embedding_cache=embedding_cache,
                 parent_embedding_cache_identity=embedding_cache_identity,
+                shared_cache_reference_path=shared_reference_path,
+                expected_shared_cache_reference_content_sha256=str(
+                    shared_reference["content_sha256"]
+                ),
                 expected_semantic_witness_scientific_config=(
                     semantic_witness_scientific_config
                 ),
@@ -438,8 +1112,10 @@ def publish_preflight_scope_inputs(
                 root=temporary,
                 modeling_data=modeling_data,
                 config=config,
-                embedding_cache=embedding_cache,
                 embedding_cache_identity=embedding_cache_identity,
+                shared_cache_reference_content_sha256=str(
+                    shared_reference["content_sha256"]
+                ),
                 registry_content_sha256=registry_content_sha256,
                 scope=scope,
                 forbidden_paths=(source_dataset_path, global_embedding_cache_path),
@@ -455,6 +1131,10 @@ def publish_preflight_scope_inputs(
                 parent_config=config,
                 parent_embedding_cache=embedding_cache,
                 parent_embedding_cache_identity=embedding_cache_identity,
+                shared_cache_reference_path=shared_reference_path,
+                expected_shared_cache_reference_content_sha256=str(
+                    shared_reference["content_sha256"]
+                ),
                 expected_semantic_witness_scientific_config=(
                     semantic_witness_scientific_config
                 ),
@@ -490,7 +1170,17 @@ def publish_preflight_scope_inputs(
         "scope_order": scope_ids,
         "scope_count": len(scope_ids),
         "scopes": rows,
+        "shared_embedding_cache_reference": _file_registration(
+            shared_reference_path,
+            root,
+        ),
+        "shared_embedding_cache_reference_content_sha256": str(
+            shared_reference["content_sha256"]
+        ),
         "one_scope_per_worker_payload": True,
+        "one_physical_cache_shared_across_scopes": True,
+        "per_scope_embedding_arrays_copied": False,
+        "per_scope_chunk_texts_copied": False,
     }
     _write_json(
         terminal_manifest,
@@ -512,6 +1202,7 @@ def publish_preflight_scope_inputs(
         parent_config=config,
         parent_embedding_cache=embedding_cache,
         parent_embedding_cache_identity=embedding_cache_identity,
+        expected_shared_cache_reference=shared_reference,
         expected_semantic_witness_scientific_config=(
             semantic_witness_scientific_config
         ),
@@ -529,6 +1220,8 @@ def validate_preflight_scope_input(
     parent_config: AppliedInferenceConfig | None = None,
     parent_embedding_cache: Any | None = None,
     parent_embedding_cache_identity: Mapping[str, Any] | None = None,
+    shared_cache_reference_path: Path | str | None = None,
+    expected_shared_cache_reference_content_sha256: str | None = None,
     expected_semantic_witness_scientific_config: Any | None = None,
     forbidden_paths: Sequence[Path] = (),
 ) -> AuthenticatedPreflightScopeInput:
@@ -551,7 +1244,7 @@ def validate_preflight_scope_input(
         "row_count",
         "columns",
         "files",
-        "embedding_cache",
+        "embedding_cache_view",
         "semantic_witness_scientific_config_sha256",
         "nonfit_text_supplied",
         "nonfit_labels_supplied",
@@ -724,43 +1417,95 @@ def validate_preflight_scope_input(
         .any()
     ):
         raise ValueError("preflight scope-input contains nonfit data or missing fit data")
-    cache_registration = manifest.get("embedding_cache")
-    if not isinstance(cache_registration, Mapping):
-        raise ValueError("preflight scope-input lacks a private cache")
-    cache_files = cache_registration.get("files")
-    if not isinstance(cache_files, Mapping):
-        raise ValueError("preflight scope-input cache files are malformed")
-    for filename, registration in cache_files.items():
-        cache_file = _validate_registration(
-            root,
-            registration,
-            label=f"preflight private cache {filename}",
-        )
-        if (
-            registration["relative_path"]
-            != (Path(str(cache_registration["relative_path"])) / str(filename)).as_posix()
-        ):
-            raise ValueError("preflight private cache layout changed")
-    cache = _RestrictedLogicalIdentityEmbeddingCache(
-        cache_dir=root / str(cache_registration["relative_path"]),
-        logical_identity=cache_registration["logical_identity"],
-        allowed_row_ids=fit_rows,
+    cache_view = manifest.get("embedding_cache_view")
+    view_fields = {
+        "schema_version",
+        "shared_cache_reference_content_sha256",
+        "logical_identity",
+        "logical_identity_sha256",
+        "allowed_row_ids",
+        "allowed_row_order_sha256",
+        "allowed_row_count",
+        "peer_row_access_allowed",
+        "embedding_array_payload_count",
+        "chunk_text_payload_count",
+    }
+    if (
+        not isinstance(cache_view, Mapping)
+        or set(cache_view) != view_fields
+        or cache_view.get("schema_version")
+        != PREFLIGHT_SCOPED_CACHE_VIEW_SCHEMA
+        or cache_view.get("allowed_row_ids") != list(fit_rows)
+        or cache_view.get("allowed_row_order_sha256")
+        != _sha256_json(list(fit_rows))
+        or cache_view.get("allowed_row_count") != len(fit_rows)
+        or cache_view.get("peer_row_access_allowed") is not False
+        or cache_view.get("embedding_array_payload_count") != 0
+        or cache_view.get("chunk_text_payload_count") != 0
+        or not isinstance(cache_view.get("logical_identity"), Mapping)
+        or cache_view.get("logical_identity_sha256")
+        != _sha256_json(cache_view["logical_identity"])
+    ):
+        raise ValueError("preflight scoped embedding-cache view is invalid")
+    reference_sha = _require_sha256(
+        cache_view["shared_cache_reference_content_sha256"],
+        label="preflight scoped shared-cache reference SHA",
     )
     if (
-        cache.physical_identity() != cache_registration["physical_identity"]
-        or cache.identity() != cache_registration["logical_identity"]
-        or cache.row_count != row_count
+        expected_shared_cache_reference_content_sha256 is not None
+        and reference_sha
+        != expected_shared_cache_reference_content_sha256
     ):
-        raise ValueError("preflight private cache changed")
-    for row_id in nonfit:
-        if int(cache._offsets[row_id]) != int(
-            cache._offsets[row_id + 1]
-        ) or cache._cache._cached_chunks(row_id):
-            raise ValueError("preflight private cache retained a nonfit row")
+        raise ValueError(
+            "preflight scoped embedding-cache reference changed"
+        )
+    reference_path = (
+        root.parent / PREFLIGHT_SHARED_CACHE_REFERENCE
+        if shared_cache_reference_path is None
+        else Path(shared_cache_reference_path).absolute()
+    )
+    shared_reference = _validate_shared_cache_reference(
+        path=reference_path,
+        expected_content_sha256=reference_sha,
+    )
+    if (
+        shared_reference["logical_identity"]
+        != cache_view["logical_identity"]
+        or int(shared_reference["logical_identity"].get("row_count", -1))
+        != row_count
+    ):
+        raise ValueError(
+            "preflight scoped view differs from its shared embedding cache"
+        )
+    if parent_embedding_cache_identity is not None and (
+        cache_view["logical_identity"]
+        != dict(parent_embedding_cache_identity)
+    ):
+        raise ValueError(
+            "preflight scoped view logical identity changed"
+        )
+    if parent_embedding_cache is None:
+        shared_cache = _load_shared_cache(shared_reference)
+    else:
+        if (
+            Path(parent_embedding_cache.cache_dir).resolve(strict=True)
+            != Path(shared_reference["cache_dir"])
+            or _authenticated_cache_identity(parent_embedding_cache)
+            != shared_reference["logical_identity"]
+        ):
+            raise ValueError(
+                "preflight shared cache differs from its parent handle"
+            )
+        shared_cache = parent_embedding_cache
+    cache = ScopedEmbeddingView(
+        shared_cache=shared_cache,
+        logical_identity=cache_view["logical_identity"],
+        allowed_row_ids=fit_rows,
+        shared_reference_content_sha256=reference_sha,
+    )
     expected_files = {
         PREFLIGHT_SCOPE_INPUT_MANIFEST,
         *(str(value["relative_path"]) for value in files.values()),
-        *(str(value["relative_path"]) for value in cache_registration["files"].values()),
     }
     observed_files, observed_directories = _closed_tree_inventory(
         root,
@@ -789,22 +1534,6 @@ def validate_preflight_scope_input(
         actual = modeling.iloc[list(fit_rows)][columns]
         if actual.to_dict("records") != expected.to_dict("records"):
             raise ValueError("preflight scope input differs from parent fit rows")
-    if parent_embedding_cache_identity is not None:
-        if cache_registration["logical_identity"] != dict(parent_embedding_cache_identity):
-            raise ValueError("preflight private cache logical identity changed")
-    if parent_embedding_cache is not None:
-        for row_id in fit_rows:
-            if cache._cache._cached_chunks(row_id) != parent_embedding_cache._cached_chunks(row_id):
-                raise ValueError("preflight private cache text differs from parent")
-            private_start = int(cache._offsets[row_id])
-            private_stop = int(cache._offsets[row_id + 1])
-            parent_start = int(parent_embedding_cache._offsets[row_id])
-            parent_stop = int(parent_embedding_cache._offsets[row_id + 1])
-            if not np.array_equal(
-                cache._embeddings[private_start:private_stop],
-                parent_embedding_cache._embeddings[parent_start:parent_stop],
-            ):
-                raise ValueError("preflight private cache embeddings differ from parent")
     return AuthenticatedPreflightScopeInput(
         root=root,
         manifest=copy.deepcopy(manifest),
@@ -813,6 +1542,8 @@ def validate_preflight_scope_input(
         scope_authority=authority,
         scope=copy.deepcopy(dict(scope)),
         embedding_cache=cache,
+        shared_cache_reference_path=reference_path,
+        shared_cache_reference=shared_reference,
         semantic_witness_scientific_config=(
             semantic_witness_scientific_config
         ),
@@ -828,6 +1559,7 @@ def validate_preflight_scope_input_set(
     parent_config: AppliedInferenceConfig | None = None,
     parent_embedding_cache: Any | None = None,
     parent_embedding_cache_identity: Mapping[str, Any] | None = None,
+    expected_shared_cache_reference: Mapping[str, Any] | None = None,
     expected_semantic_witness_scientific_config: Any | None = None,
     forbidden_paths: Sequence[Path] = (),
 ) -> AuthenticatedPreflightScopeInputSet:
@@ -845,7 +1577,12 @@ def validate_preflight_scope_input_set(
         "scope_order",
         "scope_count",
         "scopes",
+        "shared_embedding_cache_reference",
+        "shared_embedding_cache_reference_content_sha256",
         "one_scope_per_worker_payload",
+        "one_physical_cache_shared_across_scopes",
+        "per_scope_embedding_arrays_copied",
+        "per_scope_chunk_texts_copied",
         "content_sha256",
     }
     expected = tuple(json.loads(_canonical_json(dict(scope))) for scope in expected_scopes)
@@ -858,11 +1595,28 @@ def validate_preflight_scope_input_set(
         or manifest.get("scope_order") != expected_order
         or manifest.get("scope_count") != len(expected)
         or manifest.get("one_scope_per_worker_payload") is not True
+        or manifest.get("one_physical_cache_shared_across_scopes") is not True
+        or manifest.get("per_scope_embedding_arrays_copied") is not False
+        or manifest.get("per_scope_chunk_texts_copied") is not False
         or manifest.get("content_sha256") != _sha256_json(body)
         or not isinstance(rows, list)
         or len(rows) != len(expected)
     ):
         raise ValueError("preflight scope-input set manifest is invalid")
+    shared_reference_path = _validate_registration(
+        set_root,
+        manifest["shared_embedding_cache_reference"],
+        label="shared preflight cache reference",
+    )
+    if shared_reference_path.name != PREFLIGHT_SHARED_CACHE_REFERENCE:
+        raise ValueError("shared preflight cache reference layout changed")
+    shared_reference = _validate_shared_cache_reference(
+        path=shared_reference_path,
+        expected_content_sha256=str(
+            manifest["shared_embedding_cache_reference_content_sha256"]
+        ),
+        expected_reference=expected_shared_cache_reference,
+    )
     authenticated: dict[str, AuthenticatedPreflightScopeInput] = {}
     for scope, row in zip(expected, rows):
         scope_id = str(scope["scope_id"])
@@ -885,6 +1639,10 @@ def validate_preflight_scope_input_set(
             parent_config=parent_config,
             parent_embedding_cache=parent_embedding_cache,
             parent_embedding_cache_identity=parent_embedding_cache_identity,
+            shared_cache_reference_path=shared_reference_path,
+            expected_shared_cache_reference_content_sha256=str(
+                shared_reference["content_sha256"]
+            ),
             expected_semantic_witness_scientific_config=(
                 expected_semantic_witness_scientific_config
             ),
@@ -893,7 +1651,10 @@ def validate_preflight_scope_input_set(
         if child.scope != scope:
             raise ValueError("preflight scope-input set scope changed")
         authenticated[scope_id] = child
-    expected_files = {PREFLIGHT_SCOPE_INPUT_SET_MANIFEST}
+    expected_files = {
+        PREFLIGHT_SCOPE_INPUT_SET_MANIFEST,
+        PREFLIGHT_SHARED_CACHE_REFERENCE,
+    }
     expected_directories: set[str] = set()
     for scope_id, child in authenticated.items():
         child_files, child_directories = _closed_tree_inventory(
@@ -913,6 +1674,8 @@ def validate_preflight_scope_input_set(
         root=set_root,
         manifest=copy.deepcopy(manifest),
         scopes=authenticated,
+        shared_cache_reference_path=shared_reference_path,
+        shared_cache_reference=shared_reference,
     )
 
 
@@ -920,8 +1683,12 @@ __all__ = [
     "AuthenticatedPreflightScopeInput",
     "AuthenticatedPreflightScopeInputSet",
     "PREFLIGHT_ONE_SCOPE_AUTHORITY_SCHEMA",
+    "PREFLIGHT_SCOPED_CACHE_VIEW_SCHEMA",
+    "PREFLIGHT_SHARED_CACHE_REFERENCE",
+    "PREFLIGHT_SHARED_CACHE_REFERENCE_SCHEMA",
     "PREFLIGHT_SCOPE_INPUT_MANIFEST",
     "PREFLIGHT_SCOPE_INPUT_SET_MANIFEST",
+    "ScopedEmbeddingView",
     "publish_preflight_scope_inputs",
     "validate_preflight_scope_input",
     "validate_preflight_scope_input_set",

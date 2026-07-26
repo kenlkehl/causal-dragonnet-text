@@ -1,6 +1,7 @@
 from copy import deepcopy
 from dataclasses import asdict, replace
 import json
+import logging
 import os
 from pathlib import Path
 import socket
@@ -55,6 +56,11 @@ from tests.test_portable_workflow_contracts import (
     _post_extraction_policy,
     _scientific_spec,
 )
+from tests.stage1_test_support import (
+    PHYSICAL_FIT_IDENTITY,
+    stage1_execution_profile,
+)
+from tests.resource_safety_test_support import resource_safety_policy
 
 
 def _wire_budget() -> HierarchyWireBudgetSpec:
@@ -145,7 +151,7 @@ def _causal_review() -> PostExtractionCausalReviewSpec:
 
 
 def _resource_performance_safety() -> ResourcePerformanceSafetyPolicy:
-    return ResourcePerformanceSafetyPolicy(
+    return resource_safety_policy(
         gpu_max_allocation_fraction=0.85,
         gpu_minimum_headroom_bytes=6 * 1024**3,
         minimum_multi_device_throughput_ratio=1.5,
@@ -180,6 +186,24 @@ def _resource_performance_safety_cli_args(
         str(policy.minimum_benchmark_repetitions_per_scope),
         "--performance-read-counter-source",
         policy.read_counter_source,
+        "--hierarchical-job-cache-max-entry-bytes",
+        str(policy.hierarchical_job_cache_max_entry_bytes),
+        "--first-untouched-gate-max-initial-spent-rows",
+        str(policy.first_untouched_gate_max_initial_spent_rows),
+        "--first-untouched-gate-max-first-gate-rows",
+        str(policy.first_untouched_gate_max_first_gate_rows),
+        "--first-untouched-gate-max-total-text-utf8-bytes",
+        str(policy.first_untouched_gate_max_total_text_utf8_bytes),
+        "--first-untouched-gate-max-catalog-atoms",
+        str(policy.first_untouched_gate_max_catalog_atoms),
+        "--first-untouched-gate-max-source-manifest-bytes",
+        str(policy.first_untouched_gate_max_source_manifest_bytes),
+        "--first-untouched-gate-max-direct-numerical-signals",
+        str(policy.first_untouched_gate_max_direct_numerical_signals),
+        "--first-untouched-gate-max-single-matrix-file-bytes",
+        str(policy.first_untouched_gate_max_single_matrix_file_bytes),
+        "--first-untouched-gate-max-total-matrix-file-bytes",
+        str(policy.first_untouched_gate_max_total_matrix_file_bytes),
         occupant_flag,
     ]
 
@@ -199,7 +223,7 @@ def _options(tmp_path: Path, *, endpoint="https://different.example/v1", model="
     htr = (tmp_path / "htr").resolve()
     htr.mkdir(exist_ok=True)
     # The HTR path intentionally keeps the legacy full-byte validation path.
-    (htr / "model.safetensors").write_bytes(b"safe htr model")
+    (htr / "pytorch_model.bin").write_bytes(b"safe htr model")
     stage2_tokenizer = (tmp_path / "stage2-tokenizer").resolve()
     stage2_tokenizer.mkdir(exist_ok=True)
     (stage2_tokenizer / "tokenizer.json").write_text(
@@ -305,6 +329,115 @@ def _with_run_control(
     )
 
 
+def _accepted_fresh_terminal_report(
+    workflow: ProductionAllEvidenceWorkflow,
+) -> dict:
+    checkpoint_body = {
+        "status": "accepted",
+        "fresh_full_byte_validation": True,
+        "oracle_evaluation_after_frozen_prediction": True,
+    }
+    body = {
+        "schema_version": (
+            "production_all_evidence_fresh_terminal_validation_report_v2"
+        ),
+        "execution_completed": True,
+        "run_validation_status": "accepted",
+        "global_release_certified": False,
+        "stage1_only": workflow.options.stage1_only,
+        "validated_phase_sequence": list(workflow._phase_sequence()),
+        "stage1_handoff_validated_in_fresh_process": True,
+        "read_only_prefix_validation": {
+            "status": "accepted",
+        },
+        "portable_checkpoint_dag_validation": {
+            **checkpoint_body,
+            "content_sha256": workflow_module._sha(
+                checkpoint_body
+            ),
+        },
+        "live_runner_objects_received": False,
+        "validator_module_path": str(
+            Path(workflow_module.__file__).resolve(strict=True)
+        ),
+    }
+    return {
+        **body,
+        "content_sha256": workflow_module._sha(body),
+    }
+
+
+def _published_terminal_phase_manifest(
+    workflow: ProductionAllEvidenceWorkflow,
+    report: dict,
+) -> dict:
+    attempt = (
+        workflow.options.work_root
+        / "phases"
+        / "terminal_validation"
+        / "published_attempt"
+    )
+    attempt.mkdir(parents=True, exist_ok=True)
+    report_path = attempt / "validation.json"
+    report_path.write_text(
+        json.dumps(
+            report,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    report_sha256, report_size = (
+        workflow_module.stable_file_sha256(report_path)
+    )
+    body = {
+        "schema_version": (
+            workflow_module.WORKFLOW_PHASE_MANIFEST_SCHEMA
+        ),
+        "phase": "terminal_validation",
+        "status": "complete",
+        "request_sha256": workflow.request["request_sha256"],
+        "attempt_dir": str(attempt.resolve(strict=True)),
+        "result": {
+            **deepcopy(report),
+            "terminal_files": [
+                str(report_path.resolve(strict=True))
+            ],
+        },
+        "artifacts": [
+            {
+                "relative_path": "validation.json",
+                "path": str(report_path.resolve(strict=True)),
+                "sha256": report_sha256,
+                "size_bytes": report_size,
+            },
+        ],
+    }
+    manifest = {
+        **body,
+        "content_sha256": workflow_module._sha(body),
+    }
+    manifest_path = (
+        workflow.options.work_root
+        / "phases"
+        / "terminal_validation"
+        / "complete_manifest.json"
+    )
+    manifest_path.write_text(
+        json.dumps(
+            manifest,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
 def _portable_options(
     tmp_path: Path,
 ) -> ProductionAllEvidenceWorkflowOptions:
@@ -318,17 +451,10 @@ def _portable_options(
     return replace(
         base,
         portable_scientific_spec=specification.identity_payload(),
-        stage1_execution_profile=Stage1ExecutionProfile(
+        stage1_execution_profile=stage1_execution_profile(
             resource_kind="cpu",
             device_count=base.stage1_execution_device_count,
             scope_workers_per_device=base.stage1_scope_workers_per_gpu,
-            executor_mode="persistent_slots",
-            selection_method="operator_configured",
-            selected_candidate=None,
-            benchmark_result_sha256=None,
-            benchmark_result_locator=None,
-            benchmark_workload_deployment_sha256=None,
-            benchmark_workload_deployment_locator=None,
         ),
         forest_runtime_config=runtime,
         forest_n_estimators=None,
@@ -401,6 +527,23 @@ def _direct_deployment_args(
         "1",
         "--stage1-scope-workers-per-device",
         "1",
+        "--stage1-persistent-slot-startup-timeout-seconds",
+        "45.5",
+        "--stage1-max-parallel-owners",
+        "1",
+        "--stage1-neural-query-topology",
+        "one_context_per_selected_device",
+        "--stage1-htr-training-batch-size",
+        "4",
+        "--stage1-htr-sentence-encoder-batch-size",
+        "8",
+        "--stage1-htr-data-loader-workers",
+        "0",
+        "--no-stage1-htr-reuse-tokenizer-and-chunk-plans",
+        "--stage1-htr-chunk-plan-cache-max-entries",
+        "0",
+        "--stage1-htr-tokenized-chunk-cache-max-entries",
+        "0",
         "--cpu-budget",
         "2",
         "--forest-operational",
@@ -441,17 +584,10 @@ def _write_deployment_profile(
         ),
         resource_performance_safety=options.resource_performance_safety,
         forest_operational=_forest_operational(2),
-        stage1_execution=Stage1ExecutionProfile(
+        stage1_execution=stage1_execution_profile(
             resource_kind="cpu",
             device_count=1,
             scope_workers_per_device=1,
-            executor_mode="persistent_slots",
-            selection_method="operator_configured",
-            selected_candidate=None,
-            benchmark_result_sha256=None,
-            benchmark_result_locator=None,
-            benchmark_workload_deployment_sha256=None,
-            benchmark_workload_deployment_locator=None,
         ),
         embedding_model_name=options.embedding_model_name,
         endpoint=options.endpoint,
@@ -530,6 +666,36 @@ def test_stage2_options_propagate_complete_forest_spec_and_cpu_budget(
         stage2.post_extraction_review_config.estimator_policy
         == options.post_extraction_causal_review.scientific_policy.review_estimator
     )
+    safety = options.resource_performance_safety
+    assert stage2.hierarchical_discovery_job_cache_config.max_entry_bytes == (
+        safety.hierarchical_job_cache_max_entry_bytes
+    )
+    assert stage2.first_untouched_gate_preparation_bounds.as_dict() == {
+        "max_initial_spent_rows": (
+            safety.first_untouched_gate_max_initial_spent_rows
+        ),
+        "max_first_gate_rows": (
+            safety.first_untouched_gate_max_first_gate_rows
+        ),
+        "max_total_text_utf8_bytes": (
+            safety.first_untouched_gate_max_total_text_utf8_bytes
+        ),
+        "max_catalog_atoms": (
+            safety.first_untouched_gate_max_catalog_atoms
+        ),
+        "max_source_manifest_bytes": (
+            safety.first_untouched_gate_max_source_manifest_bytes
+        ),
+        "max_direct_numerical_signals": (
+            safety.first_untouched_gate_max_direct_numerical_signals
+        ),
+        "max_single_matrix_file_bytes": (
+            safety.first_untouched_gate_max_single_matrix_file_bytes
+        ),
+        "max_total_matrix_file_bytes": (
+            safety.first_untouched_gate_max_total_matrix_file_bytes
+        ),
+    }
 
 
 def test_endpoint_model_and_phase_resume_are_configuration_bound(tmp_path):
@@ -591,6 +757,366 @@ def test_run_control_is_excluded_from_immutable_scientific_request(
     assert observed == baseline
     assert "run_control" not in observed
     assert observed["scientific_identity"] == baseline["scientific_identity"]
+
+
+@pytest.mark.parametrize(
+    "requested",
+    ("standard", "full", "fresh_terminal_audit"),
+)
+def test_validation_depth_is_a_nonweakening_requested_minimum(
+    requested: str,
+) -> None:
+    policy = workflow_module._resolve_validation_depth_policy(
+        requested
+    )
+    assert policy["requested_minimum"] == requested
+    assert policy["production_minimum"] == "fresh_terminal_audit"
+    assert policy["effective_minimum"] == "fresh_terminal_audit"
+    assert policy["fresh_path_only_terminal_audit_required"] is True
+    assert (
+        policy["terminal_phase_override_can_satisfy_minimum"]
+        is False
+    )
+
+
+def test_run_control_selection_and_fresh_achievement_are_separate_attestations(
+    tmp_path: Path,
+) -> None:
+    options = _with_run_control(
+        _options(tmp_path),
+        validation_depth="standard",
+        log_level="ERROR",
+    )
+    options.work_root.mkdir()
+    workflow = ProductionAllEvidenceWorkflow(options)
+    workflow.request = {"request_sha256": "a" * 64}
+
+    selection = workflow._write_run_control_selection_attestation()
+    selection_path = workflow._run_control_selection_attestation_path
+    assert selection_path is not None
+    assert selection_path.name == (
+        f"selection.{selection['content_sha256']}.json"
+    )
+    assert selection["validation_policy"]["requested_minimum"] == (
+        "standard"
+    )
+    assert selection["validation_policy"]["effective_minimum"] == (
+        "fresh_terminal_audit"
+    )
+    assert selection["scientific_request_identity_affected"] is False
+    assert selection["portable_artifact_identity_affected"] is False
+    assert (
+        workflow._write_run_control_selection_attestation()
+        == selection
+    )
+
+    accepted = _accepted_fresh_terminal_report(workflow)
+    rejected = deepcopy(accepted)
+    rejected["portable_checkpoint_dag_validation"][
+        "fresh_full_byte_validation"
+    ] = False
+    rejected_body = {
+        key: value
+        for key, value in rejected.items()
+        if key != "content_sha256"
+    }
+    rejected["content_sha256"] = workflow_module._sha(
+        rejected_body
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="fresh path-only terminal report",
+    ):
+        workflow._write_validation_achievement_attestation(
+            _published_terminal_phase_manifest(
+                workflow,
+                rejected,
+            )
+        )
+
+    achievement = (
+        workflow._write_validation_achievement_attestation(
+            _published_terminal_phase_manifest(
+                workflow,
+                accepted,
+            )
+        )
+    )
+    achievement_path = (
+        workflow._validation_achievement_attestation_path
+    )
+    assert achievement_path is not None
+    assert achievement_path.name == (
+        f"achievement.{achievement['content_sha256']}.json"
+    )
+    assert achievement["run_control_selection_content_sha256"] == (
+        selection["content_sha256"]
+    )
+    assert achievement["requested_minimum"] == "standard"
+    assert achievement["effective_minimum"] == (
+        "fresh_terminal_audit"
+    )
+    assert achievement["achieved_minimum"] == (
+        "fresh_terminal_audit"
+    )
+    assert achievement["fresh_path_only_terminal_audit_achieved"] is True
+    assert achievement["execution_completed"] is True
+    assert achievement["run_validation_status"] == "accepted"
+    assert achievement["global_release_certified"] is False
+    complete_manifest = (
+        options.work_root
+        / "phases"
+        / "terminal_validation"
+        / "complete_manifest.json"
+    )
+    manifest_sha256, manifest_size = (
+        workflow_module.stable_file_sha256(complete_manifest)
+    )
+    assert achievement[
+        "published_terminal_complete_manifest_sha256"
+    ] == manifest_sha256
+    assert achievement[
+        "published_terminal_complete_manifest_size_bytes"
+    ] == manifest_size
+    assert achievement[
+        "published_checkpoint_dag_validation_content_sha256"
+    ] == accepted["portable_checkpoint_dag_validation"][
+        "content_sha256"
+    ]
+    assert achievement[
+        "terminal_phase_portable_checkpoint_published"
+    ] is False
+    assert achievement[
+        "terminal_phase_portable_checkpoint_artifact_id"
+    ] is None
+    assert (
+        workflow._write_validation_achievement_attestation(
+            _published_terminal_phase_manifest(
+                workflow,
+                accepted,
+            )
+        )
+        == achievement
+    )
+
+    changed = ProductionAllEvidenceWorkflow(
+        _with_run_control(options, validation_depth="full")
+    )
+    changed.request = {"request_sha256": "a" * 64}
+    changed_selection = (
+        changed._write_run_control_selection_attestation()
+    )
+    assert changed_selection["content_sha256"] != selection[
+        "content_sha256"
+    ]
+    assert changed_selection["validation_policy"][
+        "effective_minimum"
+    ] == "fresh_terminal_audit"
+
+
+def test_terminal_override_cannot_claim_fresh_validation_achievement(
+    tmp_path: Path,
+) -> None:
+    options = _with_run_control(
+        _options(tmp_path),
+        validation_depth="fresh_terminal_audit",
+    )
+    options.work_root.mkdir()
+    workflow = ProductionAllEvidenceWorkflow(
+        options,
+        phase_overrides={
+            "terminal_validation": (
+                lambda _attempt: {"terminal_files": []}
+            ),
+        },
+    )
+    workflow.request = {"request_sha256": "b" * 64}
+    selection = workflow._write_run_control_selection_attestation()
+    assert selection["terminal_phase_override_present"] is True
+    with pytest.raises(
+        RuntimeError,
+        match="override cannot satisfy",
+    ):
+        workflow._write_validation_achievement_attestation(
+            _published_terminal_phase_manifest(
+                workflow,
+                _accepted_fresh_terminal_report(workflow),
+            )
+        )
+    assert not list(
+        (
+            options.work_root
+            / "execution_attestations"
+            / "run_control"
+        ).glob("achievement.*.json")
+    )
+
+
+def test_paused_run_publishes_selection_without_validation_achievement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _with_run_control(
+        _options(tmp_path),
+        stop_after="handoff_validation",
+        validation_depth="fresh_terminal_audit",
+    )
+    workflow = ProductionAllEvidenceWorkflow(options)
+
+    def initialize() -> None:
+        options.work_root.mkdir(parents=True, exist_ok=True)
+        workflow.request = {
+            "request_sha256": "c" * 64,
+            "scientific_identity": {
+                "scientific_sha256": "d" * 64,
+            },
+        }
+        workflow._write_run_control_selection_attestation()
+
+    monkeypatch.setattr(workflow, "_initialize", initialize)
+    monkeypatch.setattr(
+        workflow_module,
+        "_revalidate_request_bound_external_inputs",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_execute_phase_sequence",
+        lambda sequence: {
+            phase: {"result": {}}
+            for phase in sequence
+        },
+    )
+    result = workflow.run()
+    assert result["status"] == "paused"
+    attestation_root = (
+        options.work_root
+        / "execution_attestations"
+        / "run_control"
+    )
+    assert len(list(attestation_root.glob("selection.*.json"))) == 1
+    assert not list(attestation_root.glob("achievement.*.json"))
+
+
+@pytest.mark.parametrize(
+    "failure_boundary",
+    ("complete", "publication"),
+)
+def test_terminal_publication_failure_cannot_create_validation_achievement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_boundary: str,
+) -> None:
+    options = _with_run_control(
+        _options(tmp_path),
+        validation_depth="fresh_terminal_audit",
+    )
+    workflow = ProductionAllEvidenceWorkflow(options)
+
+    def initialize() -> None:
+        options.work_root.mkdir(parents=True, exist_ok=True)
+        workflow.request = {
+            "request_sha256": "e" * 64,
+            "scientific_identity": {
+                "scientific_sha256": "f" * 64,
+            },
+        }
+        workflow._write_run_control_selection_attestation()
+
+    monkeypatch.setattr(workflow, "_initialize", initialize)
+    monkeypatch.setattr(
+        workflow_module,
+        "_revalidate_request_bound_external_inputs",
+        lambda *_args, **_kwargs: None,
+    )
+    attempt = tmp_path / "terminal-attempt"
+    attempt.mkdir()
+
+    def fail_complete(*_args, **_kwargs):
+        raise RuntimeError("terminal complete failed")
+
+    def fail_publication(*_args, **_kwargs):
+        raise RuntimeError("terminal publication failed")
+
+    monkeypatch.setattr(workflow, "_complete", fail_complete)
+    monkeypatch.setattr(
+        workflow,
+        "_publish_completed_phase_checkpoint",
+        fail_publication,
+    )
+
+    def execute(_sequence):
+        if failure_boundary == "complete":
+            workflow._complete(
+                "terminal_validation",
+                {"terminal_files": []},
+                attempt_dir=attempt,
+            )
+        workflow._publish_completed_phase_checkpoint(
+            "terminal_validation",
+            {"status": "complete"},
+        )
+        raise AssertionError("configured terminal failure did not occur")
+
+    monkeypatch.setattr(
+        workflow,
+        "_execute_phase_sequence",
+        execute,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=f"terminal {failure_boundary} failed",
+    ):
+        workflow.run()
+    attestation_root = (
+        options.work_root
+        / "execution_attestations"
+        / "run_control"
+    )
+    assert len(list(attestation_root.glob("selection.*.json"))) == 1
+    assert not list(attestation_root.glob("achievement.*.json"))
+
+
+def test_structured_workflow_logging_honors_run_control_threshold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = {
+        "schema_version": (
+            workflow_module.WORKFLOW_STRUCTURED_LOG_EVENT_SCHEMA
+        ),
+        "event": "test",
+        "status": "running",
+    }
+    with caplog.at_level(
+        logging.DEBUG,
+        logger=workflow_module.__name__,
+    ):
+        assert (
+            workflow_module._emit_structured_workflow_log(
+                configured_threshold="WARNING",
+                event_level=logging.INFO,
+                payload=payload,
+            )
+            is False
+        )
+        assert (
+            workflow_module._emit_structured_workflow_log(
+                configured_threshold="WARNING",
+                event_level=logging.ERROR,
+                payload=payload,
+            )
+            is True
+        )
+    matching = [
+        record
+        for record in caplog.records
+        if record.name == workflow_module.__name__
+        and record.getMessage() == workflow_module._canonical(
+            payload
+        )
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.ERROR
 
 
 def test_outer_folds_do_not_constrain_configured_inner_review_partitions(
@@ -948,8 +1474,22 @@ def test_adopted_checkpoint_substitutes_phase_and_fresh_reader_reopens_bytes(
         _options(tmp_path),
         stop_after="input_preparation",
     )
-    baseline = ProductionAllEvidenceWorkflow(options)._request_body()
-    compatibility = ArtifactCompatibility(**baseline["expected_checkpoint_compatibility"])
+    calls: list[str] = []
+
+    def forbidden_preparation(_attempt: Path) -> dict:
+        calls.append("computed")
+        return {"terminal_files": []}
+
+    overrides = {"input_preparation": forbidden_preparation}
+    baseline = ProductionAllEvidenceWorkflow(
+        options,
+        phase_overrides=overrides,
+    )._request_body()
+    compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "input_preparation"
+        ]
+    )
     checkpoint = tmp_path / "prepared_checkpoint"
     cohort = checkpoint / "prepared" / "modeling_cohort.parquet"
     cohort.parent.mkdir(parents=True)
@@ -978,16 +1518,13 @@ def test_adopted_checkpoint_substitutes_phase_and_fresh_reader_reopens_bytes(
             ],
         },
     )
-    calls: list[str] = []
     adopted_options = _with_run_control(
         options,
         adopt_checkpoints=(artifact.root,),
     )
     runner = ProductionAllEvidenceWorkflow(
         adopted_options,
-        phase_overrides={
-            "input_preparation": lambda _attempt: calls.append("computed") or {"terminal_files": []}
-        },
+        phase_overrides=overrides,
     )
     result = runner.run()
     assert calls == []
@@ -1041,7 +1578,277 @@ def test_adopted_checkpoint_substitutes_phase_and_fresh_reader_reopens_bytes(
     with pytest.raises(ValueError, match="changed"):
         ProductionAllEvidenceWorkflow(
             _with_run_control(adopted_options, resume=True),
+            phase_overrides=overrides,
         ).run()
+
+
+def test_operator_trusted_legacy_prefix_allows_only_downstream_configuration_drift(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "configured-cohort.parquet"
+    dataset.write_bytes(b"current configured dataset bytes")
+    digest = lambda label: workflow_module._sha({"identity": label})
+    old_configuration = digest("legacy whole-workflow configuration")
+    new_configuration = digest("TF-IDF policy corrected downstream")
+    dataset_identity = digest("dataset")
+    row_identity = digest("rows")
+    split_identity = digest("splits")
+    seed_identity = digest("seed")
+    runtime = "portable-python-posix-test-v1"
+    models = {
+        "embedding_model_tree": digest("embedding logical tree"),
+        "embedding_model_builder_tree": digest("embedding builder tree"),
+        "htr_model_tree": digest("htr tree"),
+        "stage2_model_name": digest("stage2 model"),
+    }
+
+    def compatibility(configuration: str, producer: str) -> dict:
+        return ArtifactCompatibility(
+            dataset_identity=dataset_identity,
+            split_identity=split_identity,
+            row_order_identity=row_identity,
+            model_identities=models,
+            prompt_identities={},
+            configuration_identity=configuration,
+            seed_identity=seed_identity,
+            producer_code_identity=digest(producer),
+            runtime_compatibility_class=runtime,
+        ).as_dict()
+
+    prepared_expected = compatibility(
+        new_configuration,
+        "current preparation producer",
+    )
+    cache_expected = compatibility(
+        new_configuration,
+        "current cache producer",
+    )
+    prepared_compatibility = compatibility(
+        old_configuration,
+        "legacy preparation producer",
+    )
+    cache_compatibility = compatibility(
+        old_configuration,
+        "legacy cache producer",
+    )
+    columns = {
+        "unit_id": "arbitrary_patient_key",
+        "text": "complete_note",
+        "treatment": "received_treatment",
+        "outcome": "binary_outcome",
+    }
+    preprocessing = {
+        "empty_text_policy": "marker",
+        "repeated_character_policy": "marker",
+        "repeated_character_threshold": 731,
+        "source_text_temporally_valid_by_design": True,
+    }
+    prepared_typed = {
+        "schema_version": "legacy_prepared_migration_expectation_v1",
+        "columns": columns,
+        "preprocessing": preprocessing,
+        "dataset_sha256": dataset_identity,
+        "dataset_size_bytes": dataset.stat().st_size,
+        "prepared_cohort_sha256": digest("prepared bytes"),
+        "prepared_projection_sha256": digest("prepared projection"),
+        "unit_id_order_sha256": digest("unit order"),
+        "row_order_identity": row_identity,
+        "expected_row_count": 17,
+    }
+
+    def migration(
+        phase: str,
+        typed: dict,
+        **extra: object,
+    ) -> dict:
+        common = {
+            "schema_version": (
+                "legacy_terminal_typed_request_migration_identity_v1"
+            ),
+            "phase": phase,
+            "typed_expectation": typed,
+            "typed_expectation_identity": workflow_module.identity_sha256(
+                typed
+            ),
+            "source_tree_mutated": False,
+            "legacy_payload_copies_materialized": False,
+            **extra,
+        }
+        return {
+            **common,
+            "content_sha256": workflow_module._sha(common),
+        }
+
+    prepared_migration = migration(
+        "input_preparation",
+        prepared_typed,
+        byte_affecting_preprocessing_policy_matched=True,
+        configured_columns_reopened_exactly=True,
+        current_preparation_transform_replayed=True,
+        prepared_projection_recomputed=True,
+        unit_id_order_recomputed=True,
+    )
+    prepared_id = digest("prepared artifact")
+    prepared = SimpleNamespace(
+        artifact_id=prepared_id,
+        manifest={
+            "artifact_kind": "prepared_cohort",
+            "compatibility": prepared_compatibility,
+            "upstream_artifact_ids": [],
+        },
+        phase_binding={
+            "result_template": {
+                "legacy_terminal_migration_identity": prepared_migration,
+            }
+        },
+    )
+    encoder = {
+        "prompt_policy": "disabled",
+        "prompt_name": None,
+        "output_value": "sentence_embedding",
+        "precision": "float32",
+        "convert_to_numpy": True,
+        "convert_to_tensor": False,
+        "truncate_dim": None,
+        "pooling_output_policy": "single_process_sentence_embedding_v1",
+        "model_dtype": "float32",
+        "stored_array_dtype": "float32",
+        "zero_vector_policy": "reject",
+    }
+    chunk_configuration = {
+        "chunk_size_words": 311,
+        "chunk_overlap_words": 47,
+        "max_chunks": 173,
+        "chunk_selection": "last",
+        "normalize_embeddings": True,
+        "max_seq_length": 1536,
+        **encoder,
+    }
+    cache_typed = {
+        "schema_version": (
+            "legacy_embedding_cache_migration_expectation_v2"
+        ),
+        "prepared_expectation_identity": workflow_module.identity_sha256(
+            prepared_typed
+        ),
+        "embedding_model_name": "configured/example-embedder",
+        "embedding_model_tree_sha256": models[
+            "embedding_model_builder_tree"
+        ],
+        "chunk_configuration": chunk_configuration,
+        "ordered_text_sha256": digest("ordered prepared text"),
+        "expected_chunk_count": 91,
+        "expected_hidden_size": 13,
+        "legacy_builder_code_sha256": digest("legacy cache builder"),
+        "legacy_encoder_semantics_derivation": {
+            "status": "accepted frozen producer",
+        },
+    }
+    cache_id = digest("cache artifact")
+    cache_migration = migration(
+        "embedding_cache",
+        cache_typed,
+        chunk_and_tokenization_capacity_nonbinding=True,
+        dense_array_shape_dtype_and_finiteness_reopened=True,
+        ordered_text_identity_recomputed=True,
+        prepared_projection_recomputed=True,
+        upstream_prepared_identity_reauthenticated=True,
+        word_chunk_registry_recomputed_exactly=True,
+        upstream_prepared_artifact_id=prepared_id,
+    )
+    cache = SimpleNamespace(
+        artifact_id=cache_id,
+        manifest={
+            "artifact_kind": "embedding_cache",
+            "compatibility": cache_compatibility,
+            "upstream_artifact_ids": [prepared_id],
+        },
+        phase_binding={
+            "result_template": {
+                "legacy_terminal_migration_identity": cache_migration,
+            }
+        },
+    )
+    request = {
+        "dataset_path": str(dataset.resolve()),
+        "source_sha256": dataset_identity,
+        "unit_id_column": columns["unit_id"],
+        "text_column": columns["text"],
+        "treatment_column": columns["treatment"],
+        "outcome_column": columns["outcome"],
+        "outcome_type": "binary",
+        **preprocessing,
+        "embedding_chunk_size_words": 311,
+        "embedding_chunk_overlap_words": 47,
+        "embedding_max_chunks": 173,
+        "embedding_chunk_selection": "last",
+        "embedding_normalize": True,
+        "embedding_max_seq_length": 1536,
+        "embedding_encoder": encoder,
+        "embedding_model_name": "configured/example-embedder",
+        "embedding_model_builder_tree_sha256": models[
+            "embedding_model_builder_tree"
+        ],
+        "expected_checkpoint_compatibilities_by_phase": {
+            "input_preparation": prepared_expected,
+            "embedding_cache": cache_expected,
+        },
+    }
+    adopted = {prepared_id: prepared, cache_id: cache}
+    prepared_proof = (
+        workflow_module._operator_trusted_legacy_phase_projection_proof(
+            artifact=prepared,
+            request=request,
+            adopted_artifacts=adopted,
+        )
+    )
+    cache_proof = (
+        workflow_module._operator_trusted_legacy_phase_projection_proof(
+            artifact=cache,
+            request=request,
+            adopted_artifacts=adopted,
+        )
+    )
+
+    def record(proof: dict) -> dict:
+        return {
+            "adoption_validation_policy": (
+                workflow_module.OPERATOR_TRUSTED_VALIDATION_POLICY
+            ),
+            "prior_adoption_attestation_path": str(
+                tmp_path / "sealed-prior-attestation.json"
+            ),
+            "payload_bytes_reauthenticated": False,
+            "legacy_phase_compatibility_projection_proof": proof,
+        }
+
+    assert workflow_module._adopted_compatibility_matches_request(
+        artifact=prepared,
+        expected=prepared_expected,
+        record=record(prepared_proof),
+    )
+    assert workflow_module._adopted_compatibility_matches_request(
+        artifact=cache,
+        expected=cache_expected,
+        record=record(cache_proof),
+    )
+
+    changed_preparation = deepcopy(request)
+    changed_preparation["repeated_character_threshold"] += 1
+    with pytest.raises(ValueError, match="current phase-specific"):
+        workflow_module._operator_trusted_legacy_phase_projection_proof(
+            artifact=prepared,
+            request=changed_preparation,
+            adopted_artifacts=adopted,
+        )
+    changed_cache = deepcopy(request)
+    changed_cache["embedding_chunk_size_words"] += 1
+    with pytest.raises(ValueError, match="current phase-specific"):
+        workflow_module._operator_trusted_legacy_phase_projection_proof(
+            artifact=cache,
+            request=changed_cache,
+            adopted_artifacts=adopted,
+        )
 
 
 def test_phase_adoption_rejects_unbound_and_orphaned_checkpoints(
@@ -1052,7 +1859,16 @@ def test_phase_adoption_rejects_unbound_and_orphaned_checkpoints(
         stop_after="input_preparation",
     )
     baseline = ProductionAllEvidenceWorkflow(options)._request_body()
-    compatibility = ArtifactCompatibility(**baseline["expected_checkpoint_compatibility"])
+    prepared_compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "input_preparation"
+        ]
+    )
+    cache_compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "embedding_cache"
+        ]
+    )
 
     unbound_root = tmp_path / "unbound_prepared"
     unbound_root.mkdir()
@@ -1061,7 +1877,7 @@ def test_phase_adoption_rejects_unbound_and_orphaned_checkpoints(
         root=unbound_root,
         artifact_kind="prepared_cohort",
         artifact_schema="unbound_prepared_test_v1",
-        compatibility=compatibility,
+        compatibility=prepared_compatibility,
         upstream_artifact_ids=(),
         payload_paths=("cohort.parquet",),
     )
@@ -1082,7 +1898,7 @@ def test_phase_adoption_rejects_unbound_and_orphaned_checkpoints(
         root=orphan_root,
         artifact_kind="embedding_cache",
         artifact_schema="orphan_cache_test_v1",
-        compatibility=compatibility,
+        compatibility=cache_compatibility,
         upstream_artifact_ids=("a" * 64,),
         payload_paths=("cache.bin",),
         workflow_phase="embedding_cache",
@@ -1107,8 +1923,28 @@ def test_adopted_phase_dag_substitutes_dependency_prefix_once(
         _options(tmp_path),
         stop_after="embedding_cache",
     )
-    baseline = ProductionAllEvidenceWorkflow(options)._request_body()
-    compatibility = ArtifactCompatibility(**baseline["expected_checkpoint_compatibility"])
+    calls: list[str] = []
+    overrides = {
+        phase: (
+            lambda _attempt, value=phase: calls.append(value)
+            or {"terminal_files": []}
+        )
+        for phase in ("input_preparation", "embedding_cache")
+    }
+    baseline = ProductionAllEvidenceWorkflow(
+        options,
+        phase_overrides=overrides,
+    )._request_body()
+    prepared_compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "input_preparation"
+        ]
+    )
+    cache_compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "embedding_cache"
+        ]
+    )
 
     prepared_root = tmp_path / "dag_prepared"
     cohort = prepared_root / "prepared" / "modeling_cohort.parquet"
@@ -1120,7 +1956,7 @@ def test_adopted_phase_dag_substitutes_dependency_prefix_once(
         root=prepared_root,
         artifact_kind="prepared_cohort",
         artifact_schema="dag_prepared_test_v1",
-        compatibility=compatibility,
+        compatibility=prepared_compatibility,
         upstream_artifact_ids=(),
         payload_paths=(
             "prepared/modeling_cohort.parquet",
@@ -1148,7 +1984,7 @@ def test_adopted_phase_dag_substitutes_dependency_prefix_once(
         root=cache_root,
         artifact_kind="embedding_cache",
         artifact_schema="dag_cache_test_v1",
-        compatibility=compatibility,
+        compatibility=cache_compatibility,
         upstream_artifact_ids=(prepared.artifact_id,),
         payload_paths=(
             "embedding_cache/metadata.json",
@@ -1167,17 +2003,13 @@ def test_adopted_phase_dag_substitutes_dependency_prefix_once(
             ],
         },
     )
-    calls: list[str] = []
     runner = ProductionAllEvidenceWorkflow(
         _with_run_control(
             options,
             # CLI ordering is operational; the authenticated DAG supplies order.
             adopt_checkpoints=(cache.root, prepared.root),
         ),
-        phase_overrides={
-            phase: (lambda _attempt, value=phase: calls.append(value) or {"terminal_files": []})
-            for phase in ("input_preparation", "embedding_cache")
-        },
+        phase_overrides=overrides,
     )
     result = runner.run()
     assert result["completed_phases"] == [
@@ -1197,8 +2029,20 @@ def _compact_preflight_adoption_prefix(
     parquet_compression: str,
 ):
     baseline = ProductionAllEvidenceWorkflow(options)._request_body()
-    compatibility = ArtifactCompatibility(
-        **baseline["expected_checkpoint_compatibility"]
+    prepared_compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "input_preparation"
+        ]
+    )
+    cache_compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "embedding_cache"
+        ]
+    )
+    preflight_compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "stage1_preflight"
+        ]
     )
 
     prepared_root = tmp_path / f"codec-{parquet_compression}-prepared"
@@ -1209,7 +2053,7 @@ def _compact_preflight_adoption_prefix(
         root=prepared_root,
         artifact_kind="prepared_cohort",
         artifact_schema="production_prepared_cohort_checkpoint_v1",
-        compatibility=compatibility,
+        compatibility=prepared_compatibility,
         upstream_artifact_ids=(),
         payload_paths=("prepared.parquet",),
         workflow_phase="input_preparation",
@@ -1226,7 +2070,7 @@ def _compact_preflight_adoption_prefix(
         root=cache_root,
         artifact_kind="embedding_cache",
         artifact_schema="production_embedding_cache_checkpoint_v1",
-        compatibility=compatibility,
+        compatibility=cache_compatibility,
         upstream_artifact_ids=(prepared.artifact_id,),
         payload_paths=("cache.bin",),
         workflow_phase="embedding_cache",
@@ -1279,7 +2123,7 @@ def _compact_preflight_adoption_prefix(
         root=preflight_root,
         artifact_kind="clustered_preflight",
         artifact_schema="production_clustered_preflight_checkpoint_v1",
-        compatibility=compatibility,
+        compatibility=preflight_compatibility,
         upstream_artifact_ids=(cache.artifact_id,),
         payload_paths=(
             "cluster_preflight/cluster_preflight_manifest.json",
@@ -1308,6 +2152,186 @@ def _compact_preflight_adoption_prefix(
         },
     )
     return prepared, cache, preflight
+
+
+def test_portable_preflight_adoption_accepts_only_its_exact_prepared_context(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    options = _options(tmp_path)
+    request = ProductionAllEvidenceWorkflow(options)._request_body()
+    prepared, cache, preflight = _compact_preflight_adoption_prefix(
+        tmp_path=tmp_path,
+        options=options,
+        parquet_compression="zstd",
+    )
+    compatibility = ArtifactCompatibility(
+        **request["expected_checkpoint_compatibilities_by_phase"][
+            "stage1_preflight"
+        ]
+    )
+    def publish_context(
+        name: str,
+        *,
+        upstream_artifact_id: str,
+    ):
+        context_root = tmp_path / name
+        context_root.mkdir()
+        context_payload = (
+            context_root / "prepared_stage1_context_manifest.json"
+        )
+        context_payload.write_text(
+            json.dumps({"context": name}) + "\n",
+            encoding="utf-8",
+        )
+        return publish_portable_artifact(
+            root=context_root,
+            artifact_kind="prepared_stage1_context",
+            artifact_schema=(
+                workflow_module.GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS[
+                    "prepared_stage1_context"
+                ]
+            ),
+            compatibility=compatibility,
+            upstream_artifact_ids=(upstream_artifact_id,),
+            payload_paths=(context_payload.name,),
+            artifact_metadata={
+                "schema_version": (
+                    workflow_module.WORKFLOW_GRANULAR_CHECKPOINT_NODE_SCHEMA
+                ),
+                "producer_phase": "stage1_preflight",
+                "node_ordinal": 0,
+                "node_key": "prepared_stage1_context",
+                "coverage_role": "prepared_stage1_context",
+                "scientific_content_root_sha256": workflow_module._sha(
+                    {"prepared_context": name}
+                ),
+            },
+        )
+
+    context = publish_context(
+        "portable-prepared-context",
+        upstream_artifact_id=preflight.artifact_id,
+    )
+    artifacts = (prepared, cache, preflight, context)
+    reopened_contexts = []
+
+    def reopen_scope_plan(**kwargs):
+        reopened_contexts.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        workflow_module,
+        "_load_authenticated_current_stage1_scope_plan",
+        reopen_scope_plan,
+    )
+
+    def validate(*nodes):
+        return workflow_module._validate_adopted_checkpoint_graph(
+            nodes,
+            allowed_phases=PHASES,
+            expected_granular_checkpoint_plan=request[
+                "expected_granular_checkpoint_plan"
+            ],
+            expected_stage1_physical_fit_identity=request[
+                "stage1_physical_fit_identity"
+            ],
+            expected_global_seed=int(request["seed"]),
+            require_prepared_stage1_context=True,
+        )
+
+    observed = validate(*artifacts)
+    assert observed["stage1_preflight"] == preflight.artifact_id
+    assert len(reopened_contexts) == 1
+    assert (
+        reopened_contexts[0]["prepared_context_artifact"].artifact_id
+        == context.artifact_id
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="prepared Stage 1 context binding is invalid",
+    ):
+        validate(prepared, cache, preflight)
+
+    wrong_parent = publish_context(
+        "wrong-parent-prepared-context",
+        upstream_artifact_id=cache.artifact_id,
+    )
+    with pytest.raises(
+        ValueError,
+        match="prepared Stage 1 context binding is invalid",
+    ):
+        validate(prepared, cache, preflight, wrong_parent)
+
+    duplicate = publish_context(
+        "duplicate-prepared-context",
+        upstream_artifact_id=preflight.artifact_id,
+    )
+    with pytest.raises(
+        ValueError,
+        match="prepared Stage 1 context binding is invalid",
+    ):
+        validate(*artifacts, duplicate)
+
+    with pytest.raises(
+        ValueError,
+        match="upstream dependencies are absent",
+    ):
+        validate(prepared, cache, context)
+
+    def reject_tampered_scope_plan(**_kwargs):
+        raise ValueError("prepared context scope plan was tampered")
+
+    monkeypatch.setattr(
+        workflow_module,
+        "_load_authenticated_current_stage1_scope_plan",
+        reject_tampered_scope_plan,
+    )
+    with pytest.raises(
+        ValueError,
+        match="prepared context scope plan was tampered",
+    ):
+        validate(*artifacts)
+    monkeypatch.setattr(
+        workflow_module,
+        "_load_authenticated_current_stage1_scope_plan",
+        reopen_scope_plan,
+    )
+
+    unrelated_root = tmp_path / "unrelated-preflight-descendant"
+    unrelated_root.mkdir()
+    unrelated_payload = unrelated_root / "payload.bin"
+    unrelated_payload.write_bytes(b"unrelated")
+    unrelated = publish_portable_artifact(
+        root=unrelated_root,
+        artifact_kind="tfidf_component",
+        artifact_schema=(
+            workflow_module.GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS[
+                "tfidf_component"
+            ]
+        ),
+        compatibility=ArtifactCompatibility(
+            **request[
+                "expected_checkpoint_compatibilities_by_phase"
+            ]["stage1_modeling"]
+        ),
+        upstream_artifact_ids=(context.artifact_id,),
+        payload_paths=(unrelated_payload.name,),
+        artifact_metadata={
+            "schema_version": (
+                workflow_module.WORKFLOW_GRANULAR_CHECKPOINT_NODE_SCHEMA
+            ),
+            "producer_phase": "stage1_modeling",
+            "node_ordinal": 0,
+            "node_key": "unrelated",
+        },
+    )
+    with pytest.raises(
+        ValueError,
+        match="component checkpoints must be authenticated ancestors",
+    ):
+        validate(*artifacts, unrelated)
 
 
 @pytest.mark.parametrize(
@@ -1411,8 +2435,23 @@ def test_terminal_validator_accepts_only_freshly_reopened_adopted_phase(
         model_name=None,
         stage1_only=True,
     )
-    baseline = ProductionAllEvidenceWorkflow(options)._request_body()
-    compatibility = ArtifactCompatibility(**baseline["expected_checkpoint_compatibility"])
+    calls: list[str] = []
+    overrides = {
+        phase: (
+            lambda _attempt, value=phase: calls.append(value)
+            or {"terminal_files": []}
+        )
+        for phase in STAGE1_ONLY_PHASES[:-1]
+    }
+    baseline = ProductionAllEvidenceWorkflow(
+        options,
+        phase_overrides=overrides,
+    )._request_body()
+    compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "input_preparation"
+        ]
+    )
     checkpoint = tmp_path / "terminal_adopted_prepared"
     cohort = checkpoint / "prepared" / "modeling_cohort.parquet"
     cohort.parent.mkdir(parents=True)
@@ -1438,11 +2477,6 @@ def test_terminal_validator_accepts_only_freshly_reopened_adopted_phase(
             ],
         },
     )
-    calls: list[str] = []
-    overrides = {
-        phase: (lambda _attempt, value=phase: calls.append(value) or {"terminal_files": []})
-        for phase in STAGE1_ONLY_PHASES[:-1]
-    }
     result = ProductionAllEvidenceWorkflow(
         _with_run_control(
             options,
@@ -1642,6 +2676,31 @@ def test_scientific_spec_and_complete_direct_deployment_compile_typed_options(
     assert parsed.scientific_spec_path == scientific_path.resolve()
     assert parsed.embedding_model_name == configured.embedding_model_name
     assert parsed.device_policy == ("cpu",)
+    assert parsed.stage1_execution_profile is not None
+    assert parsed.stage1_execution_profile.max_parallel_owners == 1
+    assert (
+        parsed.stage1_execution_profile
+        .persistent_slot_startup_timeout_seconds
+        == 45.5
+    )
+    assert (
+        parsed.stage1_execution_profile.neural_query_topology.mode
+        == "one_context_per_selected_device"
+    )
+    assert (
+        parsed.stage1_execution_profile.htr_operational_controls.as_dict()
+        == {
+            "schema_version": (
+                "production_role_neutral_htr_operational_controls_v1"
+            ),
+            "training_batch_size": 4,
+            "sentence_encoder_batch_size": 8,
+            "data_loader_workers": 0,
+            "reuse_tokenizer_and_chunk_plans": False,
+            "chunk_plan_cache_max_entries": 0,
+            "tokenized_chunk_cache_max_entries": 0,
+        }
+    )
     assert parsed.cpu_budget == 2
     assert parsed.response_concurrency == 3
     assert parsed.forest_runtime_config is not None
@@ -1687,6 +2746,36 @@ def test_scientific_spec_and_complete_direct_deployment_compile_typed_options(
         ("--cpu-budget", "positive"),
         ("--response-concurrency", "positive"),
         ("--embedding-batch-size", "positive"),
+        ("--stage1-max-parallel-owners", "positive"),
+        ("--stage1-htr-training-batch-size", "positive"),
+        ("--stage1-htr-sentence-encoder-batch-size", "positive"),
+        ("--hierarchical-job-cache-max-entry-bytes", "positive"),
+        (
+            "--first-untouched-gate-max-initial-spent-rows",
+            "positive",
+        ),
+        ("--first-untouched-gate-max-first-gate-rows", "positive"),
+        (
+            "--first-untouched-gate-max-total-text-utf8-bytes",
+            "positive",
+        ),
+        ("--first-untouched-gate-max-catalog-atoms", "positive"),
+        (
+            "--first-untouched-gate-max-source-manifest-bytes",
+            "positive",
+        ),
+        (
+            "--first-untouched-gate-max-direct-numerical-signals",
+            "positive",
+        ),
+        (
+            "--first-untouched-gate-max-single-matrix-file-bytes",
+            "positive",
+        ),
+        (
+            "--first-untouched-gate-max-total-matrix-file-bytes",
+            "positive",
+        ),
     ),
 )
 def test_direct_deployment_zero_does_not_fall_back(
@@ -1710,6 +2799,9 @@ def test_direct_deployment_zero_does_not_fall_back(
 @pytest.mark.parametrize(
     ("extra", "field"),
     (
+        (["--dataset", "other-cohort.parquet"], "dataset"),
+        (["--stage1-profile", "other-stage1.json"], "stage1_profile"),
+        (["--cpu-budget", "7"], "cpu_budget"),
         (["--endpoint", "https://other.invalid/v1"], "endpoint"),
         (["--model", "other/model"], "model"),
         (["--stage2-tokenizer-locator", "other-tokenizer"], "stage2_tokenizer"),
@@ -1741,7 +2833,7 @@ def test_typed_deployment_rejects_direct_aliases(
     assert not configured.work_root.exists()
 
 
-def test_typed_pair_accepts_only_run_control_overrides(
+def test_typed_pair_accepts_run_control_and_operational_root_overrides(
     tmp_path: Path,
 ) -> None:
     configured = _options(tmp_path)
@@ -1750,7 +2842,11 @@ def test_typed_pair_accepts_only_run_control_overrides(
         tmp_path / "deployment.json",
         configured,
     )
+    profile_bytes = deployment_path.read_bytes()
+    loaded_profile = DeploymentProfile.from_json(deployment_path)
     checkpoint = tmp_path / "future-checkpoint"
+    work_root = tmp_path / "arbitrary durable root" / "run"
+    scratch_root = tmp_path / "unrelated local scratch" / "run"
     parsed = options_from_args(
         build_parser().parse_args(
             [
@@ -1758,6 +2854,10 @@ def test_typed_pair_accepts_only_run_control_overrides(
                 str(scientific_path),
                 "--deployment-profile",
                 str(deployment_path),
+                "--work-root",
+                str(work_root),
+                "--scratch-root",
+                str(scratch_root),
                 "--resume",
                 "--stop-after",
                 "handoff_validation",
@@ -1778,7 +2878,71 @@ def test_typed_pair_accepts_only_run_control_overrides(
         validation_depth="fresh_terminal_audit",
     )
     assert parsed.portable_scientific_spec is not None
+    assert parsed.work_root == work_root.resolve()
+    assert parsed.scratch_root == scratch_root.resolve()
+    assert parsed.work_root != loaded_profile.durable_artifact_root
+    assert parsed.scratch_root != loaded_profile.scratch_root
+    assert deployment_path.read_bytes() == profile_bytes
+    assert DeploymentProfile.from_json(deployment_path) == loaded_profile
+    assert not work_root.exists()
+    assert not scratch_root.exists()
     assert not configured.work_root.exists()
+
+
+def test_typed_operational_root_overrides_do_not_change_scientific_identity(
+    tmp_path: Path,
+) -> None:
+    configured = _options(tmp_path)
+    scientific_path = _write_scientific_spec(tmp_path / "scientific.json")
+    deployment_path = _write_deployment_profile(
+        tmp_path / "deployment.json",
+        configured,
+    )
+    profile_bytes = deployment_path.read_bytes()
+
+    def compile_with_roots(label: str) -> ProductionAllEvidenceWorkflowOptions:
+        return options_from_args(
+            build_parser().parse_args(
+                [
+                    "--scientific-spec",
+                    str(scientific_path),
+                    "--deployment-profile",
+                    str(deployment_path),
+                    "--work-root",
+                    str(tmp_path / f"{label} durable" / "run"),
+                    "--scratch-root",
+                    str(tmp_path / f"{label} scratch" / "run"),
+                ]
+            )
+        )
+
+    first = compile_with_roots("first")
+    second = compile_with_roots("second")
+    first_request = ProductionAllEvidenceWorkflow(first)._request_body()
+    second_request = ProductionAllEvidenceWorkflow(second)._request_body()
+
+    assert first.work_root != second.work_root
+    assert first.scratch_root != second.scratch_root
+    assert first_request["work_root"] != second_request["work_root"]
+    assert first_request["scratch_root"] != second_request["scratch_root"]
+    assert workflow_module._sha(first_request) != workflow_module._sha(
+        second_request
+    )
+    for field in (
+        "scientific_configuration_identity",
+        "scientific_identity",
+        "phase_producer_code_identities",
+        "workflow_producer_code_identity",
+        "expected_checkpoint_compatibility",
+        "expected_checkpoint_compatibilities_by_phase",
+        "stage1_physical_fit_identity",
+    ):
+        assert first_request[field] == second_request[field]
+    assert deployment_path.read_bytes() == profile_bytes
+    assert not first.work_root.exists()
+    assert not first.scratch_root.exists()
+    assert not second.work_root.exists()
+    assert not second.scratch_root.exists()
 
 
 def test_direct_deployment_rejects_partial_endpoint_group(
@@ -1945,15 +3109,31 @@ def test_canary_descriptor_preparation_is_an_operational_prefix_only(
         model_name=None,
         stage1_only=True,
         gpu_id=None,
-        stage1_gpu_ids=(0, 1),
+        stage1_gpu_ids=(2, 3),
         source_snapshot_root=loaded_root,
     )
     calls = []
     prefix = ("input_preparation", "embedding_cache", "stage1_preflight")
-    overrides = {
-        phase: (lambda _attempt, value=phase: calls.append(value) or {"terminal_files": []})
-        for phase in prefix
-    }
+    overrides = {}
+    for phase in prefix:
+        hook = (
+            lambda _attempt, value=phase: calls.append(value)
+            or {"terminal_files": []}
+        )
+        # ``calls`` is an operational test observer, not producer state. Give
+        # the injected producer an explicit, stable identity so mutating the
+        # observer during the first execution cannot masquerade as a
+        # scientific request change on resume.
+        setattr(
+            hook,
+            workflow_module._EXPLICIT_CALLABLE_SCIENTIFIC_IDENTITY,
+            {
+                "schema_version": "test_phase_override_identity_v1",
+                "phase": phase,
+                "behavior": "empty_terminal_files",
+            },
+        )
+        overrides[phase] = hook
     cache = (tmp_path / "prepared_cache").resolve()
     cache.mkdir()
     prepared_path = (tmp_path / "prepared.parquet").resolve()
@@ -1977,24 +3157,37 @@ def test_canary_descriptor_preparation_is_an_operational_prefix_only(
 
     selected_root = descriptor_root / "outer_001_full"
     selected_manifest = selected_root / "descriptor_manifest.json"
+    peer_root = descriptor_root / "outer_001_inner_001"
+    peer_manifest = peer_root / "descriptor_manifest.json"
 
     def publish(*, prepared, descriptor_root):
         del prepared
         descriptor_root.mkdir(parents=True)
         selected_root.mkdir()
+        peer_root.mkdir()
         selected_manifest.write_text("selected", encoding="utf-8")
+        peer_manifest.write_text("peer", encoding="utf-8")
         set_manifest = descriptor_root / "descriptor_set_manifest.json"
         set_manifest.write_text("set", encoding="utf-8")
         selected = SimpleNamespace(
             scope_id="outer_001_full",
             scope=SimpleNamespace(scope_kind="full_outer"),
-            assignment=SimpleNamespace(gpu_id=0),
+            assignment=SimpleNamespace(gpu_id=2),
             manifest_path=selected_manifest,
+        )
+        peer = SimpleNamespace(
+            scope_id="outer_001_inner_001",
+            scope=SimpleNamespace(scope_kind="exact_inner"),
+            assignment=SimpleNamespace(gpu_id=3),
+            manifest_path=peer_manifest,
         )
         return SimpleNamespace(
             root=descriptor_root,
             manifest={"content_sha256": "b" * 64},
-            descriptors={"outer_001_full": selected},
+            descriptors={
+                "outer_001_full": selected,
+                "outer_001_inner_001": peer,
+            },
         )
 
     monkeypatch.setattr(
@@ -2023,9 +3216,15 @@ def test_canary_descriptor_preparation_is_an_operational_prefix_only(
                     "outer_001_full": SimpleNamespace(
                         scope_id="outer_001_full",
                         scope=SimpleNamespace(scope_kind="full_outer"),
-                        assignment=SimpleNamespace(gpu_id=0),
+                        assignment=SimpleNamespace(gpu_id=2),
                         manifest_path=selected_manifest,
-                    )
+                    ),
+                    "outer_001_inner_001": SimpleNamespace(
+                        scope_id="outer_001_inner_001",
+                        scope=SimpleNamespace(scope_kind="exact_inner"),
+                        assignment=SimpleNamespace(gpu_id=3),
+                        manifest_path=peer_manifest,
+                    ),
                 },
             )
         ),
@@ -2064,7 +3263,7 @@ def test_canary_descriptor_preparation_is_an_operational_prefix_only(
     assert calls == list(prefix)
     assert result["status"] == "complete"
     assert result["selected_scope_id"] == "outer_001_full"
-    assert result["selected_logical_gpu_id"] == 0
+    assert result["selected_configured_gpu_id"] == 2
     assert result["supervised_stage1_fits_started"] is False
     assert not (options.work_root / "phases" / "stage1_modeling").exists()
     request_before = (options.work_root / "immutable_run_request.json").read_bytes()
@@ -2074,6 +3273,29 @@ def test_canary_descriptor_preparation_is_an_operational_prefix_only(
     )
     resumed._initialize()
     assert (options.work_root / "immutable_run_request.json").read_bytes() == request_before
+
+
+def test_canary_descriptor_selection_rejects_device_inventory_disagreement():
+    descriptors = {
+        "outer_001_full": SimpleNamespace(
+            scope=SimpleNamespace(scope_kind="full_outer"),
+            assignment=SimpleNamespace(gpu_id=2),
+        ),
+        "outer_001_inner_001": SimpleNamespace(
+            scope=SimpleNamespace(scope_kind="exact_inner"),
+            assignment=SimpleNamespace(gpu_id=4),
+        ),
+    }
+
+    with pytest.raises(ValueError, match="assignments disagree"):
+        workflow_module._select_configured_canary_descriptor(
+            descriptors,
+            configured_gpu_ids=(2, 3),
+        )
+    with pytest.raises(ValueError, match="exactly two ordered"):
+        workflow_module._canary_stage1_gpu_ids_from_request(
+            {"resolved_stage1_gpu_ids": [True, 3]}
+        )
 
 
 def test_canary_descriptor_preparation_requires_source_snapshot(tmp_path):
@@ -2539,6 +3761,62 @@ def test_typed_portable_stage1_fails_before_legacy_bundle_build(
     assert not tuple(attempt.iterdir())
 
 
+def test_portable_stage1_phase_honestly_records_disabled_compute_canary(
+    tmp_path,
+) -> None:
+    execution_root = (tmp_path / "execution").resolve()
+    terminal_paths = [
+        execution_root / "execution_manifest.json",
+        tmp_path / "role_neutral_handoff_binding.json",
+        tmp_path / "stage1_bundle" / "bundle_manifest.json",
+        tmp_path / "numerical" / "direct_upstream_numerical_manifest.json",
+        tmp_path / "numerical" / "locator_attestation.json",
+    ]
+    value = {
+        "schema_version": workflow_module.PORTABLE_ROLE_NEUTRAL_STAGE1_PHASE_SCHEMA,
+        "execution_mode": "deduplicated_role_neutral_all_ten_v1",
+        "prepared_stage1_request_sha256": "1" * 64,
+        "stage1_scope_plan_scientific_content_sha256": "2" * 64,
+        "role_neutral_execution_root": str(execution_root),
+        "role_neutral_execution_manifest_path": str(terminal_paths[0]),
+        "role_neutral_execution_content_sha256": "3" * 64,
+        "role_neutral_handoff_binding_path": str(terminal_paths[1]),
+        "bundle_manifest_path": str(terminal_paths[2]),
+        "bundle_sha256": "4" * 64,
+        "direct_numerical_bank_manifest_path": str(terminal_paths[3]),
+        "direct_numerical_bank_locator_path": str(terminal_paths[4]),
+        "direct_numerical_bank_content_sha256": "5" * 64,
+        "physical_fit_count": 35,
+        "logical_scope_count": 40,
+        "deduplicated_fit_count": 5,
+        "every_physical_owner_executed_once": True,
+        "productive_compute_canary_completed": False,
+        "selected_canary_replica_adopted_as_production": False,
+        "compute_canary_scientific_equality": None,
+        "all_ten_families_bound_per_logical_context": True,
+        "legacy_bundle_build_invoked": False,
+        "stage2_handoff_derived_exclusively_from_role_neutral_execution": True,
+        "resource_preflight": {"selected_devices": ["cuda:0", "cuda:1"]},
+        "terminal_files": [str(path) for path in terminal_paths],
+    }
+
+    assert (
+        workflow_module._validate_portable_role_neutral_stage1_phase_result(
+            value
+        )
+        == value
+    )
+    with pytest.raises(ValueError, match="closed authenticated"):
+        workflow_module._validate_portable_role_neutral_stage1_phase_result(
+            {
+                **value,
+                "productive_compute_canary_completed": True,
+                "selected_canary_replica_adopted_as_production": True,
+                "compute_canary_scientific_equality": True,
+            }
+        )
+
+
 def test_typed_portable_modeling_reopens_preflight_context_without_prepare(
     tmp_path,
     monkeypatch,
@@ -2677,6 +3955,7 @@ def test_adopted_prepared_context_rebinds_all_consumer_execution_roots(
         ).resolve(),
         cluster_preflight_manifest_path=preflight,
         cluster_preflight_state_bundle_manifest_path=state,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
     )
     from oci.inference.prepared_stage1_context import (
         serialize_stage1_build_options,
@@ -2832,17 +4111,10 @@ def test_typed_portable_scope_concurrency_is_deployment_selected(
     portable = replace(
         _portable_options(portable_root),
         stage1_scope_workers_per_gpu=2,
-        stage1_execution_profile=Stage1ExecutionProfile(
+        stage1_execution_profile=stage1_execution_profile(
             resource_kind="cpu",
             device_count=1,
             scope_workers_per_device=2,
-            executor_mode="persistent_slots",
-            selection_method="operator_configured",
-            selected_candidate=None,
-            benchmark_result_sha256=None,
-            benchmark_result_locator=None,
-            benchmark_workload_deployment_sha256=None,
-            benchmark_workload_deployment_locator=None,
         ),
     )
     workflow = ProductionAllEvidenceWorkflow(portable)
@@ -2868,7 +4140,7 @@ def test_resume_revalidation_reopens_measured_benchmark_authorities(
         path = (tmp_path / f"{name}.json").resolve()
         path.write_text(name, encoding="utf-8")
         paths[name] = path
-    safety = ResourcePerformanceSafetyPolicy(
+    safety = resource_safety_policy(
         gpu_max_allocation_fraction=0.85,
         gpu_minimum_headroom_bytes=6 * 1024**3,
         minimum_multi_device_throughput_ratio=1.5,
@@ -2878,7 +4150,20 @@ def test_resume_revalidation_reopens_measured_benchmark_authorities(
         read_counter_source="process_read_bytes",
         fail_on_external_gpu_occupants=True,
     )
+    outer_folds = 5
+    initial_training_partitions = 3
+    review_rounds = 2
     request = {
+        "outer_folds": outer_folds,
+        "initial_training_partitions": initial_training_partitions,
+        "review_rounds": review_rounds,
+        "expected_granular_checkpoint_plan": (
+            workflow_module._derive_expected_granular_checkpoint_plan(
+                outer_folds=outer_folds,
+                initial_training_partitions=initial_training_partitions,
+                review_rounds=review_rounds,
+            )
+        ),
         "dataset_path": str(paths["dataset"]),
         "source_sha256": workflow_module.stable_file_sha256(
             paths["dataset"]
@@ -2897,12 +4182,32 @@ def test_resume_revalidation_reopens_measured_benchmark_authorities(
         ),
         "deployment_profile_path": None,
         "stage1_execution_profile": {
-            "schema_version": "portable_stage1_execution_profile_v3",
+            "schema_version": "portable_stage1_execution_profile_v6",
             "resource_kind": "accelerator",
             "device_count": 2,
             "scope_workers_per_device": 2,
+            "max_parallel_owners": 4,
             "executor_mode": "persistent_slots",
+            "persistent_slot_startup_timeout_seconds": 30.0,
+            "neural_query_topology": {
+                "schema_version": (
+                    "portable_stage1_execution_topology_policy_v1"
+                ),
+                "mode": "one_context_per_selected_device",
+            },
+            "htr_operational_controls": {
+                "schema_version": (
+                    "production_role_neutral_htr_operational_controls_v1"
+                ),
+                "training_batch_size": 4,
+                "sentence_encoder_batch_size": 8,
+                "data_loader_workers": 0,
+                "reuse_tokenizer_and_chunk_plans": False,
+                "chunk_plan_cache_max_entries": 0,
+                "tokenized_chunk_cache_max_entries": 0,
+            },
             "selection_method": "measured_role_neutral_benchmark_v1",
+            "benchmark_evidence_kind": "raw_result_v1",
             "selected_candidate": "measured-x2",
             "benchmark_result_sha256": "a" * 64,
             "benchmark_result_locator": str(
@@ -2912,6 +4217,8 @@ def test_resume_revalidation_reopens_measured_benchmark_authorities(
             "benchmark_workload_deployment_locator": str(
                 (tmp_path / "workload-deployment.json").resolve()
             ),
+            "benchmark_publication_sha256": None,
+            "benchmark_publication_locator": None,
         },
         "resource_performance_safety": safety.as_dict(),
         "cpu_budget": 8,
@@ -3081,11 +4388,72 @@ def test_public_main_binds_default_role_neutral_integration_for_typed_mode(
     assert type(integration.executor).__name__ == (
         "PersistentSpawnRoleNeutralPhysicalOwnerExecutor"
     )
+    assert (
+        integration.executor.startup_timeout_seconds
+        == options.stage1_execution_profile
+        .persistent_slot_startup_timeout_seconds
+    )
     assert integration.executor.process_isolated_physical_owners is True
     assert type(integration.handoff_publisher).__name__ == (
         "ReferenceOnlyRoleNeutralStage1HandoffPublisher"
     )
     assert "not_started_test" in capsys.readouterr().out
+
+
+def test_default_role_neutral_callable_identity_is_closed_and_worker_neutral(
+    tmp_path,
+) -> None:
+    baseline = _portable_options(tmp_path)
+    changed_workers = replace(
+        baseline,
+        stage1_scope_workers_per_gpu=2,
+        stage1_execution_profile=replace(
+            baseline.stage1_execution_profile,
+            scope_workers_per_device=2,
+            max_parallel_owners=2,
+            persistent_slot_startup_timeout_seconds=45.5,
+        ),
+    )
+    baseline_integration = (
+        workflow_module._default_portable_role_neutral_hooks(
+            baseline
+        ).role_neutral_stage1
+    )
+    changed_integration = (
+        workflow_module._default_portable_role_neutral_hooks(
+            changed_workers
+        ).role_neutral_stage1
+    )
+    assert baseline_integration is not None
+    assert changed_integration is not None
+    assert (
+        baseline_integration.executor.startup_timeout_seconds
+        != changed_integration.executor.startup_timeout_seconds
+    )
+    assert (
+        baseline_integration.physical_owner_executor_scientific_identity
+        == changed_integration.physical_owner_executor_scientific_identity
+    )
+    baseline_identity = (
+        workflow_module._role_neutral_stage1_integration_identity(
+            baseline_integration
+        )
+    )
+    changed_identity = (
+        workflow_module._role_neutral_stage1_integration_identity(
+            changed_integration
+        )
+    )
+    assert baseline_identity == changed_identity
+    assert all(
+        capability["behavior_state"]["state_policy"]
+        == "explicit_closed_scientific_identity_v1"
+        for capability in (
+            baseline_identity["producer_factories_builder"],
+            baseline_identity["physical_owner_executor"],
+            baseline_identity["stage2_handoff_publisher"],
+        )
+    )
 
 
 def test_default_typed_integration_rejects_missing_profile_before_fitting(
@@ -3124,6 +4492,9 @@ def test_relocated_cache_attestation_is_propagated_to_stage1_builder(
         embedding_cache_import_source_preparation_manifest_path=source_manifest,
     )
     workflow = ProductionAllEvidenceWorkflow(options)
+    workflow.request["stage1_physical_fit_identity"] = (
+        PHYSICAL_FIT_IDENTITY.as_dict()
+    )
     sentinel = object()
     monkeypatch.setattr(
         workflow,
@@ -3179,6 +4550,9 @@ def test_portable_semantic_witness_profile_is_bound_to_stage1_request(
         portable_scientific_spec=portable_identity,
     )
     workflow = ProductionAllEvidenceWorkflow(options)
+    workflow.request["stage1_physical_fit_identity"] = (
+        PHYSICAL_FIT_IDENTITY.as_dict()
+    )
     cache = tmp_path / "embedding-cache"
     cache.mkdir()
     output = tmp_path / "bundle"
@@ -3291,10 +4665,8 @@ def test_effective_profile_rejects_implicit_htr_text_window_defaults(tmp_path):
 @pytest.mark.parametrize("mutation", ["change", "extra"])
 def test_resume_rejects_any_change_to_a_sealed_attempt_tree(tmp_path, mutation):
     options = _options(tmp_path)
-    payload_path = None
 
     def input_phase(attempt):
-        nonlocal payload_path
         payload_path = attempt / "unlisted" / "nested.bin"
         payload_path.parent.mkdir()
         payload_path.write_bytes(b"sealed")
@@ -3303,14 +4675,12 @@ def test_resume_rejects_any_change_to_a_sealed_attempt_tree(tmp_path, mutation):
     overrides = {phase: (lambda _attempt: {"terminal_files": []}) for phase in PHASES}
     overrides["input_preparation"] = input_phase
     ProductionAllEvidenceWorkflow(options, phase_overrides=overrides).run()
-    assert payload_path is not None
     manifest = json.loads(
         (options.work_root / "phases/input_preparation/complete_manifest.json").read_text(
             encoding="utf-8"
         )
     )
     assert any(row["relative_path"] == "unlisted/nested.bin" for row in manifest["artifacts"])
-    assert not payload_path.exists()
     payload_path = Path(manifest["attempt_dir"]) / "unlisted" / "nested.bin"
     assert payload_path.is_file()
     assert payload_path.is_relative_to(options.work_root / "phases" / "input_preparation")
@@ -3528,6 +4898,10 @@ def test_phase_boundary_rejects_request_bound_external_input_changes(
         target.write_text("changed after immutable request", encoding="utf-8")
         return {"terminal_files": []}
 
+    mutate_bound_input.__portable_workflow_scientific_identity__ = {
+        "schema_version": "test_request_bound_input_mutator_v1",
+        "request_field": field,
+    }
     overrides = {phase: (lambda _attempt: {"terminal_files": []}) for phase in PHASES}
     overrides["input_preparation"] = mutate_bound_input
     workflow = ProductionAllEvidenceWorkflow(
@@ -3539,6 +4913,178 @@ def test_phase_boundary_rejects_request_bound_external_input_changes(
         workflow.run()
     assert not (
         options.work_root / "phases" / "input_preparation" / "complete_manifest.json"
+    ).exists()
+
+
+def _prepared_checkpoint_for_tree_cache_regression(
+    *,
+    tmp_path: Path,
+    options: ProductionAllEvidenceWorkflowOptions,
+    phase_overrides,
+):
+    baseline = ProductionAllEvidenceWorkflow(
+        options,
+        phase_overrides=phase_overrides,
+    )._request_body()
+    compatibility = ArtifactCompatibility(
+        **baseline["expected_checkpoint_compatibilities_by_phase"][
+            "input_preparation"
+        ]
+    )
+    checkpoint = tmp_path / "tree-cache-prepared-checkpoint"
+    cohort = checkpoint / "prepared" / "modeling_cohort.parquet"
+    cohort.parent.mkdir(parents=True)
+    cohort.write_bytes(b"portable prepared cohort")
+    preparation_manifest = checkpoint / "prepared" / "preparation_manifest.json"
+    preparation_manifest.write_text(
+        '{"schema_version":"tree_cache_regression_v1"}',
+        encoding="utf-8",
+    )
+    return publish_portable_artifact(
+        root=checkpoint,
+        artifact_kind="prepared_cohort",
+        artifact_schema="tree_cache_regression_prepared_v1",
+        compatibility=compatibility,
+        upstream_artifact_ids=(),
+        payload_paths=(
+            "prepared/modeling_cohort.parquet",
+            "prepared/preparation_manifest.json",
+        ),
+        workflow_phase="input_preparation",
+        workflow_phase_result={
+            "output": {"path": str(cohort.resolve())},
+            "terminal_files": [
+                str(cohort.resolve()),
+                str(preparation_manifest.resolve()),
+            ],
+        },
+    )
+
+
+def test_checkpoint_adoption_hashes_embedding_tree_once_across_phase_boundaries(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    options = _with_run_control(
+        _options(tmp_path),
+        stop_after="stage1_preflight",
+    )
+
+    def empty_phase(_attempt: Path) -> dict:
+        return {"terminal_files": []}
+
+    overrides = {
+        phase: empty_phase
+        for phase in ("input_preparation", "embedding_cache", "stage1_preflight")
+    }
+    artifact = _prepared_checkpoint_for_tree_cache_regression(
+        tmp_path=tmp_path,
+        options=options,
+        phase_overrides=overrides,
+    )
+    adopted_options = _with_run_control(
+        options,
+        adopt_checkpoints=(artifact.root,),
+    )
+    tree_module.clear_authenticated_directory_tree_cache()
+    full_authentications: list[Path] = []
+    original = tree_module._full_authentication
+
+    def counted(root: Path):
+        full_authentications.append(root)
+        return original(root)
+
+    monkeypatch.setattr(tree_module, "_full_authentication", counted)
+    result = ProductionAllEvidenceWorkflow(
+        adopted_options,
+        phase_overrides=overrides,
+    ).run()
+
+    assert result["completed_phases"] == [
+        "input_preparation",
+        "embedding_cache",
+        "stage1_preflight",
+    ]
+    embedding_root = adopted_options.embedding_local_model_path.resolve()
+    htr_root = adopted_options.htr_local_model_path.resolve()
+    tokenizer_root = adopted_options.stage2_tokenizer_locator
+    assert tokenizer_root is not None
+    assert full_authentications.count(embedding_root) == 1
+    assert htr_root not in full_authentications
+    assert tokenizer_root.resolve() not in full_authentications
+    request = json.loads(
+        (
+            adopted_options.work_root / "immutable_run_request.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert (
+        request["embedding_model_revalidation_policy"]
+        == tree_module.AUTHENTICATED_DIRECTORY_TREE_POLICY
+    )
+
+
+def test_checkpoint_adoption_tree_cache_fails_closed_on_phase_mutation(
+    tmp_path: Path,
+) -> None:
+    options = _with_run_control(
+        _options(tmp_path),
+        stop_after="embedding_cache",
+    )
+    embedding_file = (
+        options.embedding_local_model_path / "model.safetensors"
+    )
+
+    def empty_phase(_attempt: Path) -> dict:
+        return {"terminal_files": []}
+
+    def mutate_embedding_tree(_attempt: Path) -> dict:
+        before = embedding_file.stat()
+        original = embedding_file.read_bytes()
+        replacement = bytes((value + 1) % 256 for value in original)
+        assert len(replacement) == len(original)
+        embedding_file.write_bytes(replacement)
+        os.utime(
+            embedding_file,
+            ns=(int(before.st_atime_ns), int(before.st_mtime_ns)),
+        )
+        return {"terminal_files": []}
+
+    mutate_embedding_tree.__portable_workflow_scientific_identity__ = {
+        "schema_version": "tree_cache_phase_mutator_v1",
+        "request_field": "embedding_model_tree",
+    }
+    overrides = {
+        "input_preparation": empty_phase,
+        "embedding_cache": mutate_embedding_tree,
+    }
+    artifact = _prepared_checkpoint_for_tree_cache_regression(
+        tmp_path=tmp_path,
+        options=options,
+        phase_overrides=overrides,
+    )
+    adopted_options = _with_run_control(
+        options,
+        adopt_checkpoints=(artifact.root,),
+    )
+    tree_module.clear_authenticated_directory_tree_cache()
+
+    with pytest.raises(
+        RuntimeError,
+        match="embedding model tree changed",
+    ) as exc_info:
+        ProductionAllEvidenceWorkflow(
+            adopted_options,
+            phase_overrides=overrides,
+        ).run()
+    assert isinstance(
+        exc_info.value.__cause__,
+        tree_module.AuthenticatedDirectoryTreeDriftError,
+    )
+    assert not (
+        adopted_options.work_root
+        / "phases"
+        / "embedding_cache"
+        / "complete_manifest.json"
     ).exists()
 
 
@@ -3583,19 +5129,37 @@ def test_imported_cache_workflow_hashes_embedding_tree_once_per_process(
     )
 
 
-def test_fresh_cache_build_keeps_full_model_tree_validation_path(
+def test_fresh_workflow_hashes_embedding_tree_once_and_accepts_htr_bin(
     tmp_path,
     monkeypatch,
 ):
     options = _options(tmp_path)
+    tree_module.clear_authenticated_directory_tree_cache()
+    full_authentications: list[Path] = []
+    original = tree_module._full_authentication
 
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("fresh embedding-cache builds cannot use process-local tree reuse")
+    def counted(root: Path):
+        full_authentications.append(root)
+        return original(root)
 
-    monkeypatch.setattr(workflow_module, "authenticate_directory_tree", forbidden)
+    monkeypatch.setattr(tree_module, "_full_authentication", counted)
     overrides = {phase: (lambda _attempt: {"terminal_files": []}) for phase in PHASES}
     ProductionAllEvidenceWorkflow(options, phase_overrides=overrides).run()
     request = json.loads(
         (options.work_root / "immutable_run_request.json").read_text(encoding="utf-8")
     )
-    assert request["embedding_model_revalidation_policy"] == "full_byte_tree_reauthentication_v1"
+    assert (
+        full_authentications.count(
+            options.embedding_local_model_path.resolve()
+        )
+        == 1
+    )
+    assert options.htr_local_model_path.resolve() not in full_authentications
+    assert {
+        row["relative_path"]
+        for row in request["htr_model_tree"]["files"]
+    } == {"pytorch_model.bin"}
+    assert (
+        request["embedding_model_revalidation_policy"]
+        == tree_module.AUTHENTICATED_DIRECTORY_TREE_POLICY
+    )

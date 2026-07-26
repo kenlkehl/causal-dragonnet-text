@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from oci.inference.agentic_explicit_feature_forest import (
     _spec_extraction_contract_dict,
 )
 from oci.inference import all_evidence_fusion_cli as fusion_cli
+from tests.semantic_witness_test_support import semantic_witness_mapping
 
 
 def _abstract_specs() -> list[ExplicitFeatureSpec]:
@@ -278,6 +280,11 @@ def test_per_spec_cache_identity_separates_companion_contracts_and_order(tmp_pat
 
 
 def _cli_args(tmp_path: Path, *extra: str):
+    semantic_witness_path = tmp_path / "semantic-witness.json"
+    semantic_witness_path.write_text(
+        json.dumps(semantic_witness_mapping()),
+        encoding="utf-8",
+    )
     return fusion_cli.build_parser().parse_args(
         [
             "--benchmark-name",
@@ -298,6 +305,10 @@ def _cli_args(tmp_path: Path, *extra: str):
             "remote/model",
             "--extraction-max-text-length",
             "400000",
+            "--final-upstream-max-orphan-features",
+            "32",
+            "--review-semantic-witness-scientific-config",
+            str(semantic_witness_path),
             *extra,
         ]
     )

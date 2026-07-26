@@ -93,12 +93,18 @@ from .final_context_fit_causal_forest_adapter import FixedCausalForestHeadBacken
 from .frozen_hierarchical_review_evidence import (
     frozen_hierarchical_review_evidence_identity,
 )
+from .first_untouched_gate_direct_numerical_preparation import (
+    FirstUntouchedGatePreparationBounds,
+)
 from .hierarchical_all_architecture_discovery import (
     EXTRACTION_DEFINITION_JOB,
     HierarchicalDiscoveryConfig,
 )
 from .hierarchical_discovery_response_contract import (
     HierarchyWireBudget,
+)
+from .hierarchical_discovery_job_cache import (
+    HierarchicalDiscoveryJobCacheConfig,
 )
 from .neural_query_agentic_forest import NeuralQueryAgenticForestConfig
 from .neural_query_context_backend import ContextFitNeuralQueryService, NeuralQueryContextBackend
@@ -112,6 +118,9 @@ from .openai_compatible_json_discovery_job_runner import (
     parse_strict_json_object,
 )
 from .post_extraction_scientific_policy import PostExtractionScientificPolicy
+from .tfidf_orphan_evidence_adapter import (
+    orphan_ngram_adapter_config_from_tfidf_topic,
+)
 from .production_stage1_hierarchy_handoff import (
     GENUINE_HIERARCHY_NATIVE_PROOF_VALIDATION_READY,
     AuthenticatedProductionStage1HierarchyHandoff,
@@ -785,7 +794,17 @@ class ProductionSingleEndpointVLLMFeatureExtractor(VLLMFeatureExtractor):
         child_payloads = [
             {
                 "child_id": child["node_id"],
-                "response": child["response"],
+                "response": {
+                    **dict(child["response"]),
+                    "citations": [
+                        {
+                            "start": citation["start"],
+                            "end": citation["end"],
+                            "text": citation["text"],
+                        }
+                        for citation in child["response"].get("citations", ())
+                    ],
+                },
             }
             for child in children
         ]
@@ -803,7 +822,9 @@ class ProductionSingleEndpointVLLMFeatureExtractor(VLLMFeatureExtractor):
             'Return exactly: {"child_ids":[...],"schema_version":'
             f'"{COMPLETE_PAGED_RESPONSE_SCHEMA}","status":'
             '"positive|negative|missing|ambiguous","normalized_value":null,'
-            '"reason":null,"citations":[]}.\n'
+            '"reason":null,"citations":[{"start":0,"end":1,'
+            '"text":"exact prepared-text substring"}]}. Every citation object '
+            "must contain exactly start, end, and text; do not return sha256.\n"
             f"feature_contract={json.dumps(contract, sort_keys=True)}\n"
             f"required_child_ids={json.dumps(child_ids)}\n"
             f"children={json.dumps(child_payloads, sort_keys=True)}"
@@ -816,7 +837,9 @@ class ProductionSingleEndpointVLLMFeatureExtractor(VLLMFeatureExtractor):
                     "role": "user",
                     "content": (
                         "SCHEMA REPAIR ONLY. Reference the required child_ids in "
-                        "their exact order and return only the closed JSON object."
+                        "their exact order and return only the closed JSON object. "
+                        "Every citation must contain exactly start, end, and text; "
+                        "omit sha256."
                     ),
                 },
             )
@@ -1661,6 +1684,12 @@ class ProductionStage1HierarchyOneShotOptions:
     post_extraction_scientific_policy: PostExtractionScientificPolicy
     review_stage1_device: str
     review_neural_query_devices: tuple[str, ...]
+    hierarchical_discovery_job_cache_config: (
+        HierarchicalDiscoveryJobCacheConfig
+    )
+    first_untouched_gate_preparation_bounds: (
+        FirstUntouchedGatePreparationBounds
+    )
     source_text_temporally_valid_by_design: bool | None = None
     interaction_inner_folds: int = 3
     tfidf_nested_calibration_folds: int = 3
@@ -1870,6 +1899,20 @@ def _validate_options(options: ProductionStage1HierarchyOneShotOptions) -> None:
         raise TypeError(
             "post_extraction_scientific_policy must be the required "
             "PostExtractionScientificPolicy"
+        )
+    if not isinstance(
+        options.hierarchical_discovery_job_cache_config,
+        HierarchicalDiscoveryJobCacheConfig,
+    ):
+        raise TypeError(
+            "hierarchical_discovery_job_cache_config must be required and typed"
+        )
+    if not isinstance(
+        options.first_untouched_gate_preparation_bounds,
+        FirstUntouchedGatePreparationBounds,
+    ):
+        raise TypeError(
+            "first_untouched_gate_preparation_bounds must be required and typed"
         )
     if (
         options.post_extraction_review_config.estimator_policy
@@ -2555,6 +2598,9 @@ def build_production_stage1_hierarchy_runner(
             stage1_config_path=inputs.stage1_config_path,
             stage1_config_snapshot=stage1_snapshot,
             outcome_type=applied.outcome_type,
+            orphan_config=orphan_ngram_adapter_config_from_tfidf_topic(
+                applied.architecture.multi_model_forest.tfidf_topic
+            ),
         ),
         context_backend=tfidf_context,
     )
@@ -2714,6 +2760,12 @@ def build_production_stage1_hierarchy_runner(
         hierarchical_discovery_runner=hierarchy_runner,
         hierarchical_discovery_config=_hierarchy_config(options),
         hierarchical_discovery_job_cache_root=(options.preparation_dir / "hierarchical_job_cache"),
+        hierarchical_discovery_job_cache_config=(
+            options.hierarchical_discovery_job_cache_config
+        ),
+        first_untouched_gate_preparation_bounds=(
+            options.first_untouched_gate_preparation_bounds
+        ),
         hierarchical_discovery_approved_batch_sha256=None,
         hierarchical_review_evidence_policy=_review_policy(options),
         hierarchical_preparation_dir=options.preparation_dir,
@@ -2769,6 +2821,9 @@ def build_production_stage1_hierarchy_runner(
             require_registry_seal=True,
             include_tfidf_orphan_ngrams=True,
             require_tfidf_orphan_ngrams=False,
+            orphan_ngram_adapter=orphan_ngram_adapter_config_from_tfidf_topic(
+                applied.architecture.multi_model_forest.tfidf_topic
+            ),
             derive_sparse_query_moments_when_missing=False,
             require_neural_query_moments=False,
             query_moment_adapter=QueryMomentEvidenceAdapterConfig(
@@ -2979,6 +3034,12 @@ def _construct_reference_only_role_neutral_stage2_runner(
         hierarchical_discovery_runner=hierarchy_runner,
         hierarchical_discovery_config=_hierarchy_config(options),
         hierarchical_discovery_job_cache_root=(options.preparation_dir / "hierarchical_job_cache"),
+        hierarchical_discovery_job_cache_config=(
+            options.hierarchical_discovery_job_cache_config
+        ),
+        first_untouched_gate_preparation_bounds=(
+            options.first_untouched_gate_preparation_bounds
+        ),
         hierarchical_discovery_approved_batch_sha256=None,
         hierarchical_review_evidence_policy=_review_policy(options),
         hierarchical_preparation_dir=options.preparation_dir,
@@ -4119,6 +4180,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-rounds", required=True, type=int)
     parser.add_argument("--initial-training-partitions", required=True, type=int)
     parser.add_argument(
+        "--hierarchical-job-cache-max-entry-bytes",
+        required=True,
+        type=int,
+    )
+    for field_name in (
+        "max_initial_spent_rows",
+        "max_first_gate_rows",
+        "max_total_text_utf8_bytes",
+        "max_catalog_atoms",
+        "max_source_manifest_bytes",
+        "max_direct_numerical_signals",
+        "max_single_matrix_file_bytes",
+        "max_total_matrix_file_bytes",
+    ):
+        parser.add_argument(
+            "--first-untouched-gate-" + field_name.replace("_", "-"),
+            dest="first_untouched_gate_" + field_name,
+            required=True,
+            type=int,
+        )
+    parser.add_argument(
         "--source-text-temporally-valid-by-design",
         action=argparse.BooleanOptionalAction,
         required=True,
@@ -4218,7 +4300,25 @@ def options_from_args(args: argparse.Namespace) -> ProductionStage1HierarchyOneS
         "proposal_schema_repair_attempts": (args.proposal_schema_repair_attempts, 0),
         "request_max_retries": (args.request_max_retries, 0),
         "extraction_batch_size": (args.extraction_batch_size, 1),
+        "hierarchical_job_cache_max_entry_bytes": (
+            args.hierarchical_job_cache_max_entry_bytes,
+            1,
+        ),
     }
+    for field_name in (
+        "max_initial_spent_rows",
+        "max_first_gate_rows",
+        "max_total_text_utf8_bytes",
+        "max_catalog_atoms",
+        "max_source_manifest_bytes",
+        "max_direct_numerical_signals",
+        "max_single_matrix_file_bytes",
+        "max_total_matrix_file_bytes",
+    ):
+        integer_bounds["first_untouched_gate_" + field_name] = (
+            getattr(args, "first_untouched_gate_" + field_name),
+            1,
+        )
     for label, (value, minimum) in integer_bounds.items():
         _positive_int(value, label=label, minimum=minimum)
     for device in (args.review_stage1_device, *args.review_neural_query_device):
@@ -4252,6 +4352,41 @@ def options_from_args(args: argparse.Namespace) -> ProductionStage1HierarchyOneS
         tfidf_nested_calibration_folds=int(args.tfidf_nested_calibration_folds),
         review_stage1_device=str(args.review_stage1_device),
         review_neural_query_devices=tuple(args.review_neural_query_device),
+        hierarchical_discovery_job_cache_config=(
+            HierarchicalDiscoveryJobCacheConfig(
+                max_entry_bytes=int(
+                    args.hierarchical_job_cache_max_entry_bytes
+                )
+            )
+        ),
+        first_untouched_gate_preparation_bounds=(
+            FirstUntouchedGatePreparationBounds(
+                max_initial_spent_rows=int(
+                    args.first_untouched_gate_max_initial_spent_rows
+                ),
+                max_first_gate_rows=int(
+                    args.first_untouched_gate_max_first_gate_rows
+                ),
+                max_total_text_utf8_bytes=int(
+                    args.first_untouched_gate_max_total_text_utf8_bytes
+                ),
+                max_catalog_atoms=int(
+                    args.first_untouched_gate_max_catalog_atoms
+                ),
+                max_source_manifest_bytes=int(
+                    args.first_untouched_gate_max_source_manifest_bytes
+                ),
+                max_direct_numerical_signals=int(
+                    args.first_untouched_gate_max_direct_numerical_signals
+                ),
+                max_single_matrix_file_bytes=int(
+                    args.first_untouched_gate_max_single_matrix_file_bytes
+                ),
+                max_total_matrix_file_bytes=int(
+                    args.first_untouched_gate_max_total_matrix_file_bytes
+                ),
+            )
+        ),
         review_stage1_bow_fold_parallelism=int(args.review_stage1_bow_fold_parallelism),
         review_stage1_bow_parallel_backend=str(args.review_stage1_bow_parallel_backend),
         max_candidates=int(args.max_candidates),

@@ -28,7 +28,11 @@ _FAKE_WORKER_TARGET = (
 )
 
 
-def _write_test_descriptor(path: Path) -> Path:
+def _write_test_descriptor(
+    path: Path,
+    *,
+    configured_gpu_id: int = 2,
+) -> Path:
     scope = {
         "canonical_index": 0,
         "scope_id": "outer_001_full",
@@ -55,7 +59,7 @@ def _write_test_descriptor(path: Path) -> Path:
         "scope": scope,
         "assignment": {
             "scope_id": "outer_001_full",
-            "gpu_id": 0,
+            "gpu_id": configured_gpu_id,
             "execution_rank": 0,
             "fit_row_count": 4,
             "assigned_gpu_load_after": 4,
@@ -116,15 +120,19 @@ def _options(
     sleep_seconds: float = 0.2,
     minimum_concurrency_factor: float = 0.05,
     descendant_sentinel_path: Path | None = None,
+    configured_gpu_id: int = 2,
 ) -> Stage1DualGpuCanaryOptions:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    descriptor = _write_test_descriptor(tmp_path / "descriptor_manifest.json")
+    descriptor = _write_test_descriptor(
+        tmp_path / "descriptor_manifest.json",
+        configured_gpu_id=configured_gpu_id,
+    )
     snapshot = _snapshot_binding(tmp_path)
     return Stage1DualGpuCanaryOptions(
         descriptor_manifest_path=descriptor,
         source_snapshot_root=Path(snapshot["root"]),
         output_root=(tmp_path / "canary").resolve(),
-        gpu_ids=(0, 1),
+        gpu_ids=(2, 3),
         resource_poll_seconds=0.05,
         maximum_reservation_fraction=0.85,
         minimum_headroom_bytes=6 * 1024**3,
@@ -183,6 +191,10 @@ def test_cpu_replicas_share_scientific_request_and_authenticate_exactly(
         (options.output_root / "canary_request.json").read_text(encoding="utf-8")
     )
     assert "gpu_ids" not in request["scientific_request"]
+    assert "configured_assignment" not in request["scientific_request"]
+    assert "replica_logical_gpu_id" not in request["scientific_request"]
+    assert request["descriptor"]["configured_assignment"]["gpu_id"] == 2
+    assert request["descriptor"]["replica_logical_gpu_id"] == 0
     replica_manifests = [
         json.loads(
             (
@@ -192,14 +204,14 @@ def test_cpu_replicas_share_scientific_request_and_authenticate_exactly(
                 / "replica_manifest.json"
             ).read_text(encoding="utf-8")
         )
-        for gpu_id in (0, 1)
+        for gpu_id in (2, 3)
     ]
     assert {
         row["scientific_request_sha256"] for row in replica_manifests
     } == {request["scientific_request_sha256"]}
-    assert {row["physical_gpu_id"] for row in replica_manifests} == {0, 1}
+    assert {row["physical_gpu_id"] for row in replica_manifests} == {2, 3}
     assert {row["logical_gpu_id"] for row in replica_manifests} == {0}
-    for gpu_id in (0, 1):
+    for gpu_id in (2, 3):
         replica_root = (
             options.output_root / "replicas" / f"gpu_{gpu_id:03d}"
         )
@@ -214,6 +226,38 @@ def test_cpu_replicas_share_scientific_request_and_authenticate_exactly(
         allow_test_worker=True,
         require_source_snapshot_execution=False,
     ) == result
+
+
+def test_configured_assignment_is_authenticated_but_runtime_gpu_is_replica_local(
+    tmp_path: Path,
+) -> None:
+    options = _options(tmp_path)
+    descriptor = canary._descriptor_binding(options)
+    snapshot = _snapshot_binding(tmp_path, identity="f" * 64)
+    request = canary._build_request(
+        options=options,
+        snapshot=snapshot,
+        descriptor=descriptor,
+    )
+    replica = canary._replica_request(
+        root=(tmp_path / "replica").resolve(),
+        physical_gpu_id=2,
+        canary_request=request,
+        descriptor=descriptor,
+        options=options,
+    )
+
+    assert replica.assignment["gpu_id"] == 2
+    assert replica.gpu_id == 0
+    assert descriptor.as_dict()["configured_assignment"]["gpu_id"] == 2
+    assert descriptor.as_dict()["replica_logical_gpu_id"] == 0
+
+    mismatched = _options(
+        tmp_path / "mismatch",
+        configured_gpu_id=0,
+    )
+    with pytest.raises(ValueError, match="configured canary GPU inventory"):
+        canary._descriptor_binding(mismatched)
 
 
 def test_payload_descriptor_and_extra_file_tampering_abort(
@@ -235,7 +279,7 @@ def test_payload_descriptor_and_extra_file_tampering_abort(
     proof = (
         options.output_root
         / "replicas"
-        / "gpu_000"
+        / "gpu_002"
         / "payload"
         / "fake_scientific_proof.json"
     )
@@ -282,7 +326,7 @@ def test_peer_failure_and_parent_cancellation_terminate_and_join_children(
     descendant_sentinel = tmp_path / "orphaned_descendant.txt"
     failing = _options(
         tmp_path / "failure_case",
-        fail_gpu_id=0,
+        fail_gpu_id=2,
         sleep_seconds=5.0,
         descendant_sentinel_path=descendant_sentinel,
     )
@@ -397,6 +441,7 @@ def test_snapshot_execution_binding_and_descriptor_bytes_enter_request(
         descriptor_manifest_path=(tmp_path / "unused.json").resolve(),
         source_snapshot_root=snapshot_root,
         output_root=(tmp_path / "output").resolve(),
+        gpu_ids=(2, 3),
         production_worker_required=False,
         require_source_snapshot_execution=True,
         worker_target=_FAKE_WORKER_TARGET,
@@ -465,6 +510,7 @@ def test_production_mode_cannot_switch_worker_or_reuse_output(
         descriptor_manifest_path=(tmp_path / "descriptor.json").resolve(),
         source_snapshot_root=(tmp_path / "snapshot").resolve(),
         output_root=output,
+        gpu_ids=(2, 3),
         worker_target=_FAKE_WORKER_TARGET,
         production_worker_required=True,
     )
@@ -476,6 +522,7 @@ def test_production_mode_cannot_switch_worker_or_reuse_output(
         descriptor_manifest_path=options.descriptor_manifest_path,
         source_snapshot_root=options.source_snapshot_root,
         output_root=output,
+        gpu_ids=(2, 3),
     )
     with pytest.raises(FileExistsError, match="fresh"):
         canary._validate_options(correct_worker)

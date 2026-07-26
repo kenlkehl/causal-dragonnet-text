@@ -53,6 +53,9 @@ from oci.inference.lossless_stage1_evidence_catalog import (
 from oci.inference.production_coordinate_preserving_upstream_schema import (
     build_production_coordinate_preserving_schema,
 )
+from tests.hierarchy_resource_test_support import (
+    FIRST_UNTOUCHED_GATE_BOUNDS,
+)
 
 _VIEWS = (
     "linear_unigram_c0p5",
@@ -272,6 +275,7 @@ def _prepare(tmp_path: Path, provider, **overrides):
         "catalog": _catalog(),
         "provider": provider,
         "destination": tmp_path / "direct" / "direct_upstream_numerical_manifest.json",
+        "bounds": FIRST_UNTOUCHED_GATE_BOUNDS,
     }
     kwargs.update(overrides)
     return prepare_first_untouched_gate_direct_numerical(**kwargs)
@@ -412,13 +416,18 @@ def test_public_api_has_no_gate_label_parameters() -> None:
         ({"first_gate_row_ids": (4, 9)}, "must be disjoint"),
         ({"initial_spent_outcome": (0.1, 0.2)}, "one-dimensional with length"),
         (
-            {"bounds": replace(FirstUntouchedGatePreparationBounds(), max_initial_spent_rows=3)},
+            {
+                "bounds": replace(
+                    FIRST_UNTOUCHED_GATE_BOUNDS,
+                    max_initial_spent_rows=3,
+                )
+            },
             "row count exceeds",
         ),
         (
             {
                 "bounds": replace(
-                    FirstUntouchedGatePreparationBounds(),
+                    FIRST_UNTOUCHED_GATE_BOUNDS,
                     max_total_text_utf8_bytes=1,
                 )
             },

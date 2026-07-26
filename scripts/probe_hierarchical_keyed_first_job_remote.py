@@ -46,6 +46,7 @@ from oci.inference.hierarchical_discovery_response_contract import (
 from oci.inference.lossless_stage1_evidence_catalog import (
     NON_GROUNDING_SUMMARY_SCHEMA_VERSION,
     ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+    SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
     ArchitectureChunkPlan,
     ArchitectureEvidenceChunk,
     NonGroundingNumericalSummary,
@@ -141,23 +142,23 @@ EXPECTED_RETIRED_PLAN_SHA256 = (
     "52cb8176f9c7b1e58036fa4b2bb73d17394b67cb66b74d06545e3bfd0bcb4c1f"
 )
 EXPECTED_CURRENT_CATALOG_SHA256 = (
-    "ac0877ac074af3c82c3204f016fa537892167c7088253b80a0b7252d6d5ba72e"
+    "54ca35db68608846b34e18db830d1d66fbe4fd049e1ba22a1557e17971cbf70c"
 )
 EXPECTED_CURRENT_CATALOG_CONTENT_SHA256 = (
-    "5539e3e3b042989f9fd65aafb4c378e793ff0c01abb1cb5d017a2e904119db26"
+    "11f5736f01fea35bc1b68c694a5034829532e425adc22022a45c36af089584fe"
 )
 EXPECTED_CURRENT_PLAN_SHA256 = (
-    "d5762609bc1c0344fca6bd916ffcb53b58583321399bca4c4b8beb80e708e456"
+    "c1bf054ef2a6f12ace65a210c63ffa1c2306924b86e10612122b070588a266bb"
 )
 EXPECTED_CURRENT_PLAN_CONTENT_SHA256 = (
-    "69fe952052833a89057ed37a1ce9855c2973e8dc98bff6a7ddae37057aa7f237"
+    "a39ce1f3bfb29382029c88e4e4627b2cc330a7de3796b34695bdcf1cb89d5b80"
 )
 EXPECTED_RETIRED_JOB_ID = "job_7096d1629cfff17c149963786b8bca5c58dbcf2bffcd57e80a173704c7ade598"
 EXPECTED_RETIRED_CHUNK_ID = (
     "chunk_fe031c1020bb83a671460a0b2ccb9f32ff93152bd010fc9e63f469109f6cea0b"
 )
 EXPECTED_CURRENT_CHUNK_ID = (
-    "chunk_ebcee66bf0eb9ccf6a3f391694393cc74c33be515afbf5440329e1b1efa1bbb3"
+    "chunk_55160e4437d55883f40e21e4d197685b5ac4a9182d590aec0bc37cc81a05d064"
 )
 EXPECTED_OWNER_MEMBER_COUNTS = (11, 9, 6, 11, 7, 9, 8)
 EXPECTED_EVIDENCE_ID = "evidence_220e6715b7cc98d3780f023d6cf9b6df09f0a0e15cacc98a7bf437bfa845b13c"
@@ -317,8 +318,28 @@ def _catalog_from_authenticated_body(body: Mapping[str, Any]) -> RoleNeutralEvid
                 _metrics_json=canonical_json(row["metrics"]),
             )
         )
+    retired_audit = body.get("audit")
+    if not isinstance(retired_audit, Mapping):
+        raise TypeError("retired catalog audit must be one object")
+    semantic_member_batch_size = retired_audit.get("semantic_member_batch_size")
+    if (
+        isinstance(semantic_member_batch_size, bool)
+        or not isinstance(semantic_member_batch_size, int)
+        or semantic_member_batch_size < 1
+        or retired_audit.get("semantic_member_batches_truncated") is not False
+    ):
+        raise ValueError(
+            "retired catalog does not prove complete configured semantic-member batching"
+        )
+    semantic_member_batching = {
+        "schema_version": SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
+        "semantic_member_batch_size": semantic_member_batch_size,
+        "selection_or_truncation_authorized": False,
+        "complete_member_coverage_required": True,
+    }
     current_identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": semantic_member_batching,
         "outer_fold": int(body["outer_fold"]),
         "scope": str(body["scope"]),
         "inner_fold": (None if body["inner_fold"] is None else int(body["inner_fold"])),
@@ -329,12 +350,10 @@ def _catalog_from_authenticated_body(body: Mapping[str, Any]) -> RoleNeutralEvid
     current_catalog_sha256 = content_sha256(current_identity)
     if current_catalog_sha256 != EXPECTED_CURRENT_CATALOG_SHA256:
         raise ValueError("current catalog migration content differs")
-    retired_audit = body.get("audit")
-    if not isinstance(retired_audit, Mapping):
-        raise TypeError("retired catalog audit must be one object")
     current_audit = json.loads(canonical_json(retired_audit))
     current_audit["schema_version"] = ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION
     current_audit["catalog_sha256"] = current_catalog_sha256
+    current_audit["semantic_member_batching"] = semantic_member_batching
     catalog = RoleNeutralEvidenceCatalog(
         outer_fold=int(body["outer_fold"]),
         scope=str(body["scope"]),

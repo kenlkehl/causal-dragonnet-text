@@ -16,12 +16,44 @@ LOGICAL_CONTEXT_PLAN_SCHEMA = "portable_stage1_logical_context_plan_v2"
 LOGICAL_BINDING_SCHEMA = "portable_stage1_logical_scope_binding_v2"
 COMPUTE_CANARY_SCHEMA = "portable_stage1_compute_canary_v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+RowId = str | int
+
+
+def _validated_row_id_keys(
+    row_ids: Sequence[Any],
+    *,
+    label: str,
+    require_nonempty: bool,
+) -> tuple[tuple[str, RowId], ...]:
+    normalized = tuple(row_ids)
+    if require_nonempty and not normalized:
+        raise ValueError(f"{label} must be nonempty")
+    tagged: list[tuple[str, RowId]] = []
+    for value in normalized:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise TypeError(
+                f"{label} must contain only exact string or integer IDs"
+            )
+        tagged.append(
+            (
+                "integer" if isinstance(value, int) else "string",
+                value,
+            )
+        )
+    if len(tagged) != len(set(tagged)):
+        raise ValueError(f"{label} must contain unique IDs")
+    return tuple(tagged)
 
 
 def ordered_row_identity(row_ids: Sequence[Any]) -> str:
-    normalized = tuple(str(value) for value in row_ids)
-    if not normalized or len(normalized) != len(set(normalized)):
-        raise ValueError("ordered fit rows must be nonempty and unique")
+    normalized = tuple(row_ids)
+    _validated_row_id_keys(
+        normalized,
+        label="ordered fit rows",
+        require_nonempty=True,
+    )
+    # Hash the original JSON scalars rather than their string projections.
+    # In particular, integer row 1 and string row "1" are distinct inputs.
     return identity_sha256(list(normalized))
 
 
@@ -31,8 +63,8 @@ class LogicalContext:
     scope_id: str
     purpose: str
     outer_fold: int
-    fit_row_ids: tuple[str, ...]
-    heldout_row_ids: tuple[str, ...]
+    fit_row_ids: tuple[RowId, ...]
+    heldout_row_ids: tuple[RowId, ...]
     architecture_identity: str
     target: str
     scientific_configuration_identity: str
@@ -52,11 +84,17 @@ class LogicalContext:
             raise ValueError("logical context indices must be valid")
         if not self.scope_id or not self.purpose or not self.target:
             raise ValueError("logical context labels are required")
-        if len(self.fit_row_ids) != len(set(self.fit_row_ids)) or not self.fit_row_ids:
-            raise ValueError("logical fit rows must be nonempty and unique")
-        if len(self.heldout_row_ids) != len(set(self.heldout_row_ids)):
-            raise ValueError("logical held-out rows must be unique")
-        if set(self.fit_row_ids) & set(self.heldout_row_ids):
+        fit_keys = _validated_row_id_keys(
+            self.fit_row_ids,
+            label="logical fit rows",
+            require_nonempty=True,
+        )
+        heldout_keys = _validated_row_id_keys(
+            self.heldout_row_ids,
+            label="logical held-out rows",
+            require_nonempty=False,
+        )
+        if set(fit_keys) & set(heldout_keys):
             raise ValueError("logical fit and held-out rows overlap")
         if (
             isinstance(self.scope_seed, bool)
@@ -208,24 +246,32 @@ def derive_logical_context_plan(
     canonical_index = 0
     for outer_fold in sorted(outer_training_partitions):
         partitions = tuple(
-            tuple(str(value) for value in partition)
+            tuple(value for value in partition)
             for partition in outer_training_partitions[outer_fold]
         )
         if len(partitions) < 2 or any(not value for value in partitions):
             raise ValueError("each outer fold needs at least two nonempty partitions")
         flattened = tuple(value for partition in partitions for value in partition)
-        if len(flattened) != len(set(flattened)):
-            raise ValueError("outer training partitions overlap")
-        outer_heldout = tuple(str(value) for value in outer_heldout_rows[outer_fold])
-        if set(flattened) & set(outer_heldout):
+        flattened_keys = _validated_row_id_keys(
+            flattened,
+            label="outer training partitions",
+            require_nonempty=True,
+        )
+        outer_heldout = tuple(outer_heldout_rows[outer_fold])
+        outer_heldout_keys = _validated_row_id_keys(
+            outer_heldout,
+            label="outer held-out rows",
+            require_nonempty=False,
+        )
+        if set(flattened_keys) & set(outer_heldout_keys):
             raise ValueError("outer training and held-out rows overlap")
 
         def append_context(
             *,
             scope_id: str,
             purpose: str,
-            fit_rows: tuple[str, ...],
-            heldout_rows: tuple[str, ...],
+            fit_rows: tuple[RowId, ...],
+            heldout_rows: tuple[RowId, ...],
         ) -> None:
             nonlocal canonical_index
             seed_payload = {

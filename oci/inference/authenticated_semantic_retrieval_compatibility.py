@@ -52,10 +52,10 @@ SEMANTIC_COMPATIBILITY_VIEW_SCHEMA_VERSION = (
 )
 SEMANTIC_RETRIEVAL_DERIVATION = "tfidf_ngrams_contrasting_frozen_embedding_retrieval_tails"
 CURRENT_SPENT_PROJECTION_COMPATIBILITY_VERSION = (
-    "current_spent_semantic_retrieval_projection_compatibility_v3"
+    "current_spent_semantic_retrieval_projection_compatibility_v4"
 )
 CURRENT_SPENT_PROJECTION_MIGRATION_LEDGER_SCHEMA_VERSION = (
-    "current_spent_semantic_retrieval_projection_migration_ledger_v3"
+    "current_spent_semantic_retrieval_projection_migration_ledger_v4"
 )
 CURRENT_SPENT_PROJECTION_COMPATIBILITY_IDENTITY_SCHEMA_VERSION = (
     "current_spent_semantic_retrieval_projection_compatibility_identity_v1"
@@ -69,10 +69,10 @@ CURRENT_SPENT_CACHE_LOCATOR_POLICY = (
 # must carry the provenance fields directly or this compatibility path must be
 # reviewed and versioned again.
 _ALLOWED_CURRENT_SPENT_PROVIDER_CODE_SHA256 = (
-    "6978aa0419a89a0b74a7c187ef1580bfc857ace49159726d2681fc1f0a2d5916"
+    "681cb3cbb26302e6acd4c42f1d8c023ce37e644b48a9766946d2493daa4e3d5c"
 )
 _ALLOWED_LEGACY_GROUPING_HELPER_SHA256 = (
-    "de7a2c5a22fd5253bff4e7157c589ed09631c1cf34b9e6e9fa5ae46fec62c530"
+    "9988f1f541086b5f63481cd3094c846ee80f641924a4860d6df14634d4d74f15"
 )
 _ALLOWED_CACHE_OVERLAY_CODE_SHA256 = (
     "821ceb6780dce1ab9c83d524c00d7ef3253afcf0a5fb824fc50046522c217599"

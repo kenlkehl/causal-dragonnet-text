@@ -36,12 +36,19 @@ from .lossless_stage1_evidence_catalog import (
     NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
 )
 from .neural_cohort_witness import soft_retrieval_activations
+from .neural_numerical_replay import (
+    neural_float_arrays_within_tolerance,
+    validate_neural_replay_settings,
+)
 from .neural_query_agentic_forest import NeuralQueryAgenticForestConfig
 from .neural_query_context_backend import (
     NEURAL_QUERY_CONTEXT_SERVICE_ID,
     ContextFitNeuralQueryService,
     NeuralQueryContextBackend,
     validate_owned_discovery_snapshot,
+)
+from .neural_query_execution_topology import (
+    NeuralQueryExecutionTopology,
 )
 from .production_neural_query_binary_layout import (
     validate_npy_array_set,
@@ -54,7 +61,7 @@ from .production_stage1_scope_scheduler import Stage1ScopePlan, Stage1ScopeSpec
 
 
 ROLE_NEUTRAL_NEURAL_QUERY_GROUP_REQUEST_SCHEMA = (
-    "production_role_neutral_neural_query_physical_group_request_v2"
+    "production_role_neutral_neural_query_physical_group_request_v3"
 )
 ROLE_NEUTRAL_NEURAL_QUERY_FIT_STATE_SCHEMA = (
     "production_role_neutral_neural_query_fit_state_v2"
@@ -338,6 +345,9 @@ def _validated_scientific_configuration(
     evidence_capacity_policy: str,
     embedding_text_coverage_policy: str,
     heldout_transform_policy: str,
+    replay_comparison_policy: str,
+    replay_relative_tolerance: float,
+    replay_absolute_tolerance: float,
 ) -> dict[str, Any]:
     query = _validated_query_configuration(query_config)
     if isinstance(nuisance_folds, bool) or not isinstance(nuisance_folds, int):
@@ -355,6 +365,11 @@ def _validated_scientific_configuration(
         raise ValueError("embedding text coverage policy must explicitly be complete")
     if heldout_transform_policy != REGISTERED_HELDOUT_TRANSFORM_POLICY:
         raise ValueError("held-out transform policy must explicitly forbid labels")
+    replay_policy, replay_rtol, replay_atol = validate_neural_replay_settings(
+        policy=replay_comparison_policy,
+        relative_tolerance=replay_relative_tolerance,
+        absolute_tolerance=replay_absolute_tolerance,
+    )
     service_identity = _closed_json(service_scientific_identity)
     if (
         not isinstance(service_identity, dict)
@@ -383,6 +398,9 @@ def _validated_scientific_configuration(
         "evidence_capacity_policy": evidence_capacity_policy,
         "embedding_text_coverage_policy": embedding_text_coverage_policy,
         "heldout_transform_policy": heldout_transform_policy,
+        "replay_comparison_policy": replay_policy,
+        "replay_relative_tolerance": replay_rtol,
+        "replay_absolute_tolerance": replay_atol,
     }
     return {**body, "content_sha256": _sha256_json(body)}
 
@@ -411,6 +429,9 @@ class RoleNeutralNeuralQueryPhysicalGroupRequest:
         service_scientific_identity: Mapping[str, Any],
         evidence_capacity_policy: str,
         embedding_text_coverage_policy: str,
+        replay_comparison_policy: str,
+        replay_relative_tolerance: float,
+        replay_absolute_tolerance: float,
         heldout_transform_policy: str | None = None,
         exact_transform_policy: str | None = None,
     ) -> "RoleNeutralNeuralQueryPhysicalGroupRequest":
@@ -465,6 +486,9 @@ class RoleNeutralNeuralQueryPhysicalGroupRequest:
             evidence_capacity_policy=evidence_capacity_policy,
             embedding_text_coverage_policy=embedding_text_coverage_policy,
             heldout_transform_policy=selected_transform_policy,
+            replay_comparison_policy=replay_comparison_policy,
+            replay_relative_tolerance=replay_relative_tolerance,
+            replay_absolute_tolerance=replay_absolute_tolerance,
         )
         body = {
             "schema_version": ROLE_NEUTRAL_NEURAL_QUERY_GROUP_REQUEST_SCHEMA,
@@ -516,6 +540,15 @@ class RoleNeutralNeuralQueryPhysicalGroupRequest:
             ),
             heldout_transform_policy=self.scientific_configuration.get(
                 "heldout_transform_policy"
+            ),
+            replay_comparison_policy=self.scientific_configuration.get(
+                "replay_comparison_policy"
+            ),
+            replay_relative_tolerance=self.scientific_configuration.get(
+                "replay_relative_tolerance"
+            ),
+            replay_absolute_tolerance=self.scientific_configuration.get(
+                "replay_absolute_tolerance"
             ),
         )
         if configuration != dict(self.scientific_configuration):
@@ -1111,6 +1144,7 @@ def execute_role_neutral_neural_query_physical_group(
     fit_texts: Sequence[str],
     fit_treatment: Sequence[Any],
     fit_outcome: Sequence[Any],
+    execution_topology: NeuralQueryExecutionTopology | None = None,
     heldout_text_loader: Callable[[tuple[int, ...]], Sequence[str]] | None = None,
     exact_heldout_text_loader: Callable[
         [tuple[int, ...]], Sequence[str]
@@ -1121,6 +1155,20 @@ def execute_role_neutral_neural_query_physical_group(
     if not isinstance(request, RoleNeutralNeuralQueryPhysicalGroupRequest):
         raise TypeError("execution requires its typed neural-query group request")
     request.as_dict()
+    topology = (
+        NeuralQueryExecutionTopology(devices=tuple(service.devices))
+        if execution_topology is None
+        else execution_topology
+    )
+    if not isinstance(topology, NeuralQueryExecutionTopology):
+        raise TypeError(
+            "neural-query execution requires a typed deployment topology"
+        )
+    if tuple(service.devices) != topology.devices:
+        raise ValueError(
+            "live neural-query service devices differ from the reserved "
+            "execution topology"
+        )
     service_identity = _validate_service_against_request(service, request)
     root = Path(output_root)
     if not root.is_absolute():
@@ -1357,13 +1405,23 @@ def execute_role_neutral_neural_query_physical_group(
         or tuple(live_prediction.feature_names) != replay_names
         or tuple(live_prediction.feature_kinds) != replay_kinds
         or tuple(live_prediction.feature_roles) != replay_roles
-        or not np.array_equal(
+        or not neural_float_arrays_within_tolerance(
             np.asarray(live_prediction.feature_values, dtype=np.float64),
             replay_values,
+            policy=request.scientific_configuration[
+                "replay_comparison_policy"
+            ],
+            relative_tolerance=request.scientific_configuration[
+                "replay_relative_tolerance"
+            ],
+            absolute_tolerance=request.scientific_configuration[
+                "replay_absolute_tolerance"
+            ],
         )
     ):
         raise RuntimeError(
-            "live owned neural-query transform differs from safe snapshot replay"
+            "live owned neural-query transform differs from safe snapshot "
+            "replay beyond its declared tolerance"
         )
     if (
         live_prediction.calibrated_source_names
@@ -2112,9 +2170,24 @@ def replay_role_neutral_neural_query_heldout_transform(
         list(names) != prediction["feature_names"]
         or list(kinds) != prediction["feature_kinds"]
         or list(roles) != prediction["feature_roles"]
-        or not np.array_equal(values, sealed_values)
+        or not neural_float_arrays_within_tolerance(
+            values,
+            sealed_values,
+            policy=request.scientific_configuration[
+                "replay_comparison_policy"
+            ],
+            relative_tolerance=request.scientific_configuration[
+                "replay_relative_tolerance"
+            ],
+            absolute_tolerance=request.scientific_configuration[
+                "replay_absolute_tolerance"
+            ],
+        )
     ):
-        raise RuntimeError("fresh neural-query safe-state replay differs from sealed output")
+        raise RuntimeError(
+            "fresh neural-query safe-state replay differs from sealed output "
+            "beyond its declared tolerance"
+        )
     return {
         "gate_row_ids": owner.heldout_row_ids,
         "feature_names": names,

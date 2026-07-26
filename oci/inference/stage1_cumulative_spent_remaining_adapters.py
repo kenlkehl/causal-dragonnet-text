@@ -343,6 +343,10 @@ _TFIDF_METADATA_FIELDS = frozenset(
         "config_hash",
         "common_vocabulary_size",
         "common_vocabulary",
+        "common_vocabulary_selection",
+        "nuisance_stack_scientific",
+        "screening_scientific",
+        "nmf_scientific",
         "nuisance",
         "topic_banks",
         "heldout_score_tests_enabled",
@@ -671,6 +675,34 @@ def _tfidf_configuration(
     config: AppliedInferenceConfig, metadata: Mapping[str, Any]
 ) -> dict[str, Any]:
     nn_config = config.architecture.multi_model_forest
+    topic_config = nn_config.tfidf_topic
+    vocabulary = metadata.get("common_vocabulary")
+    selection = metadata.get("common_vocabulary_selection")
+    expected_selection = {
+        "selected_term_count": len(vocabulary) if isinstance(vocabulary, list) else -1,
+        "configured_max_features": int(topic_config.max_features),
+        "selection_rule": topic_config.vectorizer_scientific.feature_selection_rule,
+        "complete_input_text_consumed": True,
+    }
+    if (
+        not isinstance(vocabulary, list)
+        or not vocabulary
+        or any(type(term) is not str or not term for term in vocabulary)
+        or len(set(vocabulary)) != len(vocabulary)
+        or type(metadata.get("common_vocabulary_size")) is not int
+        or metadata.get("common_vocabulary_size") != len(vocabulary)
+        or not isinstance(selection, Mapping)
+        or _canonical_json(selection) != _canonical_json(expected_selection)
+        or _canonical_json(metadata.get("nuisance_stack_scientific"))
+        != _canonical_json(asdict(topic_config.nuisance_stack_scientific))
+        or _canonical_json(metadata.get("screening_scientific"))
+        != _canonical_json(asdict(topic_config.screening_scientific))
+        or _canonical_json(metadata.get("nmf_scientific"))
+        != _canonical_json(asdict(topic_config.nmf_scientific))
+    ):
+        raise ValueError(
+            "TF-IDF metadata differs from its configured scientific policies"
+        )
     return {
         "text_column": config.text_column,
         "treatment_column": config.treatment_column,
@@ -680,7 +712,7 @@ def _tfidf_configuration(
         "nuisance_folds": int(nn_config.nuisance_folds),
         "bow_views": [asdict(value) for value in nn_config.bow_views],
         "tfidf_nested_calibration_folds": int(nn_config.tfidf_nested_calibration_folds),
-        "topic_configuration": asdict(nn_config.tfidf_topic),
+        "topic_configuration": asdict(topic_config),
         "topic_configuration_hash": metadata.get("config_hash"),
         "score_selection_label_policy": "nested_fit_calibration",
         "heldout_alias_policy": "id_and_spent_text_only_after_selection_freeze",

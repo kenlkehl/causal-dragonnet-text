@@ -65,10 +65,19 @@ from oci.inference.lossless_stage1_evidence_catalog import (
     build_complete_architecture_chunks,
     validate_role_neutral_catalog,
 )
+from tests.hierarchy_resource_test_support import HIERARCHY_JOB_CACHE_CONFIG
+from tests.semantic_member_batching_test_support import (
+    semantic_member_batching_audit,
+    semantic_member_batching_identity,
+)
 
 
 def _catalog() -> RoleNeutralEvidenceCatalog:
     split_fingerprint = "1" * 64
+    semantic_member_batch_size = 1
+    batching = semantic_member_batching_identity(
+        semantic_member_batch_size=semantic_member_batch_size,
+    )
     atoms = []
     for ordinal, family in enumerate(ACTIVE_STAGE1_CONCEPT_FAMILIES, start=1):
         member_id = f"member_{ordinal:03d}"
@@ -110,6 +119,7 @@ def _catalog() -> RoleNeutralEvidenceCatalog:
         )
     identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": batching,
         "outer_fold": 1,
         "scope": "outer_train",
         "inner_fold": None,
@@ -125,7 +135,11 @@ def _catalog() -> RoleNeutralEvidenceCatalog:
         atoms=tuple(atoms),
         non_grounding_numerical_summaries=(),
         catalog_sha256=content_sha256(identity),
-        _audit_json="{}",
+        _audit_json=canonical_json(
+            semantic_member_batching_audit(
+                semantic_member_batch_size=semantic_member_batch_size,
+            )
+        ),
     )
     validate_role_neutral_catalog(catalog)
     return catalog
@@ -1122,7 +1136,10 @@ def test_cache_binding_static_preflight_and_wrong_approval_do_not_read_cache(tmp
     target.mkdir()
     root = tmp_path / "cache_symlink"
     root.symlink_to(target, target_is_directory=True)
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     agent, runner = _agent(job_cache=cache)
 
     binding = agent.precommit.packet["job_cache_binding"]
@@ -1144,7 +1161,10 @@ def test_cache_binding_static_preflight_and_wrong_approval_do_not_read_cache(tmp
 
 def test_invalid_semantic_response_is_repaired_then_only_validated_output_is_cached(tmp_path):
     cache_root = tmp_path / "cache"
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     runner = _InvalidFirstSemanticRunner()
     agent, _ = _agent(runner=runner, job_cache=cache)
 
@@ -1176,7 +1196,10 @@ def test_invalid_semantic_response_is_repaired_then_only_validated_output_is_cac
 
 def test_poisoned_raw_metadata_fails_before_cache_write_and_cannot_seed_replay(tmp_path):
     cache_root = tmp_path / "cache"
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     poisoned_agent, poisoned_runner = _agent(
         runner=_PoisonedSuccessfulMetadataRunner(),
         job_cache=cache,
@@ -1202,7 +1225,10 @@ def test_poisoned_raw_metadata_fails_before_cache_write_and_cannot_seed_replay(t
 
 def test_poisoned_repair_raw_metadata_fails_before_cache_write(tmp_path):
     cache_root = tmp_path / "cache"
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     agent, runner = _agent(runner=_PoisonedRepairMetadataRunner(), job_cache=cache)
 
     with pytest.raises(ValueError, match="final parsed response hash"):
@@ -1230,7 +1256,10 @@ def test_initial_response_envelope_metadata_fails_before_cache_write(
     runner = _PoisonedSuccessfulResponseEnvelopeRunner(field=field, mode=mode)
     agent, _ = _agent(
         runner=runner,
-        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root),
+        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(
+            root=cache_root,
+            config=HIERARCHY_JOB_CACHE_CONFIG,
+        ),
     )
 
     with pytest.raises(ValueError, match=message):
@@ -1255,7 +1284,10 @@ def test_repair_response_envelope_metadata_fails_before_cache_write(tmp_path, fi
     runner = _PoisonedRepairResponseEnvelopeRunner(field=field, mode=mode)
     agent, _ = _agent(
         runner=runner,
-        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root),
+        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(
+            root=cache_root,
+            config=HIERARCHY_JOB_CACHE_CONFIG,
+        ),
     )
 
     with pytest.raises(ValueError, match=message):
@@ -1280,7 +1312,10 @@ def test_invalid_initial_response_envelope_is_rejected_before_repair_or_cache(
     runner = _PoisonedInvalidResponseEnvelopeRunner(field=field, mode=mode)
     agent, _ = _agent(
         runner=runner,
-        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root),
+        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(
+            root=cache_root,
+            config=HIERARCHY_JOB_CACHE_CONFIG,
+        ),
     )
 
     with pytest.raises(ValueError, match=message):
@@ -1298,7 +1333,10 @@ def test_wrong_response_model_cannot_seed_a_later_cache_replay(tmp_path):
     )
     poisoned_agent, _ = _agent(
         runner=poisoned_runner,
-        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root),
+        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(
+            root=cache_root,
+            config=HIERARCHY_JOB_CACHE_CONFIG,
+        ),
     )
     with pytest.raises(ValueError, match="response model differs"):
         poisoned_agent.execute(approved_wrapper_sha256=poisoned_agent.precommit.approval_sha256)
@@ -1307,7 +1345,10 @@ def test_wrong_response_model_cannot_seed_a_later_cache_replay(tmp_path):
     clean_runner = _FailOnceRunner(fail_on_remote_attempt=2)
     replay_agent, _ = _agent(
         runner=clean_runner,
-        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root),
+        job_cache=AuthenticatedHierarchicalDiscoveryJobCache(
+            root=cache_root,
+            config=HIERARCHY_JOB_CACHE_CONFIG,
+        ),
     )
     with pytest.raises(RuntimeError, match="one later remote job failed"):
         replay_agent.execute(approved_wrapper_sha256=replay_agent.precommit.approval_sha256)
@@ -1317,7 +1358,10 @@ def test_wrong_response_model_cannot_seed_a_later_cache_replay(tmp_path):
 
 
 def test_strict_json_failure_metadata_is_authenticated_before_successful_repair(tmp_path):
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=tmp_path / "cache")
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=tmp_path / "cache",
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     agent, runner = _agent(runner=_InvalidFirstStrictJsonRunner(), job_cache=cache)
 
     result = agent.execute(approved_wrapper_sha256=agent.precommit.approval_sha256)
@@ -1335,7 +1379,10 @@ def test_strict_json_failure_metadata_is_authenticated_before_successful_repair(
 
 
 def test_raw_transport_budget_failure_is_authenticated_before_successful_repair(tmp_path):
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=tmp_path / "cache")
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=tmp_path / "cache",
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     agent, runner = _agent(runner=_InvalidFirstRawTransportRunner(), job_cache=cache)
 
     result = agent.execute(approved_wrapper_sha256=agent.precommit.approval_sha256)
@@ -1354,7 +1401,10 @@ def test_raw_transport_budget_failure_is_authenticated_before_successful_repair(
 
 def test_fully_rehashed_fabricated_repair_trace_fails_on_cache_replay(tmp_path):
     cache_root = tmp_path / "cache"
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     agent, _ = _agent(runner=_InvalidFirstSemanticRunner(), job_cache=cache)
     agent.execute(approved_wrapper_sha256=agent.precommit.approval_sha256)
 
@@ -1384,7 +1434,10 @@ def test_fully_rehashed_fabricated_repair_trace_fails_on_cache_replay(tmp_path):
 
 
 def test_dynamic_jobs_resume_after_later_failure_and_trace_cache_hits(tmp_path):
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=tmp_path / "cache")
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=tmp_path / "cache",
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     runner = _FailOnceRunner(fail_on_remote_attempt=5)
     agent, _ = _agent(runner=runner, job_cache=cache)
 

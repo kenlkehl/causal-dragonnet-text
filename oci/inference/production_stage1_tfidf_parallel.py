@@ -42,6 +42,22 @@ TFIDF_CUMULATIVE_RESULT_SCHEMA = "production_cumulative_tfidf_scope_result_v1"
 TFIDF_SPENT_ONLY_DATASET_MARKER = "__spent_only_in_memory__"
 _SCOPE_ID = re.compile(r"^outer_[0-9]{3}_hierarchy_epoch_[0-9]{3}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LEGACY_DIRECT_CALL_SEED = 42
+
+
+def _configured_tfidf_seed(
+    config: AppliedInferenceConfig,
+    *,
+    override: int | None = None,
+) -> int:
+    """Resolve the compatibility config's nullable seed without changing it."""
+
+    value = config.seed if override is None else override
+    if value is None:
+        value = _LEGACY_DIRECT_CALL_SEED
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("cumulative TF-IDF seed must be a nonnegative integer")
+    return int(value)
 
 
 def _json_default(value: Any) -> Any:
@@ -133,9 +149,7 @@ def project_tfidf_worker_config(
             multi_model_forest=nn_config,
         ),
     )
-    projected.seed = int(
-        getattr(source, "seed", 42) if seed is None else seed
-    )
+    projected.seed = _configured_tfidf_seed(source, override=seed)
     return projected
 
 
@@ -233,7 +247,7 @@ class CumulativeTfidfScopeTask:
     def input_identity(self) -> Mapping[str, Any]:
         reference = self.requests[self.family_order[0]]
         scope_seed = derive_cumulative_tfidf_scope_seed(
-            global_seed=int(getattr(self.config, "seed", 42)),
+            global_seed=_configured_tfidf_seed(self.config),
             scope_id=self.scope_id,
         )
         body = {
@@ -249,7 +263,7 @@ class CumulativeTfidfScopeTask:
             "spent_row_ids": list(reference.spent_row_ids),
             "sealed_row_ids": list(reference.sealed_row_ids),
             "replay_canary": dict(self.replay_canary.binding),
-            "global_seed": int(getattr(self.config, "seed", 42)),
+            "global_seed": _configured_tfidf_seed(self.config),
             "scope_seed": scope_seed,
             "scientific_tfidf_config_sha256": _sha256_json(
                 asdict(self.config)

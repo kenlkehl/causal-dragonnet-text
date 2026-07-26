@@ -19,7 +19,10 @@ from oci.inference.all_evidence_fusion_runner import (
     AllEvidenceFusionRunResult,
     AllEvidenceFusionRunner,
 )
-from oci.inference.all_evidence_post_extraction_review import CausalReviewConfig
+from oci.inference.all_evidence_post_extraction_review import (
+    GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY,
+    CausalReviewConfig,
+)
 from oci.inference.production_stage1_hierarchy_one_shot import (
     PRODUCTION_STAGE1_HIERARCHY_ONE_SHOT_ATTESTATION_SCHEMA,
     ProductionSingleEndpointFeatureSearchAgent,
@@ -66,6 +69,10 @@ from oci.models.strict_causal_forest_runtime import (
 from tests.test_portable_workflow_contracts import (
     _forest_operational,
     _forest_spec,
+)
+from tests.hierarchy_resource_test_support import (
+    FIRST_UNTOUCHED_GATE_BOUNDS,
+    HIERARCHY_JOB_CACHE_CONFIG,
 )
 
 TEST_ENDPOINT = "https://llm.example.test:8443/v1"
@@ -360,6 +367,8 @@ def _options(tmp_path: Path) -> ProductionStage1HierarchyOneShotOptions:
         initial_training_partitions=3,
         stage2_protocol=_stage2_protocol(),
         stage2_tokenizer_locator=tokenizer,
+        hierarchical_discovery_job_cache_config=HIERARCHY_JOB_CACHE_CONFIG,
+        first_untouched_gate_preparation_bounds=FIRST_UNTOUCHED_GATE_BOUNDS,
         post_extraction_review_config=_causal_review_config(),
         post_extraction_scientific_policy=(_post_extraction_scientific_policy()),
         review_stage1_device="cpu",
@@ -549,6 +558,12 @@ def test_stage2_prompt_protocol_has_no_defaults_and_cli_requires_every_field() -
     assert actions["review_stage1_device"].default is None
     assert actions["review_neural_query_device"].required is True
     assert actions["review_neural_query_device"].default is None
+    assert actions["hierarchical_job_cache_max_entry_bytes"].required is True
+    assert actions["hierarchical_job_cache_max_entry_bytes"].default is None
+    for field_name in FIRST_UNTOUCHED_GATE_BOUNDS.__dataclass_fields__:
+        action = actions["first_untouched_gate_" + field_name]
+        assert action.required is True
+        assert action.default is None
 
     first = _stage2_protocol(
         proposal_max_tokens=26_001,
@@ -1074,6 +1089,105 @@ def test_explicit_extractor_rejects_response_metadata_before_content(
         extractor._extract_single_server("patient text must remain unread")
 
 
+def test_complete_page_reconciliation_prompt_strips_authenticated_citation_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from oci.extraction.complete_paged import (
+        COMPLETE_PAGED_RESPONSE_SCHEMA,
+        CompleteFeatureContract,
+        CompletePageResponse,
+    )
+
+    text = "alpha beta"
+    leaf = CompletePageResponse.validate(
+        {
+            "schema_version": COMPLETE_PAGED_RESPONSE_SCHEMA,
+            "status": "positive",
+            "normalized_value": "present",
+            "reason": None,
+            "citations": [
+                {
+                    "start": 0,
+                    "end": 5,
+                    "text": "alpha",
+                }
+            ],
+        },
+        text=text,
+        page=None,
+    ).as_dict()
+    assert set(leaf["citations"][0]) == {"start", "end", "text", "sha256"}
+
+    generation = _generation_policy().patient_feature_extraction
+    extractor = subject.ProductionSingleEndpointVLLMFeatureExtractor(
+        specs=[],
+        mode="server",
+        server_url=TEST_ENDPOINT,
+        model_name=TEST_MODEL,
+        model_names_by_url={TEST_ENDPOINT: TEST_MODEL},
+        vllm_enable_thinking=generation.thinking_enabled,
+        temperature=generation.temperature,
+        max_tokens=generation.max_tokens,
+        max_retries=generation.transport_max_retries,
+        schema_repair_attempts=generation.schema_repair_attempts,
+        prompt_nontruncation_guard=_PromptGuard(),
+        generation_parameters=generation,
+    )
+    calls: list[dict[str, object]] = []
+
+    def copy_prompt_citation(request: object) -> object:
+        assert isinstance(request, dict)
+        calls.append(request)
+        messages = request["messages"]
+        assert isinstance(messages, list)
+        prompt = messages[0]["content"]
+        assert isinstance(prompt, str)
+        prompt_children = json.loads(prompt.split("\nchildren=", 1)[1])
+        copied_citation = prompt_children[0]["response"]["citations"][0]
+        assert set(copied_citation) == {"start", "end", "text"}
+        content = json.dumps(
+            {
+                "child_ids": ["leaf-a", "leaf-b"],
+                "schema_version": COMPLETE_PAGED_RESPONSE_SCHEMA,
+                "status": "positive",
+                "normalized_value": "present",
+                "reason": None,
+                "citations": [copied_citation],
+            }
+        )
+        return _completion_response(content=content)
+
+    monkeypatch.setattr(extractor, "_complete_page_call", copy_prompt_citation)
+    feature = CompleteFeatureContract(
+        name="documented_marker",
+        value_type="categorical",
+        description="Whether the marker is documented",
+        categories=("present", "absent"),
+        temporal_rule="use eligible evidence only",
+        aggregation_rule="ever documented",
+    )
+    result, audit = extractor.reconcile_complete_pages(
+        text=text,
+        feature=feature,
+        children=(
+            {"node_id": "leaf-a", "response": leaf},
+            {"node_id": "leaf-b", "response": leaf},
+        ),
+    )
+
+    assert len(calls) == 1
+    assert audit["schema_repair_count"] == 0
+    assert result["citations"] == [
+        {
+            "start": 0,
+            "end": 5,
+            "text": "alpha",
+            "sha256": hashlib.sha256(b"alpha").hexdigest(),
+        }
+    ]
+    assert set(leaf["citations"][0]) == {"start", "end", "text", "sha256"}
+
+
 def test_roots_are_absolute_fresh_nonnested_and_outside_bundle(tmp_path: Path) -> None:
     options = _options(tmp_path)
     _validate_fresh_roots(options)
@@ -1395,6 +1509,106 @@ def test_fixed_endpoint_is_explicitly_propagated_to_all_three_client_paths(
     assert runner.review_partition_provider is provider
     assert runner.review_gate_source_provider is gate_provider
     assert runner.review_gate_feature_bank_provider is gate_provider
+    assert (
+        runner.hierarchical_discovery_job_cache_config
+        is options.hierarchical_discovery_job_cache_config
+    )
+    assert (
+        runner.first_untouched_gate_preparation_bounds
+        is options.first_untouched_gate_preparation_bounds
+    )
+
+
+def test_reference_only_builder_propagates_explicit_cache_and_gate_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared_path = tmp_path / "portable_prepared.parquet"
+    options = replace(
+        _options(tmp_path),
+        prepared_cohort_path=prepared_path,
+        unit_id_column="portable_patient_id",
+        text_column="portable_note",
+        treatment_column="portable_treatment",
+        outcome_column="portable_outcome",
+        outcome_type="binary",
+        upstream_review_policy=(
+            GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY
+        ),
+    )
+    provider = object()
+    numerical_bank = object()
+    direct_inputs = subject.ReferenceOnlyRoleNeutralStage2Inputs(
+        prepared=pd.DataFrame(),
+        prepared_cohort_artifact_sha256="1" * 64,
+        outer_fold_assignments={
+            1: {"fit": (1,), "held_out": (2,)},
+            2: {"fit": (2,), "held_out": (1,)},
+        },
+        prepared_projection_binding=object(),
+        runtime_binding=object(),
+        numerical_bank=numerical_bank,
+    )
+    handoff = SimpleNamespace(stage2_provider=provider)
+    prompt_guard = _PromptGuard()
+
+    monkeypatch.setattr(
+        subject,
+        "Stage2PromptNonTruncationGuard",
+        lambda **_kwargs: prompt_guard,
+    )
+    monkeypatch.setattr(
+        subject,
+        "ProductionSingleEndpointFeatureSearchAgent",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        subject,
+        "ProductionSingleEndpointExplicitFeatureExtractionProvider",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    def hierarchy_runner(**kwargs: object) -> object:
+        return SimpleNamespace(
+            identity=lambda: {
+                "endpoint_urls": [kwargs["server_urls"]],
+                "model": {"name": kwargs["model_name"]},
+                "prompt_nontruncation_guard": prompt_guard.identity(),
+            }
+        )
+
+    monkeypatch.setattr(
+        subject,
+        "ProductionSingleEndpointJsonDiscoveryJobRunner",
+        hierarchy_runner,
+    )
+    monkeypatch.setattr(
+        subject,
+        "_configured_strict_causal_forest_backend",
+        lambda _options: object(),
+    )
+
+    class CapturedRunner:
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
+
+    monkeypatch.setattr(subject, "AllEvidenceFusionRunner", CapturedRunner)
+    runner = subject._construct_reference_only_role_neutral_stage2_runner(
+        runner_type=CapturedRunner,
+        handoff=handoff,
+        direct_inputs=direct_inputs,
+        options=options,
+        endpoint=TEST_ENDPOINT,
+    )
+
+    assert (
+        runner.hierarchical_discovery_job_cache_config
+        is options.hierarchical_discovery_job_cache_config
+    )
+    assert (
+        runner.first_untouched_gate_preparation_bounds
+        is options.first_untouched_gate_preparation_bounds
+    )
 
 
 @pytest.mark.parametrize(

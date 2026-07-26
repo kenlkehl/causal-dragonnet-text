@@ -148,7 +148,10 @@ def _configured_seed(config: AppliedInferenceConfig) -> int:
     here preserves those callers while ensuring a propagated ``config.seed``
     controls every v2 outer and inner split.
     """
-    return int(getattr(config, "seed", _DEFAULT_STAGE1_SEED))
+    configured = getattr(config, "seed", None)
+    if configured is None:
+        return _DEFAULT_STAGE1_SEED
+    return int(configured)
 
 
 def _tfidf_context_scope_seed(*, global_seed: int, scope_id: str) -> int:

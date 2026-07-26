@@ -2505,6 +2505,13 @@ def finalize_legacy_stage1_component_from_merge(
                 row["scope_kind"] == "cumulative_spent" for row in ordered_cluster_rows
             ),
             "scope_order": cluster_order,
+            "logical_scope_count": len(
+                prepared.embedding_cluster_feasibility_audit["scope_order"]
+            ),
+            "logical_scope_order": list(
+                prepared.embedding_cluster_feasibility_audit["scope_order"]
+            ),
+            "all_logical_scopes_bound_to_physical_fit": True,
             "all_actual_identities_equal_preflight": True,
             "scopes": ordered_cluster_rows,
         }

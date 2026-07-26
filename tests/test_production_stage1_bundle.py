@@ -90,9 +90,19 @@ from tests.cluster_local_embedding_test_support import (
     cluster_local_embedding_config,
 )
 from tests.semantic_witness_test_support import semantic_witness_config
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 
 
 _SEMANTIC_WITNESS_CONFIG = semantic_witness_config()
+
+
+def _physical_fit_identity_file(tmp_path: Path) -> Path:
+    path = tmp_path / "physical_fit_identity.json"
+    path.write_text(
+        json.dumps(PHYSICAL_FIT_IDENTITY.as_dict()),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _embedding_cache_configuration(config: AppliedInferenceConfig) -> dict:
@@ -118,11 +128,76 @@ def _embedding_cache_configuration(config: AppliedInferenceConfig) -> dict:
     }
 
 
+def _legacy_cache_migration_case(
+    config: AppliedInferenceConfig,
+) -> tuple[SimpleNamespace, dict, dict]:
+    typed_configuration = _embedding_cache_configuration(config)
+    raw_configuration = {
+        key: typed_configuration[key]
+        for key in (
+            "chunk_size_words",
+            "chunk_overlap_words",
+            "max_chunks",
+            "chunk_selection",
+            "normalize_embeddings",
+            "max_seq_length",
+        )
+    }
+    builder_sha256 = "b" * 64
+    model_tree_sha256 = "c" * 64
+    embedding = config.architecture.multi_model_forest.embedding_contrast
+    metadata = {
+        "sentence_model_name": str(embedding.model_name),
+        **raw_configuration,
+        "total_chunks": 17,
+        "hidden_size": 8,
+        "production_provenance": {
+            "chunk_configuration": raw_configuration,
+            "builder_code_sha256": builder_sha256,
+            "local_model": {"tree_sha256": model_tree_sha256},
+        },
+    }
+    typed_expectation = {
+        "schema_version": "legacy_embedding_cache_migration_expectation_v2",
+        "prepared_expectation_identity": "d" * 64,
+        "embedding_model_name": str(embedding.model_name),
+        "embedding_model_tree_sha256": model_tree_sha256,
+        "chunk_configuration": copy.deepcopy(typed_configuration),
+        "ordered_text_sha256": "e" * 64,
+        "expected_chunk_count": 17,
+        "expected_hidden_size": 8,
+        "legacy_builder_code_sha256": builder_sha256,
+        "legacy_encoder_semantics_derivation": {"authenticated": True},
+    }
+    migration_body = {
+        "schema_version": "legacy_terminal_typed_request_migration_identity_v1",
+        "phase": "embedding_cache",
+        "typed_expectation": typed_expectation,
+        "typed_expectation_identity": _sha256_json(typed_expectation),
+        "upstream_prepared_artifact_id": "f" * 64,
+        "upstream_prepared_identity_reauthenticated": True,
+        "prepared_projection_recomputed": True,
+        "ordered_text_identity_recomputed": True,
+        "word_chunk_registry_recomputed_exactly": True,
+        "chunk_and_tokenization_capacity_nonbinding": True,
+        "dense_array_shape_dtype_and_finiteness_reopened": True,
+        "encoder_semantics_attestation": {"authenticated": True},
+        "source_tree_mutated": False,
+        "legacy_payload_copies_materialized": False,
+    }
+    migration_identity = {
+        **migration_body,
+        "content_sha256": _sha256_json(migration_body),
+    }
+    return SimpleNamespace(metadata=metadata), typed_configuration, migration_identity
+
+
 def _valid_config(tmp_path: Path) -> tuple[AppliedInferenceConfig, Path]:
     config = AppliedInferenceConfig(cv_folds=3)
     architecture = config.architecture
     architecture.model_type = "multi_model_forest"
     architecture.htr_freeze_sentence_encoder = False
+    architecture.htr_require_live_unfrozen_encoder_attestation = True
     model_dir = tmp_path / "htr_model"
     model_dir.mkdir()
     (model_dir / "weights.bin").write_bytes(b"test model")
@@ -170,8 +245,12 @@ def _valid_config(tmp_path: Path) -> tuple[AppliedInferenceConfig, Path]:
     forest.require_honest_outer_split = True
     forest.candidate_consistency_enabled = True
     forest.candidate_consistency_inner_folds = 4
+    forest.tfidf_topic.score_selection_label_policy = "nested_fit_calibration"
     forest.embedding_contrast.enabled = True
     forest.embedding_contrast.include_cluster_contrast_vectors = True
+    forest.embedding_contrast.include_bow_phrases_as_concepts = False
+    forest.embedding_contrast.concept_phrases = []
+    forest.embedding_contrast.external_corpus_cache_dirs = []
     forest.embedding_contrast.cluster_local_scientific = (
         cluster_local_embedding_config()
     )
@@ -427,7 +506,9 @@ def _write_legacy_component(tmp_path: Path, registry: dict, registry_sha: str):
     return handoff, rows
 
 
-def test_cli_is_one_command_and_has_no_digest_approval_option():
+def test_cli_is_one_command_and_has_no_digest_approval_option(
+    tmp_path: Path,
+):
     parser = build_parser()
     destinations = {action.dest for action in parser._actions}
     assert "approval_sha256" not in destinations
@@ -446,6 +527,8 @@ def test_cli_is_one_command_and_has_no_digest_approval_option():
             "person_key",
             "--initial-training-partitions",
             "3",
+            "--physical-fit-identity",
+            str(_physical_fit_identity_file(tmp_path)),
             "--query-config",
             "query.json",
             "--dry-run",
@@ -454,7 +537,9 @@ def test_cli_is_one_command_and_has_no_digest_approval_option():
     assert args.dry_run is True
 
 
-def test_cli_supports_one_command_fresh_cache_build_and_rejects_write_on_dry_run():
+def test_cli_supports_one_command_fresh_cache_build_and_rejects_write_on_dry_run(
+    tmp_path: Path,
+):
     parser = build_parser()
     values = [
         "--dataset",
@@ -471,6 +556,8 @@ def test_cli_supports_one_command_fresh_cache_build_and_rejects_write_on_dry_run
         "person_key",
         "--initial-training-partitions",
         "3",
+        "--physical-fit-identity",
+        str(_physical_fit_identity_file(tmp_path)),
         "--query-config",
         "query.json",
     ]
@@ -482,7 +569,9 @@ def test_cli_supports_one_command_fresh_cache_build_and_rejects_write_on_dry_run
         options_from_args(parser.parse_args([*values, "--dry-run"]))
 
 
-def test_cli_rejects_incomplete_or_resume_fresh_cache_modes():
+def test_cli_rejects_incomplete_or_resume_fresh_cache_modes(
+    tmp_path: Path,
+):
     parser = build_parser()
     base = [
         "--dataset",
@@ -497,6 +586,8 @@ def test_cli_rejects_incomplete_or_resume_fresh_cache_modes():
         "person_key",
         "--initial-training-partitions",
         "3",
+        "--physical-fit-identity",
+        str(_physical_fit_identity_file(tmp_path)),
         "--query-config",
         "query.json",
     ]
@@ -527,6 +618,7 @@ def test_prepare_rejects_output_root_symlink_before_resolution(tmp_path: Path):
             output_dir=linked_output,
             unit_id_column="person_key",
             initial_training_partitions=3,
+            physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         )
     )
     with pytest.raises(ValueError, match="output directory cannot be a symlink"):
@@ -558,6 +650,7 @@ def test_prepare_rejects_overlapping_cache_and_output_trees(
             output_dir=output,
             unit_id_column="person_key",
             initial_training_partitions=3,
+            physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         )
     )
     with pytest.raises(ValueError, match="must be disjoint"):
@@ -572,6 +665,7 @@ def test_production_identity_rejects_non_utf8_cohort_values(surrogate):
 
 def test_cli_returns_nonzero_when_readiness_preflight_is_blocked(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ):
     monkeypatch.setattr(
         ProductionStage1BundleBuilder,
@@ -580,6 +674,7 @@ def test_cli_returns_nonzero_when_readiness_preflight_is_blocked(
             "status": "blocked_pending_cumulative_hierarchy_emission_and_e2e_validation"
         },
     )
+    identity_path = _physical_fit_identity_file(tmp_path)
     assert (
         main(
             [
@@ -595,6 +690,8 @@ def test_cli_returns_nonzero_when_readiness_preflight_is_blocked(
                 "person_key",
                 "--initial-training-partitions",
                 "3",
+                "--physical-fit-identity",
+                str(identity_path),
                 "--query-config",
                 "query.json",
                 "--dry-run",
@@ -1273,6 +1370,7 @@ def test_query_component_emits_owned_snapshots_exact_moments_and_native_proofs(
             output_dir=output,
             unit_id_column="unit_id",
             initial_training_partitions=3,
+            physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         )
     )
     builder._run_query_component(root, output, prepared)
@@ -1303,6 +1401,38 @@ def test_effective_config_requires_every_legacy_architecture(tmp_path: Path):
     assert htr_path == model_dir
     assert validated.architecture.htr_require_live_unfrozen_encoder_attestation is True
     assert validated.architecture.multi_model_forest.outer_parallelism == "1"
+    assert (
+        validated.architecture.multi_model_forest.tfidf_topic.score_selection_label_policy
+        == "nested_fit_calibration"
+    )
+
+    implicit_tfidf_policy = copy.deepcopy(config)
+    (
+        implicit_tfidf_policy.architecture.multi_model_forest.tfidf_topic
+        .score_selection_label_policy
+    ) = "registered_context_heldout"
+    with pytest.raises(ValueError, match="explicit nested_fit_calibration"):
+        _validate_effective_config(
+            implicit_tfidf_policy,
+            dataset_path=tmp_path / "cohort.parquet",
+            embedding_cache_dir=tmp_path / "cache",
+            config_dir=tmp_path,
+            seed=19,
+        )
+
+    implicit_bow_concepts = copy.deepcopy(config)
+    (
+        implicit_bow_concepts.architecture.multi_model_forest.embedding_contrast
+        .include_bow_phrases_as_concepts
+    ) = True
+    with pytest.raises(ValueError, match="include_bow_phrases_as_concepts=false"):
+        _validate_effective_config(
+            implicit_bow_concepts,
+            dataset_path=tmp_path / "cohort.parquet",
+            embedding_cache_dir=tmp_path / "cache",
+            config_dir=tmp_path,
+            seed=19,
+        )
 
     missing_htr = copy.deepcopy(config)
     missing_htr.architecture.multi_model_forest.htr_evidence_enabled = False
@@ -1460,6 +1590,60 @@ def test_cache_configuration_requires_explicit_supported_chunk_selection(
 
     metadata["chunk_selection"] = "last"
     _validate_cache_configuration(SimpleNamespace(metadata=metadata), config)
+
+
+def test_cache_configuration_accepts_exact_sealed_legacy_typed_projection(
+    tmp_path: Path,
+):
+    config, _model_dir = _valid_config(tmp_path)
+    cache, typed_configuration, migration_identity = (
+        _legacy_cache_migration_case(config)
+    )
+
+    _validate_cache_configuration(
+        cache,
+        config,
+        cache_configuration=typed_configuration,
+        legacy_terminal_migration_identity=migration_identity,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("typed_projection", "raw_legacy_field", "unsealed_identity"),
+)
+def test_cache_configuration_rejects_mismatched_legacy_typed_projection(
+    tmp_path: Path,
+    mutation: str,
+):
+    config, _model_dir = _valid_config(tmp_path)
+    cache, typed_configuration, migration_identity = (
+        _legacy_cache_migration_case(config)
+    )
+    if mutation == "typed_projection":
+        migration_identity["typed_expectation"]["chunk_configuration"][
+            "truncate_dim"
+        ] = 64
+        migration_identity["typed_expectation_identity"] = _sha256_json(
+            migration_identity["typed_expectation"]
+        )
+        body = dict(migration_identity)
+        body.pop("content_sha256")
+        migration_identity["content_sha256"] = _sha256_json(body)
+    elif mutation == "raw_legacy_field":
+        cache.metadata["production_provenance"]["chunk_configuration"][
+            "chunk_overlap_words"
+        ] += 1
+    else:
+        migration_identity["source_tree_mutated"] = True
+
+    with pytest.raises(ValueError, match="legacy|sealed"):
+        _validate_cache_configuration(
+            cache,
+            config,
+            cache_configuration=typed_configuration,
+            legacy_terminal_migration_identity=migration_identity,
+        )
 
 
 def test_embedding_cluster_preflight_enumerates_all_native_scopes_with_real_catalogs(
@@ -1942,6 +2126,7 @@ def test_builder_does_not_initialize_output_when_preflight_prepare_fails(
             output_dir=output_dir,
             unit_id_column="person_key",
             initial_training_partitions=3,
+            physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         )
     )
     initialized = False
@@ -2050,6 +2235,7 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
             output_dir=tmp_path / "output",
             unit_id_column="person_key",
             initial_training_partitions=3,
+            physical_fit_identity=PHYSICAL_FIT_IDENTITY,
             query_config_path=query_config_path,
             embedding_cache_configuration=(
                 _embedding_cache_configuration(config)
@@ -2219,6 +2405,7 @@ def test_prepare_accepts_selected_x2_concurrency_before_provider_use(
             output_dir=tmp_path / "bundle",
             unit_id_column="person_key",
             initial_training_partitions=3,
+            physical_fit_identity=PHYSICAL_FIT_IDENTITY,
             embedding_cache_configuration=cache_configuration,
             scope_workers_per_gpu=2,
         )
@@ -2482,6 +2669,7 @@ def test_partial_tfidf_component_reuse_is_disabled(tmp_path: Path):
             output_dir=Path("output"),
             unit_id_column="unit_id",
             initial_training_partitions=3,
+            physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         )
     )
     with pytest.raises(RuntimeError, match="partial checkpoint reuse is disabled"):
@@ -2698,6 +2886,7 @@ def test_every_scope_must_have_all_ten_catalog_families(
             output_dir=Path("output"),
             unit_id_column="unit_id",
             initial_training_partitions=3,
+            physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         )
     )
     legacy_root = tmp_path / "legacy"

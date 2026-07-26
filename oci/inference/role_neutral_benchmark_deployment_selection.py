@@ -6,7 +6,7 @@ import json
 import os
 import re
 import stat
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
@@ -40,6 +40,17 @@ from .role_neutral_performance_benchmark import (
     RoleNeutralBenchmarkConfig,
     RoleNeutralBenchmarkSourceBinding,
     build_role_neutral_benchmark_matrix_coverage,
+)
+from .role_neutral_performance_benchmark_publication import (
+    ROLE_NEUTRAL_BENCHMARK_PUBLICATION_MANIFEST,
+    RoleNeutralBenchmarkSelectionEvidence,
+    load_role_neutral_benchmark_selection_evidence,
+)
+from .stage1_execution_topology_policy import (
+    Stage1ExecutionTopologyPolicy,
+)
+from .stage1_htr_operational_controls import (
+    RoleNeutralHTROperationalControls,
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -81,6 +92,22 @@ _PATH_FIELDS = (
     "stage2_tokenizer_locator",
     "oracle_source",
 )
+
+
+@dataclass(frozen=True)
+class _AuthenticatedBenchmarkEvidence:
+    kind: str
+    result: Mapping[str, Any]
+    result_file_sha256: str
+    result_content_sha256: str
+    config: RoleNeutralBenchmarkConfig
+    workload_binding: Mapping[str, Any]
+    source_binding: RoleNeutralBenchmarkSourceBinding
+    scientific_workflow_binding: Mapping[str, Any] | None = None
+    raw_result_locator: Path | None = None
+    publication_manifest_locator: Path | None = None
+    publication_manifest_file_sha256: str | None = None
+    publication_path_neutral_content_root_sha256: str | None = None
 
 
 def _strict_object(pairs: Iterable[tuple[str, Any]]) -> dict[str, Any]:
@@ -175,7 +202,7 @@ def _read_result(
         or value["ordinary_observations_exclude_terminal_audit"] is not True
         or value["warmup_observations_excluded_from_selection"] is not True
         or value["selection_policy"]
-        != "fastest_end_to_end_then_lower_total_concurrency_then_name_v1"
+        != "fastest_end_to_end_then_lower_effective_owner_concurrency_then_name_v2"
         or _SHA256.fullmatch(
             str(value["scientific_result_identity_sha256"])
         )
@@ -189,6 +216,162 @@ def _read_result(
     ):
         raise ValueError("benchmark result lacks its complete terminal audit")
     return value, file_sha256, config
+
+
+def _publication_root_from_locator(path: Path) -> Path | None:
+    state = os.lstat(path)
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if stat.S_ISLNK(state.st_mode):
+        raise ValueError(
+            "benchmark evidence locator must be one private regular file or "
+            "a canonical publication root; symlinks are forbidden"
+        )
+    if stat.S_ISDIR(state.st_mode):
+        root = path.resolve(strict=True)
+        if root != absolute:
+            raise ValueError(
+                "benchmark publication root must be canonical and symlink-free"
+            )
+        return root
+    if path.name != ROLE_NEUTRAL_BENCHMARK_PUBLICATION_MANIFEST:
+        return None
+    if not stat.S_ISREG(state.st_mode) or int(state.st_nlink) != 1:
+        raise ValueError(
+            "benchmark publication manifest must be one private regular file"
+        )
+    manifest = path.resolve(strict=True)
+    if manifest != absolute:
+        raise ValueError(
+            "benchmark publication manifest path must be canonical and symlink-free"
+        )
+    return manifest.parent
+
+
+def _validated_publication_result(
+    evidence: RoleNeutralBenchmarkSelectionEvidence,
+) -> tuple[dict[str, Any], RoleNeutralBenchmarkConfig]:
+    result = dict(evidence.normalized_benchmark_result)
+    if (
+        result.get("schema_version")
+        != ROLE_NEUTRAL_BENCHMARK_RESULT_SCHEMA
+        or result.get("status") != "complete"
+        or result.get("accepted") is not True
+        or result.get("ordinary_observations_exclude_terminal_audit")
+        is not True
+        or result.get("warmup_observations_excluded_from_selection")
+        is not True
+        or result.get("selection_policy")
+        != "fastest_end_to_end_then_lower_effective_owner_concurrency_then_name_v2"
+        or not isinstance(result.get("config"), Mapping)
+        or result.get("config_sha256")
+        != identity_sha256(result["config"])
+        or _SHA256.fullmatch(
+            str(result.get("scientific_result_identity_sha256"))
+        )
+        is None
+    ):
+        raise ValueError(
+            "published path-neutral benchmark result is not accepted"
+        )
+    config = RoleNeutralBenchmarkConfig.from_mapping(result["config"])
+    _validate_execution_schedule(result["execution_schedule"], config=config)
+    matrix = result.get("benchmark_matrix_coverage")
+    compression = result.get("preflight_compression_benchmark")
+    if (
+        not isinstance(matrix, Mapping)
+        or matrix.get("all_required_axes_accounted") is not True
+        or not isinstance(compression, Mapping)
+        or compression.get("accepted") is not True
+        or not isinstance(
+            compression.get("selected_parquet_compression"),
+            str,
+        )
+    ):
+        raise ValueError(
+            "published path-neutral benchmark coverage is incomplete"
+        )
+    return result, config
+
+
+def _read_benchmark_evidence(
+    path: Path,
+) -> _AuthenticatedBenchmarkEvidence:
+    publication_root = _publication_root_from_locator(path)
+    if publication_root is None:
+        result, file_sha256, config = _read_result(path)
+        source = _validate_workload_binding(
+            value=result["workload_binding"],
+            config=config,
+        )
+        return _AuthenticatedBenchmarkEvidence(
+            kind="raw_result_v1",
+            result=result,
+            result_file_sha256=file_sha256,
+            result_content_sha256=str(result["content_sha256"]),
+            config=config,
+            workload_binding=result["workload_binding"],
+            source_binding=source,
+            raw_result_locator=path.resolve(strict=True),
+        )
+
+    published = load_role_neutral_benchmark_selection_evidence(
+        publication_root
+    )
+    result, config = _validated_publication_result(published)
+    source = _validate_workload_binding(
+        value=published.workload_binding,
+        config=config,
+    )
+    if source != published.source_binding:
+        raise ValueError(
+            "published benchmark workload source binding changed"
+        )
+    return _AuthenticatedBenchmarkEvidence(
+        kind="durable_publication_v1",
+        result=result,
+        result_file_sha256=published.benchmark_result_file_sha256,
+        result_content_sha256=published.benchmark_result_content_sha256,
+        config=config,
+        workload_binding=published.workload_binding,
+        source_binding=source,
+        scientific_workflow_binding=(
+            published.scientific_workflow_binding
+        ),
+        publication_manifest_locator=(
+            published.publication_manifest_path
+        ),
+        publication_manifest_file_sha256=(
+            published.publication_manifest_file_sha256
+        ),
+        publication_path_neutral_content_root_sha256=(
+            published.publication_manifest.path_neutral_content_root_sha256
+        ),
+    )
+
+
+def _authenticate_published_scientific_spec(
+    *,
+    scientific_spec_path: Path,
+    binding: Mapping[str, Any],
+) -> tuple[ScientificWorkflowSpec, str]:
+    scientific_source = scientific_spec_path.resolve(strict=True)
+    scientific_spec_file_sha256, _scientific_size = stable_file_sha256(
+        scientific_source
+    )
+    scientific_spec = ScientificWorkflowSpec.from_json(scientific_source)
+    portable_identity = scientific_spec.identity_payload()
+    if (
+        binding.get("scientific_spec_source_sha256")
+        != scientific_spec_file_sha256
+        or binding.get("portable_scientific_spec")
+        != portable_identity
+        or binding.get("portable_scientific_spec_sha256")
+        != identity_sha256(portable_identity)
+    ):
+        raise ValueError(
+            "supplied scientific spec differs from the benchmarked workflow"
+        )
+    return scientific_spec, scientific_spec_file_sha256
 
 
 def _validate_execution_schedule(
@@ -427,13 +610,13 @@ def _authenticate_prepared_context_binding(
 
 def _authenticate_selection_source(
     *,
-    result: Mapping[str, Any],
+    workload_binding: Mapping[str, Any],
     config: RoleNeutralBenchmarkConfig,
     workload_deployment_path: Path,
     scientific_spec_path: Path,
 ) -> RoleNeutralBenchmarkSourceBinding:
     source = _validate_workload_binding(
-        value=result["workload_binding"],
+        value=workload_binding,
         config=config,
     )
     deployment, deployment_sha256 = _read_workload_deployment(
@@ -540,6 +723,32 @@ def _selected_candidate(
             != (candidate.accelerator_count or 1)
             or row.get("concurrency_per_device")
             != candidate.concurrency_per_device
+            or row.get("effective_parallel_owners")
+            != candidate.total_concurrency
+            or row.get("resource_slot_count")
+            != candidate.resource_slot_count
+            or row.get("neural_query_topology")
+            != candidate.neural_query_topology.as_dict()
+            or row.get("htr_operational_controls")
+            != candidate.htr_operational_controls.as_dict()
+            or row.get("cpu_gpu_lane_interval_telemetry_accepted")
+            is not True
+            or isinstance(
+                row.get("cpu_gpu_lane_overlap_observation_count"),
+                bool,
+            )
+            or not isinstance(
+                row.get("cpu_gpu_lane_overlap_observation_count"),
+                int,
+            )
+            or int(
+                row["cpu_gpu_lane_overlap_observation_count"]
+            )
+            < (1 if candidate.accelerator_count > 0 else 0)
+            or row.get("cpu_gpu_lane_overlap_descriptive_only")
+            is not True
+            or row.get("cpu_gpu_lane_overlap_speedup_claimed")
+            is not False
         ):
             raise ValueError("accepted benchmark candidate result is inconsistent")
         throughput = row.get("throughput_fit_rows_per_second")
@@ -557,8 +766,7 @@ def _selected_candidate(
             accepted,
             key=lambda item: (
                 -float(item[0]["throughput_fit_rows_per_second"]),
-                int(item[0]["execution_device_count"])
-                * int(item[0]["concurrency_per_device"]),
+                int(item[0]["effective_parallel_owners"]),
                 str(item[0]["candidate_name"]),
             ),
         )[1].name
@@ -692,23 +900,60 @@ def validate_benchmarked_stage1_execution_profile(
         raise TypeError("benchmark evidence validation requires typed safety")
     if isinstance(cpu_budget, bool) or not isinstance(cpu_budget, int) or cpu_budget < 1:
         raise ValueError("benchmark evidence validation requires a positive CPU budget")
-    assert profile.benchmark_result_locator is not None
-    assert profile.benchmark_workload_deployment_locator is not None
     assert profile.benchmark_result_sha256 is not None
     assert profile.benchmark_workload_deployment_sha256 is not None
-    result, result_sha256, config = _read_result(
-        profile.benchmark_result_locator
-    )
-    if result_sha256 != profile.benchmark_result_sha256:
+    if profile.benchmark_evidence_kind == "raw_result_v1":
+        assert profile.benchmark_result_locator is not None
+        evidence_locator = profile.benchmark_result_locator
+    elif profile.benchmark_evidence_kind == "durable_publication_v1":
+        assert profile.benchmark_publication_locator is not None
+        evidence_locator = profile.benchmark_publication_locator
+    else:
+        raise ValueError(
+            "Stage 1 execution profile has unsupported benchmark evidence"
+        )
+    evidence = _read_benchmark_evidence(evidence_locator)
+    if evidence.kind != profile.benchmark_evidence_kind:
+        raise ValueError(
+            "benchmark evidence kind differs from the selected profile"
+        )
+    if evidence.result_file_sha256 != profile.benchmark_result_sha256:
         raise ValueError("benchmark result differs from the selected profile")
-    source = _authenticate_selection_source(
-        result=result,
-        config=config,
-        workload_deployment_path=(
-            profile.benchmark_workload_deployment_locator
-        ),
-        scientific_spec_path=Path(scientific_spec_path),
-    )
+    if evidence.kind == "raw_result_v1":
+        assert profile.benchmark_workload_deployment_locator is not None
+        source = _authenticate_selection_source(
+            workload_binding=evidence.workload_binding,
+            config=evidence.config,
+            workload_deployment_path=(
+                profile.benchmark_workload_deployment_locator
+            ),
+            scientific_spec_path=Path(scientific_spec_path),
+        )
+    else:
+        assert profile.benchmark_publication_sha256 is not None
+        if (
+            evidence.publication_manifest_file_sha256
+            != profile.benchmark_publication_sha256
+            or evidence.publication_manifest_locator
+            != profile.benchmark_publication_locator
+        ):
+            raise ValueError(
+                "benchmark publication differs from the selected profile"
+            )
+        source = evidence.source_binding
+        if not isinstance(
+            evidence.scientific_workflow_binding,
+            Mapping,
+        ):
+            raise ValueError(
+                "benchmark publication lacks its scientific workflow binding"
+            )
+        scientific_spec, scientific_spec_file_sha256 = (
+            _authenticate_published_scientific_spec(
+                scientific_spec_path=Path(scientific_spec_path),
+                binding=evidence.scientific_workflow_binding,
+            )
+        )
     if (
         source.workload_deployment_sha256
         != profile.benchmark_workload_deployment_sha256
@@ -716,22 +961,45 @@ def validate_benchmarked_stage1_execution_profile(
         raise ValueError(
             "benchmark workload deployment differs from the selected profile"
         )
+    result = evidence.result
+    config = evidence.config
     if config.resource_performance_safety != resource_performance_safety:
         raise ValueError(
             "benchmark safety policy differs from the selected deployment"
         )
     selected_name, candidate = _selected_candidate(result, config=config)
     accelerator_count = int(candidate["accelerator_count"])
+    selected_topology = Stage1ExecutionTopologyPolicy.from_mapping(
+        candidate["neural_query_topology"]
+    )
+    selected_htr_controls = (
+        RoleNeutralHTROperationalControls.from_mapping(
+            candidate["htr_operational_controls"]
+        )
+    )
     expected_resource_kind = (
         "cpu" if accelerator_count == 0 else "accelerator"
+    )
+    expected_device_count = accelerator_count or 1
+    expected_parallel_owners = (
+        selected_topology.effective_parallel_owners_for_shape(
+            resource_kind=expected_resource_kind,
+            device_count=expected_device_count,
+            workers_per_device=int(
+                candidate["concurrency_per_device"]
+            ),
+        )
     )
     if (
         selected_name != profile.selected_candidate
         or expected_resource_kind != profile.resource_kind
-        or (accelerator_count or 1) != profile.device_count
+        or expected_device_count != profile.device_count
         or int(candidate["concurrency_per_device"])
         != profile.scope_workers_per_device
+        or expected_parallel_owners != profile.max_parallel_owners
         or str(candidate["executor_mode"]) != profile.executor_mode
+        or selected_topology != profile.neural_query_topology
+        or selected_htr_controls != profile.htr_operational_controls
         or int(candidate["host_cpu_budget"]) != int(cpu_budget)
     ):
         raise ValueError(
@@ -739,11 +1007,20 @@ def validate_benchmarked_stage1_execution_profile(
         )
     body = {
         "schema_version": (
-            "portable_benchmarked_stage1_execution_revalidation_v2"
+            "portable_benchmarked_stage1_execution_revalidation_v4"
         ),
         "selected_candidate": selected_name,
-        "benchmark_result_sha256": result_sha256,
-        "benchmark_result_content_sha256": result["content_sha256"],
+        "benchmark_evidence_kind": evidence.kind,
+        "benchmark_result_sha256": evidence.result_file_sha256,
+        "benchmark_result_content_sha256": (
+            evidence.result_content_sha256
+        ),
+        "benchmark_publication_sha256": (
+            evidence.publication_manifest_file_sha256
+        ),
+        "benchmark_publication_path_neutral_content_root_sha256": (
+            evidence.publication_path_neutral_content_root_sha256
+        ),
         "benchmark_workload_deployment_sha256": (
             source.workload_deployment_sha256
         ),
@@ -758,10 +1035,23 @@ def validate_benchmarked_stage1_execution_profile(
         "resource_kind": expected_resource_kind,
         "device_count": accelerator_count or 1,
         "scope_workers_per_device": int(candidate["concurrency_per_device"]),
+        "max_parallel_owners": expected_parallel_owners,
         "executor_mode": str(candidate["executor_mode"]),
+        "neural_query_topology": selected_topology.as_dict(),
+        "htr_operational_controls": selected_htr_controls.as_dict(),
         "cpu_budget": int(cpu_budget),
         "resource_performance_safety_sha256": (
             resource_performance_safety.content_sha256
+        ),
+        "scientific_spec_file_sha256": (
+            None
+            if evidence.kind == "raw_result_v1"
+            else scientific_spec_file_sha256
+        ),
+        "scientific_spec_scientific_sha256": (
+            None
+            if evidence.kind == "raw_result_v1"
+            else scientific_spec.scientific_sha256
         ),
         "benchmark_matrix_coverage": result[
             "benchmark_matrix_coverage"
@@ -776,13 +1066,20 @@ def validate_benchmarked_stage1_execution_profile(
 def select_benchmarked_deployment_profile(
     *,
     base_deployment_path: Path | str,
-    benchmark_result_path: Path | str,
-    benchmark_workload_deployment_path: Path | str,
+    benchmark_result_path: Path | str | None = None,
+    benchmark_publication_path: Path | str | None = None,
+    benchmark_workload_deployment_path: Path | str | None = None,
     scientific_spec_path: Path | str,
     output_path: Path | str,
 ) -> DeploymentProfile:
     """Authenticate a benchmark and publish its selected operational profile."""
 
+    if (benchmark_result_path is None) == (
+        benchmark_publication_path is None
+    ):
+        raise ValueError(
+            "select exactly one raw benchmark result or durable publication"
+        )
     base_source = Path(base_deployment_path).resolve(strict=True)
     base = _rebase_profile_paths(
         DeploymentProfile.from_json(base_source),
@@ -790,13 +1087,54 @@ def select_benchmarked_deployment_profile(
     )
     if base.stage1_execution.selection_method != "operator_configured":
         raise ValueError("base deployment already claims measured benchmark selection")
-    result, result_file_sha256, config = _read_result(Path(benchmark_result_path))
-    source_binding = _authenticate_selection_source(
-        result=result,
-        config=config,
-        workload_deployment_path=Path(benchmark_workload_deployment_path),
-        scientific_spec_path=Path(scientific_spec_path),
+    evidence_path = Path(
+        benchmark_publication_path
+        if benchmark_publication_path is not None
+        else benchmark_result_path
     )
+    evidence = _read_benchmark_evidence(evidence_path)
+    expected_evidence_kind = (
+        "durable_publication_v1"
+        if benchmark_publication_path is not None
+        else "raw_result_v1"
+    )
+    if evidence.kind != expected_evidence_kind:
+        raise ValueError(
+            "benchmark evidence input kind differs from its explicit argument"
+        )
+    result = evidence.result
+    config = evidence.config
+    if evidence.kind == "raw_result_v1":
+        if benchmark_workload_deployment_path is None:
+            raise ValueError(
+                "raw benchmark selection requires its workload deployment"
+            )
+        source_binding = _authenticate_selection_source(
+            workload_binding=evidence.workload_binding,
+            config=config,
+            workload_deployment_path=Path(
+                benchmark_workload_deployment_path
+            ),
+            scientific_spec_path=Path(scientific_spec_path),
+        )
+    else:
+        if benchmark_workload_deployment_path is not None:
+            raise ValueError(
+                "durable benchmark selection forbids a historical workload "
+                "deployment locator"
+            )
+        source_binding = evidence.source_binding
+        if not isinstance(
+            evidence.scientific_workflow_binding,
+            Mapping,
+        ):
+            raise ValueError(
+                "benchmark publication lacks its scientific workflow binding"
+            )
+        _authenticate_published_scientific_spec(
+            scientific_spec_path=Path(scientific_spec_path),
+            binding=evidence.scientific_workflow_binding,
+        )
     if config.resource_performance_safety != base.resource_performance_safety:
         raise ValueError(
             "benchmark safety policy differs from the target deployment"
@@ -810,6 +1148,12 @@ def select_benchmarked_deployment_profile(
     concurrency = candidate["concurrency_per_device"]
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
         raise ValueError("selected candidate concurrency_per_device is invalid")
+    topology = Stage1ExecutionTopologyPolicy.from_mapping(
+        candidate["neural_query_topology"]
+    )
+    htr_controls = RoleNeutralHTROperationalControls.from_mapping(
+        candidate["htr_operational_controls"]
+    )
     devices, execution_device_count = _selected_devices(
         base=base,
         accelerator_count=accelerator_count,
@@ -826,19 +1170,43 @@ def select_benchmarked_deployment_profile(
             ),
             device_count=execution_device_count,
             scope_workers_per_device=concurrency,
+            max_parallel_owners=(
+                topology.effective_parallel_owners_for_shape(
+                    resource_kind=(
+                        "cpu"
+                        if accelerator_count == 0
+                        else "accelerator"
+                    ),
+                    device_count=execution_device_count,
+                    workers_per_device=concurrency,
+                )
+            ),
             executor_mode=str(candidate["executor_mode"]),
+            persistent_slot_startup_timeout_seconds=(
+                base.stage1_execution
+                .persistent_slot_startup_timeout_seconds
+            ),
+            neural_query_topology=topology,
+            htr_operational_controls=htr_controls,
             selection_method="measured_role_neutral_benchmark_v1",
+            benchmark_evidence_kind=evidence.kind,
             selected_candidate=selected_name,
-            benchmark_result_sha256=result_file_sha256,
-            benchmark_result_locator=Path(
-                benchmark_result_path
-            ).resolve(strict=True),
+            benchmark_result_sha256=evidence.result_file_sha256,
+            benchmark_result_locator=evidence.raw_result_locator,
             benchmark_workload_deployment_sha256=(
                 source_binding.workload_deployment_sha256
             ),
-            benchmark_workload_deployment_locator=Path(
-                benchmark_workload_deployment_path
-            ).resolve(strict=True),
+            benchmark_workload_deployment_locator=(
+                Path(benchmark_workload_deployment_path).resolve(strict=True)
+                if evidence.kind == "raw_result_v1"
+                else None
+            ),
+            benchmark_publication_sha256=(
+                evidence.publication_manifest_file_sha256
+            ),
+            benchmark_publication_locator=(
+                evidence.publication_manifest_locator
+            ),
         ),
     )
     destination = Path(output_path)

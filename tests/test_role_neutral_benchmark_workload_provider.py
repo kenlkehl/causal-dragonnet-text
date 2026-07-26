@@ -8,13 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.resource_safety_test_support import resource_safety_policy
+
 import oci.inference.role_neutral_benchmark_workload_provider as provider
 from oci.inference.compact_preflight_compression_benchmark import (
     CompactPreflightCompressionBenchmarkConfig,
 )
 from oci.inference.performance_telemetry import ImmutableInputObservation
 from oci.inference.portable_workflow_spec import (
-    ResourcePerformanceSafetyPolicy,
     identity_sha256,
 )
 from oci.inference.production_all_evidence_workflow import (
@@ -31,10 +32,18 @@ from oci.inference.production_stage1_scope_scheduler import (
     _sha256_json,
     _stage1_scope_plan_body,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_performance_benchmark import (
     RoleNeutralBenchmarkCandidate,
     RoleNeutralBenchmarkConfig,
     RoleNeutralBenchmarkScope,
+)
+from oci.inference.role_neutral_htr_group_execution import (
+    RoleNeutralHTROperationalControls,
+)
+from oci.inference.stage1_execution_topology_policy import (
+    ONE_CONTEXT_PER_SELECTED_DEVICE,
+    Stage1ExecutionTopologyPolicy,
 )
 
 
@@ -103,6 +112,7 @@ def _arbitrary_plan() -> Stage1ScopePlan:
         global_seed=19,
         review_rounds=1,
         initial_training_partitions=1,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         scope_workers_per_gpu=1,
         scopes=scopes,
@@ -113,6 +123,7 @@ def _arbitrary_plan() -> Stage1ScopePlan:
         global_seed=19,
         review_rounds=1,
         initial_training_partitions=1,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         scope_workers_per_gpu=1,
         scopes=scopes,
@@ -122,7 +133,7 @@ def _arbitrary_plan() -> Stage1ScopePlan:
 
 
 def _benchmark_config() -> RoleNeutralBenchmarkConfig:
-    safety = ResourcePerformanceSafetyPolicy(
+    safety = resource_safety_policy(
         gpu_max_allocation_fraction=0.9,
         gpu_minimum_headroom_bytes=1,
         minimum_multi_device_throughput_ratio=1.0,
@@ -152,6 +163,17 @@ def _benchmark_config() -> RoleNeutralBenchmarkConfig:
                 concurrency_per_device=1,
                 host_cpu_budget=2,
                 executor_mode="fresh_per_fit",
+                neural_query_topology=Stage1ExecutionTopologyPolicy(
+                    mode=ONE_CONTEXT_PER_SELECTED_DEVICE,
+                ),
+                htr_operational_controls=RoleNeutralHTROperationalControls(
+                    training_batch_size=4,
+                    sentence_encoder_batch_size=8,
+                    data_loader_workers=0,
+                    reuse_tokenizer_and_chunk_plans=False,
+                    chunk_plan_cache_max_entries=0,
+                    tokenized_chunk_cache_max_entries=0,
+                ),
             ),
             RoleNeutralBenchmarkCandidate(
                 name="cpu-persistent",
@@ -159,6 +181,71 @@ def _benchmark_config() -> RoleNeutralBenchmarkConfig:
                 concurrency_per_device=1,
                 host_cpu_budget=2,
                 executor_mode="persistent_slots",
+                neural_query_topology=Stage1ExecutionTopologyPolicy(
+                    mode=ONE_CONTEXT_PER_SELECTED_DEVICE,
+                ),
+                htr_operational_controls=RoleNeutralHTROperationalControls(
+                    training_batch_size=4,
+                    sentence_encoder_batch_size=8,
+                    data_loader_workers=0,
+                    reuse_tokenizer_and_chunk_plans=False,
+                    chunk_plan_cache_max_entries=0,
+                    tokenized_chunk_cache_max_entries=0,
+                ),
+            ),
+            RoleNeutralBenchmarkCandidate(
+                name="cpu-htr-encoder",
+                accelerator_count=0,
+                concurrency_per_device=1,
+                host_cpu_budget=2,
+                executor_mode="persistent_slots",
+                neural_query_topology=Stage1ExecutionTopologyPolicy(
+                    mode=ONE_CONTEXT_PER_SELECTED_DEVICE,
+                ),
+                htr_operational_controls=RoleNeutralHTROperationalControls(
+                    training_batch_size=4,
+                    sentence_encoder_batch_size=16,
+                    data_loader_workers=0,
+                    reuse_tokenizer_and_chunk_plans=False,
+                    chunk_plan_cache_max_entries=0,
+                    tokenized_chunk_cache_max_entries=0,
+                ),
+            ),
+            RoleNeutralBenchmarkCandidate(
+                name="cpu-htr-workers",
+                accelerator_count=0,
+                concurrency_per_device=1,
+                host_cpu_budget=2,
+                executor_mode="persistent_slots",
+                neural_query_topology=Stage1ExecutionTopologyPolicy(
+                    mode=ONE_CONTEXT_PER_SELECTED_DEVICE,
+                ),
+                htr_operational_controls=RoleNeutralHTROperationalControls(
+                    training_batch_size=4,
+                    sentence_encoder_batch_size=8,
+                    data_loader_workers=2,
+                    reuse_tokenizer_and_chunk_plans=True,
+                    chunk_plan_cache_max_entries=100,
+                    tokenized_chunk_cache_max_entries=1000,
+                ),
+            ),
+            RoleNeutralBenchmarkCandidate(
+                name="cpu-htr-reuse",
+                accelerator_count=0,
+                concurrency_per_device=1,
+                host_cpu_budget=2,
+                executor_mode="persistent_slots",
+                neural_query_topology=Stage1ExecutionTopologyPolicy(
+                    mode=ONE_CONTEXT_PER_SELECTED_DEVICE,
+                ),
+                htr_operational_controls=RoleNeutralHTROperationalControls(
+                    training_batch_size=4,
+                    sentence_encoder_batch_size=8,
+                    data_loader_workers=0,
+                    reuse_tokenizer_and_chunk_plans=True,
+                    chunk_plan_cache_max_entries=100,
+                    tokenized_chunk_cache_max_entries=1000,
+                ),
             ),
         ),
         scientific_reference_candidate="cpu-fresh",
@@ -219,17 +306,39 @@ def _write_paused_fixture(root: Path) -> tuple[str, dict[str, object]]:
         "resolved_stage1_gpu_ids": [],
         "stage1_execution_device_count": 1,
         "stage1_execution_profile": {
-            "schema_version": "portable_stage1_execution_profile_v3",
+            "schema_version": "portable_stage1_execution_profile_v6",
             "resource_kind": "cpu",
             "device_count": 1,
             "scope_workers_per_device": 1,
+            "max_parallel_owners": 1,
             "executor_mode": "persistent_slots",
+            "persistent_slot_startup_timeout_seconds": 30.0,
+            "neural_query_topology": {
+                "schema_version": (
+                    "portable_stage1_execution_topology_policy_v1"
+                ),
+                "mode": "one_context_per_selected_device",
+            },
+            "htr_operational_controls": {
+                "schema_version": (
+                    "production_role_neutral_htr_operational_controls_v1"
+                ),
+                "training_batch_size": 4,
+                "sentence_encoder_batch_size": 8,
+                "data_loader_workers": 0,
+                "reuse_tokenizer_and_chunk_plans": False,
+                "chunk_plan_cache_max_entries": 0,
+                "tokenized_chunk_cache_max_entries": 0,
+            },
             "selection_method": "operator_configured",
+            "benchmark_evidence_kind": "none",
             "selected_candidate": None,
             "benchmark_result_sha256": None,
             "benchmark_result_locator": None,
             "benchmark_workload_deployment_sha256": None,
             "benchmark_workload_deployment_locator": None,
+            "benchmark_publication_sha256": None,
+            "benchmark_publication_locator": None,
         },
         "stage1_scope_workers_per_gpu": 1,
         "stage1_preflight_workers": 3,
@@ -437,7 +546,68 @@ def test_paused_workflow_rejects_any_later_partial_phase_tree(
         provider._authenticate_paused_stage1_preflight(deployment)
 
 
-def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
+def test_existing_prepared_context_root_is_exact_and_link_safe(
+    tmp_path: Path,
+) -> None:
+    config = _benchmark_config()
+    workflow = tmp_path / "canonical workflow"
+    workflow.mkdir()
+    request_sha256 = hashlib.sha256(b"canonical-request").hexdigest()
+
+    exact_root = tmp_path / "exact scratch" / "prepared"
+    exact_manifest = (
+        exact_root
+        / provider._SEALED_PREPARED_CONTEXT_DIRECTORY
+        / provider.PREPARED_STAGE1_CONTEXT_MANIFEST_NAME
+    )
+    exact_manifest.parent.mkdir(parents=True)
+    exact_manifest.write_text("fixture", encoding="utf-8")
+    exact = provider.RoleNeutralBenchmarkWorkloadDeployment.from_mapping(
+        _deployment_payload(
+            workflow_root=workflow,
+            context_root=exact_root,
+            config=config,
+            request_sha256=request_sha256,
+        )
+    )
+    assert (
+        provider._sealed_prepared_context_manifest_path(
+            exact,
+            require_existing=True,
+        )
+        == exact_manifest
+    )
+    (exact_root / "unregistered.tmp").write_text(
+        "partial",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="partial, substituted"):
+        provider._sealed_prepared_context_manifest_path(
+            exact,
+            require_existing=True,
+        )
+
+    linked_root = tmp_path / "linked scratch" / "prepared"
+    linked_root.mkdir(parents=True)
+    (
+        linked_root / provider._SEALED_PREPARED_CONTEXT_DIRECTORY
+    ).symlink_to(exact_manifest.parent, target_is_directory=True)
+    linked = provider.RoleNeutralBenchmarkWorkloadDeployment.from_mapping(
+        _deployment_payload(
+            workflow_root=workflow,
+            context_root=linked_root,
+            config=config,
+            request_sha256=request_sha256,
+        )
+    )
+    with pytest.raises(ValueError, match="partial, substituted"):
+        provider._sealed_prepared_context_manifest_path(
+            linked,
+            require_existing=True,
+        )
+
+
+def test_provider_prepares_once_then_resumes_the_exact_sealed_context(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -464,7 +634,13 @@ def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
         root=workflow,
         request={
             "portable_scientific_spec": {
-                "architecture_profiles": {"fixture": {"closed": True}},
+                "architecture_profiles": {
+                    "hierarchical_transformer": {
+                        "producer_configuration": {
+                            "batch_size": 4,
+                        },
+                    },
+                },
             },
             "runtime_compatibility_class": "fixture-runtime",
             "scientific_identity": {
@@ -480,12 +656,44 @@ def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
     monkeypatch.setattr(
         provider,
         "_authenticate_paused_stage1_preflight",
-        lambda _deployment: authenticated,
+        lambda _deployment, **_kwargs: authenticated,
+    )
+    counts = {
+        "prepare": 0,
+        "seal": 0,
+        "reconstruct": 0,
+        "load": 0,
+        "process_bind_context": 0,
+        "persistent_bind_context": 0,
+    }
+    fake_options = object()
+    exact_request_body = {"schema_version": "fixture_stage1_request_v1"}
+    exact_request = {
+        **exact_request_body,
+        "request_sha256": provider._sha(exact_request_body),
+    }
+    prepared_value = SimpleNamespace(
+        stage1_scope_plan=plan,
+        cluster_preflight_artifact_handle="preflight-handle",
+        config=SimpleNamespace(
+            training=SimpleNamespace(batch_size=4),
+        ),
+        options=fake_options,
+        request=exact_request,
     )
     monkeypatch.setattr(
         provider,
         "_stage1_build_options",
-        lambda **_kwargs: object(),
+        lambda **_kwargs: fake_options,
+    )
+    monkeypatch.setattr(
+        provider,
+        "serialize_stage1_build_options",
+        lambda value: (
+            {"fixture_options": True}
+            if value is fake_options
+            else pytest.fail("provider serialized an unexpected options object")
+        ),
     )
 
     class FakeStage1Builder:
@@ -493,10 +701,8 @@ def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
             pass
 
         def prepare(self):
-            return SimpleNamespace(
-                stage1_scope_plan=plan,
-                cluster_preflight_artifact_handle="preflight-handle",
-            )
+            counts["prepare"] += 1
+            return prepared_value
 
     class FakeFactoryBuilder:
         def __init__(self, **_kwargs):
@@ -515,6 +721,50 @@ def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
         "PreparedBuildRoleNeutralProducerFactoriesBuilder",
         FakeFactoryBuilder,
     )
+    context_artifact: provider.PreparedStage1ContextArtifact | None = None
+
+    def seal_context(*, root, prepared, producer_factories_builder):
+        del producer_factories_builder
+        nonlocal context_artifact
+        counts["seal"] += 1
+        assert prepared is prepared_value
+        root.mkdir(parents=True)
+        manifest_path = (
+            root / provider.PREPARED_STAGE1_CONTEXT_MANIFEST_NAME
+        )
+        manifest_path.write_text("fixture", encoding="utf-8")
+        context_artifact = provider.PreparedStage1ContextArtifact(
+            root=root,
+            manifest_path=manifest_path,
+            manifest={"content_root_sha256": "5" * 64},
+            scientific_identity={},
+            execution_locators={
+                "stage1_build_options": {"fixture_options": True},
+                "architecture_profiles": authenticated.request[
+                    "portable_scientific_spec"
+                ]["architecture_profiles"],
+                "runtime_compatibility_class": "fixture-runtime",
+                "exact_stage1_request": exact_request,
+            },
+        )
+        return context_artifact
+
+    monkeypatch.setattr(
+        provider,
+        "seal_prepared_stage1_context",
+        seal_context,
+    )
+
+    def reconstruct_context(self, **_kwargs):
+        counts["reconstruct"] += 1
+        assert self is context_artifact
+        return prepared_value, object()
+
+    monkeypatch.setattr(
+        provider.PreparedStage1ContextArtifact,
+        "reconstruct",
+        reconstruct_context,
+    )
 
     @dataclass(frozen=True)
     class FakeBoundProcessExecutor:
@@ -524,7 +774,10 @@ def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
         def __init__(self, *, max_workers_per_resource: int):
             self.max_workers_per_resource = max_workers_per_resource
 
-        def bind_prepared(self, **_kwargs):
+        def bind_context(self, manifest_path):
+            counts["process_bind_context"] += 1
+            assert context_artifact is not None
+            assert Path(manifest_path) == context_artifact.manifest_path
             return FakeBoundProcessExecutor(
                 max_workers_per_resource=self.max_workers_per_resource,
             )
@@ -538,13 +791,14 @@ def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
         def __init__(self, *, max_workers_per_resource: int):
             self.max_workers_per_resource = max_workers_per_resource
 
-        def bind_prepared(self, **_kwargs):
+        def bind_context(self, manifest_path):
+            counts["persistent_bind_context"] += 1
+            assert context_artifact is not None
+            assert Path(manifest_path) == context_artifact.manifest_path
             return FakeBoundPersistentExecutor(
                 max_workers_per_resource=self.max_workers_per_resource,
                 worker_parameters={
-                    "prepared_context_manifest_path": str(
-                        (tmp_path / "prepared-context-manifest.json").resolve()
-                    )
+                    "prepared_context_manifest_path": str(manifest_path)
                 },
             )
 
@@ -558,10 +812,16 @@ def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
         "PersistentSpawnRoleNeutralPhysicalOwnerExecutor",
         FakePersistentExecutor,
     )
+    def load_context(_path):
+        counts["load"] += 1
+        if context_artifact is None:
+            pytest.fail("prepared context was loaded before sealing")
+        return context_artifact
+
     monkeypatch.setattr(
         provider,
         "load_prepared_stage1_context",
-        lambda _path: SimpleNamespace(content_root_sha256="5" * 64),
+        load_context,
     )
     monkeypatch.setattr(
         provider,
@@ -578,7 +838,30 @@ def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
         config,
         deployment_path,
     )
+    assert context_artifact is not None
+    sealed_bytes = context_artifact.manifest_path.read_bytes()
+    sealed_stat = context_artifact.manifest_path.stat()
+    resumed = provider.build_authenticated_role_neutral_benchmark_workloads(
+        config,
+        deployment_path,
+    )
+    assert context_artifact.manifest_path.read_bytes() == sealed_bytes
+    assert (
+        context_artifact.manifest_path.stat().st_mtime_ns
+        == sealed_stat.st_mtime_ns
+    )
+    assert counts == {
+        "prepare": 1,
+        "seal": 1,
+        "reconstruct": 1,
+        # The provider performs one explicit fresh reopen on resume; each real
+        # executor separately authenticates the same context in bind_context.
+        "load": 1,
+        "process_bind_context": 2,
+        "persistent_bind_context": 2,
+    }
     assert set(workloads) == {"arbitrary-outer", "arbitrary-inner"}
+    assert set(resumed) == set(workloads)
     assert workloads["arbitrary-outer"].fit_row_count == 7
     assert workloads["arbitrary-inner"].fit_row_count == 5
     assert workloads["arbitrary-inner"].plan.physical_scopes[0].fit_row_ids == tuple(range(5))
@@ -604,6 +887,217 @@ def test_provider_binds_arbitrary_paths_rows_and_typed_prepared_context(
         ].preflight_compression_source_builder()
         == "preflight-handle"
     )
+
+
+def _resume_provider_fixture(
+    *,
+    tmp_path: Path,
+    monkeypatch,
+) -> tuple[
+    RoleNeutralBenchmarkConfig,
+    Path,
+    Path,
+    provider.AuthenticatedPausedStage1Preflight,
+    object,
+]:
+    config = _benchmark_config()
+    workflow = tmp_path / "resume workflow"
+    workflow.mkdir()
+    prepared_root = tmp_path / "resume scratch" / "prepared"
+    sealed_root = (
+        prepared_root / provider._SEALED_PREPARED_CONTEXT_DIRECTORY
+    )
+    sealed_root.mkdir(parents=True)
+    manifest_path = (
+        sealed_root / provider.PREPARED_STAGE1_CONTEXT_MANIFEST_NAME
+    )
+    manifest_path.write_text("sealed-fixture", encoding="utf-8")
+    request_sha256 = hashlib.sha256(b"resume-workflow").hexdigest()
+    deployment_path = tmp_path / "resume-workload.json"
+    deployment_path.write_text(
+        json.dumps(
+            _deployment_payload(
+                workflow_root=workflow,
+                context_root=prepared_root,
+                config=config,
+                request_sha256=request_sha256,
+            )
+        ),
+        encoding="utf-8",
+    )
+    architecture_profiles = {
+        "hierarchical_transformer": {
+            "producer_configuration": {"batch_size": 4},
+        },
+    }
+    authenticated = provider.AuthenticatedPausedStage1Preflight(
+        root=workflow,
+        request={
+            "portable_scientific_spec": {
+                "architecture_profiles": architecture_profiles,
+            },
+            "runtime_compatibility_class": "resume-runtime",
+        },
+        phases={},
+    )
+    fake_options = object()
+    monkeypatch.setattr(
+        provider,
+        "_authenticate_paused_stage1_preflight",
+        lambda _deployment, **_kwargs: authenticated,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_stage1_build_options",
+        lambda **_kwargs: fake_options,
+    )
+
+    class FakeFactoryBuilder:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        provider,
+        "PreparedBuildRoleNeutralProducerFactoriesBuilder",
+        FakeFactoryBuilder,
+    )
+    return (
+        config,
+        deployment_path,
+        manifest_path,
+        authenticated,
+        fake_options,
+    )
+
+
+def test_provider_resume_rejects_tampered_context_without_preparing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (
+        config,
+        deployment_path,
+        _manifest_path,
+        _authenticated,
+        _fake_options,
+    ) = _resume_provider_fixture(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+    )
+    prepare_calls = 0
+
+    class ForbiddenStage1Builder:
+        def __init__(self, _options):
+            nonlocal prepare_calls
+            prepare_calls += 1
+
+    monkeypatch.setattr(
+        provider,
+        "ProductionStage1BundleBuilder",
+        ForbiddenStage1Builder,
+    )
+    monkeypatch.setattr(
+        provider,
+        "load_prepared_stage1_context",
+        lambda _path: (_ for _ in ()).throw(
+            ValueError("prepared-context payload changed")
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="prepared-context payload changed",
+    ):
+        provider.build_authenticated_role_neutral_benchmark_workloads(
+            config,
+            deployment_path,
+        )
+    assert prepare_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("substitution", "message"),
+    (
+        ("options", "request/config locators differ"),
+        ("architectures", "architecture profiles differ"),
+        ("runtime", "runtime compatibility class differs"),
+    ),
+)
+def test_provider_resume_rejects_substituted_context_bindings(
+    tmp_path: Path,
+    monkeypatch,
+    substitution: str,
+    message: str,
+) -> None:
+    (
+        config,
+        deployment_path,
+        manifest_path,
+        authenticated,
+        fake_options,
+    ) = _resume_provider_fixture(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+    )
+    expected_options = {"fixture_options": True}
+    monkeypatch.setattr(
+        provider,
+        "serialize_stage1_build_options",
+        lambda value: (
+            expected_options
+            if value is fake_options
+            else pytest.fail("unexpected Stage 1 options")
+        ),
+    )
+    exact_body = {"schema_version": "fixture_stage1_request_v1"}
+    locators = {
+        "stage1_build_options": expected_options,
+        "architecture_profiles": authenticated.request[
+            "portable_scientific_spec"
+        ]["architecture_profiles"],
+        "runtime_compatibility_class": "resume-runtime",
+        "exact_stage1_request": {
+            **exact_body,
+            "request_sha256": provider._sha(exact_body),
+        },
+    }
+    if substitution == "options":
+        locators["stage1_build_options"] = {"fixture_options": False}
+    elif substitution == "architectures":
+        locators["architecture_profiles"] = {
+            "hierarchical_transformer": {
+                "producer_configuration": {"batch_size": 99},
+            },
+        }
+    elif substitution == "runtime":
+        locators["runtime_compatibility_class"] = "substituted-runtime"
+    else:  # pragma: no cover - closed parametrization guard
+        raise AssertionError(substitution)
+    artifact = provider.PreparedStage1ContextArtifact(
+        root=manifest_path.parent,
+        manifest_path=manifest_path,
+        manifest={"content_root_sha256": "6" * 64},
+        scientific_identity={},
+        execution_locators=locators,
+    )
+    monkeypatch.setattr(
+        provider,
+        "load_prepared_stage1_context",
+        lambda _path: artifact,
+    )
+    monkeypatch.setattr(
+        provider,
+        "ProductionStage1BundleBuilder",
+        lambda _options: pytest.fail(
+            "resume must not invoke monolithic preparation"
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        provider.build_authenticated_role_neutral_benchmark_workloads(
+            config,
+            deployment_path,
+        )
 
 
 def test_workload_deployment_and_benchmark_identity_fail_closed(

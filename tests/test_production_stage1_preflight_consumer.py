@@ -21,6 +21,7 @@ from oci.inference.production_stage1_cluster_preflight_artifact import (
     seal_production_stage1_cluster_preflight_artifact,
 )
 from tests.test_production_stage1_bundle import _valid_config
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 
 
 def _addressed(body):
@@ -160,6 +161,7 @@ def test_modeling_prepare_consumes_sealed_preflight_without_recomputation(
         output_dir=tmp_path / "output",
         unit_id_column="person_key",
         initial_training_partitions=3,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         query_config_path=query_config_path,
         dry_run=True,
     )

@@ -31,6 +31,7 @@ import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import cached_property
 from pathlib import Path
 from queue import Empty
 from typing import Any, Callable, Mapping, Sequence
@@ -1041,7 +1042,7 @@ class Stage1ScopePlan:
             _normalize_physical_fit_identity(self.physical_fit_identity),
         )
 
-    @property
+    @cached_property
     def scientific_content_sha256(self) -> str:
         return _sha256_json(
             _stage1_scope_scientific_plan_body(
@@ -1054,7 +1055,7 @@ class Stage1ScopePlan:
             )
         )
 
-    @property
+    @cached_property
     def physical_fit_groups(
         self,
     ) -> tuple[

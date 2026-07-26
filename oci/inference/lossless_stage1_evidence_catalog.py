@@ -58,6 +58,10 @@ ARCHITECTURE_CHUNK_SCHEMA_VERSION = "role_neutral_architecture_chunk_v5"
 ARCHITECTURE_CHUNK_PLAN_SCHEMA_VERSION = "complete_architecture_chunk_plan_v5"
 NON_GROUNDING_SUMMARY_SCHEMA_VERSION = "separated_non_grounding_summary_v1"
 NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION = "native_stage1_family_concept_evidence_v1"
+NATIVE_ROLE_NEUTRAL_PAYLOAD_ADAPTER_SCHEMA_VERSION = (
+    "native_role_neutral_family_payload_adapter_v1"
+)
+NATIVE_ROLE_NEUTRAL_UNIT_SCHEMA_VERSION = "native_role_neutral_evidence_unit_v1"
 SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION = (
     "configured_lossless_semantic_member_batching_v1"
 )
@@ -1836,6 +1840,1117 @@ def _contains_member_id(value: Any) -> bool:
     return False
 
 
+def _native_semantic_projection(
+    value: Mapping[str, Any],
+    *,
+    keys: Sequence[str],
+) -> dict[str, Any]:
+    """Project readable scalar labels while the canonical native JSON stays authoritative."""
+
+    projected: dict[str, Any] = {}
+    for key in keys:
+        child = value.get(key)
+        if child is None or isinstance(child, (str, bool, int, float)):
+            if child is not None:
+                projected[key] = _clone(child)
+    return projected
+
+
+def _native_evidence_unit(
+    *,
+    source_record: Mapping[str, Any],
+    source_record_index: int,
+    native_record: Mapping[str, Any],
+    native_record_index: int,
+    semantic_projection: Mapping[str, Any],
+    proof_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seal one native producer record inside one catalog semantic member.
+
+    Native JSON is stored canonically as a string.  That keeps upstream
+    catalog-local ``member_id`` fields distinguishable from the new catalog's
+    member IDs while retaining the exact producer object without deletion or
+    key rewriting.
+    """
+
+    source = _clone(source_record)
+    native = _clone(native_record)
+    context = None if proof_context is None else _clone(proof_context)
+    body = {
+        "schema_version": NATIVE_ROLE_NEUTRAL_UNIT_SCHEMA_VERSION,
+        "source_record_index": int(source_record_index),
+        "source_record_sha256": _sha256_json(source),
+        "native_record_index": int(native_record_index),
+        "native_record_sha256": _sha256_json(native),
+        "native_record_json": canonical_json(native),
+        "native_proof_context_json": (
+            None if context is None else canonical_json(context)
+        ),
+        "semantic_projection": _clone(semantic_projection),
+    }
+    return {**body, "native_unit_sha256": _sha256_json(body)}
+
+
+def _validate_native_evidence_unit(value: Mapping[str, Any]) -> dict[str, Any]:
+    unit = _clone(value)
+    expected = {
+        "schema_version",
+        "source_record_index",
+        "source_record_sha256",
+        "native_record_index",
+        "native_record_sha256",
+        "native_record_json",
+        "native_proof_context_json",
+        "semantic_projection",
+        "native_unit_sha256",
+    }
+    if set(unit) != expected:
+        raise ValueError("native role-neutral evidence unit is not a closed schema")
+    if unit.get("schema_version") != NATIVE_ROLE_NEUTRAL_UNIT_SCHEMA_VERSION:
+        raise ValueError("native role-neutral evidence unit changed schema")
+    for key in ("source_record_index", "native_record_index"):
+        if (
+            isinstance(unit.get(key), bool)
+            or not isinstance(unit.get(key), int)
+            or int(unit[key]) < 0
+        ):
+            raise ValueError(f"native role-neutral evidence unit has invalid {key}")
+    for key in (
+        "source_record_sha256",
+        "native_record_sha256",
+        "native_unit_sha256",
+    ):
+        if _SHA256.fullmatch(str(unit.get(key) or "")) is None:
+            raise ValueError(f"native role-neutral evidence unit has invalid {key}")
+    native_json = unit.get("native_record_json")
+    if not isinstance(native_json, str):
+        raise ValueError("native role-neutral evidence unit lacks canonical native JSON")
+    try:
+        native_record = json.loads(native_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("native role-neutral evidence unit contains invalid JSON") from exc
+    if (
+        not isinstance(native_record, dict)
+        or canonical_json(native_record) != native_json
+        or _sha256_json(native_record) != unit["native_record_sha256"]
+    ):
+        raise ValueError("native role-neutral evidence unit record does not authenticate")
+    proof_json = unit.get("native_proof_context_json")
+    if proof_json is not None:
+        if not isinstance(proof_json, str):
+            raise ValueError("native role-neutral proof context must be canonical JSON or null")
+        try:
+            proof = json.loads(proof_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("native role-neutral proof context is invalid JSON") from exc
+        if not isinstance(proof, dict) or canonical_json(proof) != proof_json:
+            raise ValueError("native role-neutral proof context is not canonical")
+    if not isinstance(unit.get("semantic_projection"), Mapping):
+        raise ValueError("native role-neutral evidence unit lacks a semantic projection")
+    body = {key: child for key, child in unit.items() if key != "native_unit_sha256"}
+    if _sha256_json(body) != unit["native_unit_sha256"]:
+        raise ValueError("native role-neutral evidence unit does not self-authenticate")
+    return unit
+
+
+def _native_units_in(value: Any) -> list[dict[str, Any]]:
+    units: list[dict[str, Any]] = []
+    if isinstance(value, Mapping):
+        if value.get("schema_version") == NATIVE_ROLE_NEUTRAL_UNIT_SCHEMA_VERSION:
+            units.append(_validate_native_evidence_unit(value))
+            return units
+        for child in value.values():
+            units.extend(_native_units_in(child))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            units.extend(_native_units_in(child))
+    return units
+
+
+def _positive_native_integer(value: Any, *, path: str, allow_zero: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{path} must be an integer")
+    minimum = 0 if allow_zero else 1
+    if int(value) < minimum:
+        raise ValueError(f"{path} must be at least {minimum}")
+    return int(value)
+
+
+def _native_finite(value: Any, *, path: str) -> int | float:
+    return _finite_number(value, path=path)
+
+
+def _native_batched_atoms(
+    *,
+    family: str,
+    atom_kind: str,
+    source_kind: str,
+    axes: tuple[str, ...],
+    base_content: Mapping[str, Any],
+    collection_key: str,
+    members: Sequence[Mapping[str, Any]],
+    semantic_member_batch_size: int,
+) -> list[dict[str, Any]]:
+    batches = _member_batches(
+        members,
+        semantic_member_batch_size=semantic_member_batch_size,
+    )
+    if not batches:
+        raise ValueError(f"{family} native evidence group has no semantic members")
+    output: list[dict[str, Any]] = []
+    for batch_index, batch in enumerate(batches, start=1):
+        output.append(
+            {
+                "atom_kind": atom_kind,
+                "source_kind": source_kind,
+                "observable_axes": list(axes),
+                "content": {
+                    **_clone(base_content),
+                    collection_key: list(batch),
+                    "member_batch_index": batch_index,
+                    "member_batch_count": len(batches),
+                    "full_member_count": len(members),
+                },
+            }
+        )
+    return output
+
+
+def _adapt_native_bow_payload(
+    evidence: Sequence[Mapping[str, Any]],
+    *,
+    family: str,
+    semantic_member_batch_size: int,
+) -> list[dict[str, Any]]:
+    objectives = {
+        BOW_NUISANCE: {
+            "treatment_nuisance": "treatment_positive",
+            "outcome_nuisance": "outcome_positive",
+        },
+        BOW_R_LOSS: {
+            "effect_pseudo_target": "pseudo_target_positive",
+            "effect_weighted_r": "pseudo_target_positive",
+        },
+    }[family]
+    groups: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
+    for source_index, raw in enumerate(evidence):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{family} native BoW record must be an object")
+        row = _clone(raw)
+        witness_kind = str(row.get("witness_kind") or "")
+        expected_keys = {
+            "objective",
+            "view_name",
+            "fold",
+            "witness_kind",
+            *(
+                {"feature_index", "term", "idf"}
+                if witness_kind == "fitted_tfidf_term"
+                else {"constant_prediction"}
+                if witness_kind == "constant_fit"
+                else {"__unknown_witness_kind__"}
+            ),
+        }
+        if set(row) != expected_keys:
+            raise ValueError(f"{family} native BoW evidence schema changed")
+        objective = str(row.get("objective") or "")
+        view_name = str(row.get("view_name") or "")
+        fold = _positive_native_integer(row.get("fold"), path="native BoW fold")
+        if objective not in objectives or not view_name.strip():
+            raise ValueError(f"{family} native BoW objective/view changed")
+        projection = _native_semantic_projection(
+            row,
+            keys=(
+                "witness_kind",
+                "objective",
+                "view_name",
+                "fold",
+                "term",
+                "idf",
+                "constant_prediction",
+            ),
+        )
+        if witness_kind == "fitted_tfidf_term":
+            _positive_native_integer(
+                row.get("feature_index"),
+                path="native BoW feature_index",
+                allow_zero=True,
+            )
+            if not isinstance(row.get("term"), str) or not row["term"].strip():
+                raise ValueError("native BoW term must be a non-empty string")
+            _native_finite(row.get("idf"), path="native BoW idf")
+        else:
+            _native_finite(
+                row.get("constant_prediction"),
+                path="native BoW constant_prediction",
+            )
+        groups[(objective, view_name, fold)].append(
+            _native_evidence_unit(
+                source_record=row,
+                source_record_index=source_index,
+                native_record=row,
+                native_record_index=0,
+                semantic_projection=projection,
+            )
+        )
+    output: list[dict[str, Any]] = []
+    for (objective, view_name, fold), members in sorted(groups.items()):
+        evidence_type = objectives[objective]
+        source = (
+            f"ensemble_r.{view_name}.{evidence_type}"
+            if family == BOW_R_LOSS and view_name.startswith("ensemble_r__")
+            else f"{view_name}.{evidence_type}"
+        )
+        group = {
+            "view_name": view_name,
+            "evidence_type": evidence_type,
+            "source": source,
+            "native_objective": objective,
+            "native_fold": fold,
+        }
+        observed_family, axes = _classify_bow(group)
+        if observed_family != family:
+            raise RuntimeError("native BoW adapter changed the source family")
+        output.extend(
+            _native_batched_atoms(
+                family=family,
+                atom_kind="bow_term_group",
+                source_kind=LEGACY_ALL_SOURCE,
+                axes=axes,
+                base_content={
+                    "architecture_encoder": "bow",
+                    "group": group,
+                },
+                collection_key="terms",
+                members=members,
+                semantic_member_batch_size=semantic_member_batch_size,
+            )
+        )
+    return output
+
+
+def _adapt_native_htr_payload(
+    evidence: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    expected = {
+        "witness_kind",
+        "stage",
+        "objective",
+        "fold",
+        "fit_note_position",
+        "chunk_index",
+        "chunk_text",
+        "chunk_sha256",
+        "attention",
+    }
+    output: list[dict[str, Any]] = []
+    for source_index, raw in enumerate(evidence):
+        if not isinstance(raw, Mapping) or set(raw) != expected:
+            raise ValueError("native HTR attention evidence schema changed")
+        row = _clone(raw)
+        stage = str(row.get("stage") or "")
+        if (
+            row.get("witness_kind") != "complete_htr_chunk_attention"
+            or stage not in {"nuisance", "effect_modifier"}
+            or not isinstance(row.get("objective"), str)
+            or not row["objective"].strip()
+        ):
+            raise ValueError("native HTR evidence changed its witness semantics")
+        for key in ("fold",):
+            _positive_native_integer(row.get(key), path=f"native HTR {key}")
+        for key in ("fit_note_position", "chunk_index"):
+            _positive_native_integer(
+                row.get(key),
+                path=f"native HTR {key}",
+                allow_zero=True,
+            )
+        chunk_text = row.get("chunk_text")
+        if not isinstance(chunk_text, str) or not chunk_text:
+            raise ValueError("native HTR chunk text must be non-empty")
+        if hashlib.sha256(chunk_text.encode("utf-8")).hexdigest() != row.get(
+            "chunk_sha256"
+        ):
+            raise ValueError("native HTR chunk digest does not authenticate")
+        _native_finite(row.get("attention"), path="native HTR attention")
+        normalized_stage = "nuisance" if stage == "nuisance" else "effect"
+        axes = (
+            (TREATMENT_AXIS, OUTCOME_AXIS)
+            if normalized_stage == "nuisance"
+            else (HETEROGENEITY_AXIS,)
+        )
+        unit = _native_evidence_unit(
+            source_record=row,
+            source_record_index=source_index,
+            native_record=row,
+            native_record_index=0,
+            semantic_projection={
+                "chunk_text": chunk_text,
+                "attention": row["attention"],
+                "objective": row["objective"],
+                "fold": row["fold"],
+                "fit_note_position": row["fit_note_position"],
+                "chunk_index": row["chunk_index"],
+            },
+        )
+        output.append(
+            {
+                "atom_kind": "htr_phrase",
+                "source_kind": LEGACY_ALL_SOURCE,
+                "observable_axes": list(axes),
+                "content": {
+                    "architecture_encoder": "htr",
+                    "group": {
+                        "stage": normalized_stage,
+                        "meaning": row["objective"],
+                    },
+                    "phrase_evidence": unit,
+                },
+            }
+        )
+    return output
+
+
+def _adapt_native_embedding_payload(
+    evidence: Sequence[Mapping[str, Any]],
+    *,
+    family: str,
+    semantic_member_batch_size: int,
+) -> list[dict[str, Any]]:
+    expected_atom_kind = (
+        "tfidf_semantic_retrieval_contrast"
+        if family == TFIDF_SEMANTIC_RETRIEVAL
+        else "embedding_contrast"
+    )
+    output: list[dict[str, Any]] = []
+    for source_index, raw in enumerate(evidence):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"{family} native embedding evidence must be an object")
+        row = _clone(raw)
+        if set(row) not in (
+            {"atom_kind", "source_kind", "observable_axes", "content"},
+            {
+                "atom_kind",
+                "source_kind",
+                "observable_axes",
+                "content",
+                "canonical_preflight_scope_reused",
+                "canonical_preflight_atom_index",
+            },
+        ):
+            raise ValueError(f"{family} native embedding evidence schema changed")
+        if (
+            row.get("atom_kind") != expected_atom_kind
+            or row.get("source_kind") != LEGACY_ALL_SOURCE
+            or not isinstance(row.get("content"), Mapping)
+            or not isinstance(row.get("observable_axes"), list)
+        ):
+            raise ValueError(f"{family} native embedding architecture binding changed")
+        axes = tuple(map(str, row["observable_axes"]))
+        if axes != _ordered_axes(axes):
+            raise ValueError(f"{family} native embedding axes are not canonical")
+        content = row["content"]
+        contrast = content.get("contrast")
+        witnesses = content.get("concept_witnesses")
+        if (
+            not isinstance(contrast, Mapping)
+            or not isinstance(witnesses, list)
+            or not witnesses
+            or any(not isinstance(member, Mapping) for member in witnesses)
+        ):
+            raise ValueError(f"{family} native embedding witnesses are malformed")
+        structural_family, expected_axes = _classify_embedding(contrast)
+        if expected_axes != axes or (
+            family != TFIDF_SEMANTIC_RETRIEVAL
+            and structural_family != family
+        ):
+            raise ValueError(f"{family} native embedding contrast changed family/axes")
+        if family == TFIDF_SEMANTIC_RETRIEVAL:
+            if (
+                content.get("architecture_view")
+                != SEMANTIC_RETRIEVAL_DERIVATION
+                or content.get("source_passages_removed") is not True
+            ):
+                raise ValueError("native semantic retrieval evidence retains passages")
+        elif content.get("architecture_view") != "embedding_contrast":
+            raise ValueError("native embedding evidence changed architecture view")
+        if content.get("all_source_chunks_accounted_once") not in (None, True):
+            raise ValueError("native embedding source-chunk coverage is incomplete")
+        if content.get("all_configured_semantic_terms_accounted_once") not in (
+            None,
+            True,
+        ):
+            raise ValueError("native embedding semantic-term coverage is incomplete")
+        unit = _native_evidence_unit(
+            source_record=row,
+            source_record_index=source_index,
+            native_record=row,
+            native_record_index=0,
+            semantic_projection={
+                "contrast": _clone(contrast),
+                "concept_witnesses_json": canonical_json(witnesses),
+                "producer_member_batch_index": content.get("member_batch_index"),
+                "producer_member_batch_count": content.get("member_batch_count"),
+                "producer_full_member_count": content.get("full_member_count"),
+            },
+        )
+        normalized_contrast = {
+            **_clone(contrast),
+            "native_source_record_index": source_index,
+            "native_source_record_sha256": _sha256_json(row),
+        }
+        base = {
+            "architecture_view": (
+                SEMANTIC_RETRIEVAL_DERIVATION
+                if family == TFIDF_SEMANTIC_RETRIEVAL
+                else "embedding_contrast"
+            ),
+            "contrast": normalized_contrast,
+        }
+        if family == TFIDF_SEMANTIC_RETRIEVAL:
+            base["source_passages_removed"] = True
+        output.extend(
+            _native_batched_atoms(
+                family=family,
+                atom_kind=expected_atom_kind,
+                source_kind=LEGACY_ALL_SOURCE,
+                axes=axes,
+                base_content=base,
+                collection_key="concept_witnesses",
+                members=[unit],
+                semantic_member_batch_size=semantic_member_batch_size,
+            )
+        )
+    return output
+
+
+def _adapt_native_tfidf_topic_payload(
+    evidence: Sequence[Mapping[str, Any]],
+    *,
+    semantic_member_batch_size: int,
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for source_index, raw in enumerate(evidence):
+        if not isinstance(raw, Mapping):
+            raise ValueError("native TF-IDF topic evidence must be an object")
+        row = _clone(raw)
+        witness_kind = str(row.get("witness_kind") or "")
+        if witness_kind not in {
+            "fitted_consensus_nmf_topic_term",
+            "fitted_topic_without_rendered_terms",
+            "no_feasible_fitted_topic",
+        }:
+            raise ValueError("native TF-IDF topic witness kind changed")
+        if witness_kind == "no_feasible_fitted_topic":
+            if set(row) != {"witness_kind", "reason"}:
+                raise ValueError("native no-topic witness schema changed")
+            bank = "unavailable"
+            topic_id = "no_feasible_fitted_topic"
+        else:
+            bank = str(row.get("bank") or "").casefold()
+            topic_id = str(row.get("topic_id") or "")
+            _bank_axis(bank, path="native TF-IDF topic bank")
+            if not topic_id:
+                raise ValueError("native TF-IDF topic ID is empty")
+            if witness_kind == "fitted_topic_without_rendered_terms":
+                if set(row) != {"bank", "topic_id", "witness_kind"}:
+                    raise ValueError("native empty-topic witness schema changed")
+            else:
+                required = {
+                    "bank",
+                    "topic_id",
+                    "topic_position",
+                    "term_position",
+                    "witness_kind",
+                }
+                if not required.issubset(row):
+                    raise ValueError("native TF-IDF topic-term witness is incomplete")
+                if not isinstance(row.get("term"), str) or not row["term"].strip():
+                    raise ValueError("native TF-IDF topic-term witness has no term")
+                _positive_native_integer(
+                    row.get("topic_position"),
+                    path="native topic_position",
+                    allow_zero=True,
+                )
+                _positive_native_integer(
+                    row.get("term_position"),
+                    path="native term_position",
+                    allow_zero=True,
+                )
+        projection = _native_semantic_projection(
+            row,
+            keys=(
+                "witness_kind",
+                "bank",
+                "topic_id",
+                "term",
+                "feature",
+                "loading",
+                "signed_score",
+                "reason",
+            ),
+        )
+        groups[(bank, topic_id)].append(
+            _native_evidence_unit(
+                source_record=row,
+                source_record_index=source_index,
+                native_record=row,
+                native_record_index=0,
+                semantic_projection=projection,
+            )
+        )
+    output: list[dict[str, Any]] = []
+    for (bank, topic_id), members in sorted(groups.items()):
+        axes = (
+            _ordered_axes((TREATMENT_AXIS, OUTCOME_AXIS, HETEROGENEITY_AXIS))
+            if bank == "unavailable"
+            else _bank_axis(bank, path="native TF-IDF topic bank")
+        )
+        output.extend(
+            _native_batched_atoms(
+                family=TFIDF_TOPICS,
+                atom_kind="tfidf_topic",
+                source_kind=TFIDF_TOPIC_SOURCE,
+                axes=axes,
+                base_content={"bank": bank, "topic_id": topic_id},
+                collection_key="terms",
+                members=members,
+                semantic_member_batch_size=semantic_member_batch_size,
+            )
+        )
+    return output
+
+
+def _adapt_native_tfidf_orphan_payload(
+    evidence: Sequence[Mapping[str, Any]],
+    *,
+    semantic_member_batch_size: int,
+) -> list[dict[str, Any]]:
+    members: list[dict[str, Any]] = []
+    for source_index, raw in enumerate(evidence):
+        if not isinstance(raw, Mapping):
+            raise ValueError("native residual TF-IDF evidence must be an object")
+        row = _clone(raw)
+        witness_kind = str(row.get("witness_kind") or "")
+        if witness_kind == "fit_side_residual_tfidf_ngram":
+            required = {
+                "witness_kind",
+                "fit_rank",
+                "represented_in_effect_topic",
+                "feature",
+            }
+            if (
+                not required.issubset(row)
+                or row.get("represented_in_effect_topic") is not False
+                or not isinstance(row.get("feature"), str)
+                or not row["feature"].strip()
+            ):
+                raise ValueError("native residual TF-IDF n-gram witness changed")
+            _positive_native_integer(row.get("fit_rank"), path="native residual fit_rank")
+        elif witness_kind == "no_eligible_residual_tfidf_ngram":
+            if set(row) != {"witness_kind", "reason"}:
+                raise ValueError("native empty residual TF-IDF witness schema changed")
+        else:
+            raise ValueError("native residual TF-IDF witness kind changed")
+        members.append(
+            _native_evidence_unit(
+                source_record=row,
+                source_record_index=source_index,
+                native_record=row,
+                native_record_index=0,
+                semantic_projection=_native_semantic_projection(
+                    row,
+                    keys=(
+                        "witness_kind",
+                        "fit_rank",
+                        "feature",
+                        "signed_score",
+                        "combined_importance",
+                        "reason",
+                    ),
+                ),
+            )
+        )
+    return _native_batched_atoms(
+        family=TFIDF_ORPHAN_NGRAMS,
+        atom_kind="tfidf_orphan_ngram_cluster",
+        source_kind=TFIDF_TOPIC_SOURCE,
+        axes=(HETEROGENEITY_AXIS,),
+        base_content={
+            "cluster_id": "complete_native_fit_side_residual_tfidf_ngrams"
+        },
+        collection_key="terms",
+        members=members,
+        semantic_member_batch_size=semantic_member_batch_size,
+    )
+
+
+def _adapt_native_neural_query_payload(
+    evidence: Sequence[Mapping[str, Any]],
+    *,
+    semantic_member_batch_size: int,
+) -> list[dict[str, Any]]:
+    expected = {
+        "query_id",
+        "bank",
+        "mechanical_role",
+        "statistical_gate_applied",
+        "member_count",
+        "fit_standardized_score",
+        "top_chunks",
+        "top_contrastive_ngrams",
+    }
+    output: list[dict[str, Any]] = []
+    query_ids: set[str] = set()
+    for source_index, raw in enumerate(evidence):
+        if not isinstance(raw, Mapping) or set(raw) != expected:
+            raise ValueError("native neural-query evidence schema changed")
+        row = _clone(raw)
+        bank = str(row.get("bank") or "").casefold()
+        axes = _bank_axis(bank, path="native neural-query bank")
+        query_id = str(row.get("query_id") or "")
+        expected_role = "effect_modifier" if bank == "effect" else "confounder"
+        if (
+            not query_id
+            or query_id in query_ids
+            or row.get("mechanical_role") != expected_role
+            or row.get("statistical_gate_applied") is not False
+            or row.get("top_chunks") != []
+            or not isinstance(row.get("top_contrastive_ngrams"), list)
+        ):
+            raise ValueError("native neural-query evidence changed safe query semantics")
+        query_ids.add(query_id)
+        unit = _native_evidence_unit(
+            source_record=row,
+            source_record_index=source_index,
+            native_record=row,
+            native_record_index=0,
+            semantic_projection={
+                **_native_semantic_projection(
+                    row,
+                    keys=(
+                        "query_id",
+                        "bank",
+                        "mechanical_role",
+                        "member_count",
+                        "fit_standardized_score",
+                    ),
+                ),
+                "top_contrastive_ngrams_json": canonical_json(
+                    row["top_contrastive_ngrams"]
+                ),
+            },
+        )
+        output.extend(
+            _native_batched_atoms(
+                family=NEURAL_QUERY_MOMENTS,
+                atom_kind="neural_query_semantic_witnesses",
+                source_kind=NEURAL_QUERY_SOURCE,
+                axes=axes,
+                base_content={
+                    "bank": bank,
+                    "query_id": query_id,
+                    "statistical_gate_applied": False,
+                },
+                collection_key="semantic_witnesses",
+                members=[unit],
+                semantic_member_batch_size=semantic_member_batch_size,
+            )
+        )
+    return output
+
+
+def _adapt_native_matched_pair_payload(
+    evidence: Sequence[Mapping[str, Any]],
+    *,
+    semantic_member_batch_size: int,
+) -> list[dict[str, Any]]:
+    bow_groups: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    htr_rows: list[dict[str, Any]] = []
+    seen_subproducers: set[str] = set()
+    source_seals: set[str] = set()
+    for source_index, raw in enumerate(evidence):
+        if not isinstance(raw, Mapping):
+            raise ValueError("native matched-pair proof must be an object")
+        source = _clone(raw)
+        if set(source) != {
+            "source_family_seal_content_sha256",
+            "subproducer",
+            "evidence_payload_sha256",
+            "evidence_payload",
+        }:
+            raise ValueError("native matched-pair proof schema changed")
+        source_seal = str(source.get("source_family_seal_content_sha256") or "")
+        subproducer = str(source.get("subproducer") or "")
+        payload = source.get("evidence_payload")
+        if (
+            _SHA256.fullmatch(source_seal) is None
+            or subproducer not in {"bow", "htr"}
+            or subproducer in seen_subproducers
+            or _SHA256.fullmatch(str(source.get("evidence_payload_sha256") or ""))
+            is None
+            or not isinstance(payload, Mapping)
+            or _sha256_json(payload) != source["evidence_payload_sha256"]
+        ):
+            raise ValueError("native matched-pair proof does not authenticate")
+        seen_subproducers.add(subproducer)
+        source_seals.add(source_seal)
+        nested = _clone(payload)
+        expected_kind = {
+            "bow": "complete_fold_vocabulary_coefficients_v1",
+            "htr": "complete_validation_pair_witnesses_v1",
+        }[subproducer]
+        if (
+            set(nested)
+            != {
+                "subproducer",
+                "evidence_kind",
+                "top_k_applied",
+                "text_truncation_applied",
+                "atoms",
+            }
+            or nested.get("subproducer") != subproducer
+            or nested.get("evidence_kind") != expected_kind
+            or nested.get("top_k_applied") is not False
+            or nested.get("text_truncation_applied") is not False
+            or not isinstance(nested.get("atoms"), list)
+            or not nested["atoms"]
+        ):
+            raise ValueError("native matched-pair subproducer evidence changed")
+        proof_context = {
+            "source_family_seal_content_sha256": source_seal,
+            "subproducer": subproducer,
+            "evidence_payload_sha256": source["evidence_payload_sha256"],
+            "evidence_payload_without_atoms": {
+                key: child for key, child in nested.items() if key != "atoms"
+            },
+        }
+        for native_index, raw_atom in enumerate(nested["atoms"]):
+            if not isinstance(raw_atom, Mapping):
+                raise ValueError("native matched-pair atom must be an object")
+            atom = _clone(raw_atom)
+            if subproducer == "bow":
+                if set(atom) != {
+                    "fold",
+                    "view_name",
+                    "feature_index",
+                    "term",
+                    "control_delta_logit_coefficient",
+                    "treated_delta_logit_coefficient",
+                }:
+                    raise ValueError("native matched-pair BoW atom schema changed")
+                fold = _positive_native_integer(
+                    atom.get("fold"),
+                    path="native matched-pair BoW fold",
+                )
+                view_name = str(atom.get("view_name") or "")
+                _positive_native_integer(
+                    atom.get("feature_index"),
+                    path="native matched-pair feature_index",
+                    allow_zero=True,
+                )
+                if (
+                    not view_name
+                    or not isinstance(atom.get("term"), str)
+                    or not atom["term"].strip()
+                ):
+                    raise ValueError("native matched-pair BoW term/view is invalid")
+                for key in (
+                    "control_delta_logit_coefficient",
+                    "treated_delta_logit_coefficient",
+                ):
+                    _native_finite(atom.get(key), path=f"native matched-pair {key}")
+                bow_groups[(fold, view_name)].append(
+                    _native_evidence_unit(
+                        source_record=source,
+                        source_record_index=source_index,
+                        native_record=atom,
+                        native_record_index=native_index,
+                        proof_context=proof_context,
+                        semantic_projection=_clone(atom),
+                    )
+                )
+            else:
+                if set(atom) != {
+                    "fold",
+                    "pair_index",
+                    "candidate_row_id",
+                    "control_row_id",
+                    "propensity_abs_diff",
+                    "outcome_abs_diff",
+                    "delta_logit",
+                }:
+                    raise ValueError("native matched-pair HTR atom schema changed")
+                _positive_native_integer(
+                    atom.get("fold"),
+                    path="native matched-pair HTR fold",
+                )
+                for key in (
+                    "pair_index",
+                    "candidate_row_id",
+                    "control_row_id",
+                ):
+                    _positive_native_integer(
+                        atom.get(key),
+                        path=f"native matched-pair {key}",
+                        allow_zero=True,
+                    )
+                for key in (
+                    "propensity_abs_diff",
+                    "outcome_abs_diff",
+                    "delta_logit",
+                ):
+                    _native_finite(atom.get(key), path=f"native matched-pair {key}")
+                # Candidate/control row identifiers authenticate in the
+                # upstream source record but are operational coordinates, not
+                # clinical concept evidence.  The discovery-facing native
+                # unit therefore carries the complete non-identifying pair
+                # witness and the source-record hash, never the row IDs.
+                safe_atom = {
+                    key: child
+                    for key, child in atom.items()
+                    if key not in {"candidate_row_id", "control_row_id"}
+                }
+                htr_rows.append(
+                    _native_evidence_unit(
+                        source_record=source,
+                        source_record_index=source_index,
+                        native_record=safe_atom,
+                        native_record_index=native_index,
+                        proof_context=proof_context,
+                        semantic_projection=_clone(safe_atom),
+                    )
+                )
+    if seen_subproducers != {"bow", "htr"} or len(source_seals) != 1:
+        raise ValueError("native matched-pair payload lacks one common subproducer proof")
+    output: list[dict[str, Any]] = []
+    for (fold, view_name), members in sorted(bow_groups.items()):
+        normalized_view = f"pair_uplift__{view_name}"
+        evidence_type = "uplift_pair_features"
+        group = {
+            "view_name": normalized_view,
+            "evidence_type": evidence_type,
+            "source": (
+                f"matched_pair_uplift.{normalized_view}.{evidence_type}"
+            ),
+            "native_fold": fold,
+            "native_view_name": view_name,
+        }
+        observed_family, axes = _classify_bow(group)
+        if observed_family != MATCHED_PAIR_UPLIFT:
+            raise RuntimeError("matched-pair native adapter changed family")
+        output.extend(
+            _native_batched_atoms(
+                family=MATCHED_PAIR_UPLIFT,
+                atom_kind="bow_term_group",
+                source_kind=LEGACY_ALL_SOURCE,
+                axes=axes,
+                base_content={
+                    "architecture_encoder": "bow",
+                    "group": group,
+                },
+                collection_key="terms",
+                members=members,
+                semantic_member_batch_size=semantic_member_batch_size,
+            )
+        )
+    for unit in htr_rows:
+        output.append(
+            {
+                "atom_kind": "matched_pair_htr_phrase",
+                "source_kind": LEGACY_ALL_SOURCE,
+                "observable_axes": [PAIR_UPLIFT_AXIS],
+                "content": {
+                    "architecture_encoder": "htr",
+                    "group": {
+                        "stage": "pair_uplift",
+                        "meaning": "complete_validation_pair_witnesses_v1",
+                    },
+                    "phrase_evidence": unit,
+                },
+            }
+        )
+    return output
+
+
+def _normalize_cumulative_family_payload(
+    raw_payload: Mapping[str, Any],
+    *,
+    family: str,
+    semantic_member_batch_size: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = _clone(raw_payload)
+    if set(payload) != {"schema_version", "family", "architecture_evidence"}:
+        raise ValueError(f"{family} cumulative family payload is not a closed schema")
+    evidence = payload.get("architecture_evidence")
+    if (
+        payload.get("schema_version") != NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
+        or payload.get("family") != family
+        or not isinstance(evidence, list)
+        or not evidence
+    ):
+        raise ValueError(f"{family} cumulative family payload is empty or misbound")
+    def is_catalog_shaped(item: Any) -> bool:
+        if (
+            not isinstance(item, Mapping)
+            or set(item)
+            != {"atom_kind", "source_kind", "observable_axes", "content"}
+            or item.get("atom_kind") not in _CUMULATIVE_FAMILY_ATOM_KINDS[family]
+            or item.get("source_kind") != _CUMULATIVE_FAMILY_SOURCE_KIND[family]
+            or not isinstance(item.get("content"), Mapping)
+        ):
+            return False
+        content_keys = set(item["content"])
+        expected_content_keys = set(
+            _CUMULATIVE_ATOM_CONTENT_KEYS[str(item["atom_kind"])]
+        )
+        native_embedding_proof_keys = {
+            "source_chunk_count",
+            "all_source_chunks_accounted_once",
+            "all_configured_semantic_terms_accounted_once",
+        }
+        if (
+            family
+            in {
+                EMBEDDING_WHOLE_COHORT,
+                EMBEDDING_CLUSTERED,
+                TFIDF_SEMANTIC_RETRIEVAL,
+            }
+            and content_keys != expected_content_keys
+            and native_embedding_proof_keys.intersection(content_keys)
+        ):
+            return False
+        return True
+
+    catalog_shaped = [is_catalog_shaped(item) for item in evidence]
+    if any(catalog_shaped) and not all(catalog_shaped):
+        raise ValueError(f"{family} cumulative payload mixes catalog and native schemas")
+    if all(catalog_shaped):
+        normalized = payload
+        adapter_applied = False
+    else:
+        adapters = {
+            BOW_NUISANCE: lambda: _adapt_native_bow_payload(
+                evidence,
+                family=BOW_NUISANCE,
+                semantic_member_batch_size=semantic_member_batch_size,
+            ),
+            BOW_R_LOSS: lambda: _adapt_native_bow_payload(
+                evidence,
+                family=BOW_R_LOSS,
+                semantic_member_batch_size=semantic_member_batch_size,
+            ),
+            HTR_NEURAL: lambda: _adapt_native_htr_payload(evidence),
+            MATCHED_PAIR_UPLIFT: lambda: _adapt_native_matched_pair_payload(
+                evidence,
+                semantic_member_batch_size=semantic_member_batch_size,
+            ),
+            EMBEDDING_WHOLE_COHORT: lambda: _adapt_native_embedding_payload(
+                evidence,
+                family=EMBEDDING_WHOLE_COHORT,
+                semantic_member_batch_size=semantic_member_batch_size,
+            ),
+            EMBEDDING_CLUSTERED: lambda: _adapt_native_embedding_payload(
+                evidence,
+                family=EMBEDDING_CLUSTERED,
+                semantic_member_batch_size=semantic_member_batch_size,
+            ),
+            TFIDF_SEMANTIC_RETRIEVAL: lambda: _adapt_native_embedding_payload(
+                evidence,
+                family=TFIDF_SEMANTIC_RETRIEVAL,
+                semantic_member_batch_size=semantic_member_batch_size,
+            ),
+            TFIDF_TOPICS: lambda: _adapt_native_tfidf_topic_payload(
+                evidence,
+                semantic_member_batch_size=semantic_member_batch_size,
+            ),
+            TFIDF_ORPHAN_NGRAMS: lambda: _adapt_native_tfidf_orphan_payload(
+                evidence,
+                semantic_member_batch_size=semantic_member_batch_size,
+            ),
+            NEURAL_QUERY_MOMENTS: lambda: _adapt_native_neural_query_payload(
+                evidence,
+                semantic_member_batch_size=semantic_member_batch_size,
+            ),
+        }
+        normalized_evidence = adapters[family]()
+        if not normalized_evidence:
+            raise ValueError(f"{family} native payload normalization emitted no evidence")
+        normalized = {
+            "schema_version": NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
+            "family": family,
+            "architecture_evidence": sorted(
+                normalized_evidence,
+                key=canonical_json,
+            ),
+        }
+        adapter_applied = True
+
+    units = _native_units_in(normalized["architecture_evidence"])
+    source_hashes = [_sha256_json(item) for item in evidence]
+    if adapter_applied:
+        observed_source_counts = Counter(
+            int(unit["source_record_index"]) for unit in units
+        )
+        covered_source_indices = {
+            int(unit["source_record_index"]) for unit in units
+        }
+        if (
+            not units
+            or covered_source_indices != set(range(len(evidence)))
+            or any(
+                unit["source_record_sha256"]
+                != source_hashes[int(unit["source_record_index"])]
+                for unit in units
+            )
+        ):
+            raise RuntimeError(f"{family} native payload normalization lost a source record")
+        if family == MATCHED_PAIR_UPLIFT:
+            for source_index, source_record in enumerate(evidence):
+                nested = source_record.get("evidence_payload")
+                native_atoms = (
+                    nested.get("atoms") if isinstance(nested, Mapping) else None
+                )
+                expected_count = len(native_atoms) if isinstance(native_atoms, list) else 0
+                observed_indices = {
+                    int(unit["native_record_index"])
+                    for unit in units
+                    if int(unit["source_record_index"]) == source_index
+                }
+                if (
+                    observed_source_counts[source_index] != expected_count
+                    or observed_indices != set(range(expected_count))
+                ):
+                    raise RuntimeError(
+                        "matched-pair native payload normalization omitted or "
+                        "duplicated a nested atom"
+                    )
+        elif (
+            observed_source_counts
+            != Counter({index: 1 for index in range(len(evidence))})
+            or any(int(unit["native_record_index"]) != 0 for unit in units)
+        ):
+            raise RuntimeError(
+                f"{family} native payload normalization omitted or duplicated a record"
+            )
+    audit = {
+        "schema_version": NATIVE_ROLE_NEUTRAL_PAYLOAD_ADAPTER_SCHEMA_VERSION,
+        "family": family,
+        "adapter_applied": adapter_applied,
+        "source_payload_sha256": _sha256_json(payload),
+        "normalized_payload_sha256": _sha256_json(normalized),
+        "source_record_count": len(evidence),
+        "source_ordered_record_sha256": _sha256_json(source_hashes),
+        "native_unit_count": len(units),
+        "native_unit_multiset_sha256": _sha256_json(
+            sorted(unit["native_unit_sha256"] for unit in units)
+        ),
+        "all_source_records_accounted_once_or_by_complete_nested_units": True,
+        "native_units_self_authenticated": True,
+        "selection_or_truncation_applied": False,
+    }
+    return normalized, audit
+
+
 def _validate_cumulative_payload_item(
     value: Any,
     *,
@@ -1912,7 +3027,13 @@ def _validate_cumulative_payload_item(
         if expected != (family, axes):
             raise ValueError("cumulative HTR atom changed its family or observable axes")
     elif atom_kind == "tfidf_topic":
-        if _bank_axis(str(content.get("bank") or ""), path="cumulative.tfidf.bank") != axes:
+        topic_bank = str(content.get("bank") or "")
+        expected_topic_axes = (
+            _ordered_axes((TREATMENT_AXIS, OUTCOME_AXIS, HETEROGENEITY_AXIS))
+            if topic_bank == "unavailable"
+            else _bank_axis(topic_bank, path="cumulative.tfidf.bank")
+        )
+        if expected_topic_axes != axes:
             raise ValueError("cumulative TF-IDF topic observable axes changed")
     elif atom_kind == "tfidf_orphan_ngram_cluster":
         if axes != (HETEROGENEITY_AXIS,):
@@ -1931,6 +3052,12 @@ def _validate_cumulative_payload_item(
             or not all(isinstance(member, Mapping) for member in members)
         ):
             raise ValueError(f"{family} cumulative semantic-member batch is invalid")
+        for member in members:
+            if (
+                member.get("schema_version")
+                == NATIVE_ROLE_NEUTRAL_UNIT_SCHEMA_VERSION
+            ):
+                _validate_native_evidence_unit(member)
         raw_numbers = {
             name: content.get(name)
             for name in ("member_batch_index", "member_batch_count", "full_member_count")
@@ -1971,6 +3098,12 @@ def _validate_cumulative_payload_item(
         singular_key = _CUMULATIVE_ATOM_SINGULAR_KEY[atom_kind]
         if not isinstance(content.get(singular_key), Mapping):
             raise ValueError(f"{family} cumulative singular semantic member is invalid")
+        singular = content[singular_key]
+        if (
+            singular.get("schema_version")
+            == NATIVE_ROLE_NEUTRAL_UNIT_SCHEMA_VERSION
+        ):
+            _validate_native_evidence_unit(singular)
 
     item["observable_axes"] = list(axes)
     item["content"] = content
@@ -2072,22 +3205,21 @@ def assemble_cumulative_spent_role_neutral_catalog(
 
     batch_groups: dict[str, list[tuple[int, int, int, int]]] = defaultdict(list)
     payloads: dict[str, dict[str, Any]] = {}
+    source_payloads: dict[str, dict[str, Any]] = {}
+    native_adapter_audits: dict[str, dict[str, Any]] = {}
     rows: list[tuple[str, dict[str, Any]]] = []
     for family in ACTIVE_STAGE1_CONCEPT_FAMILIES:
         raw_payload = family_payload_by_family[family]
         if not isinstance(raw_payload, Mapping):
             raise TypeError(f"{family} cumulative family payload must be a mapping")
-        payload = _clone(raw_payload)
-        if set(payload) != {"schema_version", "family", "architecture_evidence"}:
-            raise ValueError(f"{family} cumulative family payload is not a closed schema")
+        source_payloads[family] = _clone(raw_payload)
+        payload, adapter_audit = _normalize_cumulative_family_payload(
+            raw_payload,
+            family=family,
+            semantic_member_batch_size=semantic_member_batch_size,
+        )
+        native_adapter_audits[family] = adapter_audit
         evidence = payload.get("architecture_evidence")
-        if (
-            payload.get("schema_version") != NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
-            or payload.get("family") != family
-            or not isinstance(evidence, list)
-            or not evidence
-        ):
-            raise ValueError(f"{family} cumulative family payload is empty or misbound")
         validated = [
             _validate_cumulative_payload_item(
                 item,
@@ -2253,6 +3385,12 @@ def assemble_cumulative_spent_role_neutral_catalog(
         "family_payload_sha256_by_family": {
             family: _sha256_json(payloads[family]) for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
         },
+        "source_family_payload_sha256_by_family": {
+            family: _sha256_json(source_payloads[family])
+            for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+        },
+        "native_payload_adapter_by_family": native_adapter_audits,
+        "native_payload_adapter_selection_or_truncation_applied": False,
         "inactive_sparse_query_present": False,
         "role_fields_emitted": False,
         "extraction_contracts_emitted": False,
@@ -2698,6 +3836,8 @@ __all__ = [
     "DEFAULT_MAX_BYTES_PER_ARCHITECTURE_CHUNK",
     "DEFAULT_MAX_SEMANTIC_MEMBER_IDS_PER_ARCHITECTURE_CHUNK",
     "NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION",
+    "NATIVE_ROLE_NEUTRAL_PAYLOAD_ADAPTER_SCHEMA_VERSION",
+    "NATIVE_ROLE_NEUTRAL_UNIT_SCHEMA_VERSION",
     "NON_GROUNDING_SUMMARY_SCHEMA_VERSION",
     "ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION",
     "SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION",

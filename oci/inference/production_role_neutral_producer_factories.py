@@ -36,6 +36,7 @@ from ..models.hierarchical_transformer_extractor import (
 )
 from .neural_query_agentic_forest import NeuralQueryAgenticForestConfig
 from .neural_query_context_backend import ContextFitNeuralQueryService
+from .neural_numerical_replay import validate_neural_replay_settings
 from .production_stage1_bundle import _PreparedBuild
 from .production_stage1_cluster_preflight_artifact import (
     load_production_stage1_cluster_preflight_artifact,
@@ -43,6 +44,7 @@ from .production_stage1_cluster_preflight_artifact import (
 from .production_stage1_role_neutral_execution import (
     BoundRoleNeutralComponentProducer,
     RoleNeutralComponentInvocation,
+    RoleNeutralOperationalComponentReport,
     RoleNeutralProducerFactories,
 )
 from .review_spent_evidence_provider import (
@@ -201,6 +203,9 @@ _QUERY_CONFIGURATION_KEYS = frozenset(
         "evidence_capacity_policy",
         "embedding_text_coverage_policy",
         "heldout_transform_policy",
+        "replay_comparison_policy",
+        "replay_relative_tolerance",
+        "replay_absolute_tolerance",
     }
 )
 _QUERY_CONFIG_KEYS = frozenset(
@@ -929,6 +934,11 @@ def _neural_query_configuration(
             "producer_configuration.query_config"
         ),
     )
+    validate_neural_replay_settings(
+        policy=configured["replay_comparison_policy"],
+        relative_tolerance=configured["replay_relative_tolerance"],
+        absolute_tolerance=configured["replay_absolute_tolerance"],
+    )
     expected = {
         "query_config": asdict(prepared.query_config),
         "nuisance_folds": int(prepared.options.query_nuisance_folds),
@@ -937,7 +947,12 @@ def _neural_query_configuration(
         "embedding_text_coverage_policy": COMPLETE_EMBEDDING_TEXT_POLICY,
         "heldout_transform_policy": REGISTERED_HELDOUT_TRANSFORM_POLICY,
     }
-    if _canonical(configured) != _canonical(expected):
+    observed_core = {
+        key: value
+        for key, value in configured.items()
+        if not key.startswith("replay_")
+    }
+    if _canonical(observed_core) != _canonical(expected):
         raise RoleNeutralScientificContractError(
             "learned-neural-query producer configuration differs from the "
             "authenticated explicit query/Stage 1 profiles"
@@ -1489,6 +1504,9 @@ def _scientific_bindings(
             "schema_version",
             "model_tree_sha256",
             "text_truncation_applied",
+            "replay_comparison_policy",
+            "replay_relative_tolerance",
+            "replay_absolute_tolerance",
         }
     }
     if _canonical(observed_htr) != _canonical(expected_htr):
@@ -1502,7 +1520,13 @@ def _scientific_bindings(
     observed_matched = {
         key: value
         for key, value in matched.as_dict().items()
-        if key != "schema_version"
+        if key
+        not in {
+            "schema_version",
+            "replay_comparison_policy",
+            "replay_relative_tolerance",
+            "replay_absolute_tolerance",
+        }
     }
     if _canonical(observed_matched) != _canonical(
         {
@@ -1813,6 +1837,13 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
         def bow_factory(
             invocation: RoleNeutralComponentInvocation,
         ) -> BoundRoleNeutralComponentProducer:
+            forest = prepared.config.architecture.multi_model_forest
+            configured_fold_parallelism = forest.bow_fold_parallelism
+            if configured_fold_parallelism is None:
+                configured_fold_parallelism = forest.fold_parallelism
+            owner_cpu_budget = invocation.owner_cpu_budget
+            if owner_cpu_budget is None:
+                owner_cpu_budget = prepared.options.num_workers
             request = RoleNeutralBoWPhysicalGroupRequest.from_plan(
                 plan=invocation.plan,
                 physical_owner_scope_id=invocation.physical_owner.scope_id,
@@ -1833,6 +1864,9 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                     nuisance_folds=bindings.bow_nuisance_folds,
                     effect_folds=bindings.bow_effect_folds,
                     e_clip=bindings.bow_e_clip,
+                    bow_fold_parallelism=configured_fold_parallelism,
+                    bow_parallel_backend=forest.bow_parallel_backend,
+                    owner_cpu_budget=owner_cpu_budget,
                     exact_heldout_text_loader=heldout_loader,
                 ),
                 authenticate=lambda: authenticate_role_neutral_bow_component(
@@ -1856,8 +1890,26 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                 owner_rows=request.physical_owner.heldout_row_ids,
                 texts=inputs.heldout_texts,
             )
-            return BoundRoleNeutralComponentProducer(
-                execute=lambda: execute_role_neutral_htr_physical_group(
+
+            def execute_htr() -> Any:
+                controls = invocation.htr_operational_controls
+                if controls is None:
+                    return execute_role_neutral_htr_physical_group(
+                        request=request,
+                        output_root=invocation.output_root,
+                        fit_texts=inputs.fit_texts,
+                        fit_treatment=inputs.fit_treatment,
+                        fit_outcome=inputs.fit_outcome,
+                        config=bindings.htr,
+                        runtime_compatibility_class=(
+                            self.runtime_compatibility_class
+                        ),
+                        exact_heldout_text_loader=heldout_loader,
+                        htr_model_path=prepared.htr_model_path,
+                        device=invocation.resource,
+                    )
+                captured: list[Mapping[str, Any]] = []
+                execute_role_neutral_htr_physical_group(
                     request=request,
                     output_root=invocation.output_root,
                     fit_texts=inputs.fit_texts,
@@ -1870,7 +1922,20 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                     exact_heldout_text_loader=heldout_loader,
                     htr_model_path=prepared.htr_model_path,
                     device=invocation.resource,
-                ),
+                    operational_controls=controls,
+                    operational_attestation_sink=captured.append,
+                )
+                if len(captured) != 1:
+                    raise RuntimeError(
+                        "HTR operational execution omitted its one attestation"
+                    )
+                return RoleNeutralOperationalComponentReport(
+                    component="htr",
+                    attestation=captured[0],
+                )
+
+            return BoundRoleNeutralComponentProducer(
+                execute=execute_htr,
                 authenticate=lambda: authenticate_role_neutral_htr_component(
                     root=invocation.output_root,
                     plan=invocation.plan,
@@ -2091,7 +2156,9 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                             "nuisance_folds"
                         ]
                     ),
-                    devices=(invocation.resource,),
+                    devices=(
+                        invocation.neural_query_execution_topology.devices
+                    ),
                     seed=int(invocation.physical_owner.scope_seed),
                     outcome_type=str(prepared.config.outcome_type),
                 )
@@ -2122,6 +2189,21 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                                 "embedding_text_coverage_policy"
                             ]
                         ),
+                        replay_comparison_policy=(
+                            bindings.neural_query_configuration[
+                                "replay_comparison_policy"
+                            ]
+                        ),
+                        replay_relative_tolerance=(
+                            bindings.neural_query_configuration[
+                                "replay_relative_tolerance"
+                            ]
+                        ),
+                        replay_absolute_tolerance=(
+                            bindings.neural_query_configuration[
+                                "replay_absolute_tolerance"
+                            ]
+                        ),
                         heldout_transform_policy=(
                             bindings.neural_query_configuration[
                                 "heldout_transform_policy"
@@ -2146,6 +2228,9 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                         fit_texts=inputs.fit_texts,
                         fit_treatment=inputs.fit_treatment,
                         fit_outcome=inputs.fit_outcome,
+                        execution_topology=(
+                            invocation.neural_query_execution_topology
+                        ),
                         heldout_text_loader=heldout_loader,
                     )
                 finally:

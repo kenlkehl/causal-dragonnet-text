@@ -35,6 +35,9 @@ from oci.inference.hierarchical_all_architecture_discovery import (
 from oci.inference.hierarchical_discovery_job_cache import (
     AuthenticatedHierarchicalDiscoveryJobCache,
 )
+from tests.hierarchy_resource_test_support import (
+    HIERARCHY_JOB_CACHE_CONFIG,
+)
 from oci.inference.hierarchical_discovery_response_contract import (
     HIERARCHICAL_DISCOVERY_INTERPRET_TOKEN_BUDGET,
     HIERARCHICAL_DISCOVERY_MAX_ATOMS_PER_INTERPRET_JOB,
@@ -1331,7 +1334,10 @@ def test_schema_tamper_fails_even_after_rehashing_job_binding_and_cache_key(tmp_
 
     runner_body = {"schema_version": "contract_test_runner_v1", "name": "offline"}
     runner_identity = {**runner_body, "identity_sha256": content_sha256(runner_body)}
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=tmp_path / "cache")
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=tmp_path / "cache",
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     cache.begin_execution(
         hierarchy_inner_precommit_sha256="a" * 64,
         runner_identity=runner_identity,

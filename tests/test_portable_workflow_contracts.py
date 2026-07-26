@@ -89,6 +89,8 @@ from tests.test_post_extraction_scientific_policy import (
 from tests.cluster_local_embedding_test_support import (
     cluster_local_embedding_config,
 )
+from tests.resource_safety_test_support import resource_safety_policy
+from tests.stage1_test_support import stage1_execution_profile
 
 
 def _digest(label: str) -> str:
@@ -101,7 +103,7 @@ def _resource_safety(
     minimum_headroom_bytes: int = 6 * GIB,
     minimum_multi_device_throughput_ratio: float = 1.4,
 ) -> ResourcePerformanceSafetyPolicy:
-    return ResourcePerformanceSafetyPolicy(
+    return resource_safety_policy(
         gpu_max_allocation_fraction=maximum_allocation_fraction,
         gpu_minimum_headroom_bytes=minimum_headroom_bytes,
         minimum_multi_device_throughput_ratio=(minimum_multi_device_throughput_ratio),
@@ -323,6 +325,16 @@ def _scientific_spec() -> ScientificWorkflowSpec:
                 ),
                 **(
                     {
+                        "producer_configuration": {
+                            "batch_size": 4,
+                            "sentence_encoder_batch_size": 8,
+                        }
+                    }
+                    if family == "hierarchical_transformer"
+                    else {}
+                ),
+                **(
+                    {
                         "producer_configuration": (
                             cluster_local_embedding_config().as_dict()
                         )
@@ -486,6 +498,10 @@ def test_run_control_strict_round_trip_and_scientific_exclusion(
             tmp_path / "prepared",
             tmp_path / "embedding",
         ),
+        trust_prior_adoption_attestations=(
+            tmp_path / "prepared-adoption.json",
+            tmp_path / "embedding-adoption.json",
+        ),
         log_level="warning",
         validation_depth="fresh_terminal_audit",
     )
@@ -508,6 +524,15 @@ def test_run_control_strict_round_trip_and_scientific_exclusion(
         ({"stop_after": ""}, "nonempty"),
         (
             {"adopt_checkpoints": ["same", "same"]},
+            "duplicated",
+        ),
+        (
+            {
+                "trust_prior_adoption_attestations": [
+                    "same.json",
+                    "same.json",
+                ]
+            },
             "duplicated",
         ),
         ({"log_level": "verbose"}, "log level"),
@@ -548,17 +573,10 @@ def test_scientific_identity_changes_for_window_config_not_deployment_metadata(
         cluster_preflight_parquet_compression="zstd",
         resource_performance_safety=_resource_safety(),
         forest_operational=_forest_operational(3),
-        stage1_execution=Stage1ExecutionProfile(
+        stage1_execution=stage1_execution_profile(
             resource_kind="accelerator",
             device_count=1,
             scope_workers_per_device=1,
-            executor_mode="persistent_slots",
-            selection_method="operator_configured",
-            selected_candidate=None,
-            benchmark_result_sha256=None,
-            benchmark_result_locator=None,
-            benchmark_workload_deployment_sha256=None,
-            benchmark_workload_deployment_locator=None,
         ),
         devices=("cuda:7",),
         cpu_budget=3,
@@ -571,17 +589,10 @@ def test_scientific_identity_changes_for_window_config_not_deployment_metadata(
         scratch_root=tmp_path / "relocated" / "scratch",
         devices=("cpu",),
         embedding_batch_size=3,
-        stage1_execution=Stage1ExecutionProfile(
+        stage1_execution=stage1_execution_profile(
             resource_kind="cpu",
             device_count=1,
             scope_workers_per_device=2,
-            executor_mode="persistent_slots",
-            selection_method="operator_configured",
-            selected_candidate=None,
-            benchmark_result_sha256=None,
-            benchmark_result_locator=None,
-            benchmark_workload_deployment_sha256=None,
-            benchmark_workload_deployment_locator=None,
         ),
         resource_performance_safety=_resource_safety(
             maximum_allocation_fraction=0.7,
@@ -681,17 +692,10 @@ def test_typed_deployment_requires_every_operational_safety_field(
         cluster_preflight_parquet_compression="zstd",
         resource_performance_safety=_resource_safety(),
         forest_operational=_forest_operational(),
-        stage1_execution=Stage1ExecutionProfile(
+        stage1_execution=stage1_execution_profile(
             resource_kind="accelerator",
             device_count=1,
             scope_workers_per_device=1,
-            executor_mode="persistent_slots",
-            selection_method="operator_configured",
-            selected_candidate=None,
-            benchmark_result_sha256=None,
-            benchmark_result_locator=None,
-            benchmark_workload_deployment_sha256=None,
-            benchmark_workload_deployment_locator=None,
         ),
     )
     payload = asdict(profile)
@@ -723,6 +727,26 @@ def test_typed_deployment_requires_every_operational_safety_field(
     with pytest.raises(ValueError, match="configure every field"):
         DeploymentProfile.from_mapping(missing_safety_field)
 
+    capacity_fields = (
+        "hierarchical_job_cache_max_entry_bytes",
+        "first_untouched_gate_max_initial_spent_rows",
+        "first_untouched_gate_max_first_gate_rows",
+        "first_untouched_gate_max_total_text_utf8_bytes",
+        "first_untouched_gate_max_catalog_atoms",
+        "first_untouched_gate_max_source_manifest_bytes",
+        "first_untouched_gate_max_direct_numerical_signals",
+        "first_untouched_gate_max_single_matrix_file_bytes",
+        "first_untouched_gate_max_total_matrix_file_bytes",
+    )
+    for field_name in capacity_fields:
+        incomplete = dict(payload)
+        incomplete["resource_performance_safety"] = dict(
+            payload["resource_performance_safety"]
+        )
+        incomplete["resource_performance_safety"].pop(field_name)
+        with pytest.raises(ValueError, match="configure every field"):
+            DeploymentProfile.from_mapping(incomplete)
+
 
 def test_nsclc_page_sizes_are_configuration_only_not_production_literals() -> None:
     repository = Path(__file__).resolve().parents[1]
@@ -743,12 +767,13 @@ def test_nsclc_page_sizes_are_configuration_only_not_production_literals() -> No
 def test_measured_stage1_execution_requires_reopenable_evidence_locators(
     tmp_path: Path,
 ) -> None:
-    measured = Stage1ExecutionProfile(
+    measured = stage1_execution_profile(
         resource_kind="accelerator",
         device_count=2,
         scope_workers_per_device=2,
         executor_mode="persistent_slots",
         selection_method="measured_role_neutral_benchmark_v1",
+        benchmark_evidence_kind="raw_result_v1",
         selected_candidate="measured-x2",
         benchmark_result_sha256="a" * 64,
         benchmark_result_locator=(
@@ -763,10 +788,28 @@ def test_measured_stage1_execution_requires_reopenable_evidence_locators(
         asdict(measured)
     ) == measured
     json.dumps(measured.as_dict(), allow_nan=False)
-    with pytest.raises(ValueError, match="locators and hashes"):
+    with pytest.raises(ValueError, match="raw benchmark evidence"):
         replace(measured, benchmark_workload_deployment_locator=None)
     with pytest.raises(ValueError, match="cannot claim benchmark"):
-        replace(measured, selection_method="operator_configured")
+        replace(
+            measured,
+            selection_method="operator_configured",
+            benchmark_evidence_kind="none",
+        )
+
+    durable = replace(
+        measured,
+        benchmark_evidence_kind="durable_publication_v1",
+        benchmark_result_locator=None,
+        benchmark_workload_deployment_locator=None,
+        benchmark_publication_sha256="c" * 64,
+        benchmark_publication_locator=(
+            tmp_path / "publication" / "publication_manifest.json"
+        ).resolve(),
+    )
+    assert Stage1ExecutionProfile.from_mapping(asdict(durable)) == durable
+    with pytest.raises(ValueError, match="forbids historical scratch"):
+        replace(durable, benchmark_result_locator=measured.benchmark_result_locator)
 
 
 def test_scientific_mapping_requires_text_window_and_forest_configuration() -> None:
@@ -1057,17 +1100,10 @@ def test_stage2_endpoint_requires_a_local_tokenizer_locator(tmp_path: Path) -> N
         cluster_preflight_parquet_compression="zstd",
         resource_performance_safety=_resource_safety(),
         forest_operational=_forest_operational(),
-        stage1_execution=Stage1ExecutionProfile(
+        stage1_execution=stage1_execution_profile(
             resource_kind="accelerator",
             device_count=1,
             scope_workers_per_device=1,
-            executor_mode="persistent_slots",
-            selection_method="operator_configured",
-            selected_candidate=None,
-            benchmark_result_sha256=None,
-            benchmark_result_locator=None,
-            benchmark_workload_deployment_sha256=None,
-            benchmark_workload_deployment_locator=None,
         ),
         endpoint="https://model.example/v1",
         endpoint_model="exact/model",
@@ -1132,9 +1168,56 @@ def test_portable_artifact_relocation_adoption_and_tamper_fail_closed(
         expected_upstream_artifact_ids=(),
     )
     assert first == second
+    assert second["recorded_at"] == first["recorded_at"]
+    assert second["content_sha256"] == identity_sha256(
+        {
+            key: value
+            for key, value in second.items()
+            if key != "content_sha256"
+        }
+    )
     (relocated.root / "values.bin").write_bytes(b"tampered values")
     with pytest.raises(ValueError, match="changed"):
         validate_portable_artifact(relocated.root)
+
+
+def test_adoption_recorded_at_is_integrity_bound_and_conflicts_fail_closed(
+    tmp_path: Path,
+) -> None:
+    artifact = _portable_artifact(tmp_path / "timestamp_bound")
+    request_id = _digest("timestamp-bound consumer")
+    attestation_root = tmp_path / "timestamp_bound_adoptions"
+    adopted = adopt_checkpoint(
+        source=artifact.root,
+        attestation_root=attestation_root,
+        consumer_request_sha256=request_id,
+        validated_artifact=artifact,
+    )
+    attestation_path = (
+        attestation_root / f"{artifact.artifact_id}.adoption.json"
+    )
+    mutated = dict(adopted)
+    mutated["recorded_at"] = f"{adopted['recorded_at']}-mutated"
+    os.chmod(attestation_path, 0o644)
+    attestation_path.write_text(
+        json.dumps(mutated, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(attestation_path, 0o444)
+
+    with pytest.raises(ValueError, match="adoption attestation"):
+        portable_artifacts_module.validate_checkpoint_adoption(
+            attestation_path=attestation_path,
+            artifact=artifact,
+            consumer_request_sha256=request_id,
+        )
+    with pytest.raises(ValueError, match="attestation conflicts"):
+        adopt_checkpoint(
+            source=artifact.root,
+            attestation_root=attestation_root,
+            consumer_request_sha256=request_id,
+            validated_artifact=artifact,
+        )
 
 
 def test_process_authenticated_adoption_handle_rejects_later_mutation(
@@ -1216,6 +1299,95 @@ def test_portable_phase_binding_is_path_neutral_and_relocatable(
         materialize_portable_phase(
             relocated,
             expected_phase="embedding_cache",
+        )
+
+
+def test_adoption_binds_operational_phase_control_bytes_without_changing_artifact_id(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "operational_binding_artifact"
+    payload = root / "payload.bin"
+    root.mkdir()
+    payload.write_bytes(b"scientific payload")
+    artifact = publish_portable_artifact(
+        root=root,
+        artifact_kind="prepared_cohort",
+        artifact_schema="operational_binding_test_v1",
+        compatibility=_compatibility(),
+        upstream_artifact_ids=(),
+        payload_paths=("payload.bin",),
+        workflow_phase="input_preparation",
+        workflow_phase_result={
+            "terminal_files": [str(payload.resolve())],
+            "resource_preflight": {"gpu_ids": [0]},
+        },
+    )
+    consumer_request = _digest("operational binding consumer")
+    attestation_root = tmp_path / "operational_binding_adoptions"
+    adopt_checkpoint(
+        source=artifact.root,
+        attestation_root=attestation_root,
+        consumer_request_sha256=consumer_request,
+    )
+    attestation_path = (
+        attestation_root / f"{artifact.artifact_id}.adoption.json"
+    )
+
+    manifest_path = artifact.manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    binding = manifest["workflow_phase_binding"]
+    binding["result_template"]["resource_preflight"]["gpu_ids"] = [7]
+    binding_body = {
+        key: value
+        for key, value in binding.items()
+        if key != "content_sha256"
+    }
+    binding["content_sha256"] = identity_sha256(binding_body)
+    os.chmod(manifest_path, 0o644)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(manifest_path, 0o444)
+
+    locator_path = artifact.locator_path
+    locator = json.loads(locator_path.read_text(encoding="utf-8"))
+    locator["operational_phase_binding_content_sha256"] = binding[
+        "content_sha256"
+    ]
+    locator_body = {
+        key: value
+        for key, value in locator.items()
+        if key != "content_sha256"
+    }
+    locator["content_sha256"] = identity_sha256(locator_body)
+    os.chmod(locator_path, 0o644)
+    locator_path.write_text(
+        json.dumps(locator, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(locator_path, 0o444)
+
+    rewritten = validate_portable_artifact(root)
+    assert rewritten.artifact_id == artifact.artifact_id
+    assert (
+        rewritten.phase_binding["result_template"][
+            "resource_preflight"
+        ]["gpu_ids"]
+        == [7]
+    )
+    with pytest.raises(ValueError, match="adoption attestation"):
+        portable_artifacts_module.validate_checkpoint_adoption(
+            attestation_path=attestation_path,
+            artifact=rewritten,
+            consumer_request_sha256=consumer_request,
+        )
+    with pytest.raises(ValueError, match="attestation conflicts"):
+        adopt_checkpoint(
+            source=rewritten.root,
+            attestation_root=attestation_root,
+            consumer_request_sha256=consumer_request,
+            validated_artifact=rewritten,
         )
 
 
@@ -1352,6 +1524,176 @@ def test_portable_reference_reuses_same_process_authenticated_stat_handle(
         )
 
 
+def test_portable_manifest_rejects_noninteger_payload_sizes(
+    tmp_path: Path,
+) -> None:
+    for ordinal, invalid_size in enumerate((True, 1.0)):
+        artifact = _portable_artifact(
+            tmp_path / f"noninteger_payload_size_{ordinal}"
+        )
+        manifest_path = artifact.manifest_path
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["payloads"][0]["size_bytes"] = invalid_size
+        os.chmod(manifest_path, 0o644)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(manifest_path, 0o444)
+        with pytest.raises(ValueError, match="nonnegative integer"):
+            validate_portable_artifact(artifact.root)
+
+
+def test_registered_payload_path_rejects_symlinked_ancestor(
+    tmp_path: Path,
+) -> None:
+    payload_root = tmp_path / "symlinked_ancestor_payload"
+    real = payload_root / "real"
+    real.mkdir(parents=True)
+    (real / "values.bin").write_bytes(b"values")
+    (payload_root / "alias").symlink_to(real, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        publish_portable_reference_artifact(
+            control_root=tmp_path / "symlinked_ancestor_control",
+            payload_root=payload_root,
+            artifact_kind="prepared_cohort",
+            artifact_schema="symlinked_ancestor_test_v1",
+            compatibility=_compatibility(),
+            upstream_artifact_ids=(),
+            payload_paths=("alias/values.bin",),
+            payload_inventory_policy=(
+                portable_artifacts_module.REGISTERED_PAYLOAD_PATHS_ONLY
+            ),
+        )
+
+
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "hardlink", "fifo"))
+def test_registered_only_inventory_rejects_unsafe_unregistered_entries(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    payload_root = tmp_path / f"registered_only_{unsafe_kind}_payload"
+    payload_root.mkdir()
+    (payload_root / "registered.bin").write_bytes(b"registered")
+    unsafe = payload_root / "unsafe"
+    if unsafe_kind == "symlink":
+        target = tmp_path / "unregistered_target"
+        target.mkdir()
+        unsafe.symlink_to(target, target_is_directory=True)
+    elif unsafe_kind == "hardlink":
+        target = tmp_path / "unregistered_hardlink_target"
+        target.write_bytes(b"unregistered")
+        os.link(target, unsafe)
+    elif unsafe_kind == "fifo":
+        os.mkfifo(unsafe)
+    else:  # pragma: no cover
+        raise AssertionError(unsafe_kind)
+    with pytest.raises(ValueError, match="symlink|hard-linked|special"):
+        publish_portable_reference_artifact(
+            control_root=tmp_path / f"registered_only_{unsafe_kind}_control",
+            payload_root=payload_root,
+            artifact_kind="prepared_cohort",
+            artifact_schema="registered_only_unsafe_tree_test_v1",
+            compatibility=_compatibility(),
+            upstream_artifact_ids=(),
+            payload_paths=("registered.bin",),
+            payload_inventory_policy=(
+                portable_artifacts_module.REGISTERED_PAYLOAD_PATHS_ONLY
+            ),
+        )
+
+
+def test_complete_reference_inventory_rejects_extra_empty_directory(
+    tmp_path: Path,
+) -> None:
+    payload_root = tmp_path / "extra_directory_payload"
+    payload_root.mkdir()
+    (payload_root / "registered.bin").write_bytes(b"registered")
+    (payload_root / "unregistered_empty").mkdir()
+    with pytest.raises(ValueError, match="complete payload tree|extra entries"):
+        publish_portable_reference_artifact(
+            control_root=tmp_path / "extra_directory_control",
+            payload_root=payload_root,
+            artifact_kind="prepared_cohort",
+            artifact_schema="extra_directory_test_v1",
+            compatibility=_compatibility(),
+            upstream_artifact_ids=(),
+            payload_paths=("registered.bin",),
+        )
+
+
+def test_validation_rejects_mutation_after_payload_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = _portable_artifact(tmp_path / "hash_time_race")
+    payload = artifact.root / "values.bin"
+    original_hash = portable_artifacts_module._safe_file_hash_with_identity
+    mutated = False
+
+    def mutate_after_hash(
+        path: Path,
+        *,
+        label: str,
+    ) -> tuple[str, int, tuple[int, ...]]:
+        nonlocal mutated
+        result = original_hash(path, label=label)
+        if Path(path) == payload and not mutated:
+            mutated = True
+            payload.write_bytes(b"changed after its authenticated read")
+        return result
+
+    monkeypatch.setattr(
+        portable_artifacts_module,
+        "_safe_file_hash_with_identity",
+        mutate_after_hash,
+    )
+    with pytest.raises(RuntimeError, match="changed|authenticating"):
+        validate_portable_artifact(artifact.root)
+    assert mutated
+
+
+def test_reference_publication_rejects_mutation_after_payload_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_root = tmp_path / "reference_hash_time_race_payload"
+    payload_root.mkdir()
+    payload = payload_root / "values.bin"
+    payload.write_bytes(b"authenticated values")
+    original_hash = portable_artifacts_module._safe_file_hash_with_identity
+    mutated = False
+
+    def mutate_after_hash(
+        path: Path,
+        *,
+        label: str,
+    ) -> tuple[str, int, tuple[int, ...]]:
+        nonlocal mutated
+        result = original_hash(path, label=label)
+        if Path(path) == payload and not mutated:
+            mutated = True
+            payload.write_bytes(b"changed before checkpoint publication")
+        return result
+
+    monkeypatch.setattr(
+        portable_artifacts_module,
+        "_safe_file_hash_with_identity",
+        mutate_after_hash,
+    )
+    with pytest.raises(RuntimeError, match="changed|authenticating"):
+        publish_portable_reference_artifact(
+            control_root=tmp_path / "reference_hash_time_race_control",
+            payload_root=payload_root,
+            artifact_kind="prepared_cohort",
+            artifact_schema="reference_hash_time_race_test_v1",
+            compatibility=_compatibility(),
+            upstream_artifact_ids=(),
+            payload_paths=("values.bin",),
+        )
+    assert mutated
+
+
 def test_legacy_preparation_migrates_but_v2_embedding_cache_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1384,11 +1726,16 @@ def test_legacy_preparation_migrates_but_v2_embedding_cache_is_rejected(
     ).to_parquet(source, index=False)
     source_sha256, source_size = stable_file_sha256(source)
     model_sha256 = _digest("legacy embedding model tree")
-    compatibility = replace(
+    prepared_compatibility = replace(
         _compatibility(),
         dataset_identity=source_sha256,
         row_order_identity=_digest("configured source row order"),
         model_identities={"embed": model_sha256},
+        producer_code_identity=_digest("input preparation producer"),
+    )
+    cache_compatibility = replace(
+        prepared_compatibility,
+        producer_code_identity=_digest("embedding cache producer"),
     )
 
     def write_phase(
@@ -1468,7 +1815,7 @@ def test_legacy_preparation_migrates_but_v2_embedding_cache_is_rejected(
         unit_id_order_sha256=legacy_migration_module._unit_id_order_sha256(
             prepared_frame[columns.unit_id].tolist()
         ),
-        row_order_identity=compatibility.row_order_identity,
+        row_order_identity=prepared_compatibility.row_order_identity,
         expected_row_count=len(prepared_frame),
     )
     prepared_manifest = write_phase(
@@ -1488,7 +1835,7 @@ def test_legacy_preparation_migrates_but_v2_embedding_cache_is_rejected(
         control_root=tmp_path / "prepared_control",
         artifact_kind="prepared_cohort",
         artifact_schema="legacy_prepared_migration_test_v1",
-        compatibility=compatibility,
+        compatibility=prepared_compatibility,
         upstream_artifact_ids=(),
         typed_expectation=prepared_expectation,
         upstream_prepared_artifact=None,
@@ -1510,7 +1857,7 @@ def test_legacy_preparation_migrates_but_v2_embedding_cache_is_rejected(
             control_root=tmp_path / "wrong_count_control",
             artifact_kind="prepared_cohort",
             artifact_schema="legacy_prepared_migration_test_v1",
-            compatibility=compatibility,
+            compatibility=prepared_compatibility,
             upstream_artifact_ids=(),
             typed_expectation=replace(
                 prepared_expectation,
@@ -1525,7 +1872,7 @@ def test_legacy_preparation_migrates_but_v2_embedding_cache_is_rejected(
             control_root=tmp_path / "wrong_preprocessing_control",
             artifact_kind="prepared_cohort",
             artifact_schema="legacy_prepared_migration_test_v1",
-            compatibility=compatibility,
+            compatibility=prepared_compatibility,
             upstream_artifact_ids=(),
             typed_expectation=replace(
                 prepared_expectation,
@@ -1544,7 +1891,7 @@ def test_legacy_preparation_migrates_but_v2_embedding_cache_is_rejected(
             artifact_kind="prepared_cohort",
             artifact_schema="legacy_prepared_migration_test_v1",
             compatibility=replace(
-                compatibility,
+                prepared_compatibility,
                 row_order_identity=_digest("different row order"),
             ),
             upstream_artifact_ids=(),
@@ -1811,6 +2158,21 @@ def test_legacy_preparation_migrates_but_v2_embedding_cache_is_rejected(
         attempt=cache_attempt,
         result=cache_result,
     )
+    with pytest.raises(
+        ValueError,
+        match="legacy cache upstream is not the requested prepared node",
+    ):
+        migrate_legacy_terminal_phase_reference(
+            manifest_path=cache_manifest,
+            expected_phase="embedding_cache",
+            control_root=tmp_path / "cache_same_producer_control",
+            artifact_kind="embedding_cache",
+            artifact_schema="legacy_cache_migration_test_v1",
+            compatibility=prepared_compatibility,
+            upstream_artifact_ids=(prepared.artifact_id,),
+            typed_expectation=cache_expectation,
+            upstream_prepared_artifact=prepared,
+        )
     with pytest.raises(ValueError, match="allowlisted frozen V5 producer"):
         migrate_legacy_terminal_phase_reference(
             manifest_path=cache_manifest,
@@ -1818,7 +2180,7 @@ def test_legacy_preparation_migrates_but_v2_embedding_cache_is_rejected(
             control_root=tmp_path / "cache_control",
             artifact_kind="embedding_cache",
             artifact_schema="legacy_cache_migration_test_v1",
-            compatibility=compatibility,
+            compatibility=cache_compatibility,
             upstream_artifact_ids=(prepared.artifact_id,),
             typed_expectation=cache_expectation,
             upstream_prepared_artifact=prepared,
@@ -1878,6 +2240,48 @@ def test_five_fold_context_plan_discovers_40_logical_and_35_physical() -> None:
         set(row["family_artifact_ids"]) == set(EVIDENCE_FAMILIES)
         for row in bindings["logical_bindings"]
     )
+
+    alias_index = next(
+        index
+        for index, context in enumerate(contexts)
+        if context.scope_id == "outer_001_hierarchy_epoch_001"
+    )
+    alias = contexts[alias_index]
+    with pytest.raises(ValueError, match="canonical group seed"):
+        group_equivalent_contexts(
+            contexts[:alias_index]
+            + (replace(alias, scope_seed=alias.scope_seed + 1),)
+            + contexts[alias_index + 1 :]
+        )
+
+    mutation_kwargs = (
+        {"architecture_identity": _digest("changed architecture")},
+        {"target": "changed_all_ten_target_v2"},
+        {
+            "scientific_configuration_identity": _digest(
+                "changed scientific config"
+            )
+        },
+        {"producer_identity": _digest("changed producer")},
+        {"runtime_compatibility_class": "python-posix-test-v2"},
+        {"fit_row_ids": tuple(reversed(alias.fit_row_ids))},
+    )
+    for kwargs in mutation_kwargs:
+        changed_contexts = (
+            contexts[:alias_index]
+            + (replace(alias, **kwargs),)
+            + contexts[alias_index + 1 :]
+        )
+        changed_groups = group_equivalent_contexts(changed_contexts)
+        assert len(changed_groups) == 36
+        assert all(
+            len(group.logical_contexts) == 1
+            for group in changed_groups
+            if any(
+                context.scope_id == alias.scope_id
+                for context in group.logical_contexts
+            )
+        )
 
 
 def test_legacy_classifier_rejects_partial_v5_and_migration_accounts_for_v4(
@@ -1949,11 +2353,18 @@ def test_legacy_classifier_rejects_partial_v5_and_migration_accounts_for_v4(
 
     partitions = {
         fold: tuple(
-            tuple(f"{fold}{partition}{row}" for row in range(3)) for partition in range(1, 6)
+            tuple(
+                fold * 1_000 + partition * 10 + row
+                for row in range(3)
+            )
+            for partition in range(1, 6)
         )
         for fold in range(1, 6)
     }
-    heldout = {fold: tuple(f"h{fold}{row}" for row in range(3)) for fold in range(1, 6)}
+    heldout = {
+        fold: tuple(fold * 1_000 + 900 + row for row in range(3))
+        for fold in range(1, 6)
+    }
     contexts = derive_logical_context_plan(
         outer_training_partitions=partitions,
         outer_heldout_rows=heldout,

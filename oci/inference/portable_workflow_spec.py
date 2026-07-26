@@ -11,7 +11,6 @@ controls.
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import math
 import re
@@ -19,6 +18,14 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
+
+from .portable_identity import canonical_json, identity_sha256
+from .stage1_execution_topology_policy import (
+    Stage1ExecutionTopologyPolicy,
+)
+from .stage1_htr_operational_controls import (
+    RoleNeutralHTROperationalControls,
+)
 
 from ..models.strict_causal_forest_runtime import (
     CAUSAL_FOREST_IMPLEMENTATION,
@@ -45,10 +52,10 @@ from .post_extraction_scientific_policy import (
 )
 
 PORTABLE_SPEC_VERSION = "portable_all_evidence_scientific_workflow_v11"
-DEPLOYMENT_PROFILE_VERSION = "portable_all_evidence_deployment_profile_v6"
-STAGE1_EXECUTION_PROFILE_VERSION = "portable_stage1_execution_profile_v3"
-RESOURCE_PERFORMANCE_SAFETY_VERSION = "portable_resource_performance_safety_policy_v1"
-RUN_CONTROL_VERSION = "portable_all_evidence_run_control_v1"
+DEPLOYMENT_PROFILE_VERSION = "portable_all_evidence_deployment_profile_v8"
+STAGE1_EXECUTION_PROFILE_VERSION = "portable_stage1_execution_profile_v6"
+RESOURCE_PERFORMANCE_SAFETY_VERSION = "portable_resource_performance_safety_policy_v2"
+RUN_CONTROL_VERSION = "portable_all_evidence_run_control_v2"
 BINARY_PROBABILITY_DIFFERENCE = "binary_treatment_binary_outcome_probability_difference_v1"
 
 EVIDENCE_FAMILIES = (
@@ -93,22 +100,6 @@ _ARCHITECTURE_OPERATIONAL_KEYS = frozenset(
         "workers",
     }
 )
-
-
-def canonical_json(value: Any) -> str:
-    """Return the canonical JSON representation used by scientific identities."""
-
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-
-
-def identity_sha256(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
 def _strict_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -1144,6 +1135,15 @@ class ResourcePerformanceSafetyPolicy:
     minimum_benchmark_repetitions_per_scope: int
     read_counter_source: str
     fail_on_external_gpu_occupants: bool
+    hierarchical_job_cache_max_entry_bytes: int
+    first_untouched_gate_max_initial_spent_rows: int
+    first_untouched_gate_max_first_gate_rows: int
+    first_untouched_gate_max_total_text_utf8_bytes: int
+    first_untouched_gate_max_catalog_atoms: int
+    first_untouched_gate_max_source_manifest_bytes: int
+    first_untouched_gate_max_direct_numerical_signals: int
+    first_untouched_gate_max_single_matrix_file_bytes: int
+    first_untouched_gate_max_total_matrix_file_bytes: int
     schema_version: str = RESOURCE_PERFORMANCE_SAFETY_VERSION
 
     def __post_init__(self) -> None:
@@ -1184,6 +1184,29 @@ class ResourcePerformanceSafetyPolicy:
             raise ValueError("read_counter_source must select logical or process bytes")
         if not isinstance(self.fail_on_external_gpu_occupants, bool):
             raise TypeError("fail_on_external_gpu_occupants must be explicitly boolean")
+        capacity_fields = (
+            "hierarchical_job_cache_max_entry_bytes",
+            "first_untouched_gate_max_initial_spent_rows",
+            "first_untouched_gate_max_first_gate_rows",
+            "first_untouched_gate_max_total_text_utf8_bytes",
+            "first_untouched_gate_max_catalog_atoms",
+            "first_untouched_gate_max_source_manifest_bytes",
+            "first_untouched_gate_max_direct_numerical_signals",
+            "first_untouched_gate_max_single_matrix_file_bytes",
+            "first_untouched_gate_max_total_matrix_file_bytes",
+        )
+        for name in capacity_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            self.first_untouched_gate_max_single_matrix_file_bytes
+            > self.first_untouched_gate_max_total_matrix_file_bytes
+        ):
+            raise ValueError(
+                "first_untouched_gate_max_single_matrix_file_bytes cannot exceed "
+                "first_untouched_gate_max_total_matrix_file_bytes"
+            )
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1211,18 +1234,25 @@ class ResourcePerformanceSafetyPolicy:
 
 @dataclass(frozen=True)
 class Stage1ExecutionProfile:
-    """Deployment-only device count and per-device Stage 1 concurrency."""
+    """Complete deployment-only Stage 1 execution selection."""
 
     resource_kind: str
     device_count: int
     scope_workers_per_device: int
+    max_parallel_owners: int
     executor_mode: str
+    persistent_slot_startup_timeout_seconds: float
+    neural_query_topology: Stage1ExecutionTopologyPolicy
+    htr_operational_controls: RoleNeutralHTROperationalControls
     selection_method: str
+    benchmark_evidence_kind: str
     selected_candidate: str | None
     benchmark_result_sha256: str | None
     benchmark_result_locator: Path | None
     benchmark_workload_deployment_sha256: str | None
     benchmark_workload_deployment_locator: Path | None
+    benchmark_publication_sha256: str | None
+    benchmark_publication_locator: Path | None
     schema_version: str = STAGE1_EXECUTION_PROFILE_VERSION
 
     def __post_init__(self) -> None:
@@ -1232,7 +1262,11 @@ class Stage1ExecutionProfile:
             raise ValueError(
                 "Stage 1 execution resource_kind must be cpu or accelerator"
             )
-        for name in ("device_count", "scope_workers_per_device"):
+        for name in (
+            "device_count",
+            "scope_workers_per_device",
+            "max_parallel_owners",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(
@@ -1241,6 +1275,32 @@ class Stage1ExecutionProfile:
                 )
         if self.resource_kind == "cpu" and self.device_count != 1:
             raise ValueError("CPU Stage 1 execution requires exactly one device")
+        if not isinstance(
+            self.neural_query_topology,
+            Stage1ExecutionTopologyPolicy,
+        ):
+            raise TypeError(
+                "Stage 1 execution requires a typed neural-query topology"
+            )
+        expected_parallel = (
+            self.neural_query_topology.effective_parallel_owners_for_shape(
+                resource_kind=self.resource_kind,
+                device_count=self.device_count,
+                workers_per_device=self.scope_workers_per_device,
+            )
+        )
+        if self.max_parallel_owners != expected_parallel:
+            raise ValueError(
+                "Stage 1 max_parallel_owners differs from the effective "
+                "device-topology capacity"
+            )
+        if not isinstance(
+            self.htr_operational_controls,
+            RoleNeutralHTROperationalControls,
+        ):
+            raise TypeError(
+                "Stage 1 execution requires typed HTR operational controls"
+            )
         if self.executor_mode not in {
             "fresh_per_fit",
             "persistent_slots",
@@ -1249,12 +1309,29 @@ class Stage1ExecutionProfile:
                 "Stage 1 execution executor_mode must be fresh_per_fit or "
                 "persistent_slots"
             )
+        if (
+            isinstance(self.persistent_slot_startup_timeout_seconds, bool)
+            or not isinstance(
+                self.persistent_slot_startup_timeout_seconds,
+                (int, float),
+            )
+            or not math.isfinite(
+                float(self.persistent_slot_startup_timeout_seconds)
+            )
+            or float(self.persistent_slot_startup_timeout_seconds) <= 0
+        ):
+            raise ValueError(
+                "persistent_slot_startup_timeout_seconds must be a finite "
+                "positive deployment value"
+            )
         evidence = (
             self.selected_candidate,
             self.benchmark_result_sha256,
             self.benchmark_result_locator,
             self.benchmark_workload_deployment_sha256,
             self.benchmark_workload_deployment_locator,
+            self.benchmark_publication_sha256,
+            self.benchmark_publication_locator,
         )
         if self.selection_method not in {
             "operator_configured",
@@ -1262,14 +1339,19 @@ class Stage1ExecutionProfile:
         }:
             raise ValueError("unsupported Stage 1 execution selection method")
         if self.selection_method == "operator_configured":
-            if any(value is not None for value in evidence):
+            if (
+                self.benchmark_evidence_kind != "none"
+                or any(value is not None for value in evidence)
+            ):
                 raise ValueError(
                     "operator-configured Stage 1 execution cannot claim "
                     "benchmark selection evidence"
                 )
         else:
             if (
-                not isinstance(self.selected_candidate, str)
+                self.benchmark_evidence_kind
+                not in {"raw_result_v1", "durable_publication_v1"}
+                or not isinstance(self.selected_candidate, str)
                 or not self.selected_candidate.strip()
                 or not isinstance(self.benchmark_result_sha256, str)
                 or _SHA256.fullmatch(self.benchmark_result_sha256) is None
@@ -1281,18 +1363,50 @@ class Stage1ExecutionProfile:
                     self.benchmark_workload_deployment_sha256
                 )
                 is None
-                or not isinstance(self.benchmark_result_locator, Path)
-                or not self.benchmark_result_locator.is_absolute()
-                or not isinstance(
-                    self.benchmark_workload_deployment_locator,
-                    Path,
-                )
-                or not self.benchmark_workload_deployment_locator.is_absolute()
             ):
                 raise ValueError(
                     "measured Stage 1 execution requires a selected candidate "
-                    "and exact absolute benchmark evidence locators and hashes"
+                    "and exact benchmark evidence hashes"
                 )
+            if self.benchmark_evidence_kind == "raw_result_v1":
+                if (
+                    not isinstance(self.benchmark_result_locator, Path)
+                    or not self.benchmark_result_locator.is_absolute()
+                    or not isinstance(
+                        self.benchmark_workload_deployment_locator,
+                        Path,
+                    )
+                    or not self.benchmark_workload_deployment_locator.is_absolute()
+                    or self.benchmark_publication_sha256 is not None
+                    or self.benchmark_publication_locator is not None
+                ):
+                    raise ValueError(
+                        "raw benchmark evidence requires exact absolute result "
+                        "and workload locators and forbids publication evidence"
+                    )
+            else:
+                if (
+                    self.benchmark_result_locator is not None
+                    or self.benchmark_workload_deployment_locator is not None
+                    or not isinstance(
+                        self.benchmark_publication_sha256,
+                        str,
+                    )
+                    or _SHA256.fullmatch(
+                        self.benchmark_publication_sha256
+                    )
+                    is None
+                    or not isinstance(
+                        self.benchmark_publication_locator,
+                        Path,
+                    )
+                    or not self.benchmark_publication_locator.is_absolute()
+                ):
+                    raise ValueError(
+                        "durable benchmark evidence requires one exact absolute "
+                        "publication manifest locator/hash and forbids historical "
+                        "scratch result/workload locators"
+                    )
             object.__setattr__(
                 self,
                 "selected_candidate",
@@ -1304,6 +1418,7 @@ class Stage1ExecutionProfile:
         for name in (
             "benchmark_result_locator",
             "benchmark_workload_deployment_locator",
+            "benchmark_publication_locator",
         ):
             if value[name] is not None:
                 value[name] = str(value[name])
@@ -1324,9 +1439,28 @@ class Stage1ExecutionProfile:
                 f"extra={sorted(set(value) - required)}"
             )
         normalized = dict(value)
+        topology = normalized.get("neural_query_topology")
+        if not isinstance(topology, Mapping):
+            raise ValueError(
+                "stage1_execution must explicitly configure "
+                "neural_query_topology"
+            )
+        normalized["neural_query_topology"] = (
+            Stage1ExecutionTopologyPolicy.from_mapping(topology)
+        )
+        htr_controls = normalized.get("htr_operational_controls")
+        if not isinstance(htr_controls, Mapping):
+            raise ValueError(
+                "stage1_execution must explicitly configure "
+                "htr_operational_controls"
+            )
+        normalized["htr_operational_controls"] = (
+            RoleNeutralHTROperationalControls.from_mapping(htr_controls)
+        )
         for name in (
             "benchmark_result_locator",
             "benchmark_workload_deployment_locator",
+            "benchmark_publication_locator",
         ):
             if normalized.get(name) is not None:
                 normalized[name] = Path(str(normalized[name]))
@@ -1540,11 +1674,18 @@ def compile_strict_causal_forest_runtime(
 
 @dataclass(frozen=True)
 class RunControl:
-    """Operational controls excluded from scientific compatibility."""
+    """Operational controls excluded from scientific compatibility.
+
+    ``validation_depth`` is a requested minimum. Production acceptance may
+    enforce a stronger floor and must attest both the request and the depth
+    actually achieved. ``log_level`` controls orchestrator lifecycle logging;
+    durable progress and scientific validation are never suppressed by it.
+    """
 
     resume: bool = False
     stop_after: str | None = None
     adopt_checkpoints: tuple[Path, ...] = ()
+    trust_prior_adoption_attestations: tuple[Path, ...] = ()
     log_level: str = "INFO"
     validation_depth: str = "full"
     schema_version: str = RUN_CONTROL_VERSION
@@ -1588,12 +1729,53 @@ class RunControl:
             "adopt_checkpoints",
             tuple(checkpoints),
         )
+        if isinstance(
+            self.trust_prior_adoption_attestations,
+            (str, bytes),
+        ) or not isinstance(
+            self.trust_prior_adoption_attestations,
+            Sequence,
+        ):
+            raise TypeError(
+                "run-control trusted prior adoption attestations must be "
+                "one ordered sequence"
+            )
+        trusted_attestations: list[Path] = []
+        for value in self.trust_prior_adoption_attestations:
+            if isinstance(value, str) and not value.strip():
+                raise ValueError(
+                    "run-control trusted prior adoption attestation paths "
+                    "cannot be empty"
+                )
+            attestation = Path(value)
+            if not str(attestation).strip():
+                raise ValueError(
+                    "run-control trusted prior adoption attestation paths "
+                    "cannot be empty"
+                )
+            trusted_attestations.append(attestation)
+        if len(trusted_attestations) != len(
+            set(map(str, trusted_attestations))
+        ):
+            raise ValueError(
+                "run-control trusted prior adoption attestation paths "
+                "cannot be duplicated"
+            )
+        object.__setattr__(
+            self,
+            "trust_prior_adoption_attestations",
+            tuple(trusted_attestations),
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "resume": self.resume,
             "stop_after": self.stop_after,
             "adopt_checkpoints": [str(value) for value in self.adopt_checkpoints],
+            "trust_prior_adoption_attestations": [
+                str(value)
+                for value in self.trust_prior_adoption_attestations
+            ],
             "log_level": self.log_level,
             "validation_depth": self.validation_depth,
             "schema_version": self.schema_version,
@@ -1613,10 +1795,24 @@ class RunControl:
         checkpoints = value.get("adopt_checkpoints")
         if isinstance(checkpoints, (str, bytes)) or not isinstance(checkpoints, Sequence):
             raise TypeError("run-control adopt_checkpoints must be one ordered list")
+        trusted_attestations = value.get(
+            "trust_prior_adoption_attestations"
+        )
+        if isinstance(
+            trusted_attestations,
+            (str, bytes),
+        ) or not isinstance(trusted_attestations, Sequence):
+            raise TypeError(
+                "run-control trusted prior adoption attestations must be "
+                "one ordered list"
+            )
         return cls(
             resume=value.get("resume"),
             stop_after=value.get("stop_after"),
             adopt_checkpoints=tuple(checkpoints),
+            trust_prior_adoption_attestations=tuple(
+                trusted_attestations
+            ),
             log_level=value.get("log_level"),
             validation_depth=value.get("validation_depth"),
             schema_version=value.get("schema_version"),

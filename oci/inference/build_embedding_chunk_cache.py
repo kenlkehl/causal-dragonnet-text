@@ -21,14 +21,14 @@ def build_embedding_chunk_cache(
     text_column: str,
     output_cache_dir: Path,
     model_name: str,
+    max_seq_length: Optional[int],
+    chunk_size_words: int,
+    chunk_overlap_words: int,
+    max_chunks: int,
+    chunk_selection: str,
+    normalize_embeddings: bool,
     device: Optional[str] = None,
     batch_size: int = 16,
-    max_seq_length: Optional[int] = 1024,
-    chunk_size_words: int = 256,
-    chunk_overlap_words: int = 64,
-    max_chunks: int = 128,
-    chunk_selection: str = "first",
-    normalize_embeddings: bool = True,
     corpus_name: Optional[str] = None,
     source_id_column: Optional[str] = None,
     metadata_columns: Optional[List[str]] = None,
@@ -178,28 +178,46 @@ def _torch_device_or_none(device: Optional[str]):
     return torch.device(str(device))
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build an external text chunk embedding cache for OCI retrieval."
     )
     parser.add_argument("--input", required=True, help="Input parquet/csv/tsv/jsonl/json file.")
-    parser.add_argument("--text-column", default="text")
+    parser.add_argument("--text-column", required=True)
     parser.add_argument("--output-cache-dir", required=True)
-    parser.add_argument("--model-name", default="Qwen/Qwen3-Embedding-8B")
+    parser.add_argument("--model-name", required=True)
     parser.add_argument("--device", default=None)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--max-seq-length", type=int, default=1024)
-    parser.add_argument("--chunk-size-words", type=int, default=256)
-    parser.add_argument("--chunk-overlap-words", type=int, default=64)
-    parser.add_argument("--max-chunks", type=int, default=128)
-    parser.add_argument("--chunk-selection", choices=["first", "last"], default="first")
-    parser.add_argument("--no-normalize-embeddings", action="store_true")
+    parser.add_argument("--max-seq-length", type=int, required=True)
+    parser.add_argument("--chunk-size-words", type=int, required=True)
+    parser.add_argument("--chunk-overlap-words", type=int, required=True)
+    parser.add_argument("--max-chunks", type=int, required=True)
+    parser.add_argument(
+        "--chunk-selection",
+        choices=["first", "last"],
+        required=True,
+    )
+    normalization = parser.add_mutually_exclusive_group(required=True)
+    normalization.add_argument(
+        "--normalize-embeddings",
+        dest="normalize_embeddings",
+        action="store_true",
+    )
+    normalization.add_argument(
+        "--no-normalize-embeddings",
+        dest="normalize_embeddings",
+        action="store_false",
+    )
     parser.add_argument("--corpus-name", default=None)
     parser.add_argument("--source-id-column", default=None)
     parser.add_argument("--metadata-column", action="append", default=[])
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -217,7 +235,7 @@ def main() -> None:
         chunk_overlap_words=args.chunk_overlap_words,
         max_chunks=args.max_chunks,
         chunk_selection=args.chunk_selection,
-        normalize_embeddings=not args.no_normalize_embeddings,
+        normalize_embeddings=args.normalize_embeddings,
         corpus_name=args.corpus_name,
         source_id_column=args.source_id_column,
         metadata_columns=args.metadata_column or None,

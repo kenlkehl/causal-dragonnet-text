@@ -10,15 +10,23 @@ import numpy as np
 import pytest
 import torch
 
+import oci.inference.role_neutral_htr_group_execution as group_module
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_htr_group_execution import (
     RoleNeutralHTRConfig,
+    RoleNeutralHTROperationalControls,
     RoleNeutralHTRPhysicalGroupRequest,
+    _model_tree_sha256,
+    _resolve_model_marker,
     execute_role_neutral_htr_physical_group,
     replay_role_neutral_htr_exact_transform,
     validate_role_neutral_htr_group_execution,
+)
+from oci.inference.stage1_upstream_gate_backend import (
+    _directory_tree_sha256,
 )
 from oci.inference.role_neutral_all_ten_binding import (
     authenticate_role_neutral_htr_component,
@@ -62,6 +70,7 @@ def _plan(*, gpu_ids=(), scope_workers_per_gpu: int = 1):
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=gpu_ids,
         scope_workers_per_gpu=scope_workers_per_gpu,
         review_rounds=2,
@@ -191,7 +200,28 @@ def _config() -> RoleNeutralHTRConfig:
         gradient_clip_foreach=False,
         effect_objectives=("squared_r_loss",),
         outcome_type="binary",
+        replay_comparison_policy="allclose_and_exact_discrete_state_v1",
+        replay_relative_tolerance=1e-4,
+        replay_absolute_tolerance=1e-5,
     ).validated()
+
+
+def test_runtime_model_tree_identity_matches_prepared_context_identity(
+    tmp_path: Path,
+) -> None:
+    model_root = tmp_path / "model"
+    model_root.mkdir()
+    (model_root / "config.json").write_bytes(b'{"model_type":"bert"}\n')
+    (model_root / "weights.bin").write_bytes(b"\x00\x01\x02")
+    prepared_identity = _directory_tree_sha256(model_root)
+    config = replace(
+        _config(),
+        sentence_encoder_model_kind="authenticated_local_tree",
+        model_tree_sha256=prepared_identity,
+    ).validated()
+
+    assert _model_tree_sha256(model_root) == prepared_identity
+    assert _resolve_model_marker(config, model_root) == str(model_root.resolve())
 
 
 def _inputs(request: RoleNeutralHTRPhysicalGroupRequest):
@@ -248,6 +278,28 @@ def test_request_scientific_identity_is_independent_of_device_assignments():
 def test_complete_htr_configuration_roundtrips_without_source_defaults():
     config = _config()
     assert RoleNeutralHTRConfig.from_mapping(config.as_dict()) == config
+
+
+def test_htr_operational_controls_fail_closed_for_scientific_or_idle_workers():
+    config = _config()
+    with pytest.raises(ValueError, match="optimizer training_batch_size"):
+        RoleNeutralHTROperationalControls(
+            training_batch_size=config.batch_size + 1,
+            sentence_encoder_batch_size=16,
+            data_loader_workers=0,
+            reuse_tokenizer_and_chunk_plans=False,
+            chunk_plan_cache_max_entries=0,
+            tokenized_chunk_cache_max_entries=0,
+        ).validate_for(config)
+    with pytest.raises(ValueError, match="require reusable plans"):
+        RoleNeutralHTROperationalControls(
+            training_batch_size=config.batch_size,
+            sentence_encoder_batch_size=16,
+            data_loader_workers=2,
+            reuse_tokenizer_and_chunk_plans=False,
+            chunk_plan_cache_max_entries=0,
+            tokenized_chunk_cache_max_entries=0,
+        )
     missing = config.as_dict()
     del missing["max_chunks"]
     with pytest.raises(ValueError, match="missing=.*max_chunks"):
@@ -362,6 +414,88 @@ def completed_htr_group(tmp_path_factory):
     }
 
 
+def test_operational_encoder_batch_workers_and_complete_plan_reuse_are_exact(
+    completed_htr_group,
+    tmp_path: Path,
+):
+    request = completed_htr_group["request"]
+    config = completed_htr_group["config"]
+    fit_texts = completed_htr_group["fit_texts"]
+    heldout_texts = completed_htr_group["heldout_texts"]
+    controls = RoleNeutralHTROperationalControls(
+        training_batch_size=config.batch_size,
+        sentence_encoder_batch_size=16,
+        data_loader_workers=2,
+        reuse_tokenizer_and_chunk_plans=True,
+        chunk_plan_cache_max_entries=len(fit_texts),
+        tokenized_chunk_cache_max_entries=(
+            len(fit_texts) * config.max_chunks
+        ),
+    )
+    attestations: list[dict] = []
+    root = (tmp_path / "operational-htr").resolve()
+
+    terminal = execute_role_neutral_htr_physical_group(
+        request=request,
+        output_root=root,
+        fit_texts=fit_texts,
+        fit_treatment=completed_htr_group["treatment"],
+        fit_outcome=completed_htr_group["outcome"],
+        config=config,
+        runtime_compatibility_class="torch-cpu-float32-v1",
+        exact_heldout_text_loader=lambda row_ids: (
+            heldout_texts
+            if row_ids == request.physical_owner.heldout_row_ids
+            else (_ for _ in ()).throw(AssertionError("unexpected held-out rows"))
+        ),
+        device="cpu",
+        operational_controls=controls,
+        operational_attestation_sink=lambda value: attestations.append(
+            dict(value)
+        ),
+    )
+
+    assert terminal["content_sha256"] == completed_htr_group["terminal"][
+        "content_sha256"
+    ]
+    assert len(attestations) == 1
+    attestation = attestations[0]
+    assert attestation["controls"] == controls.as_dict()
+    assert attestation["training_batch_override_applied"] is False
+    assert attestation["cache_capacities_nonbinding"] is True
+    assert attestation["positive_data_loader_workers_exercised"] is True
+    assert (
+        attestation[
+            "operational_predictions_within_declared_tolerance_of_scientific_replay"
+        ]
+        is True
+    )
+    assert attestation["replay_relative_tolerance"] == 1e-4
+    assert attestation["replay_absolute_tolerance"] == 1e-5
+    for plan_name in (
+        "fit_reusable_plan",
+        "exact_heldout_reusable_plan",
+    ):
+        plan = attestation[plan_name]
+        assert plan["positive_data_loader_workers_exercised"] is True
+        assert plan["parallel_plan_task_count"] == plan["note_count"]
+        assert 1 <= plan["parallel_plan_thread_count"] <= 2
+        assert (
+            plan["unique_note_count"]
+            <= controls.chunk_plan_cache_max_entries
+        )
+        assert (
+            plan["unique_chunk_count"]
+            <= controls.tokenized_chunk_cache_max_entries
+        )
+        assert plan["semantic_truncation_applied"] is False
+        assert plan["raw_text_persisted"] is False
+    assert "sentinel_after_former_page_boundary" not in json.dumps(
+        attestation,
+        sort_keys=True,
+    )
+
+
 def test_fit_seals_before_loader_and_fresh_json_npy_replay(completed_htr_group):
     root = completed_htr_group["root"]
     request = completed_htr_group["request"]
@@ -426,13 +560,59 @@ def test_fit_seals_before_loader_and_fresh_json_npy_replay(completed_htr_group):
     assert replay["state_source"] == "authenticated_json_and_per_array_npy_only"
     assert replay["allow_pickle"] is False
     assert replay["heldout_labels_accessed"] is False
-    np.testing.assert_allclose(replay["predictions"], registered, rtol=3e-5, atol=3e-6)
+    np.testing.assert_allclose(
+        replay["predictions"],
+        registered,
+        rtol=completed_htr_group["config"].replay_relative_tolerance,
+        atol=completed_htr_group["config"].replay_absolute_tolerance,
+    )
 
     assert not tuple(root.rglob("*.npz"))
     assert not tuple(root.rglob("*.pkl"))
     assert not tuple(root.rglob("*.pickle"))
     assert not tuple(root.rglob("*.joblib"))
     assert all(path.suffix in {".json", ".npy"} for path in root.rglob("*") if path.is_file())
+
+
+def test_fresh_htr_replay_authenticates_bytes_then_uses_declared_tolerance(
+    completed_htr_group,
+    monkeypatch,
+):
+    original = group_module._predict_from_state
+    configured = completed_htr_group["config"]
+    drift = {"value": configured.replay_absolute_tolerance / 2.0}
+
+    def replay_with_declared_drift(**kwargs):
+        columns, values = original(**kwargs)
+        return columns, values + drift["value"]
+
+    monkeypatch.setattr(
+        group_module,
+        "_predict_from_state",
+        replay_with_declared_drift,
+    )
+    replay = replay_role_neutral_htr_exact_transform(
+        root=completed_htr_group["root"],
+        request=completed_htr_group["request"],
+        exact_heldout_texts=completed_htr_group["heldout_texts"],
+        device="cpu",
+    )
+    assert replay["predictions"].shape[0] == len(
+        completed_htr_group["request"].physical_owner.heldout_row_ids
+    )
+
+    drift["value"] = (
+        configured.replay_absolute_tolerance
+        + configured.replay_relative_tolerance
+        + 1.0
+    )
+    with pytest.raises(RuntimeError, match="declared tolerance"):
+        replay_role_neutral_htr_exact_transform(
+            root=completed_htr_group["root"],
+            request=completed_htr_group["request"],
+            exact_heldout_texts=completed_htr_group["heldout_texts"],
+            device="cpu",
+        )
 
 
 def test_binding_chunk_capacity_fails_before_fit_or_loader(tmp_path: Path):

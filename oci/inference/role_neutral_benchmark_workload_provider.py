@@ -26,9 +26,16 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .performance_telemetry import ImmutableInputObservation
-from .prepared_stage1_context import load_prepared_stage1_context
+from .prepared_stage1_context import (
+    PREPARED_STAGE1_CONTEXT_MANIFEST_NAME,
+    PreparedStage1ContextArtifact,
+    load_prepared_stage1_context,
+    seal_prepared_stage1_context,
+    serialize_stage1_build_options,
+)
 from .portable_workflow_spec import (
     SentenceEmbeddingEncoderSpec,
+    Stage1ExecutionProfile,
     identity_sha256,
 )
 from .production_all_evidence_workflow import (
@@ -79,6 +86,7 @@ _PAUSED_PREFIX = (
     "embedding_cache",
     "stage1_preflight",
 )
+_SEALED_PREPARED_CONTEXT_DIRECTORY = "sealed_prepared_stage1_context"
 _SCOPE_KINDS = frozenset(
     {
         "full_outer",
@@ -256,6 +264,93 @@ class AuthenticatedPausedStage1Preflight:
     root: Path
     request: Mapping[str, Any]
     phases: Mapping[str, Mapping[str, Any]]
+
+
+def _sealed_prepared_context_manifest_path(
+    deployment: RoleNeutralBenchmarkWorkloadDeployment,
+    *,
+    require_existing: bool,
+) -> Path:
+    """Resolve the one permitted artifact below the configured scratch root."""
+
+    if not isinstance(require_existing, bool):
+        raise TypeError("require_existing must be boolean")
+    root = deployment.prepared_context_root
+    manifest = (
+        root
+        / _SEALED_PREPARED_CONTEXT_DIRECTORY
+        / PREPARED_STAGE1_CONTEXT_MANIFEST_NAME
+    )
+    if not require_existing:
+        return manifest
+    if (
+        root.is_symlink()
+        or not root.is_dir()
+        or root.resolve(strict=True) != root
+    ):
+        raise ValueError(
+            "existing prepared_context_root must be one canonical directory"
+        )
+    children = tuple(root.iterdir())
+    if (
+        len(children) != 1
+        or children[0].name != _SEALED_PREPARED_CONTEXT_DIRECTORY
+        or children[0].is_symlink()
+        or not children[0].is_dir()
+        or children[0].resolve(strict=True) != children[0]
+    ):
+        raise ValueError(
+            "existing prepared_context_root is partial, substituted, or has "
+            "unregistered entries"
+        )
+    return manifest
+
+
+def _validate_prepared_context_bindings(
+    *,
+    artifact: PreparedStage1ContextArtifact,
+    stage1_build_options: Stage1BundleBuildOptions,
+    architecture_profiles: Mapping[str, Any],
+    runtime_compatibility_class: str,
+) -> None:
+    """Bind a sealed context to the exact current authenticated request."""
+
+    if not isinstance(artifact, PreparedStage1ContextArtifact):
+        raise TypeError("prepared context did not reopen as its typed artifact")
+    expected_options = serialize_stage1_build_options(stage1_build_options)
+    locators = artifact.execution_locators
+    if locators.get("stage1_build_options") != expected_options:
+        raise ValueError(
+            "sealed prepared context Stage 1 request/config locators differ "
+            "from the authenticated benchmark workflow"
+        )
+    if locators.get("architecture_profiles") != copy.deepcopy(
+        dict(architecture_profiles)
+    ):
+        raise ValueError(
+            "sealed prepared context architecture profiles differ from the "
+            "authenticated benchmark workflow"
+        )
+    if locators.get("runtime_compatibility_class") != str(
+        runtime_compatibility_class
+    ):
+        raise ValueError(
+            "sealed prepared context runtime compatibility class differs "
+            "from the authenticated benchmark workflow"
+        )
+    exact_request = locators.get("exact_stage1_request")
+    if (
+        not isinstance(exact_request, Mapping)
+        or exact_request.get("request_sha256")
+        != _sha256_json(
+            {
+                key: value
+                for key, value in exact_request.items()
+                if key != "request_sha256"
+            }
+        )
+    ):
+        raise ValueError("sealed prepared context exact Stage 1 request changed")
 
 
 def _authenticate_paused_stage1_preflight(
@@ -837,42 +932,132 @@ def build_authenticated_role_neutral_benchmark_workloads(
     if set(selectors) != configured_labels:
         raise ValueError("workload selectors do not match configured representative scopes")
 
-    authenticated = _authenticate_paused_stage1_preflight(deployment)
-    prepared = ProductionStage1BundleBuilder(
-        _stage1_build_options(
-            authenticated=authenticated,
-            deployment=deployment,
-        )
-    ).prepare()
+    prepared_root_exists = (
+        deployment.prepared_context_root.exists()
+        or deployment.prepared_context_root.is_symlink()
+    )
+    authenticated = _authenticate_paused_stage1_preflight(
+        deployment,
+        require_fresh_prepared_context=not prepared_root_exists,
+    )
+    stage1_build_options = _stage1_build_options(
+        authenticated=authenticated,
+        deployment=deployment,
+    )
     portable = authenticated.request.get("portable_scientific_spec")
     architecture_profiles = (
         portable.get("architecture_profiles") if isinstance(portable, Mapping) else None
     )
     if not isinstance(architecture_profiles, Mapping):
         raise ValueError("workflow request lacks all-ten architecture profiles")
+    runtime_compatibility_class = str(
+        authenticated.request["runtime_compatibility_class"]
+    )
     factory_builder = PreparedBuildRoleNeutralProducerFactoriesBuilder(
         architecture_profiles=architecture_profiles,
-        runtime_compatibility_class=str(authenticated.request["runtime_compatibility_class"]),
+        runtime_compatibility_class=runtime_compatibility_class,
     )
+    if prepared_root_exists:
+        prepared_context_manifest = (
+            _sealed_prepared_context_manifest_path(
+                deployment,
+                require_existing=True,
+            )
+        )
+        prepared_artifact = load_prepared_stage1_context(
+            prepared_context_manifest
+        )
+        _validate_prepared_context_bindings(
+            artifact=prepared_artifact,
+            stage1_build_options=stage1_build_options,
+            architecture_profiles=architecture_profiles,
+            runtime_compatibility_class=runtime_compatibility_class,
+        )
+        prepared, _authenticated_factories = (
+            prepared_artifact.reconstruct()
+        )
+        if (
+            prepared.request
+            != prepared_artifact.execution_locators[
+                "exact_stage1_request"
+            ]
+            or serialize_stage1_build_options(prepared.options)
+            != serialize_stage1_build_options(stage1_build_options)
+        ):
+            raise RuntimeError(
+                "reconstructed prepared context differs from its exact "
+                "authenticated request/config binding"
+            )
+    else:
+        prepared = ProductionStage1BundleBuilder(
+            stage1_build_options
+        ).prepare()
+        prepared_artifact = seal_prepared_stage1_context(
+            root=(
+                deployment.prepared_context_root
+                / _SEALED_PREPARED_CONTEXT_DIRECTORY
+            ),
+            prepared=prepared,
+            producer_factories_builder=factory_builder,
+        )
+        _sealed_prepared_context_manifest_path(
+            deployment,
+            require_existing=True,
+        )
+        _validate_prepared_context_bindings(
+            artifact=prepared_artifact,
+            stage1_build_options=stage1_build_options,
+            architecture_profiles=architecture_profiles,
+            runtime_compatibility_class=runtime_compatibility_class,
+        )
+    htr_profile = architecture_profiles.get("hierarchical_transformer")
+    htr_producer_configuration = (
+        htr_profile.get("producer_configuration")
+        if isinstance(htr_profile, Mapping)
+        else None
+    )
+    configured_htr_training_batch = (
+        htr_producer_configuration.get("batch_size")
+        if isinstance(htr_producer_configuration, Mapping)
+        else None
+    )
+    prepared_htr_training_batch = prepared.config.training.batch_size
+    if (
+        isinstance(configured_htr_training_batch, bool)
+        or not isinstance(configured_htr_training_batch, int)
+        or configured_htr_training_batch < 1
+        or isinstance(prepared_htr_training_batch, bool)
+        or not isinstance(prepared_htr_training_batch, int)
+        or prepared_htr_training_batch < 1
+        or configured_htr_training_batch != prepared_htr_training_batch
+    ):
+        raise ValueError(
+            "authenticated hierarchical-transformer optimizer batch differs "
+            "from the prepared Stage 1 scientific profile"
+        )
     immutable_inputs = _immutable_inputs(authenticated)
     maximum_concurrency_per_device = max(
         int(candidate.concurrency_per_device)
         for candidate in config.candidates
     )
+    execution_profile = Stage1ExecutionProfile.from_mapping(
+        authenticated.request["stage1_execution_profile"]
+    )
     process_executor = (
         ProcessIsolatedRoleNeutralPhysicalOwnerExecutor(
             max_workers_per_resource=maximum_concurrency_per_device,
-        ).bind_prepared(
-            prepared=prepared,
-            producer_factories_builder=factory_builder,
+        ).bind_context(
+            prepared_artifact.manifest_path,
         )
     )
     persistent_executor = (
         PersistentSpawnRoleNeutralPhysicalOwnerExecutor(
             max_workers_per_resource=maximum_concurrency_per_device,
-        ).bind_prepared(
-            prepared=prepared,
-            producer_factories_builder=factory_builder,
+            startup_timeout_seconds=(
+                execution_profile.persistent_slot_startup_timeout_seconds
+            ),
+        ).bind_context(
+            prepared_artifact.manifest_path,
         )
     )
     persistent_parameters = persistent_executor.worker_parameters
@@ -883,15 +1068,17 @@ def build_authenticated_role_neutral_benchmark_workloads(
         raise RuntimeError(
             "persistent benchmark executor omitted its prepared-context binding"
         )
-    prepared_artifact = load_prepared_stage1_context(
-        Path(
-            str(
-                persistent_parameters[
-                    "prepared_context_manifest_path"
-                ]
-            )
+    rebound_manifest_path = Path(
+        str(
+            persistent_parameters[
+                "prepared_context_manifest_path"
+            ]
         )
-    )
+    ).resolve(strict=True)
+    if rebound_manifest_path != prepared_artifact.manifest_path:
+        raise RuntimeError(
+            "benchmark executor changed its sealed prepared-context binding"
+        )
     scientific_identity = authenticated.request.get("scientific_identity")
     scientific_sha256 = (
         scientific_identity.get("scientific_sha256")
@@ -947,6 +1134,9 @@ def build_authenticated_role_neutral_benchmark_workloads(
         workloads[label] = RoleNeutralBenchmarkWorkload(
             scope_label=label,
             plan=plan,
+            scientific_htr_training_batch_size=(
+                configured_htr_training_batch
+            ),
             producer_factories_builder=build_factories,
             physical_owner_executor_builder=build_bound_executor,
             preflight_compression_source_builder=(

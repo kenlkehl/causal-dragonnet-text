@@ -1571,9 +1571,28 @@ def _validate_cache_migration_candidate(
     upstream_prepared_artifact: ValidatedPortableArtifact,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     assert_validated_artifact_unchanged(upstream_prepared_artifact)
+    upstream_compatibility = ArtifactCompatibility(
+        **dict(upstream_prepared_artifact.manifest["compatibility"])
+    )
+    shared_compatibility_fields = (
+        "dataset_identity",
+        "split_identity",
+        "row_order_identity",
+        "model_identities",
+        "prompt_identities",
+        "configuration_identity",
+        "seed_identity",
+        "runtime_compatibility_class",
+    )
     if (
         upstream_prepared_artifact.manifest.get("artifact_kind") != "prepared_cohort"
-        or upstream_prepared_artifact.compatibility_key != compatibility.key
+        or any(
+            getattr(upstream_compatibility, field)
+            != getattr(compatibility, field)
+            for field in shared_compatibility_fields
+        )
+        or upstream_compatibility.producer_code_identity
+        == compatibility.producer_code_identity
     ):
         raise ValueError("legacy cache upstream is not the requested prepared node")
     upstream_phase = upstream_prepared_artifact.phase_binding
@@ -2577,15 +2596,26 @@ def validate_legacy_preflight_manifest(
     return result
 
 
-def _legacy_row_fingerprint(row_ids: Sequence[str]) -> str:
-    """Reconstruct the row fingerprint emitted by the preserved v4 producer."""
+def _legacy_row_fingerprint(row_ids: Sequence[int]) -> str:
+    """Reconstruct the preserved v4 fingerprint from exact scheduler row IDs.
 
-    normalized: list[int | str] = []
+    V4 scope planning used nonnegative integer row positions.  Coercing a
+    current string ID such as ``"1"`` to integer ``1`` would falsely claim an
+    exact row-identity match, so this trust-boundary helper accepts only exact
+    (non-boolean) integers.
+    """
+
+    normalized: list[int] = []
     for value in row_ids:
-        try:
-            normalized.append(int(value))
-        except (TypeError, ValueError):
-            normalized.append(str(value))
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                "legacy v4 row fingerprints require exact integer scheduler row IDs"
+            )
+        if value < 0:
+            raise ValueError(
+                "legacy v4 row fingerprints require nonnegative scheduler row IDs"
+            )
+        normalized.append(value)
     return identity_sha256({"ordered_row_ids": normalized})
 
 

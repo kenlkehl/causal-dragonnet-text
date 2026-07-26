@@ -31,9 +31,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
+from joblib import Parallel, delayed
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import KFold
+from threadpoolctl import threadpool_limits
 
 from ..config import BoWViewConfig
 from .all_evidence_discovery_interfaces import BOW_NUISANCE, BOW_R_LOSS
@@ -522,6 +524,188 @@ class _LiveFold:
     captured_learner: Mapping[str, Any]
 
 
+@dataclass
+class _UncapturedFold:
+    """One fitted fold before deterministic parent-side proof capture."""
+
+    fold: int
+    fit_pos: np.ndarray
+    validation_pos: np.ndarray
+    fold_seed: int
+    vectorizer: TfidfVectorizer | None
+    learner: Any | None
+    constant_prediction: float | None
+    validation_prediction: np.ndarray
+    fit_sample_weight: np.ndarray | None
+
+
+def _resolve_fold_parallelism(
+    *,
+    setting: int | str,
+    task_count: int,
+    owner_cpu_budget: int,
+) -> int:
+    if isinstance(setting, bool):
+        raise TypeError("bow_fold_parallelism must be an integer or 'auto'")
+    budget = int(owner_cpu_budget)
+    if isinstance(owner_cpu_budget, bool) or budget < 1:
+        raise ValueError("BoW owner CPU budget must be a positive integer")
+    if int(task_count) < 1:
+        raise ValueError("BoW fold task count must be positive")
+    text = str(setting).strip().lower()
+    if text == "auto":
+        requested = budget
+    else:
+        try:
+            requested = int(text)
+        except ValueError as exc:
+            raise ValueError(
+                "bow_fold_parallelism must be a positive integer or 'auto'"
+            ) from exc
+        if requested < 1 or str(requested) != text:
+            raise ValueError(
+                "bow_fold_parallelism must be a positive integer or 'auto'"
+            )
+    if requested > budget:
+        raise ValueError(
+            "bow_fold_parallelism cannot exceed the physical owner's CPU budget"
+        )
+    return min(requested, int(task_count))
+
+
+def _parallel_backend_name(value: str) -> str:
+    backend = str(value).strip().lower()
+    if backend == "loky":
+        backend = "processes"
+    if backend not in {"threads", "processes"}:
+        raise ValueError(
+            "bow_parallel_backend must be 'threads', 'processes', or 'loky'"
+        )
+    return "threading" if backend == "threads" else "loky"
+
+
+def _run_fold_tasks(
+    *,
+    run_fold: Callable[[int, np.ndarray, np.ndarray], _UncapturedFold],
+    split_items: Sequence[tuple[int, tuple[Any, Any]]],
+    bow_fold_parallelism: int | str,
+    bow_parallel_backend: str,
+    owner_cpu_budget: int,
+) -> list[_UncapturedFold]:
+    """Fit independent folds concurrently without sharing proof state."""
+
+    n_jobs = _resolve_fold_parallelism(
+        setting=bow_fold_parallelism,
+        task_count=len(split_items),
+        owner_cpu_budget=owner_cpu_budget,
+    )
+    backend = _parallel_backend_name(bow_parallel_backend)
+
+    def invoke(
+        fold: int,
+        raw_fit_pos: Any,
+        raw_validation_pos: Any,
+    ) -> _UncapturedFold:
+        # Every estimator constructed by this producer is already configured
+        # for one learner job.  This process-wide/native-library limit also
+        # prevents BLAS/OpenMP nesting from multiplying the configured fold
+        # concurrency inside one physical-owner CPU allocation.
+        with threadpool_limits(limits=1):
+            return run_fold(
+                int(fold),
+                np.asarray(raw_fit_pos, dtype=int),
+                np.asarray(raw_validation_pos, dtype=int),
+            )
+
+    # The outer limit keeps the process-wide native-library setting at one
+    # until every threaded task has returned.  The per-task limit above also
+    # applies the same rule inside a process-backend child.
+    with threadpool_limits(limits=1):
+        if n_jobs == 1:
+            results = [
+                invoke(fold, raw_fit_pos, raw_validation_pos)
+                for fold, (raw_fit_pos, raw_validation_pos) in split_items
+            ]
+        else:
+            results = Parallel(
+                n_jobs=n_jobs,
+                backend=backend,
+                batch_size=1,
+                pre_dispatch="all",
+            )(
+                delayed(invoke)(fold, raw_fit_pos, raw_validation_pos)
+                for fold, (raw_fit_pos, raw_validation_pos) in split_items
+            )
+    ordered = sorted(results, key=lambda result: int(result.fold))
+    expected = [int(fold) for fold, _split in split_items]
+    if [int(result.fold) for result in ordered] != expected:
+        raise RuntimeError("parallel BoW fold execution changed canonical fold coverage")
+    return ordered
+
+
+def _fit_one_binary_fold(
+    *,
+    request: RoleNeutralBoWPhysicalGroupRequest,
+    fit_texts: tuple[str, ...],
+    labels: np.ndarray,
+    objective: str,
+    view: BoWViewConfig,
+    fold: int,
+    fit_pos: np.ndarray,
+    validation_pos: np.ndarray,
+    vectorizer_params: Mapping[str, Any],
+    model_params: Mapping[str, Any],
+    e_clip: float,
+) -> _UncapturedFold:
+    fold_seed = _derived_seed(
+        request.physical_owner.scope_seed,
+        view_name=view.name,
+        objective=objective,
+        purpose="fold_model",
+        fold=fold,
+    )
+    vectorizer: TfidfVectorizer | None = None
+    learner: Any | None = None
+    constant: float | None = None
+    if len(np.unique(labels[fit_pos])) < 2:
+        constant = float(np.mean(labels[fit_pos]))
+        validation_prediction = np.full(
+            len(validation_pos),
+            constant,
+            dtype=np.float64,
+        )
+    else:
+        vectorizer = _make_bow_vectorizer(dict(vectorizer_params))
+        x_fit = vectorizer.fit_transform(
+            [fit_texts[int(position)] for position in fit_pos]
+        )
+        x_validation = vectorizer.transform(
+            [fit_texts[int(position)] for position in validation_pos]
+        )
+        learner = _make_bow_classifier(
+            dict(model_params),
+            random_state=fold_seed,
+        )
+        learner.fit(x_fit, labels[fit_pos])
+        validation_prediction = learner.predict_proba(x_validation)[:, 1]
+    validation_prediction = np.clip(
+        np.asarray(validation_prediction, dtype=np.float64),
+        e_clip,
+        1.0 - e_clip,
+    )
+    return _UncapturedFold(
+        fold=int(fold),
+        fit_pos=np.asarray(fit_pos, dtype=int),
+        validation_pos=np.asarray(validation_pos, dtype=int),
+        fold_seed=int(fold_seed),
+        vectorizer=vectorizer,
+        learner=learner,
+        constant_prediction=constant,
+        validation_prediction=validation_prediction,
+        fit_sample_weight=None,
+    )
+
+
 def _fit_binary_objective(
     *,
     request: RoleNeutralBoWPhysicalGroupRequest,
@@ -533,6 +717,9 @@ def _fit_binary_objective(
     nuisance_folds: int,
     e_clip: float,
     store: _ArrayStore,
+    bow_fold_parallelism: int | str,
+    bow_parallel_backend: str,
+    owner_cpu_budget: int,
 ) -> tuple[list[_LiveFold], list[dict[str, Any]], np.ndarray]:
     split_seed = _derived_seed(
         request.physical_owner.scope_seed,
@@ -555,43 +742,33 @@ def _fit_binary_objective(
     records: list[dict[str, Any]] = []
     vectorizer_params = _vectorizer_params(view)
     model_params = _model_params(view)
-    for fold, (raw_fit_pos, raw_validation_pos) in split_items:
-        fit_pos = np.asarray(raw_fit_pos, dtype=int)
-        validation_pos = np.asarray(raw_validation_pos, dtype=int)
-        fold_seed = _derived_seed(
-            request.physical_owner.scope_seed,
-            view_name=view.name,
+    fitted_folds = _run_fold_tasks(
+        run_fold=lambda fold, fit_pos, validation_pos: _fit_one_binary_fold(
+            request=request,
+            fit_texts=fit_texts,
+            labels=labels,
             objective=objective,
-            purpose="fold_model",
+            view=view,
             fold=fold,
-        )
-        vectorizer: TfidfVectorizer | None = None
-        learner: Any | None = None
-        constant: float | None = None
-        if len(np.unique(labels[fit_pos])) < 2:
-            constant = float(np.mean(labels[fit_pos]))
-            validation_prediction = np.full(
-                len(validation_pos),
-                constant,
-                dtype=np.float64,
-            )
-        else:
-            vectorizer = _make_bow_vectorizer(vectorizer_params)
-            x_fit = vectorizer.fit_transform([fit_texts[int(position)] for position in fit_pos])
-            x_validation = vectorizer.transform(
-                [fit_texts[int(position)] for position in validation_pos]
-            )
-            learner = _make_bow_classifier(
-                model_params,
-                random_state=fold_seed,
-            )
-            learner.fit(x_fit, labels[fit_pos])
-            validation_prediction = learner.predict_proba(x_validation)[:, 1]
-        validation_prediction = np.clip(
-            np.asarray(validation_prediction, dtype=np.float64),
-            e_clip,
-            1.0 - e_clip,
-        )
+            fit_pos=fit_pos,
+            validation_pos=validation_pos,
+            vectorizer_params=vectorizer_params,
+            model_params=model_params,
+            e_clip=e_clip,
+        ),
+        split_items=split_items,
+        bow_fold_parallelism=bow_fold_parallelism,
+        bow_parallel_backend=bow_parallel_backend,
+        owner_cpu_budget=owner_cpu_budget,
+    )
+    for fitted in fitted_folds:
+        fold = int(fitted.fold)
+        fit_pos = fitted.fit_pos
+        validation_pos = fitted.validation_pos
+        vectorizer = fitted.vectorizer
+        learner = fitted.learner
+        constant = fitted.constant_prediction
+        validation_prediction = fitted.validation_prediction
         oof[validation_pos] = validation_prediction
         prefix = f"{objective}_{int(view_index):04d}_{int(fold):04d}"
         captured_vectorizer = (
@@ -617,7 +794,7 @@ def _fit_binary_objective(
             "view_name": view.name,
             "view_config": _bow_view_to_dict(view),
             "fold": int(fold),
-            "seed": int(fold_seed),
+            "seed": int(fitted.fold_seed),
             "fit_row_ids": [
                 int(request.physical_owner.fit_row_ids[int(position)]) for position in fit_pos
             ],
@@ -662,6 +839,74 @@ def _fit_binary_objective(
     return live, records, oof
 
 
+def _fit_one_regression_fold(
+    *,
+    request: RoleNeutralBoWPhysicalGroupRequest,
+    fit_texts: tuple[str, ...],
+    values: np.ndarray,
+    weights: np.ndarray | None,
+    objective: str,
+    view: BoWViewConfig,
+    fold: int,
+    fit_pos: np.ndarray,
+    validation_pos: np.ndarray,
+    vectorizer_params: Mapping[str, Any],
+    model_params: Mapping[str, Any],
+) -> _UncapturedFold:
+    fold_seed = _derived_seed(
+        request.physical_owner.scope_seed,
+        view_name=view.name,
+        objective=objective,
+        purpose="fold_model",
+        fold=fold,
+    )
+    vectorizer = _make_bow_vectorizer(dict(vectorizer_params))
+    x_fit = vectorizer.fit_transform(
+        [fit_texts[int(position)] for position in fit_pos]
+    )
+    x_validation = vectorizer.transform(
+        [fit_texts[int(position)] for position in validation_pos]
+    )
+    learner = _make_bow_regressor(
+        dict(model_params),
+        random_state=fold_seed,
+    )
+    fold_weight = None if weights is None else weights[fit_pos]
+    _fit_regressor(
+        learner,
+        x_fit,
+        values[fit_pos],
+        sample_weight=fold_weight,
+        unsupported_sample_weight_policy=str(
+            model_params["unsupported_sample_weight_policy"]
+        ),
+    )
+    validation_prediction = np.asarray(
+        learner.predict(x_validation),
+        dtype=np.float64,
+    )
+    if (
+        validation_prediction.shape != (len(validation_pos),)
+        or not np.isfinite(validation_prediction).all()
+    ):
+        raise RuntimeError("BoW residual-effect fold emitted invalid predictions")
+    return _UncapturedFold(
+        fold=int(fold),
+        fit_pos=np.asarray(fit_pos, dtype=int),
+        validation_pos=np.asarray(validation_pos, dtype=int),
+        fold_seed=int(fold_seed),
+        vectorizer=vectorizer,
+        learner=learner,
+        constant_prediction=None,
+        validation_prediction=validation_prediction,
+        fit_sample_weight=(
+            None
+            if fold_weight is None
+            else np.asarray(fold_weight, dtype=np.float64)
+        ),
+    )
+
+
 def _fit_regression_objective(
     *,
     request: RoleNeutralBoWPhysicalGroupRequest,
@@ -673,6 +918,9 @@ def _fit_regression_objective(
     view_index: int,
     effect_folds: int,
     store: _ArrayStore,
+    bow_fold_parallelism: int | str,
+    bow_parallel_backend: str,
+    owner_cpu_budget: int,
 ) -> tuple[list[_LiveFold], list[dict[str, Any]], np.ndarray]:
     values = np.asarray(target, dtype=np.float64)
     if values.shape != (len(fit_texts),) or not np.isfinite(values).all():
@@ -704,47 +952,36 @@ def _fit_regression_objective(
     oof = np.full(len(values), np.nan, dtype=np.float64)
     live: list[_LiveFold] = []
     records: list[dict[str, Any]] = []
-    for fold, (raw_fit_pos, raw_validation_pos) in enumerate(
-        splitter.split(fit_texts),
-        start=1,
-    ):
-        fit_pos = np.asarray(raw_fit_pos, dtype=int)
-        validation_pos = np.asarray(raw_validation_pos, dtype=int)
-        fold_seed = _derived_seed(
-            request.physical_owner.scope_seed,
-            view_name=view.name,
+    split_items = list(enumerate(splitter.split(fit_texts), start=1))
+    fitted_folds = _run_fold_tasks(
+        run_fold=lambda fold, fit_pos, validation_pos: _fit_one_regression_fold(
+            request=request,
+            fit_texts=fit_texts,
+            values=values,
+            weights=weights,
             objective=objective,
-            purpose="fold_model",
+            view=view,
             fold=fold,
-        )
-        vectorizer = _make_bow_vectorizer(vectorizer_params)
-        x_fit = vectorizer.fit_transform([fit_texts[int(position)] for position in fit_pos])
-        x_validation = vectorizer.transform(
-            [fit_texts[int(position)] for position in validation_pos]
-        )
-        learner = _make_bow_regressor(
-            model_params,
-            random_state=fold_seed,
-        )
-        fold_weight = None if weights is None else weights[fit_pos]
-        _fit_regressor(
-            learner,
-            x_fit,
-            values[fit_pos],
-            sample_weight=fold_weight,
-            unsupported_sample_weight_policy=str(
-                model_params["unsupported_sample_weight_policy"]
-            ),
-        )
-        validation_prediction = np.asarray(
-            learner.predict(x_validation),
-            dtype=np.float64,
-        )
-        if (
-            validation_prediction.shape != (len(validation_pos),)
-            or not np.isfinite(validation_prediction).all()
-        ):
-            raise RuntimeError("BoW residual-effect fold emitted invalid predictions")
+            fit_pos=fit_pos,
+            validation_pos=validation_pos,
+            vectorizer_params=vectorizer_params,
+            model_params=model_params,
+        ),
+        split_items=split_items,
+        bow_fold_parallelism=bow_fold_parallelism,
+        bow_parallel_backend=bow_parallel_backend,
+        owner_cpu_budget=owner_cpu_budget,
+    )
+    for fitted in fitted_folds:
+        fold = int(fitted.fold)
+        fit_pos = fitted.fit_pos
+        validation_pos = fitted.validation_pos
+        vectorizer = fitted.vectorizer
+        learner = fitted.learner
+        fold_weight = fitted.fit_sample_weight
+        validation_prediction = fitted.validation_prediction
+        if vectorizer is None or learner is None:
+            raise RuntimeError("fitted BoW regression fold lost live model state")
         oof[validation_pos] = validation_prediction
         prefix = f"{objective}_{int(view_index):04d}_{int(fold):04d}"
         captured_vectorizer = _capture_vectorizer(
@@ -766,7 +1003,7 @@ def _fit_regression_objective(
             "view_name": view.name,
             "view_config": _bow_view_to_dict(view),
             "fold": int(fold),
-            "seed": int(fold_seed),
+            "seed": int(fitted.fold_seed),
             "fit_row_ids": [
                 int(request.physical_owner.fit_row_ids[int(position)]) for position in fit_pos
             ],
@@ -873,7 +1110,12 @@ def _evidence_payload(
 
 def _producer_identity() -> str:
     functions = (
+        _resolve_fold_parallelism,
+        _parallel_backend_name,
+        _run_fold_tasks,
+        _fit_one_binary_fold,
         _fit_binary_objective,
+        _fit_one_regression_fold,
         _fit_regression_objective,
         _evidence_payload,
         execute_role_neutral_bow_physical_group,
@@ -1119,6 +1361,9 @@ def execute_role_neutral_bow_physical_group(
     nuisance_folds: int,
     effect_folds: int,
     e_clip: float,
+    bow_fold_parallelism: int | str,
+    bow_parallel_backend: str,
+    owner_cpu_budget: int,
     exact_heldout_text_loader: Callable[[tuple[int, ...]], Sequence[str]],
 ) -> Mapping[str, Any]:
     """Fit once, seal, then produce exact and cumulative logical views.
@@ -1169,6 +1414,15 @@ def execute_role_neutral_bow_physical_group(
     clip = float(e_clip)
     if not 0.0 < clip < 0.5:
         raise ValueError("configured e_clip must be in (0, 0.5)")
+    owner_budget = int(owner_cpu_budget)
+    if isinstance(owner_cpu_budget, bool) or owner_budget < 1:
+        raise ValueError("BoW owner CPU budget must be a positive integer")
+    _parallel_backend_name(bow_parallel_backend)
+    _resolve_fold_parallelism(
+        setting=bow_fold_parallelism,
+        task_count=max(nuisance_fold_count, effect_fold_count),
+        owner_cpu_budget=owner_budget,
+    )
     if not callable(exact_heldout_text_loader):
         raise TypeError("exact held-out text loader must be callable")
 
@@ -1191,6 +1445,9 @@ def execute_role_neutral_bow_physical_group(
                 nuisance_folds=nuisance_fold_count,
                 e_clip=clip,
                 store=store,
+                bow_fold_parallelism=bow_fold_parallelism,
+                bow_parallel_backend=bow_parallel_backend,
+                owner_cpu_budget=owner_budget,
             )
             key = f"{view.name}::{objective}"
             live_by_objective_view[key] = live
@@ -1247,6 +1504,9 @@ def execute_role_neutral_bow_physical_group(
                 view_index=view_index,
                 effect_folds=effect_fold_count,
                 store=store,
+                bow_fold_parallelism=bow_fold_parallelism,
+                bow_parallel_backend=bow_parallel_backend,
+                owner_cpu_budget=owner_budget,
             )
             key = f"{view.name}::{objective}"
             live_by_objective_view[key] = live

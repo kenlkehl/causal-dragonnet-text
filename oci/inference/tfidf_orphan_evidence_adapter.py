@@ -22,7 +22,7 @@ import pandas as pd
 
 from .all_evidence_fusion import source_text_temporal_policy_audit
 
-ORPHAN_NGRAM_EVIDENCE_ADAPTER_SCHEMA_VERSION = "tfidf_full_outer_orphan_ngram_evidence_v2"
+ORPHAN_NGRAM_EVIDENCE_ADAPTER_SCHEMA_VERSION = "tfidf_full_outer_orphan_ngram_evidence_v3"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", flags=re.IGNORECASE)
 _FORBIDDEN_FIELD = re.compile(
@@ -138,31 +138,76 @@ _ALLOWED_SCORE_SCOPES = frozenset(
 
 @dataclass(frozen=True)
 class OrphanNgramEvidenceAdapterConfig:
-    """Deterministic safety and size bounds for the residual branch."""
+    """Explicit scientific filters and fail-closed capacity guards.
 
-    min_abs_fit_score: float = 2.0
-    lexical_overlap_threshold: float = 0.5
-    max_candidates: int = 96
-    max_clusters: int = 12
-    max_terms_per_cluster: int = 8
-    max_term_chars: int = 160
-    max_ngram_tokens: int = 6
+    ``None`` means complete retention for a capacity.  A finite capacity is
+    never a selection instruction: if it would bind, adaptation aborts rather
+    than silently omitting eligible evidence.
+    """
+
+    min_abs_fit_score: float
+    lexical_overlap_threshold: float
+    max_candidates: int | None
+    max_clusters: int | None
+    max_terms_per_cluster: int | None
+    max_term_chars: int | None
+    max_ngram_tokens: int | None
 
     def validate(self) -> None:
         if not math.isfinite(float(self.min_abs_fit_score)) or float(self.min_abs_fit_score) < 0.0:
             raise ValueError("min_abs_fit_score must be finite and non-negative")
         if not 0.0 < float(self.lexical_overlap_threshold) <= 1.0:
             raise ValueError("lexical_overlap_threshold must be in (0, 1]")
-        if not 1 <= int(self.max_candidates) <= 1000:
-            raise ValueError("max_candidates must be in [1, 1000]")
-        if not 1 <= int(self.max_clusters) <= 64:
-            raise ValueError("max_clusters must be in [1, 64]")
-        if not 1 <= int(self.max_terms_per_cluster) <= 15:
-            raise ValueError("max_terms_per_cluster must be in [1, 15]")
-        if not 8 <= int(self.max_term_chars) <= 500:
-            raise ValueError("max_term_chars must be in [8, 500]")
-        if not 1 <= int(self.max_ngram_tokens) <= 10:
-            raise ValueError("max_ngram_tokens must be in [1, 10]")
+        for name in (
+            "max_candidates",
+            "max_clusters",
+            "max_terms_per_cluster",
+            "max_term_chars",
+            "max_ngram_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(f"{name} must be null or a positive integer")
+
+
+class OrphanNgramEvidenceCapacityOverflowError(ValueError):
+    """A configured orphan-evidence capacity would omit scientific evidence."""
+
+
+def orphan_ngram_adapter_config_from_tfidf_topic(
+    topic_config: Any,
+) -> OrphanNgramEvidenceAdapterConfig:
+    """Project one explicit TF-IDF topic profile without inventing capacities."""
+
+    required = {
+        "min_abs_fit_score": "orphan_ngram_min_abs_fit_score",
+        "lexical_overlap_threshold": "orphan_ngram_cluster_similarity_threshold",
+        "max_clusters": "orphan_ngram_max_selected_clusters",
+        "max_terms_per_cluster": "orphan_ngram_cluster_max_terms",
+    }
+    values: dict[str, Any] = {}
+    for target, source in required.items():
+        if isinstance(topic_config, Mapping):
+            if source not in topic_config:
+                raise ValueError(f"TF-IDF topic config is missing {source}")
+            values[target] = topic_config[source]
+        else:
+            if not hasattr(topic_config, source):
+                raise ValueError(f"TF-IDF topic config is missing {source}")
+            values[target] = getattr(topic_config, source)
+    config = OrphanNgramEvidenceAdapterConfig(
+        min_abs_fit_score=values["min_abs_fit_score"],
+        lexical_overlap_threshold=values["lexical_overlap_threshold"],
+        max_candidates=None,
+        max_clusters=values["max_clusters"],
+        max_terms_per_cluster=values["max_terms_per_cluster"],
+        max_term_chars=None,
+        max_ngram_tokens=None,
+    )
+    config.validate()
+    return config
 
 
 @dataclass(frozen=True)
@@ -224,9 +269,9 @@ def adapt_full_outer_orphan_ngram_evidence(
     row: Mapping[str, Any],
     effect_score_path: Path | str | None = None,
     *,
+    config: OrphanNgramEvidenceAdapterConfig,
     artifact_base_dir: Path | str | None = None,
     expected_sha256: str | None = None,
-    config: OrphanNgramEvidenceAdapterConfig = OrphanNgramEvidenceAdapterConfig(),
 ) -> AdaptedOrphanNgramEvidence:
     """Build an authenticated, fold-local orphan n-gram evidence branch.
 
@@ -325,6 +370,14 @@ def adapt_full_outer_orphan_ngram_evidence(
         **counts,
         "selected_cluster_count": len(clusters),
         "selected_term_count": sum(len(cluster["terms"]) for cluster in clusters),
+        "capacity_policy": {
+            "max_candidates": config.max_candidates,
+            "max_clusters": config.max_clusters,
+            "max_terms_per_cluster": config.max_terms_per_cluster,
+            "max_term_chars": config.max_term_chars,
+            "max_ngram_tokens": config.max_ngram_tokens,
+            "finite_capacity_overflow": "abort_no_silent_omission",
+        },
     }
     branch = {
         "schema_version": ORPHAN_NGRAM_EVIDENCE_ADAPTER_SCHEMA_VERSION,
@@ -339,8 +392,9 @@ def adapt_full_outer_orphan_ngram_evidence(
         "topic_term_exclusion_is_fit_side": True,
         "cluster_construction_uses_heldout_rows_or_labels": False,
         "selection_rule": (
-            "descending outer-fit importance with deterministic greedy lexical-token "
-            "overlap clustering"
+            "complete eligible outer-fit candidate retention with deterministic "
+            "greedy lexical-token overlap clustering; configured capacities abort "
+            "instead of selecting"
         ),
         "lexical_overlap_threshold": float(config.lexical_overlap_threshold),
         "selected_cluster_ids": selected_ids,
@@ -602,12 +656,7 @@ def _eligible_residual_records(
         signed = _finite_number(raw.get("fit_signed_score"))
         if signed is None:
             signed = _finite_number(raw.get("signed_score"))
-        if (
-            not normalized
-            or signed is None
-            or len(term) > int(config.max_term_chars)
-            or len(_TOKEN.findall(term)) > int(config.max_ngram_tokens)
-        ):
+        if not normalized or signed is None:
             counts["invalid_term_or_score_count"] += 1
             continue
         if normalized in represented_terms:
@@ -620,6 +669,19 @@ def _eligible_residual_records(
         if abs(float(signed)) < float(config.min_abs_fit_score):
             counts["below_min_abs_fit_score_count"] += 1
             continue
+        if config.max_term_chars is not None and len(term) > config.max_term_chars:
+            raise OrphanNgramEvidenceCapacityOverflowError(
+                "eligible orphan n-gram exceeds configured max_term_chars; "
+                "no term text was silently discarded"
+            )
+        if (
+            config.max_ngram_tokens is not None
+            and len(_TOKEN.findall(term)) > config.max_ngram_tokens
+        ):
+            raise OrphanNgramEvidenceCapacityOverflowError(
+                "eligible orphan n-gram exceeds configured max_ngram_tokens; "
+                "no term was silently discarded"
+            )
         record = _term_record(raw, term=term, source_rank=source_index)
         record["_normalized"] = normalized
         record["_tokens"] = _lexical_tokens(term)
@@ -644,9 +706,14 @@ def _eligible_residual_records(
         seen.add(normalized)
         unique.append(record)
     counts["eligible_residual_count_before_bound"] = len(unique)
-    bounded = unique[: int(config.max_candidates)]
-    counts["bounded_candidate_count"] = len(bounded)
-    return bounded, counts
+    if config.max_candidates is not None and len(unique) > config.max_candidates:
+        raise OrphanNgramEvidenceCapacityOverflowError(
+            f"{len(unique)} eligible orphan n-grams exceed configured "
+            f"max_candidates={config.max_candidates}; no candidates were "
+            "silently discarded"
+        )
+    counts["bounded_candidate_count"] = len(unique)
+    return unique, counts
 
 
 def _eligible_bool(value: Any) -> bool:
@@ -715,23 +782,34 @@ def _cluster_records(
         best_index: int | None = None
         best_similarity = -1.0
         for index, group in enumerate(groups):
-            if len(group["members"]) >= int(config.max_terms_per_cluster):
-                continue
             similarity = _overlap_coefficient(tokens, group["seed_tokens"])
             if similarity >= threshold and similarity > best_similarity:
                 best_index = index
                 best_similarity = similarity
-        if best_index is None:
-            if len(groups) >= int(config.max_clusters):
-                continue
+        if best_index is not None:
+            if (
+                config.max_terms_per_cluster is not None
+                and len(groups[best_index]["members"]) >= config.max_terms_per_cluster
+            ):
+                raise OrphanNgramEvidenceCapacityOverflowError(
+                    "an orphan n-gram cluster exceeds configured "
+                    f"max_terms_per_cluster={config.max_terms_per_cluster}; "
+                    "no cluster member was silently discarded"
+                )
+            groups[best_index]["members"].append((raw, best_similarity))
+        else:
+            if config.max_clusters is not None and len(groups) >= config.max_clusters:
+                raise OrphanNgramEvidenceCapacityOverflowError(
+                    f"orphan n-gram evidence exceeds configured "
+                    f"max_clusters={config.max_clusters}; no cluster was "
+                    "silently discarded"
+                )
             groups.append(
                 {
                     "seed_tokens": tokens,
                     "members": [(raw, 1.0)],
                 }
             )
-        else:
-            groups[best_index]["members"].append((raw, best_similarity))
 
     output: list[dict[str, Any]] = []
     for index, group in enumerate(groups, start=1):

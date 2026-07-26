@@ -20,13 +20,13 @@ from oci.inference.multi_model_forest_stage1 import MultiModelForestStage1HTRPro
 
 _PRESERVED_SOURCE_HASHES = {
     "multi_model_forest_stage1.py": (
-        "b1f67dfff5832311d60a71f0e336a97a6580f5b52efa614db6af8fbd82352bd0"
+        "ea74e85b31e33fe61cf19474477bdc7c6118143bd11c8534eb1e8bbe0b759f12"
     ),
     "multi_model_pair_uplift.py": (
-        "f078aa58f917db3b847009106f65d26d4a385037fd35927dd9fa583bb7988262"
+        "0d72709578f58d4318da2dcbc57ab2bdaf76d154d3aca3b9d25d55cd6f949bed"
     ),
     "review_spent_evidence_provider.py": (
-        "6978aa0419a89a0b74a7c187ef1580bfc857ace49159726d2681fc1f0a2d5916"
+        "681cb3cbb26302e6acd4c42f1d8c023ce37e644b48a9766946d2493daa4e3d5c"
     ),
 }
 

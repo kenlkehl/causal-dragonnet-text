@@ -36,6 +36,9 @@ from oci.inference.review_spent_evidence_provider import (
     _sanitize_digest_terms,
 )
 from oci.inference.multi_model_agentic_forest import _build_role_grouped_evidence_digest
+from oci.inference.tfidf_orphan_evidence_adapter import (
+    OrphanNgramEvidenceAdapterConfig,
+)
 import oci.inference.review_spent_evidence_provider as spent_module
 import oci.inference.tfidf_upstream_gate_backend as tfidf_backend_module
 from tests.semantic_witness_test_support import (
@@ -45,6 +48,18 @@ from tests.semantic_witness_test_support import (
 
 
 _SEMANTIC_WITNESS_CONFIG = semantic_witness_config()
+
+
+def _orphan_adapter_config() -> OrphanNgramEvidenceAdapterConfig:
+    return OrphanNgramEvidenceAdapterConfig(
+        min_abs_fit_score=0.0,
+        lexical_overlap_threshold=0.5,
+        max_candidates=None,
+        max_clusters=None,
+        max_terms_per_cluster=None,
+        max_term_chars=None,
+        max_ngram_tokens=None,
+    )
 
 
 def test_temporal_wording_is_not_filtered_from_spent_concepts():
@@ -1060,7 +1075,10 @@ def test_tfidf_backend_refits_only_spent_rows_and_builds_safe_orphans(
         "oci.inference.review_spent_evidence_provider.fit_tfidf_topic_context",
         fake_fit,
     )
-    backend = TfidfTopicOrphanSpentDiscoveryBackend(stage1_config_path=config_path)
+    backend = TfidfTopicOrphanSpentDiscoveryBackend(
+        stage1_config_path=config_path,
+        orphan_config=_orphan_adapter_config(),
+    )
     result = backend.fit_discovery(
         outer_fold=3,
         review_round=1,

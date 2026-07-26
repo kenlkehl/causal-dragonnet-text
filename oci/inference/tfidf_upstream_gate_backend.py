@@ -40,6 +40,30 @@ from .tfidf_safe_artifacts import (
 TFIDF_CONTEXT_BACKEND_ID = "tfidf_topic_orphan_context_gate_backend_v2"
 
 
+class TfidfOrphanFeatureCapacityOverflowError(ValueError):
+    """A finite transform capacity would omit an eligible orphan feature."""
+
+
+def _optional_positive_capacity(value: Any, *, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be a positive integer or None")
+    result = int(value)
+    if result < 1:
+        raise ValueError(f"{name} must be a positive integer or None")
+    return result
+
+
+def _positive_integer(value: Any, *, name: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be a positive integer")
+    result = int(value)
+    if result < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return result
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -85,8 +109,8 @@ class TfidfTopicOrphanContextBackend:
         stage1_config_path: Path | str | None = None,
         stage1_config_snapshot: HistoricalStage1ConfigSnapshot | None = None,
         outcome_type: str = "binary",
-        max_orphan_features: int = 32,
-        minimum_orphan_arm_support: int = 2,
+        max_orphan_features: int | None = None,
+        minimum_orphan_arm_support: int | None = None,
     ) -> None:
         self._stage1_config_snapshot = _historical_stage1_config_snapshot(
             stage1_config_path,
@@ -97,14 +121,22 @@ class TfidfTopicOrphanContextBackend:
         self.outcome_type = str(outcome_type).strip().lower()
         if self.outcome_type not in {"binary", "continuous"}:
             raise ValueError("outcome_type must be binary or continuous")
-        self.max_orphan_features = int(max_orphan_features)
-        self.minimum_orphan_arm_support = int(minimum_orphan_arm_support)
-        if self.max_orphan_features < 1 or self.minimum_orphan_arm_support < 1:
-            raise ValueError("orphan limits must be positive")
+        self.max_orphan_features = _optional_positive_capacity(
+            max_orphan_features,
+            name="max_orphan_features",
+        )
         forest = self.config.architecture.multi_model_forest
         self._views = copy.deepcopy(tuple(forest.bow_views))
         self._topic_config = copy.deepcopy(forest.tfidf_topic)
         self._topic_config.score_test_enabled = False
+        self.minimum_orphan_arm_support = _positive_integer(
+            (
+                self._topic_config.minimum_arm_document_support
+                if minimum_orphan_arm_support is None
+                else minimum_orphan_arm_support
+            ),
+            name="minimum_orphan_arm_support",
+        )
 
         import oci.inference.tfidf_topic_discovery as discovery_module
 
@@ -113,12 +145,18 @@ class TfidfTopicOrphanContextBackend:
             "stage1_config_sha256": self._stage1_config_snapshot.sha256,
             "discovery_code_sha256": _sha256_file(Path(discovery_module.__file__)),
             "topic_config_sha256": _sha256_json(asdict(self._topic_config)),
-            "view_config_sha256": _sha256_json(
-                [asdict(view) for view in self._views]
-            ),
+            "view_config_sha256": _sha256_json([asdict(view) for view in self._views]),
             "outcome_type": self.outcome_type,
             "max_orphan_features": self.max_orphan_features,
+            "max_orphan_features_semantics": (
+                "none_retains_complete_eligible_vocabulary_finite_aborts_before_omission_v1"
+            ),
             "minimum_orphan_arm_support": self.minimum_orphan_arm_support,
+            "minimum_orphan_arm_support_source": (
+                "tfidf_topic.minimum_arm_document_support"
+                if minimum_orphan_arm_support is None
+                else "explicit_constructor_argument"
+            ),
             "heldout_score_tests_enabled": False,
             "gate_labels_exposed": False,
             "raw_topics_are_calibrated_effects": False,
@@ -167,17 +205,24 @@ class TfidfTopicOrphanContextBackend:
         if vectorizer is None or not hasattr(vectorizer, "vocabulary_"):
             raise ValueError("fitted TF-IDF context has no authenticated vocabulary")
         selected_terms: list[str] = []
+        selected_term_set: set[str] = set()
         selected_columns: list[int] = []
         for term in candidates["feature"].astype(str):
             column = vectorizer.vocabulary_.get(term)
-            if column is None or term in selected_terms:
+            if column is None or term in selected_term_set:
                 continue
             selected_terms.append(term)
+            selected_term_set.add(term)
             selected_columns.append(int(column))
-            if len(selected_terms) >= self.max_orphan_features:
-                break
         if not selected_terms:
             raise RuntimeError("context-fitted TF-IDF model produced no eligible orphan n-grams")
+        if self.max_orphan_features is not None and len(selected_terms) > self.max_orphan_features:
+            raise TfidfOrphanFeatureCapacityOverflowError(
+                "context-fitted TF-IDF model produced "
+                f"{len(selected_terms)} eligible orphan n-grams, exceeding "
+                f"max_orphan_features={self.max_orphan_features}; refusing silent "
+                "orphan-feature omission"
+            )
         matrix = vectorizer.transform(list(gate_texts))[:, selected_columns]
         values = np.asarray(matrix.toarray(), dtype=float)
         names = tuple(
@@ -304,4 +349,8 @@ class TfidfTopicOrphanContextBackend:
         return prediction
 
 
-__all__ = ["TFIDF_CONTEXT_BACKEND_ID", "TfidfTopicOrphanContextBackend"]
+__all__ = [
+    "TFIDF_CONTEXT_BACKEND_ID",
+    "TfidfOrphanFeatureCapacityOverflowError",
+    "TfidfTopicOrphanContextBackend",
+]

@@ -331,7 +331,8 @@ def test_native_matched_pair_capture_replays_local_transformer_pair_state(
     m_fit = np.linspace(0.30, 0.70, len(train_df))
     e_heldout = np.asarray([0.45, 0.55])
     m_heldout = np.asarray([0.40, 0.60])
-    view_config = vars(config.architecture.multi_model_forest.bow_views[0])
+    view = config.architecture.multi_model_forest.bow_views[0]
+    view_config = vars(view)
     sink = NativeMatchedPairProofCaptureSink(
         artifact_dir=tmp_path / "local_capture",
         scope_id="outer_001_inner_001",
@@ -360,16 +361,19 @@ def test_native_matched_pair_capture_replays_local_transformer_pair_state(
         e_heldout=e_heldout,
         m_heldout=m_heldout,
     )
-    vectorizer_params = {
-        key: view_config[key]
-        for key in (
-            "ngram_range_min",
-            "ngram_range_max",
-            "min_df",
-            "max_df",
-            "sublinear_tf",
-            "max_features",
-        )
+    vectorizer_params = asdict(view.vectorizer_scientific)
+    model_params = {
+        "bow_model": view.bow_model,
+        "logistic_c": view.logistic_c,
+        "logistic_max_iter": view.logistic_max_iter,
+        "ridge_alpha": view.ridge_alpha,
+        "logistic_scientific": asdict(view.logistic_scientific),
+        "ridge_scientific": asdict(view.ridge_scientific),
+        "forest_scientific": asdict(view.forest_scientific),
+        "xgboost_scientific": asdict(view.xgboost_scientific),
+        "single_class_policy": view.single_class_policy,
+        "empty_vocabulary_policy": view.empty_vocabulary_policy,
+        "unsupported_sample_weight_policy": view.unsupported_sample_weight_policy,
     }
     bow_result = fit_bow_pair_uplift_train_test(
         train_df=train_df,
@@ -383,12 +387,7 @@ def test_native_matched_pair_capture_replays_local_transformer_pair_state(
         e_test=e_heldout,
         m_test=m_heldout,
         vectorizer_params=vectorizer_params,
-        model_params={
-            "bow_model": "linear",
-            "logistic_c": 1.0,
-            "logistic_max_iter": 1000,
-            "ridge_alpha": 10.0,
-        },
+        model_params=model_params,
         outer_fold=1,
         view_name="linear_1_2",
         view_index=0,

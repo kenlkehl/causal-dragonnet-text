@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -12,15 +13,18 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, MutableMapping, Sequence
 
-from .portable_workflow_spec import canonical_json, identity_sha256
+from .portable_identity import canonical_json, identity_sha256
 
 
 PORTABLE_ARTIFACT_MANIFEST = "portable_scientific_artifact_manifest_v1"
 PORTABLE_ARTIFACT_LOCATOR = "portable_scientific_artifact_locator_v2"
-PORTABLE_ADOPTION_ATTESTATION = "portable_checkpoint_adoption_attestation_v1"
+PORTABLE_ADOPTION_ATTESTATION = "portable_checkpoint_adoption_attestation_v3"
 PORTABLE_PHASE_BINDING = "portable_workflow_phase_binding_v1"
+PORTABLE_SCIENTIFIC_CONTENT_DESCRIPTOR = (
+    "portable_scientific_content_descriptor_v2"
+)
 SCIENTIFIC_COMPATIBILITY_VERSION = "portable_all_evidence_compatibility_v1"
 MANIFEST_NAME = "artifact_manifest.json"
 LOCATOR_NAME = "artifact_locator.json"
@@ -28,6 +32,11 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RELATIVE = re.compile(r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$")
 _PAYLOAD_PATH_TOKEN = "$portable_payload_path"
 _OMITTED_EXTERNAL_LOCATOR_TOKEN = "$omitted_external_locator"
+COMPLETE_PAYLOAD_TREE = "complete_payload_tree_v1"
+REGISTERED_PAYLOAD_PATHS_ONLY = "registered_payload_paths_only_v1"
+_PAYLOAD_INVENTORY_POLICIES = frozenset(
+    {COMPLETE_PAYLOAD_TREE, REGISTERED_PAYLOAD_PATHS_ONLY}
+)
 
 CHECKPOINT_ARTIFACT_KINDS = frozenset(
     {
@@ -92,7 +101,52 @@ def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _safe_file_hash(path: Path, *, label: str) -> tuple[str, int]:
+def _safe_path_boundaries(
+    *,
+    root: Path,
+    relative_path: str,
+    label: str,
+) -> dict[str, tuple[int, ...]]:
+    """Authenticate every lexical path component without following symlinks."""
+
+    root = Path(root)
+    relative = _normalize_relative(relative_path)
+    try:
+        root_state = os.lstat(root)
+    except OSError as exc:
+        raise FileNotFoundError(f"{label} root is missing: {root}") from exc
+    if stat.S_ISLNK(root_state.st_mode) or not stat.S_ISDIR(root_state.st_mode):
+        raise ValueError(f"{label} root must be a non-symlink directory")
+    identities = {str(root): _stat_identity(root_state)}
+    parts = Path(relative).parts
+    cursor = root
+    for ordinal, part in enumerate(parts):
+        cursor = cursor / part
+        try:
+            state = os.lstat(cursor)
+        except OSError as exc:
+            raise FileNotFoundError(f"{label} is missing: {cursor}") from exc
+        is_leaf = ordinal == len(parts) - 1
+        if stat.S_ISLNK(state.st_mode):
+            raise ValueError(f"{label} cannot traverse a symlink: {cursor}")
+        if is_leaf:
+            if not stat.S_ISREG(state.st_mode) or int(state.st_nlink) != 1:
+                raise ValueError(
+                    f"{label} must end at a private regular file with one hard link"
+                )
+        elif not stat.S_ISDIR(state.st_mode):
+            raise ValueError(
+                f"{label} ancestor must be a non-symlink directory: {cursor}"
+            )
+        identities[str(cursor)] = _stat_identity(state)
+    return identities
+
+
+def _safe_file_hash_with_identity(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[str, int, tuple[int, ...]]:
     """Authenticate a non-symlink, single-link regular file through one fd."""
 
     try:
@@ -133,24 +187,59 @@ def _safe_file_hash(path: Path, *, label: str) -> tuple[str, int]:
         or size != int(before_path.st_size)
     ):
         raise RuntimeError(f"{label} changed while being authenticated")
-    return digest.hexdigest(), size
+    return digest.hexdigest(), size, expected
 
 
-def _safe_read(path: Path, *, label: str) -> bytes:
-    expected_hash, expected_size = _safe_file_hash(path, label=label)
+def _safe_file_hash(path: Path, *, label: str) -> tuple[str, int]:
+    digest, size, _identity = _safe_file_hash_with_identity(path, label=label)
+    return digest, size
+
+
+def _safe_read_with_identity(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[bytes, tuple[int, ...]]:
+    """Read one private regular file from a stable no-follow descriptor."""
+
+    try:
+        before_path = os.lstat(path)
+    except OSError as exc:
+        raise FileNotFoundError(f"{label} is missing: {path}") from exc
+    if (
+        stat.S_ISLNK(before_path.st_mode)
+        or not stat.S_ISREG(before_path.st_mode)
+        or int(before_path.st_nlink) != 1
+    ):
+        raise ValueError(f"{label} must be a non-symlink regular file with one hard link")
     descriptor = os.open(
         path,
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
+        before_fd = os.fstat(descriptor)
+        expected = _stat_identity(before_path)
+        if _stat_identity(before_fd) != expected:
+            raise RuntimeError(f"{label} changed while being opened")
         blocks: list[bytes] = []
         while block := os.read(descriptor, 1024 * 1024):
             blocks.append(block)
+        after_fd = os.fstat(descriptor)
     finally:
         os.close(descriptor)
+    after_path = os.lstat(path)
     payload = b"".join(blocks)
-    if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_hash:
-        raise RuntimeError(f"{label} changed between authentication and decoding")
+    if (
+        _stat_identity(after_fd) != expected
+        or _stat_identity(after_path) != expected
+        or len(payload) != int(before_path.st_size)
+    ):
+        raise RuntimeError(f"{label} changed while being read")
+    return payload, expected
+
+
+def _safe_read(path: Path, *, label: str) -> bytes:
+    payload, _identity = _safe_read_with_identity(path, label=label)
     return payload
 
 
@@ -207,8 +296,12 @@ class PayloadRegistration:
 
     def __post_init__(self) -> None:
         _normalize_relative(self.relative_path)
-        if int(self.size_bytes) < 0:
-            raise ValueError("payload size cannot be negative")
+        if (
+            isinstance(self.size_bytes, bool)
+            or not isinstance(self.size_bytes, int)
+            or self.size_bytes < 0
+        ):
+            raise ValueError("payload size must be a nonnegative integer")
         if _SHA256.fullmatch(self.sha256) is None:
             raise ValueError("payload SHA-256 is invalid")
         if not isinstance(self.media_type, str) or not self.media_type:
@@ -282,6 +375,49 @@ class ValidatedPortableArtifact:
     def phase_binding(self) -> Mapping[str, Any] | None:
         value = self.manifest.get("workflow_phase_binding")
         return None if value is None else dict(value)
+
+    @property
+    def artifact_metadata(self) -> Mapping[str, Any]:
+        value = self.manifest.get("artifact_metadata")
+        return {} if value is None else dict(value)
+
+    @property
+    def payload_inventory_policy(self) -> str:
+        return str(
+            self.manifest.get("payload_inventory_policy", COMPLETE_PAYLOAD_TREE)
+        )
+
+
+def _closed_artifact_metadata(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("portable artifact metadata must be one mapping")
+    try:
+        normalized = json.loads(canonical_json(dict(value)))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise TypeError("portable artifact metadata must be closed finite JSON") from exc
+    if not isinstance(normalized, dict) or any(
+        not isinstance(key, str) or not key for key in normalized
+    ):
+        raise ValueError("portable artifact metadata keys must be nonempty strings")
+
+    def reject_absolute_locator(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for child in item.values():
+                reject_absolute_locator(child)
+            return
+        if isinstance(item, list):
+            for child in item:
+                reject_absolute_locator(child)
+            return
+        if isinstance(item, str) and Path(item).is_absolute():
+            raise ValueError(
+                "portable artifact metadata cannot contain absolute locators"
+            )
+
+    reject_absolute_locator(normalized)
+    return normalized
 
 
 def _encode_phase_result_value(value: Any, *, payload_root: Path) -> Any:
@@ -460,6 +596,59 @@ def _validate_phase_binding(
     return dict(value)
 
 
+def _scientific_content_descriptor(
+    *,
+    payloads: Sequence[PayloadRegistration],
+    phase_binding: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Describe ordered logical payload roles without physical locators.
+
+    Relative payload IDs are part of the producer's logical artifact schema,
+    not deployment locators.  Binding them in producer order prevents two
+    different file roles from being exchanged merely because their byte
+    multisets happen to be equal.  Absolute payload/control roots remain in
+    the locator record only.
+
+    The workflow result template is execution metadata.  It may contain GPU
+    inventory, worker assignments, UUIDs, and other machine-local values, so
+    it is authenticated by the locator but deliberately excluded from the
+    scientific content root.  Scientific scalar claims belong in closed
+    ``artifact_metadata`` or in registered payload bytes.
+    """
+
+    ordered_payloads = [
+        {
+            "logical_relative_id": row.relative_path,
+            "size_bytes": int(row.size_bytes),
+            "sha256": row.sha256,
+            "media_type": row.media_type,
+        }
+        for row in payloads
+    ]
+
+    phase_claims: Mapping[str, Any] | None = None
+    if phase_binding is not None:
+        binding = _validate_phase_binding(
+            phase_binding,
+            payloads=payloads,
+        )
+        phase_claims = {
+            "phase": str(binding["phase"]),
+            "terminal_payload_logical_ids": list(
+                binding["terminal_payload_paths"]
+            ),
+            "operational_result_template_included": False,
+        }
+    body = {
+        "schema_version": PORTABLE_SCIENTIFIC_CONTENT_DESCRIPTOR,
+        "payload_count": len(payloads),
+        "ordered_logical_payloads": ordered_payloads,
+        "workflow_phase_claims": phase_claims,
+        "absolute_filesystem_locators_included": False,
+    }
+    return {**body, "content_sha256": identity_sha256(body)}
+
+
 def materialize_portable_phase(
     artifact: ValidatedPortableArtifact,
     *,
@@ -525,20 +714,159 @@ def materialize_portable_phase(
     }
 
 
+def _expected_tree_directories(relative_files: set[str]) -> set[str]:
+    expected: set[str] = set()
+    for relative in relative_files:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            expected.add(parent.as_posix())
+            parent = parent.parent
+    return expected
+
+
+def _safe_tree_inventory(
+    root: Path,
+    *,
+    label: str,
+) -> tuple[set[str], set[str]]:
+    """Inspect every subtree entry and reject links and special files."""
+
+    tree = Path(root)
+    try:
+        root_state = os.lstat(tree)
+    except OSError as exc:
+        raise FileNotFoundError(f"{label} is missing: {tree}") from exc
+    if stat.S_ISLNK(root_state.st_mode) or not stat.S_ISDIR(root_state.st_mode):
+        raise ValueError(f"{label} must be a non-symlink directory")
+    files: set[str] = set()
+    directories: set[str] = set()
+    for path in tree.rglob("*"):
+        state = os.lstat(path)
+        relative = path.relative_to(tree).as_posix()
+        if stat.S_ISLNK(state.st_mode):
+            raise ValueError(f"{label} cannot contain symlinks: {relative}")
+        if stat.S_ISDIR(state.st_mode):
+            directories.add(relative)
+            continue
+        if not stat.S_ISREG(state.st_mode):
+            raise ValueError(f"{label} cannot contain special files: {relative}")
+        if int(state.st_nlink) != 1:
+            raise ValueError(f"{label} cannot contain hard-linked files: {relative}")
+        files.add(relative)
+    return files, directories
+
+
+def _validate_artifact_tree_boundaries(
+    *,
+    root: Path,
+    payload_root: Path,
+    payloads: Sequence[PayloadRegistration],
+    payload_inventory_policy: str,
+    reject_extra_files: bool,
+) -> None:
+    """Validate closed control trees and safe payload subtree boundaries."""
+
+    registered_payloads = {row.relative_path for row in payloads}
+    control_files, control_directories = _safe_tree_inventory(
+        root,
+        label="portable artifact control tree",
+    )
+    expected_control = {MANIFEST_NAME, LOCATOR_NAME}
+    if payload_root == root:
+        expected_control |= registered_payloads
+    if reject_extra_files:
+        expected_directories = _expected_tree_directories(expected_control)
+        if (
+            control_files != expected_control
+            or control_directories != expected_directories
+        ):
+            raise ValueError(
+                "portable artifact control tree contains missing or "
+                "unregistered entries; "
+                f"missing_files={sorted(expected_control - control_files)}, "
+                f"extra_files={sorted(control_files - expected_control)}, "
+                "missing_directories="
+                f"{sorted(expected_directories - control_directories)}, "
+                "extra_directories="
+                f"{sorted(control_directories - expected_directories)}"
+            )
+    if payload_root == root:
+        return
+
+    observed_payloads, observed_directories = _safe_tree_inventory(
+        payload_root,
+        label="portable artifact payload tree",
+    )
+    if not registered_payloads.issubset(observed_payloads):
+        raise ValueError(
+            "portable payload tree is missing registered files; "
+            f"missing={sorted(registered_payloads - observed_payloads)}"
+        )
+    if (
+        reject_extra_files
+        and payload_inventory_policy == COMPLETE_PAYLOAD_TREE
+    ):
+        expected_directories = _expected_tree_directories(
+            registered_payloads
+        )
+        if (
+            observed_payloads != registered_payloads
+            or observed_directories != expected_directories
+        ):
+            raise ValueError(
+                "portable payload tree contains missing or unregistered "
+                "entries; "
+                f"missing_files={sorted(registered_payloads - observed_payloads)}, "
+                f"extra_files={sorted(observed_payloads - registered_payloads)}, "
+                "missing_directories="
+                f"{sorted(expected_directories - observed_directories)}, "
+                "extra_directories="
+                f"{sorted(observed_directories - expected_directories)}"
+            )
+
+
 def _portable_artifact_stat_inventory(
     *,
     root: Path,
     payload_root: Path,
     payloads: Sequence[PayloadRegistration],
+    expected_identities: Mapping[str, tuple[int, ...]] | None = None,
 ) -> dict[str, tuple[int, ...]]:
     paths = [root / MANIFEST_NAME, root / LOCATOR_NAME]
     paths.extend(payload_root / row.relative_path for row in payloads)
     inventory: dict[str, tuple[int, ...]] = {}
+    expected = dict(expected_identities or {})
     for path in paths:
+        is_control = path.parent == root and path.name in {
+            MANIFEST_NAME,
+            LOCATOR_NAME,
+        }
+        if not is_control:
+            _safe_path_boundaries(
+                root=payload_root,
+                relative_path=path.relative_to(payload_root).as_posix(),
+                label="portable artifact inventory path",
+            )
         state = os.lstat(path)
-        if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
-            raise ValueError("portable artifact inventory contains a non-regular file")
-        inventory[str(path.resolve(strict=True))] = _stat_identity(state)
+        identity = _stat_identity(state)
+        if (
+            stat.S_ISLNK(state.st_mode)
+            or not stat.S_ISREG(state.st_mode)
+            or int(state.st_nlink) != 1
+        ):
+            raise ValueError(
+                "portable artifact inventory contains a non-private regular file"
+            )
+        key = str(path.resolve(strict=True))
+        if key in expected and expected[key] != identity:
+            raise RuntimeError(
+                "portable artifact changed after its bytes were authenticated"
+            )
+        inventory[key] = identity
+    if expected and set(expected) != set(inventory):
+        raise RuntimeError(
+            "portable artifact authenticated identity inventory is incomplete"
+        )
     return inventory
 
 
@@ -549,31 +877,25 @@ def assert_validated_artifact_unchanged(
 
     if not isinstance(artifact, ValidatedPortableArtifact):
         raise TypeError("validated portable artifact handle is required")
-    current = _portable_artifact_stat_inventory(
-        root=artifact.root,
-        payload_root=artifact.payload_root,
-        payloads=artifact.payloads,
-    )
+    try:
+        current = _portable_artifact_stat_inventory(
+            root=artifact.root,
+            payload_root=artifact.payload_root,
+            payloads=artifact.payloads,
+        )
+        _validate_artifact_tree_boundaries(
+            root=artifact.root,
+            payload_root=artifact.payload_root,
+            payloads=artifact.payloads,
+            payload_inventory_policy=artifact.payload_inventory_policy,
+            reject_extra_files=True,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "portable artifact changed after full-byte authentication"
+        ) from exc
     if current != dict(artifact.stat_inventory):
         raise RuntimeError("portable artifact changed after full-byte authentication")
-    control_files = {
-        path.relative_to(artifact.root).as_posix()
-        for path in artifact.root.rglob("*")
-        if path.is_file()
-    }
-    expected_control = {MANIFEST_NAME, LOCATOR_NAME}
-    if artifact.payload_root == artifact.root:
-        expected_control |= {row.relative_path for row in artifact.payloads}
-    if control_files != expected_control:
-        raise RuntimeError("portable artifact control inventory changed")
-    if artifact.payload_root != artifact.root:
-        payload_files = {
-            path.relative_to(artifact.payload_root).as_posix()
-            for path in artifact.payload_root.rglob("*")
-            if path.is_file()
-        }
-        if payload_files != {row.relative_path for row in artifact.payloads}:
-            raise RuntimeError("portable artifact payload inventory changed")
 
 
 def publish_portable_artifact(
@@ -587,6 +909,7 @@ def publish_portable_artifact(
     media_types: Mapping[str, str] | None = None,
     workflow_phase: str | None = None,
     workflow_phase_result: Mapping[str, Any] | None = None,
+    artifact_metadata: Mapping[str, Any] | None = None,
     scientific_compatibility_version: str = SCIENTIFIC_COMPATIBILITY_VERSION,
 ) -> ValidatedPortableArtifact:
     """Seal an already-written payload tree without copying its payloads."""
@@ -614,9 +937,26 @@ def publish_portable_artifact(
     media = dict(media_types or {})
     for relative in normalized_paths:
         path = root / relative
-        if path.resolve(strict=True).parent != path.parent.resolve(strict=True):
-            raise ValueError("artifact payload cannot traverse a symlink")
-        digest, size = _safe_file_hash(path, label=f"artifact payload {relative}")
+        before_boundaries = _safe_path_boundaries(
+            root=root,
+            relative_path=relative,
+            label=f"artifact payload {relative}",
+        )
+        digest, size = _safe_file_hash(
+            path,
+            label=f"artifact payload {relative}",
+        )
+        if (
+            _safe_path_boundaries(
+                root=root,
+                relative_path=relative,
+                label=f"artifact payload {relative}",
+            )
+            != before_boundaries
+        ):
+            raise RuntimeError(
+                f"artifact payload path changed while authenticating: {relative}"
+            )
         payloads.append(
             PayloadRegistration(
                 relative_path=relative,
@@ -626,6 +966,7 @@ def publish_portable_artifact(
             )
         )
     compatibility_payload = compatibility.as_dict()
+    metadata = _closed_artifact_metadata(artifact_metadata)
     if (workflow_phase is None) != (workflow_phase_result is None):
         raise ValueError(
             "workflow_phase and workflow_phase_result must be supplied together"
@@ -651,10 +992,19 @@ def publish_portable_artifact(
         "compatibility": compatibility_payload,
         "compatibility_key": compatibility.key,
         "payloads": [asdict(value) for value in payloads],
+        "payload_inventory_policy": COMPLETE_PAYLOAD_TREE,
     }
+    if metadata is not None:
+        body["artifact_metadata"] = metadata
     if phase_binding is not None:
         body["workflow_phase_binding"] = phase_binding
-    content_root = identity_sha256(body)
+    body["scientific_content_descriptor"] = (
+        _scientific_content_descriptor(
+            payloads=payloads,
+            phase_binding=phase_binding,
+        )
+    )
+    content_root = identity_sha256(_manifest_content_body(body))
     manifest = {
         **body,
         "content_root": content_root,
@@ -669,6 +1019,10 @@ def publish_portable_artifact(
         "manifest_relative_path": MANIFEST_NAME,
         "payload_relative_paths": list(normalized_paths),
     }
+    if phase_binding is not None:
+        locator_body["operational_phase_binding_content_sha256"] = (
+            phase_binding["content_sha256"]
+        )
     locator = {**locator_body, "content_sha256": identity_sha256(locator_body)}
     _atomic_json_new(root / LOCATOR_NAME, locator)
     return validate_portable_artifact(root)
@@ -690,14 +1044,19 @@ def publish_portable_reference_artifact(
     ) = None,
     workflow_phase: str | None = None,
     workflow_phase_result: Mapping[str, Any] | None = None,
+    artifact_metadata: Mapping[str, Any] | None = None,
+    payload_inventory_policy: str = COMPLETE_PAYLOAD_TREE,
     scientific_compatibility_version: str = SCIENTIFIC_COMPATIBILITY_VERSION,
 ) -> ValidatedPortableArtifact:
-    """Seal a complete existing payload tree through a small control artifact.
+    """Seal existing payload bytes through a small no-copy control artifact.
 
     No payload byte is copied or modified. The path-neutral manifest contains
     only ordered sizes/hashes; the physical payload locator is kept in the
-    separate locator record. ``payload_paths`` must account for the complete
-    referenced tree so later extra/missing-byte checks remain fail closed.
+    separate locator record. The default policy requires ``payload_paths`` to
+    account for the complete referenced tree. ``registered_paths_only`` is for
+    immutable records that intentionally share a parent directory; every
+    claimed byte remains authenticated, while sibling bytes belong to other
+    independently indexed artifacts.
 
     A producer in the same trusted process may supply the exact stat inventory
     captured when those hashes were written or authenticated. This avoids a
@@ -719,6 +1078,9 @@ def publish_portable_reference_artifact(
         raise ValueError("artifact schema is required")
     if scientific_compatibility_version != SCIENTIFIC_COMPATIBILITY_VERSION:
         raise ValueError("scientific artifact schema downgrade or substitution is forbidden")
+    inventory_policy = str(payload_inventory_policy)
+    if inventory_policy not in _PAYLOAD_INVENTORY_POLICIES:
+        raise ValueError("portable payload inventory policy is unsupported")
     upstream = tuple(str(value) for value in upstream_artifact_ids)
     if len(upstream) != len(set(upstream)) or any(
         _SHA256.fullmatch(value) is None for value in upstream
@@ -750,31 +1112,55 @@ def publish_portable_reference_artifact(
             "identities and complete path coverage"
         )
     registrations: list[PayloadRegistration] = []
+    publication_authentication_cache: dict[
+        str, tuple[tuple[int, ...], str, int]
+    ] = {}
     for relative in normalized_paths:
         path = payload / relative
+        before_boundaries = _safe_path_boundaries(
+            root=payload,
+            relative_path=relative,
+            label=f"portable reference payload {relative}",
+        )
         resolved = path.resolve(strict=True)
-        try:
-            resolved.relative_to(payload)
-        except ValueError as exc:
-            raise ValueError("portable reference payload escapes its root") from exc
+        if resolved != path:
+            raise ValueError(
+                "portable reference payload path must be lexical and symlink-free"
+            )
         if trusted_stats is None:
-            digest, size = _safe_file_hash(
-                path,
-                label=f"portable reference payload {relative}",
+            digest, size, authenticated_identity = (
+                _safe_file_hash_with_identity(
+                    path,
+                    label=f"portable reference payload {relative}",
+                )
             )
         else:
             state = os.lstat(path)
+            authenticated_identity = _stat_identity(state)
             if (
                 stat.S_ISLNK(state.st_mode)
                 or not stat.S_ISREG(state.st_mode)
                 or int(state.st_nlink) != 1
-                or _stat_identity(state) != trusted_stats[relative]
+                or authenticated_identity != trusted_stats[relative]
             ):
                 raise RuntimeError(
                     "process-authenticated portable payload changed: "
                     f"{relative}"
                 )
             digest, size = expected_identities[relative]
+        after_boundaries = _safe_path_boundaries(
+            root=payload,
+            relative_path=relative,
+            label=f"portable reference payload {relative}",
+        )
+        if (
+            after_boundaries != before_boundaries
+            or after_boundaries[str(path)] != authenticated_identity
+        ):
+            raise RuntimeError(
+                "portable reference payload path changed while "
+                f"authenticating: {relative}"
+            )
         if expected_identities and expected_identities[relative] != (
             digest,
             size,
@@ -790,18 +1176,34 @@ def publish_portable_reference_artifact(
                 media_type=media.get(relative, "application/octet-stream"),
             )
         )
-    observed_payloads = {
-        path.relative_to(payload).as_posix()
-        for path in payload.rglob("*")
-        if path.is_file()
-    }
-    if observed_payloads != set(normalized_paths):
-        raise ValueError(
-            "portable reference inventory must cover the complete payload tree; "
-            f"missing={sorted(set(normalized_paths) - observed_payloads)}, "
-            f"extra={sorted(observed_payloads - set(normalized_paths))}"
+        publication_authentication_cache[str(resolved)] = (
+            authenticated_identity,
+            digest,
+            size,
         )
+    observed_payloads, observed_directories = _safe_tree_inventory(
+        payload,
+        label="portable reference payload tree",
+    )
+    registered_payloads = set(normalized_paths)
+    if not registered_payloads.issubset(observed_payloads):
+        raise ValueError(
+            "portable reference payload tree is missing registered files"
+        )
+    if inventory_policy == COMPLETE_PAYLOAD_TREE:
+        expected_directories = _expected_tree_directories(
+            registered_payloads
+        )
+        if (
+            observed_payloads != registered_payloads
+            or observed_directories != expected_directories
+        ):
+            raise ValueError(
+                "portable reference inventory must cover the complete payload "
+                "tree without extra entries"
+            )
     compatibility_payload = compatibility.as_dict()
+    metadata = _closed_artifact_metadata(artifact_metadata)
     if (workflow_phase is None) != (workflow_phase_result is None):
         raise ValueError(
             "workflow_phase and workflow_phase_result must be supplied together"
@@ -827,10 +1229,19 @@ def publish_portable_reference_artifact(
         "compatibility": compatibility_payload,
         "compatibility_key": compatibility.key,
         "payloads": [asdict(value) for value in registrations],
+        "payload_inventory_policy": inventory_policy,
     }
+    if metadata is not None:
+        body["artifact_metadata"] = metadata
     if phase_binding is not None:
         body["workflow_phase_binding"] = phase_binding
-    content_root = identity_sha256(body)
+    body["scientific_content_descriptor"] = (
+        _scientific_content_descriptor(
+            payloads=registrations,
+            phase_binding=phase_binding,
+        )
+    )
+    content_root = identity_sha256(_manifest_content_body(body))
     control.mkdir(parents=True, exist_ok=False)
     manifest = {
         **body,
@@ -848,35 +1259,43 @@ def publish_portable_reference_artifact(
         "payload_root": str(payload),
         "manifest_relative_path": MANIFEST_NAME,
         "payload_relative_paths": list(normalized_paths),
+        "payload_inventory_policy": inventory_policy,
     }
+    if phase_binding is not None:
+        locator_body["operational_phase_binding_content_sha256"] = (
+            phase_binding["content_sha256"]
+        )
     _atomic_json_new(
         control / LOCATOR_NAME,
         {**locator_body, "content_sha256": identity_sha256(locator_body)},
     )
-    if trusted_stats is not None:
-        for relative, expected_stat in trusted_stats.items():
-            state = os.lstat(payload / relative)
-            if _stat_identity(state) != expected_stat:
-                raise RuntimeError(
-                    "process-authenticated portable payload changed during "
-                    f"publication: {relative}"
-                )
-    return ValidatedPortableArtifact(
-        root=control.resolve(strict=True),
-        payload_root=payload,
-        manifest_path=(control / MANIFEST_NAME).resolve(strict=True),
-        locator_path=(control / LOCATOR_NAME).resolve(strict=True),
-        manifest=manifest,
-        payloads=tuple(registrations),
-        stat_inventory=_portable_artifact_stat_inventory(
-            root=control.resolve(strict=True),
-            payload_root=payload,
-            payloads=tuple(registrations),
-        ),
+    return validate_portable_artifact(
+        control,
+        expected_kind=artifact_kind,
+        expected_compatibility_key=compatibility.key,
+        expected_upstream_artifact_ids=upstream,
+        payload_authentication_cache=publication_authentication_cache,
     )
 
 
 def _manifest_content_body(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    if "scientific_content_descriptor" in manifest:
+        body = {
+            key: manifest[key]
+            for key in (
+                "schema_version",
+                "artifact_kind",
+                "artifact_schema",
+                "scientific_compatibility_version",
+                "upstream_artifact_ids",
+                "compatibility",
+                "compatibility_key",
+                "scientific_content_descriptor",
+            )
+        }
+        if "artifact_metadata" in manifest:
+            body["artifact_metadata"] = manifest["artifact_metadata"]
+        return body
     body = {
         key: manifest[key]
         for key in (
@@ -892,6 +1311,10 @@ def _manifest_content_body(manifest: Mapping[str, Any]) -> dict[str, Any]:
     }
     if "workflow_phase_binding" in manifest:
         body["workflow_phase_binding"] = manifest["workflow_phase_binding"]
+    if "payload_inventory_policy" in manifest:
+        body["payload_inventory_policy"] = manifest["payload_inventory_policy"]
+    if "artifact_metadata" in manifest:
+        body["artifact_metadata"] = manifest["artifact_metadata"]
     return body
 
 
@@ -902,6 +1325,10 @@ def validate_portable_artifact(
     expected_compatibility_key: str | None = None,
     expected_upstream_artifact_ids: Sequence[str] | None = None,
     reject_extra_files: bool = True,
+    payload_authentication_cache: MutableMapping[
+        str, tuple[tuple[int, ...], str, int]
+    ]
+    | None = None,
 ) -> ValidatedPortableArtifact:
     """Freshly reopen every registered byte and validate the path-neutral root."""
 
@@ -914,8 +1341,16 @@ def validate_portable_artifact(
         raise ValueError("portable artifact source must be a directory or manifest")
     manifest_path = root / MANIFEST_NAME
     locator_path = root / LOCATOR_NAME
+    authenticated_identities: dict[str, tuple[int, ...]] = {}
+    manifest_bytes, manifest_identity = _safe_read_with_identity(
+        manifest_path,
+        label="portable artifact manifest",
+    )
+    authenticated_identities[str(manifest_path.resolve(strict=True))] = (
+        manifest_identity
+    )
     manifest = _strict_json_bytes(
-        _safe_read(manifest_path, label="portable artifact manifest"),
+        manifest_bytes,
         label="portable artifact manifest",
     )
     required_manifest = {
@@ -930,9 +1365,14 @@ def validate_portable_artifact(
         "content_root",
         "artifact_id",
     }
-    if set(manifest) not in (
-        required_manifest,
-        {*required_manifest, "workflow_phase_binding"},
+    optional_manifest = {
+        "workflow_phase_binding",
+        "payload_inventory_policy",
+        "artifact_metadata",
+        "scientific_content_descriptor",
+    }
+    if not required_manifest.issubset(manifest) or not set(manifest).issubset(
+        required_manifest | optional_manifest
     ):
         raise ValueError("portable artifact manifest has missing or extra fields")
     if (
@@ -945,6 +1385,16 @@ def validate_portable_artifact(
         raise ValueError("portable artifact kind is unsupported")
     if expected_kind is not None and manifest["artifact_kind"] != expected_kind:
         raise ValueError("portable artifact kind is incompatible with the requested phase")
+    inventory_policy = str(
+        manifest.get("payload_inventory_policy", COMPLETE_PAYLOAD_TREE)
+    )
+    if inventory_policy not in _PAYLOAD_INVENTORY_POLICIES:
+        raise ValueError("portable artifact payload inventory policy is invalid")
+    if "artifact_metadata" in manifest:
+        if _closed_artifact_metadata(manifest["artifact_metadata"]) != manifest[
+            "artifact_metadata"
+        ]:
+            raise ValueError("portable artifact metadata is not canonical")
     compatibility_raw = manifest["compatibility"]
     if not isinstance(compatibility_raw, Mapping):
         raise ValueError("portable artifact compatibility payload is invalid")
@@ -977,20 +1427,44 @@ def validate_portable_artifact(
             manifest["workflow_phase_binding"],
             payloads=payloads,
         )
-    locator = _strict_json_bytes(
-        _safe_read(locator_path, label="portable artifact locator"),
+    if "scientific_content_descriptor" in manifest:
+        expected_descriptor = _scientific_content_descriptor(
+            payloads=payloads,
+            phase_binding=manifest.get("workflow_phase_binding"),
+        )
+        if manifest["scientific_content_descriptor"] != expected_descriptor:
+            raise ValueError(
+                "portable artifact scientific content descriptor is invalid"
+            )
+    locator_bytes, locator_identity = _safe_read_with_identity(
+        locator_path,
         label="portable artifact locator",
     )
+    authenticated_identities[str(locator_path.resolve(strict=True))] = (
+        locator_identity
+    )
+    locator = _strict_json_bytes(
+        locator_bytes,
+        label="portable artifact locator",
+    )
+    locator_keys = (
+        "schema_version",
+        "artifact_id",
+        "root",
+        "payload_root",
+        "manifest_relative_path",
+        "payload_relative_paths",
+    )
+    if "payload_inventory_policy" in locator:
+        locator_keys = (*locator_keys, "payload_inventory_policy")
+    if "operational_phase_binding_content_sha256" in locator:
+        locator_keys = (
+            *locator_keys,
+            "operational_phase_binding_content_sha256",
+        )
     locator_body = {
         key: locator.get(key)
-        for key in (
-            "schema_version",
-            "artifact_id",
-            "root",
-            "payload_root",
-            "manifest_relative_path",
-            "payload_relative_paths",
-        )
+        for key in locator_keys
     }
     if set(locator) != {*locator_body, "content_sha256"}:
         raise ValueError("portable artifact locator has missing or extra fields")
@@ -1011,20 +1485,84 @@ def validate_portable_artifact(
         or locator_body["manifest_relative_path"] != MANIFEST_NAME
         or locator_body["payload_relative_paths"]
         != [row.relative_path for row in payloads]
+        or locator_body.get("payload_inventory_policy", COMPLETE_PAYLOAD_TREE)
+        != inventory_policy
+        or (
+            "operational_phase_binding_content_sha256" in locator_body
+        )
+        != ("workflow_phase_binding" in manifest)
+        or locator_body.get("operational_phase_binding_content_sha256")
+        != (
+            manifest["workflow_phase_binding"]["content_sha256"]
+            if "workflow_phase_binding" in manifest
+            else None
+        )
         or locator.get("content_sha256") != identity_sha256(locator_body)
     ):
         raise ValueError("portable artifact locator is absent, stale, or substituted")
     for row in payloads:
         path = payload_root / row.relative_path
-        resolved = path.resolve(strict=True)
-        try:
-            resolved.relative_to(payload_root)
-        except ValueError as exc:
-            raise ValueError("portable artifact payload escapes its root") from exc
-        observed_hash, observed_size = _safe_file_hash(
-            path,
+        before_boundaries = _safe_path_boundaries(
+            root=payload_root,
+            relative_path=row.relative_path,
             label=f"portable artifact payload {row.relative_path}",
         )
+        resolved = path.resolve(strict=True)
+        if resolved != path:
+            raise ValueError(
+                "portable artifact payload path must be lexical and symlink-free"
+            )
+        cache_key = str(resolved)
+        state_identity = before_boundaries[str(path)]
+        cached = (
+            None
+            if payload_authentication_cache is None
+            else payload_authentication_cache.get(cache_key)
+        )
+        if cached is not None:
+            cached_state, observed_hash, observed_size = cached
+            if cached_state != state_identity:
+                raise RuntimeError(
+                    f"portable artifact payload changed within trust boundary: "
+                    f"{row.relative_path}"
+                )
+            authenticated_identity = cached_state
+        else:
+            (
+                observed_hash,
+                observed_size,
+                authenticated_identity,
+            ) = _safe_file_hash_with_identity(
+                path,
+                label=(
+                    f"portable artifact payload {row.relative_path}"
+                ),
+            )
+            if authenticated_identity != state_identity:
+                raise RuntimeError(
+                    f"portable artifact payload changed while authenticating: "
+                    f"{row.relative_path}"
+                )
+            if payload_authentication_cache is not None:
+                payload_authentication_cache[cache_key] = (
+                    authenticated_identity,
+                    observed_hash,
+                    observed_size,
+                )
+        after_boundaries = _safe_path_boundaries(
+            root=payload_root,
+            relative_path=row.relative_path,
+            label=f"portable artifact payload {row.relative_path}",
+        )
+        if (
+            after_boundaries != before_boundaries
+            or after_boundaries[str(path)] != authenticated_identity
+        ):
+            raise RuntimeError(
+                f"portable artifact payload path changed while authenticating: "
+                f"{row.relative_path}"
+            )
+        authenticated_identities[cache_key] = authenticated_identity
         if (observed_hash, observed_size) != (row.sha256, row.size_bytes):
             raise ValueError(f"portable artifact payload changed: {row.relative_path}")
     body = _manifest_content_body(manifest)
@@ -1036,42 +1574,19 @@ def validate_portable_artifact(
         raise ValueError("portable artifact content root is invalid")
     if locator_body["artifact_id"] != content_root:
         raise ValueError("portable artifact locator content root changed")
-    if reject_extra_files:
-        control_registered = {MANIFEST_NAME, LOCATOR_NAME}
-        control_observed: set[str] = set()
-        for path in root.rglob("*"):
-            if path.is_symlink():
-                raise ValueError("portable artifact tree cannot contain symlinks")
-            if path.is_file():
-                control_observed.add(path.relative_to(root).as_posix())
-        expected_control = (
-            control_registered
-            | {row.relative_path for row in payloads}
-            if payload_root == root
-            else control_registered
-        )
-        if control_observed != expected_control:
-            raise ValueError(
-                "portable artifact control tree contains missing or unregistered files; "
-                f"missing={sorted(expected_control - control_observed)}, "
-                f"extra={sorted(control_observed - expected_control)}"
-            )
-        if payload_root != root:
-            observed_payloads: set[str] = set()
-            for path in payload_root.rglob("*"):
-                if path.is_symlink():
-                    raise ValueError("portable payload tree cannot contain symlinks")
-                if path.is_file():
-                    observed_payloads.add(
-                        path.relative_to(payload_root).as_posix()
-                    )
-            registered_payloads = {row.relative_path for row in payloads}
-            if observed_payloads != registered_payloads:
-                raise ValueError(
-                    "portable payload tree contains missing or unregistered files; "
-                    f"missing={sorted(registered_payloads - observed_payloads)}, "
-                    f"extra={sorted(observed_payloads - registered_payloads)}"
-                )
+    _validate_artifact_tree_boundaries(
+        root=root,
+        payload_root=payload_root,
+        payloads=payloads,
+        payload_inventory_policy=inventory_policy,
+        reject_extra_files=reject_extra_files,
+    )
+    final_stat_inventory = _portable_artifact_stat_inventory(
+        root=root,
+        payload_root=payload_root,
+        payloads=payloads,
+        expected_identities=authenticated_identities,
+    )
     return ValidatedPortableArtifact(
         root=root,
         payload_root=payload_root,
@@ -1079,12 +1594,61 @@ def validate_portable_artifact(
         locator_path=locator_path,
         manifest=manifest,
         payloads=payloads,
-        stat_inventory=_portable_artifact_stat_inventory(
-            root=root,
-            payload_root=payload_root,
-            payloads=payloads,
-        ),
+        stat_inventory=final_stat_inventory,
     )
+
+
+def _artifact_control_attestation_claims(
+    artifact: ValidatedPortableArtifact,
+) -> dict[str, Any]:
+    """Bind one handle to its exact operational manifest and locator bytes."""
+
+    assert_validated_artifact_unchanged(artifact)
+    manifest_sha256, manifest_size, manifest_identity = (
+        _safe_file_hash_with_identity(
+            artifact.manifest_path,
+            label="portable artifact manifest for adoption",
+        )
+    )
+    locator_sha256, locator_size, locator_identity = (
+        _safe_file_hash_with_identity(
+            artifact.locator_path,
+            label="portable artifact locator for adoption",
+        )
+    )
+    expected_inventory = dict(artifact.stat_inventory)
+    if (
+        expected_inventory.get(str(artifact.manifest_path))
+        != manifest_identity
+        or expected_inventory.get(str(artifact.locator_path))
+        != locator_identity
+    ):
+        raise RuntimeError(
+            "portable artifact controls changed before adoption"
+        )
+    assert_validated_artifact_unchanged(artifact)
+    phase_binding = artifact.phase_binding
+    operational_binding_sha256 = (
+        None
+        if phase_binding is None
+        else phase_binding.get("content_sha256")
+    )
+    if (
+        operational_binding_sha256 is not None
+        and _SHA256.fullmatch(str(operational_binding_sha256)) is None
+    ):
+        raise ValueError(
+            "portable artifact operational phase binding is invalid"
+        )
+    return {
+        "producer_manifest_sha256": manifest_sha256,
+        "producer_manifest_size_bytes": manifest_size,
+        "producer_locator_sha256": locator_sha256,
+        "producer_locator_size_bytes": locator_size,
+        "producer_operational_phase_binding_content_sha256": (
+            operational_binding_sha256
+        ),
+    }
 
 
 def adopt_checkpoint(
@@ -1142,26 +1706,22 @@ def adopt_checkpoint(
             raise ValueError(
                 "checkpoint upstream dependencies do not match the new request"
             )
-    body = {
+    control_claims = _artifact_control_attestation_claims(artifact)
+    stable_body = {
         "schema_version": PORTABLE_ADOPTION_ATTESTATION,
         "producer_artifact_id": artifact.artifact_id,
         "producer_artifact_kind": artifact.manifest["artifact_kind"],
         "producer_compatibility_key": artifact.compatibility_key,
         "producer_content_root": artifact.manifest["content_root"],
         "producer_locator": str(artifact.locator_path),
+        **control_claims,
         "consumer_request_sha256": consumer_request_sha256,
         "validated_upstream_artifact_ids": list(
             artifact.manifest["upstream_artifact_ids"]
         ),
         "validation_policy": (
-            "fresh_full_byte_inventory_no_force_no_schema_downgrade_v1"
+            "fresh_full_byte_and_exact_control_inventory_no_force_v3"
         ),
-    }
-    content_sha = identity_sha256(body)
-    attestation = {
-        **body,
-        "content_sha256": content_sha,
-        "recorded_at": _utc_now(),
     }
     target_root = Path(attestation_root)
     if target_root.exists() and (target_root.is_symlink() or not target_root.is_dir()):
@@ -1169,17 +1729,34 @@ def adopt_checkpoint(
     target_root.mkdir(parents=True, exist_ok=True)
     target = target_root / f"{artifact.artifact_id}.adoption.json"
     if target.exists():
-        observed = _strict_json_bytes(
-            _safe_read(target, label="checkpoint adoption attestation"),
-            label="checkpoint adoption attestation",
-        )
-        observed_without_time = {key: value for key, value in observed.items() if key != "recorded_at"}
-        expected_without_time = {
-            key: value for key, value in attestation.items() if key != "recorded_at"
+        try:
+            observed = validate_checkpoint_adoption(
+                attestation_path=target,
+                artifact=artifact,
+                consumer_request_sha256=consumer_request_sha256,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise ValueError(
+                "existing checkpoint adoption attestation conflicts"
+            ) from exc
+        observed_stable_body = {
+            key: value
+            for key, value in observed.items()
+            if key not in {"content_sha256", "recorded_at"}
         }
-        if observed_without_time != expected_without_time:
-            raise ValueError("existing checkpoint adoption attestation conflicts")
+        if observed_stable_body != stable_body:
+            raise ValueError(
+                "existing checkpoint adoption attestation conflicts"
+            )
         return observed
+    body = {
+        **stable_body,
+        "recorded_at": _utc_now(),
+    }
+    attestation = {
+        **body,
+        "content_sha256": identity_sha256(body),
+    }
     _atomic_json_new(target, attestation)
     reopened = _strict_json_bytes(
         _safe_read(target, label="new checkpoint adoption attestation"),
@@ -1200,6 +1777,7 @@ def validate_checkpoint_adoption(
 
     if _SHA256.fullmatch(str(consumer_request_sha256)) is None:
         raise ValueError("consumer request identity must be one lowercase SHA-256")
+    control_claims = _artifact_control_attestation_claims(artifact)
     value = _strict_json_bytes(
         _safe_read(
             Path(attestation_path),
@@ -1214,6 +1792,11 @@ def validate_checkpoint_adoption(
         "producer_compatibility_key",
         "producer_content_root",
         "producer_locator",
+        "producer_manifest_sha256",
+        "producer_manifest_size_bytes",
+        "producer_locator_sha256",
+        "producer_locator_size_bytes",
+        "producer_operational_phase_binding_content_sha256",
         "consumer_request_sha256",
         "validated_upstream_artifact_ids",
         "validation_policy",
@@ -1223,7 +1806,7 @@ def validate_checkpoint_adoption(
     body = {
         key: item
         for key, item in value.items()
-        if key not in {"content_sha256", "recorded_at"}
+        if key != "content_sha256"
     }
     if (
         set(value) != required
@@ -1234,11 +1817,15 @@ def validate_checkpoint_adoption(
         or value.get("producer_compatibility_key") != artifact.compatibility_key
         or value.get("producer_content_root") != artifact.manifest["content_root"]
         or value.get("producer_locator") != str(artifact.locator_path)
+        or any(
+            value.get(key) != expected
+            for key, expected in control_claims.items()
+        )
         or value.get("consumer_request_sha256") != consumer_request_sha256
         or value.get("validated_upstream_artifact_ids")
         != list(artifact.manifest["upstream_artifact_ids"])
         or value.get("validation_policy")
-        != "fresh_full_byte_inventory_no_force_no_schema_downgrade_v1"
+        != "fresh_full_byte_and_exact_control_inventory_no_force_v3"
         or value.get("content_sha256") != identity_sha256(body)
         or not isinstance(value.get("recorded_at"), str)
         or not str(value["recorded_at"]).strip()
@@ -1293,6 +1880,14 @@ def relocate_portable_artifact(
                 payload.relative_path for payload in artifact.payloads
             ],
         }
+        if "payload_inventory_policy" in artifact.manifest:
+            locator_body["payload_inventory_policy"] = (
+                artifact.payload_inventory_policy
+            )
+        if artifact.phase_binding is not None:
+            locator_body[
+                "operational_phase_binding_content_sha256"
+            ] = artifact.phase_binding["content_sha256"]
         _atomic_json_new(
             attempt / LOCATOR_NAME,
             {**locator_body, "content_sha256": identity_sha256(locator_body)},
@@ -1357,12 +1952,14 @@ def write_table_parquet_new(path: Path, table: Any) -> PayloadRegistration:
 __all__ = [
     "ArtifactCompatibility",
     "CHECKPOINT_ARTIFACT_KINDS",
+    "COMPLETE_PAYLOAD_TREE",
     "LOCATOR_NAME",
     "MANIFEST_NAME",
     "PORTABLE_ADOPTION_ATTESTATION",
     "PORTABLE_ARTIFACT_LOCATOR",
     "PORTABLE_ARTIFACT_MANIFEST",
     "PORTABLE_PHASE_BINDING",
+    "REGISTERED_PAYLOAD_PATHS_ONLY",
     "PayloadRegistration",
     "SCIENTIFIC_COMPATIBILITY_VERSION",
     "ValidatedPortableArtifact",

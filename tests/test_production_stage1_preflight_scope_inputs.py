@@ -4,7 +4,6 @@ import copy
 import hashlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -128,13 +127,14 @@ def test_scope_inputs_expose_only_fit_rows_and_refuse_nonfit_cache(
         source,
         modeling,
         cache,
-        _matrix,
+        matrix,
         scopes,
         registry,
         registry_sha,
     ) = _fixture(tmp_path)
+    output_root = (tmp_path / "scope_inputs").resolve()
     published = publish_preflight_scope_inputs(
-        output_root=(tmp_path / "private").resolve(),
+        output_root=output_root,
         modeling_data=modeling,
         config=config,
         embedding_cache=cache,
@@ -152,7 +152,36 @@ def test_scope_inputs_expose_only_fit_rows_and_refuse_nonfit_cache(
     operational_identity = published.identity()
     assert operational_identity["scope_inputs_outside_terminal_scientific_artifact"]
     assert operational_identity["scope_order"] == [scope["scope_id"] for scope in scopes]
+    assert operational_identity["per_scope_embedding_arrays_copied"] is False
+    assert operational_identity["per_scope_chunk_texts_copied"] is False
+    shared_references = list(output_root.rglob("shared_embedding_cache_reference.json"))
+    assert shared_references == [
+        output_root / "shared_embedding_cache_reference.json"
+    ]
+    assert not [
+        path
+        for path in output_root.rglob("*")
+        if path.is_file()
+        and (
+            path.suffix == ".npy"
+            or path.name == "chunk_texts.jsonl"
+        )
+    ]
+    assert not [
+        path
+        for path in output_root.rglob("*")
+        if path.is_dir() and path.name == "private_embedding_cache"
+    ]
     for payload in published.worker_payloads():
+        assert (
+            payload["schema_version"]
+            == "production_stage1_preflight_worker_payload_v2"
+        )
+        assert Path(payload["shared_cache_reference_path"]) == shared_references[0]
+        assert (
+            payload["shared_cache_reference_content_sha256"]
+            == published.shared_cache_reference["content_sha256"]
+        )
         serialized = json.dumps(payload, sort_keys=True)
         assert str(source) not in serialized
         assert str(cache.cache_dir) not in serialized
@@ -208,6 +237,23 @@ def test_scope_inputs_expose_only_fit_rows_and_refuse_nonfit_cache(
         assert all(row == expected_definition for row in observed_scope_definitions)
         fit = set(map(int, private.scope["fit_row_ids"]))
         nonfit = sorted(set(range(len(modeling))) - fit)
+        fit_order = list(map(int, private.scope["fit_row_ids"]))
+        assert (
+            private.modeling_data.iloc[fit_order][
+                [
+                    config.text_column,
+                    config.treatment_column,
+                    config.outcome_column,
+                ]
+            ].to_dict("records")
+            == modeling.iloc[fit_order][
+                [
+                    config.text_column,
+                    config.treatment_column,
+                    config.outcome_column,
+                ]
+            ].to_dict("records")
+        )
         assert (private.modeling_data.iloc[nonfit][config.text_column] == "").all()
         assert (
             private.modeling_data.iloc[nonfit][[config.treatment_column, config.outcome_column]]
@@ -215,6 +261,16 @@ def test_scope_inputs_expose_only_fit_rows_and_refuse_nonfit_cache(
             .all()
             .all()
         )
+        bound = private.embedding_cache.bind_spent(
+            fit_order,
+            modeling.iloc[fit_order][config.text_column].tolist(),
+        )
+        for row_id in fit_order:
+            np.testing.assert_array_equal(
+                bound.chunk_matrix(row_id),
+                matrix[row_id : row_id + 1],
+            )
+            assert bound.chunk_texts([row_id]) == ((modeling.iloc[row_id][config.text_column],),)
         with pytest.raises(ValueError, match="non-fit"):
             private.embedding_cache.bind_spent(
                 [nonfit[0]],
@@ -338,7 +394,7 @@ def test_full_production_config_alias_publishes_and_validates_one_scope(
     )
 
 
-def test_nonfit_text_label_and_cache_mutation_leave_scope_content_unchanged(
+def test_nonfit_modeling_mutation_is_invisible_but_cache_substitution_fails(
     tmp_path: Path,
 ):
     (
@@ -352,12 +408,13 @@ def test_nonfit_text_label_and_cache_mutation_leave_scope_content_unchanged(
         registry_sha,
     ) = _fixture(tmp_path)
     selected = (scopes[0],)
+    cache_identity = cache.identity()
     first = publish_preflight_scope_inputs(
         output_root=(tmp_path / "first").resolve(),
         modeling_data=modeling,
         config=config,
         embedding_cache=cache,
-        embedding_cache_identity=cache.identity(),
+        embedding_cache_identity=cache_identity,
         registry=registry,
         registry_content_sha256=registry_sha,
         scopes=selected,
@@ -374,6 +431,27 @@ def test_nonfit_text_label_and_cache_mutation_leave_scope_content_unchanged(
     changed.loc[nonfit, config.outcome_column] = 1.0 - changed.loc[
         nonfit, config.outcome_column
     ].to_numpy(dtype=float)
+    second = publish_preflight_scope_inputs(
+        output_root=(tmp_path / "second").resolve(),
+        modeling_data=changed,
+        config=config,
+        embedding_cache=cache,
+        embedding_cache_identity=cache_identity,
+        registry=registry,
+        registry_content_sha256=registry_sha,
+        scopes=selected,
+        source_dataset_path=source,
+        global_embedding_cache_path=cache.cache_dir,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
+    first_scope = first.scopes[selected[0]["scope_id"]]
+    second_scope = second.scopes[selected[0]["scope_id"]]
+    assert first_scope.manifest["content_sha256"] == second_scope.manifest["content_sha256"]
+    assert (
+        first_scope.manifest["embedding_cache_view"]
+        == second_scope.manifest["embedding_cache_view"]
+    )
+
     changed_matrix = matrix.copy()
     changed_matrix[nonfit] += 10000.0
     changed_texts = modeling[config.text_column].tolist()
@@ -385,29 +463,61 @@ def test_nonfit_text_label_and_cache_mutation_leave_scope_content_unchanged(
         matrices=changed_matrix,
         config=config,
     )
-    second = publish_preflight_scope_inputs(
-        output_root=(tmp_path / "second").resolve(),
-        modeling_data=changed,
+    with pytest.raises(ValueError, match="authenticated logical identity"):
+        publish_preflight_scope_inputs(
+            output_root=(tmp_path / "substituted").resolve(),
+            modeling_data=changed,
+            config=config,
+            embedding_cache=changed_cache,
+            embedding_cache_identity=cache_identity,
+            registry=registry,
+            registry_content_sha256=registry_sha,
+            scopes=selected,
+            source_dataset_path=source,
+            global_embedding_cache_path=changed_cache.cache_dir,
+            semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
+        )
+
+
+def test_tampered_shared_cache_identity_fails_closed(tmp_path: Path):
+    (
+        config,
+        source,
+        modeling,
+        cache,
+        _matrix,
+        scopes,
+        registry,
+        registry_sha,
+    ) = _fixture(tmp_path)
+    published = publish_preflight_scope_inputs(
+        output_root=(tmp_path / "scope_inputs").resolve(),
+        modeling_data=modeling,
         config=config,
-        embedding_cache=changed_cache,
-        # The parent separately authenticates this immutable logical identity.
-        # Holding it fixed isolates whether the selected task can observe
-        # physically nonfit cache bytes.
+        embedding_cache=cache,
         embedding_cache_identity=cache.identity(),
         registry=registry,
         registry_content_sha256=registry_sha,
-        scopes=selected,
+        scopes=(scopes[0],),
         source_dataset_path=source,
-        global_embedding_cache_path=changed_cache.cache_dir,
+        global_embedding_cache_path=cache.cache_dir,
         semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
     )
-    first_scope = first.scopes[selected[0]["scope_id"]]
-    second_scope = second.scopes[selected[0]["scope_id"]]
-    assert first_scope.manifest["content_sha256"] == second_scope.manifest["content_sha256"]
-    assert (
-        first_scope.manifest["embedding_cache"]["physical_identity"]
-        == second_scope.manifest["embedding_cache"]["physical_identity"]
-    )
+    reference_path = published.shared_cache_reference_path
+    tampered = json.loads(reference_path.read_text(encoding="utf-8"))
+    tampered["logical_identity"]["row_count"] += 1
+    reference_path.write_text(json.dumps(tampered), encoding="utf-8")
+    child = published.scopes[scopes[0]["scope_id"]]
+    with pytest.raises(ValueError, match="shared preflight cache reference is invalid"):
+        validate_preflight_scope_input(
+            manifest_path=child.manifest_path,
+            expected_scope_id=child.scope_id,
+            expected_manifest_content_sha256=child.manifest["content_sha256"],
+            shared_cache_reference_path=reference_path,
+            expected_shared_cache_reference_content_sha256=(
+                published.shared_cache_reference["content_sha256"]
+            ),
+        )
 
 
 def test_interrupted_publication_reuses_completed_scope_views_byte_for_byte(

@@ -101,6 +101,9 @@
         "optimizer_name": "adamw",
         "optimizer_zero_grad_set_to_none": true,
         "outcome_type": "binary",
+        "replay_absolute_tolerance": 3e-06,
+        "replay_comparison_policy": "allclose_and_exact_discrete_state_v1",
+        "replay_relative_tolerance": 3e-05,
         "output_projection_activation": "gelu_exact",
         "output_projection_bias": true,
         "output_projection_depth": 1,
@@ -148,6 +151,9 @@
         "heldout_transform_policy": "owned_fit_snapshot_registered_heldout_text_only_no_labels_v1",
         "nuisance_folds": 3,
         "outcome_type": "binary",
+        "replay_absolute_tolerance": 3e-06,
+        "replay_comparison_policy": "allclose_and_exact_discrete_state_v1",
+        "replay_relative_tolerance": 3e-05,
         "query_config": {
           "activation_diversity_weight": 0.04,
           "activation_scale_weight": 1.0,
@@ -391,7 +397,10 @@
         "max_controls_per_candidate": 3,
         "nearest_fallback_controls": 1,
         "outcome_caliper": 0.05,
-        "propensity_caliper": 0.05
+        "propensity_caliper": 0.05,
+        "replay_absolute_tolerance": 3e-06,
+        "replay_comparison_policy": "allclose_and_exact_discrete_state_v1",
+        "replay_relative_tolerance": 3e-05
       }
     },
     "residual_tfidf_ngrams": {
@@ -1247,7 +1256,7 @@
           },
           "prompt_version": "tfidf_topic_label_v2",
           "random_state": 42,
-          "score_selection_label_policy": "registered_context_heldout",
+          "score_selection_label_policy": "nested_fit_calibration",
           "score_test_bootstrap_chunk_size": 100,
           "score_test_bootstrap_repeats": 100,
           "score_test_bootstrap_top_topics": 0,

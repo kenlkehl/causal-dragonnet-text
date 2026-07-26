@@ -26,11 +26,26 @@ from oci.inference.shared_tfidf_context_fit_service import (
     build_shared_tfidf_context_fit_backends,
 )
 from oci.inference.tfidf_topic_discovery import FittedTopicContext
+from oci.inference.tfidf_orphan_evidence_adapter import (
+    OrphanNgramEvidenceAdapterConfig,
+)
 from oci.inference.tfidf_safe_artifacts import write_named_array_bank
 from oci.inference.tfidf_upstream_gate_backend import TfidfTopicOrphanContextBackend
 import oci.inference.review_spent_evidence_provider as spent_module
 import oci.inference.shared_tfidf_context_fit_service as shared_module
 import oci.inference.tfidf_upstream_gate_backend as context_module
+
+
+def _orphan_adapter_config() -> OrphanNgramEvidenceAdapterConfig:
+    return OrphanNgramEvidenceAdapterConfig(
+        min_abs_fit_score=0.0,
+        lexical_overlap_threshold=0.5,
+        max_candidates=None,
+        max_clusters=None,
+        max_terms_per_cluster=None,
+        max_term_chars=None,
+        max_ngram_tokens=None,
+    )
 
 
 @dataclass
@@ -219,6 +234,7 @@ def shared_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     spent_delegate = TfidfTopicOrphanSpentDiscoveryBackend(
         stage1_config_path=config_path,
+        orphan_config=_orphan_adapter_config(),
     )
     context_delegate = TfidfTopicOrphanContextBackend(
         stage1_config_path=config_path,
@@ -304,6 +320,45 @@ def test_exact_spent_fit_is_transform_only_and_numerically_equivalent(
     assert not (tmp_path / "shared_should_remain_empty").exists()
 
 
+def test_shared_transform_uses_complete_orphan_set_or_fails_before_omission() -> None:
+    vectorizer = TfidfVectorizer(ngram_range=(1, 2)).fit(
+        ["brain metastases durable response", "brain response"]
+    )
+    fitted = SimpleNamespace(common_vectorizer=vectorizer)
+    scores = pd.DataFrame(
+        {
+            "feature": ["brain metastases", "durable response"],
+            "eligible": [True, True],
+            "combined_importance": [4.0, 3.0],
+            "support_control": [5, 5],
+            "support_treated": [5, 5],
+        }
+    )
+    kwargs = {
+        "fitted": fitted,
+        "metadata": {"topic_banks": {"effect": {"topics": []}}},
+        "scores": scores,
+        "gate_texts": ("brain metastases durable response",),
+        "minimum_orphan_arm_support": 2,
+    }
+
+    names, values = InMemorySharedTfidfContextFitService._orphan_values(
+        **kwargs,
+        max_orphan_features=None,
+    )
+    assert len(names) == 2
+    assert values.shape == (1, 2)
+
+    with pytest.raises(
+        context_module.TfidfOrphanFeatureCapacityOverflowError,
+        match="refusing silent orphan-feature omission",
+    ):
+        InMemorySharedTfidfContextFitService._orphan_values(
+            **kwargs,
+            max_orphan_features=1,
+        )
+
+
 def test_factory_binds_both_wrappers_to_one_authenticated_service(shared_fixture) -> None:
     shared = shared_fixture.shared
     assert shared.spent_discovery_backend.service is shared.service
@@ -312,7 +367,11 @@ def test_factory_binds_both_wrappers_to_one_authenticated_service(shared_fixture
     spent_identity = shared.spent_discovery_backend.identity()
     context_identity = shared.context_backend.identity()
     assert spent_identity["service"] == context_identity["service"]
-    transform_only = {"max_orphan_features", "minimum_orphan_arm_support"}
+    transform_only = {
+        "max_orphan_features",
+        "minimum_orphan_arm_support",
+        "minimum_orphan_arm_support_source",
+    }
     assert {
         key: value
         for key, value in spent_identity["fit_source"].items()

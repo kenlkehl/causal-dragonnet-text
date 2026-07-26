@@ -324,14 +324,14 @@ def _json_object_no_duplicates(payload: bytes, *, label: str) -> dict[str, Any]:
 class FirstUntouchedGatePreparationBounds:
     """Fixed resource limits applied before unbounded cache parsing."""
 
-    max_initial_spent_rows: int = 1_000_000
-    max_first_gate_rows: int = 1_000_000
-    max_total_text_utf8_bytes: int = 1_073_741_824
-    max_catalog_atoms: int = 100_000
-    max_source_manifest_bytes: int = 16_777_216
-    max_direct_numerical_signals: int = 16_384
-    max_single_matrix_file_bytes: int = 1_073_741_824
-    max_total_matrix_file_bytes: int = 4_294_967_296
+    max_initial_spent_rows: int
+    max_first_gate_rows: int
+    max_total_text_utf8_bytes: int
+    max_catalog_atoms: int
+    max_source_manifest_bytes: int
+    max_direct_numerical_signals: int
+    max_single_matrix_file_bytes: int
+    max_total_matrix_file_bytes: int
 
     def __post_init__(self) -> None:
         for name, value in self.as_dict().items():
@@ -598,7 +598,16 @@ class PreparedFirstUntouchedGateDirectNumerical:
         for binding, expected_keys, label in closed_bindings:
             if set(binding) != expected_keys:
                 raise ValueError(f"{label} audit binding has an unexpected closed schema")
-        if set(bounds_binding) != set(FirstUntouchedGatePreparationBounds().as_dict()):
+        if set(bounds_binding) != {
+            "max_initial_spent_rows",
+            "max_first_gate_rows",
+            "max_total_text_utf8_bytes",
+            "max_catalog_atoms",
+            "max_source_manifest_bytes",
+            "max_direct_numerical_signals",
+            "max_single_matrix_file_bytes",
+            "max_total_matrix_file_bytes",
+        }:
             raise ValueError("preparation bounds audit has an unexpected closed schema")
         FirstUntouchedGatePreparationBounds(**bounds_binding)
         if initial_binding.get("placeholder_extraction_columns") != ["_oci_row_id"]:
@@ -773,7 +782,7 @@ def prepare_first_untouched_gate_direct_numerical(
     catalog: RoleNeutralEvidenceCatalog,
     provider: ContextFitUpstreamGateProvider | AuthenticatedContextFitGateCacheOverlay,
     destination: Path | str,
-    bounds: FirstUntouchedGatePreparationBounds | None = None,
+    bounds: FirstUntouchedGatePreparationBounds,
 ) -> PreparedFirstUntouchedGateDirectNumerical:
     """Fit/cache one first gate and persist its v3 direct numerical manifest.
 
@@ -782,8 +791,8 @@ def prepare_first_untouched_gate_direct_numerical(
     """
 
     fold = _positive_integer(outer_fold, label="outer_fold")
-    limits = bounds or FirstUntouchedGatePreparationBounds()
-    if not isinstance(limits, FirstUntouchedGatePreparationBounds):
+    limits = bounds
+    if not isinstance(bounds, FirstUntouchedGatePreparationBounds):
         raise TypeError("bounds must be FirstUntouchedGatePreparationBounds")
     context_ids = _exact_integer_rows(initial_spent_row_ids, label="initial_spent_row_ids")
     gate_ids = _exact_integer_rows(first_gate_row_ids, label="first_gate_row_ids")

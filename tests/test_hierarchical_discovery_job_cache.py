@@ -18,6 +18,9 @@ from oci.inference.hierarchical_discovery_job_cache import (
     AuthenticatedHierarchicalDiscoveryJobCache,
     HierarchicalDiscoveryJobCacheConfig,
 )
+from tests.hierarchy_resource_test_support import (
+    HIERARCHY_JOB_CACHE_CONFIG,
+)
 
 
 def _runner_identity(*, label: str = "one") -> dict:
@@ -83,7 +86,10 @@ def _keyed_wire_validator(raw):
 
 def _begun_cache(tmp_path):
     root = tmp_path / "hierarchy_cache"
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     runner_identity = _runner_identity()
     inner_sha = "b" * 64
     validator_sha = "c" * 64
@@ -273,7 +279,10 @@ def test_symlink_or_unexpected_namespace_entry_fails_closed(tmp_path):
     target.mkdir()
     symlink_root = tmp_path / "cache_link"
     symlink_root.symlink_to(target, target_is_directory=True)
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=symlink_root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=symlink_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     cache.begin_execution(
         hierarchy_inner_precommit_sha256="b" * 64,
         runner_identity=_runner_identity(),

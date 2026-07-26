@@ -261,7 +261,7 @@ def _job_dictionary(job: Any) -> dict[str, Any]:
 class HierarchicalDiscoveryJobCacheConfig:
     """Closed immutable-cache policy bound into offline approval."""
 
-    max_entry_bytes: int = 32_000_000
+    max_entry_bytes: int
     file_mode: int = 0o600
     directory_mode: int = 0o700
 
@@ -307,14 +307,14 @@ class AuthenticatedHierarchicalDiscoveryJobCache:
         self,
         *,
         root: str | os.PathLike[str],
-        config: HierarchicalDiscoveryJobCacheConfig | None = None,
+        config: HierarchicalDiscoveryJobCacheConfig,
     ) -> None:
         raw_root = os.fspath(root)
         if not isinstance(raw_root, str) or not raw_root:
             raise ValueError("cache root must be one non-empty path")
         self.root = Path(os.path.abspath(raw_root))
-        self.config = config or HierarchicalDiscoveryJobCacheConfig()
-        if not isinstance(self.config, HierarchicalDiscoveryJobCacheConfig):
+        self.config = config
+        if not isinstance(config, HierarchicalDiscoveryJobCacheConfig):
             raise TypeError("config must be HierarchicalDiscoveryJobCacheConfig")
         self._active_inner_precommit_sha256: str | None = None
         self._active_runner_identity_json: str | None = None

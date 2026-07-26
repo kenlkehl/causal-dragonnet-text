@@ -16,7 +16,7 @@ from tests.cluster_local_embedding_test_support import (
 from tests.semantic_witness_test_support import semantic_witness_config
 
 
-def test_parallel_preflight_submits_exactly_35_private_physical_payloads_for_40_logical_scopes(
+def test_parallel_preflight_submits_35_row_views_over_one_shared_cache(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -59,12 +59,20 @@ def test_parallel_preflight_submits_exactly_35_private_physical_payloads_for_40_
         for index in range(5)
     )
     scopes = (*physical_scopes, *aliases)
+    shared_reference_path = (
+        tmp_path / "scope_inputs" / "shared_embedding_cache_reference.json"
+    )
+    shared_reference_sha256 = "a" * 64
     payloads = tuple(
         {
-            "schema_version": "production_stage1_preflight_worker_payload_v1",
+            "schema_version": "production_stage1_preflight_worker_payload_v2",
             "scope_id": scope["scope_id"],
-            "manifest_path": str(tmp_path / "private" / scope["scope_id"] / "manifest.json"),
+            "manifest_path": str(
+                tmp_path / "scope_inputs" / scope["scope_id"] / "manifest.json"
+            ),
             "manifest_content_sha256": f"{index:064x}",
+            "shared_cache_reference_path": str(shared_reference_path),
+            "shared_cache_reference_content_sha256": shared_reference_sha256,
         }
         for index, scope in enumerate(physical_scopes)
     )
@@ -113,7 +121,7 @@ def test_parallel_preflight_submits_exactly_35_private_physical_payloads_for_40_
         initial_training_partitions=3,
         semantic_witness_scientific_config=semantic_witness_config(),
         preflight_workers=8,
-        preflight_scope_input_root=(tmp_path / "private").resolve(),
+        preflight_scope_input_root=(tmp_path / "scope_inputs").resolve(),
         _return_scope_audits=True,
     )
     assert len(publisher_calls) == 1
@@ -123,6 +131,18 @@ def test_parallel_preflight_submits_exactly_35_private_physical_payloads_for_40_
         scope["scope_id"] for scope in physical_scopes
     ]
     assert len({row["manifest_path"] for row in captured}) == 35
+    assert {
+        row["shared_cache_reference_path"] for row in captured
+    } == {str(shared_reference_path)}
+    assert {
+        row["shared_cache_reference_content_sha256"] for row in captured
+    } == {shared_reference_sha256}
+    assert {
+        row["schema_version"] for row in captured
+    } == {"production_stage1_preflight_worker_payload_v2"}
+    assert {
+        row["initial_training_partitions"] for row in captured
+    } == {3}
     assert parallel_options == [{"n_jobs": 8, "batch_size": 1, "pre_dispatch": "all"}]
     assert [row["scope_id"] for row in result["_scope_audits"]] == [
         scope["scope_id"] for scope in physical_scopes
@@ -130,3 +150,5 @@ def test_parallel_preflight_submits_exactly_35_private_physical_payloads_for_40_
     serialized = json.dumps(captured, sort_keys=True)
     assert "/global/prepared-label-cohort.parquet" not in serialized
     assert "/global/cache" not in serialized
+    assert '"cache_dir"' not in serialized
+    assert '"global_embedding_cache_path"' not in serialized

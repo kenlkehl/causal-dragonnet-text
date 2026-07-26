@@ -12,6 +12,9 @@ import pytest
 
 from oci.config import TfidfNuisanceStackScientificConfig
 from oci.inference import neural_query_context_backend as context_module
+from oci.inference import (
+    role_neutral_neural_query_group_execution as group_module,
+)
 from oci.inference.all_evidence_discovery_interfaces import NEURAL_QUERY_MOMENTS
 from oci.inference.neural_query_agentic_forest import (
     NeuralQueryAgenticForestConfig,
@@ -19,9 +22,13 @@ from oci.inference.neural_query_agentic_forest import (
     build_query_evidence,
 )
 from oci.inference.neural_query_context_backend import ContextFitNeuralQueryService
+from oci.inference.neural_query_execution_topology import (
+    NeuralQueryExecutionTopology,
+)
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_neural_query_group_execution import (
     COMPLETE_EMBEDDING_TEXT_POLICY,
     EXACT_INNER_TRANSFORM_POLICY,
@@ -72,6 +79,7 @@ def _plan(*, gpu_ids: tuple[int, ...] = ()):
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,
@@ -290,6 +298,9 @@ def _request(
         service_scientific_identity=service.identity(),
         evidence_capacity_policy=FAIL_CLOSED_EVIDENCE_CAPACITY_POLICY,
         embedding_text_coverage_policy=COMPLETE_EMBEDDING_TEXT_POLICY,
+        replay_comparison_policy="allclose_and_exact_discrete_state_v1",
+        replay_relative_tolerance=1e-4,
+        replay_absolute_tolerance=1e-5,
         heldout_transform_policy=REGISTERED_HELDOUT_TRANSFORM_POLICY,
     )
 
@@ -353,9 +364,14 @@ def _execute(
     *,
     physical_owner_scope_id: str | None = None,
     config: NeuralQueryAgenticForestConfig | None = None,
+    devices: tuple[str, ...] = ("cpu",),
 ):
     selected_config = config or _query_config()
-    service = _service(tmp_path / "service", config=selected_config)
+    service = _service(
+        tmp_path / "service",
+        config=selected_config,
+        devices=devices,
+    )
     request = _request(
         service,
         physical_owner_scope_id=physical_owner_scope_id,
@@ -399,6 +415,9 @@ def _execute(
         fit_texts=fit_texts,
         fit_treatment=treatment,
         fit_outcome=outcome,
+        execution_topology=NeuralQueryExecutionTopology(
+            devices=devices
+        ),
         heldout_text_loader=loader,
     )
     return {
@@ -430,6 +449,46 @@ def test_request_is_device_neutral_and_requires_every_query_setting(tmp_path: Pa
     incomplete.pop("evidence_excerpt_chars")
     with pytest.raises(ValueError, match="explicitly contain every closed setting"):
         _request(cpu, query_config=incomplete)
+
+
+def test_single_and_spanned_device_topologies_publish_exact_scientific_equality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_build = context_module.build_query_evidence
+    original_soft = group_module.soft_retrieval_activations
+
+    def cpu_build(**kwargs):
+        return original_build(**{**kwargs, "device": "cpu"})
+
+    def cpu_soft(*args, **kwargs):
+        return original_soft(*args, **{**kwargs, "device": "cpu"})
+
+    monkeypatch.setattr(context_module, "build_query_evidence", cpu_build)
+    monkeypatch.setattr(
+        group_module,
+        "soft_retrieval_activations",
+        cpu_soft,
+    )
+    monkeypatch.setattr(
+        context_module,
+        "soft_retrieval_activations",
+        cpu_soft,
+    )
+    single = _execute(
+        tmp_path / "single",
+        monkeypatch,
+        devices=("cpu",),
+    )
+    spanned = _execute(
+        tmp_path / "spanned",
+        monkeypatch,
+        devices=("cuda:11", "cuda:4"),
+    )
+
+    assert single["service"].identity() == spanned["service"].identity()
+    assert single["request"].as_dict() == spanned["request"].as_dict()
+    assert single["terminal"] == spanned["terminal"]
 
 
 def test_fit_once_seals_before_text_loader_and_replays_safe_state(

@@ -53,6 +53,12 @@ from oci.inference.hierarchical_all_architecture_discovery import (
     discovery_response_repair_policy_identity,
     local_json_schema_validator_identity,
 )
+from oci.inference.hierarchical_discovery_job_cache import (
+    HierarchicalDiscoveryJobCacheConfig,
+)
+from oci.inference.first_untouched_gate_direct_numerical_preparation import (
+    FirstUntouchedGatePreparationBounds,
+)
 from oci.inference.openai_compatible_json_discovery_job_runner import (
     Stage2GenerationPolicy,
     parse_strict_json_object,
@@ -769,6 +775,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-rounds", required=True, type=int)
     parser.add_argument("--initial-training-partitions", required=True, type=int)
     parser.add_argument(
+        "--hierarchical-job-cache-max-entry-bytes",
+        required=True,
+        type=int,
+    )
+    for field_name in (
+        "max_initial_spent_rows",
+        "max_first_gate_rows",
+        "max_total_text_utf8_bytes",
+        "max_catalog_atoms",
+        "max_source_manifest_bytes",
+        "max_direct_numerical_signals",
+        "max_single_matrix_file_bytes",
+        "max_total_matrix_file_bytes",
+    ):
+        parser.add_argument(
+            "--first-untouched-gate-" + field_name.replace("_", "-"),
+            dest="first_untouched_gate_" + field_name,
+            required=True,
+            type=int,
+        )
+    parser.add_argument(
         "--source-text-temporally-valid-by-design",
         action=argparse.BooleanOptionalAction,
         required=True,
@@ -885,6 +912,41 @@ def options_from_args(args: argparse.Namespace) -> ProductionStage1HierarchyOneS
         initial_training_partitions=int(args.initial_training_partitions),
         stage2_protocol=stage2_hierarchy_prompt_protocol_from_namespace(args),
         stage2_tokenizer_locator=args.stage2_tokenizer_locator,
+        hierarchical_discovery_job_cache_config=(
+            HierarchicalDiscoveryJobCacheConfig(
+                max_entry_bytes=int(
+                    args.hierarchical_job_cache_max_entry_bytes
+                )
+            )
+        ),
+        first_untouched_gate_preparation_bounds=(
+            FirstUntouchedGatePreparationBounds(
+                max_initial_spent_rows=int(
+                    args.first_untouched_gate_max_initial_spent_rows
+                ),
+                max_first_gate_rows=int(
+                    args.first_untouched_gate_max_first_gate_rows
+                ),
+                max_total_text_utf8_bytes=int(
+                    args.first_untouched_gate_max_total_text_utf8_bytes
+                ),
+                max_catalog_atoms=int(
+                    args.first_untouched_gate_max_catalog_atoms
+                ),
+                max_source_manifest_bytes=int(
+                    args.first_untouched_gate_max_source_manifest_bytes
+                ),
+                max_direct_numerical_signals=int(
+                    args.first_untouched_gate_max_direct_numerical_signals
+                ),
+                max_single_matrix_file_bytes=int(
+                    args.first_untouched_gate_max_single_matrix_file_bytes
+                ),
+                max_total_matrix_file_bytes=int(
+                    args.first_untouched_gate_max_total_matrix_file_bytes
+                ),
+            )
+        ),
         post_extraction_review_config=(
             post_extraction_causal_review_from_namespace(
                 args,

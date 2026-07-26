@@ -115,7 +115,7 @@ def _legacy_payload(*, reverse: bool = False) -> dict:
     }
 
 
-def test_legacy_compaction_interleaves_late_model_and_family_strata_deterministically():
+def test_legacy_adapter_preserves_all_groups_in_deterministic_canonical_order():
     first = prepare_all_evidence_fusion(
         [FoldEvidenceInput(LEGACY_ALL_SOURCE, _legacy_payload(), _provenance())]
     )
@@ -134,8 +134,13 @@ def test_legacy_compaction_interleaves_late_model_and_family_strata_deterministi
     assert EMBEDDING_CLUSTERED in first.source_family_coverage["present_source_families"]
     audit = first.source_family_coverage["legacy_compaction"]
     assert audit["schema_version"] == LEGACY_COMPACTION_STRATEGY_VERSION
-    assert audit["discovered_group_count"] > audit["retained_group_count"]
-    assert audit["retained_unique_value_count_by_axis"]["bow_model"] >= 4
+    assert audit["discovered_group_count"] == audit["retained_group_count"] == 65
+    assert audit["dropped_group_count"] == 0
+    assert audit["maximum_groups_per_role_and_kind"] is None
+    assert (
+        audit["retained_unique_value_count_by_axis"]
+        == audit["discovered_unique_value_count_by_axis"]
+    )
 
 
 def test_legacy_digest_carries_explicit_bow_model_even_for_opaque_view_names():

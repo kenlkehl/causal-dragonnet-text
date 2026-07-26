@@ -4,7 +4,7 @@ import hashlib
 import json
 import shutil
 import copy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -111,6 +111,41 @@ def _tfidf_config() -> AppliedInferenceConfig:
     )
     config.seed = 42
     return config
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("vocabulary_size_bool", "selection_count_bool", "nested_policy_int_for_bool"),
+)
+def test_tfidf_configuration_rejects_json_type_substitution(tamper: str):
+    config = _tfidf_config()
+    topic = config.architecture.multi_model_forest.tfidf_topic
+    metadata = {
+        "common_vocabulary": ["therapy"],
+        "common_vocabulary_size": 1,
+        "common_vocabulary_selection": {
+            "selected_term_count": 1,
+            "configured_max_features": int(topic.max_features),
+            "selection_rule": topic.vectorizer_scientific.feature_selection_rule,
+            "complete_input_text_consumed": True,
+        },
+        "nuisance_stack_scientific": asdict(topic.nuisance_stack_scientific),
+        "screening_scientific": asdict(topic.screening_scientific),
+        "nmf_scientific": asdict(topic.nmf_scientific),
+        "config_hash": "0" * 64,
+    }
+    if tamper == "vocabulary_size_bool":
+        metadata["common_vocabulary_size"] = True
+    elif tamper == "selection_count_bool":
+        metadata["common_vocabulary_selection"]["selected_term_count"] = True
+    else:
+        metadata["nuisance_stack_scientific"]["split_shuffle"] = 1
+
+    with pytest.raises(
+        ValueError,
+        match="metadata differs from its configured scientific policies",
+    ):
+        remaining_module._tfidf_configuration(config, metadata)
 
 
 def _cohort() -> tuple[tuple[str, ...], np.ndarray, np.ndarray]:
@@ -578,6 +613,10 @@ def _query_service(tmp_path: Path, texts: tuple[str, ...]) -> ContextFitNeuralQu
     service.embedding_cache = _FakeFrozenEmbeddings(texts)
     service._dataset_row_count = len(texts)
     service._nuisance_views = ({"name": "test_unigram_view"},)
+    service._nuisance_stack_config = copy.deepcopy(
+        _tfidf_config()
+        .architecture.multi_model_forest.tfidf_topic.nuisance_stack_scientific
+    )
     service.query_config = NeuralQueryAgenticForestConfig(
         treatment_query_count=1,
         outcome_query_count=1,

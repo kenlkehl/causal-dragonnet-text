@@ -45,7 +45,9 @@ from .production_role_neutral_process_executor import (
     _process_io_counters,
     _process_io_delta,
     _resolve_worker_target,
+    _runtime_neural_query_topology_attestation,
     _start_process,
+    _task_execution_resources,
 )
 from .production_stage1_role_neutral_execution import (
     RoleNeutralPhysicalOwnerResult,
@@ -237,12 +239,26 @@ def _persistent_slot_entry(
                 if completed_count == 0
                 else _process_io_counters()
             )
+            topology_attestation = (
+                _runtime_neural_query_topology_attestation(
+                    task.neural_query_execution_topology,
+                    torch_module=torch,
+                )
+            )
             seed_stage1_scope_rngs(
                 task.physical_owner.scope_seed,
                 gpu_id=gpu_id,
             )
-            if gpu_id is not None:
-                torch.cuda.reset_peak_memory_stats(gpu_id)
+            topology_gpu_ids = tuple(
+                value
+                for value in (
+                    _gpu_id(device)
+                    for device in _task_execution_resources(task)
+                )
+                if value is not None
+            )
+            for topology_gpu_id in topology_gpu_ids:
+                torch.cuda.reset_peak_memory_stats(topology_gpu_id)
             with threadpool_limits(limits=int(slot_cpu_budget)):
                 if factories is not None:
                     result = _execute_one_owner(
@@ -272,13 +288,28 @@ def _persistent_slot_entry(
                 )
             owner_usage_after = resource.getrusage(resource.RUSAGE_SELF)
             owner_io_after = _process_io_counters()
-            peak_allocated: int | None = None
-            peak_reserved: int | None = None
-            if gpu_id is not None:
-                peak_allocated = int(
-                    torch.cuda.max_memory_allocated(gpu_id)
+            peak_allocated_by_device = {
+                f"cuda:{topology_gpu_id}": int(
+                    torch.cuda.max_memory_allocated(topology_gpu_id)
                 )
-                peak_reserved = int(torch.cuda.max_memory_reserved(gpu_id))
+                for topology_gpu_id in topology_gpu_ids
+            }
+            peak_reserved_by_device = {
+                f"cuda:{topology_gpu_id}": int(
+                    torch.cuda.max_memory_reserved(topology_gpu_id)
+                )
+                for topology_gpu_id in topology_gpu_ids
+            }
+            peak_allocated = (
+                None
+                if gpu_id is None
+                else peak_allocated_by_device[task.resource]
+            )
+            peak_reserved = (
+                None
+                if gpu_id is None
+                else peak_reserved_by_device[task.resource]
+            )
             completed_count += 1
             telemetry = {
                 "schema_version": (
@@ -297,6 +328,12 @@ def _persistent_slot_entry(
                 "per_owner_python_hash_secret_reset_claimed": False,
                 "scope_seed": int(task.physical_owner.scope_seed),
                 "resource": task.resource,
+                "reserved_resources": list(
+                    _task_execution_resources(task)
+                ),
+                "neural_query_device_topology": (
+                    topology_attestation
+                ),
                 "native_threads": int(slot_cpu_budget),
                 "slot_cpu_budget": int(slot_cpu_budget),
                 "host_cpu_budget": int(host_cpu_budget),
@@ -350,6 +387,12 @@ def _persistent_slot_entry(
                 ),
                 "peak_gpu_allocated_bytes": peak_allocated,
                 "peak_gpu_reserved_bytes": peak_reserved,
+                "peak_gpu_allocated_bytes_by_device": (
+                    peak_allocated_by_device
+                ),
+                "peak_gpu_reserved_bytes_by_device": (
+                    peak_reserved_by_device
+                ),
                 "torch_determinism_observed": determinism_after,
                 "worker_report": (
                     None
@@ -413,6 +456,85 @@ class _PersistentSlot:
     shutting_down: bool = False
     closed_message: bool = False
     busy: bool = False
+
+
+def _authenticate_persistent_slot_startup(
+    *,
+    slots: Sequence[_PersistentSlot],
+    slot_cpu_budget: int,
+    host_cpu_budget: int,
+    active_slot_count: int,
+    poll_interval_seconds: float,
+    timeout_seconds: float,
+) -> None:
+    """Require every configured slot to attest readiness before dispatch."""
+
+    pending = list(slots)
+    if not pending:
+        raise ValueError("persistent startup requires at least one slot")
+    deadline = time.monotonic() + float(timeout_seconds)
+    while pending:
+        made_progress = False
+        for slot in tuple(pending):
+            if slot.connection.poll():
+                try:
+                    message = slot.connection.recv()
+                except EOFError as exc:
+                    raise RuntimeError(
+                        "persistent slot closed IPC before its startup "
+                        "attestation"
+                    ) from exc
+                if not isinstance(message, Mapping):
+                    raise RuntimeError(
+                        "persistent slot sent malformed startup IPC"
+                    )
+                status = message.get("status")
+                if status == "failed":
+                    raise RuntimeError(
+                        "persistent role-neutral slot "
+                        f"{slot.index} failed during startup: "
+                        f"{message.get('exception_type', 'WorkerError')}: "
+                        f"{message.get('message', 'unknown failure')}\n"
+                        f"{message.get('traceback', '')}"
+                    )
+                if status != "ready":
+                    raise RuntimeError(
+                        "persistent slot sent a non-ready startup "
+                        f"message: {status!r}"
+                    )
+                if slot.ready:
+                    raise RuntimeError(
+                        "persistent slot sent duplicate ready"
+                    )
+                if (
+                    message.get("slot_index") != slot.index
+                    or message.get("resource") != slot.resource
+                    or message.get("slot_cpu_budget") != slot_cpu_budget
+                    or message.get("host_cpu_budget") != host_cpu_budget
+                    or message.get("active_slot_count")
+                    != active_slot_count
+                ):
+                    raise RuntimeError(
+                        "persistent slot failed its startup attestation"
+                    )
+                slot.ready = True
+                pending.remove(slot)
+                made_progress = True
+            elif not slot.process.is_alive():
+                slot.process.join()
+                raise RuntimeError(
+                    "persistent role-neutral slot exited before its startup "
+                    "attestation"
+                )
+        if not pending:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "persistent session slot did not authenticate in time"
+            )
+        if not made_progress:
+            time.sleep(min(float(poll_interval_seconds), remaining))
 
 
 class PersistentRoleNeutralExecutionSession:
@@ -557,26 +679,14 @@ class PersistentRoleNeutralExecutionSession:
                     )
                     self._slots.append(slot)
                     slot_index += 1
-            for slot in self._slots:
-                if not slot.connection.poll(600):
-                    raise RuntimeError(
-                        "persistent session slot did not authenticate in time"
-                    )
-                message = slot.connection.recv()
-                if (
-                    not isinstance(message, Mapping)
-                    or message.get("status") != "ready"
-                    or message.get("resource") != slot.resource
-                    or int(message.get("slot_cpu_budget", 0))
-                    != self.slot_cpu_budget
-                    or int(message.get("host_cpu_budget", 0)) != budget
-                    or int(message.get("active_slot_count", 0))
-                    != self.active_slot_count
-                ):
-                    raise RuntimeError(
-                        "persistent session slot failed its startup attestation"
-                    )
-                slot.ready = True
+            _authenticate_persistent_slot_startup(
+                slots=self._slots,
+                slot_cpu_budget=self.slot_cpu_budget,
+                host_cpu_budget=budget,
+                active_slot_count=self.active_slot_count,
+                poll_interval_seconds=executor.poll_interval_seconds,
+                timeout_seconds=executor.startup_timeout_seconds,
+            )
         except BaseException:
             self._terminate()
             raise
@@ -589,7 +699,16 @@ class PersistentRoleNeutralExecutionSession:
     def process_isolated_physical_owners(self) -> bool:
         return True
 
-    def _acquire(self, resource_name: str) -> _PersistentSlot:
+    def _acquire(
+        self,
+        resource_names: Sequence[str],
+    ) -> tuple[_PersistentSlot, ...]:
+        requested = tuple(str(value) for value in resource_names)
+        if not requested or len(requested) != len(set(requested)):
+            raise ValueError(
+                "persistent session resource reservation must be nonempty "
+                "and duplicate-free"
+            )
         with self._condition:
             while True:
                 if self._closed:
@@ -598,27 +717,53 @@ class PersistentRoleNeutralExecutionSession:
                     raise RuntimeError(
                         "persistent execution session is broken"
                     ) from self._broken
-                for slot in self._slots:
-                    if slot.resource == resource_name and not slot.busy:
-                        slot.busy = True
-                        self._active_calls += 1
-                        return slot
-                if not any(
-                    slot.resource == resource_name for slot in self._slots
-                ):
-                    raise ValueError(
-                        "persistent session has no slot for task resource"
+                missing = [
+                    resource_name
+                    for resource_name in requested
+                    if not any(
+                        slot.resource == resource_name
+                        for slot in self._slots
                     )
+                ]
+                if missing:
+                    raise ValueError(
+                        "persistent session has no slot for one or more "
+                        f"reserved task resources: {missing}"
+                    )
+                selected: list[_PersistentSlot] = []
+                for resource_name in requested:
+                    available = next(
+                        (
+                            slot
+                            for slot in self._slots
+                            if slot.resource == resource_name
+                            and not slot.busy
+                        ),
+                        None,
+                    )
+                    if available is None:
+                        selected = []
+                        break
+                    selected.append(available)
+                if selected:
+                    for slot in selected:
+                        slot.busy = True
+                    self._active_calls += 1
+                    return tuple(selected)
                 self._condition.wait()
 
     def _release(
         self,
-        slot: _PersistentSlot,
+        slots: Sequence[_PersistentSlot],
         *,
         failure: BaseException | None,
     ) -> None:
+        reserved = tuple(slots)
+        if not reserved:
+            raise ValueError("persistent session cannot release no slots")
         with self._condition:
-            slot.busy = False
+            for slot in reserved:
+                slot.busy = False
             self._active_calls -= 1
             if failure is not None and self._broken is None:
                 self._broken = failure
@@ -628,7 +773,13 @@ class PersistentRoleNeutralExecutionSession:
         self,
         task: RoleNeutralPhysicalOwnerTask,
     ) -> RoleNeutralPhysicalOwnerResult:
-        slot = self._acquire(task.resource)
+        reserved = self._acquire(_task_execution_resources(task))
+        slot = reserved[0]
+        if slot.resource != task.resource:
+            self._release(reserved, failure=None)
+            raise RuntimeError(
+                "persistent session reservation changed the primary resource"
+            )
         failure: BaseException | None = None
         try:
             slot.connection.send({"command": "execute", "task": task})
@@ -664,7 +815,7 @@ class PersistentRoleNeutralExecutionSession:
             failure = exc
             raise
         finally:
-            self._release(slot, failure=failure)
+            self._release(reserved, failure=failure)
 
     def execute(
         self,
@@ -700,7 +851,7 @@ class PersistentRoleNeutralExecutionSession:
                 raise TypeError(
                     "persistent session received an untyped owner task"
                 )
-            _gpu_id(task.resource)
+            _task_execution_resources(task)
         if len(rows) == 1:
             return (self._execute_task(rows[0]),)
         with concurrent.futures.ThreadPoolExecutor(
@@ -788,6 +939,7 @@ class PersistentSpawnRoleNeutralPhysicalOwnerExecutor:
     """Spawn-only executor that prepares once per resource-bound slot."""
 
     max_workers_per_resource: int
+    startup_timeout_seconds: float
     worker_target: str = PRODUCTION_PROCESS_WORKER_TARGET
     worker_parameters: Mapping[str, Any] | None = None
     production_worker_required: bool = True
@@ -801,11 +953,16 @@ class PersistentSpawnRoleNeutralPhysicalOwnerExecutor:
     def __post_init__(self) -> None:
         workers = int(self.max_workers_per_resource)
         interval = float(self.poll_interval_seconds)
+        startup_timeout = float(self.startup_timeout_seconds)
         if workers < 1:
             raise ValueError("max_workers_per_resource must be positive")
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError(
                 "persistent executor poll interval must be positive"
+            )
+        if not math.isfinite(startup_timeout) or startup_timeout <= 0:
+            raise ValueError(
+                "persistent executor startup timeout must be positive"
             )
         if self.worker_lifecycle_mode != PERSISTENT_ROLE_NEUTRAL_WORKER_MODE:
             raise ValueError(
@@ -841,6 +998,11 @@ class PersistentSpawnRoleNeutralPhysicalOwnerExecutor:
             )
         object.__setattr__(self, "max_workers_per_resource", workers)
         object.__setattr__(self, "poll_interval_seconds", interval)
+        object.__setattr__(
+            self,
+            "startup_timeout_seconds",
+            startup_timeout,
+        )
         object.__setattr__(self, "worker_parameters", parameters)
 
     def bind_prepared(
@@ -952,7 +1114,16 @@ class PersistentSpawnRoleNeutralPhysicalOwnerExecutor:
                 raise TypeError(
                     "persistent executor received an untyped owner task"
                 )
-            _gpu_id(task.resource)
+            _task_execution_resources(task)
+        if any(
+            len(_task_execution_resources(task)) > 1
+            for task in rows
+        ):
+            raise RuntimeError(
+                "multi-device neural-query contexts require "
+                "open_session() so every participating persistent slot can "
+                "be reserved atomically"
+            )
 
         by_resource: dict[str, list[RoleNeutralPhysicalOwnerTask]] = {}
         resource_order: list[str] = []
@@ -1052,6 +1223,19 @@ class PersistentSpawnRoleNeutralPhysicalOwnerExecutor:
                         )
                     )
                     slot_index += 1
+
+            # Authenticate every configured slot before dispatching any owner.
+            # Without this startup barrier, a fast first slot can complete and
+            # consume a second queued owner before a later slot's ``ready``
+            # message is observed, silently collapsing requested concurrency.
+            _authenticate_persistent_slot_startup(
+                slots=slots,
+                slot_cpu_budget=slot_cpu_budget,
+                host_cpu_budget=budget,
+                active_slot_count=active_slot_count,
+                poll_interval_seconds=self.poll_interval_seconds,
+                timeout_seconds=self.startup_timeout_seconds,
+            )
 
             while slots:
                 made_progress = False

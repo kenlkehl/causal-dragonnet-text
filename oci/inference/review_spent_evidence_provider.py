@@ -2326,15 +2326,14 @@ class TfidfTopicOrphanSpentDiscoveryBackend:
         stage1_config_path: Path | str | None = None,
         stage1_config_snapshot: HistoricalStage1ConfigSnapshot | None = None,
         outcome_type: str = "binary",
-        orphan_config: OrphanNgramEvidenceAdapterConfig = OrphanNgramEvidenceAdapterConfig(
-            min_abs_fit_score=0.0
-        ),
+        orphan_config: OrphanNgramEvidenceAdapterConfig,
     ) -> None:
         orphan_config.validate()
         self.source = TfidfTopicOrphanContextBackend(
             stage1_config_path=stage1_config_path,
             stage1_config_snapshot=stage1_config_snapshot,
             outcome_type=outcome_type,
+            max_orphan_features=None,
         )
         self.orphan_config = orphan_config
         self._identity = {

@@ -34,6 +34,7 @@ from oci.inference.production_stage1_scope_scheduler import (
     Stage1ScopeExecutionRequest,
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.review_spent_evidence_provider import (
     SpentOnlyFrozenChunkEmbeddingCache,
 )
@@ -140,6 +141,7 @@ def _prepared(
         registry=registry,
         registry_content_sha256=_REGISTRY_SHA,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         review_rounds=2,
         initial_training_partitions=3,
@@ -353,6 +355,11 @@ def test_private_descriptors_project_labels_text_preflight_and_cache(
     assert reused == {
         "logical_scope_id": "outer_001_hierarchy_epoch_001",
         "physical_owner_scope_id": "outer_001_inner_005",
+        "physical_fit_key": (
+            prepared.stage1_scope_plan.physical_fit_key(
+                "outer_001_hierarchy_epoch_001"
+            ).key
+        ),
         "reuses_physical_fit": True,
     }
     source_path = str(prepared.options.dataset_path).encode()

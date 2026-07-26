@@ -10,10 +10,13 @@ and has the source artifact's exact path-neutral scientific content.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
 import re
+import shutil
+import stat
 import statistics
 import time
 from dataclasses import asdict, dataclass, fields
@@ -732,6 +735,347 @@ def run_compact_preflight_compression_benchmark(
     return copy.deepcopy(result)
 
 
+def _copy_authenticated_replica_tree(
+    *,
+    source_manifest: Path,
+    destination_root: Path,
+) -> PortableProductionStage1ClusterPreflightArtifact:
+    """Copy one authenticated replica once, hashing every byte while writing."""
+
+    source = (
+        load_path_only_portable_production_stage1_cluster_preflight_artifact(
+            manifest_path=source_manifest,
+        )
+    )
+    source_root = source.root
+    destination_root.parent.mkdir(parents=True, exist_ok=True)
+    destination_root.mkdir(mode=0o700)
+    directories: list[tuple[Path, int]] = []
+    for path in sorted(
+        source_root.rglob("*"),
+        key=lambda value: (
+            len(value.relative_to(source_root).parts),
+            value.as_posix(),
+        ),
+    ):
+        relative = path.relative_to(source_root)
+        source_state = os.lstat(path)
+        destination = destination_root / relative
+        if stat.S_ISLNK(source_state.st_mode):
+            raise ValueError(
+                "compression benchmark publication cannot copy links"
+            )
+        if stat.S_ISDIR(source_state.st_mode):
+            destination.mkdir(mode=0o700)
+            directories.append(
+                (destination, stat.S_IMODE(source_state.st_mode))
+            )
+            continue
+        if (
+            not stat.S_ISREG(source_state.st_mode)
+            or int(source_state.st_nlink) != 1
+        ):
+            raise ValueError(
+                "compression benchmark publication requires private files"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source_descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            while True:
+                block = os.read(source_descriptor, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                copied += len(block)
+                view = memoryview(block)
+                while view:
+                    written = os.write(
+                        destination_descriptor,
+                        view,
+                    )
+                    if written < 1:
+                        raise OSError(
+                            "compression benchmark publication made no progress"
+                        )
+                    view = view[written:]
+            os.fsync(destination_descriptor)
+        finally:
+            os.close(source_descriptor)
+            os.close(destination_descriptor)
+        after = os.lstat(path)
+        if (
+            copied != int(source_state.st_size)
+            or _SHA256.fullmatch(digest.hexdigest()) is None
+            or (
+                int(source_state.st_dev),
+                int(source_state.st_ino),
+                int(source_state.st_mode),
+                int(source_state.st_nlink),
+                int(source_state.st_size),
+                int(source_state.st_mtime_ns),
+                int(source_state.st_ctime_ns),
+            )
+            != (
+                int(after.st_dev),
+                int(after.st_ino),
+                int(after.st_mode),
+                int(after.st_nlink),
+                int(after.st_size),
+                int(after.st_mtime_ns),
+                int(after.st_ctime_ns),
+            )
+        ):
+            raise RuntimeError(
+                "compression benchmark replica changed while being published"
+            )
+        os.chmod(destination, stat.S_IMODE(source_state.st_mode))
+    for directory, mode in sorted(
+        directories,
+        key=lambda value: len(value[0].parts),
+        reverse=True,
+    ):
+        os.chmod(directory, mode)
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    os.chmod(
+        destination_root,
+        stat.S_IMODE(os.lstat(source_root).st_mode),
+    )
+    descriptor = os.open(
+        destination_root,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    copied_artifact = (
+        load_path_only_portable_production_stage1_cluster_preflight_artifact(
+            manifest_path=(
+                destination_root
+                / PORTABLE_CLUSTER_PREFLIGHT_MANIFEST_NAME
+            ),
+        )
+    )
+    copied_identity = copied_artifact.identity()
+    source_identity = source.identity()
+    if (
+        copied_identity[
+            "path_neutral_scientific_content_sha256"
+        ]
+        != source_identity[
+            "path_neutral_scientific_content_sha256"
+        ]
+        or copied_identity["payload_inventory_content_sha256"]
+        != source_identity["payload_inventory_content_sha256"]
+    ):
+        raise RuntimeError(
+            "compression benchmark publication changed replica content"
+        )
+    return copied_artifact
+
+
+def publish_compact_preflight_compression_benchmark_result(
+    value: Mapping[str, Any],
+    *,
+    output_root: Path | str,
+) -> dict[str, Any]:
+    """Publish terminal codec evidence from local scratch to durable storage."""
+
+    validated = validate_compact_preflight_compression_benchmark_result(
+        value,
+        reopen_artifacts=True,
+    )
+    destination = Path(output_root)
+    if not destination.is_absolute():
+        raise ValueError(
+            "compression benchmark publication root must be absolute"
+        )
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(
+            "compression benchmark publication root must be fresh"
+        )
+    parent = destination.parent.resolve(strict=True)
+    if parent != destination.parent or not parent.is_dir():
+        raise ValueError(
+            "compression benchmark publication parent must be canonical"
+        )
+    destination.mkdir(mode=0o700)
+    temporary = destination
+    try:
+        (temporary / "warmups").mkdir()
+        (temporary / "runs").mkdir()
+        relocated_rows: dict[str, list[dict[str, Any]]] = {
+            "warmup_observations": [],
+            "measured_observations": [],
+        }
+        for collection in relocated_rows:
+            kind = (
+                "warmups"
+                if collection == "warmup_observations"
+                else "runs"
+            )
+            for row in validated[collection]:
+                sequence = int(row["sequence_index"])
+                codec = str(row["parquet_compression"])
+                relative_root = (
+                    Path(kind) / f"{sequence:04d}-{codec}"
+                )
+                copied = _copy_authenticated_replica_tree(
+                    source_manifest=Path(
+                        str(row["artifact_manifest_path"])
+                    ),
+                    destination_root=temporary / relative_root,
+                )
+                relocated_body = {
+                    key: copy.deepcopy(child)
+                    for key, child in row.items()
+                    if key != "content_sha256"
+                }
+                relocated_body["artifact_manifest_path"] = str(
+                    destination
+                    / relative_root
+                    / PORTABLE_CLUSTER_PREFLIGHT_MANIFEST_NAME
+                )
+                relocated_body["artifact_content_sha256"] = (
+                    copied.identity()["content_sha256"]
+                )
+                if (
+                    copied.identity()[
+                        "path_neutral_scientific_content_sha256"
+                    ]
+                    != relocated_body[
+                        "path_neutral_scientific_content_sha256"
+                    ]
+                ):
+                    raise RuntimeError(
+                        "published compression replica identity changed"
+                    )
+                relocated_rows[collection].append(
+                    {
+                        **relocated_body,
+                        "content_sha256": identity_sha256(
+                            relocated_body
+                        ),
+                    }
+                )
+        result_body = {
+            key: copy.deepcopy(child)
+            for key, child in validated.items()
+            if key != "content_sha256"
+        }
+        result_body.update(relocated_rows)
+        result = {
+            **result_body,
+            "content_sha256": identity_sha256(result_body),
+        }
+        result_path = temporary / "compression_benchmark_result.json"
+        payload = (
+            json.dumps(
+                result,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        descriptor = os.open(
+            result_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o444,
+        )
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written < 1:
+                    raise OSError(
+                        "compression benchmark result publication made no progress"
+                    )
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.chmod(temporary / "warmups", 0o555)
+        os.chmod(temporary / "runs", 0o555)
+        os.chmod(temporary, 0o555)
+        descriptor = os.open(
+            temporary,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    except BaseException:
+        if temporary.exists():
+            for path in sorted(
+                temporary.rglob("*"),
+                key=lambda item: len(item.parts),
+                reverse=True,
+            ):
+                try:
+                    os.chmod(
+                        path,
+                        0o700 if path.is_dir() else 0o600,
+                    )
+                except OSError:
+                    pass
+            try:
+                os.chmod(temporary, 0o700)
+            except OSError:
+                pass
+            shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return validate_compact_preflight_compression_benchmark_result(
+        result,
+        reopen_artifacts=True,
+    )
+
+
 def validate_compact_preflight_compression_benchmark_result(
     value: Mapping[str, Any],
     *,
@@ -1021,6 +1365,7 @@ __all__ = [
     "COMPACT_PREFLIGHT_COMPRESSION_BENCHMARK_RESULT_SCHEMA",
     "COMPACT_PREFLIGHT_COMPRESSION_BENCHMARK_SCHEDULE_SCHEMA",
     "CompactPreflightCompressionBenchmarkConfig",
+    "publish_compact_preflight_compression_benchmark_result",
     "run_compact_preflight_compression_benchmark",
     "validate_compact_preflight_compression_benchmark_result",
 ]

@@ -17,6 +17,7 @@ from oci.inference.all_evidence_discovery_interfaces import MATCHED_PAIR_UPLIFT
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_bow_group_execution import (
     RoleNeutralBoWPhysicalGroupRequest,
     execute_role_neutral_bow_physical_group,
@@ -74,6 +75,7 @@ def _plan(gpu_ids=()):
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,
@@ -230,6 +232,9 @@ def _config(**overrides) -> RoleNeutralMatchedPairConfig:
         "htr_head_layer_norm": True,
         "htr_head_bias": True,
         "htr_extractor": _extractor_configuration(),
+        "replay_comparison_policy": "allclose_and_exact_discrete_state_v1",
+        "replay_relative_tolerance": 1e-4,
+        "replay_absolute_tolerance": 1e-5,
     }
     values.update(overrides)
     return RoleNeutralMatchedPairConfig(**values)

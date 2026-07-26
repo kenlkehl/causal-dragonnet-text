@@ -30,10 +30,12 @@ from oci.inference.production_stage1_scope_scheduler import (
     Stage1ScopePlan,
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 import oci.inference.production_stage1_scope_scheduler as scope_scheduler
 from oci.inference.review_spent_evidence_provider import (
     SpentOnlyFrozenChunkEmbeddingCache,
 )
+from oci.inference.stage1_exact_inner_evidence import row_order_fingerprint
 from oci.inference.role_neutral_embedding_group_execution import (
     EmbeddingContrastSpec,
     ExactHeldoutEmbeddingBatch,
@@ -92,6 +94,7 @@ def _plan(*, gpu_ids: tuple[int, ...] = ()):
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,
@@ -129,6 +132,7 @@ def _one_physical_group_plan() -> Stage1ScopePlan:
         global_seed=base.global_seed,
         review_rounds=base.review_rounds,
         initial_training_partitions=base.initial_training_partitions,
+        physical_fit_identity=base.physical_fit_identity,
         gpu_ids=base.gpu_ids,
         scope_workers_per_gpu=base.scope_workers_per_gpu,
         scopes=members,
@@ -139,6 +143,7 @@ def _one_physical_group_plan() -> Stage1ScopePlan:
         global_seed=base.global_seed,
         review_rounds=base.review_rounds,
         initial_training_partitions=base.initial_training_partitions,
+        physical_fit_identity=base.physical_fit_identity,
         gpu_ids=base.gpu_ids,
         scope_workers_per_gpu=base.scope_workers_per_gpu,
         scopes=members,
@@ -610,7 +615,7 @@ def _preflight_and_states(
         "schema_version": "production_stage1_embedding_cluster_fit_identity_v2",
         "scope_id": request.physical_owner.scope_id,
         "fit_row_ids": list(rows),
-        "fit_row_order_fingerprint": _sha256_json(list(rows)),
+        "fit_row_order_fingerprint": row_order_fingerprint(rows),
         "canonical_group_seed": request.physical_owner.scope_seed,
         "ordered_fit_row_seed_policy": (
             "canonical_ordered_fit_rows_group_seed_v1"
@@ -674,11 +679,11 @@ def _preflight_and_states(
         "context_epoch": request.physical_owner.context_epoch,
         "provider_inner_fold": request.physical_owner.provider_inner_fold,
         "fit_row_count": len(rows),
-        "fit_row_order_fingerprint": _sha256_json(list(rows)),
+        "fit_row_order_fingerprint": row_order_fingerprint(rows),
         "canonical_group_seed": request.physical_owner.scope_seed,
         "heldout_row_count": len(request.physical_owner.heldout_row_ids),
-        "heldout_row_order_fingerprint": _sha256_json(
-            list(request.physical_owner.heldout_row_ids)
+        "heldout_row_order_fingerprint": row_order_fingerprint(
+            request.physical_owner.heldout_row_ids
         ),
         "token_bounded_row_count": 0,
         "uncapped_semantic_projection": True,
@@ -962,12 +967,14 @@ def test_cluster_state_bundle_seals_every_physical_owner_once_and_fails_closed(
     payload = bytearray(array_path.read_bytes())
     payload[-1] ^= 1
     array_path.write_bytes(payload)
+    lazily_reopened = load_canonical_clustered_preflight_state_bundle(
+        manifest_path=bundle.root / "cluster_state_bundle_manifest.json",
+        preflight=preflight,
+        plan=plan,
+    )
+    assert set(lazily_reopened.states) == {owner_id}
     with pytest.raises((ValueError, RuntimeError), match="cluster state array|array"):
-        load_canonical_clustered_preflight_state_bundle(
-            manifest_path=bundle.root / "cluster_state_bundle_manifest.json",
-            preflight=preflight,
-            plan=plan,
-        )
+        lazily_reopened.load_state_for_owner(owner_id)
 
 
 def test_all_three_families_seal_before_exact_loader_and_replay(tmp_path: Path):

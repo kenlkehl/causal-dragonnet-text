@@ -716,9 +716,9 @@ def _validate_portable_stage1_handoff_binding(
         or binding.get("logical_scope_count") != bundle.get("logical_scope_count")
         or binding.get("deduplicated_fit_count")
         != int(bundle["logical_scope_count"]) - int(bundle["physical_fit_count"])
-        or binding.get("productive_compute_canary_completed") is not True
-        or binding.get("selected_canary_replica_adopted_as_production") is not True
-        or binding.get("compute_canary_scientific_equality") is not True
+        or binding.get("productive_compute_canary_completed") is not False
+        or binding.get("selected_canary_replica_adopted_as_production") is not False
+        or binding.get("compute_canary_scientific_equality") is not None
         or binding.get("legacy_bundle_build_invoked") is not False
         or binding.get("all_ten_role_neutral_execution_is_exclusive_evidence_source") is not True
         or binding.get("stage2_loader_validation")

@@ -30,6 +30,7 @@ from oci.inference.production_stage1_role_neutral_execution import (
     execute_and_publish_role_neutral_stage1,
 )
 from oci.inference.role_neutral_all_ten_binding import (
+    EXPECTED_COMPONENT_FAMILIES,
     validate_authenticated_role_neutral_component_receipt,
 )
 
@@ -43,7 +44,7 @@ from tests.test_production_stage1_role_neutral_execution import (
 def _fake_spawn_owner_worker(*, task, worker_parameters):
     if worker_parameters != {"test_token": "mixed-seed-isolation"}:
         raise ValueError("test worker parameters changed")
-    report = {
+    probe = {
         "pid": os.getpid(),
         "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
         "native_thread_environment": {
@@ -63,7 +64,14 @@ def _fake_spawn_owner_worker(*, task, worker_parameters):
         task=task,
         factories=_ProducerRecorder().factories().as_mapping(),
     )
-    return dataclasses.replace(result, execution_telemetry=report)
+    assert result.execution_telemetry is not None
+    return dataclasses.replace(
+        result,
+        execution_telemetry={
+            **dict(result.execution_telemetry),
+            **probe,
+        },
+    )
 
 
 def _must_not_execute_in_parent(_task):
@@ -95,6 +103,25 @@ def _scientific_by_owner(results):
         )
         for result in results
     }
+
+
+def _assert_reopened_cpu_component_intervals(report, *, owner_scope_id):
+    assert report["schema_version"] == (
+        "production_role_neutral_component_operational_reports_v2"
+    )
+    intervals = report["component_execution_intervals"]
+    assert len(intervals) == len(EXPECTED_COMPONENT_FAMILIES)
+    assert tuple(row["component"] for row in intervals) == tuple(
+        EXPECTED_COMPONENT_FAMILIES
+    )
+    assert all(
+        row["physical_owner_scope_id"] == owner_scope_id
+        and row["lane_kind"] == "cpu"
+        and row["resource_ids"] == ["host_cpu"]
+        and row["timestamps_measured_directly"] is True
+        and row["finished_monotonic_ns"] > row["started_monotonic_ns"]
+        for row in intervals
+    )
 
 
 def test_fresh_production_worker_reconstructs_sealed_context_without_prepare(
@@ -207,6 +234,10 @@ def test_mixed_owner_seeds_are_spawn_isolated_and_schedule_equal(
             assert report["python_hash_seed"] == str(
                 task.physical_owner.scope_seed
             )
+            _assert_reopened_cpu_component_intervals(
+                report,
+                owner_scope_id=owner,
+            )
         assert set(first_report["native_thread_environment"].values()) == {
             str(first["native_threads"])
         }
@@ -256,6 +287,7 @@ def test_persistent_slots_reseed_mixed_owners_and_cleanup(
     )
     executor = PersistentSpawnRoleNeutralPhysicalOwnerExecutor(
         max_workers_per_resource=2,
+        startup_timeout_seconds=30.0,
         worker_target=f"{__name__}:_fake_spawn_owner_worker",
         worker_parameters={"test_token": "mixed-seed-isolation"},
         production_worker_required=False,
@@ -311,6 +343,14 @@ def test_persistent_slots_reseed_mixed_owners_and_cleanup(
         assert second["slot_cpu_budget"] == 1
         first_report = first["worker_report"]
         second_report = second["worker_report"]
+        _assert_reopened_cpu_component_intervals(
+            first_report,
+            owner_scope_id=owner,
+        )
+        _assert_reopened_cpu_component_intervals(
+            second_report,
+            owner_scope_id=owner,
+        )
         assert (
             first_report["python_random"],
             first_report["numpy_random"],
@@ -336,6 +376,39 @@ def test_persistent_slots_reseed_mixed_owners_and_cleanup(
     )
 
 
+def test_persistent_slot_startup_timeout_terminates_live_child_and_cleans(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    component_parent = (tmp_path / "persistent_startup_timeout").resolve()
+    tasks = _tasks(plan, component_parent, count=1)
+    executor = PersistentSpawnRoleNeutralPhysicalOwnerExecutor(
+        max_workers_per_resource=1,
+        worker_target=f"{__name__}:_fake_spawn_owner_worker",
+        worker_parameters={"test_token": "mixed-seed-isolation"},
+        production_worker_required=False,
+        poll_interval_seconds=0.0001,
+        startup_timeout_seconds=0.0001,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="slot did not authenticate in time",
+    ):
+        executor.execute(
+            tasks=tasks,
+            worker=_must_not_execute_in_parent,
+            max_workers=1,
+            cpu_budget=1,
+        )
+
+    assert not tuple(
+        component_parent.glob(
+            ".persistent-process-group-*.json"
+        )
+    )
+
+
 def test_persistent_session_reuses_one_slot_across_executor_calls(
     tmp_path: Path,
 ) -> None:
@@ -347,6 +420,7 @@ def test_persistent_session_reuses_one_slot_across_executor_calls(
     marker_root = (tmp_path / "persistent_session_markers").resolve()
     executor = PersistentSpawnRoleNeutralPhysicalOwnerExecutor(
         max_workers_per_resource=1,
+        startup_timeout_seconds=30.0,
         worker_target=f"{__name__}:_fake_spawn_owner_worker",
         worker_parameters={"test_token": "mixed-seed-isolation"},
         production_worker_required=False,
@@ -509,6 +583,7 @@ def test_productive_canary_and_production_share_persistent_session(
     plan = _plan(gpu_ids=())
     executor = PersistentSpawnRoleNeutralPhysicalOwnerExecutor(
         max_workers_per_resource=2,
+        startup_timeout_seconds=30.0,
         worker_target=f"{__name__}:_fake_spawn_owner_worker",
         worker_parameters={"test_token": "mixed-seed-isolation"},
         production_worker_required=False,

@@ -5,9 +5,12 @@ The canary deliberately executes the production legacy scientific worker,
 descriptor.  The two replicas have the same scope, seed, model/profile inputs,
 and scientific attempt identity.  Only their operational CUDA device differs.
 
-PID, timing, GPU assignment, and resource telemetry are kept outside the
-scientific comparison.  Success requires independently authenticated fragment
-accumulators and artifact inventories to be byte-identical.
+PID, timing, direct GPU assignment, and resource telemetry are kept outside
+the within-descriptor scientific comparison.  Legacy descriptor, request, and
+plan hashes remain deployment-specific provenance, so this canary makes no
+cross-descriptor device-neutrality claim.  Success requires independently
+authenticated fragment accumulators and artifact inventories to be
+byte-identical.
 """
 
 from __future__ import annotations
@@ -55,17 +58,17 @@ from .production_stage1_scope_scheduler import (
 from .production_source_snapshot import validate_production_source_snapshot
 
 
-STAGE1_DUAL_GPU_CANARY_REQUEST_SCHEMA = "production_stage1_dual_gpu_canary_request_v2"
-STAGE1_DUAL_GPU_CANARY_REPLICA_SCHEMA = "production_stage1_dual_gpu_canary_replica_v2"
+STAGE1_DUAL_GPU_CANARY_REQUEST_SCHEMA = "production_stage1_dual_gpu_canary_request_v3"
+STAGE1_DUAL_GPU_CANARY_REPLICA_SCHEMA = "production_stage1_dual_gpu_canary_replica_v3"
 STAGE1_DUAL_GPU_CANARY_RESOURCE_LEDGER_SCHEMA = (
     "production_stage1_dual_gpu_canary_resource_ledger_v2"
 )
-STAGE1_DUAL_GPU_CANARY_MANIFEST_SCHEMA = "production_stage1_dual_gpu_canary_manifest_v2"
+STAGE1_DUAL_GPU_CANARY_MANIFEST_SCHEMA = "production_stage1_dual_gpu_canary_manifest_v3"
 STAGE1_DUAL_GPU_CANARY_SCIENTIFIC_IDENTITY_SCHEMA = (
     "production_stage1_dual_gpu_canary_scientific_identity_v2"
 )
 STAGE1_DUAL_GPU_CANARY_TEST_DESCRIPTOR_SCHEMA = (
-    "production_stage1_dual_gpu_canary_test_descriptor_v2"
+    "production_stage1_dual_gpu_canary_test_descriptor_v3"
 )
 SOURCE_SNAPSHOT_EXECUTION_ENV = "OCI_PRODUCTION_SOURCE_SNAPSHOT_SHA256"
 
@@ -314,8 +317,8 @@ class Stage1DualGpuCanaryOptions:
     descriptor_manifest_path: Path
     source_snapshot_root: Path
     output_root: Path
+    gpu_ids: tuple[int, int]
     scope_id: str = "outer_001_full"
-    gpu_ids: tuple[int, int] = (0, 1)
     resource_poll_seconds: float = 5.0
     maximum_reservation_fraction: float = 0.85
     minimum_headroom_bytes: int = _DEFAULT_MINIMUM_HEADROOM_BYTES
@@ -337,8 +340,18 @@ class _DescriptorBinding:
     stage1_request_sha256: str
     plan_content_sha256: str
     scope: Mapping[str, Any]
-    assignment: Mapping[str, Any]
+    configured_assignment: Mapping[str, Any]
+    replica_logical_gpu_id: int
     descriptor: Any | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.replica_logical_gpu_id) is not int
+            or self.replica_logical_gpu_id != 0
+        ):
+            raise ValueError(
+                "isolated canary descriptors must attest replica-local GPU ID zero"
+            )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -348,16 +361,32 @@ class _DescriptorBinding:
             "stage1_request_sha256": self.stage1_request_sha256,
             "plan_content_sha256": self.plan_content_sha256,
             "scope": copy.deepcopy(dict(self.scope)),
-            "logical_assignment": copy.deepcopy(dict(self.assignment)),
+            "configured_assignment": copy.deepcopy(
+                dict(self.configured_assignment)
+            ),
+            "replica_logical_gpu_id": int(self.replica_logical_gpu_id),
         }
+
+
+@dataclass(frozen=True)
+class _CanaryReplicaExecutionRequest(Stage1ScopeExecutionRequest):
+    """Preserve configured authority while exposing one replica-local CUDA ID."""
+
+    @property
+    def gpu_id(self) -> int:
+        return 0
 
 
 def _validate_options(options: Stage1DualGpuCanaryOptions) -> None:
     if not isinstance(options, Stage1DualGpuCanaryOptions):
         raise TypeError("options must be Stage1DualGpuCanaryOptions")
-    if len(options.gpu_ids) != 2 or len(set(map(int, options.gpu_ids))) != 2:
+    if (
+        len(options.gpu_ids) != 2
+        or any(type(gpu_id) is not int for gpu_id in options.gpu_ids)
+        or len(set(options.gpu_ids)) != 2
+    ):
         raise ValueError("the reproducibility canary requires exactly two distinct GPUs")
-    if any(int(gpu_id) < 0 for gpu_id in options.gpu_ids):
+    if any(gpu_id < 0 for gpu_id in options.gpu_ids):
         raise ValueError("canary GPU IDs must be nonnegative")
     if not options.scope_id:
         raise ValueError("canary scope_id cannot be empty")
@@ -446,10 +475,14 @@ def _descriptor_binding(
             expected_scope_id=options.scope_id,
             retain_embedding_cache=False,
         )
-        if int(descriptor.assignment.gpu_id) != 0:
+        configured_gpu_id = descriptor.assignment.gpu_id
+        if (
+            type(configured_gpu_id) is not int
+            or configured_gpu_id not in options.gpu_ids
+        ):
             raise ValueError(
-                "the dual-GPU canary descriptor must use logical cuda:0; "
-                "physical GPU selection is isolated through CUDA visibility"
+                "the dual-GPU canary descriptor assignment is not in the "
+                "configured canary GPU inventory"
             )
         if int(descriptor.scope.global_seed) != int(options.seed):
             raise ValueError("canary seed differs from the descriptor global seed")
@@ -460,7 +493,8 @@ def _descriptor_binding(
             stage1_request_sha256=request_sha,
             plan_content_sha256=descriptor.plan_content_sha256,
             scope=descriptor.scope.as_dict(),
-            assignment=descriptor.assignment.as_dict(),
+            configured_assignment=descriptor.assignment.as_dict(),
+            replica_logical_gpu_id=0,
             descriptor=descriptor,
         )
     if (
@@ -487,6 +521,11 @@ def _descriptor_binding(
     )
     scope = manifest.get("scope")
     assignment = manifest.get("assignment")
+    configured_gpu_id = (
+        assignment.get("gpu_id")
+        if isinstance(assignment, Mapping)
+        else None
+    )
     if (
         not isinstance(scope, Mapping)
         or scope.get("scope_id") != options.scope_id
@@ -494,9 +533,16 @@ def _descriptor_binding(
         or int(scope.get("global_seed", -1)) != int(options.seed)
         or not isinstance(assignment, Mapping)
         or assignment.get("scope_id") != options.scope_id
-        or int(assignment.get("gpu_id", -1)) != 0
     ):
         raise ValueError("test canary descriptor has an invalid scope")
+    if (
+        type(configured_gpu_id) is not int
+        or configured_gpu_id not in options.gpu_ids
+    ):
+        raise ValueError(
+            "the test canary descriptor assignment is not in the "
+            "configured canary GPU inventory"
+        )
     return _DescriptorBinding(
         manifest_path=manifest_path,
         manifest_sha256=digest,
@@ -504,7 +550,8 @@ def _descriptor_binding(
         stage1_request_sha256=request_sha,
         plan_content_sha256=plan_sha,
         scope=copy.deepcopy(dict(scope)),
-        assignment=copy.deepcopy(dict(assignment)),
+        configured_assignment=copy.deepcopy(dict(assignment)),
+        replica_logical_gpu_id=0,
         descriptor=None,
     )
 
@@ -516,13 +563,13 @@ def _build_request(
     descriptor: _DescriptorBinding,
 ) -> dict[str, Any]:
     scientific_body = {
-        "schema_version": "production_stage1_dual_gpu_canary_scientific_request_v2",
+        "schema_version": "production_stage1_dual_gpu_canary_scientific_request_v3",
+        "comparison_domain": "same_authenticated_descriptor_only_v1",
         "source_snapshot_content_sha256": snapshot["content_sha256"],
         "descriptor_manifest_sha256": descriptor.manifest_sha256,
         "stage1_request_sha256": descriptor.stage1_request_sha256,
         "plan_content_sha256": descriptor.plan_content_sha256,
         "scope": copy.deepcopy(dict(descriptor.scope)),
-        "logical_assignment": copy.deepcopy(dict(descriptor.assignment)),
         "worker_target": options.worker_target,
         "global_seed": int(options.seed),
         "determinism_policy": stage1_torch_determinism_policy(),
@@ -605,14 +652,14 @@ def _replica_request(
 ) -> Stage1ScopeExecutionRequest:
     del physical_gpu_id
     parameters = _replica_worker_parameters(options=options, descriptor=descriptor)
-    return Stage1ScopeExecutionRequest(
+    return _CanaryReplicaExecutionRequest(
         attempt_dir=str(root),
         plan_content_sha256=descriptor.plan_content_sha256,
         scope=copy.deepcopy(dict(descriptor.scope)),
-        # This authenticated logical assignment is deliberately identical in
-        # both replicas.  The parent maps logical cuda:0 onto a different
-        # physical GPU for each child through CUDA_VISIBLE_DEVICES.
-        assignment=copy.deepcopy(dict(descriptor.assignment)),
+        # Preserve the descriptor's authenticated configured assignment.  The
+        # private request subclass exposes replica-local gpu_id 0 only at the
+        # runtime device boundary after CUDA_VISIBLE_DEVICES isolation.
+        assignment=copy.deepcopy(dict(descriptor.configured_assignment)),
         worker_target=options.worker_target,
         worker_parameters=parameters,
         worker_parameters_sha256=_sha256_json(parameters),
@@ -1171,7 +1218,7 @@ def _validate_replica(
         != request.worker_parameters_sha256
         or manifest.get("physical_gpu_id") != int(gpu_id)
         or manifest.get("logical_gpu_id")
-        != int(descriptor.assignment["gpu_id"])
+        != int(descriptor.replica_logical_gpu_id)
         or manifest.get("heldout_labels_supplied") is not False
         or manifest.get("determinism_policy") != stage1_torch_determinism_policy()
     ):
@@ -1204,7 +1251,7 @@ def _validate_replica(
         != "production_stage1_dual_gpu_canary_worker_result_v2"
         or worker_result.get("physical_gpu_id") != int(gpu_id)
         or worker_result.get("logical_gpu_id")
-        != int(descriptor.assignment["gpu_id"])
+        != int(descriptor.replica_logical_gpu_id)
         or not isinstance(worker_result.get("elapsed_seconds"), (int, float))
         or isinstance(worker_result.get("elapsed_seconds"), bool)
         or not math.isfinite(float(worker_result["elapsed_seconds"]))

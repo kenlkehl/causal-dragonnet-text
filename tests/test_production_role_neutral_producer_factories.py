@@ -31,6 +31,7 @@ from oci.inference.production_stage1_role_neutral_execution import (
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_bow_group_execution import (
     AuthenticatedRoleNeutralBoWNuisanceBank,
 )
@@ -99,6 +100,7 @@ def _plan():
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         review_rounds=2,
         initial_training_partitions=3,
@@ -457,7 +459,15 @@ def test_builder_binds_matched_and_embedding_to_prior_bow_without_heldout_labels
         text_column="text",
         treatment_column="treatment",
         outcome_column="outcome",
+        architecture=SimpleNamespace(
+            multi_model_forest=SimpleNamespace(
+                bow_fold_parallelism="3",
+                fold_parallelism="auto",
+                bow_parallel_backend="threads",
+            )
+        ),
     )
+    prepared.options = SimpleNamespace(num_workers=8)
     prepared.registry = {}
     prepared.registry_content_sha256 = "a" * 64
     prepared.embedding_cache_identity = {}
@@ -469,6 +479,9 @@ def test_builder_binds_matched_and_embedding_to_prior_bow_without_heldout_labels
 
     bindings = SimpleNamespace(
         bow_views=(),
+        bow_nuisance_folds=5,
+        bow_effect_folds=5,
+        bow_e_clip=0.01,
         matched_pair=object(),
         embedding=object(),
         embedding_target_sources={
@@ -483,6 +496,7 @@ def test_builder_binds_matched_and_embedding_to_prior_bow_without_heldout_labels
         },
     )
     bank_loads = []
+    bow_calls = []
     matched_calls = []
     embedding_calls = []
 
@@ -510,6 +524,21 @@ def test_builder_binds_matched_and_embedding_to_prior_bow_without_heldout_labels
         factories_module,
         "_htr_extractor_factory",
         lambda **_kwargs: object(),
+    )
+
+    def execute_bow(**kwargs):
+        bow_calls.append(kwargs)
+        return {"bow": True}
+
+    monkeypatch.setattr(
+        factories_module,
+        "execute_role_neutral_bow_physical_group",
+        execute_bow,
+    )
+    monkeypatch.setattr(
+        factories_module,
+        "authenticate_role_neutral_bow_component",
+        lambda **_kwargs: "bow-receipt",
     )
 
     def execute_matched(**kwargs):
@@ -577,6 +606,15 @@ def test_builder_binds_matched_and_embedding_to_prior_bow_without_heldout_labels
         "neural_query",
     )
     parent = tmp_path / "components"
+    bow_invocation = RoleNeutralComponentInvocation(
+        plan=plan,
+        physical_owner=owner,
+        logical_members=members,
+        component="bow",
+        output_root=parent / "bow",
+        resource="cpu",
+        owner_cpu_budget=4,
+    )
     matched_invocation = RoleNeutralComponentInvocation(
         plan=plan,
         physical_owner=owner,
@@ -594,6 +632,9 @@ def test_builder_binds_matched_and_embedding_to_prior_bow_without_heldout_labels
         resource="cpu",
     )
 
+    bow = factories.bow(bow_invocation)
+    assert bow.execute() == {"bow": True}
+    assert bow.authenticate() == "bow-receipt"
     matched = factories.matched_pair(matched_invocation)
     assert matched.execute() == {"matched": True}
     assert matched.authenticate() == "matched-receipt"
@@ -605,6 +646,9 @@ def test_builder_binds_matched_and_embedding_to_prior_bow_without_heldout_labels
         parent / "bow",
         parent / "bow",
     ]
+    assert bow_calls[0]["bow_fold_parallelism"] == "3"
+    assert bow_calls[0]["bow_parallel_backend"] == "threads"
+    assert bow_calls[0]["owner_cpu_budget"] == 4
     assert matched_calls[0]["nuisance_bank"] is bank
     assert embedding_calls[0]["fit_targets"]["r"].shape == (
         owner.fit_row_count,

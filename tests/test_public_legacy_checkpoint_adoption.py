@@ -49,6 +49,7 @@ from tests.test_production_all_evidence_workflow import (
     _options,
     _with_run_control,
 )
+from tests.stage1_test_support import stage1_execution_profile
 
 
 class _Tokenizer:
@@ -181,17 +182,10 @@ def _typed_options(tmp_path: Path):
         forest_nuisance_outcome_max_features=None,
         forest_random_seed=None,
         portable_scientific_spec=spec.identity_payload(),
-        stage1_execution_profile=Stage1ExecutionProfile(
+        stage1_execution_profile=stage1_execution_profile(
             resource_kind="cpu",
             device_count=base.stage1_execution_device_count,
             scope_workers_per_device=base.stage1_scope_workers_per_gpu,
-            executor_mode="persistent_slots",
-            selection_method="operator_configured",
-            selected_candidate=None,
-            benchmark_result_sha256=None,
-            benchmark_result_locator=None,
-            benchmark_workload_deployment_sha256=None,
-            benchmark_workload_deployment_locator=None,
         ),
     )
 
@@ -463,11 +457,18 @@ def _write_minimal_legacy_preflight_candidate(root: Path) -> Path:
 def _representative_legacy_contexts():
     partitions = {
         fold: tuple(
-            tuple(f"{fold}{partition}{row}" for row in range(3)) for partition in range(1, 6)
+            tuple(
+                fold * 1_000 + partition * 10 + row
+                for row in range(3)
+            )
+            for partition in range(1, 6)
         )
         for fold in range(1, 6)
     }
-    heldout = {fold: tuple(f"h{fold}{row}" for row in range(3)) for fold in range(1, 6)}
+    heldout = {
+        fold: tuple(fold * 1_000 + 900 + row for row in range(3))
+        for fold in range(1, 6)
+    }
     return derive_logical_context_plan(
         outer_training_partitions=partitions,
         outer_heldout_rows=heldout,
@@ -894,11 +895,15 @@ def test_representative_v4_recompute_decision_is_closed_and_terminal(
 
 
 def test_legacy_v4_row_fingerprint_reconstructs_authentic_wrapped_shape() -> None:
-    values = ("10", "2", "30")
+    values = (10, 2, 30)
     assert legacy_migration_module._legacy_row_fingerprint(values) == identity_sha256(
         {"ordered_row_ids": [10, 2, 30]}
     )
     assert legacy_migration_module._legacy_row_fingerprint(values) != identity_sha256([10, 2, 30])
+    with pytest.raises(TypeError, match="exact integer"):
+        legacy_migration_module._legacy_row_fingerprint(("10", 2, 30))
+    with pytest.raises(TypeError, match="exact integer"):
+        legacy_migration_module._legacy_row_fingerprint((True, 2, 30))
 
 
 def test_representative_v4_rejects_noncumulative_order_drift(

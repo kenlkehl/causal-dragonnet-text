@@ -147,6 +147,7 @@ from .frozen_hierarchical_review_evidence import (
     freeze_hierarchical_review_evidence,
 )
 from .first_untouched_gate_direct_numerical_preparation import (
+    FirstUntouchedGatePreparationBounds,
     prepare_first_untouched_gate_direct_numerical,
 )
 from .first_gate_materialization_contract import (
@@ -156,6 +157,7 @@ from .first_gate_materialization_contract import (
 from .hierarchical_all_architecture_discovery import HierarchicalDiscoveryConfig
 from .hierarchical_discovery_job_cache import (
     AuthenticatedHierarchicalDiscoveryJobCache,
+    HierarchicalDiscoveryJobCacheConfig,
 )
 from .lossless_stage1_evidence_catalog import (
     DEFAULT_MAX_ATOMS_PER_ARCHITECTURE_CHUNK,
@@ -3592,11 +3594,9 @@ class AllEvidenceFusionRunnerConfig:
     final_upstream_meta_inner_folds: int = 3
     final_upstream_head_regularization: float = 1.0
     require_registry_seal: bool = True
-    include_tfidf_orphan_ngrams: bool = True
+    include_tfidf_orphan_ngrams: bool = False
     require_tfidf_orphan_ngrams: bool = False
-    orphan_ngram_adapter: OrphanNgramEvidenceAdapterConfig = field(
-        default_factory=OrphanNgramEvidenceAdapterConfig
-    )
+    orphan_ngram_adapter: OrphanNgramEvidenceAdapterConfig | None = None
     derive_sparse_query_moments_when_missing: bool = False
     require_neural_query_moments: bool = False
     neural_query_moment_artifacts_by_fold: Mapping[
@@ -3608,6 +3608,29 @@ class AllEvidenceFusionRunnerConfig:
     )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.include_tfidf_orphan_ngrams, bool):
+            raise ValueError("include_tfidf_orphan_ngrams must be a boolean")
+        if not isinstance(self.require_tfidf_orphan_ngrams, bool):
+            raise ValueError("require_tfidf_orphan_ngrams must be a boolean")
+        if self.require_tfidf_orphan_ngrams and not self.include_tfidf_orphan_ngrams:
+            raise ValueError(
+                "require_tfidf_orphan_ngrams requires include_tfidf_orphan_ngrams"
+            )
+        if self.include_tfidf_orphan_ngrams:
+            if not isinstance(
+                self.orphan_ngram_adapter,
+                OrphanNgramEvidenceAdapterConfig,
+            ):
+                raise ValueError(
+                    "enabled TF-IDF orphan adaptation requires an explicit "
+                    "OrphanNgramEvidenceAdapterConfig"
+                )
+            self.orphan_ngram_adapter.validate()
+        elif self.orphan_ngram_adapter is not None:
+            raise ValueError(
+                "orphan_ngram_adapter must be null when TF-IDF orphan adaptation "
+                "is disabled"
+            )
         if not isinstance(self.fusion_enable_thinking, bool):
             raise ValueError("fusion_enable_thinking must be a boolean")
         maximum = self.fusion_max_tokens
@@ -5140,6 +5163,12 @@ class AllEvidenceFusionRunner:
         hierarchical_discovery_runner: MetadataJsonDiscoveryJobRunner | None = None,
         hierarchical_discovery_config: HierarchicalDiscoveryConfig | None = None,
         hierarchical_discovery_job_cache_root: Path | str | None = None,
+        hierarchical_discovery_job_cache_config: (
+            HierarchicalDiscoveryJobCacheConfig | None
+        ) = None,
+        first_untouched_gate_preparation_bounds: (
+            FirstUntouchedGatePreparationBounds | None
+        ) = None,
         hierarchical_discovery_approved_batch_sha256: str | None = None,
         hierarchical_review_evidence_policy: FrozenReviewEvidencePolicyBinding | None = None,
         hierarchical_preparation_dir: Path | str | None = None,
@@ -5276,6 +5305,12 @@ class AllEvidenceFusionRunner:
             if hierarchical_discovery_job_cache_root is None
             else Path(hierarchical_discovery_job_cache_root).resolve()
         )
+        self.hierarchical_discovery_job_cache_config = (
+            hierarchical_discovery_job_cache_config
+        )
+        self.first_untouched_gate_preparation_bounds = (
+            first_untouched_gate_preparation_bounds
+        )
         self.hierarchical_discovery_approved_batch_sha256 = (
             None
             if hierarchical_discovery_approved_batch_sha256 is None
@@ -5304,6 +5339,12 @@ class AllEvidenceFusionRunner:
         hierarchical_values = {
             "hierarchical_discovery_config": self.hierarchical_discovery_config,
             "hierarchical_discovery_job_cache_root": (self.hierarchical_discovery_job_cache_root),
+            "hierarchical_discovery_job_cache_config": (
+                self.hierarchical_discovery_job_cache_config
+            ),
+            "first_untouched_gate_preparation_bounds": (
+                self.first_untouched_gate_preparation_bounds
+            ),
             "hierarchical_discovery_approved_batch_sha256": (
                 self.hierarchical_discovery_approved_batch_sha256
             ),
@@ -5336,6 +5377,22 @@ class AllEvidenceFusionRunner:
             if self.hierarchical_discovery_job_cache_root is None:
                 raise ValueError(
                     "hierarchical discovery requires an explicit stable job cache root"
+                )
+            if not isinstance(
+                self.hierarchical_discovery_job_cache_config,
+                HierarchicalDiscoveryJobCacheConfig,
+            ):
+                raise TypeError(
+                    "hierarchical discovery requires a typed "
+                    "hierarchical_discovery_job_cache_config"
+                )
+            if not isinstance(
+                self.first_untouched_gate_preparation_bounds,
+                FirstUntouchedGatePreparationBounds,
+            ):
+                raise TypeError(
+                    "hierarchical discovery requires typed "
+                    "first_untouched_gate_preparation_bounds"
                 )
             if not isinstance(
                 self.hierarchical_review_evidence_policy,
@@ -6368,7 +6425,8 @@ class AllEvidenceFusionRunner:
                 schema="architecture_chunk_plan_preparation_envelope_v1",
             )
             job_cache = AuthenticatedHierarchicalDiscoveryJobCache(
-                root=(self.hierarchical_discovery_job_cache_root / f"outer_fold_{outer_fold:03d}")
+                root=(self.hierarchical_discovery_job_cache_root / f"outer_fold_{outer_fold:03d}"),
+                config=self.hierarchical_discovery_job_cache_config,
             )
             agent = ApprovedHierarchicalDiscoveryAgent(
                 catalog=catalog,
@@ -6551,6 +6609,9 @@ class AllEvidenceFusionRunner:
                 "outer_fold": int(outer_fold),
                 "model_inference_performed": False,
             }
+        adapter_config = self.config.orphan_ngram_adapter
+        if not isinstance(adapter_config, OrphanNgramEvidenceAdapterConfig):
+            raise RuntimeError("enabled TF-IDF orphan adapter lost its explicit config")
 
         original_reference = _effect_ngram_registration(full_row)
         registry_entry = self.tfidf_orphan_artifacts_by_fold.get(int(outer_fold))
@@ -6615,7 +6676,7 @@ class AllEvidenceFusionRunner:
             effect_path,
             artifact_base_dir=self.tfidf_handoff_path.parent,
             expected_sha256=expected_sha256,
-            config=self.config.orphan_ngram_adapter,
+            config=adapter_config,
         )
         audit = adapted.audit
         audit["artifact_resolution"] = resolution
@@ -9829,7 +9890,8 @@ class AllEvidenceFusionRunner:
                         root=(
                             self.hierarchical_discovery_job_cache_root
                             / f"outer_fold_{outer_fold:03d}"
-                        )
+                        ),
+                        config=self.hierarchical_discovery_job_cache_config,
                     )
                     try:
                         adaptive_execution = adaptive_builder.execute_authenticated(
@@ -10778,6 +10840,9 @@ class AllEvidenceFusionRunner:
                             provider=shared_provider,
                             destination=(
                                 attempt_dir / "first_gate_direct_upstream_numerical_manifest.json"
+                            ),
+                            bounds=(
+                                self.first_untouched_gate_preparation_bounds
                             ),
                         )
                         materialized.verify()
@@ -11875,7 +11940,11 @@ class AllEvidenceFusionRunner:
             "tfidf_orphan_ngram_evidence": {
                 "enabled": self.config.include_tfidf_orphan_ngrams,
                 "required": self.config.require_tfidf_orphan_ngrams,
-                "adapter_config": asdict(self.config.orphan_ngram_adapter),
+                "adapter_config": (
+                    None
+                    if self.config.orphan_ngram_adapter is None
+                    else asdict(self.config.orphan_ngram_adapter)
+                ),
                 "explicit_per_fold_registry": {
                     str(fold): {
                         "path": str(artifact.path),

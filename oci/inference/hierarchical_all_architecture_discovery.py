@@ -109,7 +109,6 @@ _HIERARCHICAL_DISCOVERY_IMPLEMENTATION_BUNDLE_FILES = (
     "lossless_stage1_evidence_catalog.py",
 )
 MAX_DISCOVERY_RESPONSE_REPAIR_ATTEMPTS = 1
-MAX_DIRECT_CONSOLIDATION_CANDIDATES = 8
 STRICT_JSON_PARSE_FAILURE = "strict_json_parse_failure"
 LOCAL_JSON_SCHEMA_VALIDATION_FAILURE = "local_json_schema_validation_failure"
 RAW_TRANSPORT_BUDGET_FAILURE = "raw_transport_budget_failure"
@@ -5016,7 +5015,15 @@ class HierarchicalAllArchitectureDiscoveryOrchestrator:
             chunk_candidate_tuple = tuple(chunk_candidates)
             interpretation_job_ids = tuple(job.job_id for job in interpret_jobs)
             interpretation_response_sha256 = tuple(_sha(row) for row in interpretations)
-            if len(chunk_candidate_tuple) <= MAX_DIRECT_CONSOLIDATION_CANDIDATES:
+            # Whether one architecture can be consolidated in a single model
+            # request is part of the authenticated scientific wire budget.
+            # Reusing that configured capacity avoids a hidden, source-level
+            # candidate-count threshold while retaining the lossless paged
+            # path whenever the complete candidate set does not fit.
+            if (
+                len(chunk_candidate_tuple)
+                <= self.config.wire_budget.max_definition_fold_inputs
+            ):
                 consolidation_job = self._create_job(
                     job_kind=CONSOLIDATE_ARCHITECTURE_JOB,
                     scope=family,

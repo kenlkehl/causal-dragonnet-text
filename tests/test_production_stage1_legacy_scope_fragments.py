@@ -28,6 +28,7 @@ from oci.inference.production_stage1_legacy_scope_fragments import (
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 
 _REGISTRY_SHA = "a" * 64
 _REQUEST_SHA = "b" * 64
@@ -64,6 +65,7 @@ def _plan(*, gpu_ids: tuple[int, ...] = (0, 1)):
         registry=_registry(),
         registry_content_sha256=_REGISTRY_SHA,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,

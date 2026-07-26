@@ -7,6 +7,7 @@ import pytest
 
 from oci.inference.compact_preflight_compression_benchmark import (
     CompactPreflightCompressionBenchmarkConfig,
+    publish_compact_preflight_compression_benchmark_result,
     run_compact_preflight_compression_benchmark,
     validate_compact_preflight_compression_benchmark_result,
 )
@@ -94,6 +95,33 @@ def test_benchmark_measures_both_codecs_and_requires_scientific_equality(
     assert validate_compact_preflight_compression_benchmark_result(
         result,
     ) == result
+    published_root = (tmp_path / "durable_compression_evidence").resolve()
+    published = publish_compact_preflight_compression_benchmark_result(
+        result,
+        output_root=published_root,
+    )
+    assert published["content_sha256"] != result["content_sha256"]
+    assert (
+        published["selected_parquet_compression"]
+        == result["selected_parquet_compression"]
+    )
+    assert all(
+        Path(row["artifact_manifest_path"]).is_relative_to(
+            published_root
+        )
+        for row in (
+            *published["warmup_observations"],
+            *published["measured_observations"],
+        )
+    )
+    assert validate_compact_preflight_compression_benchmark_result(
+        published,
+    ) == published
+    with pytest.raises(FileExistsError, match="must be fresh"):
+        publish_compact_preflight_compression_benchmark_result(
+            result,
+            output_root=published_root,
+        )
 
     changed = copy.deepcopy(result)
     changed["measured_observations"][0][

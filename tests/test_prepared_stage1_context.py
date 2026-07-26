@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import oci.inference.prepared_stage1_context as context_module
+import oci.inference.production_all_evidence_workflow as workflow_module
 import oci.inference.production_stage1_cluster_preflight_artifact as preflight_module
 from oci.inference.prepared_stage1_context import (
     PREPARED_STAGE1_CONTEXT_LOCATOR_SCHEMA,
@@ -25,6 +26,7 @@ from oci.inference.production_role_neutral_process_executor import (
     _option_mapping,
 )
 from oci.inference.production_stage1_bundle import Stage1BundleBuildOptions
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 
 
 def _request(*, dataset_path: str, runtime_root: str) -> dict:
@@ -58,6 +60,7 @@ def _options(tmp_path: Path, prefix: str) -> dict:
         output_dir=root / "output",
         unit_id_column="person_id",
         initial_training_partitions=3,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         query_config_path=root / "query.json",
         cluster_preflight_manifest_path=root / "preflight.json",
         cluster_preflight_state_bundle_manifest_path=root / "state.json",
@@ -181,6 +184,69 @@ def test_context_directory_is_byte_relocatable_and_tamper_fails(
         )
     _make_writable(original.root)
     _make_writable(moved_root)
+
+
+def test_cross_filesystem_phase_publication_preserves_immutable_context_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt = (tmp_path / "scratch" / "attempt").resolve()
+    attempt.mkdir(parents=True)
+    original = context_module._publish_prepared_stage1_context_payloads(
+        root=(attempt / "prepared_stage1_context").resolve(),
+        scientific=_scientific(),
+        locator=_locator(tmp_path, "cross-device"),
+    )
+    artifacts = workflow_module._attempt_tree_artifacts(attempt)
+    durable_root = (tmp_path / "durable").resolve()
+    source = attempt.resolve(strict=True)
+
+    real_stat = workflow_module.os.stat
+
+    def different_source_device(path, *args, **kwargs):
+        observed = real_stat(path, *args, **kwargs)
+        if os.fspath(path) == os.fspath(source):
+            fields = list(observed)
+            fields[2] = int(observed.st_dev) + 1
+            return os.stat_result(fields)
+        return observed
+
+    monkeypatch.setattr(workflow_module.os, "stat", different_source_device)
+
+    real_rmtree = workflow_module.shutil.rmtree
+    cleanup_calls = 0
+
+    def cleanup_then_report_failure(path, *args, **kwargs):
+        nonlocal cleanup_calls
+        real_rmtree(path, *args, **kwargs)
+        cleanup_calls += 1
+        raise PermissionError("simulated post-commit cleanup report")
+
+    monkeypatch.setattr(
+        workflow_module.shutil,
+        "rmtree",
+        cleanup_then_report_failure,
+    )
+
+    published, _counters, _stats = workflow_module._publish_attempt_tree(
+        attempt_dir=attempt,
+        durable_phase_root=durable_root,
+        artifacts=artifacts,
+    )
+
+    assert cleanup_calls == 1
+    assert not attempt.exists()
+    published_context = published / "prepared_stage1_context"
+    assert stat.S_IMODE(os.lstat(published_context).st_mode) == 0o555
+    assert {
+        stat.S_IMODE(os.lstat(child).st_mode)
+        for child in published_context.iterdir()
+    } == {0o444}
+    reopened = load_prepared_stage1_context(
+        published_context / PREPARED_STAGE1_CONTEXT_MANIFEST_NAME
+    )
+    assert reopened.content_root_sha256 == original.content_root_sha256
+    _make_writable(reopened.root)
 
 
 def test_context_rehydration_source_cannot_call_monolithic_prepare() -> None:

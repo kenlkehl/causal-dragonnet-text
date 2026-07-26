@@ -18,6 +18,10 @@ from tests.semantic_witness_test_support import (
     semantic_witness_config,
     semantic_witness_mapping,
 )
+from tests.hierarchy_resource_test_support import (
+    FIRST_UNTOUCHED_GATE_BOUNDS,
+    HIERARCHY_JOB_CACHE_CONFIG,
+)
 
 
 def _all_architecture_applied_config_payload():
@@ -97,6 +101,8 @@ def _args(
         "2",
         "--extraction-max-text-length",
         "400000",
+        "--final-upstream-max-orphan-features",
+        "32",
         *review_values,
         *extra,
     ]
@@ -104,12 +110,24 @@ def _args(
 
 
 def _hierarchical_args(tmp_path: Path, *extra: str):
+    resource_values = [
+        "--hierarchical-job-cache-max-entry-bytes",
+        str(HIERARCHY_JOB_CACHE_CONFIG.max_entry_bytes),
+    ]
+    for name, value in asdict(FIRST_UNTOUCHED_GATE_BOUNDS).items():
+        resource_values.extend(
+            (
+                "--first-untouched-gate-" + name.replace("_", "-"),
+                str(value),
+            )
+        )
     return _args(
         tmp_path,
         "--discovery-mode",
         cli._HIERARCHICAL_DISCOVERY_MODE,
         "--hierarchical-preparation-dir",
         str(tmp_path / "hierarchical_preparation"),
+        *resource_values,
         *extra,
     )
 
@@ -118,6 +136,22 @@ def test_benchmark_parser_defaults_to_hierarchical_initial_discovery():
     assert cli.build_parser().get_default("discovery_mode") == cli._HIERARCHICAL_DISCOVERY_MODE
     assert cli.build_parser().get_default("hierarchical_max_atoms_per_chunk") == 2
     assert cli.build_parser().get_default("hierarchical_max_semantic_member_ids_per_chunk") == 3
+
+
+def test_hierarchical_runtime_requires_explicit_cache_and_gate_resource_bounds(
+    tmp_path: Path,
+) -> None:
+    args = _hierarchical_args(tmp_path)
+    cli._validate_discovery_cli_mode(args)
+
+    args.hierarchical_job_cache_max_entry_bytes = None
+    with pytest.raises(ValueError, match="explicit resource bounds"):
+        cli._validate_discovery_cli_mode(args)
+
+    args = _hierarchical_args(tmp_path)
+    args.first_untouched_gate_max_total_text_utf8_bytes = 0
+    with pytest.raises(ValueError, match="positive integers"):
+        cli._validate_discovery_cli_mode(args)
 
 
 def test_hierarchical_semantic_member_cap_is_bound_into_adaptive_review_policy(tmp_path):
@@ -725,6 +759,14 @@ def test_hierarchical_prepare_only_uses_strict_json_runner_without_remote_call(
             assert kwargs["hierarchical_preparation_dir"] == preparation_dir
             assert kwargs["hierarchical_discovery_job_cache_root"] == job_cache_root
             assert (
+                kwargs["hierarchical_discovery_job_cache_config"]
+                == HIERARCHY_JOB_CACHE_CONFIG
+            )
+            assert (
+                kwargs["first_untouched_gate_preparation_bounds"]
+                == FIRST_UNTOUCHED_GATE_BOUNDS
+            )
+            assert (
                 kwargs["hierarchical_discovery_config"].max_integrated_features
                 == args.max_candidates
             )
@@ -1297,7 +1339,10 @@ def test_review_query_config_is_closed_and_validated(tmp_path):
 
 def test_final_upstream_schema_is_exact_and_precommitted_from_stage1_config(tmp_path):
     args = _args(tmp_path, *_review_dependency_args(tmp_path))
-    schema = cli.build_final_upstream_schema_config(args.review_stage1_config)
+    schema = cli.build_final_upstream_schema_config(
+        args.review_stage1_config,
+        signed_order_width=16,
+    )
     applied = cli._minimal_historical_applied_config(Path(args.review_stage1_config).resolve())
     view_names = tuple(view.name for view in applied.architecture.multi_model_forest.bow_views)
 
@@ -1347,6 +1392,7 @@ def test_final_upstream_neural_widths_follow_unequal_query_bank_counts(tmp_path)
     schema = cli.build_final_upstream_schema_config(
         args.review_stage1_config,
         neural_query_config=query_config,
+        signed_order_width=16,
     )
     widths = {family.source_kind: family.signed_order_width for family in schema.raw_families}
 
@@ -1357,6 +1403,20 @@ def test_final_upstream_neural_widths_follow_unequal_query_bank_counts(tmp_path)
         name for family in schema.raw_families for name in family.exact_passthrough_feature_names
     ) == query_signal_columns({"treatment": 2, "outcome": 3, "effect": 4})
     assert len(schema.raw_output_schema()) == 303
+
+
+def test_final_upstream_orphan_capacity_has_no_implicit_cli_or_builder_default(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.final_upstream_max_orphan_features = None
+    with pytest.raises(ValueError, match="there is no production default"):
+        cli.build_agent_config(args)
+
+    with pytest.raises(TypeError, match="max_orphan_features"):
+        cli.build_coordinate_preserving_final_upstream_schema_config(
+            args.review_stage1_config,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1487,6 +1547,7 @@ def test_adaptive_review_dry_run_validates_context_fit_dependencies_only(
     assert result["raw_final_upstream_runtime_retained_separately_from_cache_overlay"] is True
     assert result["final_upstream_meta_inner_folds"] == 3
     assert result["final_upstream_head_regularization"] == 1.0
+    assert result["final_upstream_max_orphan_features"] == 32
     assert result["final_upstream_schema_namespace"] == "all_evidence_upstream"
     assert result["final_upstream_signed_order_width"] is None
     assert result["final_upstream_volatile_signed_order_widths"] == {

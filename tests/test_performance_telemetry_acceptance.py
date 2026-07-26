@@ -20,6 +20,7 @@ from oci.inference.portable_resource_scheduler import (
 from oci.inference.portable_workflow_spec import (
     ResourcePerformanceSafetyPolicy,
 )
+from tests.resource_safety_test_support import resource_safety_policy
 
 OUTER_SCOPE = "configured-full-fit"
 INNER_SCOPE = "configured-inner-fit"
@@ -43,7 +44,7 @@ def _policy(
             RepresentativeScope(label=OUTER_SCOPE, fit_row_count=17),
             RepresentativeScope(label=INNER_SCOPE, fit_row_count=11),
         ),
-        resource_performance_safety=ResourcePerformanceSafetyPolicy(
+        resource_performance_safety=resource_safety_policy(
             gpu_max_allocation_fraction=peak,
             gpu_minimum_headroom_bytes=headroom,
             minimum_multi_device_throughput_ratio=speedup,
@@ -424,7 +425,7 @@ def test_legacy_scheduler_selector_requires_explicit_configured_gates() -> None:
     )
     selected = select_fastest_safe_candidate(
         (high_concurrency, low_concurrency),
-        resource_performance_safety=ResourcePerformanceSafetyPolicy(
+        resource_performance_safety=resource_safety_policy(
             gpu_max_allocation_fraction=0.7,
             gpu_minimum_headroom_bytes=400,
             minimum_multi_device_throughput_ratio=1.2,

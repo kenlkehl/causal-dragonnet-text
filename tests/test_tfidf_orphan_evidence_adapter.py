@@ -14,6 +14,7 @@ from oci.inference.all_evidence_fusion import (
     source_text_temporal_policy_audit,
 )
 from oci.inference.tfidf_orphan_evidence_adapter import (
+    OrphanNgramEvidenceCapacityOverflowError,
     OrphanNgramEvidenceAdapterConfig,
     adapt_full_outer_orphan_ngram_evidence,
 )
@@ -120,6 +121,20 @@ def _write_scores(tmp_path, *, name="effect_ngram_scores.parquet"):
     return path
 
 
+def _adapter_config(**overrides) -> OrphanNgramEvidenceAdapterConfig:
+    values = {
+        "min_abs_fit_score": 2.0,
+        "lexical_overlap_threshold": 0.5,
+        "max_candidates": None,
+        "max_clusters": None,
+        "max_terms_per_cluster": None,
+        "max_term_chars": None,
+        "max_ngram_tokens": None,
+    }
+    values.update(overrides)
+    return OrphanNgramEvidenceAdapterConfig(**values)
+
+
 def test_builds_authenticated_compact_branch_and_fusion_payload(tmp_path):
     score_path = _write_scores(tmp_path)
     digest = hashlib.sha256(score_path.read_bytes()).hexdigest()
@@ -127,6 +142,7 @@ def test_builds_authenticated_compact_branch_and_fusion_payload(tmp_path):
     result = adapt_full_outer_orphan_ngram_evidence(
         _row(score_path, digest=digest),
         score_path,
+        config=_adapter_config(),
     )
 
     branch = result.branch
@@ -186,8 +202,11 @@ def test_selection_is_deterministic_and_uses_lexical_overlap_only(tmp_path):
     config = OrphanNgramEvidenceAdapterConfig(
         min_abs_fit_score=2.0,
         lexical_overlap_threshold=0.5,
-        max_clusters=2,
+        max_candidates=None,
+        max_clusters=3,
         max_terms_per_cluster=2,
+        max_term_chars=None,
+        max_ngram_tokens=None,
     )
 
     first = adapt_full_outer_orphan_ngram_evidence(_row(score_path), score_path, config=config)
@@ -231,7 +250,11 @@ def test_rejects_non_outer_or_leaky_discovery_rows(tmp_path, mutation, error):
     mutation(row)
 
     with pytest.raises(ValueError, match=error):
-        adapt_full_outer_orphan_ngram_evidence(row, score_path)
+        adapt_full_outer_orphan_ngram_evidence(
+            row,
+            score_path,
+            config=_adapter_config(),
+        )
 
 
 def test_rejects_wrong_path_or_registered_hash(tmp_path):
@@ -242,16 +265,28 @@ def test_rejects_wrong_path_or_registered_hash(tmp_path):
     _score_frame().to_parquet(other_path, index=False)
 
     with pytest.raises(ValueError, match="path does not match"):
-        adapt_full_outer_orphan_ngram_evidence(_row(score_path), other_path)
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(score_path),
+            other_path,
+            config=_adapter_config(),
+        )
 
     with pytest.raises(ValueError, match="SHA-256"):
-        adapt_full_outer_orphan_ngram_evidence(_row(score_path, digest="0" * 64), score_path)
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(score_path, digest="0" * 64),
+            score_path,
+            config=_adapter_config(),
+        )
 
 
 def test_rejects_heldout_filename_and_forbidden_score_fields(tmp_path):
     heldout_path = _write_scores(tmp_path, name="heldout_effect_ngram_scores.parquet")
     with pytest.raises(ValueError, match="heldout/test"):
-        adapt_full_outer_orphan_ngram_evidence(_row(heldout_path), heldout_path)
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(heldout_path),
+            heldout_path,
+            config=_adapter_config(),
+        )
 
     safe_dir = tmp_path / "safe"
     safe_dir.mkdir()
@@ -260,7 +295,11 @@ def test_rejects_heldout_filename_and_forbidden_score_fields(tmp_path):
     frame["oracle_score"] = 1.0
     frame.to_parquet(score_path, index=False)
     with pytest.raises(ValueError, match="forbidden heldout/test fields"):
-        adapt_full_outer_orphan_ngram_evidence(_row(score_path), score_path)
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(score_path),
+            score_path,
+            config=_adapter_config(),
+        )
 
 
 def test_rejects_non_outer_fit_rows_declared_inside_score_table(tmp_path):
@@ -273,4 +312,66 @@ def test_rejects_non_outer_fit_rows_declared_inside_score_table(tmp_path):
     frame.to_parquet(score_path, index=False)
 
     with pytest.raises(ValueError, match="non-outer-fit score rows"):
-        adapt_full_outer_orphan_ngram_evidence(_row(score_path), score_path)
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(score_path),
+            score_path,
+            config=_adapter_config(),
+        )
+
+
+def test_candidate_and_cluster_capacities_fail_closed_without_selection(tmp_path):
+    score_path = _write_scores(tmp_path)
+
+    with pytest.raises(
+        OrphanNgramEvidenceCapacityOverflowError,
+        match="max_candidates=2.*no candidates were silently discarded",
+    ):
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(score_path),
+            score_path,
+            config=_adapter_config(max_candidates=2),
+        )
+
+    with pytest.raises(
+        OrphanNgramEvidenceCapacityOverflowError,
+        match="max_clusters=2.*no cluster was silently discarded",
+    ):
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(score_path),
+            score_path,
+            config=_adapter_config(max_clusters=2),
+        )
+
+
+def test_term_capacities_fail_closed_without_text_or_member_omission(tmp_path):
+    score_path = _write_scores(tmp_path)
+
+    with pytest.raises(
+        OrphanNgramEvidenceCapacityOverflowError,
+        match="max_term_chars.*no term text was silently discarded",
+    ):
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(score_path),
+            score_path,
+            config=_adapter_config(max_term_chars=5),
+        )
+
+    with pytest.raises(
+        OrphanNgramEvidenceCapacityOverflowError,
+        match="max_ngram_tokens.*no term was silently discarded",
+    ):
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(score_path),
+            score_path,
+            config=_adapter_config(max_ngram_tokens=1),
+        )
+
+    with pytest.raises(
+        OrphanNgramEvidenceCapacityOverflowError,
+        match="max_terms_per_cluster=1.*no cluster member was silently discarded",
+    ):
+        adapt_full_outer_orphan_ngram_evidence(
+            _row(score_path),
+            score_path,
+            config=_adapter_config(max_terms_per_cluster=1),
+        )

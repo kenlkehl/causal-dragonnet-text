@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import json
 import hashlib
+import time
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from oci.inference import role_neutral_bow_group_execution as bow_execution
 from oci.config import BoWViewConfig
 from oci.inference.all_evidence_discovery_interfaces import (
     BOW_NUISANCE,
@@ -32,6 +35,7 @@ from oci.inference.production_stage1_legacy_scope_fragments import (
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_all_ten_binding import (
     authenticate_role_neutral_bow_component,
     validate_authenticated_role_neutral_component_receipt,
@@ -73,6 +77,7 @@ def _plan(*, gpu_ids: tuple[int, ...] = ()):
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,
@@ -165,6 +170,9 @@ def _execute(
     root: Path,
     request: RoleNeutralBoWPhysicalGroupRequest,
     loader,
+    bow_fold_parallelism: int | str = 1,
+    bow_parallel_backend: str = "threads",
+    owner_cpu_budget: int = 1,
 ):
     fit_texts, treatment, outcome, _heldout_texts, views = _inputs(request)
     return execute_role_neutral_bow_physical_group(
@@ -177,6 +185,9 @@ def _execute(
         nuisance_folds=2,
         effect_folds=2,
         e_clip=0.02,
+        bow_fold_parallelism=bow_fold_parallelism,
+        bow_parallel_backend=bow_parallel_backend,
+        owner_cpu_budget=owner_cpu_budget,
         exact_heldout_text_loader=loader,
     )
 
@@ -198,6 +209,94 @@ def _content_sha256(value: dict) -> str:
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def test_serial_and_parallel_fold_execution_are_byte_equal_and_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    _fit_texts, _treatment, _outcome, heldout_texts, _views = _inputs(request)
+    serial_root = (tmp_path / "serial").resolve()
+    parallel_root = (tmp_path / "parallel").resolve()
+    process_root = (tmp_path / "process").resolve()
+    original = bow_execution._fit_one_binary_fold
+    lock_path = tmp_path / "overlap.lock"
+    active_path = tmp_path / "active.txt"
+    maximum_path = tmp_path / "maximum.txt"
+    lock_path.touch()
+    active_path.write_text("0", encoding="ascii")
+    maximum_path.write_text("0", encoding="ascii")
+    tracking_parallel = False
+
+    def change_active(delta: int) -> None:
+        with lock_path.open("a+", encoding="ascii") as lock_stream:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+            current = int(active_path.read_text(encoding="ascii")) + int(
+                delta
+            )
+            active_path.write_text(str(current), encoding="ascii")
+            maximum = int(maximum_path.read_text(encoding="ascii"))
+            maximum_path.write_text(
+                str(max(maximum, current)),
+                encoding="ascii",
+            )
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+    def observed_fit_one_binary_fold(**kwargs):
+        if not tracking_parallel:
+            return original(**kwargs)
+        change_active(1)
+        try:
+            time.sleep(0.05)
+            return original(**kwargs)
+        finally:
+            change_active(-1)
+
+    monkeypatch.setattr(
+        bow_execution,
+        "_fit_one_binary_fold",
+        observed_fit_one_binary_fold,
+    )
+    _execute(
+        root=serial_root,
+        request=request,
+        loader=lambda _rows: heldout_texts,
+        bow_fold_parallelism=1,
+        bow_parallel_backend="threads",
+        owner_cpu_budget=2,
+    )
+    tracking_parallel = True
+    _execute(
+        root=parallel_root,
+        request=request,
+        loader=lambda _rows: heldout_texts,
+        bow_fold_parallelism=2,
+        bow_parallel_backend="threads",
+        owner_cpu_budget=2,
+    )
+    _execute(
+        root=process_root,
+        request=request,
+        loader=lambda _rows: heldout_texts,
+        bow_fold_parallelism=2,
+        bow_parallel_backend="processes",
+        owner_cpu_budget=2,
+    )
+
+    def complete_bytes(root: Path) -> dict[str, bytes]:
+        return {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    observed_maximum_active = int(
+        maximum_path.read_text(encoding="ascii")
+    )
+    assert observed_maximum_active >= 2
+    assert complete_bytes(parallel_root) == complete_bytes(serial_root)
+    assert complete_bytes(process_root) == complete_bytes(serial_root)
 
 
 def test_group_request_contains_only_owner_and_complete_equivalence_group():

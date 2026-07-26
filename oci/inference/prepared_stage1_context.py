@@ -420,6 +420,11 @@ class PreparedStage1ContextArtifact:
         from .production_stage1_scope_scheduler import (
             build_canonical_stage1_scope_plan,
         )
+        from .operator_trusted_embedding_cache_reader import (
+            OperatorTrustedSpentOnlyFrozenChunkEmbeddingCache,
+            cache_build_identity_from_operator_trusted_proof,
+            validate_operator_trusted_cache_read_proof,
+        )
         from .review_spent_evidence_provider import (
             SemanticWitnessScientificConfig,
         )
@@ -536,10 +541,38 @@ class PreparedStage1ContextArtifact:
             ]
         ].copy()
 
-        embedding_cache = SpentOnlyFrozenChunkEmbeddingCache(cache_path)
-        # Construction snapshots and authenticates every registered byte.
-        # Avoid a redundant third full replay by consuming the public identity
-        # of the just-created authenticated snapshot handle.
+        trusted_cache_read_proof = (
+            options.embedding_cache_operator_trusted_read_proof
+        )
+        if trusted_cache_read_proof is None:
+            embedding_cache = SpentOnlyFrozenChunkEmbeddingCache(cache_path)
+        else:
+            validated_trusted_proof = (
+                validate_operator_trusted_cache_read_proof(
+                    trusted_cache_read_proof,
+                    cache_dir=cache_path,
+                )
+            )
+            if (
+                validated_trusted_proof[
+                    "legacy_terminal_migration_identity"
+                ]
+                != options.embedding_cache_legacy_migration_identity
+            ):
+                raise ValueError(
+                    "prepared-context operator-trusted cache proof differs "
+                    "from its legacy migration identity"
+                )
+            embedding_cache = (
+                OperatorTrustedSpentOnlyFrozenChunkEmbeddingCache(
+                    cache_path,
+                    proof=validated_trusted_proof,
+                )
+            )
+        # The ordinary reader authenticates every registered byte.  The
+        # explicit operator-trusted reader instead inherits the sealed digests
+        # after exact stat-continuity checks.  Both expose the same scientific
+        # provider identity through this nonserializable handle.
         cache_identity = copy.deepcopy(
             embedding_cache.authenticated_snapshot_identity()
         )
@@ -555,7 +588,24 @@ class PreparedStage1ContextArtifact:
                 if options.embedding_cache_configuration is None
                 else options.embedding_cache_configuration
             ),
+            legacy_terminal_migration_identity=(
+                options.embedding_cache_legacy_migration_identity
+            ),
         )
+        if trusted_cache_read_proof is not None:
+            trusted_build_identity = (
+                cache_build_identity_from_operator_trusted_proof(
+                    trusted_cache_read_proof,
+                    cache_dir=cache_path,
+                )
+            )
+            if trusted_build_identity != exact_request[
+                "embedding_cache"
+            ]["production_cache_build_identity"]:
+                raise ValueError(
+                    "prepared-context operator-trusted cache build identity "
+                    "differs from its exact request"
+                )
         htr_sha256 = _directory_tree_sha256(htr_model_path)
         if htr_sha256 != htr_identity["tree_sha256"]:
             raise ValueError("prepared-context HTR model tree changed")

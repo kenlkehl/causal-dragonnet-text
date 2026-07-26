@@ -114,6 +114,127 @@ def test_repeated_and_concurrent_calls_hash_content_once(
     assert len(calls) == expected_calls
 
 
+def test_cache_hit_rejects_file_authentication_callable_replacement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _tree(tmp_path)
+    authenticate_directory_tree(root)
+    original = tree_module._stable_file_authentication
+
+    def replacement(tree_root: Path, relative_path: str):
+        return original(tree_root, relative_path)
+
+    monkeypatch.setattr(
+        tree_module,
+        "_stable_file_authentication",
+        replacement,
+    )
+    with pytest.raises(
+        AuthenticatedDirectoryTreeDriftError,
+        match="backend changed after authentication",
+    ):
+        authenticate_directory_tree(root)
+    with pytest.raises(
+        AuthenticatedDirectoryTreeDriftError,
+        match="previously observed to drift",
+    ):
+        authenticate_directory_tree(root)
+
+
+def test_full_authentication_rejects_callable_replacement_during_hashing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _tree(tmp_path)
+    original = tree_module._stable_file_authentication
+    calls = 0
+
+    def replace_during_hash(tree_root: Path, relative_path: str):
+        nonlocal calls
+        calls += 1
+        result = original(tree_root, relative_path)
+        if calls == 1:
+            monkeypatch.setattr(
+                tree_module,
+                "_stable_file_authentication",
+                original,
+            )
+        return result
+
+    monkeypatch.setattr(
+        tree_module,
+        "_stable_file_authentication",
+        replace_during_hash,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="backend changed during full authentication",
+    ):
+        authenticate_directory_tree(root)
+
+
+def test_cache_hit_rejects_sha256_callable_replacement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _tree(tmp_path)
+    authenticate_directory_tree(root)
+    original = tree_module.hashlib.sha256
+
+    def replacement(*args, **kwargs):
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tree_module.hashlib, "sha256", replacement)
+    with pytest.raises(
+        AuthenticatedDirectoryTreeDriftError,
+        match="backend changed after authentication",
+    ):
+        authenticate_directory_tree(root)
+
+
+def test_full_authentication_rejects_sha256_replacement_during_hashing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = _tree(tmp_path)
+    original_file_authentication = tree_module._stable_file_authentication
+    original_sha256 = tree_module.hashlib.sha256
+    calls = 0
+
+    def replacement_sha256(*args, **kwargs):
+        return original_sha256(*args, **kwargs)
+
+    def replace_sha256_during_hash(
+        tree_root: Path,
+        relative_path: str,
+    ):
+        nonlocal calls
+        calls += 1
+        result = original_file_authentication(
+            tree_root,
+            relative_path,
+        )
+        if calls == 1:
+            monkeypatch.setattr(
+                tree_module.hashlib,
+                "sha256",
+                replacement_sha256,
+            )
+        return result
+
+    monkeypatch.setattr(
+        tree_module,
+        "_stable_file_authentication",
+        replace_sha256_during_hash,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="backend changed during full authentication",
+    ):
+        authenticate_directory_tree(root)
+
+
 def test_same_size_mutation_poisons_same_process_capability(
     tmp_path: Path,
 ) -> None:
@@ -136,6 +257,42 @@ def test_same_size_mutation_poisons_same_process_capability(
         authenticate_directory_tree(root)
     with pytest.raises(AuthenticatedDirectoryTreeDriftError, match="previously"):
         authenticate_directory_tree(root)
+
+
+def test_retained_snapshot_projection_detects_mutation_and_is_revoked(
+    tmp_path: Path,
+) -> None:
+    root = _tree(tmp_path)
+    snapshot = authenticate_directory_tree(root)
+    (root / "config.json").write_text(
+        '{"model_type":"changed"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        AuthenticatedDirectoryTreeDriftError,
+        match="inventory changed",
+    ):
+        snapshot.workflow_path_identity()
+    with pytest.raises(
+        AuthenticatedDirectoryTreeDriftError,
+        match="no longer the current process authority",
+    ):
+        snapshot.local_model_provenance()
+
+
+def test_explicit_clear_revokes_retained_snapshot(
+    tmp_path: Path,
+) -> None:
+    root = _tree(tmp_path)
+    snapshot = authenticate_directory_tree(root)
+    clear_authenticated_directory_tree_cache()
+
+    with pytest.raises(
+        AuthenticatedDirectoryTreeDriftError,
+        match="no longer the current process authority",
+    ):
+        snapshot.workflow_inventory_projection()
 
 
 def test_inode_replacement_and_root_substitution_fail_closed(
@@ -234,6 +391,19 @@ def test_initial_authentication_rejects_links_specials_and_executables(
             authenticate_directory_tree(root)
     finally:
         fifo.unlink()
+
+
+def test_initial_authentication_rejects_hard_linked_files(
+    tmp_path: Path,
+) -> None:
+    root = _tree(tmp_path)
+    os.link(
+        root / "model.safetensors",
+        root / "duplicated-model.safetensors",
+    )
+
+    with pytest.raises(ValueError, match="hard-linked file"):
+        authenticate_directory_tree(root)
 
 
 @pytest.mark.parametrize("mutation_point", ["before_later_file", "after_last_file"])

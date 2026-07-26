@@ -458,6 +458,7 @@ def _embedding_cache_scientific_identity(value: Any) -> dict[str, Any]:
         "identity",
         "production_cache_build_identity",
         "authenticated_relocation",
+        "legacy_terminal_migration_identity",
     }
     if set(cache) != required:
         raise ValueError(
@@ -508,10 +509,22 @@ def _embedding_cache_scientific_identity(value: Any) -> dict[str, Any]:
             key: _path_neutral_identity(relocation[key])
             for key in sorted(relocation_required)
         }
+    migration = cache["legacy_terminal_migration_identity"]
+    if migration is not None:
+        migration = _path_neutral_identity(
+            _require_mapping(
+                migration,
+                label=(
+                    "stage1_request.embedding_cache."
+                    "legacy_terminal_migration_identity"
+                ),
+            )
+        )
     return {
         "identity": _path_neutral_identity(provider_identity),
         "production_cache_build_identity": _path_neutral_identity(build_identity),
         "authenticated_relocation": relocation,
+        "legacy_terminal_migration_identity": migration,
     }
 
 

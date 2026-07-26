@@ -63,6 +63,34 @@ def _effect_score_reference(row: Mapping[str, Any]) -> str:
     return value
 
 
+def _load_orphan_adapter_config(path: Path | None) -> OrphanNgramEvidenceAdapterConfig:
+    if path is None:
+        raise ValueError(
+            "--orphan-adapter-config is required unless --skip-orphans is used"
+        )
+    payload = json.loads(path.expanduser().resolve(strict=True).read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("--orphan-adapter-config must contain one JSON object")
+    expected = {
+        "min_abs_fit_score",
+        "lexical_overlap_threshold",
+        "max_candidates",
+        "max_clusters",
+        "max_terms_per_cluster",
+        "max_term_chars",
+        "max_ngram_tokens",
+    }
+    observed = set(map(str, payload))
+    if observed != expected:
+        raise ValueError(
+            "--orphan-adapter-config must contain exactly "
+            f"{sorted(expected)}; observed {sorted(observed)}"
+        )
+    config = OrphanNgramEvidenceAdapterConfig(**dict(payload))
+    config.validate()
+    return config
+
+
 def build_request(args: argparse.Namespace):
     data = load_sanitized_dataset(
         args.dataset,
@@ -102,11 +130,12 @@ def build_request(args: argparse.Namespace):
     orphan_audit = None
     if not args.skip_orphans:
         effect_reference = _effect_score_reference(full)
+        orphan_config = _load_orphan_adapter_config(args.orphan_adapter_config)
         orphan = adapt_full_outer_orphan_ngram_evidence(
             full,
             effect_reference,
             artifact_base_dir=Path(args.tfidf_handoff).resolve().parent,
-            config=OrphanNgramEvidenceAdapterConfig(),
+            config=orphan_config,
         )
         tfidf_payload["discovery"].update(orphan.discovery_patch)
         orphan_audit = orphan.audit
@@ -160,6 +189,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=16000)
     parser.add_argument("--allow-unsealed-tfidf", action="store_true")
     parser.add_argument("--skip-orphans", action="store_true")
+    parser.add_argument(
+        "--orphan-adapter-config",
+        type=Path,
+        help=(
+            "JSON object containing every OrphanNgramEvidenceAdapterConfig field; "
+            "required unless --skip-orphans is used"
+        ),
+    )
     parser.add_argument("--skip-query-moments", action="store_true")
     parser.add_argument("--offline", action="store_true")
     return parser.parse_args()

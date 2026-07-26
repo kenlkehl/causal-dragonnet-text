@@ -218,6 +218,11 @@ from .production_embedding_cache_relocation import (
     ProductionEmbeddingCacheRelocationOptions,
     validate_relocated_production_embedding_cache,
 )
+from .operator_trusted_embedding_cache_reader import (
+    OperatorTrustedSpentOnlyFrozenChunkEmbeddingCache,
+    cache_build_identity_from_operator_trusted_proof,
+    validate_operator_trusted_cache_read_proof,
+)
 from .production_stage1_scope_scheduler import (
     Stage1PhysicalFitIdentity,
     Stage1ScopePlan,
@@ -292,7 +297,7 @@ STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA = (
     "production_stage1_embedding_cluster_feasibility_audit_v2"
 )
 STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA = "production_stage1_embedding_cluster_fit_identity_v2"
-STAGE1_EMBEDDING_CLUSTER_FIT_INDEX_SCHEMA = "production_stage1_embedding_cluster_fit_index_v1"
+STAGE1_EMBEDDING_CLUSTER_FIT_INDEX_SCHEMA = "production_stage1_embedding_cluster_fit_index_v2"
 
 # These component-local tuples enumerate all ten families whose native producer
 # persists every artifact required by ``bind_native_family_fit_proof``.  Keeping
@@ -7295,7 +7300,11 @@ def _validate_effective_config(
     tfidf = nn_config.tfidf_topic
     if not tfidf.score_test_enabled:
         raise ValueError("production TF-IDF Stage 1 requires honest score testing")
-    tfidf.score_selection_label_policy = "nested_fit_calibration"
+    if str(tfidf.score_selection_label_policy) != "nested_fit_calibration":
+        raise ValueError(
+            "production TF-IDF Stage 1 requires the explicit "
+            "nested_fit_calibration score-selection label policy"
+        )
     if not tfidf.orphan_ngram_enabled or int(tfidf.orphan_ngram_min_selected_clusters) < 1:
         raise ValueError("production Stage 1 requires a non-empty orphan-ngram architecture")
     if int(tfidf.score_test_min_topics_per_bank) < 1:
@@ -7308,7 +7317,10 @@ def _validate_effective_config(
     if not htr_path.is_dir():
         raise FileNotFoundError(f"local HTR sentence-model directory does not exist: {htr_path}")
     architecture.htr_sentence_model = str(htr_path)
-    architecture.htr_require_live_unfrozen_encoder_attestation = True
+    if not architecture.htr_require_live_unfrozen_encoder_attestation:
+        raise ValueError(
+            "production HTR requires an explicit live unfrozen-encoder attestation"
+        )
 
     # Scope construction is serial because the authenticated cache provider and
     # private HTR tree are process-local. Inner model parallelism remains under
@@ -7317,14 +7329,25 @@ def _validate_effective_config(
     # Shared embedding/runtime paths copy the integrated settings into their
     # private runtime configs at their model boundaries.
     nn_config.outer_parallelism = "1"
-    nn_config.require_honest_outer_split = True
     embedding.cache_dir = str(embedding_cache_dir)
-    embedding.external_corpus_cache_dirs = []
+    if list(embedding.external_corpus_cache_dirs):
+        raise ValueError(
+            "production Stage 1 requires external embedding-corpus caches to be "
+            "explicitly empty"
+        )
     # Novel concept strings cannot be encoded by the frozen row cache.  Raw
     # retrieval witnesses remain available and are converted into the separate
     # TF-IDF semantic-retrieval architecture downstream.
-    embedding.include_bow_phrases_as_concepts = False
-    embedding.concept_phrases = []
+    if embedding.include_bow_phrases_as_concepts:
+        raise ValueError(
+            "production Stage 1 requires include_bow_phrases_as_concepts=false "
+            "when using the frozen row embedding cache"
+        )
+    if list(embedding.concept_phrases):
+        raise ValueError(
+            "production Stage 1 requires concept_phrases to be explicitly empty "
+            "when using the frozen row embedding cache"
+        )
     return config, htr_path
 
 
@@ -7342,11 +7365,148 @@ def _embedding_chunk_configuration(config: AppliedInferenceConfig) -> Mapping[st
     }
 
 
+_LEGACY_CACHE_MIGRATION_IDENTITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "phase",
+        "typed_expectation",
+        "typed_expectation_identity",
+        "upstream_prepared_artifact_id",
+        "upstream_prepared_identity_reauthenticated",
+        "prepared_projection_recomputed",
+        "ordered_text_identity_recomputed",
+        "word_chunk_registry_recomputed_exactly",
+        "chunk_and_tokenization_capacity_nonbinding",
+        "dense_array_shape_dtype_and_finiteness_reopened",
+        "encoder_semantics_attestation",
+        "source_tree_mutated",
+        "legacy_payload_copies_materialized",
+        "content_sha256",
+    }
+)
+_LEGACY_CACHE_TYPED_EXPECTATION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "prepared_expectation_identity",
+        "embedding_model_name",
+        "embedding_model_tree_sha256",
+        "chunk_configuration",
+        "ordered_text_sha256",
+        "expected_chunk_count",
+        "expected_hidden_size",
+        "legacy_builder_code_sha256",
+        "legacy_encoder_semantics_derivation",
+    }
+)
+
+
+def _validate_legacy_cache_configuration_projection(
+    *,
+    metadata: Mapping[str, Any],
+    expected_configuration: Mapping[str, Any],
+    migration_identity: Mapping[str, Any],
+) -> None:
+    """Validate the sealed typed projection attached by legacy migration.
+
+    A historical v2 cache stores only the six chunking fields in its raw
+    provenance.  The migration artifact authenticates the remaining encoder
+    and output semantics.  This seam accepts that projection only as one
+    closed, content-addressed identity for the exact active cache and request.
+    It never supplies defaults for a fresh or otherwise unproved cache.
+    """
+
+    if set(migration_identity) != _LEGACY_CACHE_MIGRATION_IDENTITY_FIELDS:
+        raise ValueError("legacy embedding-cache migration identity is not closed")
+    body = copy.deepcopy(dict(migration_identity))
+    declared_content_sha256 = body.pop("content_sha256", None)
+    if (
+        not _HEX_SHA256.fullmatch(str(declared_content_sha256 or ""))
+        or _sha256_json(body) != declared_content_sha256
+        or migration_identity.get("schema_version")
+        != "legacy_terminal_typed_request_migration_identity_v1"
+        or migration_identity.get("phase") != "embedding_cache"
+    ):
+        raise ValueError("legacy embedding-cache migration identity is not sealed")
+
+    typed_expectation = migration_identity.get("typed_expectation")
+    if (
+        not isinstance(typed_expectation, Mapping)
+        or set(typed_expectation) != _LEGACY_CACHE_TYPED_EXPECTATION_FIELDS
+        or typed_expectation.get("schema_version")
+        != "legacy_embedding_cache_migration_expectation_v2"
+        or not _HEX_SHA256.fullmatch(
+            str(migration_identity.get("typed_expectation_identity") or "")
+        )
+        or _sha256_json(dict(typed_expectation))
+        != migration_identity.get("typed_expectation_identity")
+    ):
+        raise ValueError("legacy embedding-cache typed expectation is not sealed")
+
+    projected_configuration = typed_expectation.get("chunk_configuration")
+    if (
+        not isinstance(projected_configuration, Mapping)
+        or dict(projected_configuration) != dict(expected_configuration)
+    ):
+        raise ValueError(
+            "legacy embedding-cache typed configuration projection does not "
+            "match the current scientific request"
+        )
+
+    proof_true_fields = (
+        "upstream_prepared_identity_reauthenticated",
+        "prepared_projection_recomputed",
+        "ordered_text_identity_recomputed",
+        "word_chunk_registry_recomputed_exactly",
+        "chunk_and_tokenization_capacity_nonbinding",
+        "dense_array_shape_dtype_and_finiteness_reopened",
+    )
+    if (
+        any(migration_identity.get(field) is not True for field in proof_true_fields)
+        or migration_identity.get("source_tree_mutated") is not False
+        or migration_identity.get("legacy_payload_copies_materialized") is not False
+        or not isinstance(
+            migration_identity.get("encoder_semantics_attestation"), Mapping
+        )
+        or not _HEX_SHA256.fullmatch(
+            str(migration_identity.get("upstream_prepared_artifact_id") or "")
+        )
+    ):
+        raise ValueError("legacy embedding-cache migration proof is incomplete")
+
+    provenance = metadata.get("production_provenance")
+    local_model = (
+        provenance.get("local_model") if isinstance(provenance, Mapping) else None
+    )
+    cache_bindings = {
+        "embedding_model_name": metadata.get("sentence_model_name"),
+        "expected_chunk_count": metadata.get("total_chunks"),
+        "expected_hidden_size": metadata.get("hidden_size"),
+        "legacy_builder_code_sha256": (
+            provenance.get("builder_code_sha256")
+            if isinstance(provenance, Mapping)
+            else None
+        ),
+        "embedding_model_tree_sha256": (
+            local_model.get("tree_sha256")
+            if isinstance(local_model, Mapping)
+            else None
+        ),
+    }
+    if any(
+        typed_expectation.get(field) != observed
+        for field, observed in cache_bindings.items()
+    ):
+        raise ValueError(
+            "legacy embedding-cache migration identity does not bind the active cache"
+        )
+
+
 def _validate_cache_configuration(
     cache: SpentOnlyFrozenChunkEmbeddingCache,
     config: AppliedInferenceConfig,
     *,
     cache_configuration: Mapping[str, Any] | None = None,
+    legacy_terminal_migration_identity: Mapping[str, Any] | None = None,
 ) -> None:
     metadata = cache.metadata
     embedding = config.architecture.multi_model_forest.embedding_contrast
@@ -7367,6 +7527,14 @@ def _validate_cache_configuration(
             "frozen embedding cache does not match effective Stage 1 config: "
             + _canonical_json(mismatches)
         )
+    if (
+        legacy_terminal_migration_identity is not None
+        and cache_configuration is None
+    ):
+        raise ValueError(
+            "legacy embedding-cache migration requires the complete current "
+            "typed encoder/output configuration"
+        )
     if cache_configuration is not None:
         provenance = metadata.get("production_provenance")
         observed_configuration = (
@@ -7374,11 +7542,38 @@ def _validate_cache_configuration(
             if isinstance(provenance, Mapping)
             else None
         )
-        if observed_configuration != dict(cache_configuration):
+        if not isinstance(observed_configuration, Mapping):
             raise ValueError(
                 "frozen embedding cache does not match the typed scientific "
                 "encoder/output configuration"
             )
+        expected_configuration = dict(cache_configuration)
+        if legacy_terminal_migration_identity is None:
+            if dict(observed_configuration) != expected_configuration:
+                raise ValueError(
+                    "frozen embedding cache does not match the typed scientific "
+                    "encoder/output configuration"
+                )
+            return
+
+        required_legacy_fields = set(_embedding_chunk_configuration(config))
+        if (
+            not required_legacy_fields.issubset(observed_configuration)
+            or any(
+                key not in expected_configuration
+                or observed_value != expected_configuration[key]
+                for key, observed_value in observed_configuration.items()
+            )
+        ):
+            raise ValueError(
+                "frozen embedding cache raw legacy configuration differs from "
+                "the typed scientific encoder/output configuration"
+            )
+        _validate_legacy_cache_configuration_projection(
+            metadata=metadata,
+            expected_configuration=expected_configuration,
+            migration_identity=legacy_terminal_migration_identity,
+        )
 
 
 def build_canonical_split_registry(
@@ -8812,7 +9007,7 @@ def validate_embedding_cluster_feasibility_audit(
 def _embedding_cluster_preflight_loky_scope(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Authenticate and evaluate exactly one physically isolated scope."""
+    """Authenticate one scope through the shared row-restricted cache."""
 
     from .production_stage1_preflight_scope_inputs import (
         validate_preflight_scope_input,
@@ -8823,12 +9018,14 @@ def _embedding_cluster_preflight_loky_scope(
         "scope_id",
         "manifest_path",
         "manifest_content_sha256",
+        "shared_cache_reference_path",
+        "shared_cache_reference_content_sha256",
         "initial_training_partitions",
     }
     if (
         not isinstance(payload, Mapping)
         or set(payload) != required
-        or payload.get("schema_version") != "production_stage1_preflight_worker_payload_v1"
+        or payload.get("schema_version") != "production_stage1_preflight_worker_payload_v2"
     ):
         raise ValueError("cluster preflight worker payload is not closed")
     scope_id = str(payload["scope_id"])
@@ -8836,12 +9033,20 @@ def _embedding_cluster_preflight_loky_scope(
         manifest_path=str(payload["manifest_path"]),
         expected_scope_id=scope_id,
         expected_manifest_content_sha256=str(payload["manifest_content_sha256"]),
+        shared_cache_reference_path=str(
+            payload["shared_cache_reference_path"]
+        ),
+        expected_shared_cache_reference_content_sha256=str(
+            payload["shared_cache_reference_content_sha256"]
+        ),
     )
     result = build_embedding_cluster_feasibility_audit(
         modeling_data=private.modeling_data,
         config=private.config,
         embedding_cache=private.embedding_cache,
-        embedding_cache_identity=private.manifest["embedding_cache"]["logical_identity"],
+        embedding_cache_identity=private.manifest[
+            "embedding_cache_view"
+        ]["logical_identity"],
         registry=private.scope_authority,
         registry_content_sha256=str(private.manifest["registry_content_sha256"]),
         initial_training_partitions=int(payload["initial_training_partitions"]),
@@ -9794,6 +9999,8 @@ class Stage1BundleBuildOptions:
     dry_run: bool = False
     embedding_cache_relocation: ProductionEmbeddingCacheRelocationOptions | None = None
     embedding_cache_configuration: Mapping[str, Any] | None = None
+    embedding_cache_legacy_migration_identity: Mapping[str, Any] | None = None
+    embedding_cache_operator_trusted_read_proof: Mapping[str, Any] | None = None
     semantic_witness_scientific_config: (
         SemanticWitnessScientificConfig | Mapping[str, Any] | None
     ) = None
@@ -9817,6 +10024,28 @@ class Stage1BundleBuildOptions:
             else Stage1PhysicalFitIdentity.from_mapping(value)
         )
         object.__setattr__(self, "physical_fit_identity", identity)
+        migration_identity = self.embedding_cache_legacy_migration_identity
+        if migration_identity is not None:
+            if not isinstance(migration_identity, Mapping):
+                raise TypeError(
+                    "embedding_cache_legacy_migration_identity must be one mapping"
+                )
+            object.__setattr__(
+                self,
+                "embedding_cache_legacy_migration_identity",
+                copy.deepcopy(dict(migration_identity)),
+            )
+        trusted_read_proof = self.embedding_cache_operator_trusted_read_proof
+        if trusted_read_proof is not None:
+            if not isinstance(trusted_read_proof, Mapping):
+                raise TypeError(
+                    "embedding_cache_operator_trusted_read_proof must be one mapping"
+                )
+            object.__setattr__(
+                self,
+                "embedding_cache_operator_trusted_read_proof",
+                copy.deepcopy(dict(trusted_read_proof)),
+            )
 
 
 @dataclass
@@ -9878,6 +10107,20 @@ class ProductionStage1BundleBuilder:
 
     def prepare(self) -> _PreparedBuild:
         options = self.options
+        trusted_cache_read_proof = (
+            options.embedding_cache_operator_trusted_read_proof
+        )
+        if trusted_cache_read_proof is not None:
+            if options.embedding_cache_legacy_migration_identity is None:
+                raise ValueError(
+                    "operator-trusted embedding-cache reuse requires its exact "
+                    "legacy migration identity"
+                )
+            if options.embedding_cache_relocation is not None:
+                raise ValueError(
+                    "operator-trusted embedding-cache reuse already binds the "
+                    "adopted cache and cannot also invoke relocation validation"
+                )
         semantic_witness_scientific_config = (
             options.semantic_witness_scientific_config
         )
@@ -10030,6 +10273,11 @@ class ProductionStage1BundleBuilder:
                 )
             cache_dir = fresh_cache_target
             build_fresh_cache = True
+        if trusted_cache_read_proof is not None and build_fresh_cache:
+            raise ValueError(
+                "operator-trusted embedding-cache reuse requires an existing "
+                "cache directory"
+            )
         canonical_cache_path = cache_dir.resolve(strict=not build_fresh_cache)
         if (
             canonical_cache_path == output_path
@@ -10167,7 +10415,31 @@ class ProductionStage1BundleBuilder:
             )
             cache_dir = result.cache_path
             fresh_result_identity = result.identity()
-        embedding_cache = SpentOnlyFrozenChunkEmbeddingCache(cache_dir)
+        if trusted_cache_read_proof is None:
+            embedding_cache = SpentOnlyFrozenChunkEmbeddingCache(cache_dir)
+        else:
+            validated_trusted_proof = (
+                validate_operator_trusted_cache_read_proof(
+                    trusted_cache_read_proof,
+                    cache_dir=cache_dir,
+                )
+            )
+            if (
+                validated_trusted_proof[
+                    "legacy_terminal_migration_identity"
+                ]
+                != options.embedding_cache_legacy_migration_identity
+            ):
+                raise ValueError(
+                    "operator-trusted cache proof and configured legacy "
+                    "migration identity differ"
+                )
+            embedding_cache = (
+                OperatorTrustedSpentOnlyFrozenChunkEmbeddingCache(
+                    cache_dir,
+                    proof=validated_trusted_proof,
+                )
+            )
         if embedding_cache.row_count != len(modeling_data):
             raise ValueError("embedding cache row count does not match the cohort")
         if options.embedding_cache_configuration is None:
@@ -10190,6 +10462,9 @@ class ProductionStage1BundleBuilder:
             embedding_cache,
             config,
             cache_configuration=cache_configuration,
+            legacy_terminal_migration_identity=(
+                options.embedding_cache_legacy_migration_identity
+            ),
         )
         all_rows = tuple(range(len(modeling_data)))
         all_texts = tuple(modeling_data[config.text_column].tolist())
@@ -10201,7 +10476,14 @@ class ProductionStage1BundleBuilder:
             scope_id="production_prepare_full_cohort",
         )
         cache_identity = embedding_cache.identity()
-        if relocation is None:
+        if trusted_cache_read_proof is not None:
+            cache_input_identity = (
+                cache_build_identity_from_operator_trusted_proof(
+                    trusted_cache_read_proof,
+                    cache_dir=cache_dir,
+                )
+            )
+        elif relocation is None:
             cache_input_identity = validate_published_production_embedding_cache(
                 cache_dir=cache_dir,
                 dataset_path=dataset_path,
@@ -10489,6 +10771,9 @@ class ProductionStage1BundleBuilder:
                 "identity": cache_identity,
                 "production_cache_build_identity": cache_input_identity,
                 "authenticated_relocation": (None if relocation is None else relocation.identity()),
+                "legacy_terminal_migration_identity": copy.deepcopy(
+                    options.embedding_cache_legacy_migration_identity
+                ),
             },
             "htr_model": {
                 "path": str(htr_model_path),
@@ -10780,7 +11065,33 @@ class ProductionStage1BundleBuilder:
         )
         if validated_scope_plan.as_dict() != prepared.request.get("stage1_scope_plan"):
             raise RuntimeError("Stage 1 scope execution plan changed after preflight")
-        if prepared.embedding_cache_relocation is None:
+        trusted_cache_read_proof = (
+            prepared.options.embedding_cache_operator_trusted_read_proof
+        )
+        if trusted_cache_read_proof is not None:
+            current_cache_input_identity = (
+                cache_build_identity_from_operator_trusted_proof(
+                    trusted_cache_read_proof,
+                    cache_dir=prepared.embedding_cache_path,
+                )
+            )
+            validated_trusted_proof = (
+                validate_operator_trusted_cache_read_proof(
+                    trusted_cache_read_proof,
+                    cache_dir=prepared.embedding_cache_path,
+                )
+            )
+            if (
+                validated_trusted_proof[
+                    "legacy_terminal_migration_identity"
+                ]
+                != prepared.options.embedding_cache_legacy_migration_identity
+            ):
+                raise RuntimeError(
+                    "operator-trusted cache migration binding changed after "
+                    "preflight"
+                )
+        elif prepared.embedding_cache_relocation is None:
             cache_provenance = prepared.embedding_cache.metadata.get(
                 "production_provenance"
             )
@@ -11111,6 +11422,9 @@ class ProductionStage1BundleBuilder:
                     None
                     if prepared.embedding_cache_relocation is None
                     else prepared.embedding_cache_relocation.identity()
+                ),
+                "legacy_terminal_migration_identity": copy.deepcopy(
+                    prepared.options.embedding_cache_legacy_migration_identity
                 ),
             },
             "components": {
@@ -12643,12 +12957,34 @@ class ProductionStage1BundleBuilder:
         ordered_cluster_fit_rows = [
             cluster_fit_by_scope[scope_id] for scope_id in expected_cluster_scope_order
         ]
+        cluster_preflight = prepared.embedding_cluster_feasibility_audit
+        logical_cluster_scope_order = list(cluster_preflight["scope_order"])
+        physical_cluster_scope_order = list(
+            cluster_preflight["physical_scope_order"]
+        )
+        if selected_scope is None:
+            selected_logical_scope_order = logical_cluster_scope_order
+            if expected_cluster_scope_order != physical_cluster_scope_order:
+                raise RuntimeError(
+                    "actual clustered-embedding records changed canonical physical owner order"
+                )
+        else:
+            selected_logical_scope_order = [
+                str(scope["scope_id"])
+                for scope in cluster_preflight["scopes"]
+                if scope["physical_fit_binding"]["physical_owner_scope_id"]
+                == selected_scope.scope_id
+            ]
+            if expected_cluster_scope_order != [selected_scope.scope_id]:
+                raise RuntimeError(
+                    "selected clustered-embedding record is not its canonical physical owner"
+                )
         cluster_fit_index_body = {
             "schema_version": STAGE1_EMBEDDING_CLUSTER_FIT_INDEX_SCHEMA,
             "request_sha256": prepared.request_sha256,
             "split_registry_content_sha256": prepared.registry_content_sha256,
             "preflight_audit_content_sha256": (
-                prepared.embedding_cluster_feasibility_audit["content_sha256"]
+                cluster_preflight["content_sha256"]
             ),
             "scope_count": len(ordered_cluster_fit_rows),
             "full_outer_scope_count": sum(
@@ -12661,6 +12997,9 @@ class ProductionStage1BundleBuilder:
                 row["scope_kind"] == "cumulative_spent" for row in ordered_cluster_fit_rows
             ),
             "scope_order": expected_cluster_scope_order,
+            "logical_scope_count": len(selected_logical_scope_order),
+            "logical_scope_order": selected_logical_scope_order,
+            "all_logical_scopes_bound_to_physical_fit": True,
             "all_actual_identities_equal_preflight": True,
             "scopes": ordered_cluster_fit_rows,
         }
@@ -15011,6 +15350,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--unit-id-column", required=True)
     parser.add_argument("--initial-training-partitions", type=int, required=True)
+    parser.add_argument(
+        "--physical-fit-identity",
+        type=Path,
+        required=True,
+        help=(
+            "Closed JSON Stage1PhysicalFitIdentity supplied by the immutable "
+            "scientific/deployment request."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
@@ -15059,6 +15407,12 @@ def options_from_args(args: argparse.Namespace) -> Stage1BundleBuildOptions:
         raise ValueError(
             "--dry-run cannot publish a fresh cache; prebuild it and pass " "--embedding-cache-dir"
         )
+    physical_fit_identity = Stage1PhysicalFitIdentity.from_mapping(
+        _read_json_object_reject_duplicates(
+            Path(args.physical_fit_identity),
+            field_name="physical_fit_identity",
+        )
+    )
     return Stage1BundleBuildOptions(
         dataset_path=args.dataset,
         config_path=args.stage1_config,
@@ -15068,6 +15422,7 @@ def options_from_args(args: argparse.Namespace) -> Stage1BundleBuildOptions:
         output_dir=args.output_dir,
         unit_id_column=args.unit_id_column,
         initial_training_partitions=int(args.initial_training_partitions),
+        physical_fit_identity=physical_fit_identity,
         seed=int(args.seed),
         device=str(args.device),
         gpu_ids=tuple(args.gpu_id),

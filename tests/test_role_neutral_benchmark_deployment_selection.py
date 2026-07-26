@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ import pytest
 
 import oci.inference.compact_preflight_compression_benchmark as compression_module
 import oci.inference.role_neutral_benchmark_deployment_selection as selection_module
+import oci.inference.role_neutral_performance_benchmark_publication as publication_module
 from oci.inference.compact_preflight_compression_benchmark import (
     COMPACT_PREFLIGHT_COMPRESSION_BENCHMARK_OBSERVATION_SCHEMA,
     COMPACT_PREFLIGHT_COMPRESSION_BENCHMARK_RESULT_SCHEMA,
@@ -35,6 +37,16 @@ from oci.inference.role_neutral_performance_benchmark import (
     ROLE_NEUTRAL_BENCHMARK_WORKLOAD_BINDING_SCHEMA,
     RoleNeutralBenchmarkConfig,
     build_role_neutral_benchmark_matrix_coverage,
+)
+from oci.inference.role_neutral_performance_benchmark_publication import (
+    ROLE_NEUTRAL_BENCHMARK_PUBLICATION_MANIFEST,
+    publish_role_neutral_performance_benchmark,
+)
+from tests.test_role_neutral_performance_benchmark_publication import (
+    _synthetic_completed_benchmark,
+)
+from tests.test_production_stage1_cluster_preflight_artifact_v2 import (
+    portable_validators,
 )
 
 _REPOSITORY = Path(__file__).resolve().parents[1]
@@ -205,7 +217,7 @@ def _bound_result(
                 scope_label=scope.label,
                 logical_scope_kind=(
                     "full_outer"
-                    if index == 0
+                    if scope.label == "configured_full_outer_fit"
                     else "exact_inner"
                 ),
                 ordinal=0,
@@ -244,7 +256,7 @@ def _bound_result(
         **workload_body,
         "content_sha256": identity_sha256(workload_body),
     }
-    selected_name = "two_accelerators_two_fits_each"
+    selected_name = "neural_query_span_all_accelerators"
     candidate_results: list[dict[str, Any]] = []
     for candidate in config.candidates:
         is_selected = candidate.name == selected_name
@@ -258,8 +270,24 @@ def _bound_result(
                 ),
                 "warmup_observation_telemetry_accepted": True,
                 "warmup_scientific_identity_matches_measured": True,
+                "htr_operational_attestations_accepted": True,
+                "neural_query_topology_runtime_attestations_accepted": True,
+                "cpu_gpu_lane_interval_telemetry_accepted": True,
+                "cpu_gpu_lane_overlap_observation_count": (
+                    1 if candidate.accelerator_count > 0 else 0
+                ),
+                "cpu_gpu_lane_overlap_descriptive_only": True,
+                "cpu_gpu_lane_overlap_speedup_claimed": False,
                 "execution_device_count": candidate.accelerator_count or 1,
                 "concurrency_per_device": candidate.concurrency_per_device,
+                "resource_slot_count": candidate.resource_slot_count,
+                "effective_parallel_owners": candidate.total_concurrency,
+                "neural_query_topology": (
+                    candidate.neural_query_topology.as_dict()
+                ),
+                "htr_operational_controls": (
+                    candidate.htr_operational_controls.as_dict()
+                ),
                 "throughput_fit_rows_per_second": (
                     100.0 if is_selected else 1.0
                 ),
@@ -379,7 +407,7 @@ def _bound_result(
         ),
         "selected_candidate": selected_name,
         "selection_policy": (
-            "fastest_end_to_end_then_lower_total_concurrency_then_name_v1"
+            "fastest_end_to_end_then_lower_effective_owner_concurrency_then_name_v2"
         ),
         "scientific_result_identity_sha256": "e" * 64,
         "accepted": True,
@@ -449,6 +477,74 @@ def _select(
     )
 
 
+def test_selection_requires_exactly_one_typed_benchmark_authority(
+    tmp_path: Path,
+) -> None:
+    common = {
+        "base_deployment_path": _BASE_DEPLOYMENT,
+        "benchmark_workload_deployment_path": tmp_path / "workload.json",
+        "scientific_spec_path": _SCIENTIFIC,
+        "output_path": (tmp_path / "selected.json").resolve(),
+    }
+    with pytest.raises(ValueError, match="exactly one"):
+        select_benchmarked_deployment_profile(**common)
+    with pytest.raises(ValueError, match="exactly one"):
+        select_benchmarked_deployment_profile(
+            **common,
+            benchmark_result_path=tmp_path / "result.json",
+            benchmark_publication_path=tmp_path / "publication",
+        )
+
+
+def test_selection_cli_separates_raw_and_durable_authorities(
+    tmp_path: Path,
+) -> None:
+    from scripts.select_role_neutral_benchmark_deployment import (
+        build_parser,
+    )
+
+    common = [
+        "--base-deployment",
+        str(_BASE_DEPLOYMENT),
+        "--scientific-spec",
+        str(_SCIENTIFIC),
+        "--output",
+        str(tmp_path / "selected.json"),
+    ]
+    durable = build_parser().parse_args(
+        [
+            *common,
+            "--benchmark-publication",
+            str(tmp_path / "publication"),
+        ]
+    )
+    assert durable.benchmark_publication == tmp_path / "publication"
+    assert durable.benchmark_result is None
+    assert durable.benchmark_workload_deployment is None
+
+    raw = build_parser().parse_args(
+        [
+            *common,
+            "--benchmark-result",
+            str(tmp_path / "result.json"),
+            "--benchmark-workload-deployment",
+            str(tmp_path / "workload.json"),
+        ]
+    )
+    assert raw.benchmark_result == tmp_path / "result.json"
+    assert raw.benchmark_publication is None
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                *common,
+                "--benchmark-result",
+                str(tmp_path / "result.json"),
+                "--benchmark-publication",
+                str(tmp_path / "publication"),
+            ]
+        )
+
+
 def test_measured_selection_publishes_fresh_operational_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -465,15 +561,25 @@ def test_measured_selection_publishes_fresh_operational_profile(
     assert selected.devices == ("auto",)
     assert selected.stage1_execution.resource_kind == "accelerator"
     assert selected.stage1_execution.device_count == 2
-    assert selected.stage1_execution.scope_workers_per_device == 2
+    assert selected.stage1_execution.scope_workers_per_device == 1
+    assert selected.stage1_execution.max_parallel_owners == 1
+    assert (
+        selected.stage1_execution.neural_query_topology.mode
+        == "one_context_spanning_all_selected_devices"
+    )
     assert selected.cluster_preflight_parquet_compression == "zstd"
     assert (
         selected.stage1_execution.selection_method
         == "measured_role_neutral_benchmark_v1"
     )
+    assert selected.stage1_execution.benchmark_evidence_kind == (
+        "raw_result_v1"
+    )
+    assert selected.stage1_execution.benchmark_publication_locator is None
+    assert selected.stage1_execution.benchmark_publication_sha256 is None
     assert (
         selected.stage1_execution.selected_candidate
-        == "two_accelerators_two_fits_each"
+        == "neural_query_span_all_accelerators"
     )
     assert selected.stage1_execution.benchmark_result_sha256 == hashlib.sha256(
         result.read_bytes()
@@ -496,7 +602,7 @@ def test_measured_selection_publishes_fresh_operational_profile(
         cpu_budget=selected.cpu_budget,
     )
     assert validation["selected_candidate"] == (
-        "two_accelerators_two_fits_each"
+        "neural_query_span_all_accelerators"
     )
     assert (
         validation["selected_preflight_parquet_compression"]
@@ -552,6 +658,36 @@ def test_unaccepted_or_tampered_benchmark_selection_fails_closed(
         )
 
 
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("cpu_gpu_lane_interval_telemetry_accepted", False),
+        ("cpu_gpu_lane_overlap_observation_count", 0),
+        ("cpu_gpu_lane_overlap_descriptive_only", False),
+        ("cpu_gpu_lane_overlap_speedup_claimed", True),
+    ),
+)
+def test_selected_candidate_requires_descriptive_cpu_gpu_interval_telemetry(
+    tmp_path: Path,
+    field_name: str,
+    invalid_value: Any,
+) -> None:
+    result_path, _workload, _authenticated = _bound_result(tmp_path)
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    config = RoleNeutralBenchmarkConfig.from_mapping(result["config"])
+    selected = next(
+        row
+        for row in result["candidate_results"]
+        if row["candidate_name"] == result["selected_candidate"]
+    )
+    selected[field_name] = invalid_value
+    with pytest.raises(
+        ValueError,
+        match="accepted benchmark candidate result is inconsistent",
+    ):
+        selection_module._selected_candidate(result, config=config)
+
+
 def test_workload_binding_mismatch_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -592,4 +728,235 @@ def test_symlinked_benchmark_result_is_rejected(
             result=linked,
             workload=workload,
             output=tmp_path / "output.json",
+        )
+
+
+def test_durable_publication_selection_is_relocatable_and_drops_scratch_locators(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    portable_validators,
+) -> None:
+    (
+        scratch,
+        historical_result,
+        workload_deployment,
+        authenticated,
+    ) = _synthetic_completed_benchmark(tmp_path)
+    monkeypatch.setattr(
+        publication_module,
+        "_authenticate_paused_stage1_preflight",
+        lambda _deployment, *, require_fresh_prepared_context: authenticated,
+    )
+    durable_a = (tmp_path / "durable-a").resolve()
+    durable_b = (tmp_path / "durable-b").resolve()
+    manifest_a = publish_role_neutral_performance_benchmark(
+        scratch_root=scratch,
+        durable_root=durable_a,
+        workload_deployment_path=workload_deployment,
+    )
+    manifest_b = publish_role_neutral_performance_benchmark(
+        scratch_root=scratch,
+        durable_root=durable_b,
+        workload_deployment_path=workload_deployment,
+    )
+    assert manifest_a.path_neutral_content_root_sha256 == (
+        manifest_b.path_neutral_content_root_sha256
+    )
+
+    config = RoleNeutralBenchmarkConfig.from_mapping(
+        historical_result["config"]
+    )
+    source_binding = selection_module._validate_workload_binding(
+        value=historical_result["workload_binding"],
+        config=config,
+    )
+    base = selection_module._rebase_profile_paths(
+        DeploymentProfile.from_json(_BASE_DEPLOYMENT),
+        source_path=_BASE_DEPLOYMENT,
+    )
+    base = replace(
+        base,
+        resource_performance_safety=(
+            config.resource_performance_safety
+        ),
+        cpu_budget=4,
+        forest_operational=replace(
+            base.forest_operational,
+            requested_host_cpu_budget=4,
+        ),
+    )
+    base_path = (tmp_path / "publication-base.json").resolve()
+    base_path.write_text(
+        json.dumps(
+            asdict(base),
+            default=str,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selected_a = select_benchmarked_deployment_profile(
+        base_deployment_path=base_path,
+        benchmark_publication_path=durable_a,
+        scientific_spec_path=_SCIENTIFIC,
+        output_path=(tmp_path / "selected-a.json").resolve(),
+    )
+    selected_b = select_benchmarked_deployment_profile(
+        base_deployment_path=base_path,
+        benchmark_publication_path=(
+            durable_b / ROLE_NEUTRAL_BENCHMARK_PUBLICATION_MANIFEST
+        ),
+        scientific_spec_path=_SCIENTIFIC,
+        output_path=(tmp_path / "selected-b.json").resolve(),
+    )
+
+    first = selected_a.stage1_execution
+    second = selected_b.stage1_execution
+    assert first.benchmark_evidence_kind == "durable_publication_v1"
+    assert first.benchmark_result_locator is None
+    assert first.benchmark_workload_deployment_locator is None
+    assert first.benchmark_publication_locator == (
+        durable_a / ROLE_NEUTRAL_BENCHMARK_PUBLICATION_MANIFEST
+    )
+    assert first.benchmark_result_sha256 == (
+        manifest_a.benchmark_bindings["benchmark_result"]["file_sha256"]
+    )
+    assert first.benchmark_workload_deployment_sha256 == (
+        source_binding.workload_deployment_sha256
+    )
+    assert replace(
+        first,
+        benchmark_publication_locator=(
+            second.benchmark_publication_locator
+        ),
+        benchmark_publication_sha256=(
+            second.benchmark_publication_sha256
+        ),
+    ) == second
+    durable_evidence = (
+        publication_module.load_role_neutral_benchmark_selection_evidence(
+            durable_a
+        )
+    )
+    scientific_binding = durable_evidence.scientific_workflow_binding
+    assert scientific_binding["scientific_configuration_identity"][
+        "dataset_content_sha256"
+    ] == "d" * 64
+    assert scientific_binding["workflow_scientific_identity"][
+        "workflow_producer_code_identity"
+    ] == scientific_binding["workflow_producer_code_identity"]
+    assert scientific_binding["workflow_scientific_identity"][
+        "phase_producer_code_identities"
+    ] == scientific_binding["phase_producer_code_identities"]
+
+    source_spec = json.loads(_SCIENTIFIC.read_text(encoding="utf-8"))
+    scientifically_different_specs: list[tuple[str, dict[str, Any]]] = []
+    changed_seed = json.loads(json.dumps(source_spec))
+    changed_seed["seed"] = int(changed_seed["seed"]) + 1
+    scientifically_different_specs.append(("seed", changed_seed))
+    changed_folds = json.loads(json.dumps(source_spec))
+    changed_folds["folds"]["outer_folds"] = (
+        int(changed_folds["folds"]["outer_folds"]) - 1
+    )
+    scientifically_different_specs.append(("folds", changed_folds))
+    changed_prompt = json.loads(json.dumps(source_spec))
+    changed_prompt["stage2_prompt_protocol"]["generation_policy"][
+        "interpret_architecture_chunk"
+    ]["seed"] = (
+        int(
+            changed_prompt["stage2_prompt_protocol"][
+                "generation_policy"
+            ]["interpret_architecture_chunk"]["seed"]
+        )
+        + 1
+    )
+    scientifically_different_specs.append(("prompt-policy", changed_prompt))
+    changed_window = json.loads(json.dumps(source_spec))
+    changed_window["text_windows"]["complete_page_core_chars"] = (
+        int(
+            changed_window["text_windows"][
+                "complete_page_core_chars"
+            ]
+        )
+        - 1
+    )
+    scientifically_different_specs.append(("text-window", changed_window))
+    for label, value in scientifically_different_specs:
+        changed_path = (tmp_path / f"changed-{label}.json").resolve()
+        changed_path.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(
+            ValueError,
+            match="differs from the benchmarked workflow",
+        ):
+            selection_module._authenticate_published_scientific_spec(
+                scientific_spec_path=changed_path,
+                binding=scientific_binding,
+            )
+
+    monkeypatch.setattr(
+        selection_module,
+        "_authenticate_selection_source",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("durable validation reopened scratch authority")
+        ),
+    )
+    validation_a = validate_benchmarked_stage1_execution_profile(
+        profile=first,
+        scientific_spec_path=_SCIENTIFIC,
+        resource_performance_safety=(
+            selected_a.resource_performance_safety
+        ),
+        cpu_budget=selected_a.cpu_budget,
+    )
+    validation_b = validate_benchmarked_stage1_execution_profile(
+        profile=second,
+        scientific_spec_path=_SCIENTIFIC,
+        resource_performance_safety=(
+            selected_b.resource_performance_safety
+        ),
+        cpu_budget=selected_b.cpu_budget,
+    )
+    assert {
+        key: value
+        for key, value in validation_a.items()
+        if key not in {"benchmark_publication_sha256", "content_sha256"}
+    } == {
+        key: value
+        for key, value in validation_b.items()
+        if key not in {"benchmark_publication_sha256", "content_sha256"}
+    }
+    assert validation_a["benchmark_evidence_kind"] == (
+        "durable_publication_v1"
+    )
+    assert validation_a[
+        "benchmark_publication_path_neutral_content_root_sha256"
+    ] == manifest_a.path_neutral_content_root_sha256
+    with pytest.raises(
+        ValueError,
+        match="differs from the benchmarked workflow",
+    ):
+        validate_benchmarked_stage1_execution_profile(
+            profile=first,
+            scientific_spec_path=(
+                tmp_path / "changed-prompt-policy.json"
+            ),
+            resource_performance_safety=(
+                selected_a.resource_performance_safety
+            ),
+            cpu_budget=selected_a.cpu_budget,
+        )
+
+    with pytest.raises(ValueError, match="publication differs"):
+        validate_benchmarked_stage1_execution_profile(
+            profile=replace(first, benchmark_publication_sha256="f" * 64),
+            scientific_spec_path=_SCIENTIFIC,
+            resource_performance_safety=(
+                selected_a.resource_performance_safety
+            ),
+            cpu_budget=selected_a.cpu_budget,
         )

@@ -28,7 +28,7 @@ from typing import Any, Hashable, Mapping, Sequence
 
 FUSION_PROMPT_VERSION = "all_evidence_candidate_fusion_v10"
 EVIDENCE_CONTRACT_GROUNDING_VERSION = "all_evidence_contract_name_grounding_v2"
-LEGACY_COMPACTION_STRATEGY_VERSION = "legacy_multiaxis_interleave_v1"
+LEGACY_COMPACTION_STRATEGY_VERSION = "legacy_complete_canonical_order_v2"
 EXACT_INNER_RECURRENCE_VERSION = "exact_inner_normalized_term_recurrence_v2"
 SOURCE_TEXT_TEMPORAL_POLICY = "source_text_temporally_valid_by_design_v1"
 SOURCE_TEXT_TEMPORAL_BOUNDARY_ENFORCED = False
@@ -229,12 +229,6 @@ _ROW_ID_KEY = re.compile(
     flags=re.IGNORECASE,
 )
 
-_MAX_LEGACY_GROUPS_PER_KIND = 12
-_MAX_ROWS_PER_GROUP = 16
-_MAX_TOPICS_PER_BANK = 12
-_MAX_TERMS_PER_TOPIC = 15
-_MAX_QUERY_ITEMS = 24
-_MAX_TEXT_CHARS = 420
 _MAX_CANDIDATE_POOL = 256
 
 # Put compact, causally targeted summaries before large sparse banks while
@@ -1164,7 +1158,7 @@ def _normalization_drop(
     return {
         "path": path,
         "reason_code": reason_code,
-        "reason": _clip_text(reason, _MAX_TEXT_CHARS),
+        "reason": _normalize_evidence_text(reason),
     }
 
 
@@ -1915,7 +1909,7 @@ def _validate_selection_notes(
                 "supporting_evidence_ids": evidence_ids,
                 "supporting_source_families": families,
                 "evidence_contract_grounding": grounding_rows,
-                "reason": _clip_text(note.get("reason"), _MAX_TEXT_CHARS),
+                "reason": _normalize_evidence_text(note.get("reason")),
             }
         )
     missing_notes = selected - seen
@@ -2008,7 +2002,7 @@ def _validate_proposal_response(
                 "supporting_evidence_ids": evidence_ids,
                 "supporting_source_families": families,
                 "evidence_contract_grounding": grounding_rows,
-                "rationale": _clip_text(proposal.get("rationale"), _MAX_TEXT_CHARS),
+                "rationale": _normalize_evidence_text(proposal.get("rationale")),
             }
         )
     family_counts = {family: 0 for family in ALL_SOURCE_FAMILIES}
@@ -2244,7 +2238,7 @@ def _reject_forbidden_content(value: Any, *, path: str) -> None:
 
 def _legacy_axis_token(value: Any, *, default: str) -> str:
     token = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
-    return token[:120] or default
+    return token or default
 
 
 def _bow_model_axis(group: Mapping[str, Any]) -> str:
@@ -2336,79 +2330,20 @@ def _legacy_group_dimensions(
     }
 
 
-def _interleave_legacy_groups(
+def _canonicalize_legacy_groups(
     records: Sequence[Mapping[str, Any]],
-    *,
-    limit: int,
 ) -> list[Mapping[str, Any]]:
-    """Select a deterministic multi-axis cover before taking repeat strata.
+    """Return every legacy group in content-defined order.
 
-    The historical handoff is ordered view-major.  A leading slice therefore
-    kept only the first linear view/objectives and could erase nonlinear,
-    ensemble-R, matched-uplift, or clustered evidence.  This greedy round robin
-    first covers unseen source families and then unseen values on every
-    declared axis.  Remaining slots minimize normalized per-stratum load.
-    Canonical content is the sole tie-breaker, so input list order is irrelevant.
+    Older implementations selected a fixed number of groups.  Even with
+    multi-axis interleaving, that silently omitted authenticated evidence when
+    a dataset produced more groups than the built-in allowance.  The legacy
+    adapter now preserves every group.  Prompt/page capacity is an orchestration
+    concern and must be handled by an explicit complete-paging protocol, never
+    by slicing this scientific evidence bank.
     """
 
-    ordered = sorted(records, key=lambda row: _canonical_json(row["canonical"]))
-    if len(ordered) <= int(limit):
-        return ordered
-    discovered: dict[str, dict[str, int]] = {}
-    for row in ordered:
-        for dimension, values in row["dimensions"].items():
-            counts = discovered.setdefault(str(dimension), {})
-            for value in values:
-                counts[str(value)] = counts.get(str(value), 0) + 1
-    retained: dict[str, dict[str, int]] = {
-        dimension: {value: 0 for value in counts} for dimension, counts in discovered.items()
-    }
-    selected: list[Mapping[str, Any]] = []
-    remaining = list(ordered)
-    while remaining and len(selected) < int(limit):
-
-        def score(row: Mapping[str, Any]) -> tuple[int, int, int, int, int, int, float, float]:
-            family_novelty = 0
-            all_axis_novelty = 0
-            novelty_by_axis = {
-                "bow_model": 0,
-                "objective": 0,
-                "sign": 0,
-                "bow_view": 0,
-            }
-            normalized_load = 0.0
-            inverse_frequency = 0.0
-            for dimension, values in row["dimensions"].items():
-                for raw_value in values:
-                    value = str(raw_value)
-                    count = retained[dimension][value]
-                    if count == 0:
-                        all_axis_novelty += 1
-                        if dimension == "source_family":
-                            family_novelty += 1
-                        elif dimension in novelty_by_axis:
-                            novelty_by_axis[dimension] += 1
-                    support = discovered[dimension][value]
-                    normalized_load += count / max(1, support)
-                    inverse_frequency += 1.0 / max(1, support)
-            return (
-                family_novelty,
-                novelty_by_axis["bow_model"],
-                novelty_by_axis["objective"],
-                novelty_by_axis["sign"],
-                novelty_by_axis["bow_view"],
-                all_axis_novelty,
-                -normalized_load,
-                inverse_frequency,
-            )
-
-        best_index = max(range(len(remaining)), key=lambda index: score(remaining[index]))
-        chosen = remaining.pop(best_index)
-        selected.append(chosen)
-        for dimension, values in chosen["dimensions"].items():
-            for raw_value in values:
-                retained[dimension][str(raw_value)] += 1
-    return selected
+    return sorted(records, key=lambda row: _canonical_json(row["canonical"]))
 
 
 def _legacy_compaction_accounting(
@@ -2439,8 +2374,8 @@ def _legacy_compaction_accounting(
 
     return {
         "schema_version": LEGACY_COMPACTION_STRATEGY_VERSION,
-        "selection_strategy": "deterministic_multi_axis_round_robin",
-        "maximum_groups_per_role_and_kind": _MAX_LEGACY_GROUPS_PER_KIND,
+        "selection_strategy": "complete_canonical_order_no_omission",
+        "maximum_groups_per_role_and_kind": None,
         "discovered_group_count": len(discovered),
         "retained_group_count": len(retained),
         "dropped_group_count": len(discovered) - len(retained),
@@ -2521,7 +2456,7 @@ def _compact_exact_inner_recurrence(
         for term_index, raw_term in enumerate(raw_terms):
             if not isinstance(raw_term, Mapping):
                 raise ValueError(f"exact-inner recurrence terms[{term_index}] must be an object")
-            term = _clip_text(raw_term.get("term"), 160)
+            term = _normalize_evidence_text(raw_term.get("term"))
             if not term or term in seen_terms:
                 continue
             seen_terms.add(term)
@@ -2586,9 +2521,8 @@ def _compact_legacy_all_source(
             if rows:
                 content = {
                     "kind": "sparse_text_terms",
-                    "signal": _clip_text(
-                        group.get("meaning") or group.get("evidence_type"),
-                        180,
+                    "signal": _normalize_evidence_text(
+                        group.get("meaning") or group.get("evidence_type")
                     ),
                     "terms": rows,
                 }
@@ -2611,10 +2545,7 @@ def _compact_legacy_all_source(
                     }
                 )
         discovered_records.extend(bow_records)
-        selected_bow = _interleave_legacy_groups(
-            bow_records,
-            limit=_MAX_LEGACY_GROUPS_PER_KIND,
-        )
+        selected_bow = _canonicalize_legacy_groups(bow_records)
         retained_records.extend(selected_bow)
 
         embedding_records: list[dict[str, Any]] = []
@@ -2643,10 +2574,7 @@ def _compact_legacy_all_source(
                     }
                 )
         discovered_records.extend(embedding_records)
-        selected_embedding = _interleave_legacy_groups(
-            embedding_records,
-            limit=_MAX_LEGACY_GROUPS_PER_KIND,
-        )
+        selected_embedding = _canonicalize_legacy_groups(embedding_records)
         retained_records.extend(selected_embedding)
 
         htr_records: list[dict[str, Any]] = []
@@ -2664,7 +2592,7 @@ def _compact_legacy_all_source(
             )
             content = {
                 "kind": "neural_attention_summaries",
-                "stage": _clip_text(stage, 80),
+                "stage": _normalize_evidence_text(stage),
                 "summaries": summaries,
             }
             htr_records.append(
@@ -2686,10 +2614,7 @@ def _compact_legacy_all_source(
                 }
             )
         discovered_records.extend(htr_records)
-        selected_htr = _interleave_legacy_groups(
-            htr_records,
-            limit=_MAX_LEGACY_GROUPS_PER_KIND,
-        )
+        selected_htr = _canonicalize_legacy_groups(htr_records)
         retained_records.extend(selected_htr)
 
     output = [
@@ -2716,12 +2641,11 @@ def _compact_bow_rows(value: Any) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     if not isinstance(value, (list, tuple)):
         return output
-    for row in value[:_MAX_ROWS_PER_GROUP]:
+    for row in value:
         if not isinstance(row, Mapping):
             continue
-        feature = _clip_text(
+        feature = _normalize_evidence_text(
             row.get("feature") or row.get("term") or row.get("phrase"),
-            160,
         )
         if not feature:
             continue
@@ -2767,21 +2691,20 @@ def _compact_embedding_contrast(contrast: Mapping[str, Any]) -> dict[str, Any]:
         rows = contrast.get(side)
         if not isinstance(rows, (list, tuple)):
             continue
-        for row in rows[:6]:
+        for row in rows:
             if not isinstance(row, Mapping):
                 continue
-            text = _clip_text(row.get("text") or row.get("chunk_text"), _MAX_TEXT_CHARS)
+            text = _normalize_evidence_text(row.get("text") or row.get("chunk_text"))
             if text:
                 chunks.append({"side": side, "text": text})
     concept_scores: list[dict[str, Any]] = []
     raw_scores = contrast.get("concept_probe_scores")
     if isinstance(raw_scores, (list, tuple)):
-        for score in raw_scores[:12]:
+        for score in raw_scores:
             if not isinstance(score, Mapping):
                 continue
-            label = _clip_text(
+            label = _normalize_evidence_text(
                 score.get("concept") or score.get("phrase") or score.get("label"),
-                140,
             )
             if not label:
                 continue
@@ -2794,9 +2717,8 @@ def _compact_embedding_contrast(contrast: Mapping[str, Any]) -> dict[str, Any]:
             concept_scores.append(item)
     return {
         "kind": "embedding_contrast",
-        "contrast_label": _clip_text(
+        "contrast_label": _normalize_evidence_text(
             contrast.get("name") or contrast.get("contrast_family"),
-            160,
         ),
         "chunks": chunks,
         "concept_scores": concept_scores,
@@ -2807,27 +2729,25 @@ def _compact_htr_rows(value: Any) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
     output: list[str] = []
-    for row in value[:_MAX_ROWS_PER_GROUP]:
+    for row in value:
         if not isinstance(row, Mapping):
             continue
         text_parts: list[str] = []
-        summary = _clip_text(
+        summary = _normalize_evidence_text(
             row.get("attended_token_summary") or row.get("evidence_snippet") or row.get("feature"),
-            _MAX_TEXT_CHARS,
         )
         if summary:
             text_parts.append(summary)
         spans = row.get("top_token_spans")
         if isinstance(spans, (list, tuple)):
-            for span in spans[:12]:
+            for span in spans:
                 if isinstance(span, Mapping):
-                    token = _clip_text(
+                    token = _normalize_evidence_text(
                         span.get("text") or span.get("token") or span.get("span"),
-                        80,
                     )
                     if token:
                         text_parts.append(token)
-        joined = _clip_text("; ".join(dict.fromkeys(text_parts)), _MAX_TEXT_CHARS)
+        joined = _normalize_evidence_text("; ".join(dict.fromkeys(text_parts)))
         if joined:
             output.append(joined)
     return output
@@ -2851,7 +2771,7 @@ def _compact_tfidf_evidence(
         topics = bank_payload.get("topics")
         if not isinstance(topics, (list, tuple)):
             continue
-        for topic in topics[:_MAX_TOPICS_PER_BANK]:
+        for topic in topics:
             if not isinstance(topic, Mapping):
                 continue
             terms = _compact_topic_terms(topic.get("terms"))
@@ -2864,7 +2784,7 @@ def _compact_tfidf_evidence(
                     {
                         "kind": "tfidf_topic",
                         "bank": bank,
-                        "topic_id": _clip_text(topic.get("topic_id"), 120),
+                        "topic_id": _normalize_evidence_text(topic.get("topic_id")),
                         "terms": terms,
                     },
                 )
@@ -2875,7 +2795,7 @@ def _compact_tfidf_evidence(
         clusters = orphan.get("selected_clusters") or orphan.get("clusters") or []
         selected_ids = {str(value) for value in orphan.get("selected_cluster_ids") or []}
         if isinstance(clusters, (list, tuple)):
-            for cluster in clusters[:_MAX_TOPICS_PER_BANK]:
+            for cluster in clusters:
                 if not isinstance(cluster, Mapping):
                     continue
                 cluster_id = str(cluster.get("cluster_id") or cluster.get("topic_id") or "")
@@ -2894,7 +2814,7 @@ def _compact_tfidf_evidence(
                         "effect_modifier",
                         {
                             "kind": "tfidf_orphan_ngram_cluster",
-                            "cluster_id": _clip_text(cluster_id, 120),
+                            "cluster_id": _normalize_evidence_text(cluster_id),
                             "terms": terms,
                         },
                     )
@@ -2920,11 +2840,10 @@ def _compact_topic_terms(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, (list, tuple)):
         return []
     output: list[dict[str, Any]] = []
-    for raw_term in value[:_MAX_TERMS_PER_TOPIC]:
+    for raw_term in value:
         row = raw_term if isinstance(raw_term, Mapping) else {"term": raw_term}
-        term = _clip_text(
+        term = _normalize_evidence_text(
             row.get("term") or row.get("feature") or row.get("ngram"),
-            160,
         )
         if not term:
             continue
@@ -2957,15 +2876,15 @@ def _compact_query_moment_evidence(
     if not isinstance(raw, (list, tuple)):
         raise ValueError("neural_query_moments payload is missing query_evidence")
     output: list[tuple[tuple[str, ...], str, dict[str, Any]]] = []
-    for query in raw[:_MAX_QUERY_ITEMS]:
+    for query in raw:
         if not isinstance(query, Mapping):
             continue
         bank = str(query.get("bank") or "").lower()
         role = "effect_modifier" if bank == "effect" else "confounder"
         chunks: list[str] = []
-        for row in list(query.get("top_chunks") or [])[:8]:
+        for row in list(query.get("top_chunks") or []):
             if isinstance(row, Mapping):
-                text = _clip_text(row.get("text") or row.get("chunk_text"), _MAX_TEXT_CHARS)
+                text = _normalize_evidence_text(row.get("text") or row.get("chunk_text"))
                 if text:
                     chunks.append(text)
         ngrams = _compact_topic_terms(query.get("top_contrastive_ngrams"))
@@ -2974,7 +2893,7 @@ def _compact_query_moment_evidence(
         content: dict[str, Any] = {
             "kind": content_kind,
             "bank": bank,
-            "query_id": _clip_text(query.get("query_id"), 100),
+            "query_id": _normalize_evidence_text(query.get("query_id")),
             "retrieved_training_excerpts": chunks,
             "contrastive_ngrams": ngrams,
         }
@@ -3037,7 +2956,7 @@ def _validate_legacy_compaction_audit(value: Any) -> dict[str, Any]:
         raise ValueError("legacy compaction audit must use the closed accounting schema")
     if value.get("schema_version") != LEGACY_COMPACTION_STRATEGY_VERSION:
         raise ValueError("legacy compaction audit has an unsupported schema")
-    if value.get("selection_strategy") != "deterministic_multi_axis_round_robin":
+    if value.get("selection_strategy") != "complete_canonical_order_no_omission":
         raise ValueError("legacy compaction audit has an unsupported selection strategy")
 
     def nonnegative_int(raw: Any, *, field_name: str) -> int:
@@ -3045,12 +2964,8 @@ def _validate_legacy_compaction_audit(value: Any) -> dict[str, Any]:
             raise ValueError(f"legacy compaction audit {field_name} must be nonnegative")
         return raw
 
-    cap = nonnegative_int(
-        value.get("maximum_groups_per_role_and_kind"),
-        field_name="maximum_groups_per_role_and_kind",
-    )
-    if cap != _MAX_LEGACY_GROUPS_PER_KIND:
-        raise ValueError("legacy compaction audit cap does not match the implementation")
+    if value.get("maximum_groups_per_role_and_kind") is not None:
+        raise ValueError("legacy compaction audit must not declare an evidence cap")
     discovered = nonnegative_int(
         value.get("discovered_group_count"), field_name="discovered_group_count"
     )
@@ -3058,6 +2973,8 @@ def _validate_legacy_compaction_audit(value: Any) -> dict[str, Any]:
     dropped = nonnegative_int(value.get("dropped_group_count"), field_name="dropped_group_count")
     if discovered != retained + dropped:
         raise ValueError("legacy compaction audit total accounting is inconsistent")
+    if dropped != 0:
+        raise ValueError("legacy compaction audit reports forbidden evidence omission")
 
     def count_map(raw: Any, *, keys: set[str], field_name: str) -> dict[str, int]:
         if not isinstance(raw, Mapping) or set(map(str, raw)) != keys:
@@ -3109,12 +3026,13 @@ def _validate_legacy_compaction_audit(value: Any) -> dict[str, Any]:
     return json.loads(_canonical_json(dict(value)))
 
 
-def _clip_text(value: Any, limit: int) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    return text[: max(0, int(limit))]
+def _normalize_evidence_text(value: Any) -> str:
+    """Normalize evidence text without shortening or dropping its suffix."""
+
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def _finite_scalar(value: Any) -> int | float | str | bool | None:
+def _finite_scalar(value: Any) -> int | float | bool | None:
     if value is None or isinstance(value, (Mapping, list, tuple, set)):
         return None
     if isinstance(value, bool):
@@ -3126,7 +3044,7 @@ def _finite_scalar(value: Any) -> int | float | str | bool | None:
     try:
         numeric = float(value)
     except (TypeError, ValueError):
-        return _clip_text(value, 100) or None
+        return None
     return round(numeric, 8) if math.isfinite(numeric) else None
 
 

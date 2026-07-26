@@ -20,69 +20,34 @@ if str(PUBMED_SCRIPT_DIR) not in sys.path:
 
 from embed_pubmed_corpus import EmbedConfig, build_pubmed_embedding_cache  # noqa: E402
 
-DEFAULT_INPUT = Path("/ksg/kehl_mm_data/mmai/v22/data/no_phi/all_synthetic_notes.parquet")
-DEFAULT_OUTPUT_ROOT = Path("/data1/ken/pcori_dev/pubmed_embeddings")
-DEFAULT_SAMPLE_NAME = "synthetic_notes_sample"
-DEFAULT_TEXT_CANDIDATES = [
-    "synthetic_note_text",
-    "note_text",
-    "text",
-    "synthetic_note",
-    "masked_text",
-    "event_text",
-]
-DEFAULT_METADATA_COLUMNS = [
-    "source_row_index",
-    "row_id",
-    "pseudo_mrn",
-    "patient_id",
-    "event_type",
-    "nct_id",
-    "split",
-    "title",
-    "space_number",
-    "criteria_index",
-    "date",
-]
-
-
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Sample synthetic notes from a parquet file and pre-embed them into "
             "an external chunk-cache for embedding contrast retrieval."
         )
     )
-    parser.add_argument("--input-parquet", default=str(DEFAULT_INPUT))
-    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
-    parser.add_argument("--sample-name", default=DEFAULT_SAMPLE_NAME)
-    parser.add_argument("--sample-size", type=int, default=100_000)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--input-parquet", required=True)
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--sample-name", required=True)
+    parser.add_argument("--sample-size", type=int, required=True)
+    parser.add_argument("--seed", type=int, required=True)
     parser.add_argument(
         "--text-column",
-        default="auto",
-        help="Text column to embed, or 'auto' to inspect common candidate names.",
+        required=True,
+        help="Exact text column to sample; implicit column auto-detection is forbidden.",
     )
-    parser.add_argument(
-        "--candidate-text-column",
-        action="append",
-        default=[],
-        help="Candidate text column for auto-detection. May be repeated.",
-    )
-    parser.add_argument("--source-id-column", default="row_id")
+    parser.add_argument("--source-id-column", required=True)
     parser.add_argument(
         "--metadata-column",
         action="append",
         default=[],
-        help=(
-            "Metadata column copied into row_metadata.jsonl. May be repeated. "
-            "Defaults to useful synthetic-note identifiers."
-        ),
+        help="Optional metadata column copied into row_metadata.jsonl. May be repeated.",
     )
-    parser.add_argument("--model-name", default="Qwen/Qwen3-Embedding-8B")
+    parser.add_argument("--model-name", required=True)
     parser.add_argument(
         "--device-ids",
         nargs="*",
@@ -91,12 +56,22 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--rows-per-part", type=int, default=2500)
-    parser.add_argument("--max-seq-length", type=int, default=1024)
-    parser.add_argument("--chunk-size-words", type=int, default=256)
-    parser.add_argument("--chunk-overlap-words", type=int, default=64)
-    parser.add_argument("--max-chunks", type=int, default=8)
-    parser.add_argument("--chunk-selection", choices=["first", "last"], default="first")
-    parser.add_argument("--no-normalize-embeddings", action="store_true")
+    parser.add_argument("--max-seq-length", type=int, required=True)
+    parser.add_argument("--chunk-size-words", type=int, required=True)
+    parser.add_argument("--chunk-overlap-words", type=int, required=True)
+    parser.add_argument("--max-chunks", type=int, required=True)
+    parser.add_argument("--chunk-selection", choices=["first", "last"], required=True)
+    normalization = parser.add_mutually_exclusive_group(required=True)
+    normalization.add_argument(
+        "--normalize-embeddings",
+        dest="normalize_embeddings",
+        action="store_true",
+    )
+    normalization.add_argument(
+        "--no-normalize-embeddings",
+        dest="normalize_embeddings",
+        action="store_false",
+    )
     parser.add_argument(
         "--force-sample",
         action="store_true",
@@ -113,7 +88,11 @@ def main() -> None:
         help="Only write the sampled JSONL; do not embed.",
     )
     parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = build_parser().parse_args(argv)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -122,13 +101,18 @@ def main() -> None:
 
     input_path = Path(args.input_parquet).expanduser()
     output_root = Path(args.output_root).expanduser()
+    if (
+        not isinstance(args.sample_name, str)
+        or not args.sample_name.strip()
+        or Path(args.sample_name).name != args.sample_name
+    ):
+        raise ValueError("--sample-name must be one non-empty path-free name")
     output_root.mkdir(parents=True, exist_ok=True)
     sample_path = output_root / f"{args.sample_name}.jsonl"
     sample_metadata_path = output_root / f"{args.sample_name}.metadata.json"
-    candidate_columns = args.candidate_text_column or DEFAULT_TEXT_CANDIDATES
-    metadata_columns = args.metadata_column or DEFAULT_METADATA_COLUMNS
+    metadata_columns = list(args.metadata_column)
 
-    text_column = resolve_text_column(input_path, args.text_column, candidate_columns)
+    text_column = resolve_text_column(input_path, args.text_column)
     logger.info("Using synthetic text column: %s", text_column)
     if args.force_sample or not sample_path.exists():
         write_sample_jsonl(
@@ -142,6 +126,15 @@ def main() -> None:
             seed=args.seed,
         )
     else:
+        _assert_reusable_sample_configuration(
+            metadata_path=sample_metadata_path,
+            input_path=input_path,
+            text_column=text_column,
+            source_id_column=args.source_id_column,
+            metadata_columns=metadata_columns,
+            sample_size=args.sample_size,
+            seed=args.seed,
+        )
         logger.info("Reusing existing sample JSONL: %s", sample_path)
 
     if args.prepare_only:
@@ -164,7 +157,7 @@ def main() -> None:
         chunk_overlap_words=args.chunk_overlap_words,
         max_chunks=args.max_chunks,
         chunk_selection=args.chunk_selection,
-        normalize_embeddings=not args.no_normalize_embeddings,
+        normalize_embeddings=args.normalize_embeddings,
         limit=None,
         force=args.force_embed,
     )
@@ -175,29 +168,15 @@ def main() -> None:
 def resolve_text_column(
     input_path: Path,
     requested: str,
-    candidates: Sequence[str],
 ) -> str:
     schema_names = parquet_column_names(input_path)
-    if requested and requested != "auto":
-        if requested not in schema_names:
-            raise ValueError(
-                f"Requested text column {requested!r} not found. "
-                f"Available columns: {schema_names}"
-            )
-        return requested
-    for candidate in candidates:
-        if candidate in schema_names:
-            return candidate
-    text_like = [
-        col
-        for col in schema_names
-        if "note" in col.lower() or "text" in col.lower() or "abstract" in col.lower()
-    ]
-    raise ValueError(
-        "Could not auto-detect a text column. "
-        f"Tried {list(candidates)}. Text-like columns found: {text_like}. "
-        "Pass --text-column explicitly."
-    )
+    if not requested or requested == "auto":
+        raise ValueError("--text-column must name one exact column; 'auto' is forbidden")
+    if requested not in schema_names:
+        raise ValueError(
+            f"Requested text column {requested!r} not found. " f"Available columns: {schema_names}"
+        )
+    return requested
 
 
 def parquet_column_names(input_path: Path) -> List[str]:
@@ -224,12 +203,19 @@ def write_sample_jsonl(
     if sample_size < 1:
         raise ValueError("--sample-size must be >= 1")
     parquet_file = pq.ParquetFile(input_path)
+    schema_names = tuple(parquet_file.schema_arrow.names)
+    required_columns = {text_column, source_id_column, *metadata_columns}
+    missing_columns = sorted(required_columns - set(schema_names))
+    if missing_columns:
+        raise ValueError(
+            f"configured sample columns are absent from the input parquet: {missing_columns}"
+        )
     total_rows = int(parquet_file.metadata.num_rows)
     target_size = min(int(sample_size), total_rows)
     rng = np.random.default_rng(int(seed))
     selected = np.sort(rng.choice(total_rows, size=target_size, replace=False))
     columns = _columns_to_read(
-        parquet_file.schema_arrow.names,
+        schema_names,
         text_column=text_column,
         source_id_column=source_id_column,
         metadata_columns=metadata_columns,
@@ -290,6 +276,44 @@ def write_sample_jsonl(
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(sample_metadata, f, indent=2, ensure_ascii=False)
     logger.info("Wrote %d sampled notes to %s", written, output_path)
+
+
+def _assert_reusable_sample_configuration(
+    *,
+    metadata_path: Path,
+    input_path: Path,
+    text_column: str,
+    source_id_column: str,
+    metadata_columns: Sequence[str],
+    sample_size: int,
+    seed: int,
+) -> None:
+    if not metadata_path.is_file():
+        raise RuntimeError(
+            "existing sample lacks its configuration metadata; use a fresh output "
+            "or explicitly rebuild with --force-sample"
+        )
+    with open(metadata_path, encoding="utf-8") as handle:
+        observed = json.load(handle)
+    expected = {
+        "input_parquet": str(input_path),
+        "text_column": text_column,
+        "source_id_column": source_id_column,
+        "metadata_columns": list(metadata_columns),
+        "sample_size_requested": int(sample_size),
+        "seed": int(seed),
+    }
+    mismatches = [
+        key
+        for key, expected_value in expected.items()
+        if not isinstance(observed, dict) or observed.get(key) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "existing synthetic-note sample is scientifically incompatible with "
+            f"this request; mismatched fields: {mismatches}. Use a fresh output "
+            "or --force-sample."
+        )
 
 
 def _columns_to_read(

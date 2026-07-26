@@ -87,14 +87,42 @@ def test_acceptance_deployment_is_closed_full_workflow_configuration() -> None:
         == "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic"
     )
     assert deployment.stage2_tokenizer_locator == Path(
-        "/data1/ken/models/"
-        "models--RedHatAI--Gemma-4-26B-A4B-it-FP8-Dynamic/"
-        "snapshots/8edbb9269ec9c3faad538ee1208a07eb46051f34"
+        "../artifacts/local_models/"
+        "gemma4_26b_a4b_it_fp8_dynamic_tokenizer_materialized"
     )
+    tokenizer_root = (
+        DEPLOYMENT_PROFILE.parent / deployment.stage2_tokenizer_locator
+    ).resolve(strict=True)
+    assert {path.name for path in tokenizer_root.iterdir()} == {
+        "chat_template.jinja",
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    }
+    assert not any(path.is_symlink() for path in tokenizer_root.rglob("*"))
     assert deployment.devices == ("auto",)
     assert deployment.stage1_execution.resource_kind == "accelerator"
     assert deployment.stage1_execution.device_count == 2
     assert deployment.stage1_execution.scope_workers_per_device == 1
+    assert deployment.stage1_execution.max_parallel_owners == 2
+    assert (
+        deployment.stage1_execution.neural_query_topology.mode
+        == "one_context_per_selected_device"
+    )
+    assert (
+        deployment.stage1_execution.htr_operational_controls.as_dict()
+        == {
+            "schema_version": (
+                "production_role_neutral_htr_operational_controls_v1"
+            ),
+            "training_batch_size": 8,
+            "sentence_encoder_batch_size": 16,
+            "data_loader_workers": 0,
+            "reuse_tokenizer_and_chunk_plans": False,
+            "chunk_plan_cache_max_entries": 0,
+            "tokenized_chunk_cache_max_entries": 0,
+        }
+    )
     assert deployment.cpu_budget == 8
     assert deployment.forest_operational.requested_host_cpu_budget == 8
     assert deployment.oracle_source == deployment.dataset_path
@@ -109,6 +137,7 @@ def test_acceptance_deployment_is_closed_full_workflow_configuration() -> None:
         "resume",
         "stop_after",
         "adopt_checkpoints",
+        "trust_prior_adoption_attestations",
         "log_level",
         "validation_depth",
     ):
@@ -128,6 +157,14 @@ def test_benchmark_staging_and_final_deployments_have_distinct_fresh_roots() -> 
     assert staging.stage1_execution.resource_kind == "accelerator"
     assert final.stage1_execution.resource_kind == "accelerator"
     assert staging.devices == final.devices == ("auto",)
+    assert (
+        staging.stage2_tokenizer_locator
+        == final.stage2_tokenizer_locator
+        == Path(
+            "../artifacts/local_models/"
+            "gemma4_26b_a4b_it_fp8_dynamic_tokenizer_materialized"
+        )
+    )
     assert (
         staging.resource_performance_safety
         == final.resource_performance_safety
@@ -188,7 +225,7 @@ def test_acceptance_cli_compiles_offline_stage1_prefix_without_server_access(
             "--stop-after",
             "handoff_validation",
             "--validation-depth",
-            "full",
+            "fresh_terminal_audit",
         ]
     )
 
@@ -199,6 +236,7 @@ def test_acceptance_cli_compiles_offline_stage1_prefix_without_server_access(
     assert options.endpoint == "http://camus:8010/v1"
     assert options.model_name == "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic"
     assert options.run_control.stop_after == "handoff_validation"
+    assert options.run_control.validation_depth == "fresh_terminal_audit"
     assert options.stage1_execution_device_count == 2
     assert options.stage1_scope_workers_per_gpu == 1
     assert options.run_control.adopt_checkpoints == (

@@ -47,6 +47,10 @@ from oci.inference.post_extraction_scientific_policy import (
     POST_EXTRACTION_SCIENTIFIC_POLICY_VERSION,
     PostExtractionScientificPolicy,
 )
+from tests.hierarchy_resource_test_support import (
+    FIRST_UNTOUCHED_GATE_BOUNDS,
+    HIERARCHY_JOB_CACHE_CONFIG,
+)
 
 CAMUS_ENDPOINT = "http://camus:8010/v1"
 CAMUS_MODEL = "RedhatAI/gemma-4-26B-A4B-it-FP8-Dynamic"
@@ -587,6 +591,8 @@ def _options(
         initial_training_partitions=3,
         stage2_protocol=_stage2_protocol(),
         stage2_tokenizer_locator=tokenizer,
+        hierarchical_discovery_job_cache_config=HIERARCHY_JOB_CACHE_CONFIG,
+        first_untouched_gate_preparation_bounds=FIRST_UNTOUCHED_GATE_BOUNDS,
         post_extraction_review_config=_causal_review_config(),
         post_extraction_scientific_policy=(
             _post_extraction_scientific_policy()
@@ -743,6 +749,9 @@ def test_cli_keeps_safety_controls_fixed_but_requires_scientific_token_budgets(
     assert actions["review_stage1_device"].required is True
     assert actions["review_neural_query_device"].required is True
     assert actions["stage2_tokenizer_locator"].required is True
+    assert actions["hierarchical_job_cache_max_entry_bytes"].required is True
+    for field_name in FIRST_UNTOUCHED_GATE_BOUNDS.__dataclass_fields__:
+        assert actions["first_untouched_gate_" + field_name].required is True
 
     options = _options(tmp_path)
     argv = [
@@ -764,6 +773,8 @@ def test_cli_keeps_safety_controls_fixed_but_requires_scientific_token_budgets(
         "1",
         "--initial-training-partitions",
         "3",
+        "--hierarchical-job-cache-max-entry-bytes",
+        str(options.hierarchical_discovery_job_cache_config.max_entry_bytes),
         "--source-text-temporally-valid-by-design",
         "--review-stage1-device",
         "cpu",
@@ -807,6 +818,15 @@ def test_cli_keeps_safety_controls_fixed_but_requires_scientific_token_budgets(
         "--forest-n-jobs",
         str(options.forest_n_jobs),
     ]
+    for name, value in asdict(
+        options.first_untouched_gate_preparation_bounds
+    ).items():
+        argv.extend(
+            (
+                "--first-untouched-gate-" + name.replace("_", "-"),
+                str(value),
+            )
+        )
     wire_budget_path = tmp_path / "hierarchy_wire_budget.json"
     wire_budget_path.write_text(
         json.dumps(

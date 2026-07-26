@@ -84,6 +84,12 @@ from .all_evidence_post_extraction_review import (
     UNCALIBRATED_EFFECT_MODIFIER_ROLE,
 )
 from .frozen_extraction_cache_overlay import FrozenExtractionCacheOverlay, sha256_file
+from .first_untouched_gate_direct_numerical_preparation import (
+    FirstUntouchedGatePreparationBounds,
+)
+from .hierarchical_discovery_job_cache import (
+    HierarchicalDiscoveryJobCacheConfig,
+)
 from .context_fit_upstream_gate_provider import (
     CompositeContextFitUpstreamBackend,
     ContextFitUpstreamGateProvider,
@@ -116,6 +122,9 @@ from .review_spent_evidence_provider import (
     SemanticWitnessScientificConfig,
     SpentOnlyFrozenChunkEmbeddingCache,
     TfidfTopicOrphanSpentDiscoveryBackend,
+)
+from .tfidf_orphan_evidence_adapter import (
+    orphan_ngram_adapter_config_from_tfidf_topic,
 )
 from .review_spent_evidence_cache_overlay import (
     AuthenticatedReviewSpentCacheSource,
@@ -199,8 +208,6 @@ _REQUIRED_REVIEW_DISCOVERY_FAMILIES = frozenset(
     set(ALL_NON_QUERY_DISCOVERY_FAMILIES) | {NEURAL_QUERY_MOMENTS}
 )
 _FINAL_UPSTREAM_NAMESPACE = "all_evidence_upstream"
-_FINAL_UPSTREAM_SIGNED_ORDER_WIDTH = 16
-_FINAL_UPSTREAM_MAX_ORPHAN_FEATURES = 32
 _FINAL_UPSTREAM_RAW_FAMILY_ROLE_KEYS = (
     ("bow_nuisance", PROPENSITY_NUISANCE_FEATURE_ROLE),
     ("bow_nuisance", OUTCOME_NUISANCE_FEATURE_ROLE),
@@ -416,6 +423,7 @@ def _validate_numeric_configuration(args: argparse.Namespace) -> None:
     _review_stage1_device(args)
     _review_neural_query_devices(args)
     if int(args.post_extraction_review_rounds) > 0:
+        _final_upstream_max_orphan_features(args)
         if args.review_stage1_config is None:
             raise ValueError(
                 "--review-stage1-config is required when post-extraction review is enabled"
@@ -457,6 +465,23 @@ def _validate_numeric_configuration(args: argparse.Namespace) -> None:
         # this here makes dry-run and live execution share one exact policy.
         build_hierarchical_discovery_config(args)
         build_frozen_review_evidence_policy(args)
+
+
+def _final_upstream_max_orphan_features(args: argparse.Namespace) -> int:
+    value = getattr(args, "final_upstream_max_orphan_features", None)
+    if value is None:
+        raise ValueError(
+            "--final-upstream-max-orphan-features is required when "
+            "post-extraction review is enabled; there is no production default"
+        )
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise TypeError("--final-upstream-max-orphan-features must be an integer")
+    result = int(value)
+    if result < 1:
+        raise ValueError("--final-upstream-max-orphan-features must be positive")
+    return result
 
 
 def build_hierarchical_discovery_config(
@@ -780,6 +805,58 @@ def _validate_discovery_cli_mode(args: argparse.Namespace) -> None:
         raise ValueError("--dry-run cannot approve a hierarchical batch")
     if bool(args.dry_run) and bool(args.prepare_hierarchical_discovery):
         raise ValueError("--dry-run and --prepare-hierarchical-discovery are mutually exclusive")
+    hierarchy_resource_options = {
+        "--hierarchical-job-cache-max-entry-bytes": (
+            args.hierarchical_job_cache_max_entry_bytes
+        ),
+        "--first-untouched-gate-max-initial-spent-rows": (
+            args.first_untouched_gate_max_initial_spent_rows
+        ),
+        "--first-untouched-gate-max-first-gate-rows": (
+            args.first_untouched_gate_max_first_gate_rows
+        ),
+        "--first-untouched-gate-max-total-text-utf8-bytes": (
+            args.first_untouched_gate_max_total_text_utf8_bytes
+        ),
+        "--first-untouched-gate-max-catalog-atoms": (
+            args.first_untouched_gate_max_catalog_atoms
+        ),
+        "--first-untouched-gate-max-source-manifest-bytes": (
+            args.first_untouched_gate_max_source_manifest_bytes
+        ),
+        "--first-untouched-gate-max-direct-numerical-signals": (
+            args.first_untouched_gate_max_direct_numerical_signals
+        ),
+        "--first-untouched-gate-max-single-matrix-file-bytes": (
+            args.first_untouched_gate_max_single_matrix_file_bytes
+        ),
+        "--first-untouched-gate-max-total-matrix-file-bytes": (
+            args.first_untouched_gate_max_total_matrix_file_bytes
+        ),
+    }
+    if hierarchical:
+        missing = sorted(
+            name
+            for name, value in hierarchy_resource_options.items()
+            if value is None
+        )
+        if missing:
+            raise ValueError(
+                "hierarchical discovery requires explicit resource bounds: "
+                + ", ".join(missing)
+            )
+        invalid = sorted(
+            name
+            for name, value in hierarchy_resource_options.items()
+            if isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+        )
+        if invalid:
+            raise ValueError(
+                "hierarchical resource bounds must be positive integers: "
+                + ", ".join(invalid)
+            )
     if not hierarchical:
         unexpected = {
             "--hierarchical-preparation-dir": args.hierarchical_preparation_dir,
@@ -790,6 +867,7 @@ def _validate_discovery_cli_mode(args: argparse.Namespace) -> None:
             "--hierarchical-offline-review-packet-dir": (
                 args.hierarchical_offline_review_packet_dir
             ),
+            **hierarchy_resource_options,
         }
         present = sorted(name for name, value in unexpected.items() if value is not None)
         if present:
@@ -922,6 +1000,7 @@ def build_final_upstream_schema_config(
     *,
     stage1_config_snapshot: HistoricalStage1ConfigSnapshot | None = None,
     neural_query_config: NeuralQueryAgenticForestConfig | None = None,
+    signed_order_width: int,
 ) -> CrossFitStableUpstreamSchemaConfig:
     """Precommit one shared gate/final schema from exact upstream configs."""
 
@@ -941,6 +1020,13 @@ def build_final_upstream_schema_config(
     if not isinstance(query_config, NeuralQueryAgenticForestConfig):
         raise TypeError("neural_query_config must be NeuralQueryAgenticForestConfig")
     query_config.validate()
+    if isinstance(signed_order_width, (bool, np.bool_)) or not isinstance(
+        signed_order_width, (int, np.integer)
+    ):
+        raise TypeError("signed_order_width must be an integer")
+    stable_width = int(signed_order_width)
+    if stable_width < 1:
+        raise ValueError("signed_order_width must be positive")
 
     calibrated_sources = tuple(
         PrecommittedCalibratedSource(
@@ -961,7 +1047,7 @@ def build_final_upstream_schema_config(
             signed_order_width=(
                 query_config.query_count(_NEURAL_QUERY_BANK_BY_RAW_SOURCE_KIND[source_kind])
                 if source_kind in _NEURAL_QUERY_BANK_BY_RAW_SOURCE_KIND
-                else _FINAL_UPSTREAM_SIGNED_ORDER_WIDTH
+                else stable_width
             ),
             required=True,
             exact_passthrough_feature_names=(
@@ -990,7 +1076,7 @@ def build_coordinate_preserving_final_upstream_schema_config(
     *,
     stage1_config_snapshot: HistoricalStage1ConfigSnapshot | None = None,
     neural_query_config: NeuralQueryAgenticForestConfig | None = None,
-    max_orphan_features: int = _FINAL_UPSTREAM_MAX_ORPHAN_FEATURES,
+    max_orphan_features: int,
 ) -> CoordinatePreservingUpstreamSchemaConfig:
     """Precommit the production v3 schema without fitting or reading patient rows."""
 
@@ -1033,7 +1119,7 @@ def build_coordinate_preserving_final_upstream_schema_config(
         source_config_sha256=snapshot.sha256,
         cluster_max_components=int(forest.embedding_contrast.cluster_contrast_max_components),
         tfidf_topic_count=int(forest.tfidf_topic.topic_count),
-        max_orphan_features=int(max_orphan_features),
+        max_orphan_features=max_orphan_features,
         neural_query_counts={
             bank: query_config.query_count(bank) for bank in ("treatment", "outcome", "effect")
         },
@@ -1398,6 +1484,7 @@ def validate_benchmark_inputs(args: argparse.Namespace) -> ValidatedBenchmarkInp
         build_coordinate_preserving_final_upstream_schema_config(
             review_stage1_config_path,
             neural_query_config=review_query_config,
+            max_orphan_features=_final_upstream_max_orphan_features(args),
         )
     else:
         _validate_fresh_benchmark_output(output_dir)
@@ -1541,6 +1628,7 @@ def _dry_run_summary(
         build_coordinate_preserving_final_upstream_schema_config(
             validated.review_stage1_config_path,
             neural_query_config=review_query_config,
+            max_orphan_features=_final_upstream_max_orphan_features(args),
         )
         if review_enabled and validated.review_stage1_config_path is not None
         else None
@@ -1765,6 +1853,9 @@ def _dry_run_summary(
         "raw_final_upstream_runtime_retained_separately_from_cache_overlay": (review_enabled),
         "final_upstream_meta_inner_folds": int(args.final_upstream_meta_inner_folds),
         "final_upstream_head_regularization": float(args.final_upstream_head_regularization),
+        "final_upstream_max_orphan_features": (
+            _final_upstream_max_orphan_features(args) if review_enabled else None
+        ),
         "final_upstream_schema_namespace": (
             final_schema.namespace if final_schema is not None else None
         ),
@@ -2058,12 +2149,15 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
             stage1_config_path=validated.review_stage1_config_path,
             stage1_config_snapshot=stage1_config_snapshot,
             outcome_type=applied_config.outcome_type,
+            orphan_config=orphan_ngram_adapter_config_from_tfidf_topic(
+                htr_config.architecture.multi_model_forest.tfidf_topic
+            ),
         )
         tfidf_context_backend = TfidfTopicOrphanContextBackend(
             stage1_config_path=validated.review_stage1_config_path,
             stage1_config_snapshot=stage1_config_snapshot,
             outcome_type=applied_config.outcome_type,
-            max_orphan_features=_FINAL_UPSTREAM_MAX_ORPHAN_FEATURES,
+            max_orphan_features=_final_upstream_max_orphan_features(args),
         )
         # Context-fit run attestations select their exact historical graph.
         # With no such source, prefer the current wrapped graph; a spent-only
@@ -2129,7 +2223,7 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
                 validated.review_stage1_config_path,
                 stage1_config_snapshot=stage1_config_snapshot,
                 neural_query_config=review_query_config,
-                max_orphan_features=_FINAL_UPSTREAM_MAX_ORPHAN_FEATURES,
+                max_orphan_features=_final_upstream_max_orphan_features(args),
             ),
         )
         raw_review_gate_provider = ContextFitUpstreamGateProvider(
@@ -2203,6 +2297,45 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
         hierarchical_discovery_job_cache_root=(
             validated.hierarchical_job_cache_root if hierarchical else None
         ),
+        hierarchical_discovery_job_cache_config=(
+            HierarchicalDiscoveryJobCacheConfig(
+                max_entry_bytes=int(
+                    args.hierarchical_job_cache_max_entry_bytes
+                )
+            )
+            if hierarchical
+            else None
+        ),
+        first_untouched_gate_preparation_bounds=(
+            FirstUntouchedGatePreparationBounds(
+                max_initial_spent_rows=int(
+                    args.first_untouched_gate_max_initial_spent_rows
+                ),
+                max_first_gate_rows=int(
+                    args.first_untouched_gate_max_first_gate_rows
+                ),
+                max_total_text_utf8_bytes=int(
+                    args.first_untouched_gate_max_total_text_utf8_bytes
+                ),
+                max_catalog_atoms=int(
+                    args.first_untouched_gate_max_catalog_atoms
+                ),
+                max_source_manifest_bytes=int(
+                    args.first_untouched_gate_max_source_manifest_bytes
+                ),
+                max_direct_numerical_signals=int(
+                    args.first_untouched_gate_max_direct_numerical_signals
+                ),
+                max_single_matrix_file_bytes=int(
+                    args.first_untouched_gate_max_single_matrix_file_bytes
+                ),
+                max_total_matrix_file_bytes=int(
+                    args.first_untouched_gate_max_total_matrix_file_bytes
+                ),
+            )
+            if hierarchical
+            else None
+        ),
         hierarchical_discovery_approved_batch_sha256=(
             args.hierarchical_approved_batch_sha256 if hierarchical else None
         ),
@@ -2259,6 +2392,9 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
             require_registry_seal=True,
             include_tfidf_orphan_ngrams=True,
             require_tfidf_orphan_ngrams=bool(args.require_orphan_ngrams),
+            orphan_ngram_adapter=orphan_ngram_adapter_config_from_tfidf_topic(
+                applied_config.architecture.multi_model_forest.tfidf_topic
+            ),
             derive_sparse_query_moments_when_missing=False,
             require_neural_query_moments=bool(args.require_neural_query_moments),
             neural_query_moment_artifacts_by_fold=(validated.neural_query_moment_artifacts_by_fold),
@@ -2481,6 +2617,33 @@ def build_parser() -> argparse.ArgumentParser:
             "outer_fold_NNN child."
         ),
     )
+    parser.add_argument(
+        "--hierarchical-job-cache-max-entry-bytes",
+        type=int,
+        help=(
+            "Required in hierarchical mode. Maximum authenticated cache-entry "
+            "size in bytes; there is no production default."
+        ),
+    )
+    for field_name in (
+        "max_initial_spent_rows",
+        "max_first_gate_rows",
+        "max_total_text_utf8_bytes",
+        "max_catalog_atoms",
+        "max_source_manifest_bytes",
+        "max_direct_numerical_signals",
+        "max_single_matrix_file_bytes",
+        "max_total_matrix_file_bytes",
+    ):
+        parser.add_argument(
+            "--first-untouched-gate-" + field_name.replace("_", "-"),
+            dest="first_untouched_gate_" + field_name,
+            type=int,
+            help=(
+                "Required in hierarchical mode. Explicit first-untouched-gate "
+                "resource bound; there is no production default."
+            ),
+        )
     parser.add_argument(
         "--hierarchical-offline-review-packet-dir",
         type=Path,
@@ -2707,6 +2870,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Fixed positive ridge penalty for the final upstream fusion head.",
+    )
+    parser.add_argument(
+        "--final-upstream-max-orphan-features",
+        type=int,
+        help=(
+            "Required with post-extraction review. Explicit rectangular-schema "
+            "capacity for context-fitted orphan n-grams. If the capacity would "
+            "bind, execution aborts before omitting any eligible feature."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--proposal-max-tokens", type=int, default=25000)

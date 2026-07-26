@@ -39,7 +39,9 @@ from oci.inference.production_stage1_bundle import (
     STAGE1_HTR_INPUT_NONTRUNCATION_AUDIT_SCHEMA,
     STAGE1_SCOPE_INDEX_SCHEMA,
     _seal_component,
+    _bind_embedding_cluster_scope_to_physical_fit,
     _embedding_cluster_feasibility_scopes,
+    _embedding_cluster_physical_scope_groups,
     _embedding_cluster_scope_binding,
     _sha256_file,
     _sha256_json,
@@ -49,6 +51,11 @@ from oci.inference.production_stage1_bundle import (
 from oci.inference.embedding_native_proof_capture import (
     EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
     canonical_logical_embedding_config,
+    validate_embedding_cluster_support_state,
+)
+from oci.inference.embedding_contrast_discovery import (
+    _canonicalize_svd_component_signs,
+    _embedding_cluster_kmeans_parameters,
 )
 from oci.inference.production_stage1_hierarchy_loader import (
     STAGE1_EXACT_INNER_INDEX_SCHEMA,
@@ -96,6 +103,13 @@ from oci.inference.review_spent_evidence_provider import (
 from oci.inference.tfidf_topic_discovery import row_set_fingerprint
 from oci.inference.tfidf_topic_split_registry import (
     TFIDF_TOPIC_SPLIT_REGISTRY_SCHEMA_VERSION,
+)
+from tests.semantic_member_batching_test_support import (
+    semantic_member_batching_audit,
+    semantic_member_batching_identity,
+)
+from tests.cluster_local_embedding_test_support import (
+    cluster_local_embedding_mapping,
 )
 
 
@@ -311,6 +325,16 @@ def _write_embedding_cache(path: Path, *, row_count: int) -> dict:
             "chunk_overlap_words": 0,
             "max_chunks": 1,
             "chunk_selection": "last",
+            "production_provenance": {
+                "chunk_configuration": {
+                    "chunk_size_words": 8,
+                    "chunk_overlap_words": 0,
+                    "max_chunks": 1,
+                    "chunk_selection": "last",
+                    "normalize_embeddings": True,
+                    "max_seq_length": None,
+                },
+            },
         },
     )
     (path / "chunk_texts.jsonl").write_text(
@@ -378,11 +402,20 @@ def _cluster_feasibility_audit(
     initial_training_partitions: int,
 ) -> dict:
     configured_clusters = int(embedding_configuration["cluster_contrast_n_clusters"])
+    cluster_scientific = copy.deepcopy(
+        embedding_configuration["cluster_local_scientific"]
+    )
     contrast_families = (
         "cluster_local_treatment_contrast_basis",
         "cluster_local_residualized_interaction_contrast_basis",
     )
-    scopes = []
+    expected_scopes = _embedding_cluster_feasibility_scopes(
+        registry,
+        initial_training_partitions=initial_training_partitions,
+        global_seed=42,
+    )
+    physical_groups = _embedding_cluster_physical_scope_groups(expected_scopes)
+    physical_audit_by_scope: dict[str, dict] = {}
 
     def array_identity(
         *,
@@ -404,52 +437,116 @@ def _cluster_feasibility_audit(
             ),
         }
 
-    for scope in _embedding_cluster_feasibility_scopes(
-        registry,
-        initial_training_partitions=initial_training_partitions,
-        global_seed=42,
-    ):
+    for scope, _logical_members in physical_groups:
         binding = _embedding_cluster_scope_binding(scope)
         fit_count = int(binding["fit_row_count"])
         counts = [fit_count // configured_clusters] * configured_clusters
         for index in range(fit_count % configured_clusters):
             counts[index] += 1
-        support = {
-            "schema_version": EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
-            "required_svd_families": ["treatment", "residualized_interaction"],
-            "minimum_distinct_local_clusters_per_family": 2,
-            "minimum_numerical_rank_per_family": 2,
-            "kmeans_cluster_count": configured_clusters,
-            "kmeans_parameters": {
-                "n_clusters": configured_clusters,
-                "random_state": int(embedding_configuration["cluster_contrast_random_state"]),
-                "batch_size": max(128, min(1024, fit_count)),
-                "n_init": int(embedding_configuration["cluster_contrast_kmeans_n_init"]),
-                "max_iter": 300,
-            },
-            "kmeans_cluster_counts": counts,
-            "kmeans_usable_row_count": fit_count,
-            "kmeans_n_iter": 2,
-            "svd_families": [
-                {
-                    "family_key": family,
-                    "item_cluster_ids": [0, 1],
-                    "local_contrast_count": 2,
-                    "weighted_matrix_shape": [2, 4],
-                    "weighted_matrix_sha256": _sha({"matrix": family, "scope": scope["scope_id"]}),
-                    "singular_value_count": 2,
-                    "singular_values_sha256": _sha(
-                        {"singular": family, "scope": scope["scope_id"]}
+        labels = np.concatenate(
+            [
+                np.full(count, cluster_id, dtype=np.int64)
+                for cluster_id, count in enumerate(counts)
+            ]
+        )
+        centers = np.eye(configured_clusters, dtype=np.float32)
+        kmeans_parameters = _embedding_cluster_kmeans_parameters(
+            embedding_configuration,
+            n_usable=fit_count,
+            canonical_group_seed=int(scope["scope_seed"]),
+        )
+
+        def svd_state(family: str, matrix: np.ndarray) -> dict:
+            typed_matrix = np.asarray(
+                matrix,
+                dtype=np.dtype(cluster_scientific["computation_dtype"]),
+            )
+            _left, singular_values, components = np.linalg.svd(
+                typed_matrix,
+                full_matrices=bool(cluster_scientific["svd_full_matrices"]),
+                compute_uv=bool(cluster_scientific["svd_compute_uv"]),
+                hermitian=bool(cluster_scientific["svd_hermitian"]),
+            )
+            components = _canonicalize_svd_component_signs(
+                components,
+                policy=cluster_scientific[
+                    "svd_sign_canonicalization_policy"
+                ],
+            )
+            rank_tolerance = (
+                float(cluster_scientific["svd_rank_tolerance_multiplier"])
+                * np.finfo(
+                    np.dtype(cluster_scientific["svd_rank_tolerance_dtype"])
+                ).eps
+                * max(typed_matrix.shape)
+                * float(singular_values[0])
+            )
+            return {
+                "family_key": family,
+                "item_cluster_ids": [0, 1],
+                "weighted_matrix": typed_matrix,
+                "singular_values": singular_values,
+                "components": components,
+                "parameters": {
+                    "full_matrices": bool(
+                        cluster_scientific["svd_full_matrices"]
                     ),
-                    "second_singular_value": 1.0,
-                    "numerical_rank_tolerance_float32": 1e-6,
-                    "numerical_rank": 2,
-                    "components_shape": [2, 4],
-                    "components_sha256": _sha({"components": family, "scope": scope["scope_id"]}),
-                }
-                for family in ("treatment", "residualized_interaction")
-            ],
-        }
+                    "compute_uv": bool(cluster_scientific["svd_compute_uv"]),
+                    "hermitian": bool(cluster_scientific["svd_hermitian"]),
+                },
+                "sign_canonicalization_policy": cluster_scientific[
+                    "svd_sign_canonicalization_policy"
+                ],
+                "rank_tolerance_policy": cluster_scientific[
+                    "svd_rank_tolerance_policy"
+                ],
+                "rank_tolerance_dtype": cluster_scientific[
+                    "svd_rank_tolerance_dtype"
+                ],
+                "rank_tolerance_multiplier": float(
+                    cluster_scientific["svd_rank_tolerance_multiplier"]
+                ),
+                "rank_tolerance": rank_tolerance,
+                "numerical_rank": int(
+                    np.sum(singular_values > rank_tolerance)
+                ),
+                "replay_comparison_policy": cluster_scientific[
+                    "replay_comparison_policy"
+                ],
+                "replay_relative_tolerance": float(
+                    cluster_scientific["replay_relative_tolerance"]
+                ),
+                "replay_absolute_tolerance": float(
+                    cluster_scientific["replay_absolute_tolerance"]
+                ),
+            }
+
+        support = validate_embedding_cluster_support_state(
+            kmeans_state={
+                "fit_row_ids": list(map(int, scope["fit_row_ids"])),
+                "parameters": kmeans_parameters,
+                "scientific_configuration": cluster_scientific,
+                "canonical_group_seed": int(scope["scope_seed"]),
+                "ordered_fit_row_seed_policy": (
+                    "canonical_ordered_fit_rows_group_seed_v1"
+                ),
+                "usable_mask": np.ones(fit_count, dtype=np.bool_),
+                "cluster_labels": labels,
+                "cluster_centers": centers,
+                "cluster_counts": np.asarray(counts, dtype=np.int64),
+                "n_iter": 2,
+                "inertia": float(fit_count),
+            },
+            svd_states=(
+                svd_state("treatment", np.eye(2, dtype=np.float32)),
+                svd_state(
+                    "residualized_interaction",
+                    np.asarray([[1.0, 1.0], [1.0, -1.0]], dtype=np.float32),
+                ),
+            ),
+            expected_cluster_count=configured_clusters,
+            expected_kmeans_configuration=embedding_configuration,
+        )
         component_coverage = []
         for family in contrast_families:
             component_ids = [f"{family}_component_{index}" for index in (1, 2)]
@@ -516,8 +613,16 @@ def _cluster_feasibility_audit(
             "fit_row_order_fingerprint": row_order_fingerprint(
                 scope["fit_row_ids"]
             ),
+            "canonical_group_seed": int(scope["scope_seed"]),
+            "ordered_fit_row_seed_policy": (
+                "canonical_ordered_fit_rows_group_seed_v1"
+            ),
+            "cluster_scientific_configuration": cluster_scientific,
+            "cluster_scientific_configuration_sha256": _sha256_json(
+                cluster_scientific
+            ),
             "kmeans": {
-                "parameters": support["kmeans_parameters"],
+                "parameters": kmeans_parameters,
                 "usable_mask": array_identity(
                     scope_id=scope["scope_id"],
                     name="usable_mask",
@@ -583,29 +688,45 @@ def _cluster_feasibility_audit(
             **cluster_identity_body,
             "content_sha256": _sha256_json(cluster_identity_body),
         }
-        scopes.append(
-            {
-                **binding,
-                "token_bounded_row_count": 0,
-                "token_bounded_row_ids_sha256": _sha256_json([]),
-                "cluster_support_contract": support,
-                "raw_cluster_contrast_count": 4,
-                "raw_contrast_count_by_family": {family: 2 for family in contrast_families},
-                "semantic_cluster_contrast_count": 4,
-                "semantic_contrast_count_by_family": {family: 2 for family in contrast_families},
-                "semantic_member_count": 8,
-                "catalog_atom_count": 4,
-                "catalog_member_count": 8,
-                "catalog_grounded_component_count_by_family": {
-                    family: 2 for family in contrast_families
-                },
-                "semantic_mirror_catalog_atom_count": 4,
-                "semantic_mirror_catalog_member_count": 8,
-                "component_coverage_by_family": component_coverage,
-                "cluster_fit_identity": cluster_identity,
-                "uncapped_semantic_projection": True,
-            }
-        )
+        physical_audit_by_scope[str(scope["scope_id"])] = {
+            **binding,
+            "token_bounded_row_count": 0,
+            "token_bounded_row_ids_sha256": _sha256_json([]),
+            "cluster_support_contract": support,
+            "raw_cluster_contrast_count": 4,
+            "raw_contrast_count_by_family": {
+                family: 2 for family in contrast_families
+            },
+            "semantic_cluster_contrast_count": 4,
+            "semantic_contrast_count_by_family": {
+                family: 2 for family in contrast_families
+            },
+            "semantic_member_count": 8,
+            "catalog_atom_count": 4,
+            "catalog_member_count": 8,
+            "catalog_grounded_component_count_by_family": {
+                family: 2 for family in contrast_families
+            },
+            "semantic_mirror_catalog_atom_count": 4,
+            "semantic_mirror_catalog_member_count": 8,
+            "component_coverage_by_family": component_coverage,
+            "cluster_fit_identity": cluster_identity,
+            "uncapped_semantic_projection": True,
+        }
+    scopes_by_id: dict[str, dict] = {}
+    for physical_owner, members in physical_groups:
+        physical_audit = physical_audit_by_scope[str(physical_owner["scope_id"])]
+        for logical_scope in members:
+            bound = _bind_embedding_cluster_scope_to_physical_fit(
+                logical_scope=logical_scope,
+                physical_owner=physical_owner,
+                physical_audit=physical_audit,
+            )
+            scopes_by_id[str(logical_scope["scope_id"])] = bound
+    scopes = [
+        scopes_by_id[str(scope["scope_id"])]
+        for scope in expected_scopes
+    ]
     body = {
         "schema_version": STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
         "split_registry_content_sha256": _sha256_json(registry),
@@ -617,9 +738,11 @@ def _cluster_feasibility_audit(
         "required_svd_families": ["treatment", "residualized_interaction"],
         "configured_cluster_count": configured_clusters,
         "configured_max_components": int(
-            embedding_configuration["cluster_contrast_max_components"]
+            cluster_scientific["maximum_components_per_family"]
         ),
-        "minimum_grounded_components_per_svd_family": 2,
+        "minimum_grounded_components_per_svd_family": int(
+            cluster_scientific["minimum_numerical_rank_per_family"]
+        ),
         "token_bounded_row_count": 0,
         "token_bounded_row_ids_sha256": _sha256_json([]),
         "scope_count": len(scopes),
@@ -629,6 +752,15 @@ def _cluster_feasibility_audit(
             row["scope_kind"] == "cumulative_spent" for row in scopes
         ),
         "scope_order": [row["scope_id"] for row in scopes],
+        "physical_fit_count": len(physical_groups),
+        "deduplicated_fit_count": len(scopes) - len(physical_groups),
+        "physical_scope_order": [
+            str(owner["scope_id"]) for owner, _members in physical_groups
+        ],
+        "physical_fit_execution_policy": (
+            "fit_each_exact_order_seed_equivalent_group_once_earliest_owner_v2"
+        ),
+        "all_logical_scopes_bound_to_physical_fit": True,
         "scopes": scopes,
         "all_required_scopes_passed": True,
         "heldout_text_accessed": False,
@@ -665,6 +797,10 @@ def _matched_pair_proofs(scope_id: str) -> dict:
 
 
 def _hierarchy_catalog(scope) -> RoleNeutralEvidenceCatalog:
+    semantic_member_batch_size = 1
+    batching = semantic_member_batching_identity(
+        semantic_member_batch_size=semantic_member_batch_size,
+    )
     atoms = []
     for ordinal, family in enumerate(ACTIVE_STAGE1_CONCEPT_FAMILIES, start=1):
         origin = {
@@ -714,6 +850,7 @@ def _hierarchy_catalog(scope) -> RoleNeutralEvidenceCatalog:
     atoms = sorted(atoms, key=lambda atom: atom.evidence_id)
     identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": batching,
         "outer_fold": scope.outer_fold,
         "scope": "inner_train",
         "inner_fold": scope.provider_inner_fold,
@@ -732,6 +869,9 @@ def _hierarchy_catalog(scope) -> RoleNeutralEvidenceCatalog:
         "all_architecture_families_required": True,
         "missing_architecture_families": [],
         "global_top_k_applied": False,
+        **semantic_member_batching_audit(
+            semantic_member_batch_size=semantic_member_batch_size,
+        ),
     }
     return RoleNeutralEvidenceCatalog(
         outer_fold=scope.outer_fold,
@@ -1166,6 +1306,7 @@ def _build_bundle(
         "content_sha256": _sha256_json(htr_audit_body),
     }
     effective_config = {
+        "seed": 42,
         "text_column": "clinical_text",
         "architecture": {
             "htr_chunk_size_words": 96,
@@ -1186,6 +1327,21 @@ def _build_bundle(
                     "cluster_contrast_max_components": 2,
                     "cluster_contrast_random_state": 42,
                     "cluster_contrast_kmeans_n_init": 20,
+                    "cluster_local_scientific": (
+                        cluster_local_embedding_mapping(
+                            requested_cluster_count=2,
+                            maximum_components_per_family=2,
+                            minimum_cluster_size=2,
+                            minimum_group_size=2,
+                            minimum_cell_size=1,
+                            computation_dtype="float32",
+                            kmeans_max_iter=300,
+                            kmeans_batch_size_lower_bound=128,
+                            kmeans_batch_size_upper_bound=1024,
+                            kmeans_n_init=20,
+                            svd_rank_tolerance_dtype="float32",
+                        )
+                    ),
                 }
             },
         },
@@ -1205,6 +1361,28 @@ def _build_bundle(
         ] = 1
         cluster_audit["content_sha256"] = _sha256_json(
             {key: value for key, value in cluster_audit.items() if key != "content_sha256"}
+        )
+    elif cluster_audit_mode == "tampered_logical_binding":
+        alias = next(
+            scope
+            for scope in cluster_audit["scopes"]
+            if scope["physical_fit_binding"]["reuses_physical_fit"] is True
+        )
+        binding = alias["physical_fit_binding"]
+        binding["canonical_cluster_fit_identity_content_sha256"] = "0" * 64
+        binding["content_sha256"] = _sha256_json(
+            {
+                key: value
+                for key, value in binding.items()
+                if key != "content_sha256"
+            }
+        )
+        cluster_audit["content_sha256"] = _sha256_json(
+            {
+                key: value
+                for key, value in cluster_audit.items()
+                if key != "content_sha256"
+            }
         )
     elif cluster_audit_mode not in {"valid", "missing"}:
         raise ValueError("unknown cluster_audit_mode")
@@ -1363,7 +1541,11 @@ def _build_bundle(
         encoding="utf-8",
     )
     cluster_fit_rows = []
-    for cluster_scope in cluster_audit["scopes"]:
+    cluster_scope_by_id = {
+        str(scope["scope_id"]): scope for scope in cluster_audit["scopes"]
+    }
+    for physical_scope_id in cluster_audit["physical_scope_order"]:
+        cluster_scope = cluster_scope_by_id[str(physical_scope_id)]
         identity = cluster_scope["cluster_fit_identity"]
         record_body = {
             "schema_version": STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA,
@@ -1411,7 +1593,10 @@ def _build_bundle(
         "cumulative_spent_scope_count": sum(
             row["scope_kind"] == "cumulative_spent" for row in cluster_fit_rows
         ),
-        "scope_order": list(cluster_audit["scope_order"]),
+        "scope_order": list(cluster_audit["physical_scope_order"]),
+        "logical_scope_count": len(cluster_audit["scope_order"]),
+        "logical_scope_order": list(cluster_audit["scope_order"]),
+        "all_logical_scopes_bound_to_physical_fit": True,
         "all_actual_identities_equal_preflight": True,
         "scopes": cluster_fit_rows,
     }
@@ -1657,6 +1842,17 @@ def test_hierarchy_loader_semantically_rejects_rehashed_cluster_audit_tamper(
     manifest_path, _tamper_target = _build_bundle(
         tmp_path,
         cluster_audit_mode="tampered_grounding",
+    )
+    with pytest.raises(ValueError, match="clustered-embedding feasibility audit"):
+        load_authenticated_stage1_bundle_for_hierarchy(manifest_path)
+
+
+def test_hierarchy_loader_rejects_rehashed_logical_to_physical_cluster_binding(
+    tmp_path: Path,
+):
+    manifest_path, _tamper_target = _build_bundle(
+        tmp_path,
+        cluster_audit_mode="tampered_logical_binding",
     )
     with pytest.raises(ValueError, match="clustered-embedding feasibility audit"):
         load_authenticated_stage1_bundle_for_hierarchy(manifest_path)
@@ -2580,10 +2776,14 @@ def test_runner_consumes_authenticated_prefit_cumulative_spent_catalog_directly(
         attempt=1,
         initial_spent_fold_ids=(1, 2, 3),
         gate_fold_ids=(4,),
+        # This synthetic registry's canonical cohort order is ascending row ID.
+        # Inner-partition concatenation is not a substitute for that order.
         outer_train_row_ids=tuple(
-            row_id
-            for partition_rows in partitions.values()
-            for row_id in partition_rows
+            sorted(
+                row_id
+                for partition_rows in partitions.values()
+                for row_id in partition_rows
+            )
         ),
         row_ids_by_fold=partitions,
         audit={},

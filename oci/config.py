@@ -850,8 +850,12 @@ class AgenticFeatureSearchConfig:
     # Prompt/context controls. Clinical text examples are sent to the proposal
     # agent to ground variable suggestions, but are not written to artifacts by
     # default because they may contain sensitive patient text.
-    clinical_text_examples_per_prompt: int = 3
-    clinical_text_example_chars: int = 1600
+    # ``None`` preserves every non-empty training note and every character.
+    # A finite example count is an explicit scientific sampling choice.  A
+    # finite character count is only a fail-closed guard and never authorizes
+    # string slicing.
+    clinical_text_examples_per_prompt: Optional[int] = None
+    clinical_text_example_chars: Optional[int] = None
     save_agent_context: bool = False
     # Raw agent output may include quoted prompt snippets or reasoning text.
     save_agent_raw_output: bool = False
@@ -921,12 +925,22 @@ class AgenticFeatureSearchConfig:
             raise ValueError(
                 "agentic_feature_search.role_diagnostic_score_delta_threshold must be >= 0"
             )
-        if self.clinical_text_examples_per_prompt < 0:
+        if (
+            self.clinical_text_examples_per_prompt is not None
+            and self.clinical_text_examples_per_prompt < 0
+        ):
             raise ValueError(
-                "agentic_feature_search.clinical_text_examples_per_prompt must be >= 0"
+                "agentic_feature_search.clinical_text_examples_per_prompt must be "
+                ">= 0 or None"
             )
-        if self.clinical_text_example_chars < 0:
-            raise ValueError("agentic_feature_search.clinical_text_example_chars must be >= 0")
+        if (
+            self.clinical_text_example_chars is not None
+            and self.clinical_text_example_chars < 1
+        ):
+            raise ValueError(
+                "agentic_feature_search.clinical_text_example_chars must be "
+                "positive or None"
+            )
         if self.agent_schema_repair_attempts < 0:
             raise ValueError("agentic_feature_search.agent_schema_repair_attempts must be >= 0")
         if self.agent_request_max_retries < 0:
@@ -3715,6 +3729,10 @@ class AppliedInferenceConfig:
     """Configuration for applied inference on real data."""
 
     clinical_question: Optional[str] = None
+    # The outer workflow/experiment must provide the scientific seed whenever
+    # a stochastic applied-inference architecture is executed.  ``None`` is a
+    # fail-closed sentinel, not a hidden fallback.
+    seed: Optional[int] = None
     outcome_type: str = "binary"  # "binary" or "continuous"
     dataset_path: str = ""
     text_column: str = "clinical_text"
@@ -4054,9 +4072,12 @@ def create_default_config(output_path: str) -> None:
     config = ExperimentConfig(
         output_dir="./oci_results",
         seed=42,
-        device="cuda:0",
+        # Device placement is deployment state.  Leave it unresolved so this
+        # generated configuration is valid on CPU-only, single-GPU, and
+        # arbitrary multi-GPU hosts without prescribing a physical device ID.
+        device=None,
         num_workers=1,
-        gpu_ids=[0, 1],
+        gpu_ids=None,
         applied_inference=AppliedInferenceConfig(
             dataset_path="./dataset.parquet",
             cv_folds=5,

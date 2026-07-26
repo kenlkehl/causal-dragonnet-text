@@ -48,6 +48,13 @@ from oci.inference.lossless_stage1_evidence_catalog import (
 from oci.inference.production_coordinate_preserving_upstream_schema import (
     build_production_coordinate_preserving_schema,
 )
+from tests.hierarchy_resource_test_support import (
+    FIRST_UNTOUCHED_GATE_BOUNDS,
+)
+from tests.semantic_member_batching_test_support import (
+    semantic_member_batching_audit,
+    semantic_member_batching_identity,
+)
 
 _VIEWS = (
     "linear_unigram_c0p5",
@@ -61,6 +68,10 @@ _VIEWS = (
 
 def _catalog(*, outer_fold: int = 1, scope: str = "inner_train"):
     split_fingerprint = "1" * 64
+    semantic_member_batch_size = 1
+    batching = semantic_member_batching_identity(
+        semantic_member_batch_size=semantic_member_batch_size,
+    )
     atoms = []
     for ordinal, family in enumerate(ACTIVE_STAGE1_CONCEPT_FAMILIES, start=1):
         member_id = f"member_{ordinal:03d}"
@@ -103,6 +114,7 @@ def _catalog(*, outer_fold: int = 1, scope: str = "inner_train"):
     inner_fold = 1 if scope == "inner_train" else None
     identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": batching,
         "outer_fold": outer_fold,
         "scope": scope,
         "inner_fold": inner_fold,
@@ -118,7 +130,11 @@ def _catalog(*, outer_fold: int = 1, scope: str = "inner_train"):
         atoms=tuple(atoms),
         non_grounding_numerical_summaries=(),
         catalog_sha256=content_sha256(identity),
-        _audit_json="{}",
+        _audit_json=canonical_json(
+            semantic_member_batching_audit(
+                semantic_member_batch_size=semantic_member_batch_size,
+            )
+        ),
     )
     validate_role_neutral_catalog(result)
     return result
@@ -241,6 +257,7 @@ def _materialize(tmp_path: Path, provider):
         catalog=_catalog(),
         provider=provider,
         destination=tmp_path / "direct" / "direct_upstream_numerical_manifest.json",
+        bounds=FIRST_UNTOUCHED_GATE_BOUNDS,
     )
 
 

@@ -26,6 +26,7 @@ from oci.inference.production_stage1_legacy_scope_fragments import (
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_all_ten_binding import (
     AuthenticatedRoleNeutralComponentReceipt,
     EXPECTED_COMPONENT_FAMILIES,
@@ -80,6 +81,7 @@ def _plan(*, gpu_ids: tuple[int, ...] = ()):
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,

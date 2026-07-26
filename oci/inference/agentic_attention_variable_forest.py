@@ -72,13 +72,6 @@ logger = logging.getLogger(__name__)
 
 VALID_ROLES = {"confounder", "effect_modifier"}
 VALID_TYPES = {"categorical", "continuous"}
-_AGENT_CONTEXT_MIN_ROWS = 12
-_AGENT_CONTEXT_ROWS_PER_TOP_CHUNK = 8
-_AGENT_CONTEXT_MAX_ROWS = 48
-_AGENT_CONTEXT_TOKEN_SPANS_PER_ROW = 4
-_AGENT_CONTEXT_SNIPPET_CHARS = 480
-_AGENT_CONTEXT_SPAN_TEXT_CHARS = 120
-_AGENT_CONTEXT_SUMMARY_CHARS = 360
 EFFECT_OBJECTIVES = {"squared_r_loss", "logistic_r_loss", "pseudo_outcome_mse"}
 
 
@@ -3181,10 +3174,7 @@ class AgenticAttentionVariableForestRunner:
                         heldout_pos=heldout_pos,
                         labels=labels,
                         probs=probs,
-                        max_rows=max(
-                            int(self.avf_config.attention_top_k_chunks) * 8,
-                            _AGENT_CONTEXT_MIN_ROWS,
-                        ),
+                        max_rows=None,
                     )
                     if len(attention_pos) > 0:
                         heldout_lookup = {
@@ -5573,18 +5563,11 @@ class AgenticAttentionVariableForestRunner:
         usable_rows = [row for row in attention_rows if _attention_row_has_usable_text(row)]
         if not usable_rows:
             usable_rows = list(attention_rows)
-        evidence_limit = min(
-            _AGENT_CONTEXT_MAX_ROWS,
-            max(
-                _AGENT_CONTEXT_MIN_ROWS,
-                int(self.avf_config.attention_top_k_chunks) * _AGENT_CONTEXT_ROWS_PER_TOP_CHUNK,
-            ),
-        )
         evidence = sorted(
             usable_rows,
             key=lambda row: abs(float(row.get("attention", 0.0))),
             reverse=True,
-        )[: max(1, evidence_limit)]
+        )
         context_rows = [self._attention_evidence_context_row(row) for row in evidence]
         context_rows = [
             row for row in context_rows if row.get("evidence_snippet") or row.get("top_token_spans")
@@ -5624,10 +5607,14 @@ class AgenticAttentionVariableForestRunner:
             "attention_evidence_policy": {
                 "source_rows": int(len(attention_rows)),
                 "usable_source_rows": int(len(usable_rows)),
-                "max_rows": int(evidence_limit),
-                "max_token_spans_per_row": _AGENT_CONTEXT_TOKEN_SPANS_PER_ROW,
-                "snippet_chars": _AGENT_CONTEXT_SNIPPET_CHARS,
-                "selection": "highest absolute chunk attention after dropping blank text",
+                "retained_rows": int(len(context_rows)),
+                "row_capacity": None,
+                "token_span_capacity_per_row": None,
+                "text_character_capacity": None,
+                "selection": (
+                    "all usable rows in descending absolute chunk-attention order; "
+                    "no rows, spans, or text characters are truncated"
+                ),
             },
             "signal_source": (
                 "residual_contrastive_tail_vs_neutral"
@@ -5696,10 +5683,7 @@ class AgenticAttentionVariableForestRunner:
             context_row["top_token_spans"] = compact_spans
             summary = row.get("attended_token_summary")
             if isinstance(summary, str) and summary:
-                context_row["attended_token_summary"] = _truncate_text(
-                    summary,
-                    _AGENT_CONTEXT_SUMMARY_CHARS,
-                )
+                context_row["attended_token_summary"] = _normalize_context_text(summary)
         return context_row
 
     def _candidate_proposal_limit(self) -> int:
@@ -8521,7 +8505,7 @@ def _tail_attention_positions(
     heldout_pos: np.ndarray,
     labels: np.ndarray,
     probs: np.ndarray,
-    max_rows: int,
+    max_rows: int | None,
 ) -> np.ndarray:
     heldout_pos = np.asarray(heldout_pos, dtype=int)
     labels = np.asarray(labels, dtype=float)
@@ -8539,7 +8523,13 @@ def _tail_attention_positions(
         positive_probs = probs[positive_mask]
         order = np.argsort(positive_probs)[::-1]
         selected = selected[order]
-    return selected[: max(1, int(max_rows))]
+    if max_rows is not None and selected.size > int(max_rows):
+        raise ValueError(
+            f"residual-contrastive attention produced {selected.size} eligible "
+            f"rows, exceeding configured max_rows={int(max_rows)}; refusing "
+            "silent attention-row omission"
+        )
+    return selected
 
 
 def _make_linear_lr_scheduler(
@@ -8723,22 +8713,17 @@ def _compact_token_spans(spans: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]
     compact: List[Dict[str, Any]] = []
     seen = set()
     for span in spans:
-        text = _truncate_text(
-            str(span.get("text", "")).strip(),
-            _AGENT_CONTEXT_SPAN_TEXT_CHARS,
-        )
+        text = _normalize_context_text(str(span.get("text", "")).strip())
         if not text or text in seen:
             continue
         seen.add(text)
         item: Dict[str, Any] = {"text": text}
         focus = str(span.get("focus_token", "")).strip()
         if focus and focus != text:
-            item["focus_token"] = _truncate_text(focus, 48)
+            item["focus_token"] = _normalize_context_text(focus)
         if "salience" in span:
             item["salience"] = _round_context_float(span["salience"], ndigits=5)
         compact.append(item)
-        if len(compact) >= _AGENT_CONTEXT_TOKEN_SPANS_PER_ROW:
-            break
     return compact
 
 
@@ -8749,60 +8734,16 @@ def _attention_evidence_snippet(
 ) -> str:
     chunk = _normalize_context_text(chunk_text)
     if chunk:
-        intervals = []
-        for span in spans[:_AGENT_CONTEXT_TOKEN_SPANS_PER_ROW]:
-            if "char_start" not in span or "char_end" not in span:
-                continue
-            try:
-                start = int(span["char_start"])
-                end = int(span["char_end"])
-            except (TypeError, ValueError):
-                continue
-            if end <= start:
-                continue
-            intervals.append((max(0, start), min(len(chunk), end)))
-        if intervals:
-            start = max(
-                0,
-                min(start for start, _ in intervals) - _AGENT_CONTEXT_SNIPPET_CHARS // 3,
-            )
-            end = min(
-                len(chunk),
-                max(end for _, end in intervals) + _AGENT_CONTEXT_SNIPPET_CHARS // 3,
-            )
-            return _truncate_text(
-                _normalize_context_text(chunk[start:end]),
-                _AGENT_CONTEXT_SNIPPET_CHARS,
-            )
-        return _truncate_text(chunk, _AGENT_CONTEXT_SNIPPET_CHARS)
+        return chunk
 
     highlighted = _normalize_context_text(highlighted_chunk_text)
-    if not highlighted:
-        return ""
-    marker_idx = highlighted.find("[[")
-    if marker_idx >= 0:
-        start = max(0, marker_idx - _AGENT_CONTEXT_SNIPPET_CHARS // 3)
-        end = min(
-            len(highlighted),
-            marker_idx + 2 * _AGENT_CONTEXT_SNIPPET_CHARS // 3,
-        )
-        return _truncate_text(highlighted[start:end], _AGENT_CONTEXT_SNIPPET_CHARS)
-    return _truncate_text(highlighted, _AGENT_CONTEXT_SNIPPET_CHARS)
+    return highlighted
 
 
 def _normalize_context_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return re.sub(r"\s+", " ", value).strip()
-
-
-def _truncate_text(value: str, max_chars: int) -> str:
-    value = _normalize_context_text(value)
-    if len(value) <= max_chars:
-        return value
-    if max_chars <= 3:
-        return value[:max_chars]
-    return value[: max_chars - 3].rstrip() + "..."
 
 
 def _round_context_float(value: Any, ndigits: int = 6) -> float:

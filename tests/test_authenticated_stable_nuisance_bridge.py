@@ -189,7 +189,11 @@ class _FakeTfidfContextBackend:
             "backend": TFIDF_CONTEXT_BACKEND_ID,
             "revision": 1,
             "max_orphan_features": self.max_orphan_features,
+            "max_orphan_features_semantics": (
+                "none_retains_complete_eligible_vocabulary_finite_aborts_before_omission_v1"
+            ),
             "minimum_orphan_arm_support": self.minimum_orphan_arm_support,
+            "minimum_orphan_arm_support_source": "explicit_constructor_argument",
         }
 
     def fit_predict(self, **kwargs):
@@ -301,7 +305,7 @@ def _schema_config(*, bad_reduction=False, ambiguous=False):
     bow_prop = PrecommittedRawFeatureFamily(
         source_kind="bow_nuisance",
         consumer_role=PROPENSITY_NUISANCE_FEATURE_ROLE,
-        signed_order_width=1,
+        signed_order_width=3,
         required=True,
     )
     if bad_reduction:
@@ -326,7 +330,7 @@ def _schema_config(*, bad_reduction=False, ambiguous=False):
         PrecommittedRawFeatureFamily(
             source_kind="bow_nuisance",
             consumer_role=OUTCOME_NUISANCE_FEATURE_ROLE,
-            signed_order_width=1,
+            signed_order_width=3,
         ),
         PrecommittedRawFeatureFamily(
             source_kind="htr_nuisance",

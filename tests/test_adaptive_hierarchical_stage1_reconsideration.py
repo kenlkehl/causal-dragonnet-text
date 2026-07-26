@@ -54,6 +54,7 @@ from oci.inference.lossless_stage1_evidence_catalog import (
     Stage1EvidenceAtom,
     validate_role_neutral_catalog,
 )
+from tests.hierarchy_resource_test_support import HIERARCHY_JOB_CACHE_CONFIG
 
 
 def _catalog(
@@ -2367,9 +2368,7 @@ def test_empty_consolidation_keeps_wire_and_normalized_shapes_separate():
     with pytest.raises(ValueError, match="consolidation response keys differ"):
         builder._validate_empty_consolidation_wire(normalized)
     assert (
-        AdaptiveHierarchicalStage1Reconsideration._revalidate_empty_consolidation_projection(
-            normalized
-        )
+        builder._revalidate_empty_consolidation_projection(normalized)
         == normalized
     )
 
@@ -2490,7 +2489,10 @@ def test_execute_authenticated_cache_miss_then_hit_revalidates_semantics(tmp_pat
     cache_root = tmp_path / "adaptive-cache"
     runner = _ConvergedAdaptiveRunner()
     first_builder = _builder()
-    first_cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    first_cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     approved_adaptive = adaptive_hierarchical_stage1_reconsideration_identity(first_builder.config)
     approved_runner = runner.identity()
     approved_cache = first_cache.identity()
@@ -2515,7 +2517,10 @@ def test_execute_authenticated_cache_miss_then_hit_revalidates_semantics(tmp_pat
     )
 
     second_builder = _builder()
-    second_cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    second_cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     semantic_revalidations = []
     original_validator = second_builder.validate_interpretation_job_response
 
@@ -2557,7 +2562,10 @@ def test_oversized_adaptive_family_uses_phased_jobs_and_replays_from_cache(tmp_p
 
     cache_root = tmp_path / "adaptive-dense-cache"
     runner = _DenseAdaptiveRunner(dense_candidate_count=16)
-    first_cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    first_cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     approved_adaptive = adaptive_hierarchical_stage1_reconsideration_identity(first_builder.config)
     approved_runner = runner.identity()
     approved_cache = first_cache.identity()
@@ -2594,7 +2602,10 @@ def test_oversized_adaptive_family_uses_phased_jobs_and_replays_from_cache(tmp_p
     )
 
     second_builder = _builder(catalog=catalog)
-    second_cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    second_cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     second = second_builder.execute_authenticated(
         runner=runner,
         job_cache=second_cache,
@@ -2613,7 +2624,10 @@ def test_execute_authenticated_uses_one_projection_bound_response_repair(tmp_pat
     builder = _builder()
     runner = _InvalidFirstAdaptiveRunner()
     cache_root = tmp_path / "adaptive-repair-cache"
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
 
     result = builder.execute_authenticated(
         runner=runner,
@@ -2643,7 +2657,10 @@ def test_execute_authenticated_rejects_adaptive_approval_mismatch_before_cache_o
     builder = _builder()
     runner = _ConvergedAdaptiveRunner()
     cache_root = tmp_path / "unused-adaptive-cache"
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
     mismatched = adaptive_hierarchical_stage1_reconsideration_identity(builder.config)
     mismatched["implementation_file_sha256"] = "0" * 64
 
@@ -2666,7 +2683,10 @@ def test_execute_authenticated_requires_runner_raw_wire_sha_before_cache_write(t
     builder = _builder()
     runner = _MissingParsedResponseShaRunner()
     cache_root = tmp_path / "missing-raw-wire-sha-cache"
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
 
     with pytest.raises(ValueError, match="parsed_response_sha256"):
         builder.execute_authenticated(
@@ -2710,7 +2730,10 @@ def test_execute_authenticated_rejects_implementation_bundle_mismatch_fail_close
     approved_adaptive = adaptive_hierarchical_stage1_reconsideration_identity(builder.config)
     runner = _ConvergedAdaptiveRunner()
     cache_root = tmp_path / "bundle-mismatch-cache"
-    cache = AuthenticatedHierarchicalDiscoveryJobCache(root=cache_root)
+    cache = AuthenticatedHierarchicalDiscoveryJobCache(
+        root=cache_root,
+        config=HIERARCHY_JOB_CACHE_CONFIG,
+    )
 
     with pytest.raises(ValueError, match="dependency bundle changed before"):
         builder.execute_authenticated(

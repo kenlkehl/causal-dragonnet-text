@@ -184,6 +184,8 @@ def _metadata_inventory(root: Path) -> _MetadataInventory:
                 raise ValueError(
                     "authenticated directory tree contains a linked or " "special file"
                 )
+            if int(state.st_nlink) != 1:
+                raise ValueError("authenticated directory tree contains a hard-linked file")
             files.append(
                 (
                     (relative_current / name).as_posix(),
@@ -218,11 +220,14 @@ def _stable_file_authentication(
     before_path = os.lstat(path)
     if stat.S_ISLNK(before_path.st_mode) or not stat.S_ISREG(before_path.st_mode):
         raise ValueError("authenticated directory tree contains a linked or special file")
+    if int(before_path.st_nlink) != 1:
+        raise ValueError("authenticated directory tree contains a hard-linked file")
     descriptor = os.open(
         path,
         os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
-    digest = hashlib.sha256()
+    sha256_callable = hashlib.sha256
+    digest = sha256_callable()
     leading = b""
     try:
         before_fd = os.fstat(descriptor)
@@ -243,6 +248,11 @@ def _stable_file_authentication(
         or _stat_signature(after_path) != signature
     ):
         raise RuntimeError(f"authenticated tree file changed while hashing: {relative_path}")
+    if hashlib.sha256 is not sha256_callable:
+        raise RuntimeError(
+            "authenticated directory tree SHA-256 callable changed while "
+            f"hashing: {relative_path}"
+        )
     suffix = path.suffix.casefold()
     mode = int(signature[2])
     if (
@@ -271,6 +281,8 @@ class AuthenticatedDirectoryTreeSnapshot:
     """One nontransferable process-local authenticated tree capability."""
 
     _owner_pid: int = field(repr=False)
+    _file_authentication_callable: Any = field(repr=False)
+    _sha256_callable: Any = field(repr=False)
     _root: Path
     _metadata: _MetadataInventory = field(repr=False)
     _files: tuple[_AuthenticatedFile, ...] = field(repr=False)
@@ -284,25 +296,56 @@ class AuthenticatedDirectoryTreeSnapshot:
                 "authenticated directory tree capability cannot cross a " "process boundary"
             )
 
+    def _require_current_authority(self) -> None:
+        self._require_owner()
+        with _CACHE_LOCK:
+            _ensure_current_process()
+            if _CACHE.get(self._root) is not self:
+                raise AuthenticatedDirectoryTreeDriftError(
+                    "authenticated directory tree capability is no longer "
+                    "the current process authority"
+                )
+            if (
+                self._file_authentication_callable is not _stable_file_authentication
+                or self._sha256_callable is not hashlib.sha256
+            ):
+                _poison_path(self._root)
+                raise AuthenticatedDirectoryTreeDriftError(
+                    "authenticated directory tree authentication backend "
+                    "changed after authentication"
+                )
+            try:
+                observed = _metadata_inventory(self._root)
+            except BaseException as exc:
+                _poison_path(self._root)
+                raise AuthenticatedDirectoryTreeDriftError(
+                    "authenticated directory tree changed after authentication"
+                ) from exc
+            if observed != self._metadata:
+                _poison_path(self._root)
+                raise AuthenticatedDirectoryTreeDriftError(
+                    "authenticated directory tree inventory changed after " "authentication"
+                )
+
     @property
     def path(self) -> Path:
-        self._require_owner()
+        self._require_current_authority()
         return self._root
 
     def local_model_provenance(self) -> dict[str, Any]:
-        self._require_owner()
+        self._require_current_authority()
         return copy.deepcopy(dict(self._local_model_provenance))
 
     def workflow_path_identity(self) -> dict[str, Any]:
         """Return the historical workflow request wire representation."""
 
-        self._require_owner()
+        self._require_current_authority()
         return copy.deepcopy(dict(self._workflow_path_identity))
 
     def workflow_inventory_projection(self) -> dict[str, Any]:
         """Return a closed audit projection including metadata signatures."""
 
-        self._require_owner()
+        self._require_current_authority()
         return copy.deepcopy(dict(self._workflow_inventory))
 
     def __copy__(self) -> None:
@@ -320,10 +363,28 @@ class AuthenticatedDirectoryTreeSnapshot:
 
 def _full_authentication(root: Path) -> AuthenticatedDirectoryTreeSnapshot:
     before = _metadata_inventory(root)
-    authenticated_files = tuple(
-        _stable_file_authentication(root, relative_path)
-        for relative_path, _signature in before.files
-    )
+    file_authentication_callable = _stable_file_authentication
+    sha256_callable = hashlib.sha256
+    authenticated_file_rows: list[_AuthenticatedFile] = []
+    for relative_path, _signature in before.files:
+        if (
+            _stable_file_authentication is not file_authentication_callable
+            or hashlib.sha256 is not sha256_callable
+        ):
+            raise RuntimeError(
+                "authenticated directory tree authentication backend "
+                "changed during full authentication"
+            )
+        authenticated_file_rows.append(file_authentication_callable(root, relative_path))
+        if (
+            _stable_file_authentication is not file_authentication_callable
+            or hashlib.sha256 is not sha256_callable
+        ):
+            raise RuntimeError(
+                "authenticated directory tree authentication backend "
+                "changed during full authentication"
+            )
+    authenticated_files = tuple(authenticated_file_rows)
     after = _metadata_inventory(root)
     if (
         before != after
@@ -395,8 +456,18 @@ def _full_authentication(root: Path) -> AuthenticatedDirectoryTreeSnapshot:
             for row in authenticated_files
         ],
     }
+    if (
+        _stable_file_authentication is not file_authentication_callable
+        or hashlib.sha256 is not sha256_callable
+    ):
+        raise RuntimeError(
+            "authenticated directory tree authentication backend changed "
+            "during full authentication"
+        )
     return AuthenticatedDirectoryTreeSnapshot(
         _owner_pid=os.getpid(),
+        _file_authentication_callable=file_authentication_callable,
+        _sha256_callable=sha256_callable,
         _root=root,
         _metadata=before,
         _files=authenticated_files,
@@ -476,18 +547,7 @@ def authenticate_directory_tree(
             )
         cached = _CACHE.get(root)
         if cached is not None:
-            try:
-                observed = _metadata_inventory(root)
-            except BaseException as exc:
-                _poison_path(root)
-                raise AuthenticatedDirectoryTreeDriftError(
-                    "authenticated directory tree changed after authentication"
-                ) from exc
-            if observed != cached._metadata:
-                _poison_path(root)
-                raise AuthenticatedDirectoryTreeDriftError(
-                    "authenticated directory tree inventory changed after " "authentication"
-                )
+            cached._require_current_authority()
             _CACHE.move_to_end(root)
             return cached
 

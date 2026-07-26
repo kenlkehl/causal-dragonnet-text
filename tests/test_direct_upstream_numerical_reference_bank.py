@@ -35,6 +35,7 @@ from oci.inference.production_stage1_scope_scheduler import (
     Stage1ScopePlan,
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 
 
 def _sha_json(value: object) -> str:
@@ -166,6 +167,7 @@ def _plan() -> Stage1ScopePlan:
         registry=_registry(),
         registry_content_sha256=_sha_json(_registry()),
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         review_rounds=1,
         initial_training_partitions=1,

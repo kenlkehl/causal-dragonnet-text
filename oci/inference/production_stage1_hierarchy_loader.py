@@ -764,13 +764,17 @@ def _validate_embedding_cluster_fit_index_snapshot(
         "exact_inner_scope_count",
         "cumulative_spent_scope_count",
         "scope_order",
+        "logical_scope_count",
+        "logical_scope_order",
+        "all_logical_scopes_bound_to_physical_fit",
         "all_actual_identities_equal_preflight",
         "scopes",
         "content_sha256",
     }
     body = {key: copy.deepcopy(value) for key, value in index.items() if key != "content_sha256"}
     preflight_scopes = cluster_audit.get("scopes")
-    expected_order = cluster_audit.get("scope_order")
+    logical_order = cluster_audit.get("scope_order")
+    expected_order = cluster_audit.get("physical_scope_order")
     rows = index.get("scopes")
     if (
         not isinstance(index, Mapping)
@@ -782,37 +786,123 @@ def _validate_embedding_cluster_fit_index_snapshot(
         != cluster_audit.get("content_sha256")
         or index.get("content_sha256") != _sha256_json(body)
         or index.get("all_actual_identities_equal_preflight") is not True
+        or index.get("all_logical_scopes_bound_to_physical_fit") is not True
         or not isinstance(preflight_scopes, list)
+        or not isinstance(logical_order, list)
         or not isinstance(expected_order, list)
         or not isinstance(rows, list)
         or index.get("scope_order") != expected_order
+        or index.get("logical_scope_order") != logical_order
         or [row.get("scope_id") for row in rows if isinstance(row, Mapping)]
         != expected_order
         or int(index.get("scope_count", -1)) != len(expected_order)
+        or int(index.get("logical_scope_count", -1)) != len(logical_order)
+        or int(cluster_audit.get("physical_fit_count", -1)) != len(expected_order)
+        or int(cluster_audit.get("scope_count", -1)) != len(logical_order)
     ):
         raise ValueError("cluster-fit index has an invalid closed binding or scope order")
-    expected_counts = {
-        "full_outer_scope_count": sum(
-            row.get("scope_kind") == "full_outer" for row in preflight_scopes
-        ),
-        "exact_inner_scope_count": sum(
-            row.get("scope_kind") == "exact_inner" for row in preflight_scopes
-        ),
-        "cumulative_spent_scope_count": sum(
-            row.get("scope_kind") == "cumulative_spent" for row in preflight_scopes
-        ),
-    }
-    if any(int(index.get(key, -1)) != value for key, value in expected_counts.items()):
-        raise ValueError("cluster-fit index scope-kind counts changed")
-    preflight_by_scope = {
+    logical_by_scope = {
         str(row.get("scope_id")): row
         for row in preflight_scopes
         if isinstance(row, Mapping)
     }
-    if len(preflight_by_scope) != len(preflight_scopes) or set(preflight_by_scope) != set(
-        expected_order
+    if (
+        len(logical_by_scope) != len(preflight_scopes)
+        or list(logical_by_scope) != logical_order
     ):
-        raise ValueError("cluster preflight scope identities are duplicated or incomplete")
+        raise ValueError(
+            "cluster preflight logical scope identities are duplicated or incomplete"
+        )
+    physical_by_scope: dict[str, Mapping[str, Any]] = {}
+    for owner_scope_id in expected_order:
+        owner = logical_by_scope.get(str(owner_scope_id))
+        binding = (
+            owner.get("physical_fit_binding")
+            if isinstance(owner, Mapping)
+            else None
+        )
+        if (
+            not isinstance(owner, Mapping)
+            or not isinstance(binding, Mapping)
+            or binding.get("logical_scope_id") != owner_scope_id
+            or binding.get("physical_owner_scope_id") != owner_scope_id
+            or binding.get("reuses_physical_fit") is not False
+        ):
+            raise ValueError(
+                "cluster preflight physical owner binding is missing or substituted"
+            )
+        physical_by_scope[str(owner_scope_id)] = owner
+    expected_counts = {
+        "full_outer_scope_count": sum(
+            row.get("scope_kind") == "full_outer" for row in physical_by_scope.values()
+        ),
+        "exact_inner_scope_count": sum(
+            row.get("scope_kind") == "exact_inner" for row in physical_by_scope.values()
+        ),
+        "cumulative_spent_scope_count": sum(
+            row.get("scope_kind") == "cumulative_spent"
+            for row in physical_by_scope.values()
+        ),
+    }
+    if any(int(index.get(key, -1)) != value for key, value in expected_counts.items()):
+        raise ValueError("cluster-fit index scope-kind counts changed")
+    for logical_scope_id in logical_order:
+        logical = logical_by_scope[str(logical_scope_id)]
+        binding = logical.get("physical_fit_binding")
+        owner_scope_id = (
+            binding.get("physical_owner_scope_id")
+            if isinstance(binding, Mapping)
+            else None
+        )
+        owner = physical_by_scope.get(str(owner_scope_id))
+        logical_identity = logical.get("cluster_fit_identity")
+        owner_identity = (
+            owner.get("cluster_fit_identity")
+            if isinstance(owner, Mapping)
+            else None
+        )
+        if (
+            not isinstance(binding, Mapping)
+            or set(binding)
+            != {
+                "schema_version",
+                "logical_scope_id",
+                "physical_owner_scope_id",
+                "reuses_physical_fit",
+                "fit_row_order_sha256",
+                "logical_fit_row_order_fingerprint",
+                "canonical_fit_row_order_fingerprint",
+                "canonical_group_seed",
+                "canonical_cluster_fit_identity_content_sha256",
+                "same_ordered_fit_rows_and_seed_proved",
+                "logical_alias_refit_performed",
+                "content_sha256",
+            }
+            or binding.get("schema_version")
+            != "production_stage1_cluster_preflight_physical_binding_v2"
+            or binding.get("logical_scope_id") != logical_scope_id
+            or owner is None
+            or not isinstance(owner_identity, Mapping)
+            or not isinstance(logical_identity, Mapping)
+            or binding.get("reuses_physical_fit")
+            is not (logical_scope_id != owner_scope_id)
+            or binding.get("same_ordered_fit_rows_and_seed_proved") is not True
+            or binding.get("logical_alias_refit_performed") is not False
+            or binding.get("canonical_cluster_fit_identity_content_sha256")
+            != owner_identity.get("content_sha256")
+            or logical_identity != owner_identity
+            or binding.get("content_sha256")
+            != _sha256_json(
+                {
+                    key: copy.deepcopy(value)
+                    for key, value in binding.items()
+                    if key != "content_sha256"
+                }
+            )
+        ):
+            raise ValueError(
+                "cluster preflight logical-to-physical binding is missing or substituted"
+            )
 
     component_registration = legacy_scope_index.get("embedding_cluster_fit_index")
     expected_relative = (
@@ -842,7 +932,7 @@ def _validate_embedding_cluster_fit_index_snapshot(
     for row, scope_id in zip(rows, expected_order, strict=True):
         if not isinstance(row, Mapping) or set(row) != row_fields:
             raise ValueError("cluster-fit index contains a malformed scope row")
-        expected_scope = preflight_by_scope[str(scope_id)]
+        expected_scope = physical_by_scope[str(scope_id)]
         preflight_identity = expected_scope.get("cluster_fit_identity")
         fit_rows = tuple(
             map(
@@ -1418,6 +1508,14 @@ def load_authenticated_stage1_bundle_for_hierarchy(
                     "non_grounding_numerical_summaries",
                 )
             }
+            catalog_audit = catalog_raw.get("audit")
+            catalog_identity["semantic_member_batching"] = copy.deepcopy(
+                (
+                    catalog_audit.get("semantic_member_batching")
+                    if isinstance(catalog_audit, Mapping)
+                    else None
+                )
+            )
             if (
                 int(catalog_raw.get("outer_fold", 0)) != scope_key[0]
                 or int(catalog_raw.get("inner_fold", 0)) != scope_key[1]

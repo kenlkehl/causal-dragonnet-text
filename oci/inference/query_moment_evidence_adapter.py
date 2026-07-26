@@ -101,36 +101,61 @@ _TERM_FIELDS = frozenset(
 
 @dataclass(frozen=True)
 class QueryMomentEvidenceAdapterConfig:
-    """Strict size limits shared by artifact and sparse-fallback modes."""
+    """Optional fail-closed capacity guards for query evidence.
 
-    max_queries: int = 24
-    # Historical neural-query artifacts retained 20 contrastive terms.  Fusion
-    # applies its own smaller prompt cap after this adapter authenticates them.
-    max_terms_per_query: int = 32
-    max_chunks_per_query: int = 16
-    fallback_chunks_per_query: int = 8
-    max_excerpt_chars: int = 1200
-    max_term_chars: int = 160
-    max_ngram_tokens: int = 6
+    ``None`` means unbounded.  A configured value is an abort threshold, not a
+    slicing instruction: exceeding it rejects the artifact or sparse fallback
+    instead of silently omitting queries, chunks, terms, or note text.
+    """
+
+    max_queries: int | None = None
+    max_terms_per_query: int | None = None
+    max_chunks_per_query: int | None = None
+    fallback_chunks_per_query: int | None = None
+    max_excerpt_chars: int | None = None
+    max_term_chars: int | None = None
+    max_ngram_tokens: int | None = None
 
     def validate(self) -> None:
-        if int(self.max_queries) < 1:
-            raise ValueError("max_queries must be positive")
-        if int(self.max_terms_per_query) < 1:
-            raise ValueError("max_terms_per_query must be positive")
-        if int(self.max_chunks_per_query) < 1:
-            raise ValueError("max_chunks_per_query must be positive")
-        if not 1 <= int(self.fallback_chunks_per_query) <= int(self.max_chunks_per_query):
+        for name in (
+            "max_queries",
+            "max_terms_per_query",
+            "max_chunks_per_query",
+            "fallback_chunks_per_query",
+            "max_excerpt_chars",
+            "max_term_chars",
+            "max_ngram_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+            ):
+                raise ValueError(f"{name} must be positive when configured")
+        if (
+            self.fallback_chunks_per_query is not None
+            and self.max_chunks_per_query is not None
+            and int(self.fallback_chunks_per_query) > int(self.max_chunks_per_query)
+        ):
             raise ValueError(
-                "fallback_chunks_per_query must be positive and no larger than "
-                "max_chunks_per_query"
+                "fallback_chunks_per_query must be no larger than "
+                "max_chunks_per_query when both are configured"
             )
-        if int(self.max_excerpt_chars) < 1:
-            raise ValueError("max_excerpt_chars must be positive")
-        if int(self.max_term_chars) < 1:
-            raise ValueError("max_term_chars must be positive")
-        if int(self.max_ngram_tokens) < 1:
-            raise ValueError("max_ngram_tokens must be positive")
+
+    def as_dict(self) -> dict[str, int | None]:
+        return {
+            name: getattr(self, name)
+            for name in (
+                "max_queries",
+                "max_terms_per_query",
+                "max_chunks_per_query",
+                "fallback_chunks_per_query",
+                "max_excerpt_chars",
+                "max_term_chars",
+                "max_ngram_tokens",
+            )
+        }
 
 
 @dataclass(frozen=True)
@@ -293,6 +318,7 @@ def load_query_moment_evidence_artifact(
     audit = {
         "schema_version": QUERY_MOMENT_ADAPTER_SCHEMA_VERSION,
         "mode": "authenticated_neural_query_artifact",
+        "capacity_policy": config.as_dict(),
         "source_kind": NEURAL_QUERY_SOURCE,
         "source_family": NEURAL_QUERY_MOMENTS,
         "query_definition_kind": "learned_neural_cohort_queries",
@@ -452,7 +478,7 @@ def derive_sparse_query_moment_evidence(
             excerpt = _term_centered_excerpt(
                 texts[position],
                 source_terms,
-                max_chars=int(config.max_excerpt_chars),
+                max_chars=config.max_excerpt_chars,
             )
             if not excerpt or _FORBIDDEN_STRING.search(excerpt):
                 skipped_excerpt_count += 1
@@ -466,8 +492,15 @@ def derive_sparse_query_moment_evidence(
                     "text": excerpt,
                 }
             )
-            if len(chunks) >= int(config.fallback_chunks_per_query):
-                break
+        if (
+            config.fallback_chunks_per_query is not None
+            and len(chunks) > int(config.fallback_chunks_per_query)
+        ):
+            raise ValueError(
+                f"sparse query {query_id} has {len(chunks)} retrievable chunks, "
+                "which exceeds configured fallback_chunks_per_query; refusing "
+                "silent ranked-chunk omission"
+            )
         top_terms = [
             {
                 "term": term,
@@ -500,6 +533,7 @@ def derive_sparse_query_moment_evidence(
     audit = {
         "schema_version": QUERY_MOMENT_ADAPTER_SCHEMA_VERSION,
         "mode": "deterministic_sparse_fallback",
+        "capacity_policy": config.as_dict(),
         "source_kind": SPARSE_QUERY_SOURCE,
         "source_family": SPARSE_QUERY_MOMENTS,
         "query_definition_kind": "fixed_sparse_tfidf_term_queries",
@@ -766,7 +800,7 @@ def _sanitize_query_records(
     heldout_ids: set[Hashable],
     config: QueryMomentEvidenceAdapterConfig,
 ) -> tuple[list[dict[str, Any]], set[Hashable]]:
-    if len(query_rows) > int(config.max_queries):
+    if config.max_queries is not None and len(query_rows) > int(config.max_queries):
         raise ValueError("query-evidence artifact exceeds max_queries")
     output: list[dict[str, Any]] = []
     query_ids: set[str] = set()
@@ -812,7 +846,10 @@ def _sanitize_query_records(
         raw_chunks = raw_query.get("top_chunks") or []
         if not isinstance(raw_chunks, list):
             raise TypeError(f"{path}.top_chunks must be a list")
-        if len(raw_chunks) > int(config.max_chunks_per_query):
+        if (
+            config.max_chunks_per_query is not None
+            and len(raw_chunks) > int(config.max_chunks_per_query)
+        ):
             raise ValueError(f"{path}.top_chunks exceeds the configured bound")
         chunks: list[dict[str, Any]] = []
         for chunk_index, raw_chunk in enumerate(raw_chunks):
@@ -850,7 +887,10 @@ def _sanitize_query_records(
             # omitted.  Nonempty oversize excerpts remain a hard failure.
             if not text:
                 continue
-            if len(text) > int(config.max_excerpt_chars):
+            if (
+                config.max_excerpt_chars is not None
+                and len(text) > int(config.max_excerpt_chars)
+            ):
                 raise ValueError(f"{chunk_path}.text exceeds the configured bound")
             _reject_forbidden_content(text, path=f"{chunk_path}.text")
             similarity = _finite_scalar(
@@ -875,7 +915,10 @@ def _sanitize_query_records(
         raw_terms = raw_query.get("top_contrastive_ngrams") or []
         if not isinstance(raw_terms, list):
             raise TypeError(f"{path}.top_contrastive_ngrams must be a list")
-        if len(raw_terms) > int(config.max_terms_per_query):
+        if (
+            config.max_terms_per_query is not None
+            and len(raw_terms) > int(config.max_terms_per_query)
+        ):
             raise ValueError(f"{path}.top_contrastive_ngrams exceeds the configured bound")
         terms: list[dict[str, Any]] = []
         for term_index, raw_term in enumerate(raw_terms):
@@ -887,8 +930,13 @@ def _sanitize_query_records(
                     f"{term_path} contains unsupported fields: {sorted(unexpected_term)}"
                 )
             term = str(row.get("term") or "").strip()
-            if not term or len(term) > int(config.max_term_chars):
-                raise ValueError(f"{term_path}.term is empty or exceeds the bound")
+            if not term:
+                raise ValueError(f"{term_path}.term is empty")
+            if (
+                config.max_term_chars is not None
+                and len(term) > int(config.max_term_chars)
+            ):
+                raise ValueError(f"{term_path}.term exceeds the configured bound")
             _reject_forbidden_content(term, path=f"{term_path}.term")
             term_record: dict[str, Any] = {"term": term}
             for field_name in _TERM_FIELDS - {"term"}:
@@ -941,7 +989,10 @@ def _extract_sparse_query_definitions(
         key = (bank, terms)
         if key in seen:
             return
-        if len(definitions) >= int(config.max_queries):
+        if (
+            config.max_queries is not None
+            and len(definitions) >= int(config.max_queries)
+        ):
             rejected_over_capacity_definitions += 1
             raise ValueError(
                 "sparse query definitions exceed configured max_queries; "
@@ -999,7 +1050,10 @@ def _definition_terms(
 ) -> tuple[tuple[str, float], ...] | None:
     if not isinstance(raw_terms, (list, tuple)):
         return None
-    if len(raw_terms) > int(config.max_terms_per_query):
+    if (
+        config.max_terms_per_query is not None
+        and len(raw_terms) > int(config.max_terms_per_query)
+    ):
         raise ValueError(
             "sparse query definition exceeds configured max_terms_per_query; "
             "refusing silent term omission"
@@ -1008,13 +1062,24 @@ def _definition_terms(
     for raw_term in raw_terms:
         row = raw_term if isinstance(raw_term, Mapping) else {"term": raw_term}
         term = _canonical_term(row.get("term") or row.get("feature") or row.get("ngram"))
-        if (
-            not term
-            or len(term) > int(config.max_term_chars)
-            or len(term.split()) > int(config.max_ngram_tokens)
-            or _FORBIDDEN_STRING.search(term)
-        ):
+        if not term or _FORBIDDEN_STRING.search(term):
             continue
+        if (
+            config.max_term_chars is not None
+            and len(term) > int(config.max_term_chars)
+        ):
+            raise ValueError(
+                "sparse query term exceeds configured max_term_chars; "
+                "refusing silent term omission"
+            )
+        if (
+            config.max_ngram_tokens is not None
+            and len(term.split()) > int(config.max_ngram_tokens)
+        ):
+            raise ValueError(
+                "sparse query term exceeds configured max_ngram_tokens; "
+                "refusing silent term omission"
+            )
         loading = row.get("loading")
         try:
             weight = abs(float(loading)) if loading is not None else 1.0
@@ -1043,24 +1108,21 @@ def _find_orphan_branch(discovery: Mapping[str, Any]) -> Any:
     return None
 
 
-def _term_centered_excerpt(text: str, terms: Sequence[str], *, max_chars: int) -> str:
+def _term_centered_excerpt(
+    text: str,
+    terms: Sequence[str],
+    *,
+    max_chars: int | None,
+) -> str:
+    del terms
     value = re.sub(r"\s+", " ", str(text)).strip()
-    if len(value) <= max_chars:
+    if max_chars is None or len(value) <= int(max_chars):
         return value
-    match_start = None
-    lowered = value.lower()
-    for term in terms:
-        tokens = term.split()
-        pattern = r"(?<![a-z0-9])" + r"\W+".join(map(re.escape, tokens)) + r"(?![a-z0-9])"
-        match = re.search(pattern, lowered, flags=re.IGNORECASE)
-        if match is not None and (match_start is None or match.start() < match_start):
-            match_start = match.start()
-    if match_start is None:
-        return value[:max_chars]
-    start = max(0, int(match_start) - max_chars // 3)
-    stop = min(len(value), start + max_chars)
-    start = max(0, stop - max_chars)
-    return value[start:stop]
+    raise ValueError(
+        f"query source text has {len(value)} normalized characters, which "
+        f"exceeds configured max_excerpt_chars={int(max_chars)}; refusing "
+        "silent note truncation"
+    )
 
 
 def _canonical_term(value: Any) -> str:

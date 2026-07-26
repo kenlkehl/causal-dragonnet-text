@@ -2164,7 +2164,7 @@ class MultiModelAgenticForestRunner:
             generator.bind_cluster_physical_fit_authority(
                 ordered_fit_row_ids=ordered_fit_rows,
                 canonical_group_seed=derive_stage1_group_seed(
-                    int(self.config.seed),
+                    _required_applied_seed(self.config),
                     ordered_fit_rows,
                 ),
             )
@@ -3451,8 +3451,7 @@ class MultiModelAgenticForestRunner:
                 support_count >= threshold
                 or (inner_fold_count == 0 and summary["proposed_on_full_outer_train"])
             )
-            summary["rationales"] = summary["rationales"][:5]
-            summary["expected_signals"] = list(dict.fromkeys(summary["expected_signals"]))[:5]
+            summary["expected_signals"] = list(dict.fromkeys(summary["expected_signals"]))
             summaries.append(summary)
         return summaries, threshold, inner_fold_count
 
@@ -3469,12 +3468,26 @@ class MultiModelAgenticForestRunner:
             item
             for item in _rank_consistency_summaries(candidate_summaries)
             if not item.get("passes_consistency_gate")
-        ][:recovery_limit]
+        ]
+        if len(below_threshold) > recovery_limit:
+            raise ValueError(
+                f"consistency review has {len(below_threshold)} below-threshold "
+                f"candidates, exceeding configured "
+                f"candidate_consistency_recovery_max_candidates={recovery_limit}; "
+                "refusing silent candidate-summary omission"
+            )
         passed = [
             item
             for item in _rank_consistency_summaries(candidate_summaries)
             if item.get("passes_consistency_gate")
         ]
+        selection_limit = int(self.nn_config.candidate_proposals_per_fold)
+        if len(passed) > selection_limit:
+            raise ValueError(
+                f"consistency review has {len(passed)} gate-passing candidates, "
+                f"exceeding configured candidate_proposals_per_fold="
+                f"{selection_limit}; refusing silent gate-passing candidate omission"
+            )
         return {
             "prompt_version": "multi_model_agentic_consistency_v1",
             "outer_fold": int(outer_fold),
@@ -3504,13 +3517,12 @@ class MultiModelAgenticForestRunner:
             canonical_proposals,
         )
         max_selected = int(self.nn_config.candidate_proposals_per_fold)
-        fallback_capped = fallback_selected[:max_selected]
         fallback_method = (
             "deterministic_consistency_gate"
             if any(
                 item.get("passes_consistency_gate")
                 for item in candidate_summaries
-                if item.get("name") in {proposal.name for proposal in fallback_capped}
+                if item.get("name") in {proposal.name for proposal in fallback_selected}
             )
             else "deterministic_full_outer_train_fallback"
         )
@@ -3528,13 +3540,17 @@ class MultiModelAgenticForestRunner:
                 "Multi-model consistency selection agent failed; using deterministic fallback",
                 exc_info=True,
             )
-            return fallback_capped, {
+            fallback_complete = _require_complete_consistency_fallback(
+                fallback_selected,
+                max_selected=max_selected,
+            )
+            return fallback_complete, {
                 "selection_method": f"{fallback_method}_after_agent_error",
                 "agent_selection_attempted": True,
                 "agent_selection_used": False,
                 "agent_error": str(exc),
                 "max_selected_candidates": max_selected,
-                "valid_proposals": [_proposal_to_dict(p) for p in fallback_capped],
+                "valid_proposals": [_proposal_to_dict(p) for p in fallback_complete],
                 "rejected_proposals": [],
                 "used_fallback": True,
             }
@@ -3554,6 +3570,10 @@ class MultiModelAgenticForestRunner:
                 artifact["agent_raw_output"] = agent_trace
             return selected, artifact
 
+        fallback_complete = _require_complete_consistency_fallback(
+            fallback_selected,
+            max_selected=max_selected,
+        )
         artifact = {
             "selection_method": f"{fallback_method}_after_empty_agent_selection",
             "agent_selection_attempted": True,
@@ -3561,13 +3581,13 @@ class MultiModelAgenticForestRunner:
             "max_selected_candidates": max_selected,
             "raw_proposals": raw_selection,
             "agent_valid_proposals": [],
-            "valid_proposals": [_proposal_to_dict(p) for p in fallback_capped],
+            "valid_proposals": [_proposal_to_dict(p) for p in fallback_complete],
             "rejected_proposals": rejected,
             "used_fallback": True,
         }
         if self.search_config.save_agent_raw_output:
             artifact["agent_raw_output"] = agent_trace
-        return fallback_capped, artifact
+        return fallback_complete, artifact
 
     def _selected_specs_from_proposals(
         self,
@@ -5434,6 +5454,18 @@ class MultiModelAgenticForestRunner:
         logger.info("Multi-model agentic forest artifacts saved to: %s", self.artifact_dir)
 
 
+def _required_applied_seed(config: AppliedInferenceConfig) -> int:
+    """Return the explicitly supplied scientific seed or fail closed."""
+
+    seed = config.seed
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**31:
+        raise ValueError(
+            "applied inference requires an explicit integer seed in [0, 2**31) "
+            "for physical-fit identity"
+        )
+    return int(seed)
+
+
 def _agentic_discovery_handoff_row(
     result: Dict[str, Any],
     *,
@@ -5730,7 +5762,25 @@ def _fallback_consistency_proposals(
         for item in _rank_consistency_summaries(candidate_summaries)
         if item.get("proposed_on_full_outer_train") and item.get("name") in canonical_proposals
     ]
-    return full_supported[:1]
+    return full_supported
+
+
+def _require_complete_consistency_fallback(
+    proposals: Sequence[AgenticFeatureProposal],
+    *,
+    max_selected: int,
+) -> List[AgenticFeatureProposal]:
+    """Reject a fallback that would need to discard otherwise eligible candidates."""
+
+    complete = list(proposals)
+    if len(complete) > int(max_selected):
+        raise RuntimeError(
+            f"deterministic consistency fallback produced {len(complete)} "
+            f"eligible candidates, exceeding configured "
+            f"candidate_proposals_per_fold={int(max_selected)}; refusing "
+            "silent fallback-candidate omission"
+        )
+    return complete
 
 
 def _agentic_consistency_selected_proposals(
@@ -5775,8 +5825,12 @@ def _agentic_consistency_selected_proposals(
             continue
         selected.append(proposal)
         selected_names.add(name)
-        if len(selected) >= max(0, int(max_selected)):
-            break
+    if len(selected) > int(max_selected):
+        raise ValueError(
+            f"agent consistency response selected {len(selected)} candidates, "
+            f"exceeding configured max_selected={int(max_selected)}; refusing "
+            "silent response truncation"
+        )
     return selected, rejected
 
 

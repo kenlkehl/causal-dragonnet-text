@@ -329,6 +329,16 @@ def test_required_and_unconfigured_child_columns_fail_closed(child_kwargs, messa
         _call(backend)
 
 
+def test_volatile_signed_order_width_has_no_hidden_legacy_upper_bound():
+    family = PrecommittedVolatileRawFeatureFamily(
+        source_kind="safe_family",
+        consumer_role=UNCALIBRATED_EFFECT_MODIFIER_ROLE,
+        signed_order_width=257,
+    )
+
+    assert family.signed_order_width == 257
+
+
 def test_identity_is_bound_and_gate_labels_are_structurally_unavailable():
     child = _HybridChildBackend()
     config = _config()

@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from tests.resource_safety_test_support import resource_safety_policy
+
 import oci.inference.production_terminal_artifact_validation as terminal_module
 import oci.inference.role_neutral_benchmark_deployment_selection as selection_module
 from oci.inference.portable_workflow_spec import (
@@ -106,7 +108,7 @@ def test_terminal_path_reopens_measured_benchmark_authorities(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    safety = ResourcePerformanceSafetyPolicy(
+    safety = resource_safety_policy(
         gpu_max_allocation_fraction=0.85,
         gpu_minimum_headroom_bytes=6 * 1024**3,
         minimum_multi_device_throughput_ratio=1.5,
@@ -129,12 +131,32 @@ def test_terminal_path_reopens_measured_benchmark_authorities(
     )
     request = {
         "stage1_execution_profile": {
-            "schema_version": "portable_stage1_execution_profile_v3",
+            "schema_version": "portable_stage1_execution_profile_v6",
             "resource_kind": "accelerator",
             "device_count": 2,
             "scope_workers_per_device": 2,
+            "max_parallel_owners": 4,
             "executor_mode": "persistent_slots",
+            "persistent_slot_startup_timeout_seconds": 30.0,
+            "neural_query_topology": {
+                "schema_version": (
+                    "portable_stage1_execution_topology_policy_v1"
+                ),
+                "mode": "one_context_per_selected_device",
+            },
+            "htr_operational_controls": {
+                "schema_version": (
+                    "production_role_neutral_htr_operational_controls_v1"
+                ),
+                "training_batch_size": 4,
+                "sentence_encoder_batch_size": 8,
+                "data_loader_workers": 0,
+                "reuse_tokenizer_and_chunk_plans": False,
+                "chunk_plan_cache_max_entries": 0,
+                "tokenized_chunk_cache_max_entries": 0,
+            },
             "selection_method": "measured_role_neutral_benchmark_v1",
+            "benchmark_evidence_kind": "raw_result_v1",
             "selected_candidate": "measured-x2",
             "benchmark_result_sha256": "a" * 64,
             "benchmark_result_locator": str(
@@ -144,6 +166,8 @@ def test_terminal_path_reopens_measured_benchmark_authorities(
             "benchmark_workload_deployment_locator": str(
                 (tmp_path / "workload-deployment.json").resolve()
             ),
+            "benchmark_publication_sha256": None,
+            "benchmark_publication_locator": None,
         },
         "scientific_spec_path": str(
             (tmp_path / "scientific.json").resolve()
@@ -1397,9 +1421,9 @@ def test_portable_stage1_binding_requires_the_closed_reference_inventory(
         "physical_fit_count": 35,
         "logical_scope_count": 40,
         "deduplicated_fit_count": 5,
-        "productive_compute_canary_completed": True,
-        "selected_canary_replica_adopted_as_production": True,
-        "compute_canary_scientific_equality": True,
+        "productive_compute_canary_completed": False,
+        "selected_canary_replica_adopted_as_production": False,
+        "compute_canary_scientific_equality": None,
         "legacy_bundle_build_invoked": False,
         "all_ten_role_neutral_execution_is_exclusive_evidence_source": True,
         "stage2_loader_validation": ("reference_only_role_neutral_provider_accepted"),

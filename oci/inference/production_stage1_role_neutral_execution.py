@@ -33,7 +33,8 @@ import shutil
 import stat
 import tempfile
 import threading
-from dataclasses import dataclass, replace
+import time
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -54,6 +55,12 @@ from .production_stage1_role_neutral_coordinator import (
 from .production_stage1_scope_scheduler import (
     Stage1ScopePlan,
     Stage1ScopeSpec,
+)
+from .neural_query_execution_topology import (
+    NeuralQueryExecutionTopology,
+)
+from .role_neutral_htr_group_execution import (
+    RoleNeutralHTROperationalControls,
 )
 from .role_neutral_all_ten_binding import (
     AuthenticatedRoleNeutralComponentReceipt,
@@ -84,6 +91,43 @@ DISTINCT_RESOURCE_CANARY_REPLICA_POLICY = (
 )
 
 _HEX = frozenset("0123456789abcdef")
+
+ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SCHEMA = (
+    "production_role_neutral_component_execution_interval_v1"
+)
+ROLE_NEUTRAL_COMPONENT_EXECUTION_CLOCK_DOMAIN = (
+    "python_monotonic_ns_systemwide_v1"
+)
+
+# These labels describe directly timed architecture-phase execution envelopes,
+# not CUDA-kernel occupancy.  The accelerator-associated components contain
+# host-side orchestration as part of their measured envelope, so downstream
+# analysis is intentionally descriptive and may not claim a throughput
+# speedup from interval overlap.
+_ACCELERATOR_ASSOCIATED_COMPONENTS = frozenset(
+    {"htr", "matched_pair", "neural_query"}
+)
+_ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_FIELDS = frozenset(
+    {
+        "schema_version",
+        "physical_owner_scope_id",
+        "component",
+        "lane_kind",
+        "resource_ids",
+        "clock_domain_id",
+        "started_monotonic_ns",
+        "finished_monotonic_ns",
+        "status",
+        "timestamps_measured_directly",
+        "interval_semantics",
+    }
+)
+_ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SEMANTICS = (
+    "architecture_phase_execution_envelope_not_kernel_occupancy_v1"
+)
+_ROLE_NEUTRAL_COMPONENT_EXECUTION_REPORT_SEMANTICS = (
+    "direct_monotonic_architecture_phase_envelopes_not_kernel_occupancy_v1"
+)
 
 
 def _canonical_json(value: Any) -> str:
@@ -232,8 +276,9 @@ def _owner_group(
 class RoleNeutralComponentInvocation:
     """One deployment-bound producer call.
 
-    ``output_root`` and ``resource`` are operational capabilities.  They are
-    intentionally absent from :meth:`scientific_payload`.
+    ``output_root``, ``resource``, and ``owner_cpu_budget`` are operational
+    capabilities.  They are intentionally absent from
+    :meth:`scientific_payload`.
     """
 
     plan: Stage1ScopePlan
@@ -242,6 +287,11 @@ class RoleNeutralComponentInvocation:
     component: str
     output_root: Path
     resource: str
+    neural_query_execution_topology: (
+        NeuralQueryExecutionTopology | None
+    ) = None
+    htr_operational_controls: RoleNeutralHTROperationalControls | None = None
+    owner_cpu_budget: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.plan, Stage1ScopePlan):
@@ -256,6 +306,45 @@ class RoleNeutralComponentInvocation:
             raise ValueError("component invocation names an unknown producer")
         if not self.output_root.is_absolute() or not str(self.resource).strip():
             raise ValueError("component invocation lacks operational capabilities")
+        topology = self.neural_query_execution_topology
+        if topology is None:
+            topology = NeuralQueryExecutionTopology.single(self.resource)
+            object.__setattr__(
+                self,
+                "neural_query_execution_topology",
+                topology,
+            )
+        if not isinstance(topology, NeuralQueryExecutionTopology):
+            raise TypeError(
+                "component invocation requires a typed neural-query "
+                "execution topology"
+            )
+        if (
+            topology.primary_device
+            != str(self.resource)
+        ):
+            raise ValueError(
+                "component invocation topology must begin with its assigned "
+                "primary resource"
+            )
+        if self.htr_operational_controls is not None and not isinstance(
+            self.htr_operational_controls,
+            RoleNeutralHTROperationalControls,
+        ):
+            raise TypeError(
+                "component invocation HTR controls must use the typed "
+                "deployment-only contract"
+            )
+        if (
+            self.owner_cpu_budget is not None
+            and (
+                isinstance(self.owner_cpu_budget, bool)
+                or int(self.owner_cpu_budget) < 1
+            )
+        ):
+            raise ValueError(
+                "component invocation owner CPU budget must be positive"
+            )
 
     def scientific_payload(self) -> dict[str, Any]:
         body = {
@@ -269,6 +358,8 @@ class RoleNeutralComponentInvocation:
             "native_families": list(EXPECTED_COMPONENT_FAMILIES[self.component]),
             "output_locator_included": False,
             "resource_assignment_included": False,
+            "neural_query_device_topology_included": False,
+            "htr_operational_controls_included": False,
         }
         return {**body, "content_sha256": _sha256_json(body)}
 
@@ -283,6 +374,29 @@ class BoundRoleNeutralComponentProducer:
     def __post_init__(self) -> None:
         if not callable(self.execute) or not callable(self.authenticate):
             raise TypeError("bound role-neutral producer requires execute/authenticate callables")
+
+
+@dataclass(frozen=True)
+class RoleNeutralOperationalComponentReport:
+    """Execution-only component report excluded from scientific receipts."""
+
+    component: str
+    attestation: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if self.component not in EXPECTED_COMPONENT_FAMILIES:
+            raise ValueError("operational component report names another producer")
+        value = copy.deepcopy(dict(self.attestation))
+        content_sha256 = value.get("content_sha256")
+        body = {key: item for key, item in value.items() if key != "content_sha256"}
+        if (
+            not isinstance(content_sha256, str)
+            or _sha256_json(body) != content_sha256
+        ):
+            raise ValueError(
+                "operational component report has an invalid content identity"
+            )
+        object.__setattr__(self, "attestation", value)
 
 
 RoleNeutralProducerFactory = Callable[
@@ -325,6 +439,11 @@ class RoleNeutralPhysicalOwnerTask:
     logical_members: tuple[Stage1ScopeSpec, ...]
     component_parent: Path
     resource: str
+    neural_query_execution_topology: (
+        NeuralQueryExecutionTopology | None
+    ) = None
+    htr_operational_controls: RoleNeutralHTROperationalControls | None = None
+    owner_cpu_budget: int | None = None
 
     def __post_init__(self) -> None:
         owner, members = _owner_group(
@@ -337,6 +456,42 @@ class RoleNeutralPhysicalOwnerTask:
             raise ValueError("physical-owner task root must be absolute")
         if not str(self.resource).strip():
             raise ValueError("physical-owner task resource cannot be empty")
+        topology = self.neural_query_execution_topology
+        if topology is None:
+            topology = NeuralQueryExecutionTopology.single(self.resource)
+            object.__setattr__(
+                self,
+                "neural_query_execution_topology",
+                topology,
+            )
+        if not isinstance(topology, NeuralQueryExecutionTopology):
+            raise TypeError(
+                "physical-owner task requires a typed neural-query "
+                "execution topology"
+            )
+        if topology.primary_device != str(self.resource):
+            raise ValueError(
+                "physical-owner neural-query topology must begin with its "
+                "assigned primary resource"
+            )
+        if self.htr_operational_controls is not None and not isinstance(
+            self.htr_operational_controls,
+            RoleNeutralHTROperationalControls,
+        ):
+            raise TypeError(
+                "physical-owner task HTR controls must use the typed "
+                "deployment-only contract"
+            )
+        if (
+            self.owner_cpu_budget is not None
+            and (
+                isinstance(self.owner_cpu_budget, bool)
+                or int(self.owner_cpu_budget) < 1
+            )
+        ):
+            raise ValueError(
+                "physical-owner task CPU budget must be positive"
+            )
 
 
 @dataclass(frozen=True)
@@ -406,6 +561,15 @@ class LocalThreadRoleNeutralPhysicalOwnerExecutor:
             )
         if len({task.physical_owner.scope_id for task in rows}) != len(rows):
             raise ValueError("local executor tasks contain duplicate physical owners")
+        if any(
+            task.neural_query_execution_topology is not None
+            and task.neural_query_execution_topology.spans_multiple_devices
+            for task in rows
+        ):
+            raise RuntimeError(
+                "the in-process thread executor cannot atomically reserve a "
+                "multi-device neural-query context"
+            )
         results: list[RoleNeutralPhysicalOwnerResult] = []
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(workers, len(rows)),
@@ -460,6 +624,11 @@ class RoleNeutralStage1ExecutionPolicy:
     resource_plan: ResourcePlan
     max_parallel_owners: int
     compute_canary: RoleNeutralComputeCanaryPolicy | None = None
+    neural_query_execution_topologies: Mapping[
+        str,
+        NeuralQueryExecutionTopology,
+    ] = field(default_factory=dict)
+    htr_operational_controls: RoleNeutralHTROperationalControls | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.resource_plan, ResourcePlan):
@@ -476,6 +645,53 @@ class RoleNeutralStage1ExecutionPolicy:
             raise TypeError(
                 "compute_canary must be a typed RoleNeutralComputeCanaryPolicy"
             )
+        if self.htr_operational_controls is not None and not isinstance(
+            self.htr_operational_controls,
+            RoleNeutralHTROperationalControls,
+        ):
+            raise TypeError(
+                "execution policy HTR controls must use the typed "
+                "deployment-only contract"
+            )
+        topologies = dict(self.neural_query_execution_topologies)
+        selected = set(self.resource_plan.devices)
+        if any(
+            not isinstance(key, str)
+            or not isinstance(value, NeuralQueryExecutionTopology)
+            or key != value.primary_device
+            for key, value in topologies.items()
+        ):
+            raise TypeError(
+                "neural-query execution topologies must map each primary "
+                "device to one typed topology"
+            )
+        if not set(topologies).issubset(selected) or any(
+            not set(value.devices).issubset(selected)
+            for value in topologies.values()
+        ):
+            raise ValueError(
+                "neural-query execution topology requests an unavailable "
+                "resource"
+            )
+        object.__setattr__(
+            self,
+            "neural_query_execution_topologies",
+            topologies,
+        )
+
+    def neural_query_topology_for(
+        self,
+        primary_resource: str,
+    ) -> NeuralQueryExecutionTopology:
+        resource = str(primary_resource)
+        if resource not in self.resource_plan.devices:
+            raise ValueError(
+                "neural-query topology requested an unselected primary resource"
+            )
+        return self.neural_query_execution_topologies.get(
+            resource,
+            NeuralQueryExecutionTopology.single(resource),
+        )
 
 
 def _execute_one_owner(
@@ -486,6 +702,8 @@ def _execute_one_owner(
     task.component_parent.mkdir(parents=True, exist_ok=False)
     sources: list[RoleNeutralComponentArtifactSource] = []
     component_order: list[str] = []
+    operational_reports: dict[str, Mapping[str, Any]] = {}
+    component_execution_intervals: list[dict[str, Any]] = []
     for component in EXPECTED_COMPONENT_FAMILIES:
         component_root = task.component_parent / component
         invocation = RoleNeutralComponentInvocation(
@@ -495,6 +713,11 @@ def _execute_one_owner(
             component=component,
             output_root=component_root,
             resource=task.resource,
+            neural_query_execution_topology=(
+                task.neural_query_execution_topology
+            ),
+            htr_operational_controls=task.htr_operational_controls,
+            owner_cpu_budget=task.owner_cpu_budget,
         )
         bound = factories[component](invocation)
         if not isinstance(bound, BoundRoleNeutralComponentProducer):
@@ -507,7 +730,73 @@ def _execute_one_owner(
                 f"{task.physical_owner.scope_id}/{component} output "
                 "existed before producer execution"
             )
-        bound.execute()
+        interval_started_monotonic_ns = time.monotonic_ns()
+        execution_result = bound.execute()
+        interval_finished_monotonic_ns = time.monotonic_ns()
+        if interval_finished_monotonic_ns <= interval_started_monotonic_ns:
+            raise RuntimeError(
+                "role-neutral component execution interval did not advance"
+            )
+        accelerator_associated = (
+            task.resource != "cpu"
+            and component in _ACCELERATOR_ASSOCIATED_COMPONENTS
+        )
+        if component == "neural_query" and accelerator_associated:
+            resource_ids = tuple(
+                task.neural_query_execution_topology.devices
+            )
+        elif accelerator_associated:
+            resource_ids = (task.resource,)
+        else:
+            resource_ids = ("host_cpu",)
+        component_execution_intervals.append(
+            {
+                "schema_version": (
+                    ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SCHEMA
+                ),
+                "physical_owner_scope_id": (
+                    task.physical_owner.scope_id
+                ),
+                "component": component,
+                "lane_kind": (
+                    "gpu" if accelerator_associated else "cpu"
+                ),
+                "resource_ids": list(resource_ids),
+                "clock_domain_id": (
+                    ROLE_NEUTRAL_COMPONENT_EXECUTION_CLOCK_DOMAIN
+                ),
+                "started_monotonic_ns": (
+                    interval_started_monotonic_ns
+                ),
+                "finished_monotonic_ns": (
+                    interval_finished_monotonic_ns
+                ),
+                "status": "completed",
+                "timestamps_measured_directly": True,
+                "interval_semantics": (
+                    _ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SEMANTICS
+                ),
+            }
+        )
+        if isinstance(
+            execution_result,
+            RoleNeutralOperationalComponentReport,
+        ):
+            if (
+                execution_result.component != component
+                or component in operational_reports
+            ):
+                raise ValueError(
+                    "component returned a substituted or duplicate "
+                    "operational report"
+                )
+            operational_reports[component] = copy.deepcopy(
+                dict(execution_result.attestation)
+            )
+        elif component == "htr" and task.htr_operational_controls is not None:
+            raise RuntimeError(
+                "typed HTR deployment controls were not operationally attested"
+            )
         if (
             component_root.is_symlink()
             or component_root.resolve(strict=True) != component_root
@@ -539,7 +828,138 @@ def _execute_one_owner(
         sources=tuple(sources),
         component_execution_order=tuple(component_order),
         resource=task.resource,
+        execution_telemetry={
+            "schema_version": (
+                "production_role_neutral_component_operational_reports_v2"
+            ),
+            "component_reports": {
+                name: operational_reports[name]
+                for name in sorted(operational_reports)
+            },
+            "component_execution_interval_semantics": (
+                _ROLE_NEUTRAL_COMPONENT_EXECUTION_REPORT_SEMANTICS
+            ),
+            "component_execution_intervals": (
+                component_execution_intervals
+            ),
+        },
     )
+
+
+def validate_role_neutral_component_execution_intervals(
+    *,
+    execution_telemetry: Mapping[str, Any] | None,
+    expected_physical_owner_scope_id: str,
+    expected_primary_resource: str,
+    expected_neural_query_resources: Sequence[str],
+) -> tuple[Mapping[str, Any], ...]:
+    """Close one owner's six directly measured architecture envelopes.
+
+    Process and persistent executors wrap the architecture report in their
+    own execution telemetry.  This reader deliberately accepts exactly that
+    one wrapper boundary, then validates the same interval contract used by
+    an in-process result.  The returned records remain operational metadata;
+    device locators and timestamps never enter scientific identity.
+    """
+
+    if not isinstance(execution_telemetry, Mapping):
+        raise ValueError(
+            "role-neutral owner omitted component execution telemetry"
+        )
+    report: Mapping[str, Any] = execution_telemetry
+    if report.get("schema_version") != (
+        "production_role_neutral_component_operational_reports_v2"
+    ):
+        wrapped = report.get("worker_report")
+        if not isinstance(wrapped, Mapping):
+            raise ValueError(
+                "role-neutral executor omitted its component worker report"
+            )
+        report = wrapped
+    intervals = report.get("component_execution_intervals")
+    if (
+        report.get("schema_version")
+        != "production_role_neutral_component_operational_reports_v2"
+        or report.get("component_execution_interval_semantics")
+        != _ROLE_NEUTRAL_COMPONENT_EXECUTION_REPORT_SEMANTICS
+        or not isinstance(report.get("component_reports"), Mapping)
+        or not isinstance(intervals, list)
+        or len(intervals) != len(EXPECTED_COMPONENT_FAMILIES)
+    ):
+        raise ValueError(
+            "role-neutral component execution report is incomplete"
+        )
+    owner_scope_id = str(expected_physical_owner_scope_id)
+    primary_resource = str(expected_primary_resource)
+    neural_resources = tuple(
+        str(value) for value in expected_neural_query_resources
+    )
+    if (
+        not owner_scope_id
+        or not primary_resource
+        or not neural_resources
+        or neural_resources[0] != primary_resource
+        or len(neural_resources) != len(set(neural_resources))
+    ):
+        raise ValueError(
+            "expected role-neutral interval capabilities are invalid"
+        )
+    closed: list[Mapping[str, Any]] = []
+    previous_finish: int | None = None
+    for component, row in zip(
+        EXPECTED_COMPONENT_FAMILIES,
+        intervals,
+        strict=True,
+    ):
+        accelerator_associated = (
+            primary_resource != "cpu"
+            and component in _ACCELERATOR_ASSOCIATED_COMPONENTS
+        )
+        expected_lane = "gpu" if accelerator_associated else "cpu"
+        expected_resources = (
+            neural_resources
+            if component == "neural_query" and accelerator_associated
+            else (
+                (primary_resource,)
+                if accelerator_associated
+                else ("host_cpu",)
+            )
+        )
+        if (
+            not isinstance(row, Mapping)
+            or set(row)
+            != _ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_FIELDS
+            or row.get("schema_version")
+            != ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SCHEMA
+            or row.get("physical_owner_scope_id") != owner_scope_id
+            or row.get("component") != component
+            or row.get("lane_kind") != expected_lane
+            or row.get("resource_ids") != list(expected_resources)
+            or row.get("clock_domain_id")
+            != ROLE_NEUTRAL_COMPONENT_EXECUTION_CLOCK_DOMAIN
+            or isinstance(row.get("started_monotonic_ns"), bool)
+            or not isinstance(row.get("started_monotonic_ns"), int)
+            or isinstance(row.get("finished_monotonic_ns"), bool)
+            or not isinstance(row.get("finished_monotonic_ns"), int)
+            or int(row["started_monotonic_ns"]) < 0
+            or int(row["finished_monotonic_ns"])
+            <= int(row["started_monotonic_ns"])
+            or (
+                previous_finish is not None
+                and int(row["started_monotonic_ns"]) < previous_finish
+            )
+            or row.get("status") != "completed"
+            or row.get("timestamps_measured_directly") is not True
+            or row.get("interval_semantics")
+            != _ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SEMANTICS
+        ):
+            raise ValueError(
+                "role-neutral component execution interval changed, "
+                "overlapped its serial peer, or is incomplete"
+            )
+        previous_finish = int(row["finished_monotonic_ns"])
+        closed.append(copy.deepcopy(dict(row)))
+    return tuple(closed)
 
 
 def _compute_canary_scientific_replica(
@@ -725,6 +1145,14 @@ def _freshly_reauthenticate_owner_result(
         or len(result.sources) != len(EXPECTED_COMPONENT_FAMILIES)
     ):
         raise ValueError("physical-owner result changed its task capability")
+    validate_role_neutral_component_execution_intervals(
+        execution_telemetry=result.execution_telemetry,
+        expected_physical_owner_scope_id=task.physical_owner.scope_id,
+        expected_primary_resource=task.resource,
+        expected_neural_query_resources=(
+            task.neural_query_execution_topology.devices
+        ),
+    )
     rebound: list[RoleNeutralComponentArtifactSource] = []
     for component, source in zip(
         EXPECTED_COMPONENT_FAMILIES,
@@ -935,6 +1363,11 @@ def execute_and_publish_role_neutral_stage1(
         policy.resource_plan,
     )
     groups = {owner.scope_id: (owner, members) for owner, members in plan.physical_scope_groups}
+    owner_cpu_budget = max(
+        1,
+        int(policy.resource_plan.cpu_budget)
+        // int(policy.max_parallel_owners),
+    )
 
     destination.mkdir(exist_ok=False)
     component_root = destination / ROLE_NEUTRAL_COMPONENT_DIRECTORY
@@ -946,6 +1379,13 @@ def execute_and_publish_role_neutral_stage1(
             logical_members=groups[owner_scope_id][1],
             component_parent=component_root / owner_scope_id,
             resource=assigned_resources[owner_scope_id],
+            neural_query_execution_topology=(
+                policy.neural_query_topology_for(
+                    assigned_resources[owner_scope_id]
+                )
+            ),
+            htr_operational_controls=policy.htr_operational_controls,
+            owner_cpu_budget=owner_cpu_budget,
         )
         for owner_scope_id in physical_order
     )
@@ -1064,6 +1504,18 @@ def execute_and_publish_role_neutral_stage1(
                         primary_resource=selected_task.resource,
                         policy=policy.compute_canary,
                         resource_plan=policy.resource_plan,
+                    ),
+                    htr_operational_controls=(
+                        policy.htr_operational_controls
+                    ),
+                    owner_cpu_budget=selected_task.owner_cpu_budget,
+                )
+                replica_b_task = replace(
+                    replica_b_task,
+                    neural_query_execution_topology=(
+                        policy.neural_query_topology_for(
+                            replica_b_task.resource
+                        )
                     ),
                 )
                 if process_isolated:
@@ -1655,6 +2107,8 @@ __all__ = [
     "DISTINCT_RESOURCE_CANARY_REPLICA_POLICY",
     "EARLIEST_CANONICAL_OWNER_CANARY_SELECTION",
     "ROLE_NEUTRAL_COMPONENT_DIRECTORY",
+    "ROLE_NEUTRAL_COMPONENT_EXECUTION_CLOCK_DOMAIN",
+    "ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SCHEMA",
     "ROLE_NEUTRAL_COMPUTE_CANARY_ATTESTATION",
     "ROLE_NEUTRAL_COMPUTE_CANARY_SCHEMA",
     "ROLE_NEUTRAL_COORDINATION_DIRECTORY",
@@ -1665,12 +2119,15 @@ __all__ = [
     "RoleNeutralComponentInvocation",
     "RoleNeutralComputeCanaryPolicy",
     "LocalThreadRoleNeutralPhysicalOwnerExecutor",
+    "NeuralQueryExecutionTopology",
     "RoleNeutralPhysicalOwnerExecutor",
     "RoleNeutralPhysicalOwnerResult",
     "RoleNeutralPhysicalOwnerTask",
+    "RoleNeutralOperationalComponentReport",
     "RoleNeutralProducerFactories",
     "RoleNeutralProducerFactory",
     "RoleNeutralStage1ExecutionPolicy",
     "execute_and_publish_role_neutral_stage1",
+    "validate_role_neutral_component_execution_intervals",
     "validate_role_neutral_stage1_execution",
 ]

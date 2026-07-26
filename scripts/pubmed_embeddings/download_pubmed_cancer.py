@@ -18,41 +18,25 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-DEFAULT_OUTPUT_ROOT = Path("/data1/ken/pcori_dev/pubmed_embeddings")
 DEFAULT_OUTPUT_NAME = "pubmed_cancer_abstracts.jsonl"
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-DEFAULT_QUERY = (
-    "("
-    "cancer[Title/Abstract] OR cancers[Title/Abstract] OR "
-    "tumor[Title/Abstract] OR tumors[Title/Abstract] OR "
-    "tumour[Title/Abstract] OR tumours[Title/Abstract] OR "
-    "neoplasm[Title/Abstract] OR neoplasms[Title/Abstract] OR "
-    "neoplasms[MeSH Terms] OR malignan*[Title/Abstract] OR "
-    "oncology[Title/Abstract] OR oncologic[Title/Abstract] OR "
-    "leukemia[Title/Abstract] OR leukaemia[Title/Abstract] OR "
-    "lymphoma[Title/Abstract] OR carcinoma[Title/Abstract] OR "
-    "adenocarcinoma[Title/Abstract] OR melanoma[Title/Abstract] OR "
-    "sarcoma[Title/Abstract] OR glioma[Title/Abstract] OR "
-    "myeloma[Title/Abstract] OR blastoma[Title/Abstract]"
-    ") AND hasabstract[text]"
-)
 
 
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Download cancer-related PubMed titles and abstracts."
     )
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_ROOT))
+    parser.add_argument("--output-dir", required=True)
     parser.add_argument("--output-name", default=DEFAULT_OUTPUT_NAME)
-    parser.add_argument("--max-records", type=int, default=100_000)
-    parser.add_argument("--query", default=DEFAULT_QUERY)
+    parser.add_argument("--max-records", type=int, required=True)
+    parser.add_argument("--query", required=True)
     parser.add_argument("--batch-size", type=int, default=500)
-    parser.add_argument("--sort", default="relevance")
+    parser.add_argument("--sort", required=True)
     parser.add_argument("--email", default=None, help="NCBI contact email.")
     parser.add_argument("--api-key", default=None, help="Optional NCBI API key.")
     parser.add_argument(
@@ -69,7 +53,11 @@ def main() -> None:
     parser.add_argument("--checkpoint-path", default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = build_parser().parse_args(argv)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -118,6 +106,10 @@ def download_pubmed(
         raise ValueError("--max-records must be >= 1")
     if batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("--query must be non-empty")
+    if not isinstance(sort, str) or not sort.strip():
+        raise ValueError("--sort must be non-empty")
 
     if force:
         _unlink_if_exists(output_path)
@@ -126,6 +118,25 @@ def download_pubmed(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     seen_pmids = _load_existing_pmids(output_path)
     checkpoint = _load_checkpoint(checkpoint_path)
+    if seen_pmids and not checkpoint:
+        raise RuntimeError(
+            "existing PubMed output lacks a checkpoint that proves its query, "
+            "record bound, and ordering; use a fresh output or --force"
+        )
+    if checkpoint:
+        expected_resume = {
+            "query": query,
+            "max_records": int(max_records),
+            "sort": sort,
+        }
+        mismatches = [
+            key for key, expected in expected_resume.items() if checkpoint.get(key) != expected
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "PubMed checkpoint is scientifically incompatible with this request; "
+                f"mismatched fields: {mismatches}. Use a fresh output or --force."
+            )
     retstart = int(checkpoint.get("retstart", len(seen_pmids)) or 0)
     written = len(seen_pmids)
     delay = sleep_seconds if sleep_seconds is not None else (0.11 if api_key else 0.34)
@@ -184,6 +195,7 @@ def download_pubmed(
                 {
                     "query": query,
                     "max_records": int(max_records),
+                    "sort": sort,
                     "available": available,
                     "written": written,
                     "retstart": retstart,

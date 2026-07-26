@@ -32,6 +32,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -69,6 +70,7 @@ from .production_stage1_scope_scheduler import Stage1ScopePlan, Stage1ScopeSpec
 from .review_spent_evidence_provider import (
     BoundSpentFrozenChunkEmbeddingProvider,
 )
+from .stage1_exact_inner_evidence import row_order_fingerprint
 
 
 ROLE_NEUTRAL_EMBEDDING_REQUEST_SCHEMA = (
@@ -1016,15 +1018,17 @@ def _canonical_preflight_scope_binding(
         fit_identity,
         label="clustered preflight fit identity",
     )
-    owner_dict = owner.as_dict()
+    canonical_fit_row_order_fingerprint = row_order_fingerprint(
+        owner.fit_row_ids
+    )
     final_concepts = fit_identity.get("final_catalog_concepts")
     if (
         scope.get("fit_row_count") != owner.fit_row_count
         or scope.get("fit_row_order_fingerprint")
-        != owner_dict["fit_row_order_fingerprint"]
+        != canonical_fit_row_order_fingerprint
         or fit_identity.get("fit_row_ids") != list(owner.fit_row_ids)
         or fit_identity.get("fit_row_order_fingerprint")
-        != owner_dict["fit_row_order_fingerprint"]
+        != canonical_fit_row_order_fingerprint
         or scope.get("canonical_group_seed") != owner.scope_seed
         or fit_identity.get("canonical_group_seed") != owner.scope_seed
         or fit_identity.get("ordered_fit_row_seed_policy")
@@ -1064,6 +1068,144 @@ def _canonical_preflight_scope_binding(
         "preflight_location_bound_in_scientific_identity": False,
     }
     return binding, scope
+
+
+def _indexed_canonical_preflight_scope_binding(
+    *,
+    preflight: _ClusterPreflightArtifact,
+    request: RoleNeutralEmbeddingPhysicalGroupRequest,
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    """Bind one owner from compact metadata without decoding its concepts.
+
+    Portable preflight loading already authenticates the compact audit index
+    and every registered payload byte.  Reconstructing the complete logical
+    scope here would additionally decode a potentially very large Parquet
+    concept payload for every owner during worker startup.  The compact index
+    carries the exact source scope/fit roots and all non-concept fitted state,
+    so it is sufficient for indexing the state-bundle registrations.  The
+    complete concepts and numerical arrays are still authenticated by
+    ``load_canonical_clustered_preflight_scope_state`` when that owner is
+    actually used.
+    """
+
+    if not isinstance(
+        preflight,
+        PortableProductionStage1ClusterPreflightArtifact,
+    ):
+        return _canonical_preflight_scope_binding(
+            preflight=preflight,
+            request=request,
+            provider_cache_identity=None,
+        )
+    identity = preflight.identity()
+    owner = request.physical_owner
+    logical_matches = [
+        row
+        for row in preflight.audit["logical_scopes"]
+        if row["scope_id"] == owner.scope_id
+    ]
+    physical_matches = [
+        row
+        for row in preflight.audit["physical_fits"]
+        if row["physical_owner_scope_id"] == owner.scope_id
+    ]
+    if len(logical_matches) != 1 or len(physical_matches) != 1:
+        raise ValueError(
+            "portable clustered preflight has no unique canonical owner index"
+        )
+    logical = logical_matches[0]
+    physical = physical_matches[0]
+    scope = logical.get("scope_without_fit_identity")
+    reference = logical.get("physical_fit_reference")
+    compact = physical.get("compact_fit_identity")
+    fit_identity = (
+        compact.get("compact_state") if isinstance(compact, Mapping) else None
+    )
+    final_binding = (
+        (compact.get("concept_collections") or {}).get(
+            "final_catalog_concepts"
+        )
+        if isinstance(compact, Mapping)
+        else None
+    )
+    final_counts = (
+        final_binding.get("family_counts")
+        if isinstance(final_binding, Mapping)
+        else None
+    )
+    canonical_fit_row_order_fingerprint = row_order_fingerprint(
+        owner.fit_row_ids
+    )
+    if (
+        not isinstance(scope, Mapping)
+        or not isinstance(reference, Mapping)
+        or not isinstance(compact, Mapping)
+        or not isinstance(fit_identity, Mapping)
+        or reference.get("physical_owner_scope_id") != owner.scope_id
+        or physical.get("logical_member_scope_ids", [None])[0]
+        != owner.scope_id
+        or scope.get("fit_row_count") != owner.fit_row_count
+        or scope.get("fit_row_order_fingerprint")
+        != canonical_fit_row_order_fingerprint
+        or fit_identity.get("fit_row_ids") != list(owner.fit_row_ids)
+        or fit_identity.get("fit_row_order_fingerprint")
+        != canonical_fit_row_order_fingerprint
+        or scope.get("canonical_group_seed") != owner.scope_seed
+        or fit_identity.get("canonical_group_seed") != owner.scope_seed
+        or fit_identity.get("ordered_fit_row_seed_policy")
+        != "canonical_ordered_fit_rows_group_seed_v1"
+        or scope.get("token_bounded_row_count") != 0
+        or scope.get("uncapped_semantic_projection") is not True
+        or not isinstance(final_counts, Mapping)
+        or int(final_counts.get(EMBEDDING_CLUSTERED, 0)) < 1
+        or int(final_counts.get(TFIDF_SEMANTIC_RETRIEVAL, 0)) < 1
+    ):
+        raise ValueError(
+            "portable clustered preflight compact owner is incomplete, "
+            "capped, or belongs to another ordered fit scope"
+        )
+    audit_identity = _require_sha256(
+        identity.get("cluster_audit_content_sha256"),
+        label="portable clustered preflight source audit",
+    )
+    if audit_identity != preflight.audit.get(
+        "source_audit_content_sha256"
+    ):
+        raise ValueError(
+            "portable clustered preflight source audit binding changed"
+        )
+    fit_identity_sha256 = _require_sha256(
+        compact.get("source_fit_identity_content_sha256"),
+        label="portable clustered preflight source fit identity",
+    )
+    if reference.get(
+        "source_fit_identity_content_sha256"
+    ) != fit_identity_sha256:
+        raise ValueError(
+            "portable logical scope names another compact fitted state"
+        )
+    expected_cache_identity = preflight.audit["audit_header"].get(
+        "embedding_cache_identity_sha256"
+    )
+    _require_sha256(
+        expected_cache_identity,
+        label="clustered preflight embedding-cache identity",
+    )
+    binding = {
+        "cluster_audit_content_sha256": audit_identity,
+        "cluster_scope_id": owner.scope_id,
+        "cluster_scope_record_sha256": _require_sha256(
+            logical.get("source_scope_record_sha256"),
+            label="portable clustered preflight source scope",
+        ),
+        "cluster_fit_identity_sha256": fit_identity_sha256,
+        "embedding_cache_identity_sha256": expected_cache_identity,
+        "source_preflight_freshly_authenticated": True,
+        "preflight_location_bound_in_scientific_identity": False,
+    }
+    return binding, {
+        "cluster_fit_identity": fit_identity,
+    }
 
 
 def _preflight_array_expectations(
@@ -1299,9 +1441,356 @@ def _materialize_cluster_scope_for_one_operation(
     return scope
 
 
+def _cluster_state_metadata_from_indexed_fit(
+    fit_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the state manifest metadata from compact fitted-state JSON."""
+
+    kmeans = fit_identity.get("kmeans")
+    svds = fit_identity.get("svd_families")
+    scientific = fit_identity.get("cluster_scientific_configuration")
+    if (
+        not isinstance(kmeans, Mapping)
+        or not isinstance(svds, list)
+        or not isinstance(scientific, Mapping)
+    ):
+        raise ValueError("indexed clustered preflight fitted state is incomplete")
+    svd_records: list[dict[str, Any]] = []
+    for index, row in enumerate(svds):
+        if not isinstance(row, Mapping):
+            raise ValueError(
+                "indexed clustered preflight SVD metadata is malformed"
+            )
+        svd_records.append(
+            {
+                "family_key": row.get("family_key"),
+                "item_cluster_ids": copy.deepcopy(
+                    row.get("item_cluster_ids")
+                ),
+                "weighted_matrix": f"cluster_svd_{index}_weighted_matrix",
+                "singular_values": f"cluster_svd_{index}_singular_values",
+                "components": f"cluster_svd_{index}_components",
+                "parameters": copy.deepcopy(row.get("parameters")),
+                "sign_canonicalization_policy": row.get(
+                    "sign_canonicalization_policy"
+                ),
+                "rank_tolerance_policy": row.get(
+                    "rank_tolerance_policy"
+                ),
+                "rank_tolerance_dtype": row.get("rank_tolerance_dtype"),
+                "rank_tolerance_multiplier_hex": row.get(
+                    "rank_tolerance_multiplier_hex"
+                ),
+                "rank_tolerance_hex": row.get("rank_tolerance_hex"),
+                "numerical_rank": row.get("numerical_rank"),
+                "replay_comparison_policy": row.get(
+                    "replay_comparison_policy"
+                ),
+                "replay_relative_tolerance_hex": row.get(
+                    "replay_relative_tolerance_hex"
+                ),
+                "replay_absolute_tolerance_hex": row.get(
+                    "replay_absolute_tolerance_hex"
+                ),
+            }
+        )
+    return {
+        "kmeans_parameters": copy.deepcopy(kmeans.get("parameters")),
+        "cluster_scientific_configuration": copy.deepcopy(dict(scientific)),
+        "canonical_group_seed": fit_identity.get("canonical_group_seed"),
+        "ordered_fit_row_seed_policy": fit_identity.get(
+            "ordered_fit_row_seed_policy"
+        ),
+        "kmeans_n_iter": kmeans.get("n_iter"),
+        "kmeans_inertia_hex": kmeans.get("inertia_hex"),
+        "svd_states": svd_records,
+    }
+
+
+def _indexed_array_identities(
+    fit_identity: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    kmeans, svds = _preflight_array_expectations(
+        {"cluster_fit_identity": fit_identity}
+    )
+    output = dict(kmeans)
+    for index, row in enumerate(svds):
+        for field_name in (
+            "weighted_matrix",
+            "singular_values",
+            "components",
+        ):
+            identity = row.get(field_name)
+            if (
+                not isinstance(identity, Mapping)
+                or set(identity) != {"dtype", "shape", "sha256"}
+            ):
+                raise ValueError(
+                    "indexed clustered preflight SVD array identity is malformed"
+                )
+            output[f"cluster_svd_{index}_{field_name}"] = identity
+    return output
+
+
+def _index_registered_array_without_reading(
+    *,
+    root: Path,
+    key: str,
+    registration: Any,
+    expected_identity: Mapping[str, Any],
+) -> tuple[int, int]:
+    """Validate one array registration and filesystem object without I/O."""
+
+    required = {
+        "relative_path",
+        "file_sha256",
+        "size_bytes",
+        "dtype",
+        "shape",
+        "sha256",
+    }
+    expected_relative = (Path("arrays") / f"{key}.npy").as_posix()
+    if (
+        not isinstance(registration, Mapping)
+        or set(registration) != required
+        or registration.get("relative_path") != expected_relative
+        or {
+            "dtype": registration.get("dtype"),
+            "shape": registration.get("shape"),
+            "sha256": registration.get("sha256"),
+        }
+        != dict(expected_identity)
+        or isinstance(registration.get("size_bytes"), bool)
+        or not isinstance(registration.get("size_bytes"), int)
+        or registration.get("size_bytes") < 1
+    ):
+        raise ValueError(
+            f"cluster state array {key} has an invalid indexed registration"
+        )
+    _require_sha256(
+        registration.get("file_sha256"),
+        label=f"cluster state array {key} file",
+    )
+    path = root / expected_relative
+    try:
+        state = os.lstat(path)
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"cluster state array {key} is absent"
+        ) from exc
+    if (
+        stat.S_ISLNK(state.st_mode)
+        or not stat.S_ISREG(state.st_mode)
+        or int(state.st_nlink) != 1
+        or int(state.st_size) != registration["size_bytes"]
+    ):
+        raise ValueError(
+            f"cluster state array {key} is linked, nonregular, or has "
+            "another registered size"
+        )
+    try:
+        dtype = np.dtype(str(registration["dtype"]))
+    except TypeError as exc:
+        raise ValueError(
+            f"cluster state array {key} has an invalid dtype"
+        ) from exc
+    if dtype.hasobject:
+        raise ValueError(
+            f"cluster state array {key} cannot contain objects"
+        )
+    return int(state.st_dev), int(state.st_ino)
+
+
+@dataclass(frozen=True)
+class _IndexedClusteredPreflightScopeState:
+    root: Path
+    manifest: Mapping[str, Any]
+    request: RoleNeutralEmbeddingPhysicalGroupRequest
+    inode_keys: tuple[tuple[int, int], ...]
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.root / _CLUSTER_STATE_MANIFEST
+
+
+def _index_canonical_clustered_preflight_scope_state(
+    *,
+    manifest_path: Path,
+    preflight: _ClusterPreflightArtifact,
+    request: RoleNeutralEmbeddingPhysicalGroupRequest,
+) -> _IndexedClusteredPreflightScopeState:
+    """Authenticate one owner's metadata while deferring its large payloads."""
+
+    supplied = Path(manifest_path)
+    if not supplied.is_absolute() or supplied.name != _CLUSTER_STATE_MANIFEST:
+        raise ValueError("cluster state manifest path must be absolute and canonical")
+    root = supplied.parent
+    if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root:
+        raise ValueError("cluster state root must be one real canonical directory")
+    binding, indexed_scope = _indexed_canonical_preflight_scope_binding(
+        preflight=preflight,
+        request=request,
+    )
+    fit_identity = indexed_scope.get("cluster_fit_identity")
+    if not isinstance(fit_identity, Mapping):
+        raise ValueError("indexed clustered preflight has no fitted state")
+    expected_metadata = _cluster_state_metadata_from_indexed_fit(fit_identity)
+    expected_arrays = _indexed_array_identities(fit_identity)
+    manifest = _read_json(supplied, label="cluster state manifest")
+    body = {
+        key: copy.deepcopy(value)
+        for key, value in manifest.items()
+        if key != "content_sha256"
+    }
+    required = {
+        "schema_version",
+        "status",
+        "group_request_content_sha256",
+        "plan_scientific_content_sha256",
+        "physical_owner_scope_id",
+        "fit_row_ids",
+        "fit_row_order_fingerprint",
+        "canonical_group_seed",
+        "cluster_scientific_configuration_sha256",
+        "preflight_binding",
+        "state_metadata",
+        "array_order",
+        "arrays",
+        "state_origin",
+        "executable_serialization_used",
+        "pickle_joblib_or_npz_used",
+        "content_sha256",
+    }
+    arrays_raw = manifest.get("arrays")
+    array_order = manifest.get("array_order")
+    if (
+        set(manifest) != required
+        or manifest.get("schema_version")
+        != ROLE_NEUTRAL_EMBEDDING_CLUSTER_STATE_SCHEMA
+        or manifest.get("status") != "complete"
+        or manifest.get("group_request_content_sha256")
+        != request.content_sha256
+        or manifest.get("plan_scientific_content_sha256")
+        != request.plan_scientific_content_sha256
+        or manifest.get("physical_owner_scope_id")
+        != request.physical_owner.scope_id
+        or manifest.get("fit_row_ids")
+        != list(request.physical_owner.fit_row_ids)
+        or manifest.get("fit_row_order_fingerprint")
+        != _row_order_fingerprint(request.physical_owner.fit_row_ids)
+        or manifest.get("canonical_group_seed")
+        != request.physical_owner.scope_seed
+        or manifest.get("cluster_scientific_configuration_sha256")
+        != _sha256_json(
+            expected_metadata["cluster_scientific_configuration"]
+        )
+        or manifest.get("preflight_binding") != binding
+        or manifest.get("state_metadata") != expected_metadata
+        or manifest.get("state_origin")
+        != "canonical_clustered_preflight_no_refit_v1"
+        or manifest.get("executable_serialization_used") is not False
+        or manifest.get("pickle_joblib_or_npz_used") is not False
+        or manifest.get("content_sha256") != _sha256_json(body)
+        or not isinstance(arrays_raw, Mapping)
+        or not isinstance(array_order, list)
+        or array_order != sorted(expected_arrays)
+        or set(arrays_raw) != set(expected_arrays)
+    ):
+        raise ValueError("cluster state manifest index is invalid or reordered")
+    if {path.name for path in root.iterdir()} != {
+        _CLUSTER_STATE_MANIFEST,
+        "arrays",
+    }:
+        raise ValueError("cluster state artifact tree contains unregistered entries")
+    arrays_root = root / "arrays"
+    if (
+        arrays_root.is_symlink()
+        or not arrays_root.is_dir()
+        or {path.name for path in arrays_root.iterdir()}
+        != {f"{key}.npy" for key in array_order}
+    ):
+        raise ValueError("cluster state array inventory is incomplete or reordered")
+    inode_keys = tuple(
+        _index_registered_array_without_reading(
+            root=root,
+            key=key,
+            registration=arrays_raw[key],
+            expected_identity=expected_arrays[key],
+        )
+        for key in array_order
+    )
+    if len(inode_keys) != len(set(inode_keys)):
+        raise ValueError("cluster state arrays may not be hard-linked")
+    return _IndexedClusteredPreflightScopeState(
+        root=root,
+        manifest=copy.deepcopy(manifest),
+        request=request,
+        inode_keys=inode_keys,
+    )
+
+
+class _LazyAuthenticatedClusteredPreflightStates(
+    Mapping[str, AuthenticatedClusteredPreflightScopeState]
+):
+    """Owner-key mapping that performs full authentication on first access."""
+
+    def __init__(
+        self,
+        *,
+        owner_order: Sequence[str],
+        registrations: Mapping[str, _IndexedClusteredPreflightScopeState],
+        preflight: _ClusterPreflightArtifact,
+    ) -> None:
+        self._owner_order = tuple(map(str, owner_order))
+        self._registrations = dict(registrations)
+        self._preflight = preflight
+        self._loaded: dict[
+            str, AuthenticatedClusteredPreflightScopeState
+        ] = {}
+        self._lock = threading.RLock()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._owner_order)
+
+    def __len__(self) -> int:
+        return len(self._owner_order)
+
+    def __getitem__(
+        self,
+        scope_id: str,
+    ) -> AuthenticatedClusteredPreflightScopeState:
+        owner = str(scope_id)
+        registration = self._registrations.get(owner)
+        if registration is None:
+            raise KeyError(scope_id)
+        with self._lock:
+            loaded = self._loaded.get(owner)
+            if loaded is None:
+                loaded = load_canonical_clustered_preflight_scope_state(
+                    manifest_path=registration.manifest_path,
+                    preflight=self._preflight,
+                    request=registration.request,
+                )
+                if dict(loaded.manifest) != dict(registration.manifest):
+                    raise RuntimeError(
+                        "cluster state manifest changed between indexing "
+                        "and owner authentication"
+                    )
+                self._loaded[owner] = loaded
+            return loaded
+
+    def manifest_path_for_owner(self, scope_id: str) -> Path:
+        registration = self._registrations.get(str(scope_id))
+        if registration is None:
+            raise ValueError(
+                "clustered preflight has no sealed state for that physical owner"
+            )
+        return registration.manifest_path
+
+
 @dataclass(frozen=True)
 class AuthenticatedClusteredPreflightStateBundle:
-    """Freshly authenticated state for every deduplicated physical owner."""
+    """Authenticated owner index with payload state loaded only on demand."""
 
     root: Path
     manifest: Mapping[str, Any]
@@ -1312,12 +1801,28 @@ class AuthenticatedClusteredPreflightStateBundle:
         return str(self.manifest["content_sha256"])
 
     def manifest_path_for_owner(self, scope_id: str) -> Path:
+        indexed = getattr(self.states, "manifest_path_for_owner", None)
+        if callable(indexed):
+            return indexed(str(scope_id))
         selected = self.states.get(str(scope_id))
         if selected is None:
             raise ValueError(
                 "clustered preflight has no sealed state for that physical owner"
             )
         return selected.root / _CLUSTER_STATE_MANIFEST
+
+    def load_state_for_owner(
+        self,
+        scope_id: str,
+    ) -> AuthenticatedClusteredPreflightScopeState:
+        """Fully authenticate and return one owner, memoized in this process."""
+
+        try:
+            return self.states[str(scope_id)]
+        except KeyError as exc:
+            raise ValueError(
+                "clustered preflight has no sealed state for that physical owner"
+            ) from exc
 
 
 def seal_canonical_clustered_preflight_scope_state(
@@ -1729,7 +2234,7 @@ def load_canonical_clustered_preflight_state_bundle(
     preflight: _ClusterPreflightArtifact,
     plan: Stage1ScopePlan,
 ) -> AuthenticatedClusteredPreflightStateBundle:
-    """Authenticate all physical-owner arrays and reject audit-only legacy input."""
+    """Authenticate the owner index; defer concepts/arrays to owner use."""
 
     if not isinstance(plan, Stage1ScopePlan):
         raise TypeError("cluster state bundle loading requires a scope plan")
@@ -1807,7 +2312,8 @@ def load_canonical_clustered_preflight_state_bundle(
         or {path.name for path in owners_root.iterdir()} != expected_directories
     ):
         raise ValueError("cluster state bundle owner inventory is incomplete")
-    states: dict[str, AuthenticatedClusteredPreflightScopeState] = {}
+    registrations: dict[str, _IndexedClusteredPreflightScopeState] = {}
+    all_inode_keys: set[tuple[int, int]] = set()
     row_fields = {
         "canonical_index",
         "physical_owner_scope_id",
@@ -1836,22 +2342,34 @@ def load_canonical_clustered_preflight_state_bundle(
             != "canonical_clustered_preflight_no_refit_v1"
         ):
             raise ValueError("cluster state bundle owner binding changed")
-        state = load_canonical_clustered_preflight_scope_state(
+        indexed = _index_canonical_clustered_preflight_scope_state(
             manifest_path=root / expected_relative,
             preflight=preflight,
             request=request,
         )
-        fit_identity = state.scope_record.get("cluster_fit_identity")
         if (
-            row.get("state_content_sha256") != state.content_sha256
-            or not isinstance(fit_identity, Mapping)
+            row.get("state_content_sha256")
+            != indexed.manifest.get("content_sha256")
             or row.get("cluster_fit_identity_content_sha256")
-            != fit_identity.get("content_sha256")
+            != indexed.manifest["preflight_binding"][
+                "cluster_fit_identity_sha256"
+            ]
         ):
             raise ValueError("cluster state bundle substituted fitted arrays")
-        states[owner_id] = state
-    if set(states) != set(owner_ids):
+        overlap = all_inode_keys.intersection(indexed.inode_keys)
+        if overlap:
+            raise ValueError(
+                "cluster state arrays may not be hard-linked between owners"
+            )
+        all_inode_keys.update(indexed.inode_keys)
+        registrations[owner_id] = indexed
+    if set(registrations) != set(owner_ids):
         raise RuntimeError("cluster state bundle omitted a physical owner")
+    states = _LazyAuthenticatedClusteredPreflightStates(
+        owner_order=owner_ids,
+        registrations=registrations,
+        preflight=preflight,
+    )
     return AuthenticatedClusteredPreflightStateBundle(
         root=root,
         manifest=copy.deepcopy(manifest),

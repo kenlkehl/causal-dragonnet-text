@@ -43,6 +43,9 @@ from .production_stage1_role_neutral_execution import (
     RoleNeutralPhysicalOwnerTask,
     _execute_one_owner,
 )
+from .neural_query_execution_topology import (
+    NeuralQueryExecutionTopology,
+)
 from .production_stage1_scope_scheduler import (
     _enforce_stage1_torch_determinism,
     _establish_worker_process_group,
@@ -191,6 +194,16 @@ def _option_mapping(prepared: Any) -> dict[str, Any]:
                         "semantic witness scientific config lacks as_dict()"
                     )
                 result[name] = _json_copy(as_dict(), label=name)
+        elif name == "physical_fit_identity":
+            from .production_stage1_scope_scheduler import (
+                Stage1PhysicalFitIdentity,
+            )
+
+            if not isinstance(raw, Stage1PhysicalFitIdentity):
+                raise TypeError(
+                    "physical_fit_identity must be one closed typed identity"
+                )
+            result[name] = _json_copy(raw.as_dict(), label=name)
         else:
             result[name] = _json_copy(raw, label=name)
     if set(result) != expected:
@@ -499,6 +512,173 @@ def _gpu_id(resource_name: str) -> int | None:
     return int(suffix)
 
 
+def _task_execution_resources(
+    task: RoleNeutralPhysicalOwnerTask,
+) -> tuple[str, ...]:
+    """All resources that must be reserved while one owner is executing."""
+
+    topology = task.neural_query_execution_topology
+    if not isinstance(topology, NeuralQueryExecutionTopology):
+        raise TypeError(
+            "owner task lacks its typed neural-query execution topology"
+        )
+    if topology.primary_device != task.resource:
+        raise ValueError(
+            "owner task neural-query topology changed its primary resource"
+        )
+    for device in topology.devices:
+        _gpu_id(device)
+    return topology.devices
+
+
+def _runtime_neural_query_topology_attestation(
+    topology: NeuralQueryExecutionTopology,
+    *,
+    torch_module: Any | None = None,
+) -> dict[str, Any]:
+    """Prove availability and exact accelerator homogeneity in the worker."""
+
+    if not isinstance(topology, NeuralQueryExecutionTopology):
+        raise TypeError(
+            "runtime topology validation requires a typed neural-query topology"
+        )
+    if topology.devices == ("cpu",):
+        return {
+            "schema_version": (
+                "neural_query_runtime_device_topology_attestation_v1"
+            ),
+            "devices": ["cpu"],
+            "backend": "cpu",
+            "homogeneous": True,
+            "scientific_identity_includes_topology": False,
+        }
+    torch = torch_module
+    if torch is None:
+        import torch as imported_torch
+
+        torch = imported_torch
+    cuda = getattr(torch, "cuda", None)
+    if (
+        cuda is None
+        or not callable(getattr(cuda, "is_available", None))
+        or not bool(cuda.is_available())
+        or not callable(getattr(cuda, "device_count", None))
+        or not callable(getattr(cuda, "get_device_properties", None))
+    ):
+        raise RuntimeError(
+            "requested neural-query accelerator topology is unavailable"
+        )
+    count = int(cuda.device_count())
+    signatures: list[dict[str, Any]] = []
+    for device in topology.devices:
+        gpu_id = _gpu_id(device)
+        if gpu_id is None or gpu_id >= count:
+            raise RuntimeError(
+                "requested neural-query accelerator topology is unavailable; "
+                f"requested={device}, visible_device_count={count}"
+            )
+        properties = cuda.get_device_properties(gpu_id)
+        try:
+            signature = {
+                "name": str(properties.name),
+                "compute_capability_major": int(properties.major),
+                "compute_capability_minor": int(properties.minor),
+                "total_memory_bytes": int(properties.total_memory),
+                "multiprocessor_count": int(properties.multi_processor_count),
+            }
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "accelerator runtime omitted compatibility properties"
+            ) from exc
+        if (
+            not signature["name"]
+            or signature["compute_capability_major"] < 0
+            or signature["compute_capability_minor"] < 0
+            or signature["total_memory_bytes"] < 1
+            or signature["multiprocessor_count"] < 1
+        ):
+            raise RuntimeError(
+                "accelerator runtime reported invalid compatibility properties"
+            )
+        signatures.append(signature)
+    first = signatures[0]
+    if any(signature != first for signature in signatures[1:]):
+        raise RuntimeError(
+            "heterogeneous accelerator resources cannot span one "
+            "neural-query context"
+        )
+    return {
+        "schema_version": (
+            "neural_query_runtime_device_topology_attestation_v1"
+        ),
+        "devices": list(topology.devices),
+        "backend": "cuda",
+        "homogeneous": True,
+        "compatibility_signature": first,
+        "scientific_identity_includes_topology": False,
+    }
+
+
+def _resource_tuple_has_capacity(
+    resources: Sequence[str],
+    *,
+    active_by_resource: Mapping[str, int],
+    maximum_per_resource: int,
+) -> bool:
+    """Return whether every member of one atomic reservation is available."""
+
+    if isinstance(resources, (str, bytes)):
+        raise TypeError("resource reservation requires one device sequence")
+    requested = tuple(str(value) for value in resources)
+    if isinstance(maximum_per_resource, bool):
+        raise TypeError("maximum resource concurrency must be an integer")
+    maximum = int(maximum_per_resource)
+    if (
+        not requested
+        or len(requested) != len(set(requested))
+        or maximum < 1
+        or any(int(value) < 0 for value in active_by_resource.values())
+    ):
+        raise ValueError("resource reservation ledger is invalid")
+    return all(
+        int(active_by_resource.get(resource_name, 0)) < maximum
+        for resource_name in requested
+    )
+
+
+def _change_resource_tuple_reservation(
+    resources: Sequence[str],
+    *,
+    active_by_resource: dict[str, int],
+    delta: int,
+) -> None:
+    """Atomically add or remove one complete resource-tuple reservation."""
+
+    if isinstance(resources, (str, bytes)):
+        raise TypeError("resource reservation requires one device sequence")
+    requested = tuple(str(value) for value in resources)
+    if isinstance(delta, bool):
+        raise TypeError("resource reservation delta must be an integer")
+    change = int(delta)
+    if (
+        not requested
+        or len(requested) != len(set(requested))
+        or change not in {-1, 1}
+    ):
+        raise ValueError("resource reservation change is invalid")
+    updated = {
+        resource_name: int(
+            active_by_resource.get(resource_name, 0)
+        )
+        + change
+        for resource_name in requested
+    }
+    if any(value < 0 for value in updated.values()):
+        raise RuntimeError("resource reservation ledger underflowed")
+    for resource_name, value in updated.items():
+        active_by_resource[resource_name] = value
+
+
 def _native_thread_environment(thread_count: int) -> dict[str, str]:
     count = int(thread_count)
     if count < 1:
@@ -587,13 +767,32 @@ def _spawned_owner_entry(
         os.environ.update(_native_thread_environment(native_threads))
         _establish_worker_process_group(marker_path)
         determinism_before = _enforce_stage1_torch_determinism()
+        topology = task.neural_query_execution_topology
+        if not isinstance(topology, NeuralQueryExecutionTopology):
+            raise TypeError(
+                "spawned owner lacks its typed neural-query topology"
+            )
         gpu_id = _gpu_id(task.resource)
+        import torch
+        from threadpoolctl import threadpool_limits
+
+        topology_attestation = _runtime_neural_query_topology_attestation(
+            topology,
+            torch_module=torch,
+        )
         seed_stage1_scope_rngs(
             task.physical_owner.scope_seed,
             gpu_id=gpu_id,
         )
-        import torch
-        from threadpoolctl import threadpool_limits
+        topology_gpu_ids = tuple(
+            value
+            for value in (
+                _gpu_id(device) for device in topology.devices
+            )
+            if value is not None
+        )
+        for topology_gpu_id in topology_gpu_ids:
+            torch.cuda.reset_peak_memory_stats(topology_gpu_id)
 
         torch.set_num_threads(int(native_threads))
         try:
@@ -632,11 +831,28 @@ def _spawned_owner_entry(
             )
         usage_after = resource.getrusage(resource.RUSAGE_SELF)
         io_after = _process_io_counters()
-        peak_allocated: int | None = None
-        peak_reserved: int | None = None
-        if gpu_id is not None:
-            peak_allocated = int(torch.cuda.max_memory_allocated(gpu_id))
-            peak_reserved = int(torch.cuda.max_memory_reserved(gpu_id))
+        peak_allocated_by_device = {
+            f"cuda:{topology_gpu_id}": int(
+                torch.cuda.max_memory_allocated(topology_gpu_id)
+            )
+            for topology_gpu_id in topology_gpu_ids
+        }
+        peak_reserved_by_device = {
+            f"cuda:{topology_gpu_id}": int(
+                torch.cuda.max_memory_reserved(topology_gpu_id)
+            )
+            for topology_gpu_id in topology_gpu_ids
+        }
+        peak_allocated = (
+            None
+            if gpu_id is None
+            else peak_allocated_by_device[task.resource]
+        )
+        peak_reserved = (
+            None
+            if gpu_id is None
+            else peak_reserved_by_device[task.resource]
+        )
         telemetry = {
             "schema_version": (
                 "production_role_neutral_process_owner_telemetry_v1"
@@ -644,6 +860,10 @@ def _spawned_owner_entry(
             "pid": int(os.getpid()),
             "scope_seed": int(task.physical_owner.scope_seed),
             "resource": task.resource,
+            "reserved_resources": list(
+                _task_execution_resources(task)
+            ),
+            "neural_query_device_topology": topology_attestation,
             "native_threads": int(native_threads),
             "wall_seconds": max(0.0, time.monotonic() - started_wall),
             "cpu_seconds": max(0.0, time.process_time() - started_cpu),
@@ -662,6 +882,12 @@ def _spawned_owner_entry(
             "peak_resident_kib": max(0, int(usage_after.ru_maxrss)),
             "peak_gpu_allocated_bytes": peak_allocated,
             "peak_gpu_reserved_bytes": peak_reserved,
+            "peak_gpu_allocated_bytes_by_device": (
+                peak_allocated_by_device
+            ),
+            "peak_gpu_reserved_bytes_by_device": (
+                peak_reserved_by_device
+            ),
             "torch_determinism_observed": determinism_after,
             "worker_report": (
                 None
@@ -861,7 +1087,7 @@ class ProcessIsolatedRoleNeutralPhysicalOwnerExecutor:
         for task in rows:
             if not isinstance(task, RoleNeutralPhysicalOwnerTask):
                 raise TypeError("process executor received an untyped owner task")
-            _gpu_id(task.resource)
+            _task_execution_resources(task)
 
         parameters = self._parameters()
         context = mp.get_context("spawn")
@@ -878,9 +1104,13 @@ class ProcessIsolatedRoleNeutralPhysicalOwnerExecutor:
             index = 0
             while len(active) < maximum_active and index < len(pending):
                 task = pending[index]
-                if (
-                    active_by_resource.get(task.resource, 0)
-                    >= self.max_workers_per_resource
+                reserved = _task_execution_resources(task)
+                if not _resource_tuple_has_capacity(
+                    reserved,
+                    active_by_resource=active_by_resource,
+                    maximum_per_resource=(
+                        self.max_workers_per_resource
+                    ),
                 ):
                     index += 1
                     continue
@@ -927,8 +1157,10 @@ class ProcessIsolatedRoleNeutralPhysicalOwnerExecutor:
                         marker_path=marker,
                     )
                 )
-                active_by_resource[task.resource] = (
-                    active_by_resource.get(task.resource, 0) + 1
+                _change_resource_tuple_reservation(
+                    reserved,
+                    active_by_resource=active_by_resource,
+                    delta=1,
                 )
 
         try:
@@ -953,7 +1185,11 @@ class ProcessIsolatedRoleNeutralPhysicalOwnerExecutor:
                             state.message = copy.deepcopy(dict(message))
                     state.connection.close()
                     active.remove(state)
-                    active_by_resource[state.task.resource] -= 1
+                    _change_resource_tuple_reservation(
+                        _task_execution_resources(state.task),
+                        active_by_resource=active_by_resource,
+                        delta=-1,
+                    )
                     try:
                         if state.marker_path.exists():
                             state.marker_path.unlink()
@@ -1033,4 +1269,8 @@ __all__ = [
     "PRODUCTION_PROCESS_WORKER_TARGET",
     "PreparedRoleNeutralProcessAuthority",
     "ProcessIsolatedRoleNeutralPhysicalOwnerExecutor",
+    "_change_resource_tuple_reservation",
+    "_resource_tuple_has_capacity",
+    "_runtime_neural_query_topology_attestation",
+    "_task_execution_resources",
 ]

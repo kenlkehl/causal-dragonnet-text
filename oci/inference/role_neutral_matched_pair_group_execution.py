@@ -66,6 +66,10 @@ from .multi_model_pair_uplift import (
     build_candidate_pairs,
     build_training_pairs,
 )
+from .neural_numerical_replay import (
+    neural_float_arrays_within_tolerance,
+    validate_neural_replay_settings,
+)
 from .production_stage1_scope_scheduler import Stage1ScopePlan, Stage1ScopeSpec
 from .role_neutral_bow_group_execution import (
     AuthenticatedRoleNeutralBoWNuisanceBank,
@@ -91,7 +95,7 @@ ROLE_NEUTRAL_MATCHED_PAIR_EXACT_INPUT_SCHEMA = (
     "production_role_neutral_matched_pair_exact_transform_input_v1"
 )
 ROLE_NEUTRAL_MATCHED_PAIR_CONFIG_SCHEMA = (
-    "production_role_neutral_matched_pair_config_v2"
+    "production_role_neutral_matched_pair_config_v3"
 )
 
 _SUBPRODUCERS = ("bow", "htr")
@@ -549,6 +553,9 @@ class RoleNeutralMatchedPairConfig:
     htr_head_layer_norm: bool
     htr_head_bias: bool
     htr_extractor: Mapping[str, Any]
+    replay_comparison_policy: str
+    replay_relative_tolerance: float
+    replay_absolute_tolerance: float
 
     @classmethod
     def from_mapping(
@@ -634,6 +641,8 @@ class RoleNeutralMatchedPairConfig:
             float(self.htr_adamw_eps),
             float(self.htr_gradient_clip_norm),
             float(self.htr_gradient_clip_norm_type),
+            float(self.replay_relative_tolerance),
+            float(self.replay_absolute_tolerance),
         )
         if not np.isfinite(finite).all():
             raise ValueError("matched-pair floating configuration must be finite")
@@ -657,6 +666,11 @@ class RoleNeutralMatchedPairConfig:
             or self.htr_gradient_clip_norm_type <= 0.0
         ):
             raise ValueError("matched-pair floating configuration is invalid")
+        validate_neural_replay_settings(
+            policy=self.replay_comparison_policy,
+            relative_tolerance=self.replay_relative_tolerance,
+            absolute_tolerance=self.replay_absolute_tolerance,
+        )
         if self.bow_optimizer_method != "L-BFGS-B":
             raise ValueError("matched-pair BoW optimizer must be L-BFGS-B")
         if self.bow_optimizer_initialization != "zeros":
@@ -743,9 +757,42 @@ class RoleNeutralMatchedPairConfig:
             "htr_head_layer_norm": self.htr_head_layer_norm,
             "htr_head_bias": self.htr_head_bias,
             "htr_extractor": _closed_extractor_config(self.htr_extractor),
+            "replay_comparison_policy": self.replay_comparison_policy,
+            "replay_relative_tolerance": float(
+                self.replay_relative_tolerance
+            ),
+            "replay_absolute_tolerance": float(
+                self.replay_absolute_tolerance
+            ),
             "text_truncation_policy": "forbidden_capacity_must_not_bind_v1",
             "matched_pair_subproducers": list(_SUBPRODUCERS),
         }
+
+
+def _replayed_predictions_match(
+    observed: Any,
+    expected: Any,
+    *,
+    subproducer: str,
+    config: Mapping[str, Any],
+) -> bool:
+    left = np.asarray(observed)
+    right = np.asarray(expected)
+    if subproducer == "bow":
+        return bool(
+            left.shape == right.shape
+            and left.dtype == right.dtype
+            and np.array_equal(left, right, equal_nan=True)
+        )
+    if subproducer != "htr":
+        raise ValueError("matched-pair replay named an unknown subproducer")
+    return neural_float_arrays_within_tolerance(
+        left,
+        right,
+        policy=config.get("replay_comparison_policy"),
+        relative_tolerance=config.get("replay_relative_tolerance"),
+        absolute_tolerance=config.get("replay_absolute_tolerance"),
+    )
 
 
 def _producer_identity() -> str:
@@ -1479,7 +1526,12 @@ def _fit_models(
                 store.arrays,
                 validation_pairs,
             )
-            if not np.allclose(pair_delta, replay_delta, rtol=1e-10, atol=1e-10):
+            if not _replayed_predictions_match(
+                pair_delta,
+                replay_delta,
+                subproducer="bow",
+                config=config,
+            ):
                 raise RuntimeError("live/sealed BoW matched-pair validation differs")
             delta, probability, n_controls = aggregate_pair_predictions(
                 validation_pairs,
@@ -1551,8 +1603,16 @@ def _fit_models(
             validation_pairs,
             batch_size=int(config["htr_batch_size"]),
         )
-        if not np.allclose(htr_pair_delta, replay_htr, rtol=3e-5, atol=3e-6):
-            raise RuntimeError("live/sealed HTR matched-pair validation differs")
+        if not _replayed_predictions_match(
+            htr_pair_delta,
+            replay_htr,
+            subproducer="htr",
+            config=config,
+        ):
+            raise RuntimeError(
+                "live/sealed HTR matched-pair validation differs beyond its "
+                "declared tolerance"
+            )
         htr_delta, htr_probability, htr_n_controls = aggregate_pair_predictions(
             validation_pairs,
             htr_pair_delta,
@@ -2638,12 +2698,11 @@ def execute_role_neutral_matched_pair_physical_group(
     for subproducer in _SUBPRODUCERS:
         live_columns, live_matrix = live_predictions[subproducer]
         replay_columns, replay_matrix = sealed_predictions[subproducer]
-        if live_columns != replay_columns or not np.allclose(
+        if live_columns != replay_columns or not _replayed_predictions_match(
             live_matrix,
             replay_matrix,
-            rtol=(1e-10 if subproducer == "bow" else 3e-5),
-            atol=(1e-10 if subproducer == "bow" else 3e-6),
-            equal_nan=True,
+            subproducer=subproducer,
+            config=configuration,
         ):
             raise RuntimeError(
                 f"live matched-pair {subproducer} transform differs from sealed state"
@@ -3178,12 +3237,11 @@ def replay_role_neutral_matched_pair_exact_transform(
             registration=registration,
             expected_rows=len(exact_input.row_ids),
         )
-        if columns != registration["columns"] or not np.allclose(
+        if columns != registration["columns"] or not _replayed_predictions_match(
             observed,
             expected,
-            rtol=(1e-10 if subproducer == "bow" else 3e-5),
-            atol=(1e-10 if subproducer == "bow" else 3e-6),
-            equal_nan=True,
+            subproducer=subproducer,
+            config=metadata["scientific_configuration"]["matched_pair"],
         ):
             raise RuntimeError(
                 f"fresh matched-pair {subproducer} replay changed predictions"

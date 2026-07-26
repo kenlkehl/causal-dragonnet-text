@@ -56,6 +56,10 @@ from oci.inference.tfidf_topic_discovery import (
     row_set_fingerprint,
 )
 from oci.inference.tfidf_topic_stage1 import TFIDF_NESTED_CALIBRATION_SCHEMA_VERSION
+from tests.semantic_member_batching_test_support import (
+    semantic_member_batching_audit,
+    semantic_member_batching_identity,
+)
 
 
 def _canonical(value: Any) -> str:
@@ -119,6 +123,10 @@ def _catalog(
     heldout_row_ids: tuple[int, ...],
     marker: str,
 ) -> RoleNeutralEvidenceCatalog:
+    semantic_member_batch_size = 1
+    batching = semantic_member_batching_identity(
+        semantic_member_batch_size=semantic_member_batch_size,
+    )
     split_fingerprint = FoldEvidenceProvenance(
         outer_fold=outer_fold,
         train_row_ids=fit_row_ids,
@@ -174,6 +182,7 @@ def _catalog(
         )
     identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": batching,
         "outer_fold": outer_fold,
         "scope": scope,
         "inner_fold": inner_fold,
@@ -189,7 +198,11 @@ def _catalog(
         atoms=tuple(atoms),
         non_grounding_numerical_summaries=(),
         catalog_sha256=_sha(identity),
-        _audit_json="{}",
+        _audit_json=_canonical(
+            semantic_member_batching_audit(
+                semantic_member_batch_size=semantic_member_batch_size,
+            )
+        ),
     )
 
 

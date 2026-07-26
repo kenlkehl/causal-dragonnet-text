@@ -1952,11 +1952,14 @@ def test_attention_agent_context_is_compact_and_filters_blank_chunks(tmp_path):
     )
 
     evidence = context["attention_evidence"]
-    assert 12 <= len(evidence) < 100
+    assert len(evidence) == 100
     assert context["attention_evidence_policy"]["source_rows"] == 101
     assert context["attention_evidence_policy"]["usable_source_rows"] == 100
+    assert context["attention_evidence_policy"]["retained_rows"] == 100
+    assert context["attention_evidence_policy"]["row_capacity"] is None
+    assert context["attention_evidence_policy"]["token_span_capacity_per_row"] is None
+    assert context["attention_evidence_policy"]["text_character_capacity"] is None
     assert all("chunk_text" not in row for row in evidence)
-    assert all(len(row["evidence_snippet"]) <= 480 for row in evidence)
     assert all("baseline age 78 years" in row["evidence_snippet"] for row in evidence)
     span = evidence[0]["top_token_spans"][0]
     assert span == {

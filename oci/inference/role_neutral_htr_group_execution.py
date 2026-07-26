@@ -28,6 +28,7 @@ family has an equivalent fit/view boundary.
 from __future__ import annotations
 
 import copy
+import concurrent.futures
 import hashlib
 import inspect
 import json
@@ -35,6 +36,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -63,21 +65,35 @@ from .htr_native_proof_capture import (
 from .lossless_stage1_evidence_catalog import (
     NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
 )
+from .neural_numerical_replay import (
+    neural_float_arrays_within_tolerance,
+    validate_neural_replay_settings,
+)
 from .production_stage1_legacy_scope_fragments import (
     LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA,
 )
 from .production_stage1_scope_scheduler import Stage1ScopePlan, Stage1ScopeSpec
+from .stage1_htr_operational_controls import (
+    ROLE_NEUTRAL_HTR_OPERATIONAL_CONTROLS_SCHEMA,
+    RoleNeutralHTROperationalControls,
+)
 
 ROLE_NEUTRAL_HTR_GROUP_REQUEST_SCHEMA = (
     "production_role_neutral_htr_physical_group_request_v1"
 )
-ROLE_NEUTRAL_HTR_CONFIG_SCHEMA = "production_role_neutral_htr_config_v2"
+ROLE_NEUTRAL_HTR_CONFIG_SCHEMA = "production_role_neutral_htr_config_v3"
 ROLE_NEUTRAL_HTR_FIT_STATE_SCHEMA = "production_role_neutral_htr_fit_state_v1"
 ROLE_NEUTRAL_HTR_LOGICAL_VIEW_SCHEMA = "production_role_neutral_htr_logical_view_v1"
 ROLE_NEUTRAL_HTR_GROUP_EXECUTION_SCHEMA = (
     "production_role_neutral_htr_group_execution_v1"
 )
 ROLE_NEUTRAL_HTR_COVERAGE_SCHEMA = "production_role_neutral_htr_word_coverage_v1"
+ROLE_NEUTRAL_HTR_REUSABLE_PLAN_SCHEMA = (
+    "production_role_neutral_htr_reusable_text_plan_v1"
+)
+ROLE_NEUTRAL_HTR_OPERATIONAL_ATTESTATION_SCHEMA = (
+    "production_role_neutral_htr_operational_attestation_v2"
+)
 
 _FIT_STATE_DIRECTORY = "fit_state"
 _FIT_STATE_METADATA = "metadata.json"
@@ -512,6 +528,9 @@ class RoleNeutralHTRConfig:
     gradient_clip_foreach: bool
     effect_objectives: tuple[str, ...]
     outcome_type: str
+    replay_comparison_policy: str
+    replay_relative_tolerance: float
+    replay_absolute_tolerance: float
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RoleNeutralHTRConfig":
@@ -678,6 +697,11 @@ class RoleNeutralHTRConfig:
                 str(item) for item in payload["effect_objectives"]
             ),
             outcome_type=str(payload["outcome_type"]),
+            replay_comparison_policy=str(
+                payload["replay_comparison_policy"]
+            ),
+            replay_relative_tolerance=payload["replay_relative_tolerance"],
+            replay_absolute_tolerance=payload["replay_absolute_tolerance"],
         ).validated()
 
     def validated(self) -> "RoleNeutralHTRConfig":
@@ -902,6 +926,11 @@ class RoleNeutralHTRConfig:
             raise ValueError("HTR effect objectives are empty, duplicated, or unsupported")
         if self.outcome_type != "binary":
             raise ValueError("role-neutral HTR v1 supports binary outcomes only")
+        validate_neural_replay_settings(
+            policy=self.replay_comparison_policy,
+            relative_tolerance=self.replay_relative_tolerance,
+            absolute_tolerance=self.replay_absolute_tolerance,
+        )
         return self
 
     def as_dict(self) -> dict[str, Any]:
@@ -1017,6 +1046,9 @@ class RoleNeutralHTRConfig:
             "gradient_clip_foreach": self.gradient_clip_foreach,
             "effect_objectives": list(self.effect_objectives),
             "outcome_type": self.outcome_type,
+            "replay_comparison_policy": self.replay_comparison_policy,
+            "replay_relative_tolerance": self.replay_relative_tolerance,
+            "replay_absolute_tolerance": self.replay_absolute_tolerance,
             "text_truncation_applied": False,
         }
 
@@ -1447,6 +1479,344 @@ def _assert_coverage_matches_plan(
         raise ValueError(f"{label} differs from complete source-text coverage")
 
 
+@dataclass(frozen=True)
+class _ReusableTextPlan:
+    phase: str
+    ordered_row_ids: tuple[int, ...]
+    text_sha256: str
+    configuration_sha256: str
+    text_rows: tuple[tuple[str, tuple[str, ...]], ...]
+    token_rows: tuple[
+        tuple[str, tuple[int, ...], tuple[int, ...]],
+        ...,
+    ]
+    unique_note_count: int
+    unique_chunk_count: int
+    parallel_plan_task_count: int
+    parallel_plan_thread_count: int
+    positive_data_loader_workers_exercised: bool
+    content_sha256: str
+
+    def attestation(self) -> dict[str, Any]:
+        body = {
+            "schema_version": ROLE_NEUTRAL_HTR_REUSABLE_PLAN_SCHEMA,
+            "phase": self.phase,
+            "ordered_row_ids_sha256": _sha256_json(
+                {"ordered_row_ids": list(self.ordered_row_ids)}
+            ),
+            "text_sha256": self.text_sha256,
+            "configuration_sha256": self.configuration_sha256,
+            "note_count": len(self.ordered_row_ids),
+            "unique_note_count": self.unique_note_count,
+            "unique_chunk_count": self.unique_chunk_count,
+            "tokenized_unique_chunk_count": len(self.token_rows),
+            "parallel_plan_task_count": self.parallel_plan_task_count,
+            "parallel_plan_thread_count": self.parallel_plan_thread_count,
+            "positive_data_loader_workers_exercised": (
+                self.positive_data_loader_workers_exercised
+            ),
+            "raw_text_persisted": False,
+            "semantic_truncation_applied": False,
+        }
+        if _sha256_json(body) != self.content_sha256:
+            raise RuntimeError("in-process HTR reusable plan was mutated")
+        return {**body, "content_sha256": self.content_sha256}
+
+
+def _reusable_plan_configuration_sha256(
+    *,
+    config: RoleNeutralHTRConfig,
+) -> str:
+    return _sha256_json(
+        {
+            "schema_version": "production_role_neutral_htr_plan_config_v1",
+            "sentence_encoder_model_kind": config.sentence_encoder_model_kind,
+            "model_tree_sha256": config.model_tree_sha256,
+            "sentence_encoder_backend": config.sentence_encoder_backend,
+            "sentence_pooling": config.sentence_pooling,
+            "chunk_size_words": config.chunk_size_words,
+            "chunk_overlap_words": config.chunk_overlap_words,
+            "max_chunks": config.max_chunks,
+            "max_chunk_length": config.max_chunk_length,
+        }
+    )
+
+
+def _build_reusable_text_plan(
+    *,
+    extractor: HierarchicalTransformerExtractor,
+    texts: Sequence[str],
+    row_ids: Sequence[int],
+    coverage: _CoveragePlan,
+    config: RoleNeutralHTRConfig,
+    controls: RoleNeutralHTROperationalControls,
+    phase: str,
+) -> _ReusableTextPlan:
+    controls.validate_for(config)
+    if not controls.reuse_tokenizer_and_chunk_plans:
+        raise ValueError("disabled HTR reuse cannot build a reusable plan")
+    values = tuple(texts)
+    rows = tuple(int(value) for value in row_ids)
+    if (
+        len(values) != len(rows)
+        or len(values) != len(coverage.chunks_by_note)
+        or any(not isinstance(value, str) for value in values)
+    ):
+        raise ValueError("HTR reusable plan rows, texts, and coverage differ")
+    unique_notes = len(set(values))
+    if unique_notes > controls.chunk_plan_cache_max_entries:
+        raise ValueError(
+            "configured HTR chunk-plan cache capacity would omit a note; "
+            f"required={unique_notes} "
+            f"configured={controls.chunk_plan_cache_max_entries}"
+        )
+
+    def prepare_row(
+        row: tuple[int, str, tuple[str, ...]],
+    ) -> tuple[int, str, tuple[str, ...], int]:
+        position, text, expected_chunks = row
+        observed_chunks = tuple(
+            split_text_into_word_chunks(
+                text,
+                config.chunk_size_words,
+                config.chunk_overlap_words,
+                config.max_chunks,
+            )
+        )
+        if observed_chunks != expected_chunks:
+            raise RuntimeError(
+                "parallel HTR data-loader plan changed complete chunk coverage"
+            )
+        return position, text, observed_chunks, threading.get_ident()
+
+    work = tuple(
+        (position, values[position], coverage.chunks_by_note[position])
+        for position in range(len(values))
+    )
+    if controls.data_loader_workers:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=controls.data_loader_workers,
+            thread_name_prefix="oci-htr-plan",
+        ) as pool:
+            prepared_rows = tuple(pool.map(prepare_row, work))
+        parallel_plan_task_count = len(prepared_rows)
+        parallel_plan_thread_count = len(
+            {row[3] for row in prepared_rows}
+        )
+        positive_data_loader_workers_exercised = (
+            parallel_plan_task_count == len(work)
+            and parallel_plan_thread_count >= 1
+        )
+        if not positive_data_loader_workers_exercised:
+            raise RuntimeError(
+                "positive HTR data-loader workers did not execute every "
+                "complete-text plan task"
+            )
+    else:
+        prepared_rows = tuple(map(prepare_row, work))
+        parallel_plan_task_count = 0
+        parallel_plan_thread_count = 0
+        positive_data_loader_workers_exercised = False
+    if tuple(
+        position for position, _text, _chunks, _thread_id in prepared_rows
+    ) != tuple(
+        range(len(values))
+    ):
+        raise RuntimeError("HTR data-loader workers reordered the text plan")
+
+    text_cache = {
+        text: chunks
+        for _position, text, chunks, _thread_id in prepared_rows
+    }
+    if (
+        len(text_cache) != unique_notes
+        or any(
+            text_cache[text] != chunks
+            for _position, text, chunks, _thread_id in prepared_rows
+        )
+    ):
+        raise RuntimeError("HTR reusable chunk plan has conflicting duplicate notes")
+    unique_chunks = tuple(
+        dict.fromkeys(
+            chunk
+            for _position, _text, chunks, _thread_id in prepared_rows
+            for chunk in chunks
+        )
+    )
+    if len(unique_chunks) > controls.tokenized_chunk_cache_max_entries:
+        raise ValueError(
+            "configured HTR tokenized-chunk cache capacity would omit a chunk; "
+            f"required={len(unique_chunks)} "
+            f"configured={controls.tokenized_chunk_cache_max_entries}"
+        )
+
+    # The preprocessor is CPU-only.  Its cache capacities are replaced with
+    # the explicit deployment bounds before it sees any text.
+    preprocessor = extractor.make_batch_preprocessor()
+    preprocessor._chunk_cache_max_entries = (
+        controls.chunk_plan_cache_max_entries
+    )
+    preprocessor._tokenization_cache_max_entries = (
+        controls.tokenized_chunk_cache_max_entries
+    )
+    preprocessor._chunk_cache = {
+        text: list(chunks) for text, chunks in text_cache.items()
+    }
+    for start in range(0, len(values), controls.training_batch_size):
+        prepared = preprocessor(
+            values[start : start + controls.training_batch_size]
+        )
+        observed = prepared.get("chunks")
+        expected = [
+            list(coverage.chunks_by_note[position])
+            for position in range(
+                start,
+                min(len(values), start + controls.training_batch_size),
+            )
+        ]
+        if observed != expected:
+            raise RuntimeError("HTR reusable tokenizer plan changed chunk order")
+    tokenize_for_transformers = bool(
+        getattr(preprocessor, "_tokenize_for_transformers", False)
+    )
+    token_cache = dict(preprocessor._tokenization_cache)
+    if tokenize_for_transformers and set(token_cache) != set(unique_chunks):
+        raise RuntimeError(
+            "HTR tokenizer plan omitted a unique complete-text chunk"
+        )
+    if not tokenize_for_transformers and token_cache:
+        raise RuntimeError("non-transformer HTR plan unexpectedly tokenized chunks")
+    token_rows = tuple(
+        (
+            chunk,
+            tuple(token_cache[chunk][0]),
+            tuple(token_cache[chunk][1]),
+        )
+        for chunk in sorted(token_cache)
+    )
+    body = {
+        "schema_version": ROLE_NEUTRAL_HTR_REUSABLE_PLAN_SCHEMA,
+        "phase": str(phase),
+        "ordered_row_ids_sha256": _sha256_json(
+            {"ordered_row_ids": list(rows)}
+        ),
+        "text_sha256": _text_sha256(rows, values),
+        "configuration_sha256": _reusable_plan_configuration_sha256(
+            config=config
+        ),
+        "note_count": len(rows),
+        "unique_note_count": unique_notes,
+        "unique_chunk_count": len(unique_chunks),
+        "tokenized_unique_chunk_count": len(token_rows),
+        "parallel_plan_task_count": parallel_plan_task_count,
+        "parallel_plan_thread_count": parallel_plan_thread_count,
+        "positive_data_loader_workers_exercised": (
+            positive_data_loader_workers_exercised
+        ),
+        "raw_text_persisted": False,
+        "semantic_truncation_applied": False,
+    }
+    return _ReusableTextPlan(
+        phase=str(phase),
+        ordered_row_ids=rows,
+        text_sha256=body["text_sha256"],
+        configuration_sha256=body["configuration_sha256"],
+        text_rows=tuple(
+            (text, chunks) for text, chunks in sorted(text_cache.items())
+        ),
+        token_rows=token_rows,
+        unique_note_count=unique_notes,
+        unique_chunk_count=len(unique_chunks),
+        parallel_plan_task_count=parallel_plan_task_count,
+        parallel_plan_thread_count=parallel_plan_thread_count,
+        positive_data_loader_workers_exercised=(
+            positive_data_loader_workers_exercised
+        ),
+        content_sha256=_sha256_json(body),
+    )
+
+
+def _install_reusable_text_plan(
+    *,
+    extractor: HierarchicalTransformerExtractor,
+    plan: _ReusableTextPlan,
+    texts: Sequence[str],
+    row_ids: Sequence[int],
+    config: RoleNeutralHTRConfig,
+    controls: RoleNeutralHTROperationalControls,
+) -> None:
+    controls.validate_for(config)
+    attestation = plan.attestation()
+    values = tuple(texts)
+    rows = tuple(int(value) for value in row_ids)
+    if (
+        rows != plan.ordered_row_ids
+        or _text_sha256(rows, values) != plan.text_sha256
+        or plan.configuration_sha256
+        != _reusable_plan_configuration_sha256(config=config)
+        or attestation["unique_note_count"]
+        > controls.chunk_plan_cache_max_entries
+        or attestation["unique_chunk_count"]
+        > controls.tokenized_chunk_cache_max_entries
+    ):
+        raise ValueError("HTR reusable plan differs from its authorized rows")
+    text_cache = {text: chunks for text, chunks in plan.text_rows}
+    if set(values) != set(text_cache):
+        raise ValueError("HTR reusable plan omits or substitutes a note")
+    extractor._chunk_cache_max_entries = (
+        controls.chunk_plan_cache_max_entries
+    )
+    extractor._tokenization_cache_max_entries = (
+        controls.tokenized_chunk_cache_max_entries
+    )
+    extractor._chunk_cache = {
+        text: list(chunks) for text, chunks in text_cache.items()
+    }
+    extractor._tokenization_cache = {
+        chunk: (input_ids, attention_mask)
+        for chunk, input_ids, attention_mask in plan.token_rows
+    }
+    observed_chunks = extractor._chunks_for_texts(values)
+    if tuple(tuple(row) for row in observed_chunks) != tuple(
+        text_cache[text] for text in values
+    ):
+        raise RuntimeError("installed HTR chunk plan changed note coverage")
+
+
+def _set_operational_encoder_batch_size(
+    extractor: HierarchicalTransformerExtractor,
+    *,
+    config: RoleNeutralHTRConfig,
+    controls: RoleNeutralHTROperationalControls,
+) -> None:
+    controls.validate_for(config)
+    if int(extractor._sentence_encoder_batch_size) != int(
+        config.sentence_encoder_batch_size
+    ):
+        raise RuntimeError(
+            "HTR extractor did not begin with its scientific encoder batch"
+        )
+    extractor._sentence_encoder_batch_size = int(
+        controls.sentence_encoder_batch_size
+    )
+
+
+def _restore_scientific_encoder_batch_size(
+    extractor: HierarchicalTransformerExtractor,
+    *,
+    config: RoleNeutralHTRConfig,
+    controls: RoleNeutralHTROperationalControls,
+) -> None:
+    observed = int(extractor._sentence_encoder_batch_size)
+    scientific = int(config.sentence_encoder_batch_size)
+    operational = int(controls.sentence_encoder_batch_size)
+    if observed == scientific:
+        return
+    if observed != operational:
+        raise RuntimeError("HTR operational encoder batch changed during execution")
+    extractor._sentence_encoder_batch_size = scientific
+
+
 def _model_tree_sha256(path: Path) -> str:
     root = Path(path)
     if root.is_symlink() or not root.is_dir():
@@ -1474,7 +1844,7 @@ def _model_tree_sha256(path: Path) -> str:
         rows.append(
             {
                 "relative_path": relative,
-                "size_bytes": size,
+                "size": size,
                 "sha256": digest,
             }
         )
@@ -2130,7 +2500,10 @@ def _validate_complete_attention_evidence(
 def _producer_identity() -> str:
     sources = [
         inspect.getsource(RoleNeutralHTRConfig),
+        inspect.getsource(RoleNeutralHTROperationalControls),
         inspect.getsource(_coverage_plan),
+        inspect.getsource(_build_reusable_text_plan),
+        inspect.getsource(_install_reusable_text_plan),
         inspect.getsource(_train_nuisance),
         inspect.getsource(_train_effect),
         inspect.getsource(_complete_attention_evidence),
@@ -2318,6 +2691,9 @@ def _predict_from_state(
     texts: Sequence[str],
     htr_model_path: Path | str | None,
     device: torch.device,
+    operational_controls: RoleNeutralHTROperationalControls | None = None,
+    reusable_plan: _ReusableTextPlan | None = None,
+    row_ids: Sequence[int] | None = None,
 ) -> tuple[list[str], np.ndarray]:
     values = tuple(str(text) for text in texts)
     config = RoleNeutralHTRConfig.from_mapping(
@@ -2331,6 +2707,46 @@ def _predict_from_state(
             }
         }
     )
+    if operational_controls is not None:
+        operational_controls.validate_for(config)
+        if (
+            operational_controls.reuse_tokenizer_and_chunk_plans
+            != (reusable_plan is not None)
+            or row_ids is None
+        ):
+            raise ValueError(
+                "HTR prediction operational controls and reusable plan differ"
+            )
+    elif reusable_plan is not None or row_ids is not None:
+        raise ValueError("HTR prediction plan requires operational controls")
+
+    def prepare_model(model: torch.nn.Module) -> None:
+        if operational_controls is None:
+            return
+        if reusable_plan is not None:
+            _install_reusable_text_plan(
+                extractor=model.extractor,
+                plan=reusable_plan,
+                texts=values,
+                row_ids=tuple(int(value) for value in row_ids or ()),
+                config=config,
+                controls=operational_controls,
+            )
+        _set_operational_encoder_batch_size(
+            model.extractor,
+            config=config,
+            controls=operational_controls,
+        )
+
+    def restore_model(model: torch.nn.Module) -> None:
+        if operational_controls is None:
+            return
+        _restore_scientific_encoder_batch_size(
+            model.extractor,
+            config=config,
+            controls=operational_controls,
+        )
+
     nuisance_e: list[np.ndarray] = []
     nuisance_m: list[np.ndarray] = []
     for record in metadata["nuisance_fold_states"]:
@@ -2342,6 +2758,7 @@ def _predict_from_state(
             device=device,
         )
         try:
+            prepare_model(model)
             raw_e, raw_m = _predict_model(
                 model,
                 values,
@@ -2350,6 +2767,7 @@ def _predict_from_state(
                 batch_size=config.prediction_batch_size,
             )
         finally:
+            restore_model(model)
             del model
         nuisance_e.append(
             _apply_calibrator(
@@ -2386,6 +2804,7 @@ def _predict_from_state(
                 device=device,
             )
             try:
+                prepare_model(model)
                 [raw_tau] = _predict_model(
                     model,
                     values,
@@ -2394,6 +2813,7 @@ def _predict_from_state(
                     batch_size=config.prediction_batch_size,
                 )
             finally:
+                restore_model(model)
                 del model
             objective_predictions.append(raw_tau)
         if len(objective_predictions) != config.effect_folds:
@@ -2770,6 +3190,10 @@ def execute_role_neutral_htr_physical_group(
     exact_heldout_text_loader: Callable[[tuple[int, ...]], Sequence[str]],
     htr_model_path: Path | str | None = None,
     device: torch.device | str = "cpu",
+    operational_controls: RoleNeutralHTROperationalControls | None = None,
+    operational_attestation_sink: (
+        Callable[[Mapping[str, Any]], None] | None
+    ) = None,
 ) -> Mapping[str, Any]:
     """Fit, seal, publish aliases, then transform authorized exact text."""
 
@@ -2784,6 +3208,22 @@ def execute_role_neutral_htr_physical_group(
         raise ValueError("HTR runtime compatibility class cannot be empty")
     if not callable(exact_heldout_text_loader):
         raise TypeError("exact held-out HTR text loader must be callable")
+    if operational_controls is None:
+        if operational_attestation_sink is not None:
+            raise ValueError(
+                "HTR operational attestation sink requires typed controls"
+            )
+    else:
+        if not isinstance(
+            operational_controls,
+            RoleNeutralHTROperationalControls,
+        ):
+            raise TypeError("HTR operational controls must use the typed contract")
+        operational_controls.validate_for(config)
+        if not callable(operational_attestation_sink):
+            raise TypeError(
+                "typed HTR operational controls require an attestation sink"
+            )
     root = Path(output_root)
     if not root.is_absolute():
         raise ValueError("role-neutral HTR output root must be absolute")
@@ -2809,6 +3249,8 @@ def execute_role_neutral_htr_physical_group(
         length=len(texts),
     )
     fit_coverage = _coverage_plan(texts=texts, config=config, phase="fit")
+    fit_reusable_plan: _ReusableTextPlan | None = None
+    heldout_reusable_plan: _ReusableTextPlan | None = None
     model_marker = _resolve_model_marker(config, htr_model_path)
     execution_device = torch.device(device)
     producer_identity = _producer_identity()
@@ -2864,14 +3306,47 @@ def execute_role_neutral_htr_physical_group(
             model_marker=model_marker,
             device=execution_device,
         )
-        extractor.fit_tokenizer([texts[int(position)] for position in fit_pos])
-        if fold == 1:
-            _preflight_token_lengths(
-                extractor,
-                texts,
-                batch_size=config.prediction_batch_size,
+        if (
+            operational_controls is not None
+            and operational_controls.reuse_tokenizer_and_chunk_plans
+        ):
+            extractor.fit_tokenizer([])
+            if fit_reusable_plan is None:
+                fit_reusable_plan = _build_reusable_text_plan(
+                    extractor=extractor,
+                    texts=texts,
+                    row_ids=owner.fit_row_ids,
+                    coverage=fit_coverage,
+                    config=config,
+                    controls=operational_controls,
+                    phase="fit",
+                )
+            _install_reusable_text_plan(
+                extractor=extractor,
+                plan=fit_reusable_plan,
+                texts=texts,
+                row_ids=owner.fit_row_ids,
+                config=config,
+                controls=operational_controls,
             )
+        else:
+            extractor.fit_tokenizer(
+                [texts[int(position)] for position in fit_pos]
+            )
+        if fold == 1:
+            if fit_reusable_plan is None:
+                _preflight_token_lengths(
+                    extractor,
+                    texts,
+                    batch_size=config.prediction_batch_size,
+                )
         attestation = _attest_extractor(extractor, config=config)
+        if operational_controls is not None:
+            _set_operational_encoder_batch_size(
+                extractor,
+                config=config,
+                controls=operational_controls,
+            )
         model = _NuisanceNet(
             extractor=extractor,
             hidden_dim=config.hidden_dim,
@@ -2932,6 +3407,12 @@ def execute_role_neutral_htr_physical_group(
                 batch_size=config.prediction_batch_size,
             )
         )
+        if operational_controls is not None:
+            _restore_scientific_encoder_batch_size(
+                model.extractor,
+                config=config,
+                controls=operational_controls,
+            )
         prefix = f"nuisance_{fold:04d}"
         nuisance_records.append(
             {
@@ -3044,10 +3525,34 @@ def execute_role_neutral_htr_physical_group(
                 model_marker=model_marker,
                 device=execution_device,
             )
-            extractor.fit_tokenizer(
-                [texts[int(position)] for position in eligible_fit_pos]
-            )
+            if (
+                operational_controls is not None
+                and operational_controls.reuse_tokenizer_and_chunk_plans
+            ):
+                extractor.fit_tokenizer([])
+                if fit_reusable_plan is None:
+                    raise RuntimeError(
+                        "HTR effect fit lost the authenticated fit-text plan"
+                    )
+                _install_reusable_text_plan(
+                    extractor=extractor,
+                    plan=fit_reusable_plan,
+                    texts=texts,
+                    row_ids=owner.fit_row_ids,
+                    config=config,
+                    controls=operational_controls,
+                )
+            else:
+                extractor.fit_tokenizer(
+                    [texts[int(position)] for position in eligible_fit_pos]
+                )
             attestation = _attest_extractor(extractor, config=config)
+            if operational_controls is not None:
+                _set_operational_encoder_batch_size(
+                    extractor,
+                    config=config,
+                    controls=operational_controls,
+                )
             model = _EffectNet(
                 extractor=extractor,
                 hidden_dim=config.hidden_dim,
@@ -3091,6 +3596,12 @@ def execute_role_neutral_htr_physical_group(
                     batch_size=config.prediction_batch_size,
                 )
             )
+            if operational_controls is not None:
+                _restore_scientific_encoder_batch_size(
+                    model.extractor,
+                    config=config,
+                    controls=operational_controls,
+                )
             prefix = f"effect_{objective}_{fold:04d}"
             effect_records.append(
                 {
@@ -3310,11 +3821,33 @@ def execute_role_neutral_htr_physical_group(
         device=execution_device,
     )
     try:
-        _preflight_token_lengths(
-            first_model.extractor,
-            heldout_texts,
-            batch_size=config.prediction_batch_size,
-        )
+        if (
+            operational_controls is not None
+            and operational_controls.reuse_tokenizer_and_chunk_plans
+        ):
+            heldout_reusable_plan = _build_reusable_text_plan(
+                extractor=first_model.extractor,
+                texts=heldout_texts,
+                row_ids=owner.heldout_row_ids,
+                coverage=heldout_coverage,
+                config=config,
+                controls=operational_controls,
+                phase="exact_heldout",
+            )
+            _install_reusable_text_plan(
+                extractor=first_model.extractor,
+                plan=heldout_reusable_plan,
+                texts=heldout_texts,
+                row_ids=owner.heldout_row_ids,
+                config=config,
+                controls=operational_controls,
+            )
+        else:
+            _preflight_token_lengths(
+                first_model.extractor,
+                heldout_texts,
+                batch_size=config.prediction_batch_size,
+            )
     finally:
         del first_model
     columns, prediction_matrix = _predict_from_state(
@@ -3323,7 +3856,38 @@ def execute_role_neutral_htr_physical_group(
         texts=heldout_texts,
         htr_model_path=htr_model_path,
         device=execution_device,
+        operational_controls=operational_controls,
+        reusable_plan=heldout_reusable_plan,
+        row_ids=(
+            owner.heldout_row_ids
+            if operational_controls is not None
+            else None
+        ),
     )
+    operational_replay_equal = True
+    if operational_controls is not None:
+        replay_columns, replay_matrix = _predict_from_state(
+            metadata=metadata,
+            arrays=store.arrays,
+            texts=heldout_texts,
+            htr_model_path=htr_model_path,
+            device=execution_device,
+        )
+        operational_replay_equal = (
+            replay_columns == columns
+            and neural_float_arrays_within_tolerance(
+                replay_matrix,
+                prediction_matrix,
+                policy=config.replay_comparison_policy,
+                relative_tolerance=config.replay_relative_tolerance,
+                absolute_tolerance=config.replay_absolute_tolerance,
+            )
+        )
+        if not operational_replay_equal:
+            raise RuntimeError(
+                "HTR operational encoder batching differs from the "
+                "scientific replay beyond its declared tolerance"
+            )
     prediction_path = logical_root / f"{owner.scope_id}.predictions.npy"
     _write_new_npy(prediction_path, prediction_matrix)
     prediction_sha256, prediction_size = _sha256_file(
@@ -3458,12 +4022,101 @@ def execute_role_neutral_htr_physical_group(
         "content_sha256": _sha256_json(terminal_body),
     }
     _write_new_json(root / _TERMINAL_FILE, terminal)
-    return validate_role_neutral_htr_group_execution(
+    validated_terminal = validate_role_neutral_htr_group_execution(
         root=root,
         request=request,
         htr_model_path=htr_model_path,
         device=execution_device,
     )
+    if operational_controls is not None:
+        if fit_reusable_plan is not None:
+            fit_plan_attestation = fit_reusable_plan.attestation()
+        else:
+            fit_plan_attestation = None
+        if heldout_reusable_plan is not None:
+            heldout_plan_attestation = heldout_reusable_plan.attestation()
+        else:
+            heldout_plan_attestation = None
+        reusable_plan_attestations = tuple(
+            value
+            for value in (
+                fit_plan_attestation,
+                heldout_plan_attestation,
+            )
+            if value is not None
+        )
+        capacities_nonbinding = (
+            not operational_controls.reuse_tokenizer_and_chunk_plans
+            or (
+                len(reusable_plan_attestations) == 2
+                and all(
+                    int(value["unique_note_count"])
+                    <= operational_controls.chunk_plan_cache_max_entries
+                    and int(value["unique_chunk_count"])
+                    <= operational_controls.tokenized_chunk_cache_max_entries
+                    for value in reusable_plan_attestations
+                )
+            )
+        )
+        positive_workers_exercised = (
+            operational_controls.data_loader_workers == 0
+            or (
+                len(reusable_plan_attestations) == 2
+                and all(
+                    value.get(
+                        "positive_data_loader_workers_exercised"
+                    )
+                    is True
+                    and int(value.get("parallel_plan_task_count", 0)) > 0
+                    and int(value.get("parallel_plan_thread_count", 0)) > 0
+                    for value in reusable_plan_attestations
+                )
+            )
+        )
+        if not capacities_nonbinding:
+            raise RuntimeError(
+                "HTR reusable-plan cache capacities bound complete evidence"
+            )
+        if not positive_workers_exercised:
+            raise RuntimeError(
+                "configured positive HTR data-loader workers were not exercised"
+            )
+        operational_body = {
+            "schema_version": ROLE_NEUTRAL_HTR_OPERATIONAL_ATTESTATION_SCHEMA,
+            "controls": operational_controls.as_dict(),
+            "scientific_training_batch_size": config.batch_size,
+            "training_batch_override_applied": False,
+            "scientific_sentence_encoder_batch_size": (
+                config.sentence_encoder_batch_size
+            ),
+            "effective_sentence_encoder_batch_size": (
+                operational_controls.sentence_encoder_batch_size
+            ),
+            "fit_reusable_plan": fit_plan_attestation,
+            "exact_heldout_reusable_plan": heldout_plan_attestation,
+            "cache_capacities_nonbinding": capacities_nonbinding,
+            "positive_data_loader_workers_exercised": (
+                positive_workers_exercised
+            ),
+            "replay_comparison_policy": config.replay_comparison_policy,
+            "replay_relative_tolerance": config.replay_relative_tolerance,
+            "replay_absolute_tolerance": config.replay_absolute_tolerance,
+            "operational_predictions_within_declared_tolerance_of_scientific_replay": (
+                operational_replay_equal
+            ),
+            "complete_artifact_equality_decided_by_benchmark": True,
+            "raw_text_persisted_in_operational_attestation": False,
+            "semantic_truncation_applied": False,
+        }
+        operational_attestation = {
+            **operational_body,
+            "content_sha256": _sha256_json(operational_body),
+        }
+        assert operational_attestation_sink is not None
+        operational_attestation_sink(
+            copy.deepcopy(operational_attestation)
+        )
+    return validated_terminal
 
 
 def replay_role_neutral_htr_exact_transform(
@@ -3548,14 +4201,52 @@ def replay_role_neutral_htr_exact_transform(
         device=torch.device(device),
     )
     registered = exact_view.get("prediction_artifact")
+    expected_prediction_relative = (
+        f"{_LOGICAL_VIEW_DIRECTORY}/"
+        f"{request.physical_owner.scope_id}.predictions.npy"
+    )
     if (
         not isinstance(registered, Mapping)
-        or registered.get("columns") != columns
-        or registered.get("dtype") != predictions.dtype.str
-        or registered.get("shape") != list(predictions.shape)
-        or registered.get("content_sha256") != _array_sha256(predictions)
+        or registered.get("relative_path") != expected_prediction_relative
     ):
-        raise RuntimeError("fresh HTR replay differs from registered exact output")
+        raise RuntimeError("registered HTR replay output is missing or noncanonical")
+    prediction_path = artifact_root / expected_prediction_relative
+    prediction_digest, prediction_size = _sha256_file(
+        prediction_path,
+        label="registered exact HTR predictions",
+    )
+    try:
+        sealed_predictions = np.load(
+            prediction_path,
+            allow_pickle=False,
+            mmap_mode="r",
+        )
+    except (OSError, ValueError, EOFError) as exc:
+        raise ValueError(
+            "registered exact HTR predictions are not safe NumPy data"
+        ) from exc
+    if (
+        prediction_digest != registered.get("sha256")
+        or prediction_size != int(registered.get("size_bytes", -1))
+        or sealed_predictions.dtype.hasobject
+        or registered.get("columns") != columns
+        or registered.get("dtype") != sealed_predictions.dtype.str
+        or registered.get("shape") != list(sealed_predictions.shape)
+        or registered.get("content_sha256")
+        != _array_sha256(sealed_predictions)
+    ):
+        raise ValueError("registered exact HTR prediction bytes changed")
+    if not neural_float_arrays_within_tolerance(
+        predictions,
+        sealed_predictions,
+        policy=config.replay_comparison_policy,
+        relative_tolerance=config.replay_relative_tolerance,
+        absolute_tolerance=config.replay_absolute_tolerance,
+    ):
+        raise RuntimeError(
+            "fresh HTR replay differs from registered output beyond its "
+            "declared tolerance"
+        )
     return {
         "columns": columns,
         "predictions": predictions,
@@ -3843,7 +4534,9 @@ __all__ = [
     "ROLE_NEUTRAL_HTR_GROUP_EXECUTION_SCHEMA",
     "ROLE_NEUTRAL_HTR_GROUP_REQUEST_SCHEMA",
     "ROLE_NEUTRAL_HTR_LOGICAL_VIEW_SCHEMA",
+    "ROLE_NEUTRAL_HTR_OPERATIONAL_CONTROLS_SCHEMA",
     "RoleNeutralHTRConfig",
+    "RoleNeutralHTROperationalControls",
     "RoleNeutralHTRPhysicalGroupRequest",
     "execute_role_neutral_htr_physical_group",
     "replay_role_neutral_htr_exact_transform",

@@ -57,9 +57,12 @@ _ROLES = frozenset(
         UNCALIBRATED_EFFECT_MODIFIER_ROLE,
     }
 )
-_MAX_SIGNED_ORDER_WIDTH = 256
 _NAMESPACE_PATTERN = re.compile(r"[a-z][a-z0-9_]*\Z")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class VolatileRawFeatureFamilyCapacityOverflowError(RuntimeError):
+    """A fixed-width family cannot represent every supplied child coordinate."""
 
 
 def _safe_string(value: Any, *, name: str) -> str:
@@ -111,8 +114,8 @@ def _positive_width(value: Any) -> int:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
         raise TypeError("signed_order_width must be an integer")
     result = int(value)
-    if result < 1 or result > _MAX_SIGNED_ORDER_WIDTH:
-        raise ValueError(f"signed_order_width must be between 1 and {_MAX_SIGNED_ORDER_WIDTH}")
+    if result < 1:
+        raise ValueError("signed_order_width must be positive")
     return result
 
 
@@ -492,14 +495,16 @@ class CoordinatePreservingContextFitUpstreamBackend:
         if matrix.ndim != 2 or matrix.shape[0] != rows or matrix.shape[1] < 1:
             raise ValueError("volatile raw feature family has an invalid matrix shape")
         if matrix.shape[1] > width:
-            raise RuntimeError(
-                "volatile raw feature family exceeds its precommitted member capacity"
+            raise VolatileRawFeatureFamilyCapacityOverflowError(
+                "volatile raw feature family exceeds its precommitted member capacity: "
+                f"{matrix.shape[1]} child columns exceed its explicit "
+                f"signed_order_width={width}; refusing silent child-column omission"
             )
         if not np.isfinite(matrix).all():
             raise ValueError("volatile raw feature family contains non-finite values")
         signed_descending = np.sort(matrix, axis=1, kind="stable")[:, ::-1]
         ordered = np.zeros((rows, width), dtype=float)
-        copied = min(width, signed_descending.shape[1])
+        copied = signed_descending.shape[1]
         ordered[:, :copied] = signed_descending[:, :copied]
         columns: list[np.ndarray] = [
             np.mean(matrix, axis=1),
@@ -684,4 +689,5 @@ __all__ = [
     "PrecommittedExactCalibratedSource",
     "PrecommittedNamedRawCoordinate",
     "PrecommittedVolatileRawFeatureFamily",
+    "VolatileRawFeatureFamilyCapacityOverflowError",
 ]

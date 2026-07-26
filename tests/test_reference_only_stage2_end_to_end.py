@@ -58,6 +58,7 @@ from oci.inference.production_stage1_role_neutral_execution import (
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.hierarchical_all_architecture_discovery import (
     CROSS_ARCHITECTURE_INTEGRATION_JOB,
     CROSS_ARCHITECTURE_PLANNER_JOB,
@@ -65,6 +66,9 @@ from oci.inference.hierarchical_all_architecture_discovery import (
 )
 from oci.inference.hierarchical_discovery_job_cache import (
     AuthenticatedHierarchicalDiscoveryJobCache,
+)
+from tests.hierarchy_resource_test_support import (
+    HIERARCHY_JOB_CACHE_CONFIG,
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
     build_complete_architecture_chunks,
@@ -981,6 +985,7 @@ def test_review_schedules_preserve_canonical_outer_order_for_deduplicated_scope(
         registry=registry,
         registry_content_sha256=_sha(registry),
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         review_rounds=2,
         initial_training_partitions=3,
@@ -1313,7 +1318,8 @@ def test_reference_fixture_compiler_retains_two_reviewable_contracts(
         config=adaptive_config,
     )
     adaptive_cache = AuthenticatedHierarchicalDiscoveryJobCache(
-        root=(tmp_path / "adaptive-cache").resolve()
+        root=(tmp_path / "adaptive-cache").resolve(),
+        config=HIERARCHY_JOB_CACHE_CONFIG,
     )
     adaptive_execution = adaptive_builder.execute_authenticated(
         runner=hierarchy,
@@ -1350,6 +1356,7 @@ def test_authenticated_reference_only_stage2_runs_five_folds_two_reviews_and_sea
         registry=registry,
         registry_content_sha256=registry_sha256,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         review_rounds=2,
         initial_training_partitions=3,

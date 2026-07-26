@@ -165,6 +165,26 @@ def test_permuted_and_renamed_discovery_columns_have_identical_schema_and_values
     assert first.calibrated_source_names == ("stable_bow_r",)
 
 
+def test_finite_signed_order_capacity_fails_before_child_column_omission():
+    backend = CrossFitStableUpstreamBackend(
+        _VaryingDiscoveryBackend(add_third_every=1),
+        config=_config(width=2),
+    )
+
+    with pytest.raises(RuntimeError, match="refusing silent child-column omission"):
+        _call(backend)
+
+
+def test_signed_order_width_has_no_hidden_legacy_upper_bound():
+    family = PrecommittedRawFeatureFamily(
+        source_kind="safe_family",
+        consumer_role=UNCALIBRATED_EFFECT_MODIFIER_ROLE,
+        signed_order_width=257,
+    )
+
+    assert family.signed_order_width == 257
+
+
 class _SourceOnlyOrZeroRawBackend:
     def __init__(self, *, expose_zero_raw: bool) -> None:
         self.expose_zero_raw = expose_zero_raw
@@ -353,7 +373,7 @@ def _final_inputs():
 def test_stable_wrappers_compose_and_feed_final_producer(tmp_path):
     effect = CrossFitStableUpstreamBackend(
         _VaryingDiscoveryBackend(add_third_every=2),
-        config=_config(namespace="effect", width=2),
+        config=_config(namespace="effect", width=3),
     )
     propensity = CrossFitStableUpstreamBackend(
         _VaryingDiscoveryBackend(
@@ -366,7 +386,7 @@ def test_stable_wrappers_compose_and_feed_final_producer(tmp_path):
             namespace="query_treatment",
             kind="neural_query_treatment_moments",
             role=PROPENSITY_NUISANCE_FEATURE_ROLE,
-            width=2,
+            width=3,
             include_source=False,
         ),
     )
@@ -377,15 +397,15 @@ def test_stable_wrappers_compose_and_feed_final_producer(tmp_path):
     ).produce(**_final_inputs())
 
     assert package.calibrated_sources.source_names == ("stable_bow_r",)
-    assert len(package.raw_features.feature_names) == 8
-    assert package.raw_features.feature_names[:4] == tuple(
+    assert len(package.raw_features.feature_names) == 10
+    assert package.raw_features.feature_names[:5] == tuple(
         item[0] for item in effect.config.raw_output_schema()
     )
-    assert package.raw_features.feature_names[4:] == tuple(
+    assert package.raw_features.feature_names[5:] == tuple(
         item[0] for item in propensity.config.raw_output_schema()
     )
-    assert package.raw_features.consumer_roles[:4] == (UNCALIBRATED_EFFECT_MODIFIER_ROLE,) * 4
-    assert package.raw_features.consumer_roles[4:] == (PROPENSITY_NUISANCE_FEATURE_ROLE,) * 4
+    assert package.raw_features.consumer_roles[:5] == (UNCALIBRATED_EFFECT_MODIFIER_ROLE,) * 5
+    assert package.raw_features.consumer_roles[5:] == (PROPENSITY_NUISANCE_FEATURE_ROLE,) * 5
     package.verify_authenticated_content()
 
 

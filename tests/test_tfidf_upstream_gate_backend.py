@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from oci.config import AppliedInferenceConfig
@@ -129,3 +130,56 @@ def test_tfidf_backend_transforms_label_free_gate_into_role_aware_banks(
     )
     assert prediction.feature_roles[-1] == UNCALIBRATED_EFFECT_MODIFIER_ROLE
     assert prediction.feature_kinds[-1] == "tfidf_orphan_ngrams"
+
+
+def test_orphan_capacity_is_nullable_complete_and_finite_binding_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vectorizer = TfidfVectorizer(ngram_range=(1, 2)).fit(
+        ["brain metastases durable response", "brain response"]
+    )
+    fitted_path = tmp_path / "fitted.json"
+    fitted_path.write_text("{}", encoding="utf-8")
+    scores_path = tmp_path / "scores.parquet"
+    pd.DataFrame(
+        {
+            "feature": ["brain metastases", "durable response"],
+            "eligible": [True, True],
+            "combined_importance": [4.0, 3.0],
+            "support_control": [5, 5],
+            "support_treated": [5, 5],
+        }
+    ).to_parquet(scores_path, index=False)
+    metadata = {
+        "topic_banks": {"effect": {"topics": []}},
+        "artifacts": {
+            "fitted_context": str(fitted_path),
+            "ngram_scores": {"effect": str(scores_path)},
+        },
+    }
+    monkeypatch.setattr(
+        module,
+        "load_fitted_topic_context",
+        lambda _path: SimpleNamespace(common_vectorizer=vectorizer),
+    )
+    backend = object.__new__(module.TfidfTopicOrphanContextBackend)
+    backend.minimum_orphan_arm_support = 2
+    backend.max_orphan_features = None
+
+    names, values = backend._orphan_values(
+        metadata=metadata,
+        gate_texts=("brain metastases durable response",),
+    )
+    assert len(names) == 2
+    assert values.shape == (1, 2)
+
+    backend.max_orphan_features = 1
+    with pytest.raises(
+        module.TfidfOrphanFeatureCapacityOverflowError,
+        match="refusing silent orphan-feature omission",
+    ):
+        backend._orphan_values(
+            metadata=metadata,
+            gate_texts=("brain metastases durable response",),
+        )

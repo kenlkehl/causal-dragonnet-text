@@ -136,6 +136,7 @@ def _fixture_values(scope_count=40):
                 "attestation_sha256": "e" * 64,
                 "terminal_manifest_sha256": "f" * 64,
             },
+            "legacy_terminal_migration_identity": None,
         },
         "htr_model": {"path": "/fixture/htr", "tree_sha256": "4" * 64},
         "htr_input_nontruncation_audit": {"all_tokens_accounted_for": True},

@@ -3,15 +3,14 @@
 Status: low-level two-phase operator and exact-replay guide for the
 architecture-at-a-time benchmark path.
 
-> **Deployment boundary:** this document describes the retained low-level
-> prepare/approve/execute benchmark interface. It is not the end-user workflow
-> for a new cohort. The arbitrary-cohort path uses
-> `scripts/build_all_evidence_stage1_bundle.py` followed by
-> `scripts/run_production_stage1_hierarchy_one_shot.py`, as documented in
-> [`production_stage1_bundle_runbook.md`](production_stage1_bundle_runbook.md).
-> Those wrappers create and authenticate integrity digests internally and never
-> ask an end user to inspect, type, or approve one. Do not expose the approval
-> steps below as a production UI.
+> **Deployment boundary:** this document describes a retained low-level
+> prepare/approve/execute interface for exact historical replay. It is not the
+> end-user workflow for a new cohort. New work must enter through
+> `scripts/run_production_all_evidence_workflow.py` with a typed
+> `ScientificWorkflowSpec` and `DeploymentProfile`. The older bundle and
+> one-shot wrappers remain compatibility tools. Do not expose the approval steps
+> below as a production UI or derive a new scientific profile from the
+> historical commands.
 
 This runbook is the durable operational companion to
 [`all_evidence_discovery_interfaces.md`](all_evidence_discovery_interfaces.md).
@@ -21,7 +20,7 @@ caches are the sources of truth.
 
 ## Scope
 
-The supported entry point is:
+The historical low-level entry point described by the replay sections is:
 
 ```text
 scripts/run_all_evidence_fusion_benchmark.py
@@ -171,76 +170,431 @@ mkdir -p "$AE_CONTROL_DIR"
 cd "$AE_REPO"
 ```
 
-### Current reference profile
+### Typed portable profile for every new run
 
-The following array makes the important scientific and transport settings
-explicit. It matches the current hierarchical benchmark profile as of
-2026-07-19. A future intentional configuration change is allowed only before
-preparation and yields a new approval digest.
+There is intentionally no source- or runbook-level reference array of numeric
+scientific settings. For a new cohort, configure every column, fold/review
+policy, model-facing token budget, hierarchy wire budget, architecture profile,
+causal-estimator setting, and text geometry in an immutable
+`ScientificWorkflowSpec`. Configure paths, endpoint/model locators, devices,
+CPU/concurrency, and scratch/storage policy in a separate
+`DeploymentProfile`.
+
+In particular, extraction must use `complete_paged_v1`. Its configured core,
+left/right context, maximum page size, and reconciliation fan-in are
+scientific-spec fields—not universal constants. Every note character must occur
+in exactly one page core, context overlap is deduplicated by absolute offsets,
+and every page is recursively reconciled. A page/chunk/token capacity may page
+or abort; it must never select a prefix, suffix, or top-k substitute. The typed
+Stage 2 protocol also requires zero transport retries and exactly one fixed
+schema-repair attempt.
+
+Create and freshly validate the immutable source snapshot only after the
+source and test gates are quiescent:
 
 ```bash
-AE_COMMON_ARGS=(
-  --benchmark-name "$AE_BENCHMARK"
-  --discovery-mode hierarchical
-  --dataset "$AE_DATASET"
-  --legacy-handoff "$AE_LEGACY_HANDOFF"
-  --resealed-tfidf-handoff "$AE_TFIDF_HANDOFF"
-  --primary-splits "$AE_PRIMARY_SPLITS"
-  --endpoint "$AE_ENDPOINT"
-  --model "$AE_MODEL"
-  --api-key "$AE_API_KEY"
-  --text-column clinical_text
-  --treatment-column treatment_indicator
-  --outcome-column outcome_indicator
-  --outcome-type binary
-  --expected-outer-folds 5
-  --interaction-inner-folds 3
-  --max-candidates 20
-  --hierarchical-max-cross-architecture-lookback-ids 24
-  --hierarchical-max-cross-architecture-lookback-bytes 96000
-  --hierarchical-max-rejection-lookback-ids-per-candidate 24
-  --hierarchical-max-rejection-lookback-bytes-per-candidate 48000
-  --hierarchical-review-max-evidence-ids 512
-  --hierarchical-review-max-evidence-bytes 2000000
-  --post-extraction-review-rounds 2
-  --post-extraction-review-max-operations 4
-  --post-extraction-review-max-quality-retries 8
-  --post-extraction-review-min-partition-rows 8
-  --review-stage1-config "$AE_STAGE1_CONFIG"
-  --review-embedding-cache-dir "$AE_EMBEDDING_CACHE"
-  --review-stage1-device "$AE_STAGE1_DEVICE"
-  --review-stage1-bow-fold-parallelism 1
-  --review-stage1-bow-parallel-backend threads
-  --review-neural-query-nuisance-folds 3
-  --review-neural-query-device "$AE_NEURAL_QUERY_DEVICE"
-  --final-upstream-meta-inner-folds 3
-  --final-upstream-head-regularization 1.0
-  --seed 42
-  --proposal-max-tokens 25000
-  --extraction-max-tokens 25000
-  --proposal-schema-repair-attempts 2
-  --request-max-retries 3
-  --request-timeout 1800
-  --extraction-batch-size 128
-  --max-variables-per-extraction-request 1
-  --extraction-grouping-strategy packed
-  --extraction-context-strategy contract_lexical_rag
-  --extraction-max-text-length 14000
-  --extraction-prompt-version explicit_features_v5
-  --require-neural-query-moments
-  --require-orphan-ngrams
-  --modifier-interactions-only
-)
+export AE_REPOSITORY_ROOT=/absolute/path/to/causal-dragonnet-text
+export AE_SOURCE_SNAPSHOT_ROOT=/absolute/path/to/absent_source_snapshot
+
+PYTHONPATH="$AE_REPOSITORY_ROOT" \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONNOUSERSITE=1 \
+/home/klkehl/thisenv/bin/python -P -B -c \
+  'import os; from pathlib import Path; from oci.inference.production_source_snapshot import create_production_source_snapshot as create; print(create(repository_root=Path(os.environ["AE_REPOSITORY_ROOT"]), target_dir=Path(os.environ["AE_SOURCE_SNAPSHOT_ROOT"])).as_dict())'
+
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONNOUSERSITE=1 \
+/home/klkehl/thisenv/bin/python -P -B -c \
+  'import os; from pathlib import Path; from oci.inference.production_source_snapshot import validate_production_source_snapshot as validate; print(validate(Path(os.environ["AE_SOURCE_SNAPSHOT_ROOT"])).as_dict())'
 ```
 
-The retained `lookback` arguments are compatibility/profile fields, not semantic
-cutoffs. Current base and adaptive discovery schedule one page for every exact
-authenticated support item and recursively fold all pages; lowering a legacy
-lookback field must not sample or discard evidence.
+The typed portable invocation shape is:
 
-For exact replay, reconstruct this array from the original invocation record and
-the immutable preparation manifest. Do not assume that the profile above is a
-substitute for an older approved configuration.
+```bash
+export AE_SCIENTIFIC_SPEC=/absolute/path/to/scientific_workflow.json
+export AE_DEPLOYMENT_PROFILE=/absolute/path/to/deployment_profile.json
+export AE_SOURCE_SNAPSHOT_ROOT=/absolute/path/to/source_snapshot
+export AE_PREPARED_CHECKPOINT=/absolute/path/to/preparation/complete_manifest.json
+export AE_CACHE_CHECKPOINT=/absolute/path/to/embedding_cache/complete_manifest.json
+export AE_PREFLIGHT_AUDIT=/absolute/path/to/cluster_preflight_manifest.json
+
+uv run --frozen python scripts/run_production_all_evidence_workflow.py \
+  --scientific-spec "$AE_SCIENTIFIC_SPEC" \
+  --deployment-profile "$AE_DEPLOYMENT_PROFILE" \
+  --source-snapshot-root "$AE_SOURCE_SNAPSHOT_ROOT" \
+  --adopt-checkpoint "$AE_PREPARED_CHECKPOINT" \
+  --adopt-checkpoint "$AE_CACHE_CHECKPOINT" \
+  --adopt-checkpoint "$AE_PREFLIGHT_AUDIT" \
+  --validation-depth fresh_terminal_audit \
+  --log-level INFO \
+  --stop-after handoff_validation
+```
+
+Dataset, work and scratch roots, device policy, and worker budgets come from
+the typed deployment profile. Do not mix `--deployment-profile` with their
+direct compatibility flags. The `stop-after`, validation, and logging values
+are operational and excluded from scientific identity. After the configured
+Stage 2 endpoint is available, repeat the same scientific, deployment,
+snapshot, and checkpoint arguments, omit `--stop-after`, and add `--resume`.
+Omitting an adoption input changes the immutable request and fails closed. Any
+scientific code or configuration change requires checkpoint adoption into a
+fresh request, not resume.
+
+This is the generic post-selection invocation shape. It is not the
+first-acceptance launch sequence: that sequence must first create the measured
+deployment profile and resolve its checkpoint-adoption controls as described
+below.
+
+### Measured Stage 1 deployment selection
+
+The first portable acceptance run must select its Stage 1 execution profile
+from the configured representative benchmark before productive modeling. Run
+the workflow and every benchmark utility from the same freshly validated
+immutable source snapshot. Importing benchmark modules from the mutable
+checkout would bind different producer-code evidence and is not a valid
+selection authority.
+
+The benchmark source workflow is a separate fresh request. Adopt the validated
+preparation/cache checkpoints and the legacy preflight audit, then pause it
+exactly at `stage1_preflight`:
+
+For the configured NSCLC acceptance deployment, use one closed set of fresh
+paths throughout the sequence:
+
+```bash
+export AE_REPOSITORY_ROOT=/data1/ken/pcori_dev/causal-dragonnet-text
+export AE_SCIENTIFIC_SPEC="$AE_REPOSITORY_ROOT/example_configs/portable_all_evidence_scientific_nsclc.json"
+export AE_BENCHMARK_STAGING_PROFILE="$AE_REPOSITORY_ROOT/example_configs/portable_all_evidence_deployment_nsclc.benchmark-staging.json"
+export AE_BASE_ACCEPTANCE_PROFILE="$AE_REPOSITORY_ROOT/example_configs/portable_all_evidence_deployment_nsclc.acceptance.json"
+export AE_BENCHMARK_CONFIG="$AE_REPOSITORY_ROOT/example_configs/portable_role_neutral_performance_benchmark_nsclc.deployment.json"
+
+export AE_SOURCE_SNAPSHOT_ROOT="$AE_REPOSITORY_ROOT/artifacts/production_source_snapshot_20260725_portable_acceptance"
+export AE_BENCHMARK_STAGING_WORK_ROOT="$AE_REPOSITORY_ROOT/artifacts/production_all_evidence_one_conf_one_mod_1000_v6_benchmark_staging"
+export AE_BENCHMARK_STAGING_SCRATCH=/tmp/causal_dragonnet_nsclc_v6_benchmark_staging
+export AE_ACCEPTANCE_WORK_ROOT="$AE_REPOSITORY_ROOT/artifacts/production_all_evidence_one_conf_one_mod_1000_v6_portable_acceptance"
+export AE_ACCEPTANCE_SCRATCH=/tmp/causal_dragonnet_nsclc_v6_acceptance
+
+export AE_PREPARED_CHECKPOINT="$AE_REPOSITORY_ROOT/artifacts/production_all_evidence_one_conf_one_mod_1000_v5_parallel_stage1/phases/input_preparation/complete_manifest.json"
+export AE_CACHE_CHECKPOINT="$AE_REPOSITORY_ROOT/artifacts/production_all_evidence_one_conf_one_mod_1000_v5_parallel_stage1/phases/embedding_cache/complete_manifest.json"
+export AE_PREFLIGHT_AUDIT="$AE_REPOSITORY_ROOT/artifacts/production_all_evidence_one_conf_one_mod_1000_v4_parallel_stage1/phases/stage1_preflight/attempt_20260723T195805360899Z/cluster_preflight/cluster_preflight_manifest.json"
+
+export AE_BENCHMARK_PREPARED_CONTEXT=/tmp/causal_dragonnet_nsclc_v6_benchmark_prepared_context
+export AE_BENCHMARK_CONTROL_DIR=/tmp/causal_dragonnet_nsclc_v6_benchmark_control
+export AE_BENCHMARK_WORKLOAD_DEPLOYMENT="$AE_BENCHMARK_CONTROL_DIR/workload_deployment.json"
+export AE_BENCHMARK_SCRATCH=/tmp/causal_dragonnet_nsclc_v6_role_neutral_benchmark
+export AE_BENCHMARK_PUBLICATION="$AE_REPOSITORY_ROOT/artifacts/production_role_neutral_benchmark_publication_20260725"
+export AE_SELECTED_DEPLOYMENT="$AE_REPOSITORY_ROOT/artifacts/portable_all_evidence_deployment_nsclc.acceptance.selected.20260725.json"
+```
+
+Before creating the source snapshot, require every output target to be absent.
+Create only the workload file's parent after this check:
+
+```bash
+for path in \
+  "$AE_SOURCE_SNAPSHOT_ROOT" \
+  "$AE_BENCHMARK_STAGING_WORK_ROOT" \
+  "$AE_BENCHMARK_STAGING_SCRATCH" \
+  "$AE_ACCEPTANCE_WORK_ROOT" \
+  "$AE_ACCEPTANCE_SCRATCH" \
+  "$AE_BENCHMARK_PREPARED_CONTEXT" \
+  "$AE_BENCHMARK_CONTROL_DIR" \
+  "$AE_BENCHMARK_SCRATCH" \
+  "$AE_BENCHMARK_PUBLICATION" \
+  "$AE_SELECTED_DEPLOYMENT"
+do
+  test ! -e "$path" || {
+    echo "refusing non-fresh rollout target: $path" >&2
+    exit 1
+  }
+done
+mkdir -p "$AE_BENCHMARK_CONTROL_DIR"
+```
+
+Create and independently validate `AE_SOURCE_SNAPSHOT_ROOT` with the two
+snapshot commands above. Run the following GPU-consuming steps outside the
+sandbox.
+
+```bash
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" /home/klkehl/thisenv/bin/python -P -u \
+  "$AE_SOURCE_SNAPSHOT_ROOT/scripts/run_production_all_evidence_workflow.py" \
+  --scientific-spec "$AE_SCIENTIFIC_SPEC" \
+  --deployment-profile "$AE_BENCHMARK_STAGING_PROFILE" \
+  --source-snapshot-root "$AE_SOURCE_SNAPSHOT_ROOT" \
+  --adopt-checkpoint "$AE_PREPARED_CHECKPOINT" \
+  --adopt-checkpoint "$AE_CACHE_CHECKPOINT" \
+  --adopt-checkpoint "$AE_PREFLIGHT_AUDIT" \
+  --stop-after stage1_preflight \
+  --validation-depth fresh_terminal_audit \
+  --log-level INFO
+```
+
+Do not advance this request to modeling or handoff: the authenticated workload
+writer accepts only the exact preflight pause. It derives the representative
+exact-inner and full-outer row counts from the configured split plan; neither
+count is a library constant. Write those two selectors into the fresh workload
+deployment and prepared-context roots:
+
+```bash
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" /home/klkehl/thisenv/bin/python -P -u \
+  "$AE_SOURCE_SNAPSHOT_ROOT/scripts/write_role_neutral_benchmark_workload_deployment.py" \
+  --workflow-root "$AE_BENCHMARK_STAGING_WORK_ROOT" \
+  --benchmark-config "$AE_BENCHMARK_CONFIG" \
+  --prepared-context-root "$AE_BENCHMARK_PREPARED_CONTEXT" \
+  --scope-selector configured_exact_inner_fit exact_inner 0 \
+  --scope-selector configured_full_outer_fit full_outer 0 \
+  --output "$AE_BENCHMARK_WORKLOAD_DEPLOYMENT"
+```
+
+Run one observation with `--stop-after-observations 1`. Its sealed checkpoint
+must be
+`$AE_BENCHMARK_SCRATCH/checkpoints/observation_000000.json`. Then resume
+without that stop option and publish the compact durable benchmark authority:
+
+```bash
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" /home/klkehl/thisenv/bin/python -P -u \
+  "$AE_SOURCE_SNAPSHOT_ROOT/scripts/run_role_neutral_performance_benchmark.py" \
+  --benchmark-config "$AE_BENCHMARK_CONFIG" \
+  --workload-deployment "$AE_BENCHMARK_WORKLOAD_DEPLOYMENT" \
+  --output-root "$AE_BENCHMARK_SCRATCH" \
+  --stop-after-observations 1
+```
+
+```bash
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" /home/klkehl/thisenv/bin/python -P -u \
+  "$AE_SOURCE_SNAPSHOT_ROOT/scripts/run_role_neutral_performance_benchmark.py" \
+  --benchmark-config "$AE_BENCHMARK_CONFIG" \
+  --workload-deployment "$AE_BENCHMARK_WORKLOAD_DEPLOYMENT" \
+  --output-root "$AE_BENCHMARK_SCRATCH" \
+  --resume \
+  --durable-publication-root "$AE_BENCHMARK_PUBLICATION"
+```
+
+Select the deployment with `--benchmark-publication`; a workload locator is
+deliberately forbidden for durable selection. The resulting profile binds the
+publication bytes, original result/workload identities, exact scientific spec,
+dataset/model/settings identity, and transitive producer code without retaining
+scratch locators.
+
+```bash
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" /home/klkehl/thisenv/bin/python -P -u \
+  "$AE_SOURCE_SNAPSHOT_ROOT/scripts/select_role_neutral_benchmark_deployment.py" \
+  --base-deployment "$AE_BASE_ACCEPTANCE_PROFILE" \
+  --benchmark-publication "$AE_BENCHMARK_PUBLICATION" \
+  --scientific-spec "$AE_SCIENTIFIC_SPEC" \
+  --output "$AE_SELECTED_DEPLOYMENT"
+```
+
+Do not pass `--benchmark-workload-deployment` in this durable-publication
+selection mode.
+
+Before starting productive Stage 1, compare the selected preflight compression
+with the staging profile:
+
+- If they match, the fresh acceptance request must adopt four portable DAG
+  nodes: migrated prepared cohort, migrated embedding cache, current clustered
+  preflight, and granular `prepared_stage1_context`. Resolve each node from the
+  authenticated staging manifests; never embed a generated node directory name
+  in code or configuration.
+- If they differ, the staged preflight and prepared context are incompatible.
+  Adopt only the migrated prepared cohort/cache, pass the legacy preflight audit
+  again, and recompute the current preflight/context under the selected codec.
+
+Resolve the four controls from authenticated staging manifests. Do not derive
+or embed the generated granular node directory name:
+
+```bash
+eval "$(
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" \
+/home/klkehl/thisenv/bin/python -P -B <<'PY'
+import os
+import shlex
+from pathlib import Path
+
+from oci.inference.production_all_evidence_workflow import (
+    _read_json_object,
+    validate_published_workflow_checkpoint_dag,
+)
+
+root = Path(
+    os.environ["AE_BENCHMARK_STAGING_WORK_ROOT"]
+).resolve(strict=True)
+request = _read_json_object(
+    root / "immutable_run_request.json",
+    label="staging immutable request",
+)
+validated = validate_published_workflow_checkpoint_dag(
+    work_root=root,
+    expected_request_sha256=request["request_sha256"],
+    expected_phases=(
+        "input_preparation",
+        "embedding_cache",
+        "stage1_preflight",
+    ),
+)
+
+phase_for_kind = {
+    "prepared_cohort": "input_preparation",
+    "embedding_cache": "embedding_cache",
+}
+portable = {}
+for record, locator in zip(
+    request["requested_checkpoint_adoptions"],
+    request["checkpoint_adoption_locators"],
+    strict=True,
+):
+    kind = record["artifact_kind"]
+    if kind in phase_for_kind:
+        phase = phase_for_kind[kind]
+        assert (
+            record["artifact_id"]
+            == validated["checkpoint_artifact_ids"][phase]
+        )
+        assert kind not in portable
+        portable[kind] = Path(locator).resolve(strict=True)
+assert set(portable) == set(phase_for_kind)
+
+preflight = (
+    root / "portable_checkpoints" / "stage1_preflight"
+).resolve(strict=True)
+assert "stage1_preflight" in validated["local_publication_phases"]
+
+granular_root = (
+    root
+    / "portable_granular_checkpoints"
+    / "stage1_preflight"
+)
+index = _read_json_object(
+    granular_root / "granular_index.json",
+    label="Stage 1 preflight granular index",
+)
+locator = _read_json_object(
+    granular_root / "granular_index_locator.json",
+    label="Stage 1 preflight granular locator",
+)
+matches = [
+    (node, control)
+    for node, control in zip(
+        index["nodes"],
+        locator["node_controls"],
+        strict=True,
+    )
+    if node["artifact_kind"] == "prepared_stage1_context"
+    and node["artifact_id"] == control["artifact_id"]
+]
+assert len(matches) == 1
+node, control = matches[0]
+assert validated["granular_checkpoint_artifact_ids"][
+    "stage1_preflight"
+] == [node["artifact_id"]]
+context = Path(control["control_root"]).resolve(strict=True)
+
+for name, value in (
+    ("AE_ADOPT_PREPARED", portable["prepared_cohort"]),
+    ("AE_ADOPT_CACHE", portable["embedding_cache"]),
+    ("AE_ADOPT_PREFLIGHT", preflight),
+    ("AE_ADOPT_PREPARED_CONTEXT", context),
+):
+    print(f"export {name}={shlex.quote(str(value))}")
+PY
+)"
+```
+
+Compare the selected and staging codecs through their typed profiles:
+
+```bash
+eval "$(
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" \
+/home/klkehl/thisenv/bin/python -P -B <<'PY'
+import os
+import shlex
+from pathlib import Path
+
+from oci.inference.portable_workflow_spec import DeploymentProfile
+
+staging = DeploymentProfile.from_json(
+    Path(os.environ["AE_BENCHMARK_STAGING_PROFILE"])
+)
+selected = DeploymentProfile.from_json(
+    Path(os.environ["AE_SELECTED_DEPLOYMENT"])
+)
+print(
+    "export AE_STAGING_CODEC="
+    + shlex.quote(staging.cluster_preflight_parquet_compression)
+)
+print(
+    "export AE_SELECTED_CODEC="
+    + shlex.quote(selected.cluster_preflight_parquet_compression)
+)
+PY
+)"
+```
+
+Construct and retain one exact adoption array for both the initial request and
+its resume:
+
+```bash
+if [ "$AE_SELECTED_CODEC" = "$AE_STAGING_CODEC" ]; then
+  AE_ADOPTION_ARGS=(
+    --adopt-checkpoint "$AE_ADOPT_PREPARED"
+    --adopt-checkpoint "$AE_ADOPT_CACHE"
+    --adopt-checkpoint "$AE_ADOPT_PREFLIGHT"
+    --adopt-checkpoint "$AE_ADOPT_PREPARED_CONTEXT"
+  )
+else
+  AE_ADOPTION_ARGS=(
+    --adopt-checkpoint "$AE_ADOPT_PREPARED"
+    --adopt-checkpoint "$AE_ADOPT_CACHE"
+    --adopt-checkpoint "$AE_PREFLIGHT_AUDIT"
+  )
+fi
+```
+
+The productive request then pauses with `--stop-after handoff_validation`:
+
+```bash
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" /home/klkehl/thisenv/bin/python -P -u \
+  "$AE_SOURCE_SNAPSHOT_ROOT/scripts/run_production_all_evidence_workflow.py" \
+  --scientific-spec "$AE_SCIENTIFIC_SPEC" \
+  --deployment-profile "$AE_SELECTED_DEPLOYMENT" \
+  --source-snapshot-root "$AE_SOURCE_SNAPSHOT_ROOT" \
+  "${AE_ADOPTION_ARGS[@]}" \
+  --stop-after handoff_validation \
+  --validation-depth fresh_terminal_audit \
+  --log-level INFO
+```
+
+This is not `--stage1-only`: the full endpoint/model identity remains part of
+the immutable request, but no endpoint call occurs before `stage2_canary`.
+Only after the configured remote Stage 2 service is available, repeat the exact
+profiles and adoption array with `--resume` and no `--stop-after`:
+
+```bash
+PYTHONPATH="$AE_SOURCE_SNAPSHOT_ROOT" /home/klkehl/thisenv/bin/python -P -u \
+  "$AE_SOURCE_SNAPSHOT_ROOT/scripts/run_production_all_evidence_workflow.py" \
+  --scientific-spec "$AE_SCIENTIFIC_SPEC" \
+  --deployment-profile "$AE_SELECTED_DEPLOYMENT" \
+  --source-snapshot-root "$AE_SOURCE_SNAPSHOT_ROOT" \
+  "${AE_ADOPTION_ARGS[@]}" \
+  --resume \
+  --validation-depth fresh_terminal_audit \
+  --log-level INFO
+```
+
+Do not occupy the local Stage 1 GPUs with vLLM when the resource policy rejects
+external GPU occupants.
+
+The remaining phase examples in this document apply only to an exact replay of
+the retired low-level interface. Before using them, reconstruct
+`AE_COMMON_ARGS` byte-for-byte from the original invocation record and immutable
+preparation manifest. This document deliberately provides no fallback values:
+
+```bash
+# Historical replay only. Populate from authenticated records; never improvise.
+AE_COMMON_ARGS=(
+  # exact original arguments
+)
+```
 
 ## Phase 1: side-effect-free dry run
 

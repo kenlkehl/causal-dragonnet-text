@@ -27,6 +27,7 @@ from oci.inference.frozen_hierarchical_review_evidence import (
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
     ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+    SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
     RoleNeutralEvidenceCatalog,
     Stage1EvidenceAtom,
     validate_role_neutral_catalog,
@@ -74,8 +75,15 @@ def _catalog() -> RoleNeutralEvidenceCatalog:
                 _content_json=canonical_json(content),
             )
         )
+    semantic_member_batching = {
+        "schema_version": SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION,
+        "semantic_member_batch_size": 1,
+        "selection_or_truncation_authorized": False,
+        "complete_member_coverage_required": True,
+    }
     catalog_identity = {
         "schema_version": ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION,
+        "semantic_member_batching": semantic_member_batching,
         "outer_fold": 1,
         "scope": "outer_train",
         "inner_fold": None,
@@ -91,7 +99,12 @@ def _catalog() -> RoleNeutralEvidenceCatalog:
         atoms=tuple(atoms),
         non_grounding_numerical_summaries=(),
         catalog_sha256=content_sha256(catalog_identity),
-        _audit_json="{}",
+        _audit_json=canonical_json(
+            {
+                "semantic_member_batching": semantic_member_batching,
+                "semantic_member_batch_size": 1,
+            }
+        ),
     )
     validate_role_neutral_catalog(catalog)
     return catalog

@@ -37,11 +37,9 @@ from oci.models.concept_embedding_utils import (  # noqa: E402
     chunk_text_words,
     split_text_to_token_chunks,
 )
+from oci.models.lossless_tokenization import SemanticTruncationError  # noqa: E402
 
-DEFAULT_OUTPUT_ROOT = Path("/data1/ken/pcori_dev/pubmed_embeddings")
-DEFAULT_INPUT = DEFAULT_OUTPUT_ROOT / "pubmed_cancer_abstracts.jsonl"
-DEFAULT_CACHE_DIR = DEFAULT_OUTPUT_ROOT / "pubmed_cancer_embedding_cache"
-DEFAULT_MODEL_NAME = "Qwen/Qwen3-Embedding-8B"
+LOSSLESS_EXTERNAL_EMBEDDING_POLICY_VERSION = "lossless_external_embedding_chunks_v1"
 
 logger = logging.getLogger(__name__)
 
@@ -78,16 +76,16 @@ class PartSpec:
         return f"part_{self.index:05d}_{self.row_start:06d}_{self.row_end:06d}"
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Embed a PubMed JSONL corpus into a resumable chunk vector cache."
     )
-    parser.add_argument("--input", default=str(DEFAULT_INPUT))
-    parser.add_argument("--output-cache-dir", default=str(DEFAULT_CACHE_DIR))
-    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
-    parser.add_argument("--corpus-name", default="pubmed_cancer")
-    parser.add_argument("--text-column", default="text")
-    parser.add_argument("--source-id-column", default="pmid")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output-cache-dir", required=True)
+    parser.add_argument("--model-name", required=True)
+    parser.add_argument("--corpus-name", required=True)
+    parser.add_argument("--text-column", required=True)
+    parser.add_argument("--source-id-column", required=True)
     parser.add_argument(
         "--metadata-column",
         action="append",
@@ -108,22 +106,38 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--rows-per-part", type=int, default=2500)
-    parser.add_argument("--max-seq-length", type=int, default=1024)
-    parser.add_argument("--chunk-size-words", type=int, default=256)
-    parser.add_argument("--chunk-overlap-words", type=int, default=64)
-    parser.add_argument("--max-chunks", type=int, default=8)
-    parser.add_argument("--chunk-selection", choices=["first", "last"], default="first")
-    parser.add_argument("--no-normalize-embeddings", action="store_true")
+    parser.add_argument("--max-seq-length", type=int, required=True)
+    parser.add_argument("--chunk-size-words", type=int, required=True)
+    parser.add_argument("--chunk-overlap-words", type=int, required=True)
+    parser.add_argument("--max-chunks", type=int, required=True)
+    parser.add_argument(
+        "--chunk-selection",
+        choices=["first", "last"],
+        required=True,
+        help=(
+            "Cache-identity compatibility label. The cap is abort-only: no first/last "
+            "selection is performed if max-chunks would bind."
+        ),
+    )
+    normalization = parser.add_mutually_exclusive_group(required=True)
+    normalization.add_argument(
+        "--normalize-embeddings",
+        dest="normalize_embeddings",
+        action="store_true",
+    )
+    normalization.add_argument(
+        "--no-normalize-embeddings",
+        dest="normalize_embeddings",
+        action="store_false",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    return parser
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-    config = EmbedConfig(
+
+def embed_config_from_args(args: argparse.Namespace) -> EmbedConfig:
+    return EmbedConfig(
         input_path=Path(args.input).expanduser(),
         output_cache_dir=Path(args.output_cache_dir).expanduser(),
         model_name=args.model_name,
@@ -138,10 +152,20 @@ def main() -> None:
         chunk_overlap_words=args.chunk_overlap_words,
         max_chunks=args.max_chunks,
         chunk_selection=args.chunk_selection,
-        normalize_embeddings=not args.no_normalize_embeddings,
+        normalize_embeddings=args.normalize_embeddings,
         limit=args.limit,
         force=args.force,
     )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = build_parser().parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    config = embed_config_from_args(args)
     cache_path = build_pubmed_embedding_cache(config, raw_device_ids=args.device_ids)
     print(cache_path)
 
@@ -156,6 +180,8 @@ def build_pubmed_embedding_cache(
     if not rows:
         raise RuntimeError(f"No rows found in {config.input_path}")
     config.output_cache_dir.mkdir(parents=True, exist_ok=True)
+    if not config.force:
+        _assert_existing_configuration_is_reusable(config)
     if _final_cache_ready(config.output_cache_dir, expected_rows=len(rows)) and not config.force:
         logger.info("Reusing complete external embedding cache: %s", config.output_cache_dir)
         return config.output_cache_dir
@@ -409,7 +435,6 @@ def _load_or_create_part_chunks(
                 max_seq_length=effective_max_seq_length,
                 chunk_overlap_tokens=config.chunk_overlap_words,
                 max_chunks=config.max_chunks,
-                chunk_selection=config.chunk_selection,
             )
             for chunks in sample_chunks
         ]
@@ -431,8 +456,9 @@ def _token_bound_chunks(
     max_seq_length: int,
     chunk_overlap_tokens: int,
     max_chunks: int,
-    chunk_selection: str,
 ) -> List[str]:
+    """Token-bound every word chunk without discarding any resulting chunk."""
+
     split_chunks: List[str] = []
     for chunk in chunks:
         split_chunks.extend(
@@ -444,10 +470,12 @@ def _token_bound_chunks(
             )
         )
     if len(split_chunks) > max_chunks:
-        if chunk_selection == "first":
-            split_chunks = split_chunks[:max_chunks]
-        else:
-            split_chunks = split_chunks[-max_chunks:]
+        raise SemanticTruncationError(
+            "token-bounded external-corpus text requires "
+            f"{len(split_chunks)} chunks but configured max_chunks={max_chunks}; "
+            "semantic truncation is forbidden. Increase --max-chunks so the "
+            "allocation bound is nonbinding."
+        )
     return split_chunks or [""]
 
 
@@ -722,18 +750,61 @@ def _concat_files(paths: Iterable[Path], output_path: Path) -> None:
 
 def _config_metadata(config: EmbedConfig) -> Dict[str, Any]:
     return {
+        "lossless_embedding_policy_version": LOSSLESS_EXTERNAL_EMBEDDING_POLICY_VERSION,
         "sentence_model_name": config.model_name,
+        "corpus_name": config.corpus_name,
+        "text_column": config.text_column,
         "chunk_size_words": config.chunk_size_words,
         "chunk_overlap_words": config.chunk_overlap_words,
         "max_chunks": config.max_chunks,
         "chunk_selection": config.chunk_selection,
+        "chunk_overflow_policy": "abort",
+        "semantic_truncation_allowed": False,
         "normalize_embeddings": config.normalize_embeddings,
         "max_seq_length": config.max_seq_length,
         "precompute_batch_size": config.batch_size,
         "rows_per_part": config.rows_per_part,
         "source_id_column": config.source_id_column,
         "metadata_columns": config.metadata_columns,
+        "input_row_limit": config.limit,
     }
+
+
+def _assert_existing_configuration_is_reusable(config: EmbedConfig) -> None:
+    """Reject old, lossy, or scientifically different partial/final caches."""
+
+    expected = _config_metadata(config)
+    scientific_keys = (
+        "lossless_embedding_policy_version",
+        "sentence_model_name",
+        "corpus_name",
+        "text_column",
+        "chunk_size_words",
+        "chunk_overlap_words",
+        "max_chunks",
+        "chunk_selection",
+        "chunk_overflow_policy",
+        "semantic_truncation_allowed",
+        "normalize_embeddings",
+        "max_seq_length",
+        "source_id_column",
+        "metadata_columns",
+        "input_row_limit",
+    )
+    for path in (
+        config.output_cache_dir / "build_config.json",
+        config.output_cache_dir / "metadata.json",
+    ):
+        if not path.exists():
+            continue
+        observed = _read_json(path)
+        mismatches = [key for key in scientific_keys if observed.get(key) != expected.get(key)]
+        if mismatches:
+            raise RuntimeError(
+                f"{path} is not reusable under the configured lossless embedding "
+                f"policy; mismatched fields: {mismatches}. Use a fresh output "
+                "directory or explicitly rebuild with --force."
+            )
 
 
 def _default_pubmed_metadata_columns() -> List[str]:
@@ -751,16 +822,30 @@ def _default_pubmed_metadata_columns() -> List[str]:
 
 
 def _validate_config(config: EmbedConfig) -> None:
+    for name in ("model_name", "corpus_name", "text_column"):
+        value = getattr(config, name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"--{name.replace('_', '-')} must be non-empty")
     if config.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
     if config.rows_per_part < 1:
         raise ValueError("--rows-per-part must be >= 1")
+    if config.max_seq_length is None or config.max_seq_length < 1:
+        raise ValueError("--max-seq-length must be >= 1")
     if config.chunk_size_words < 1:
         raise ValueError("--chunk-size-words must be >= 1")
     if config.chunk_overlap_words < 0:
         raise ValueError("--chunk-overlap-words must be >= 0")
+    if config.chunk_overlap_words >= config.chunk_size_words:
+        raise ValueError("--chunk-overlap-words must be smaller than --chunk-size-words")
     if config.max_chunks < 1:
         raise ValueError("--max-chunks must be >= 1")
+    if config.chunk_selection not in {"first", "last"}:
+        raise ValueError("--chunk-selection must be 'first' or 'last'")
+    if not isinstance(config.normalize_embeddings, bool):
+        raise TypeError("embedding normalization must be explicitly boolean")
+    if config.limit is not None and config.limit < 1:
+        raise ValueError("--limit must be >= 1 when supplied")
     if not config.input_path.exists():
         raise FileNotFoundError(config.input_path)
 

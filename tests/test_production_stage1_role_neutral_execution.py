@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from collections import Counter
 from pathlib import Path
 
 import pytest
+
+from tests.resource_safety_test_support import resource_safety_policy
 
 from oci.inference.portable_resource_scheduler import (
     GPUResource,
@@ -26,18 +29,24 @@ from oci.inference.production_stage1_role_neutral_execution import (
     DISTINCT_RESOURCE_CANARY_REPLICA_POLICY,
     EARLIEST_CANONICAL_OWNER_CANARY_SELECTION,
     LocalThreadRoleNeutralPhysicalOwnerExecutor,
+    NeuralQueryExecutionTopology,
     ROLE_NEUTRAL_COMPUTE_CANARY_ATTESTATION,
     ROLE_NEUTRAL_COORDINATION_DIRECTORY,
     ROLE_NEUTRAL_EXECUTION_MANIFEST,
     RoleNeutralComputeCanaryPolicy,
+    RoleNeutralOperationalComponentReport,
+    RoleNeutralPhysicalOwnerTask,
     RoleNeutralProducerFactories,
     RoleNeutralStage1ExecutionPolicy,
+    _execute_one_owner,
     execute_and_publish_role_neutral_stage1,
+    validate_role_neutral_component_execution_intervals,
     validate_role_neutral_stage1_execution,
 )
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_all_ten_binding import (
     AuthenticatedRoleNeutralComponentReceipt,
     EXPECTED_COMPONENT_FAMILIES,
@@ -92,6 +101,7 @@ def _plan(*, gpu_ids: tuple[int, ...]):
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,
@@ -124,7 +134,7 @@ def _resource_plan(
             gpus=gpus,
         ),
         policy=devices,
-        resource_performance_safety=ResourcePerformanceSafetyPolicy(
+        resource_performance_safety=resource_safety_policy(
             gpu_max_allocation_fraction=0.8,
             gpu_minimum_headroom_bytes=1024,
             minimum_multi_device_throughput_ratio=1.4,
@@ -217,6 +227,80 @@ class _ProducerRecorder:
                     + "\n",
                     encoding="utf-8",
                 )
+                controls = invocation.htr_operational_controls
+                if expected_component == "htr" and controls is not None:
+                    reuse = controls.reuse_tokenizer_and_chunk_plans
+                    operational_body = {
+                        "schema_version": (
+                            "production_role_neutral_htr_operational_attestation_v2"
+                        ),
+                        "controls": controls.as_dict(),
+                        "scientific_training_batch_size": (
+                            controls.training_batch_size
+                        ),
+                        "training_batch_override_applied": False,
+                        "scientific_sentence_encoder_batch_size": (
+                            controls.sentence_encoder_batch_size
+                        ),
+                        "effective_sentence_encoder_batch_size": (
+                            controls.sentence_encoder_batch_size
+                        ),
+                        "fit_reusable_plan": (
+                            {
+                                "content_sha256": "a" * 64,
+                                "unique_note_count": 1,
+                                "unique_chunk_count": 1,
+                                "parallel_plan_task_count": (
+                                    1 if controls.data_loader_workers else 0
+                                ),
+                                "parallel_plan_thread_count": (
+                                    1 if controls.data_loader_workers else 0
+                                ),
+                                "positive_data_loader_workers_exercised": (
+                                    controls.data_loader_workers > 0
+                                ),
+                            }
+                            if reuse
+                            else None
+                        ),
+                        "exact_heldout_reusable_plan": (
+                            {
+                                "content_sha256": "b" * 64,
+                                "unique_note_count": 1,
+                                "unique_chunk_count": 1,
+                                "parallel_plan_task_count": (
+                                    1 if controls.data_loader_workers else 0
+                                ),
+                                "parallel_plan_thread_count": (
+                                    1 if controls.data_loader_workers else 0
+                                ),
+                                "positive_data_loader_workers_exercised": (
+                                    controls.data_loader_workers > 0
+                                ),
+                            }
+                            if reuse
+                            else None
+                        ),
+                        "cache_capacities_nonbinding": True,
+                        "positive_data_loader_workers_exercised": True,
+                        "replay_comparison_policy": (
+                            "allclose_and_exact_discrete_state_v1"
+                        ),
+                        "replay_relative_tolerance": 1e-4,
+                        "replay_absolute_tolerance": 1e-5,
+                        "operational_predictions_within_declared_tolerance_of_scientific_replay": True,
+                        "complete_artifact_equality_decided_by_benchmark": True,
+                        "raw_text_persisted_in_operational_attestation": False,
+                        "semantic_truncation_applied": False,
+                    }
+                    return RoleNeutralOperationalComponentReport(
+                        component="htr",
+                        attestation={
+                            **operational_body,
+                            "content_sha256": _sha(operational_body),
+                        },
+                    )
+                return None
 
             def authenticate():
                 self.events.append(
@@ -311,6 +395,84 @@ class _ProducerRecorder:
         )
 
 
+def test_accelerator_owner_emits_six_direct_closed_component_intervals(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    owner, members = plan.physical_scope_groups[0]
+    task = RoleNeutralPhysicalOwnerTask(
+        plan=plan,
+        physical_owner=owner,
+        logical_members=members,
+        component_parent=(tmp_path / "interval-components").resolve(),
+        resource="cuda:3",
+        neural_query_execution_topology=(
+            NeuralQueryExecutionTopology(
+                devices=("cuda:3", "cuda:8"),
+            )
+        ),
+    )
+    result = _execute_one_owner(
+        task=task,
+        factories=_ProducerRecorder().factories().as_mapping(),
+    )
+    intervals = validate_role_neutral_component_execution_intervals(
+        execution_telemetry=result.execution_telemetry,
+        expected_physical_owner_scope_id=owner.scope_id,
+        expected_primary_resource="cuda:3",
+        expected_neural_query_resources=("cuda:3", "cuda:8"),
+    )
+
+    assert tuple(row["component"] for row in intervals) == tuple(
+        EXPECTED_COMPONENT_FAMILIES
+    )
+    assert tuple(row["lane_kind"] for row in intervals) == (
+        "cpu",
+        "gpu",
+        "gpu",
+        "cpu",
+        "cpu",
+        "gpu",
+    )
+    assert tuple(row["resource_ids"] for row in intervals) == (
+        ["host_cpu"],
+        ["cuda:3"],
+        ["cuda:3"],
+        ["host_cpu"],
+        ["host_cpu"],
+        ["cuda:3", "cuda:8"],
+    )
+    assert all(
+        row["physical_owner_scope_id"] == owner.scope_id
+        and row["timestamps_measured_directly"] is True
+        and row["status"] == "completed"
+        and row["finished_monotonic_ns"] > row["started_monotonic_ns"]
+        for row in intervals
+    )
+    assert all(
+        left["finished_monotonic_ns"]
+        <= right["started_monotonic_ns"]
+        for left, right in zip(intervals, intervals[1:])
+    )
+
+    for mutation in ("missing", "reordered", "tampered"):
+        changed = copy.deepcopy(dict(result.execution_telemetry))
+        rows = changed["component_execution_intervals"]
+        if mutation == "missing":
+            rows.pop()
+        elif mutation == "reordered":
+            rows[0], rows[1] = rows[1], rows[0]
+        else:
+            rows[-1]["resource_ids"] = ["cuda:8", "cuda:3"]
+        with pytest.raises(ValueError, match="component execution"):
+            validate_role_neutral_component_execution_intervals(
+                execution_telemetry=changed,
+                expected_physical_owner_scope_id=owner.scope_id,
+                expected_primary_resource="cuda:3",
+                expected_neural_query_resources=("cuda:3", "cuda:8"),
+            )
+
+
 def test_executes_derived_physical_owners_once_and_publishes_all_ten(
     tmp_path: Path,
 ):
@@ -338,6 +500,21 @@ def test_executes_derived_physical_owners_once_and_publishes_all_ten(
     assert manifest["logical_scope_count"] == len(plan.scopes)
     assert manifest["deduplicated_fit_count"] == 5
     assert manifest["every_component_executed_and_authenticated_once_per_owner"] is True
+    assert manifest["productive_compute_canary_completed"] is False
+    assert manifest["selected_canary_replica_adopted_as_production"] is False
+    assert manifest["compute_canary_scientific_equality"] is None
+    assert not (root / "compute_canary_attestation.json").exists()
+    execution_attestation = json.loads(
+        (root / "execution_attestation.json").read_text(encoding="utf-8")
+    )
+    assert execution_attestation["compute_canary"] is None
+    assert execution_attestation["compute_canary_replica_execution_count"] == 0
+    assert (
+        execution_attestation[
+            "compute_canary_additional_physical_execution_count"
+        ]
+        == 0
+    )
     assert executor.submitted == plan.physical_execution_order
     assert executor.max_workers == 4
     assert executor.cpu_budget == 8

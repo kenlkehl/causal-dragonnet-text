@@ -12,12 +12,15 @@ import pytest
 
 import oci.inference.production_stage1_cluster_preflight_artifact_v2 as v2
 from oci.inference.role_neutral_embedding_group_execution import (
+    load_canonical_clustered_preflight_state_bundle,
+    seal_canonical_clustered_preflight_state_bundle,
     seal_canonical_clustered_preflight_scope_state,
 )
 from tests.test_production_stage1_cluster_preflight_artifact import (
     _fixture_values as _v1_fixture_values,
 )
 from tests.test_role_neutral_embedding_group_execution import (
+    _one_physical_group_plan,
     _preflight_and_states,
     _request as _embedding_request,
     _texts,
@@ -463,8 +466,10 @@ def test_physical_storage_attestation_must_match_parquet_bytes(
 def test_role_neutral_state_sealing_consumes_lazy_portable_owner_handle(
     tmp_path: Path,
     portable_validators,
+    monkeypatch,
 ):
-    embedding_request = _embedding_request()
+    plan = _one_physical_group_plan()
+    embedding_request = _embedding_request(plan)
     texts = _texts()
     cache = _write_cache(tmp_path / "cache", texts=texts)
     legacy, _legacy_state, kmeans, svds = _preflight_and_states(
@@ -524,6 +529,51 @@ def test_role_neutral_state_sealing_consumes_lazy_portable_owner_handle(
         )
         assert state.scope_record["cluster_fit_identity"] == fit
         assert portable.owner_fit_identity(owner) == fit
+        captured = {
+            owner: {
+                "schema_version": (
+                    "production_stage1_cluster_preflight_scope_state_capture_v2"
+                ),
+                "scope_id": owner,
+                "cluster_fit_identity_content_sha256": fit["content_sha256"],
+                "kmeans_state": kmeans,
+                "svd_states": svds,
+                "captured_from_canonical_preflight_fit": True,
+                "refit_performed_for_state_capture": False,
+            }
+        }
+        bundle = seal_canonical_clustered_preflight_state_bundle(
+            output_root=(tmp_path / "portable_state_bundle").resolve(),
+            preflight=portable,
+            plan=plan,
+            captured_scope_states=captured,
+        )
+        portable._owner_fit_cache.clear()
+        reads = 0
+        original_reader = v2._read_owner_parquet
+
+        def counted_reader(*args, **kwargs):
+            nonlocal reads
+            reads += 1
+            return original_reader(*args, **kwargs)
+
+        monkeypatch.setattr(v2, "_read_owner_parquet", counted_reader)
+        reopened = load_canonical_clustered_preflight_state_bundle(
+            manifest_path=(
+                bundle.root / "cluster_state_bundle_manifest.json"
+            ),
+            preflight=portable,
+            plan=plan,
+        )
+        assert reads == 0
+        assert set(reopened.states) == {owner}
+        assert reopened.manifest_path_for_owner(owner).is_file()
+        assert reads == 0
+        loaded = reopened.load_state_for_owner(owner)
+        assert loaded.content_sha256 == state.content_sha256
+        assert reads == 1
+        assert reopened.load_state_for_owner(owner) is loaded
+        assert reads == 1
     finally:
         _make_writable(portable.root)
 

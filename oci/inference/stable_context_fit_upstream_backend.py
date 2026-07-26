@@ -50,8 +50,11 @@ _ROLES = frozenset(
         UNCALIBRATED_EFFECT_MODIFIER_ROLE,
     }
 )
-_MAX_SIGNED_ORDER_WIDTH = 256
 _NAMESPACE_PATTERN = re.compile(r"[a-z][a-z0-9_]*\Z")
+
+
+class RawFeatureFamilyCapacityOverflowError(RuntimeError):
+    """A fixed-width family cannot represent every supplied child coordinate."""
 
 
 def _safe_string(value: Any, *, name: str) -> str:
@@ -103,8 +106,8 @@ def _positive_width(value: Any) -> int:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
         raise TypeError("signed_order_width must be an integer")
     result = int(value)
-    if result < 1 or result > _MAX_SIGNED_ORDER_WIDTH:
-        raise ValueError(f"signed_order_width must be between 1 and {_MAX_SIGNED_ORDER_WIDTH}")
+    if result < 1:
+        raise ValueError("signed_order_width must be positive")
     return result
 
 
@@ -395,11 +398,17 @@ class CrossFitStableUpstreamBackend:
         matrix = np.asarray(values, dtype=float)
         if matrix.ndim != 2 or matrix.shape[0] != rows or matrix.shape[1] < 1:
             raise ValueError("raw feature family has an invalid matrix shape")
+        if matrix.shape[1] > width:
+            raise RawFeatureFamilyCapacityOverflowError(
+                "raw feature family contains "
+                f"{matrix.shape[1]} child columns, exceeding its explicit "
+                f"signed_order_width={width}; refusing silent child-column omission"
+            )
         if not np.isfinite(matrix).all():
             raise ValueError("raw feature family contains non-finite values")
         signed_descending = np.sort(matrix, axis=1, kind="stable")[:, ::-1]
         ordered = np.zeros((rows, width), dtype=float)
-        copied = min(width, signed_descending.shape[1])
+        copied = signed_descending.shape[1]
         ordered[:, :copied] = signed_descending[:, :copied]
         columns = [
             np.mean(matrix, axis=1),
@@ -527,4 +536,5 @@ __all__ = [
     "CrossFitStableUpstreamSchemaConfig",
     "PrecommittedCalibratedSource",
     "PrecommittedRawFeatureFamily",
+    "RawFeatureFamilyCapacityOverflowError",
 ]

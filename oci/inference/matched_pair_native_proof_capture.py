@@ -15,6 +15,7 @@ import os
 import re
 import tempfile
 import threading
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -85,6 +86,8 @@ def _json_default(value: Any) -> Any:
         return value.item()
     if isinstance(value, np.ndarray):
         return value.tolist()
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
     raise TypeError(f"value is not JSON serializable: {type(value).__name__}")
 
 
@@ -439,9 +442,9 @@ def _predict_htr_pair(
     batch_size: int,
 ) -> np.ndarray:
     if pairs.empty:
-        return np.zeros(0, dtype=float)
+        return np.zeros(0, dtype=np.float64)
     if model is None:
-        return np.zeros(len(pairs), dtype=float)
+        return np.zeros(len(pairs), dtype=np.float64)
     control = pairs["control_text"].astype(str).tolist()
     treated = pairs["treated_text"].astype(str).tolist()
     outputs = []
@@ -449,8 +452,18 @@ def _predict_htr_pair(
     with torch.no_grad():
         for start in range(0, len(pairs), max(1, int(batch_size))):
             end = start + max(1, int(batch_size))
-            outputs.append(model(control[start:end], treated[start:end]).detach().cpu().numpy())
-    return np.concatenate(outputs) if outputs else np.zeros(0, dtype=float)
+            outputs.append(
+                model(control[start:end], treated[start:end])
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64, copy=False)
+            )
+    return (
+        np.concatenate(outputs)
+        if outputs
+        else np.zeros(0, dtype=np.float64)
+    )
 
 
 class NativeMatchedPairProofCaptureSink:

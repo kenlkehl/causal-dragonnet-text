@@ -51,7 +51,10 @@ from .tfidf_safe_artifacts import (
     INDEX_FILENAME,
     load_fitted_topic_context,
 )
-from .tfidf_upstream_gate_backend import TFIDF_CONTEXT_BACKEND_ID
+from .tfidf_upstream_gate_backend import (
+    TFIDF_CONTEXT_BACKEND_ID,
+    TfidfOrphanFeatureCapacityOverflowError,
+)
 
 SHARED_TFIDF_FIT_SERVICE_ID = "in_memory_shared_tfidf_context_fit_service_v2"
 SHARED_TFIDF_SPENT_BACKEND_ID = "shared_tfidf_spent_discovery_backend_v2"
@@ -70,6 +73,26 @@ _REQUIRED_EFFECT_SCORE_COLUMNS = frozenset(
     }
 )
 _FORBIDDEN_IDENTITY_TOKENS = ("true", "oracle", "ground_truth")
+
+
+def _optional_positive_capacity(value: Any, *, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be a positive integer or None")
+    result = int(value)
+    if result < 1:
+        raise ValueError(f"{name} must be a positive integer or None")
+    return result
+
+
+def _positive_integer(value: Any, *, name: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be a positive integer")
+    result = int(value)
+    if result < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return result
 
 
 def _canonical_json(value: Any) -> str:
@@ -285,7 +308,11 @@ def _fit_source_identity(value: Mapping[str, Any], *, path: str) -> dict[str, An
     if not isinstance(closed, dict):
         raise TypeError(f"{path} must be a mapping")
     result = copy.deepcopy(closed)
-    for field_name in ("max_orphan_features", "minimum_orphan_arm_support"):
+    for field_name in (
+        "max_orphan_features",
+        "minimum_orphan_arm_support",
+        "minimum_orphan_arm_support_source",
+    ):
         if field_name not in result:
             raise ValueError(f"{path} lacks required transform field {field_name}")
         result.pop(field_name)
@@ -420,9 +447,7 @@ def _snapshot_fitted_context(
 
 
 def _load_fitted_context(payload: Sequence[tuple[str, bytes]]) -> FittedTopicContext:
-    if not payload or [name for name, _raw in payload] != sorted(
-        name for name, _raw in payload
-    ):
+    if not payload or [name for name, _raw in payload] != sorted(name for name, _raw in payload):
         raise ValueError("current-process fitted TF-IDF inventory is empty or reordered")
     with tempfile.TemporaryDirectory(prefix="oci-shared-tfidf-safe-") as temporary:
         root = Path(temporary) / "fitted_context"
@@ -535,6 +560,7 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
             "fit_identity_excludes_transform_only_fields": [
                 "max_orphan_features",
                 "minimum_orphan_arm_support",
+                "minimum_orphan_arm_support_source",
             ],
             "storage": "private_current_process_memory_only",
             "cross_run_artifact_or_joblib_acceptance": False,
@@ -731,7 +757,7 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
         metadata: Mapping[str, Any],
         scores: pd.DataFrame,
         gate_texts: tuple[str, ...],
-        max_orphan_features: int,
+        max_orphan_features: int | None,
         minimum_orphan_arm_support: int,
     ) -> tuple[tuple[str, ...], np.ndarray]:
         represented = _represented_topic_terms(metadata, "effect")
@@ -750,17 +776,24 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
         )
         vectorizer = fitted.common_vectorizer
         selected_terms: list[str] = []
+        selected_term_set: set[str] = set()
         selected_columns: list[int] = []
         for term in candidates["feature"].astype(str):
             column = vectorizer.vocabulary_.get(term)
-            if column is None or term in selected_terms:
+            if column is None or term in selected_term_set:
                 continue
             selected_terms.append(term)
+            selected_term_set.add(term)
             selected_columns.append(int(column))
-            if len(selected_terms) >= int(max_orphan_features):
-                break
         if not selected_terms:
             raise RuntimeError("context-fitted TF-IDF model produced no eligible orphan n-grams")
+        if max_orphan_features is not None and len(selected_terms) > max_orphan_features:
+            raise TfidfOrphanFeatureCapacityOverflowError(
+                "context-fitted TF-IDF model produced "
+                f"{len(selected_terms)} eligible orphan n-grams, exceeding "
+                f"max_orphan_features={max_orphan_features}; refusing silent "
+                "orphan-feature omission"
+            )
         matrix = vectorizer.transform(list(gate_texts))[:, selected_columns]
         values = np.asarray(matrix.toarray(), dtype=float)
         names = tuple(
@@ -779,7 +812,7 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
         context_outcome: Any,
         gate_row_ids: Sequence[int],
         gate_texts: Sequence[str],
-        max_orphan_features: int,
+        max_orphan_features: int | None,
         minimum_orphan_arm_support: int,
     ) -> ContextFitUpstreamPrediction | None:
         """Return a transform-only hit, or ``None`` for mandatory delegation."""
@@ -801,8 +834,14 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
         if set(rows) & set(gate_rows):
             raise ValueError("shared TF-IDF context and gate rows must be disjoint")
         exact_gate_texts = _texts(gate_texts, name="gate_texts", length=len(gate_rows))
-        if int(max_orphan_features) < 1 or int(minimum_orphan_arm_support) < 1:
-            raise ValueError("shared TF-IDF orphan limits must be positive")
+        orphan_capacity = _optional_positive_capacity(
+            max_orphan_features,
+            name="max_orphan_features",
+        )
+        orphan_arm_support = _positive_integer(
+            minimum_orphan_arm_support,
+            name="minimum_orphan_arm_support",
+        )
         self._verify_snapshot(snapshot)
         metadata = _parse_json_bytes(
             snapshot.metadata_json,
@@ -851,8 +890,8 @@ class InMemorySharedTfidfContextFitService(_SealedRuntimeMethodInstances):
             metadata=metadata,
             scores=scores,
             gate_texts=exact_gate_texts,
-            max_orphan_features=int(max_orphan_features),
-            minimum_orphan_arm_support=int(minimum_orphan_arm_support),
+            max_orphan_features=orphan_capacity,
+            minimum_orphan_arm_support=orphan_arm_support,
         )
         for column, name in enumerate(orphan_names):
             names.append(name)
@@ -1169,7 +1208,7 @@ class SharedTfidfContextBackend(_SealedRuntimeMethodInstances):
             context_outcome=kwargs["context_outcome"],
             gate_row_ids=kwargs["gate_row_ids"],
             gate_texts=kwargs["gate_texts"],
-            max_orphan_features=int(self.backend.max_orphan_features),
+            max_orphan_features=self.backend.max_orphan_features,
             minimum_orphan_arm_support=int(self.backend.minimum_orphan_arm_support),
         )
         if reused is not None:

@@ -6463,20 +6463,34 @@ def summarize_extractions(
 def _clinical_text_examples(
     dataset: pd.DataFrame,
     text_column: str,
-    n_examples: int = 3,
-    max_chars: int = 1600,
+    *,
+    n_examples: int | None,
+    max_chars: int | None,
 ) -> List[str]:
     if text_column not in dataset.columns or len(dataset) == 0:
         return []
-    sample = dataset.sample(
-        n=min(n_examples, len(dataset)),
-        random_state=17,
-    )
-    return [
-        str(text)[:max_chars]
-        for text in sample[text_column].fillna("").tolist()
-        if str(text).strip()
+    nonempty = [
+        str(text) for text in dataset[text_column].fillna("").tolist() if str(text).strip()
     ]
+    if n_examples == 0:
+        return []
+    if n_examples is not None:
+        sample = dataset.loc[
+            dataset[text_column].fillna("").astype(str).str.strip().ne("")
+        ].sample(
+            n=min(int(n_examples), len(nonempty)),
+            random_state=17,
+        )
+        nonempty = [str(text) for text in sample[text_column].fillna("").tolist()]
+    if max_chars is not None:
+        oversized = [len(text) for text in nonempty if len(text) > int(max_chars)]
+        if oversized:
+            raise ValueError(
+                f"clinical-text prompt input contains a {max(oversized)}-character "
+                f"note, exceeding configured clinical_text_example_chars="
+                f"{int(max_chars)}; refusing silent note truncation"
+            )
+    return nonempty
 
 
 def _coverage_failures(

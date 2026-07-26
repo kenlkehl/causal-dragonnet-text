@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from tests.resource_safety_test_support import resource_safety_policy
+
 import oci.inference.production_role_neutral_stage2_handoff as handoff_module
 from oci.inference.all_evidence_discovery_interfaces import (
     ACTIVE_STAGE1_CONCEPT_FAMILIES,
@@ -61,6 +63,7 @@ from oci.inference.production_stage1_role_neutral_execution import (
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
 )
+from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_all_ten_binding import (
     AuthenticatedRoleNeutralComponentReceipt,
     EXPECTED_COMPONENT_FAMILIES,
@@ -68,6 +71,9 @@ from oci.inference.role_neutral_all_ten_binding import (
 from tests.test_lossless_stage1_evidence_catalog import (
     _cumulative_family_payloads,
     _inputs,
+)
+from tests.test_native_role_neutral_payload_catalog_adapter import (
+    _native_payloads,
 )
 from tests.test_production_stage1_role_neutral_execution import (
     _ProducerRecorder,
@@ -84,7 +90,7 @@ def _cpu_resource_plan() -> ResourcePlan:
         cpu_budget=4,
         inventory=ResourceInventory(cpu_count=32, gpus=()),
         policy=("cpu",),
-        resource_performance_safety=ResourcePerformanceSafetyPolicy(
+        resource_performance_safety=resource_safety_policy(
             gpu_max_allocation_fraction=0.85,
             gpu_minimum_headroom_bytes=6 * 1024**3,
             minimum_multi_device_throughput_ratio=1.5,
@@ -224,15 +230,21 @@ class _ProviderReadyProducerRecorder(_ProducerRecorder):
         return bind
 
 
-def _provider_ready_execution(tmp_path: Path):
-    source_catalog = build_role_neutral_evidence_catalog(_inputs())
-    family_payloads = _cumulative_family_payloads(source_catalog)
+def _provider_ready_execution(
+    tmp_path: Path,
+    *,
+    family_payloads=None,
+):
+    if family_payloads is None:
+        source_catalog = build_role_neutral_evidence_catalog(_inputs())
+        family_payloads = _cumulative_family_payloads(source_catalog)
     assert set(family_payloads) == set(ACTIVE_STAGE1_CONCEPT_FAMILIES)
     registry = _registry()
     plan = build_canonical_stage1_scope_plan(
         registry=registry,
         registry_content_sha256=_sha(registry),
         global_seed=42,
+        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         review_rounds=2,
         initial_training_partitions=3,
@@ -515,6 +527,52 @@ def test_authenticated_provider_serves_lossless_catalog_without_raw_fallback(
 
     with pytest.raises(RuntimeError, match="raw-input"):
         provider.get_spent_evidence_inputs()
+
+
+def test_authenticated_provider_accepts_real_shaped_native_all_ten_payloads(
+    tmp_path: Path,
+) -> None:
+    payloads = _native_payloads()
+    plan, _root, _manifest, provider = _provider_ready_execution(
+        tmp_path,
+        family_payloads=payloads,
+    )
+    scope = next(
+        scope
+        for scope in plan.scopes
+        if scope.outer_fold == 1
+        and scope.scope_kind == "cumulative_spent"
+        and scope.context_epoch == 0
+    )
+    catalog = provider.get_spent_evidence_catalog(
+        outer_fold=scope.outer_fold,
+        review_round=scope.context_epoch,
+        exact_spent_row_ids=scope.fit_row_ids,
+        exact_sealed_row_ids=scope.heldout_row_ids,
+        spent_texts=tuple(_fit_text(row_id) for row_id in scope.fit_row_ids),
+        spent_treatment=np.asarray(
+            [_fit_treatment(row_id) for row_id in scope.fit_row_ids],
+            dtype=np.float64,
+        ),
+        spent_outcome=np.asarray(
+            [_fit_outcome(row_id) for row_id in scope.fit_row_ids],
+            dtype=np.float64,
+        ),
+    )
+
+    assert all(catalog.family_atoms(family) for family in ACTIVE_STAGE1_CONCEPT_FAMILIES)
+    assert all(
+        catalog.audit["native_payload_adapter_by_family"][family][
+            "adapter_applied"
+        ]
+        is True
+        for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
+    )
+    assert (
+        catalog.audit["native_payload_adapter_selection_or_truncation_applied"]
+        is False
+    )
+    assert catalog.audit["family_payload_roundtrip_verified"] is True
 
 
 def test_authenticated_provider_rejects_runtime_projection_drift(

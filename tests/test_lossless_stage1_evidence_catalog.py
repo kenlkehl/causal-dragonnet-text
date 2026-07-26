@@ -263,7 +263,7 @@ def _inputs(*, reverse: bool = False) -> list[FoldEvidenceInput]:
 
 
 def _current_spent_provider_identity() -> dict:
-    provider_code_sha256 = "6978aa0419a89a0b74a7c187ef1580bfc857ace49159726d2681fc1f0a2d5916"
+    provider_code_sha256 = "681cb3cbb26302e6acd4c42f1d8c023ce37e644b48a9766946d2493daa4e3d5c"
     return {
         "provider": "context_fit_review_spent_evidence_provider_v3",
         "provider_code_sha256": provider_code_sha256,

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
+import functools
 import hashlib
 import inspect
 import json
+import logging
 import math
 import os
 import shutil
@@ -14,14 +17,17 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from threading import RLock
+from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 from ..config import ClusterLocalEmbeddingScientificConfig
 from .production_authenticated_tree_cache import (
     AUTHENTICATED_DIRECTORY_TREE_POLICY,
+    AuthenticatedDirectoryTreeDriftError,
     authenticate_directory_tree,
 )
 from .production_stage1_bundle import (
@@ -35,7 +41,9 @@ from .production_text_preparation import (
 )
 from .portable_artifacts import (
     ArtifactCompatibility,
+    COMPLETE_PAYLOAD_TREE,
     MANIFEST_NAME,
+    REGISTERED_PAYLOAD_PATHS_ONLY,
     ValidatedPortableArtifact,
     adopt_checkpoint,
     assert_validated_artifact_unchanged,
@@ -43,6 +51,13 @@ from .portable_artifacts import (
     publish_portable_reference_artifact,
     validate_checkpoint_adoption,
     validate_portable_artifact,
+)
+from .operator_trusted_checkpoint_adoption import (
+    OPERATOR_TRUSTED_VALIDATION_POLICY,
+    OperatorTrustedCheckpoint,
+    adopt_checkpoint_from_prior_full_byte_attestation,
+    validate_operator_trusted_checkpoint_adoption,
+    validate_operator_trusted_portable_artifact,
 )
 from .performance_telemetry import TelemetryLedger
 from .portable_workflow_spec import (
@@ -67,6 +82,15 @@ from .portable_workflow_spec import (
 from .scientific_profile_identity import (
     scientific_profile_file_identity,
 )
+from .stage1_execution_topology_policy import (
+    SUPPORTED_STAGE1_EXECUTION_TOPOLOGY_MODES,
+    Stage1ExecutionTopologyPolicy,
+)
+from .stage1_htr_operational_controls import (
+    RoleNeutralHTROperationalControls,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 WORKFLOW_SCHEMA = "production_all_evidence_workflow_v5"
 PHASES = (
@@ -96,10 +120,63 @@ WORKFLOW_CHECKPOINT_PUBLICATION_ATTESTATION_SCHEMA = (
     "production_workflow_checkpoint_publication_attestation_v1"
 )
 WORKFLOW_CHECKPOINT_DAG_VALIDATION_SCHEMA = "production_workflow_checkpoint_dag_validation_v1"
+OPERATOR_TRUSTED_LEGACY_PHASE_PROJECTION_SCHEMA = (
+    "operator_trusted_legacy_phase_compatibility_projection_v1"
+)
+WORKFLOW_GRANULAR_CHECKPOINT_INDEX_SCHEMA = (
+    "production_workflow_granular_checkpoint_index_v1"
+)
+WORKFLOW_GRANULAR_CHECKPOINT_NODE_SCHEMA = (
+    "production_workflow_granular_checkpoint_node_v1"
+)
+WORKFLOW_GRANULAR_CHECKPOINT_LOCATOR_SCHEMA = (
+    "production_workflow_granular_checkpoint_locator_v1"
+)
+WORKFLOW_EXPECTED_GRANULAR_PLAN_SCHEMA = (
+    "production_workflow_expected_granular_checkpoint_plan_v2"
+)
+GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS: Mapping[str, str] = {
+    "prepared_stage1_context": (
+        "production_prepared_stage1_context_checkpoint_v1"
+    ),
+    "tfidf_component": "production_stage1_tfidf_component_checkpoint_v1",
+    "neural_query_component": (
+        "production_stage1_neural_query_component_checkpoint_v1"
+    ),
+    "physical_scope_fit": (
+        "production_stage1_physical_scope_fit_checkpoint_v1"
+    ),
+    "logical_scope_bindings": (
+        "production_stage1_logical_scope_binding_checkpoint_v1"
+    ),
+    "row_map": "production_stage1_row_map_checkpoint_v1",
+    "stage2_response_component": (
+        "production_stage2_response_component_checkpoint_v1"
+    ),
+    "stage2_extraction_component": (
+        "production_stage2_extraction_component_checkpoint_v1"
+    ),
+    "stage2_review_component": (
+        "production_stage2_review_component_checkpoint_v1"
+    ),
+    "stage2_fold": "production_stage2_fold_checkpoint_v1",
+}
 WORKFLOW_LEGACY_PREFLIGHT_DECISION_SCHEMA = (
     "production_workflow_legacy_preflight_recompute_decision_v1"
 )
 WORKFLOW_TERMINAL_VALIDATION_SCHEMA = "production_all_evidence_fresh_terminal_validation_v1"
+WORKFLOW_RUN_CONTROL_SELECTION_SCHEMA = (
+    "production_all_evidence_run_control_selection_v1"
+)
+WORKFLOW_VALIDATION_ACHIEVEMENT_SCHEMA = (
+    "production_all_evidence_validation_achievement_v1"
+)
+WORKFLOW_VALIDATION_POLICY_SCHEMA = (
+    "production_all_evidence_validation_minimum_policy_v1"
+)
+WORKFLOW_STRUCTURED_LOG_EVENT_SCHEMA = (
+    "production_all_evidence_structured_log_event_v1"
+)
 SOURCE_SNAPSHOT_EXECUTION_ENV = "OCI_PRODUCTION_SOURCE_SNAPSHOT_SHA256"
 
 ADOPTABLE_PHASE_BY_ARTIFACT_KIND = {
@@ -109,6 +186,25 @@ ADOPTABLE_PHASE_BY_ARTIFACT_KIND = {
     "stage1_handoff": "stage1_modeling",
     "stage2_canary": "stage2_canary",
     "frozen_prediction": "stage2_inference",
+}
+CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND = {
+    "prepared_cohort": "input_preparation",
+    "embedding_cache": "embedding_cache",
+    "clustered_preflight": "stage1_preflight",
+    "prepared_stage1_context": "stage1_preflight",
+    "physical_scope_fit": "stage1_modeling",
+    "logical_scope_bindings": "stage1_modeling",
+    "tfidf_component": "stage1_modeling",
+    "neural_query_component": "stage1_modeling",
+    "stage1_handoff": "stage1_modeling",
+    "row_map": "stage1_modeling",
+    "stage2_canary": "stage2_canary",
+    "stage2_response_component": "stage2_inference",
+    "stage2_extraction_component": "stage2_inference",
+    "stage2_review_component": "stage2_inference",
+    "stage2_fold": "stage2_inference",
+    "frozen_prediction": "stage2_inference",
+    "oracle_evaluation": "oracle_evaluation",
 }
 _REQUIRED_ADOPTED_ANCESTOR_KIND = {
     "embedding_cache": "prepared_cohort",
@@ -302,13 +398,291 @@ def _require_adopted_compact_preflight_parquet_compression(
         )
 
 
+def _reconstruct_granular_checkpoint_index_from_artifacts(
+    *,
+    phase: str,
+    artifacts: Sequence[ValidatedPortableArtifact],
+) -> Mapping[str, Any]:
+    """Rebuild the path-neutral granular index from authenticated nodes."""
+
+    descriptors: list[dict[str, Any]] = []
+    for ordinal, artifact in enumerate(artifacts):
+        metadata = dict(artifact.artifact_metadata)
+        descriptors.append(
+            {
+                "node_ordinal": ordinal,
+                "node_key": metadata.get("node_key"),
+                "artifact_id": artifact.artifact_id,
+                "artifact_kind": artifact.manifest["artifact_kind"],
+                "artifact_schema": artifact.manifest["artifact_schema"],
+                "upstream_artifact_ids": list(
+                    artifact.manifest["upstream_artifact_ids"]
+                ),
+                "artifact_metadata": metadata,
+            }
+        )
+    coverage = _granular_checkpoint_coverage(descriptors)
+    body = {
+        "schema_version": WORKFLOW_GRANULAR_CHECKPOINT_INDEX_SCHEMA,
+        "phase": phase,
+        "node_count": len(descriptors),
+        "nodes": descriptors,
+        "coverage": coverage,
+        "relative_filesystem_layout_included": False,
+    }
+    return {**body, "content_sha256": _sha(body)}
+
+
+def _validate_primary_granular_binding_digests(
+    *,
+    phase: str,
+    primary_metadata: Mapping[str, Any],
+    artifacts: Sequence[ValidatedPortableArtifact],
+) -> Mapping[str, Any]:
+    """Recompute both primary digest claims from authenticated nodes."""
+
+    reconstructed = (
+        _reconstruct_granular_checkpoint_index_from_artifacts(
+            phase=phase,
+            artifacts=artifacts,
+        )
+    )
+    coverage = reconstructed["coverage"]
+    if (
+        list(
+            primary_metadata.get("granular_artifact_ids") or ()
+        )
+        != [artifact.artifact_id for artifact in artifacts]
+        or primary_metadata.get(
+            "granular_index_content_sha256"
+        )
+        != reconstructed["content_sha256"]
+        or primary_metadata.get(
+            "granular_coverage_content_sha256"
+        )
+        != coverage["content_sha256"]
+        or primary_metadata.get(
+            "granular_artifact_kind_counts"
+        )
+        != coverage["artifact_kind_counts"]
+    ):
+        raise ValueError(
+            f"{phase} primary granular digest binding changed"
+        )
+    return reconstructed
+
+
+def _validated_stage1_granular_physical_fit_key(
+    *,
+    metadata: Mapping[str, Any],
+    expected_identity: Any,
+    expected_key_record: Mapping[str, Any],
+) -> tuple[str, Mapping[str, Any]]:
+    from .physical_fit_deduplication import PhysicalFitKey
+
+    key_record = metadata.get("physical_fit_key_record")
+    if not isinstance(key_record, Mapping):
+        raise ValueError(
+            "Stage 1 granular artifact lacks its complete physical-fit key"
+        )
+    key_body = {
+        key: value
+        for key, value in key_record.items()
+        if key != "content_sha256"
+    }
+    key = PhysicalFitKey(**key_body)
+    owner = str(metadata.get("physical_owner_scope_id", ""))
+    if (
+        not owner
+        or key.as_dict() != dict(key_record)
+        or metadata.get("physical_fit_key") != key.key
+        or key.architecture_identity
+        != expected_identity.architecture_identity
+        or key.target != expected_identity.target
+        or key.scientific_configuration_identity
+        != expected_identity.scientific_configuration_identity
+        or key.producer_identity
+        != expected_identity.producer_identity
+        or key.runtime_compatibility_class
+        != expected_identity.runtime_compatibility_class
+        or dict(key_record) != dict(expected_key_record)
+    ):
+        raise ValueError(
+            "Stage 1 granular full physical-fit key changed"
+        )
+    return owner, copy.deepcopy(dict(key_record))
+
+
+def _stage1_scope_plan_granular_expectations(
+    *,
+    scope_plan: Any,
+    expected_granular_checkpoint_plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Project exact owner mappings and full keys from one validated plan."""
+
+    granular_plan = _validate_expected_granular_checkpoint_plan(
+        expected_granular_checkpoint_plan
+    )
+    physical_owners = [
+        scope.scope_id for scope in scope_plan.physical_scopes
+    ]
+    logical_scopes = [scope.scope_id for scope in scope_plan.scopes]
+    logical_to_owner = {
+        scope.scope_id: scope_plan.physical_owner(scope.scope_id).scope_id
+        for scope in scope_plan.scopes
+    }
+    if (
+        physical_owners
+        != list(granular_plan["stage1_physical_owner_scope_ids"])
+        or logical_scopes
+        != list(granular_plan["stage1_logical_scope_ids"])
+        or logical_to_owner
+        != dict(
+            granular_plan["stage1_logical_to_physical_owner"]
+        )
+    ):
+        raise ValueError(
+            "authenticated Stage 1 content groups differ from the request plan"
+        )
+    return {
+        "physical_owner_scope_ids": physical_owners,
+        "logical_scope_ids": logical_scopes,
+        "logical_to_physical_owner": logical_to_owner,
+        "physical_fit_key_records_by_owner": {
+            owner: scope_plan.physical_fit_key(owner).as_dict()
+            for owner in physical_owners
+        },
+    }
+
+
+def _load_authenticated_current_stage1_scope_plan(
+    *,
+    prepared_context_artifact: ValidatedPortableArtifact,
+    expected_granular_checkpoint_plan: Mapping[str, Any],
+    expected_stage1_physical_fit_identity: Mapping[str, Any],
+    expected_global_seed: int,
+) -> Any:
+    """Rebuild the current row-level plan from an authenticated context."""
+
+    from .prepared_stage1_context import (
+        PREPARED_STAGE1_CONTEXT_MANIFEST_NAME,
+        load_prepared_stage1_context,
+    )
+    from .production_stage1_scope_scheduler import (
+        Stage1PhysicalFitIdentity,
+        build_canonical_stage1_scope_plan,
+    )
+
+    assert_validated_artifact_unchanged(prepared_context_artifact)
+    if (
+        prepared_context_artifact.manifest.get("artifact_kind")
+        != "prepared_stage1_context"
+    ):
+        raise ValueError(
+            "Stage 1 full-key validation requires its prepared context"
+        )
+    manifest_rows = [
+        row
+        for row in prepared_context_artifact.payloads
+        if row.relative_path == PREPARED_STAGE1_CONTEXT_MANIFEST_NAME
+    ]
+    if len(manifest_rows) != 1:
+        raise ValueError(
+            "prepared Stage 1 context has no unique authenticated manifest"
+        )
+    context = load_prepared_stage1_context(
+        prepared_context_artifact.payload_root
+        / manifest_rows[0].relative_path
+    )
+    granular_plan = _validate_expected_granular_checkpoint_plan(
+        expected_granular_checkpoint_plan
+    )
+    scientific = context.scientific_identity
+    projection = scientific.get(
+        "stage1_request_scientific_projection"
+    )
+    exact_request = context.execution_locators.get(
+        "exact_stage1_request"
+    )
+    registry = scientific.get("split_registry")
+    raw_scope_plan = (
+        exact_request.get("stage1_scope_plan")
+        if isinstance(exact_request, Mapping)
+        else None
+    )
+    projected_scope_plan = (
+        projection.get("stage1_scope_plan")
+        if isinstance(projection, Mapping)
+        else None
+    )
+    if (
+        not isinstance(registry, Mapping)
+        or not isinstance(raw_scope_plan, Mapping)
+        or not isinstance(projected_scope_plan, Mapping)
+    ):
+        raise ValueError(
+            "prepared Stage 1 context lacks its authenticated scope plan"
+        )
+    expected_identity = Stage1PhysicalFitIdentity.from_mapping(
+        expected_stage1_physical_fit_identity
+    )
+    rebuilt = build_canonical_stage1_scope_plan(
+        registry=registry,
+        registry_content_sha256=str(
+            scientific["split_registry_content_sha256"]
+        ),
+        global_seed=int(expected_global_seed),
+        physical_fit_identity=expected_identity,
+        gpu_ids=(),
+        review_rounds=int(granular_plan["review_rounds"]),
+        initial_training_partitions=int(
+            granular_plan["initial_training_partitions"]
+        ),
+        scope_workers_per_gpu=1,
+        expected_outer_fold_count=int(
+            granular_plan["outer_fold_count"]
+        ),
+        expected_inner_fold_count=int(
+            granular_plan["inner_partition_count"]
+        ),
+    )
+    if (
+        raw_scope_plan.get("scientific_content_sha256")
+        != rebuilt.scientific_content_sha256
+        or projected_scope_plan.get("scientific_content_sha256")
+        != rebuilt.scientific_content_sha256
+    ):
+        raise ValueError(
+            "prepared Stage 1 context scope plan differs from the current request"
+        )
+    _stage1_scope_plan_granular_expectations(
+        scope_plan=rebuilt,
+        expected_granular_checkpoint_plan=granular_plan,
+    )
+    return rebuilt
+
+
 def _validate_adopted_checkpoint_graph(
     artifacts: Sequence[ValidatedPortableArtifact],
     *,
     allowed_phases: Sequence[str],
+    expected_granular_checkpoint_plan: Mapping[str, Any],
+    expected_stage1_physical_fit_identity: Mapping[str, Any],
+    expected_global_seed: int,
+    require_prepared_stage1_context: bool,
 ) -> Mapping[str, str]:
     """Validate a closed portable DAG and return phase-to-artifact bindings."""
 
+    granular_plan = _validate_expected_granular_checkpoint_plan(
+        expected_granular_checkpoint_plan
+    )
+    from .production_stage1_scope_scheduler import (
+        Stage1PhysicalFitIdentity,
+    )
+
+    expected_fit_identity = Stage1PhysicalFitIdentity.from_mapping(
+        expected_stage1_physical_fit_identity
+    )
     by_id = {artifact.artifact_id: artifact for artifact in artifacts}
     if len(by_id) != len(artifacts):
         raise ValueError("checkpoint adoption cannot register duplicate artifact content")
@@ -366,6 +740,465 @@ def _validate_adopted_checkpoint_graph(
     for artifact_id in by_id:
         visit(artifact_id)
 
+    prepared_contexts = [
+        artifact
+        for artifact in artifacts
+        if artifact.manifest.get("artifact_kind")
+        == "prepared_stage1_context"
+    ]
+    preflight_id = phase_artifacts.get("stage1_preflight")
+    authenticated_prepared_scope_plan: Any | None = None
+    if require_prepared_stage1_context and preflight_id is not None:
+        context = (
+            prepared_contexts[0]
+            if len(prepared_contexts) == 1
+            else None
+        )
+        metadata = (
+            {}
+            if context is None
+            else dict(context.artifact_metadata)
+        )
+        scientific_root = metadata.get(
+            "scientific_content_root_sha256"
+        )
+        if (
+            context is None
+            or context.manifest.get("artifact_schema")
+            != GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS[
+                "prepared_stage1_context"
+            ]
+            or tuple(
+                str(value)
+                for value in context.manifest[
+                    "upstream_artifact_ids"
+                ]
+            )
+            != (preflight_id,)
+            or set(metadata)
+            != {
+                "schema_version",
+                "producer_phase",
+                "node_ordinal",
+                "node_key",
+                "coverage_role",
+                "scientific_content_root_sha256",
+            }
+            or metadata.get("schema_version")
+            != WORKFLOW_GRANULAR_CHECKPOINT_NODE_SCHEMA
+            or metadata.get("producer_phase") != "stage1_preflight"
+            or metadata.get("node_ordinal") != 0
+            or metadata.get("node_key")
+            != "prepared_stage1_context"
+            or metadata.get("coverage_role")
+            != "prepared_stage1_context"
+            or not isinstance(scientific_root, str)
+            or len(scientific_root) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in scientific_root
+            )
+        ):
+            raise ValueError(
+                "adopted prepared Stage 1 context binding is invalid"
+            )
+        authenticated_prepared_scope_plan = (
+            _load_authenticated_current_stage1_scope_plan(
+                prepared_context_artifact=context,
+                expected_granular_checkpoint_plan=granular_plan,
+                expected_stage1_physical_fit_identity=(
+                    expected_stage1_physical_fit_identity
+                ),
+                expected_global_seed=expected_global_seed,
+            )
+        )
+    elif prepared_contexts:
+        raise ValueError(
+            "prepared Stage 1 context requires its typed adopted preflight"
+        )
+
+    for phase in ("stage1_modeling", "stage2_inference"):
+        primary_id = phase_artifacts.get(phase)
+        if primary_id is None:
+            continue
+        expected_stage1_plan_projection: Mapping[str, Any] | None = None
+        expected_component_parent_ids: tuple[str, ...]
+        if phase == "stage1_modeling":
+            if len(prepared_contexts) != 1:
+                raise ValueError(
+                    "adopted Stage 1 requires one authenticated prepared context"
+                )
+            clustered_preflight_id = phase_artifacts.get(
+                "stage1_preflight"
+            )
+            if (
+                clustered_preflight_id is None
+                or tuple(
+                    str(value)
+                    for value in prepared_contexts[
+                        0
+                    ].manifest["upstream_artifact_ids"]
+                )
+                != (clustered_preflight_id,)
+            ):
+                raise ValueError(
+                    "adopted prepared Stage 1 context upstream edge changed"
+                )
+            authenticated_scope_plan = (
+                authenticated_prepared_scope_plan
+            )
+            if authenticated_scope_plan is None:
+                authenticated_scope_plan = (
+                    _load_authenticated_current_stage1_scope_plan(
+                        prepared_context_artifact=prepared_contexts[0],
+                        expected_granular_checkpoint_plan=granular_plan,
+                        expected_stage1_physical_fit_identity=(
+                            expected_stage1_physical_fit_identity
+                        ),
+                        expected_global_seed=expected_global_seed,
+                    )
+                )
+            expected_stage1_plan_projection = (
+                _stage1_scope_plan_granular_expectations(
+                    scope_plan=authenticated_scope_plan,
+                    expected_granular_checkpoint_plan=granular_plan,
+                )
+            )
+            expected_component_parent_ids = (
+                prepared_contexts[0].artifact_id,
+            )
+        else:
+            missing_parent_phases = [
+                parent
+                for parent in PORTABLE_CHECKPOINT_PHASE_SPECS[phase][
+                    "upstream_phases"
+                ]
+                if parent not in phase_artifacts
+            ]
+            if missing_parent_phases:
+                raise ValueError(
+                    f"adopted {phase} lacks exact workflow parents: "
+                    f"{missing_parent_phases}"
+                )
+            expected_component_parent_ids = tuple(
+                phase_artifacts[parent]
+                for parent in PORTABLE_CHECKPOINT_PHASE_SPECS[phase][
+                    "upstream_phases"
+                ]
+            )
+        primary = by_id[primary_id]
+        metadata = primary.artifact_metadata
+        required_metadata_fields = {
+            "schema_version",
+            "producer_phase",
+            "granular_index_content_sha256",
+            "granular_coverage_content_sha256",
+            "granular_artifact_ids",
+            "granular_terminal_artifact_ids",
+            "granular_artifact_kind_counts",
+        }
+        all_ids = metadata.get("granular_artifact_ids")
+        terminal_ids = metadata.get(
+            "granular_terminal_artifact_ids"
+        )
+        kind_counts = metadata.get(
+            "granular_artifact_kind_counts"
+        )
+        if (
+            set(metadata) != required_metadata_fields
+            or metadata.get("schema_version")
+            != "workflow_primary_granular_coverage_binding_v1"
+            or metadata.get("producer_phase") != phase
+            or not isinstance(all_ids, list)
+            or not all_ids
+            or len(all_ids) != len(set(all_ids))
+            or any(artifact_id not in by_id for artifact_id in all_ids)
+            or not isinstance(terminal_ids, list)
+            or not terminal_ids
+            or not set(terminal_ids).issubset(set(all_ids))
+            or not isinstance(kind_counts, Mapping)
+        ):
+            raise ValueError(
+                f"adopted {phase} granular coverage binding is invalid"
+            )
+        phase_granular_ids = {
+            artifact.artifact_id
+            for artifact in artifacts
+            if str(artifact.manifest["artifact_kind"])
+            in GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS
+            and CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.get(
+                str(artifact.manifest["artifact_kind"])
+            )
+            == phase
+        }
+        if set(str(value) for value in all_ids) != phase_granular_ids:
+            raise ValueError(
+                f"adopted {phase} granular index omits or adds nodes"
+            )
+        ordered_granular = tuple(
+            by_id[str(artifact_id)] for artifact_id in all_ids
+        )
+        reconstructed_index = (
+            _validate_primary_granular_binding_digests(
+                phase=phase,
+                primary_metadata=metadata,
+                artifacts=ordered_granular,
+            )
+        )
+        reconstructed_coverage = reconstructed_index["coverage"]
+        expected_counts = dict(
+            granular_plan[
+                (
+                    "stage1_artifact_kind_counts"
+                    if phase == "stage1_modeling"
+                    else "stage2_artifact_kind_counts"
+                )
+            ]
+        )
+        if dict(kind_counts) != expected_counts:
+            raise ValueError(
+                f"adopted {phase} is self-consistent but incomplete"
+            )
+
+        observed_counts: dict[str, int] = {}
+        observed_ordinals: list[int] = []
+        physical_key_by_owner: dict[str, Mapping[str, Any]] = {}
+        owners_by_kind: dict[str, list[str]] = {}
+        logical_to_owner: dict[str, str] = {}
+        stage2_folds: list[int] = []
+        stage2_review_folds: list[int] = []
+        for artifact_id in all_ids:
+            granular = by_id[str(artifact_id)]
+            granular_phase = (
+                CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.get(
+                    str(granular.manifest["artifact_kind"])
+                )
+            )
+            granular_metadata = granular.artifact_metadata
+            if (
+                granular_phase != phase
+                or granular_metadata.get("producer_phase") != phase
+                or not isinstance(
+                    granular_metadata.get("node_ordinal"),
+                    int,
+                )
+            ):
+                raise ValueError(
+                    f"adopted {phase} granular artifact changed domain"
+                )
+            observed_ordinals.append(
+                int(granular_metadata["node_ordinal"])
+            )
+            kind = str(granular.manifest["artifact_kind"])
+            if kind in {
+                "tfidf_component",
+                "neural_query_component",
+                "physical_scope_fit",
+                "logical_scope_bindings",
+            }:
+                owner_hint = str(
+                    granular_metadata.get(
+                        "physical_owner_scope_id", ""
+                    )
+                )
+                expected_key_records = (
+                    {}
+                    if expected_stage1_plan_projection is None
+                    else expected_stage1_plan_projection[
+                        "physical_fit_key_records_by_owner"
+                    ]
+                )
+                expected_key_record = expected_key_records.get(
+                    owner_hint
+                )
+                if not isinstance(expected_key_record, Mapping):
+                    raise ValueError(
+                        "adopted Stage 1 owner is absent from the current "
+                        "authenticated scope plan"
+                    )
+                owner, validated_key_record = (
+                    _validated_stage1_granular_physical_fit_key(
+                        metadata=granular_metadata,
+                        expected_identity=expected_fit_identity,
+                        expected_key_record=expected_key_record,
+                    )
+                )
+                prior_key = physical_key_by_owner.setdefault(
+                    owner, validated_key_record
+                )
+                if prior_key != validated_key_record:
+                    raise ValueError(
+                        "adopted Stage 1 owner has inconsistent full "
+                        "physical-fit keys"
+                    )
+                owners_by_kind.setdefault(kind, []).append(owner)
+                if kind == "logical_scope_bindings":
+                    logical_id = str(
+                        granular_metadata.get(
+                            "logical_scope_id", ""
+                        )
+                    )
+                    if (
+                        not logical_id
+                        or logical_id in logical_to_owner
+                    ):
+                        raise ValueError(
+                            "adopted Stage 1 logical scope is absent or duplicated"
+                        )
+                    logical_to_owner[logical_id] = owner
+            elif kind in {
+                "stage2_fold",
+                "stage2_review_component",
+            }:
+                outer_fold = granular_metadata.get("outer_fold")
+                if (
+                    isinstance(outer_fold, bool)
+                    or not isinstance(outer_fold, int)
+                ):
+                    raise ValueError(
+                        "adopted Stage 2 fold identity is invalid"
+                    )
+                (
+                    stage2_folds
+                    if kind == "stage2_fold"
+                    else stage2_review_folds
+                ).append(int(outer_fold))
+            observed_counts[kind] = observed_counts.get(kind, 0) + 1
+        if (
+            observed_ordinals != list(range(len(all_ids)))
+            or dict(sorted(observed_counts.items()))
+            != dict(kind_counts)
+        ):
+            raise ValueError(
+                f"adopted {phase} granular coverage is incomplete"
+            )
+        if phase == "stage1_modeling":
+            expected_owners = list(
+                granular_plan[
+                    "stage1_physical_owner_scope_ids"
+                ]
+            )
+            expected_logical = list(
+                granular_plan["stage1_logical_scope_ids"]
+            )
+            expected_logical_to_owner = dict(
+                granular_plan[
+                    "stage1_logical_to_physical_owner"
+                ]
+            )
+            if (
+                owners_by_kind.get("tfidf_component")
+                != expected_owners
+                or owners_by_kind.get("neural_query_component")
+                != expected_owners
+                or owners_by_kind.get("physical_scope_fit")
+                != expected_owners
+                or list(logical_to_owner) != expected_logical
+                or logical_to_owner != expected_logical_to_owner
+                or set(physical_key_by_owner) != set(
+                    expected_owners
+                )
+            ):
+                raise ValueError(
+                    "adopted Stage 1 physical/logical plan changed"
+                )
+            row_maps = [
+                by_id[str(artifact_id)]
+                for artifact_id in all_ids
+                if by_id[str(artifact_id)].manifest[
+                    "artifact_kind"
+                ]
+                == "row_map"
+            ]
+            logical_ids = [
+                str(artifact_id)
+                for artifact_id in all_ids
+                if by_id[str(artifact_id)].manifest[
+                    "artifact_kind"
+                ]
+                == "logical_scope_bindings"
+            ]
+            if (
+                len(row_maps) != 1
+                or row_maps[0].artifact_metadata.get(
+                    "logical_scope_count"
+                )
+                != len(expected_logical)
+                or list(
+                    row_maps[0].manifest[
+                        "upstream_artifact_ids"
+                    ]
+                )
+                != logical_ids
+            ):
+                raise ValueError(
+                    "adopted Stage 1 row-map coverage changed"
+                )
+        else:
+            expected_folds = list(
+                granular_plan["stage2_fold_ids"]
+            )
+            expected_reviews = list(
+                granular_plan["stage2_review_fold_ids"]
+            )
+            if (
+                stage2_folds != expected_folds
+                or stage2_review_folds != expected_reviews
+            ):
+                raise ValueError(
+                    "adopted Stage 2 fold/review coverage changed"
+                )
+        _validate_exact_granular_upstream_edges(
+            phase=phase,
+            artifacts=ordered_granular,
+            expected_plan=granular_plan,
+            expected_external_upstream_artifact_ids=(
+                expected_component_parent_ids
+            ),
+        )
+        expected_terminal_kinds = (
+            {"logical_scope_bindings", "row_map"}
+            if phase == "stage1_modeling"
+            else {"stage2_fold"}
+        )
+        expected_terminal_ids = [
+            str(artifact_id)
+            for artifact_id in all_ids
+            if str(
+                by_id[str(artifact_id)].manifest["artifact_kind"]
+            )
+            in expected_terminal_kinds
+        ]
+        if list(terminal_ids) != expected_terminal_ids:
+            raise ValueError(
+                f"adopted {phase} granular terminal kinds changed"
+            )
+        missing_primary_parent_phases = [
+            parent
+            for parent in PORTABLE_CHECKPOINT_PHASE_SPECS[phase][
+                "upstream_phases"
+            ]
+            if parent not in phase_artifacts
+        ]
+        if missing_primary_parent_phases:
+            raise ValueError(
+                f"adopted {phase} lacks exact primary workflow parents: "
+                f"{missing_primary_parent_phases}"
+            )
+        parent_ids = tuple(
+            phase_artifacts[parent]
+            for parent in PORTABLE_CHECKPOINT_PHASE_SPECS[phase][
+                "upstream_phases"
+            ]
+        )
+        if tuple(primary.manifest["upstream_artifact_ids"]) != (
+            *parent_ids,
+            *tuple(str(value) for value in terminal_ids),
+        ):
+            raise ValueError(
+                f"adopted {phase} primary terminal edges changed"
+            )
+
     def ancestor_ids(artifact_id: str) -> set[str]:
         output: set[str] = set()
         pending = list(by_id[artifact_id].manifest["upstream_artifact_ids"])
@@ -388,6 +1221,22 @@ def _validate_adopted_checkpoint_graph(
             raise ValueError(
                 f"{kind} checkpoint lacks its authenticated " f"{required_kind} ancestor"
             )
+    phase_ids = set(phase_artifacts.values())
+    connected = set(phase_ids)
+    for artifact_id in phase_ids:
+        connected.update(ancestor_ids(artifact_id))
+    # A typed prepared context is the one deliberate downstream component of
+    # an adopted preflight checkpoint.  Its exact schema, edge, metadata, and
+    # scope plan were authenticated above; arbitrary descendants remain
+    # unrelated and fail closed below.
+    if authenticated_prepared_scope_plan is not None:
+        connected.add(prepared_contexts[0].artifact_id)
+    unrelated = sorted(set(by_id) - connected)
+    if unrelated:
+        raise ValueError(
+            "component checkpoints must be authenticated ancestors of one "
+            f"substituted workflow phase; unrelated={unrelated}"
+        )
     return phase_artifacts
 
 
@@ -516,6 +1365,9 @@ class ProductionRoleNeutralStage1Integration:
     producer_factories_builder: RoleNeutralStage1ProducerFactoriesBuilder
     executor: Any
     handoff_publisher: RoleNeutralStage1HandoffPublisher
+    producer_factories_scientific_identity: Mapping[str, Any] | None = None
+    physical_owner_executor_scientific_identity: Mapping[str, Any] | None = None
+    handoff_publisher_scientific_identity: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not callable(self.producer_factories_builder):
@@ -526,6 +1378,25 @@ class ProductionRoleNeutralStage1Integration:
             )
         if not callable(self.handoff_publisher):
             raise TypeError("role-neutral integration requires a Stage 2 handoff publisher")
+        for label, identity in (
+            (
+                "producer-factories",
+                self.producer_factories_scientific_identity,
+            ),
+            (
+                "physical-owner executor",
+                self.physical_owner_executor_scientific_identity,
+            ),
+            (
+                "handoff publisher",
+                self.handoff_publisher_scientific_identity,
+            ),
+        ):
+            if identity is not None:
+                _closed_explicit_callable_identity(
+                    identity,
+                    label=f"{label} scientific identity",
+                )
 
 
 @dataclass(frozen=True)
@@ -549,6 +1420,1964 @@ def _canonical(value: Any) -> str:
 
 def _sha(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
+
+
+_VALIDATION_DEPTH_RANK: Mapping[str, int] = {
+    "standard": 0,
+    "full": 1,
+    "fresh_terminal_audit": 2,
+}
+_PRODUCTION_VALIDATION_MINIMUM = "fresh_terminal_audit"
+
+
+def _resolve_validation_depth_policy(
+    requested: str,
+) -> Mapping[str, Any]:
+    """Lift an operational request to the non-bypassable acceptance floor."""
+
+    if requested not in _VALIDATION_DEPTH_RANK:
+        raise ValueError("unsupported validation depth")
+    effective = max(
+        (requested, _PRODUCTION_VALIDATION_MINIMUM),
+        key=_VALIDATION_DEPTH_RANK.__getitem__,
+    )
+    return {
+        "schema_version": WORKFLOW_VALIDATION_POLICY_SCHEMA,
+        "requested_minimum": requested,
+        "production_minimum": _PRODUCTION_VALIDATION_MINIMUM,
+        "effective_minimum": effective,
+        "fresh_path_only_terminal_audit_required": True,
+        "terminal_phase_override_can_satisfy_minimum": False,
+    }
+
+
+def _configure_cli_logging(log_level: str) -> None:
+    """Configure only the public command's stderr logging threshold."""
+
+    numeric_level = getattr(logging, str(log_level), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError("unsupported log level")
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(message)s",
+    )
+    LOGGER.setLevel(numeric_level)
+
+
+def _emit_structured_workflow_log(
+    *,
+    configured_threshold: str,
+    event_level: int,
+    payload: Mapping[str, Any],
+) -> bool:
+    """Emit one canonical lifecycle record when RunControl permits it."""
+
+    threshold = getattr(logging, str(configured_threshold), None)
+    if not isinstance(threshold, int):
+        raise ValueError("unsupported log level")
+    if int(event_level) < threshold:
+        return False
+    LOGGER.log(int(event_level), _canonical(payload))
+    return True
+
+
+_PHASE_PRODUCER_ROOTS: Mapping[str, tuple[str, ...]] = {
+    "input_preparation": ("oci/inference/production_text_preparation.py",),
+    "embedding_cache": (
+        "oci/inference/production_authenticated_tree_cache.py",
+        "oci/inference/production_embedding_cache_builder.py",
+        "oci/inference/production_embedding_cache_process.py",
+        "oci/inference/production_embedding_cache_relocation.py",
+    ),
+    "stage1_preflight": (
+        "oci/inference/production_stage1_bundle.py",
+        "oci/inference/production_stage1_cluster_preflight_artifact_v2.py",
+        "oci/inference/prepared_stage1_context.py",
+        "oci/inference/role_neutral_embedding_group_execution.py",
+    ),
+    "stage1_modeling": (
+        "oci/inference/production_stage1_role_neutral_execution.py",
+        "oci/inference/production_role_neutral_process_executor.py",
+        "oci/inference/production_role_neutral_persistent_executor.py",
+        "oci/inference/production_role_neutral_producer_factories.py",
+        "oci/inference/role_neutral_all_ten_binding.py",
+        "oci/inference/role_neutral_bow_group_execution.py",
+        "oci/inference/role_neutral_htr_group_execution.py",
+        "oci/inference/role_neutral_matched_pair_group_execution.py",
+        "oci/inference/role_neutral_embedding_group_execution.py",
+        "oci/inference/role_neutral_tfidf_group_execution.py",
+        "oci/inference/role_neutral_neural_query_group_execution.py",
+        "oci/inference/production_role_neutral_stage2_handoff.py",
+        "oci/inference/direct_upstream_numerical_reference_bank.py",
+    ),
+    "stage2_canary": (
+        "scripts/canary_production_stage1_hierarchy.py",
+        "oci/inference/production_stage1_hierarchy_one_shot.py",
+        "oci/inference/openai_compatible_json_discovery_job_runner.py",
+    ),
+    "stage2_inference": (
+        "oci/inference/production_stage1_hierarchy_one_shot.py",
+        "oci/inference/hierarchical_all_architecture_discovery.py",
+        "oci/inference/all_evidence_fusion_runner.py",
+        "oci/inference/all_evidence_post_extraction_review.py",
+        "oci/inference/final_context_fit_causal_forest_adapter.py",
+        "oci/extraction/complete_paged.py",
+        "oci/models/causal_forest_head.py",
+        "oci/models/strict_causal_forest_runtime.py",
+    ),
+    "oracle_evaluation": ("oci/inference/production_oracle_evaluation.py",),
+}
+_SHARED_CHECKPOINT_PRODUCER_ROOTS = (
+    "oci/inference/portable_artifacts.py",
+    "oci/inference/portable_identity.py",
+)
+_SHARED_DEPENDENCY_LOCK_FILES = (
+    "pyproject.toml",
+    "uv.lock",
+)
+# These modules expose narrow utilities to the embedding-cache producer but
+# also host unrelated downstream orchestration.  Hash the supplying module
+# itself, while stopping traversal through imports that the selected cache
+# utility never executes.  This prevents Stage 2-only modules from becoming
+# accidental preparation/cache dependencies.
+_PHASE_TRANSITIVE_IMPORT_LEAVES: Mapping[str, frozenset[str]] = {
+    "embedding_cache": frozenset(
+        {
+            "oci/inference/__init__.py",
+            "oci/inference/production_stage1_scope_scheduler.py",
+            "oci/inference/review_spent_evidence_provider.py",
+        }
+    ),
+}
+_PHASE_WORKFLOW_METHODS: Mapping[str, tuple[str, ...]] = {
+    "input_preparation": (),
+    "embedding_cache": ("_run_embedding_cache_phase",),
+    "stage1_preflight": ("_stage1_build_options", "_effective_stage1_profile"),
+    "stage1_modeling": (
+        "_stage1_build_options",
+        "_run_portable_role_neutral_stage1_modeling",
+    ),
+    "stage2_canary": ("_stage2_options",),
+    "stage2_inference": ("_stage2_options",),
+    "oracle_evaluation": (),
+}
+_SHARED_CHECKPOINT_WORKFLOW_METHODS = (
+    "_complete",
+    "_publish_completed_phase_checkpoint",
+)
+_SHARED_CHECKPOINT_MODULE_CALLABLES = (
+    "_bind_workflow_scientific_identity",
+    "_derive_expected_granular_checkpoint_plan",
+    "_validate_adopted_checkpoint_graph",
+    "validate_published_workflow_checkpoint_dag",
+)
+_PHASE_CHECKPOINT_MODULE_CALLABLES: Mapping[
+    str, tuple[str, ...]
+] = {
+    phase: (
+        (
+            "_validate_granular_checkpoint_index_from_paths",
+            "_granular_checkpoint_coverage",
+        )
+        if phase
+        in {
+            "stage1_preflight",
+            "stage1_modeling",
+            "stage2_inference",
+        }
+        else ()
+    )
+    + (
+        (
+            "_granular_primary_metadata_from_index",
+            "_reconstruct_granular_checkpoint_index_from_artifacts",
+        )
+        if phase in {"stage1_modeling", "stage2_inference"}
+        else ()
+    )
+    for phase in PORTABLE_CHECKPOINT_PHASE_SPECS
+}
+_MODULE_CALLABLE_PHASE_DOMAINS: Mapping[str, frozenset[str]] = {
+    "_validate_granular_checkpoint_index_from_paths": frozenset(
+        {
+            "stage1_preflight",
+            "stage1_modeling",
+            "stage2_inference",
+        }
+    ),
+    "_validate_granular_handles_against_plan": frozenset(
+        {"stage1_modeling", "stage2_inference"}
+    ),
+    "_granular_primary_metadata_from_index": frozenset(
+        {"stage1_modeling", "stage2_inference"}
+    ),
+    "_reconstruct_granular_checkpoint_index_from_artifacts": (
+        frozenset({"stage1_modeling", "stage2_inference"})
+    ),
+    "_validate_primary_granular_binding_digests": frozenset(
+        {"stage1_modeling", "stage2_inference"}
+    ),
+}
+
+
+def _phase_predicate_value(node: ast.AST, *, phase: str) -> bool | None:
+    """Evaluate only closed predicates over the workflow ``phase`` name."""
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+        return bool(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        value = _phase_predicate_value(node.operand, phase=phase)
+        return None if value is None else not value
+    if isinstance(node, ast.BoolOp):
+        values = [
+            _phase_predicate_value(child, phase=phase)
+            for child in node.values
+        ]
+        if isinstance(node.op, ast.And):
+            if False in values:
+                return False
+            return True if all(value is True for value in values) else None
+        if isinstance(node.op, ast.Or):
+            if True in values:
+                return True
+            return False if all(value is False for value in values) else None
+    if (
+        isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and len(node.comparators) == 1
+    ):
+        left = node.left
+        right = node.comparators[0]
+        if isinstance(left, ast.Name) and left.id == "phase":
+            if isinstance(right, ast.Constant) and isinstance(
+                right.value, str
+            ):
+                if isinstance(node.ops[0], ast.Eq):
+                    return phase == right.value
+                if isinstance(node.ops[0], ast.NotEq):
+                    return phase != right.value
+            if isinstance(
+                right,
+                (ast.Tuple, ast.List, ast.Set),
+            ) and all(
+                isinstance(child, ast.Constant)
+                and isinstance(child.value, str)
+                for child in right.elts
+            ):
+                choices = {
+                    str(child.value) for child in right.elts
+                }
+                if isinstance(node.ops[0], ast.In):
+                    return phase in choices
+                if isinstance(node.ops[0], ast.NotIn):
+                    return phase not in choices
+    return None
+
+
+class _PhaseLocalAstPruner(ast.NodeTransformer):
+    """Discard branches that provably belong to a different phase."""
+
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+
+    def visit_If(self, node: ast.If) -> Any:  # noqa: N802
+        value = _phase_predicate_value(node.test, phase=self.phase)
+        if value is True:
+            return [
+                transformed
+                for child in node.body
+                for transformed in self._visit_statement(child)
+            ]
+        if value is False:
+            return [
+                transformed
+                for child in node.orelse
+                for transformed in self._visit_statement(child)
+            ]
+        return self.generic_visit(node)
+
+    def visit_IfExp(self, node: ast.IfExp) -> Any:  # noqa: N802
+        value = _phase_predicate_value(node.test, phase=self.phase)
+        if value is True:
+            return self.visit(node.body)
+        if value is False:
+            return self.visit(node.orelse)
+        return self.generic_visit(node)
+
+    def _visit_statement(self, node: ast.stmt) -> list[ast.stmt]:
+        value = self.visit(node)
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [child for child in value if isinstance(child, ast.stmt)]
+        return [value] if isinstance(value, ast.stmt) else []
+
+
+def _phase_local_callable_tree(value: Any, *, phase: str) -> ast.Module:
+    try:
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(value))
+        )
+    except (OSError, TypeError, IndentationError, SyntaxError):
+        code = getattr(value, "__code__", None)
+        if code is None:
+            raise ValueError(
+                "phase producer dependency lacks stable callable source"
+            )
+
+        def normalized_code(child: Any) -> Any:
+            if hasattr(child, "co_code") and hasattr(
+                child, "co_consts"
+            ):
+                return {
+                    "argcount": int(child.co_argcount),
+                    "posonlyargcount": int(
+                        child.co_posonlyargcount
+                    ),
+                    "kwonlyargcount": int(
+                        child.co_kwonlyargcount
+                    ),
+                    "flags": int(child.co_flags),
+                    "bytecode_hex": bytes(child.co_code).hex(),
+                    "names": list(child.co_names),
+                    "varnames": list(child.co_varnames),
+                    "freevars": list(child.co_freevars),
+                    "cellvars": list(child.co_cellvars),
+                    "constants": [
+                        normalized_code(constant)
+                        for constant in child.co_consts
+                    ],
+                }
+            accepted, normalized = _closed_code_constant(child)
+            if accepted:
+                return normalized
+            return {
+                "type": (
+                    f"{type(child).__module__}."
+                    f"{type(child).__qualname__}"
+                )
+            }
+
+        fallback_digest = _sha(
+            {
+                "schema_version": (
+                    "normalized_callable_code_fallback_v1"
+                ),
+                "module": str(
+                    getattr(value, "__module__", "")
+                ),
+                "qualname": str(
+                    getattr(value, "__qualname__", "")
+                ),
+                "code": normalized_code(code),
+            }
+        )
+        tree = ast.parse(
+            "def _source_fragment_fallback():\n"
+            f"    return {fallback_digest!r}\n"
+        )
+    transformed = _PhaseLocalAstPruner(phase).visit(tree)
+    assert isinstance(transformed, ast.Module)
+    return ast.fix_missing_locations(transformed)
+
+
+def _ast_tree_sha256(
+    tree: ast.AST,
+    *,
+    schema_version: str,
+) -> str:
+    return _sha(
+        {
+            "schema_version": schema_version,
+            "ast": ast.dump(
+                tree,
+                annotate_fields=True,
+                include_attributes=False,
+            ),
+        }
+    )
+
+
+def _closed_code_constant(value: Any) -> tuple[bool, Any]:
+    """Return a canonical closed value when a global is code configuration."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return True, value
+    if isinstance(value, float):
+        return (math.isfinite(value), value)
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for raw_key, child in sorted(
+            value.items(), key=lambda row: str(row[0])
+        ):
+            if not isinstance(raw_key, str):
+                return False, None
+            accepted, normalized = _closed_code_constant(child)
+            if not accepted:
+                return False, None
+            output[raw_key] = normalized
+        return True, output
+    if isinstance(value, (tuple, list)):
+        output_list: list[Any] = []
+        for child in value:
+            accepted, normalized = _closed_code_constant(child)
+            if not accepted:
+                return False, None
+            output_list.append(normalized)
+        return True, output_list
+    if isinstance(value, (set, frozenset)):
+        output_set: list[Any] = []
+        for child in value:
+            accepted, normalized = _closed_code_constant(child)
+            if not accepted:
+                return False, None
+            output_set.append(normalized)
+        return True, sorted(output_set, key=_canonical)
+    return False, None
+
+
+def _phase_local_constant_value(
+    *,
+    name: str,
+    value: Any,
+    phase: str,
+) -> tuple[bool, Any]:
+    """Project cross-phase globals to the current compatibility domain."""
+
+    if name == "PORTABLE_CHECKPOINT_PHASE_SPECS":
+        value = {phase: value[phase]}
+    elif name == "CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND":
+        value = {
+            kind: domain
+            for kind, domain in value.items()
+            if domain == phase
+        }
+    elif name == "ADOPTABLE_PHASE_BY_ARTIFACT_KIND":
+        value = {
+            kind: domain
+            for kind, domain in value.items()
+            if domain == phase
+        }
+    elif name == "GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS":
+        relevant = {
+            kind
+            for kind, domain in (
+                CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.items()
+            )
+            if domain == phase
+        }
+        value = {
+            kind: schema
+            for kind, schema in value.items()
+            if kind in relevant
+        }
+    elif name in {"PHASES", "STAGE1_ONLY_PHASES"}:
+        sequence = tuple(str(child) for child in value)
+        value = {
+            "phase": phase,
+            "included": phase in sequence,
+            "ordinal": (
+                sequence.index(phase) if phase in sequence else None
+            ),
+        }
+    elif name == "EVIDENCE_FAMILIES" and phase in {
+        "input_preparation",
+        "embedding_cache",
+        "oracle_evaluation",
+    }:
+        value = {"used_by_phase": False}
+    return _closed_code_constant(value)
+
+
+def _workflow_same_file_dependency_identity(
+    *,
+    workflow_type: type,
+    phase: str,
+    include_default_phase_producer: bool,
+) -> Mapping[str, Any]:
+    """Hash the phase-reachable same-file callable/constant closure."""
+
+    queue: list[tuple[str, Any, ast.Module]] = []
+    method_names = list(_SHARED_CHECKPOINT_WORKFLOW_METHODS)
+    if include_default_phase_producer:
+        method_names.extend(_PHASE_WORKFLOW_METHODS[phase])
+    for name in method_names:
+        target = getattr(workflow_type, name)
+        queue.append(
+            (
+                f"workflow_method:{name}",
+                target,
+                _phase_local_callable_tree(target, phase=phase),
+            )
+        )
+    if include_default_phase_producer:
+        dispatcher = workflow_type._run_default
+        dispatcher_tree = ast.parse(
+            textwrap.dedent(inspect.getsource(dispatcher))
+        )
+        branch_matches: list[ast.If] = []
+        for node in ast.walk(dispatcher_tree):
+            if not isinstance(node, ast.If):
+                continue
+            test = node.test
+            if (
+                isinstance(test, ast.Compare)
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Eq)
+                and len(test.comparators) == 1
+                and any(
+                    isinstance(candidate, ast.Name)
+                    and candidate.id == "phase"
+                    for candidate in (test.left, test.comparators[0])
+                )
+                and any(
+                    isinstance(candidate, ast.Constant)
+                    and candidate.value == phase
+                    for candidate in (test.left, test.comparators[0])
+                )
+            ):
+                branch_matches.append(node)
+        if len(branch_matches) != 1:
+            raise RuntimeError(
+                f"workflow dispatcher must expose one {phase!r} dependency root"
+            )
+        branch_tree = ast.Module(
+            body=copy.deepcopy(branch_matches[0].body),
+            type_ignores=[],
+        )
+        transformed_branch = _PhaseLocalAstPruner(phase).visit(
+            branch_tree
+        )
+        assert isinstance(transformed_branch, ast.Module)
+        queue.append(
+            (
+                "workflow_method:phase_dispatch_branch",
+                dispatcher,
+                ast.fix_missing_locations(transformed_branch),
+            )
+        )
+    module_globals = vars(sys.modules[__name__])
+    for name in (
+        *_SHARED_CHECKPOINT_MODULE_CALLABLES,
+        *_PHASE_CHECKPOINT_MODULE_CALLABLES[phase],
+    ):
+        target = module_globals[name]
+        queue.append(
+            (
+                f"module_callable:{name}",
+                target,
+                _phase_local_callable_tree(target, phase=phase),
+            )
+        )
+
+    callable_hashes: dict[str, str] = {}
+    constant_values: dict[str, Any] = {}
+    visited: set[tuple[str, str]] = set()
+    while queue:
+        label, target, tree = queue.pop()
+        module_name = str(
+            getattr(target, "__module__", type(target).__module__)
+        )
+        qualname = str(
+            getattr(target, "__qualname__", type(target).__qualname__)
+        )
+        identity = (module_name, qualname)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        logical_name = f"{module_name}:{qualname}"
+        callable_hashes[logical_name] = _ast_tree_sha256(
+            tree,
+            schema_version="phase_local_callable_ast_v1",
+        )
+        target_globals = getattr(target, "__globals__", {})
+        target_source = inspect.getsourcefile(target)
+        target_source_path = (
+            None
+            if target_source is None
+            else Path(target_source).resolve()
+        )
+        referenced_names = {
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+        }
+        referenced_attributes = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Load)
+            and isinstance(node.value, ast.Name)
+            and node.value.id
+            in {
+                "self",
+                "cls",
+                workflow_type.__name__,
+                "ProductionAllEvidenceWorkflow",
+            }
+        }
+        for name in sorted(referenced_attributes):
+            if not hasattr(workflow_type, name):
+                continue
+            dependency = getattr(workflow_type, name)
+            if inspect.isfunction(dependency) or inspect.ismethod(
+                dependency
+            ):
+                queue.append(
+                    (
+                        f"workflow_method:{name}",
+                        dependency,
+                        _phase_local_callable_tree(
+                            dependency,
+                            phase=phase,
+                        ),
+                    )
+                )
+            else:
+                accepted, normalized = _phase_local_constant_value(
+                    name=f"{workflow_type.__name__}.{name}",
+                    value=dependency,
+                    phase=phase,
+                )
+                if accepted:
+                    constant_values[
+                        f"{workflow_type.__name__}.{name}"
+                    ] = normalized
+        for name in sorted(referenced_names):
+            if name not in target_globals:
+                continue
+            allowed_domains = _MODULE_CALLABLE_PHASE_DOMAINS.get(
+                name
+            )
+            if (
+                allowed_domains is not None
+                and phase not in allowed_domains
+            ):
+                continue
+            dependency = target_globals[name]
+            if inspect.isfunction(dependency) or inspect.ismethod(
+                dependency
+            ):
+                try:
+                    dependency_source = inspect.getsourcefile(
+                        dependency
+                    )
+                except (TypeError, OSError):
+                    dependency_source = None
+                if (
+                    target_source_path is not None
+                    and dependency_source is not None
+                    and Path(dependency_source).resolve()
+                    == target_source_path
+                ):
+                    queue.append(
+                        (
+                            f"module_callable:{name}",
+                            dependency,
+                            _phase_local_callable_tree(
+                                dependency,
+                                phase=phase,
+                            ),
+                        )
+                    )
+                continue
+            accepted, normalized = _phase_local_constant_value(
+                name=name,
+                value=dependency,
+                phase=phase,
+            )
+            if accepted:
+                constant_values[f"{module_name}:{name}"] = normalized
+    body = {
+        "schema_version": (
+            "phase_local_same_file_dependency_identity_v1"
+        ),
+        "phase": phase,
+        "callable_ast_sha256": dict(sorted(callable_hashes.items())),
+        "referenced_constants": dict(sorted(constant_values.items())),
+    }
+    return {**body, "content_sha256": _sha(body)}
+
+
+def _normalized_callable_ast_sha256(value: Any) -> str:
+    """Hash executable structure without source paths or formatting."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(value)))
+    return _sha(
+        {
+            "schema_version": "normalized_callable_ast_v1",
+            "ast": ast.dump(tree, annotate_fields=True, include_attributes=False),
+        }
+    )
+
+
+def _phase_branch_ast_sha256(value: Any, phase: str) -> str:
+    """Hash only one explicit phase branch of the monolithic dispatcher."""
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(value)))
+    matches: list[ast.If] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+        ):
+            candidates = (test.left, test.comparators[0])
+            names = [item for item in candidates if isinstance(item, ast.Name)]
+            constants = [
+                item.value
+                for item in candidates
+                if isinstance(item, ast.Constant)
+            ]
+            if any(item.id == "phase" for item in names) and phase in constants:
+                matches.append(node)
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"workflow dispatcher must have exactly one explicit {phase!r} branch"
+        )
+    return _sha(
+        {
+            "schema_version": "normalized_phase_branch_ast_v1",
+            "phase": phase,
+            "body_ast": [
+                ast.dump(item, annotate_fields=True, include_attributes=False)
+                for item in matches[0].body
+            ],
+        }
+    )
+
+
+_IdentityStatToken = tuple[int, int, int, int, int, int, int]
+
+
+def _identity_stat_token(path: Path) -> _IdentityStatToken:
+    """Return the content-relevant stat guard for one authenticated path."""
+
+    value = Path(path).stat()
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _parse_local_import_module_names(
+    path: Path,
+    *,
+    repository_root: Path,
+) -> tuple[str, ...]:
+    """Parse every import name while leaving repository resolution separate."""
+
+    relative = path.relative_to(repository_root)
+    package_parts = relative.with_suffix("").parts[:-1]
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+        raise ValueError(f"cannot parse scientific producer source: {relative}") from exc
+    module_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            module_names.update(
+                alias.name
+                for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                keep = len(package_parts) - (int(node.level) - 1)
+                if keep < 0:
+                    continue
+                prefix = package_parts[:keep]
+                suffix = tuple(str(node.module).split(".")) if node.module else ()
+                resolved_parts = (*prefix, *suffix)
+                if resolved_parts:
+                    base_module = ".".join(resolved_parts)
+                    module_names.add(base_module)
+                    module_names.update(
+                        f"{base_module}.{alias.name}"
+                        for alias in node.names
+                        if alias.name != "*"
+                    )
+            elif node.module:
+                base_module = str(node.module)
+                module_names.add(base_module)
+                module_names.update(
+                    f"{base_module}.{alias.name}"
+                    for alias in node.names
+                    if alias.name != "*"
+                )
+    return tuple(sorted(module_names))
+
+
+@dataclass(frozen=True)
+class _ParsedImportCacheEntry:
+    repository_root: Path
+    source_stat: _IdentityStatToken
+    parser: Any
+    module_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _FileDigestCacheEntry:
+    repository_root: Path
+    source_stat: _IdentityStatToken
+    hasher: Any
+    digest: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class _DirectoryListingCacheEntry:
+    repository_root: Path
+    directory_stat: _IdentityStatToken
+    entries: Mapping[str, str]
+
+
+class _ScientificIdentityMemo:
+    """Process-local authenticated handles guarded by current file metadata.
+
+    Nothing in this cache is serialized or accepted across a fresh process.
+    Every hit reopens the relevant stat metadata. Parser/hasher replacement,
+    repository relocation, or a content-relevant stat change forces the exact
+    uncached operation again.
+    """
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._parsed_imports: dict[
+            tuple[Path, Path], _ParsedImportCacheEntry
+        ] = {}
+        self._file_digests: dict[
+            tuple[Path, Path], _FileDigestCacheEntry
+        ] = {}
+        self._directory_listings: dict[
+            tuple[Path, Path], _DirectoryListingCacheEntry
+        ] = {}
+
+    def clear(self) -> None:
+        """Drop all process-local authenticated handles."""
+
+        with self._lock:
+            self._parsed_imports.clear()
+            self._file_digests.clear()
+            self._directory_listings.clear()
+
+    @staticmethod
+    def _resolved_pair(
+        *,
+        repository_root: Path,
+        path: Path,
+    ) -> tuple[Path, Path]:
+        root = Path(repository_root).resolve(strict=True)
+        resolved = Path(path).resolve(strict=True)
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                "scientific identity cache path escaped the repository"
+            ) from exc
+        return root, resolved
+
+    def parsed_import_module_names(
+        self,
+        path: Path,
+        *,
+        repository_root: Path,
+    ) -> tuple[str, ...]:
+        root, resolved = self._resolved_pair(
+            repository_root=repository_root,
+            path=path,
+        )
+        source_stat = _identity_stat_token(resolved)
+        parser = _parse_local_import_module_names
+        key = (root, resolved)
+        with self._lock:
+            cached = self._parsed_imports.get(key)
+            if (
+                cached is not None
+                and cached.repository_root == root
+                and cached.source_stat == source_stat
+                and cached.parser is parser
+            ):
+                return cached.module_names
+        module_names = parser(
+            resolved,
+            repository_root=root,
+        )
+        terminal_stat = _identity_stat_token(resolved)
+        if terminal_stat != source_stat:
+            raise RuntimeError(
+                "scientific producer source changed while imports were parsed"
+            )
+        entry = _ParsedImportCacheEntry(
+            repository_root=root,
+            source_stat=terminal_stat,
+            parser=parser,
+            module_names=module_names,
+        )
+        with self._lock:
+            self._parsed_imports[key] = entry
+        return module_names
+
+    def file_digest(
+        self,
+        path: Path,
+        *,
+        repository_root: Path,
+    ) -> tuple[str, int]:
+        root, resolved = self._resolved_pair(
+            repository_root=repository_root,
+            path=path,
+        )
+        source_stat = _identity_stat_token(resolved)
+        hasher = stable_file_sha256
+        key = (root, resolved)
+        with self._lock:
+            cached = self._file_digests.get(key)
+            if (
+                cached is not None
+                and cached.repository_root == root
+                and cached.source_stat == source_stat
+                and cached.hasher is hasher
+            ):
+                return cached.digest, cached.size_bytes
+        digest, size = hasher(resolved)
+        terminal_stat = _identity_stat_token(resolved)
+        if terminal_stat != source_stat:
+            raise RuntimeError(
+                "scientific producer source changed while it was hashed"
+            )
+        entry = _FileDigestCacheEntry(
+            repository_root=root,
+            source_stat=terminal_stat,
+            hasher=hasher,
+            digest=str(digest),
+            size_bytes=int(size),
+        )
+        with self._lock:
+            self._file_digests[key] = entry
+        return entry.digest, entry.size_bytes
+
+    def directory_entries(
+        self,
+        directory: Path,
+        *,
+        repository_root: Path,
+    ) -> Mapping[str, str]:
+        root, resolved = self._resolved_pair(
+            repository_root=repository_root,
+            path=directory,
+        )
+        directory_stat = _identity_stat_token(resolved)
+        if not stat.S_ISDIR(directory_stat[2]):
+            raise NotADirectoryError(resolved)
+        key = (root, resolved)
+        with self._lock:
+            cached = self._directory_listings.get(key)
+            if (
+                cached is not None
+                and cached.repository_root == root
+                and cached.directory_stat == directory_stat
+            ):
+                return cached.entries
+        entries: dict[str, str] = {}
+        with os.scandir(resolved) as iterator:
+            for child in iterator:
+                if child.is_file(follow_symlinks=True):
+                    entries[child.name] = "file"
+                elif child.is_dir(follow_symlinks=True):
+                    entries[child.name] = "directory"
+                else:
+                    entries[child.name] = "other"
+        terminal_stat = _identity_stat_token(resolved)
+        if terminal_stat != directory_stat:
+            raise RuntimeError(
+                "repository directory changed while imports were resolved"
+            )
+        entry = _DirectoryListingCacheEntry(
+            repository_root=root,
+            directory_stat=terminal_stat,
+            entries=dict(sorted(entries.items())),
+        )
+        with self._lock:
+            self._directory_listings[key] = entry
+        return entry.entries
+
+
+_PROCESS_SCIENTIFIC_IDENTITY_MEMO = _ScientificIdentityMemo()
+
+
+def _memoized_scientific_file_digest(
+    path: Path,
+    *,
+    identity_memo: _ScientificIdentityMemo,
+) -> tuple[str, int]:
+    """Reuse one authenticated file inside the current process trust handle."""
+
+    resolved = Path(path).resolve(strict=True)
+    repository_root = Path(__file__).resolve().parents[2]
+    try:
+        resolved.relative_to(repository_root)
+        trust_root = repository_root
+    except ValueError:
+        trust_root = resolved.parent
+    return identity_memo.file_digest(
+        resolved,
+        repository_root=trust_root,
+    )
+
+
+def _resolve_repository_module_path(
+    module_name: str,
+    *,
+    repository_root: Path,
+    identity_memo: _ScientificIdentityMemo,
+    directory_views: MutableMapping[Path, Mapping[str, str]],
+) -> Path | None:
+    """Resolve one module using guarded directory views, including misses."""
+
+    parts = tuple(part for part in module_name.split(".") if part)
+    if not parts:
+        return None
+
+    def entries(directory: Path) -> Mapping[str, str]:
+        resolved = Path(directory).resolve(strict=True)
+        cached = directory_views.get(resolved)
+        if cached is None:
+            cached = identity_memo.directory_entries(
+                resolved,
+                repository_root=repository_root,
+            )
+            directory_views[resolved] = cached
+        return cached
+
+    parent = repository_root
+    for component in parts[:-1]:
+        current = entries(parent)
+        if current.get(component) != "directory":
+            return None
+        parent = parent / component
+    current = entries(parent)
+    leaf = parts[-1]
+    module_file = f"{leaf}.py"
+    if current.get(module_file) == "file":
+        return (parent / module_file).resolve(strict=True)
+    if current.get(leaf) != "directory":
+        return None
+    package = parent / leaf
+    if entries(package).get("__init__.py") == "file":
+        return (package / "__init__.py").resolve(strict=True)
+    return None
+
+
+def _local_import_paths(path: Path, *, repository_root: Path) -> tuple[Path, ...]:
+    """Resolve all repository-local imports with stat-guarded parse reuse."""
+
+    root = Path(repository_root).resolve(strict=True)
+    resolved_source = Path(path).resolve(strict=True)
+    module_names = (
+        _PROCESS_SCIENTIFIC_IDENTITY_MEMO.parsed_import_module_names(
+            resolved_source,
+            repository_root=root,
+        )
+    )
+    directory_views: dict[Path, Mapping[str, str]] = {}
+    output: set[Path] = set()
+    workflow_source = Path(__file__).resolve()
+    for module_name in module_names:
+        resolved = _resolve_repository_module_path(
+            module_name,
+            repository_root=root,
+            identity_memo=_PROCESS_SCIENTIFIC_IDENTITY_MEMO,
+            directory_views=directory_views,
+        )
+        if resolved is not None and resolved != workflow_source:
+            output.add(resolved)
+    return tuple(sorted(output))
+
+
+def _transitive_local_source_inventory(
+    *,
+    repository_root: Path,
+    roots: Sequence[str],
+    import_leaf_paths: frozenset[str] = frozenset(),
+    import_cache: MutableMapping[Path, tuple[Path, ...]] | None = None,
+    file_identity_cache: MutableMapping[Path, Mapping[str, Any]] | None = None,
+    identity_memo: _ScientificIdentityMemo | None = None,
+) -> tuple[dict[str, Any], ...]:
+    import_cache = {} if import_cache is None else import_cache
+    file_identity_cache = (
+        {} if file_identity_cache is None else file_identity_cache
+    )
+    pending = [(repository_root / relative).resolve(strict=True) for relative in roots]
+    observed: set[Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in observed:
+            continue
+        try:
+            path.relative_to(repository_root)
+        except ValueError as exc:
+            raise ValueError("producer source escaped the repository") from exc
+        observed.add(path)
+        relative = path.relative_to(repository_root).as_posix()
+        if relative in import_leaf_paths:
+            imports = ()
+        else:
+            imports = import_cache.get(path)
+            if imports is None:
+                imports = _local_import_paths(
+                    path,
+                    repository_root=repository_root,
+                )
+                import_cache[path] = imports
+        pending.extend(
+            candidate
+            for candidate in imports
+            if candidate not in observed
+        )
+    rows: list[dict[str, Any]] = []
+    for path in sorted(observed):
+        row = file_identity_cache.get(path)
+        if row is None:
+            digest, size = (
+                stable_file_sha256(path)
+                if identity_memo is None
+                else identity_memo.file_digest(
+                    path,
+                    repository_root=repository_root,
+                )
+            )
+            row = {
+                "relative_path": path.relative_to(repository_root).as_posix(),
+                "sha256": digest,
+                "size_bytes": size,
+            }
+            file_identity_cache[path] = row
+        rows.append(copy.deepcopy(dict(row)))
+    return tuple(rows)
+
+
+def _repository_local_callable_import_closure(
+    target: Any,
+    *,
+    repository_root: Path | None = None,
+    identity_memo: _ScientificIdentityMemo | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Bind an injected callable's repository-local transitive imports."""
+
+    root = (
+        Path(__file__).resolve().parents[2]
+        if repository_root is None
+        else Path(repository_root).resolve(strict=True)
+    )
+    try:
+        source = inspect.getsourcefile(target)
+    except (TypeError, OSError):
+        source = None
+    if source is None:
+        raise ValueError(
+            "injected workflow callables must have inspectable source"
+        )
+    resolved = Path(source).resolve(strict=True)
+    try:
+        relative = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            "injected workflow callable source must be inside the authenticated "
+            "repository; external callable sources are not adoptable"
+        ) from exc
+    closure = _transitive_local_source_inventory(
+        repository_root=root,
+        roots=(relative,),
+        identity_memo=(
+            _PROCESS_SCIENTIFIC_IDENTITY_MEMO
+            if identity_memo is None
+            else identity_memo
+        ),
+    )
+    if not closure:
+        raise RuntimeError(
+            "injected workflow callable dependency inventory is empty"
+        )
+    return closure
+
+
+_EXPLICIT_CALLABLE_SCIENTIFIC_IDENTITY = (
+    "__portable_workflow_scientific_identity__"
+)
+
+
+def _closed_explicit_callable_identity(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    """Validate one caller-authored, path-neutral scientific identity."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be one closed mapping")
+    try:
+        encoded = json.dumps(
+            dict(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        normalized = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} must contain only finite JSON values") from exc
+    if not isinstance(normalized, dict) or any(
+        not isinstance(key, str) or not key
+        for key in normalized
+    ):
+        raise ValueError(f"{label} keys must be nonempty strings")
+
+    def reject_absolute_locator(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for child in item.values():
+                reject_absolute_locator(child)
+            return
+        if isinstance(item, list):
+            for child in item:
+                reject_absolute_locator(child)
+            return
+        if isinstance(item, str) and Path(item).is_absolute():
+            raise ValueError(
+                f"{label} cannot contain an absolute deployment locator"
+            )
+
+    reject_absolute_locator(normalized)
+    return normalized
+
+
+def _callable_explicit_scientific_identity(
+    value: Any,
+) -> Mapping[str, Any] | None:
+    try:
+        supplied = getattr(
+            value,
+            _EXPLICIT_CALLABLE_SCIENTIFIC_IDENTITY,
+        )
+    except AttributeError:
+        return None
+    if callable(supplied):
+        raise TypeError(
+            "explicit callable scientific identity must be data, not "
+            "another executable provider"
+        )
+    return _closed_explicit_callable_identity(
+        supplied,
+        label="explicit callable scientific identity",
+    )
+
+
+def _closed_callable_state(
+    value: Any,
+    *,
+    label: str,
+    active_callables: set[int],
+    active_values: set[int],
+    identity_memo: _ScientificIdentityMemo,
+) -> Any:
+    """Encode behavior-affecting callable state without lossy string casts."""
+
+    if value is None or type(value) in {str, bool, int}:  # noqa: E721
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{label} contains a non-finite float")
+        return value
+    if type(value) is bytes:
+        return {
+            "state_type": "bytes",
+            "hex": value.hex(),
+        }
+    if isinstance(value, Path):
+        raise ValueError(
+            f"{label} closes over a deployment path; supply an explicit "
+            "path-neutral scientific identity"
+        )
+    if callable(value):
+        return {
+            "state_type": "callable",
+            "identity": _callable_behavior_identity(
+                value,
+                active_callables=active_callables,
+                identity_memo=identity_memo,
+            ),
+        }
+
+    tracked = isinstance(
+        value,
+        (Mapping, list, tuple, set, frozenset),
+    )
+    marker = id(value)
+    if tracked:
+        if marker in active_values:
+            raise ValueError(f"{label} contains a recursive state value")
+        active_values.add(marker)
+    try:
+        if isinstance(value, Mapping):
+            if any(
+                not isinstance(key, str) or not key
+                for key in value
+            ):
+                raise ValueError(
+                    f"{label} mapping keys must be nonempty strings"
+                )
+            return {
+                "state_type": "mapping",
+                "items": [
+                    [
+                        key,
+                        _closed_callable_state(
+                            value[key],
+                            label=f"{label}.{key}",
+                            active_callables=active_callables,
+                            active_values=active_values,
+                            identity_memo=identity_memo,
+                        ),
+                    ]
+                    for key in sorted(value)
+                ],
+            }
+        if isinstance(value, (list, tuple)):
+            return {
+                "state_type": (
+                    "tuple" if isinstance(value, tuple) else "list"
+                ),
+                "items": [
+                    _closed_callable_state(
+                        child,
+                        label=f"{label}[{index}]",
+                        active_callables=active_callables,
+                        active_values=active_values,
+                        identity_memo=identity_memo,
+                    )
+                    for index, child in enumerate(value)
+                ],
+            }
+        if isinstance(value, (set, frozenset)):
+            children = [
+                _closed_callable_state(
+                    child,
+                    label=f"{label} member",
+                    active_callables=active_callables,
+                    active_values=active_values,
+                    identity_memo=identity_memo,
+                )
+                for child in value
+            ]
+            return {
+                "state_type": (
+                    "frozenset"
+                    if isinstance(value, frozenset)
+                    else "set"
+                ),
+                "items": sorted(children, key=_canonical),
+            }
+    finally:
+        if tracked:
+            active_values.remove(marker)
+    raise TypeError(
+        f"{label} contains unclosed state of type "
+        f"{type(value).__module__}.{type(value).__qualname__}; supply an "
+        "explicit closed scientific identity"
+    )
+
+
+def _function_behavior_state(
+    function: Any,
+    *,
+    active_callables: set[int],
+    identity_memo: _ScientificIdentityMemo,
+) -> Mapping[str, Any]:
+    closure = function.__closure__ or ()
+    freevars = tuple(function.__code__.co_freevars)
+    if len(closure) != len(freevars):
+        raise RuntimeError("callable closure metadata is inconsistent")
+    active_values: set[int] = set()
+    attributes = {
+        key: child
+        for key, child in vars(function).items()
+        if key != _EXPLICIT_CALLABLE_SCIENTIFIC_IDENTITY
+    }
+    return {
+        "state_policy": "closed_function_state_v1",
+        "defaults": _closed_callable_state(
+            function.__defaults__,
+            label="callable positional defaults",
+            active_callables=active_callables,
+            active_values=active_values,
+            identity_memo=identity_memo,
+        ),
+        "keyword_defaults": _closed_callable_state(
+            function.__kwdefaults__,
+            label="callable keyword defaults",
+            active_callables=active_callables,
+            active_values=active_values,
+            identity_memo=identity_memo,
+        ),
+        "closure_cells": [
+            {
+                "name": name,
+                "value": _closed_callable_state(
+                    cell.cell_contents,
+                    label=f"callable closure cell {name!r}",
+                    active_callables=active_callables,
+                    active_values=active_values,
+                    identity_memo=identity_memo,
+                ),
+            }
+            for name, cell in zip(freevars, closure, strict=True)
+        ],
+        "function_attributes": _closed_callable_state(
+            attributes,
+            label="callable function attributes",
+            active_callables=active_callables,
+            active_values=active_values,
+            identity_memo=identity_memo,
+        ),
+    }
+
+
+def _callable_instance_state(
+    value: Any,
+    *,
+    active_callables: set[int],
+    identity_memo: _ScientificIdentityMemo,
+) -> Mapping[str, Any]:
+    state: dict[str, Any] = {}
+    try:
+        state.update(vars(value))
+    except TypeError:
+        pass
+    for owner in type(value).__mro__:
+        raw_slots = owner.__dict__.get("__slots__", ())
+        slots = (
+            (raw_slots,)
+            if isinstance(raw_slots, str)
+            else tuple(raw_slots)
+        )
+        for name in slots:
+            if name in {"__dict__", "__weakref__"} or name in state:
+                continue
+            if hasattr(value, name):
+                state[name] = getattr(value, name)
+    state.pop(_EXPLICIT_CALLABLE_SCIENTIFIC_IDENTITY, None)
+    return {
+        "state_policy": "closed_callable_instance_state_v1",
+        "instance_state": _closed_callable_state(
+            state,
+            label="callable instance state",
+            active_callables=active_callables,
+            active_values=set(),
+            identity_memo=identity_memo,
+        ),
+    }
+
+
+def _callable_source_identity(
+    target: Any,
+    *,
+    identity_memo: _ScientificIdentityMemo,
+) -> Mapping[str, Any]:
+    try:
+        source = inspect.getsourcefile(target)
+    except (TypeError, OSError):
+        source = None
+    if source is None:
+        raise ValueError(
+            "injected workflow callable must have inspectable repository "
+            "source"
+        )
+    resolved = Path(source).resolve(strict=True)
+    repository_root = Path(__file__).resolve().parents[2]
+    try:
+        resolved.relative_to(repository_root)
+    except ValueError as exc:
+        raise ValueError(
+            "injected workflow callable source must be inside the "
+            "authenticated repository; external callable sources are not "
+            "adoptable"
+        ) from exc
+    digest, size = identity_memo.file_digest(
+        resolved,
+        repository_root=repository_root,
+    )
+    closure = _repository_local_callable_import_closure(
+        target,
+        identity_memo=identity_memo,
+    )
+    return {
+        "source_file": {
+            "path": str(resolved),
+            "sha256": digest,
+            "size_bytes": size,
+        },
+        "repository_local_import_closure": list(closure),
+    }
+
+
+def _callable_behavior_identity(
+    value: Any,
+    *,
+    explicit_scientific_identity: Mapping[str, Any] | None = None,
+    active_callables: set[int] | None = None,
+    identity_memo: _ScientificIdentityMemo | None = None,
+) -> Mapping[str, Any]:
+    """Bind source, dependency bytes, and every closed callable state axis."""
+
+    if not callable(value):
+        raise TypeError("injected workflow capability is not callable")
+    memo = (
+        _PROCESS_SCIENTIFIC_IDENTITY_MEMO
+        if identity_memo is None
+        else identity_memo
+    )
+    active = set() if active_callables is None else active_callables
+    marker = id(value)
+    if marker in active:
+        raise ValueError("injected workflow callable state is recursive")
+    active.add(marker)
+    try:
+        supplied = (
+            _callable_explicit_scientific_identity(value)
+            if explicit_scientific_identity is None
+            else _closed_explicit_callable_identity(
+                explicit_scientific_identity,
+                label="injected callable scientific identity",
+            )
+        )
+        if isinstance(value, functools.partial):
+            target = value.func
+            source_identity = _callable_source_identity(
+                target,
+                identity_memo=memo,
+            )
+            if supplied is None:
+                state = {
+                    "state_policy": "closed_partial_state_v1",
+                    "wrapped_callable": _callable_behavior_identity(
+                        target,
+                        active_callables=active,
+                        identity_memo=memo,
+                    ),
+                    "positional_arguments": _closed_callable_state(
+                        value.args,
+                        label="partial positional arguments",
+                        active_callables=active,
+                        active_values=set(),
+                        identity_memo=memo,
+                    ),
+                    "keyword_arguments": _closed_callable_state(
+                        value.keywords or {},
+                        label="partial keyword arguments",
+                        active_callables=active,
+                        active_values=set(),
+                        identity_memo=memo,
+                    ),
+                    "partial_attributes": _closed_callable_state(
+                        vars(value),
+                        label="partial attributes",
+                        active_callables=active,
+                        active_values=set(),
+                        identity_memo=memo,
+                    ),
+                }
+            else:
+                state = {
+                    "state_policy": (
+                        "explicit_closed_scientific_identity_v1"
+                    ),
+                    "scientific_identity": supplied,
+                }
+            callable_kind = "functools.partial"
+            module = str(
+                getattr(target, "__module__", type(target).__module__)
+            )
+            qualname = str(
+                getattr(target, "__qualname__", type(target).__qualname__)
+            )
+        elif inspect.ismethod(value):
+            target = value.__func__
+            source_identity = _callable_source_identity(
+                target,
+                identity_memo=memo,
+            )
+            if supplied is None:
+                bound = value.__self__
+                if inspect.isclass(bound):
+                    raise TypeError(
+                        "class-bound injected methods require an explicit "
+                        "closed scientific identity"
+                    )
+                state = {
+                    "state_policy": "closed_bound_method_state_v1",
+                    "function_state": _function_behavior_state(
+                        target,
+                        active_callables=active,
+                        identity_memo=memo,
+                    ),
+                    "bound_instance_state": _callable_instance_state(
+                        bound,
+                        active_callables=active,
+                        identity_memo=memo,
+                    ),
+                }
+            else:
+                state = {
+                    "state_policy": (
+                        "explicit_closed_scientific_identity_v1"
+                    ),
+                    "scientific_identity": supplied,
+                }
+            callable_kind = "bound_method"
+            module = str(target.__module__)
+            qualname = str(target.__qualname__)
+        elif inspect.isfunction(value):
+            target = value
+            source_identity = _callable_source_identity(
+                target,
+                identity_memo=memo,
+            )
+            state = (
+                _function_behavior_state(
+                    target,
+                    active_callables=active,
+                    identity_memo=memo,
+                )
+                if supplied is None
+                else {
+                    "state_policy": (
+                        "explicit_closed_scientific_identity_v1"
+                    ),
+                    "scientific_identity": supplied,
+                }
+            )
+            callable_kind = "function"
+            module = str(target.__module__)
+            qualname = str(target.__qualname__)
+        else:
+            target = getattr(type(value), "__call__", None)
+            if target is None or not callable(target):
+                raise TypeError(
+                    "injected callable instance has no inspectable __call__"
+                )
+            source_identity = _callable_source_identity(
+                target,
+                identity_memo=memo,
+            )
+            state = (
+                _callable_instance_state(
+                    value,
+                    active_callables=active,
+                    identity_memo=memo,
+                )
+                if supplied is None
+                else {
+                    "state_policy": (
+                        "explicit_closed_scientific_identity_v1"
+                    ),
+                    "scientific_identity": supplied,
+                }
+            )
+            callable_kind = "callable_instance"
+            module = str(type(value).__module__)
+            qualname = str(type(value).__qualname__)
+        body = {
+            "schema_version": "closed_callable_behavior_identity_v1",
+            "callable_kind": callable_kind,
+            "module": module,
+            "qualname": qualname,
+            **source_identity,
+            "behavior_state": state,
+        }
+        neutral_body = _path_neutral_injected_identity(body)
+        return {
+            **body,
+            "content_sha256": identity_sha256(neutral_body),
+        }
+    finally:
+        active.remove(marker)
+
+
+def _repository_import_closure_rows(
+    value: Any,
+) -> tuple[Mapping[str, Any], ...]:
+    rows: list[Mapping[str, Any]] = []
+    if isinstance(value, Mapping):
+        closure = value.get("repository_local_import_closure")
+        if isinstance(closure, list):
+            rows.extend(
+                row for row in closure if isinstance(row, Mapping)
+            )
+        for child in value.values():
+            rows.extend(_repository_import_closure_rows(child))
+    elif isinstance(value, list):
+        for child in value:
+            rows.extend(_repository_import_closure_rows(child))
+    return tuple(rows)
+
+
+def _path_neutral_injected_identity(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for key, child in sorted(value.items()):
+            if key == "source_file" and isinstance(child, Mapping):
+                output[str(key)] = {
+                    str(source_key): _path_neutral_injected_identity(
+                        source_value
+                    )
+                    for source_key, source_value in sorted(
+                        child.items()
+                    )
+                    if source_key != "path"
+                }
+            else:
+                output[str(key)] = _path_neutral_injected_identity(
+                    child
+                )
+        return output
+    if isinstance(value, list):
+        return [_path_neutral_injected_identity(child) for child in value]
+    return value
+
+
+def _phase_transitive_producer_code_records(
+    *,
+    workflow_type: type,
+    integration_hooks: Mapping[str, Any],
+    phase_overrides: Mapping[str, Any],
+    identity_memo: _ScientificIdentityMemo | None = None,
+) -> dict[str, dict[str, Any]]:
+    repository_root = Path(__file__).resolve().parents[2]
+    memo = (
+        _PROCESS_SCIENTIFIC_IDENTITY_MEMO
+        if identity_memo is None
+        else identity_memo
+    )
+    output: dict[str, dict[str, Any]] = {}
+    dependency_lock_inventory: list[dict[str, Any]] = []
+    for relative in _SHARED_DEPENDENCY_LOCK_FILES:
+        path = (repository_root / relative).resolve(strict=True)
+        digest, size = memo.file_digest(
+            path,
+            repository_root=repository_root,
+        )
+        dependency_lock_inventory.append(
+            {
+                "relative_path": relative,
+                "sha256": digest,
+                "size_bytes": size,
+            }
+        )
+    for phase in PORTABLE_CHECKPOINT_PHASE_SPECS:
+        override = phase_overrides.get(phase)
+        hook = (
+            integration_hooks.get(phase)
+            if phase in {"embedding_cache", "stage1_preflight", "stage1_modeling"}
+            else None
+        )
+        injected = override if override is not None else hook
+        roots = list(_SHARED_CHECKPOINT_PRODUCER_ROOTS)
+        if injected is None:
+            roots.extend(_PHASE_PRODUCER_ROOTS[phase])
+        roots = list(dict.fromkeys(roots))
+        file_inventory = _transitive_local_source_inventory(
+            repository_root=repository_root,
+            roots=roots,
+            import_leaf_paths=_PHASE_TRANSITIVE_IMPORT_LEAVES.get(
+                phase,
+                frozenset(),
+            ),
+            identity_memo=memo,
+        )
+        same_file_dependencies = (
+            _workflow_same_file_dependency_identity(
+                workflow_type=workflow_type,
+                phase=phase,
+                include_default_phase_producer=(
+                    injected is None
+                ),
+            )
+        )
+        callable_identities = dict(
+            same_file_dependencies["callable_ast_sha256"]
+        )
+        role_neutral = (
+            _path_neutral_injected_identity(
+                integration_hooks.get("role_neutral_stage1")
+            )
+            if phase in {"stage1_preflight", "stage1_modeling"}
+            else None
+        )
+        phase_constant_body = {
+            "schema_version": (
+                "phase_workflow_constant_identity_v1"
+            ),
+            "phase": phase,
+            "workflow_schema": WORKFLOW_SCHEMA,
+            "workflow_phase_manifest_schema": (
+                WORKFLOW_PHASE_MANIFEST_SCHEMA
+            ),
+            "portable_checkpoint_phase_spec": copy.deepcopy(
+                dict(PORTABLE_CHECKPOINT_PHASE_SPECS[phase])
+            ),
+            "artifact_kind_compatibility_domains": {
+                kind: domain
+                for kind, domain in sorted(
+                    CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.items()
+                )
+                if domain == phase
+            },
+            "granular_artifact_schemas": {
+                kind: GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS[kind]
+                for kind, domain in sorted(
+                    CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.items()
+                )
+                if domain == phase
+                and kind in GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS
+            },
+            "granular_index_schema": (
+                WORKFLOW_GRANULAR_CHECKPOINT_INDEX_SCHEMA
+            ),
+            "granular_node_schema": (
+                WORKFLOW_GRANULAR_CHECKPOINT_NODE_SCHEMA
+            ),
+            "adoptable_artifact_kinds": {
+                kind: domain
+                for kind, domain in sorted(
+                    ADOPTABLE_PHASE_BY_ARTIFACT_KIND.items()
+                )
+                if domain == phase
+            },
+            "required_adopted_ancestor_kind": (
+                _REQUIRED_ADOPTED_ANCESTOR_KIND.get(
+                    str(
+                        PORTABLE_CHECKPOINT_PHASE_SPECS[phase][
+                            "artifact_kind"
+                        ]
+                    )
+                )
+            ),
+            "phase_sequence_position": PHASES.index(phase),
+            "included_in_stage1_only_workflow": (
+                phase in STAGE1_ONLY_PHASES
+            ),
+            "evidence_family_order": (
+                list(EVIDENCE_FAMILIES)
+                if phase
+                in {
+                    "stage1_preflight",
+                    "stage1_modeling",
+                    "stage2_canary",
+                    "stage2_inference",
+                }
+                else None
+            ),
+        }
+        phase_constant_identity = {
+            **phase_constant_body,
+            "content_sha256": _sha(phase_constant_body),
+        }
+        body = {
+            "schema_version": "phase_transitive_producer_code_identity_v1",
+            "phase": phase,
+            "root_modules": roots,
+            "transitive_source_inventory": list(file_inventory),
+            "dependency_lock_inventory": copy.deepcopy(
+                dependency_lock_inventory
+            ),
+            "workflow_callable_ast_sha256": callable_identities,
+            "workflow_same_file_dependency_identity": (
+                same_file_dependencies
+            ),
+            "workflow_constant_identity": phase_constant_identity,
+            "injected_phase_producer": _path_neutral_injected_identity(injected),
+            "role_neutral_stage1_integration": role_neutral,
+        }
+        output[phase] = {**body, "content_sha256": _sha(body)}
+    return output
+
+
+def _bind_workflow_scientific_identity(
+    *,
+    scientific_configuration_body: Mapping[str, Any],
+    phase_code_records: Mapping[str, Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Bind global identity to all code while retaining phase-local reuse."""
+
+    if set(phase_code_records) != set(
+        PORTABLE_CHECKPOINT_PHASE_SPECS
+    ):
+        raise ValueError(
+            "phase producer identities do not cover every checkpoint phase"
+        )
+    phase_ids: dict[str, str] = {}
+    for phase, record in phase_code_records.items():
+        body = {
+            key: copy.deepcopy(value)
+            for key, value in record.items()
+            if key != "content_sha256"
+        }
+        if (
+            record.get("phase") != phase
+            or record.get("content_sha256") != _sha(body)
+        ):
+            raise ValueError(
+                f"{phase} producer-code record is invalid"
+            )
+        phase_ids[phase] = str(record["content_sha256"])
+    scientific_configuration_sha256 = identity_sha256(
+        scientific_configuration_body
+    )
+    workflow_producer_code_identity = identity_sha256(
+        {
+            "schema_version": (
+                "workflow_phase_producer_code_aggregate_v1"
+            ),
+            "phase_producer_code_identities": phase_ids,
+        }
+    )
+    scientific_body = {
+        "schema_version": (
+            "portable_all_evidence_scientific_identity_v3"
+        ),
+        "scientific_configuration_sha256": (
+            scientific_configuration_sha256
+        ),
+        "workflow_producer_code_identity": (
+            workflow_producer_code_identity
+        ),
+        "phase_producer_code_identities": phase_ids,
+    }
+    return {
+        "scientific_configuration_identity": {
+            **copy.deepcopy(dict(scientific_configuration_body)),
+            "scientific_configuration_sha256": (
+                scientific_configuration_sha256
+            ),
+        },
+        "phase_producer_code_identities": phase_ids,
+        "workflow_producer_code_identity": (
+            workflow_producer_code_identity
+        ),
+        "scientific_identity": {
+            **scientific_body,
+            "scientific_sha256": identity_sha256(scientific_body),
+        },
+    }
 
 
 def _path_neutral_identity(value: Any) -> Any:
@@ -692,26 +3521,1011 @@ def _checkpoint_publication_attestation_value(
 
 
 def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
-    def reject_duplicates(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
-        output: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in output:
-                raise ValueError(f"{label} contains duplicate JSON key: {key}")
-            output[key] = value
-        return output
+    """Read an immutable control through the same strict private-file gate."""
 
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"{label} must be one real regular file: {path}")
+    return _read_private_json_object(Path(path), label=label)
+
+
+def _read_private_json_object(
+    path: Path,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    """Read one private JSON file through a stable no-follow descriptor."""
+
+    target = Path(path)
+    before_path = os.lstat(target)
+    if (
+        stat.S_ISLNK(before_path.st_mode)
+        or not stat.S_ISREG(before_path.st_mode)
+        or int(before_path.st_nlink) != 1
+    ):
+        raise ValueError(
+            f"{label} must be a private non-symlink regular file"
+        )
+    descriptor = os.open(
+        target,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    chunks: list[bytes] = []
+    try:
+        before_fd = os.fstat(descriptor)
+        before_identity = (
+            int(before_path.st_dev),
+            int(before_path.st_ino),
+            int(before_path.st_mode),
+            int(before_path.st_nlink),
+            int(before_path.st_size),
+            int(before_path.st_mtime_ns),
+            int(before_path.st_ctime_ns),
+        )
+        fd_identity = (
+            int(before_fd.st_dev),
+            int(before_fd.st_ino),
+            int(before_fd.st_mode),
+            int(before_fd.st_nlink),
+            int(before_fd.st_size),
+            int(before_fd.st_mtime_ns),
+            int(before_fd.st_ctime_ns),
+        )
+        if fd_identity != before_identity:
+            raise RuntimeError(f"{label} changed while being opened")
+        while block := os.read(descriptor, 1024 * 1024):
+            chunks.append(block)
+        after_fd = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after_path = os.lstat(target)
+    after_fd_identity = (
+        int(after_fd.st_dev),
+        int(after_fd.st_ino),
+        int(after_fd.st_mode),
+        int(after_fd.st_nlink),
+        int(after_fd.st_size),
+        int(after_fd.st_mtime_ns),
+        int(after_fd.st_ctime_ns),
+    )
+    after_path_identity = (
+        int(after_path.st_dev),
+        int(after_path.st_ino),
+        int(after_path.st_mode),
+        int(after_path.st_nlink),
+        int(after_path.st_size),
+        int(after_path.st_mtime_ns),
+        int(after_path.st_ctime_ns),
+    )
+    if (
+        after_fd_identity != before_identity
+        or after_path_identity != before_identity
+    ):
+        raise RuntimeError(f"{label} changed while being read")
+
+    def reject_duplicates(
+        pairs: Sequence[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(
+                    f"{label} contains duplicate JSON key: {key}"
+                )
+            value[key] = item
+        return value
+
     try:
         value = json.loads(
-            path.read_text(encoding="utf-8"),
+            b"".join(chunks).decode("utf-8"),
             object_pairs_hook=reject_duplicates,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(
+                    f"{label} contains non-finite value {token}"
+                )
+            ),
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} is invalid JSON: {path}") from exc
+        raise ValueError(f"{label} is invalid JSON") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{label} must contain one JSON object")
     return value
+
+
+def _granular_checkpoint_index_paths(
+    *,
+    work_root: Path,
+    phase: str,
+) -> tuple[Path, Path, Path]:
+    root = work_root / "portable_granular_checkpoints" / phase
+    return (
+        root,
+        root / "granular_index.json",
+        root / "granular_index_locator.json",
+    )
+
+
+def _derive_expected_granular_checkpoint_plan(
+    *,
+    outer_folds: int,
+    initial_training_partitions: int,
+    review_rounds: int,
+) -> Mapping[str, Any]:
+    """Derive exact logical/physical/fold coverage from the fold contract."""
+
+    for label, raw in (
+        ("outer_folds", outer_folds),
+        ("initial_training_partitions", initial_training_partitions),
+        ("review_rounds", review_rounds),
+    ):
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, int)
+            or int(raw) < 1
+        ):
+            raise ValueError(
+                f"granular checkpoint plan requires positive {label}"
+            )
+    inner_partitions = int(initial_training_partitions) + int(review_rounds)
+    # Derive equivalence from ordered abstract partition content.  These tokens
+    # describe the fold contract only; the terminal validators separately bind
+    # every resulting owner to the exact row-level PhysicalFitKey reconstructed
+    # from the authenticated prepared Stage 1 context.
+    logical_rows: list[tuple[str, tuple[str, ...]]] = []
+    for outer_fold in range(1, int(outer_folds) + 1):
+        full = f"outer_{outer_fold:03d}_full"
+        partitions = tuple(
+            f"outer_{outer_fold:03d}:partition_{partition:03d}"
+            for partition in range(1, inner_partitions + 1)
+        )
+        logical_rows.append((full, partitions))
+        for inner_fold in range(1, inner_partitions + 1):
+            scope = (
+                f"outer_{outer_fold:03d}_inner_{inner_fold:03d}"
+            )
+            logical_rows.append(
+                (
+                    scope,
+                    tuple(
+                        partition
+                        for partition_index, partition in enumerate(
+                            partitions,
+                            start=1,
+                        )
+                        if partition_index != inner_fold
+                    ),
+                )
+            )
+    for outer_fold in range(1, int(outer_folds) + 1):
+        partitions = tuple(
+            f"outer_{outer_fold:03d}:partition_{partition:03d}"
+            for partition in range(1, inner_partitions + 1)
+        )
+        for epoch in range(int(review_rounds)):
+            scope = (
+                f"outer_{outer_fold:03d}_hierarchy_epoch_{epoch:03d}"
+            )
+            spent_partition_count = (
+                int(initial_training_partitions) + epoch
+            )
+            logical_rows.append(
+                (scope, partitions[:spent_partition_count])
+            )
+    logical_scope_ids = [scope_id for scope_id, _rows in logical_rows]
+    physical_owner_scope_ids: list[str] = []
+    logical_to_physical_owner: dict[str, str] = {}
+    owner_by_ordered_content: dict[tuple[str, ...], str] = {}
+    for scope_id, ordered_content in logical_rows:
+        owner = owner_by_ordered_content.get(ordered_content)
+        if owner is None:
+            owner = scope_id
+            owner_by_ordered_content[ordered_content] = owner
+            physical_owner_scope_ids.append(owner)
+        logical_to_physical_owner[scope_id] = owner
+    physical_count = len(physical_owner_scope_ids)
+    logical_count = len(logical_scope_ids)
+    fold_ids = list(range(1, int(outer_folds) + 1))
+    body = {
+        "schema_version": WORKFLOW_EXPECTED_GRANULAR_PLAN_SCHEMA,
+        "outer_fold_count": int(outer_folds),
+        "initial_training_partitions": int(initial_training_partitions),
+        "review_rounds": int(review_rounds),
+        "inner_partition_count": inner_partitions,
+        "outer_fold_ids": fold_ids,
+        "stage1_physical_owner_scope_ids": (
+            physical_owner_scope_ids
+        ),
+        "stage1_logical_scope_ids": logical_scope_ids,
+        "stage1_logical_to_physical_owner": (
+            logical_to_physical_owner
+        ),
+        "stage1_physical_fit_count": physical_count,
+        "stage1_logical_scope_count": logical_count,
+        "stage1_artifact_kind_counts": {
+            "logical_scope_bindings": logical_count,
+            "neural_query_component": physical_count,
+            "physical_scope_fit": physical_count,
+            "row_map": 1,
+            "tfidf_component": physical_count,
+        },
+        "stage2_fold_ids": fold_ids,
+        "stage2_review_fold_ids": fold_ids,
+        "stage2_artifact_kind_counts": {
+            "stage2_extraction_component": 1,
+            "stage2_fold": len(fold_ids),
+            "stage2_response_component": 1,
+            "stage2_review_component": len(fold_ids),
+        },
+    }
+    return {**body, "content_sha256": _sha(body)}
+
+
+def _validate_expected_granular_checkpoint_plan(
+    value: Any,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "workflow request lacks its expected granular checkpoint plan"
+        )
+    required = {
+        "schema_version",
+        "outer_fold_count",
+        "initial_training_partitions",
+        "review_rounds",
+        "inner_partition_count",
+        "outer_fold_ids",
+        "stage1_physical_owner_scope_ids",
+        "stage1_logical_scope_ids",
+        "stage1_logical_to_physical_owner",
+        "stage1_physical_fit_count",
+        "stage1_logical_scope_count",
+        "stage1_artifact_kind_counts",
+        "stage2_fold_ids",
+        "stage2_review_fold_ids",
+        "stage2_artifact_kind_counts",
+        "content_sha256",
+    }
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in value.items()
+        if key != "content_sha256"
+    }
+    physical = value.get("stage1_physical_owner_scope_ids")
+    logical = value.get("stage1_logical_scope_ids")
+    logical_to_owner = value.get(
+        "stage1_logical_to_physical_owner"
+    )
+    folds = value.get("outer_fold_ids")
+    stage2_folds = value.get("stage2_fold_ids")
+    review_folds = value.get("stage2_review_fold_ids")
+    if (
+        set(value) != required
+        or value.get("schema_version")
+        != WORKFLOW_EXPECTED_GRANULAR_PLAN_SCHEMA
+        or value.get("content_sha256") != _sha(body)
+        or not isinstance(folds, list)
+        or not folds
+        or any(
+            isinstance(fold, bool) or not isinstance(fold, int)
+            for fold in folds
+        )
+        or isinstance(value.get("outer_fold_count"), bool)
+        or not isinstance(value.get("outer_fold_count"), int)
+        or int(value["outer_fold_count"]) < 1
+        or value.get("outer_fold_count") != len(folds)
+        or isinstance(value.get("initial_training_partitions"), bool)
+        or not isinstance(value.get("initial_training_partitions"), int)
+        or int(value["initial_training_partitions"]) < 1
+        or isinstance(value.get("review_rounds"), bool)
+        or not isinstance(value.get("review_rounds"), int)
+        or int(value["review_rounds"]) < 1
+        or isinstance(value.get("inner_partition_count"), bool)
+        or not isinstance(value.get("inner_partition_count"), int)
+        or value.get("inner_partition_count")
+        != int(value["initial_training_partitions"])
+        + int(value["review_rounds"])
+        or not isinstance(physical, list)
+        or not physical
+        or len(physical) != len(set(physical))
+        or not isinstance(logical, list)
+        or not logical
+        or len(logical) != len(set(logical))
+        or not isinstance(logical_to_owner, Mapping)
+        or set(logical_to_owner) != set(logical)
+        or any(owner not in set(physical) for owner in logical_to_owner.values())
+        or value.get("stage1_physical_fit_count") != len(physical)
+        or value.get("stage1_logical_scope_count") != len(logical)
+        or folds != list(range(1, len(folds) + 1))
+        or stage2_folds != folds
+        or review_folds != folds
+    ):
+        raise ValueError(
+            "expected granular checkpoint plan is invalid"
+        )
+    expected_stage1_counts = {
+        "logical_scope_bindings": len(logical),
+        "neural_query_component": len(physical),
+        "physical_scope_fit": len(physical),
+        "row_map": 1,
+        "tfidf_component": len(physical),
+    }
+    expected_stage2_counts = {
+        "stage2_extraction_component": 1,
+        "stage2_fold": len(folds),
+        "stage2_response_component": 1,
+        "stage2_review_component": len(folds),
+    }
+    if (
+        value.get("stage1_artifact_kind_counts")
+        != expected_stage1_counts
+        or value.get("stage2_artifact_kind_counts")
+        != expected_stage2_counts
+    ):
+        raise ValueError(
+            "expected granular checkpoint kind counts changed"
+        )
+    return copy.deepcopy(dict(value))
+
+
+def _granular_checkpoint_coverage(
+    nodes: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    artifact_ids: list[str] = []
+    for node in nodes:
+        kind = str(node["artifact_kind"])
+        counts[kind] = counts.get(kind, 0) + 1
+        artifact_ids.append(str(node["artifact_id"]))
+    body = {
+        "schema_version": "granular_checkpoint_coverage_v1",
+        "artifact_kind_counts": dict(sorted(counts.items())),
+        "ordered_artifact_ids": artifact_ids,
+        "node_count": len(nodes),
+        "payload_bytes_referenced_without_copy": True,
+    }
+    return {**body, "content_sha256": _sha(body)}
+
+
+def _granular_primary_metadata_from_index(
+    *,
+    phase: str,
+    index: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if phase == "stage1_modeling":
+        terminal_kinds = {"logical_scope_bindings", "row_map"}
+    elif phase == "stage2_inference":
+        terminal_kinds = {"stage2_fold"}
+    else:
+        raise ValueError(
+            f"{phase} has no granular primary checkpoint binding"
+        )
+    nodes = index.get("nodes")
+    coverage = index.get("coverage")
+    if not isinstance(nodes, list) or not isinstance(coverage, Mapping):
+        raise ValueError(f"{phase} granular index is incomplete")
+    return {
+        "schema_version": (
+            "workflow_primary_granular_coverage_binding_v1"
+        ),
+        "producer_phase": phase,
+        "granular_index_content_sha256": index["content_sha256"],
+        "granular_coverage_content_sha256": coverage[
+            "content_sha256"
+        ],
+        "granular_artifact_ids": [
+            node["artifact_id"] for node in nodes
+        ],
+        "granular_terminal_artifact_ids": [
+            node["artifact_id"]
+            for node in nodes
+            if node["artifact_kind"] in terminal_kinds
+        ],
+        "granular_artifact_kind_counts": copy.deepcopy(
+            coverage["artifact_kind_counts"]
+        ),
+    }
+
+
+def _validate_exact_granular_upstream_edges(
+    *,
+    phase: str,
+    artifacts: Sequence[ValidatedPortableArtifact],
+    expected_plan: Mapping[str, Any],
+    expected_external_upstream_artifact_ids: Sequence[str],
+) -> None:
+    """Require the exact scientific dependency edge for every granular node."""
+
+    plan = _validate_expected_granular_checkpoint_plan(expected_plan)
+    external = tuple(
+        str(value) for value in expected_external_upstream_artifact_ids
+    )
+
+    def artifacts_of_kind(
+        artifact_kind: str,
+    ) -> tuple[ValidatedPortableArtifact, ...]:
+        return tuple(
+            artifact
+            for artifact in artifacts
+            if artifact.manifest["artifact_kind"] == artifact_kind
+        )
+
+    def exact_upstream(
+        artifact: ValidatedPortableArtifact,
+        expected: Sequence[str],
+        *,
+        label: str,
+    ) -> None:
+        observed = tuple(
+            str(value)
+            for value in artifact.manifest["upstream_artifact_ids"]
+        )
+        if observed != tuple(str(value) for value in expected):
+            raise ValueError(
+                f"{phase} granular {label} upstream edge changed"
+            )
+
+    if phase == "stage1_modeling":
+        if len(external) != 1:
+            raise ValueError(
+                "Stage 1 granular validation requires exactly one "
+                "authenticated prepared-context parent"
+            )
+        expected_owners = tuple(
+            str(value)
+            for value in plan["stage1_physical_owner_scope_ids"]
+        )
+
+        def owner_map(
+            artifact_kind: str,
+        ) -> dict[str, ValidatedPortableArtifact]:
+            output: dict[str, ValidatedPortableArtifact] = {}
+            for artifact in artifacts_of_kind(artifact_kind):
+                owner = str(
+                    artifact.artifact_metadata.get(
+                        "physical_owner_scope_id", ""
+                    )
+                )
+                if not owner or owner in output:
+                    raise ValueError(
+                        "Stage 1 granular physical-owner edge coverage "
+                        "is absent or duplicated"
+                    )
+                output[owner] = artifact
+            if tuple(output) != expected_owners:
+                raise ValueError(
+                    "Stage 1 granular physical-owner edge coverage changed"
+                )
+            return output
+
+        tfidf_by_owner = owner_map("tfidf_component")
+        neural_by_owner = owner_map("neural_query_component")
+        physical_by_owner = owner_map("physical_scope_fit")
+        for owner in expected_owners:
+            tfidf = tfidf_by_owner[owner]
+            neural = neural_by_owner[owner]
+            physical = physical_by_owner[owner]
+            exact_upstream(
+                tfidf,
+                external,
+                label=f"TF-IDF component {owner}",
+            )
+            exact_upstream(
+                neural,
+                external,
+                label=f"neural-query component {owner}",
+            )
+            exact_upstream(
+                physical,
+                (
+                    *external,
+                    tfidf.artifact_id,
+                    neural.artifact_id,
+                ),
+                label=f"physical fit {owner}",
+            )
+
+        logical_by_id: dict[str, ValidatedPortableArtifact] = {}
+        for artifact in artifacts_of_kind("logical_scope_bindings"):
+            logical_id = str(
+                artifact.artifact_metadata.get("logical_scope_id", "")
+            )
+            if not logical_id or logical_id in logical_by_id:
+                raise ValueError(
+                    "Stage 1 granular logical edge coverage is absent or "
+                    "duplicated"
+                )
+            logical_by_id[logical_id] = artifact
+        expected_logical = tuple(
+            str(value) for value in plan["stage1_logical_scope_ids"]
+        )
+        if tuple(logical_by_id) != expected_logical:
+            raise ValueError(
+                "Stage 1 granular logical edge coverage changed"
+            )
+        expected_logical_to_owner = dict(
+            plan["stage1_logical_to_physical_owner"]
+        )
+        for logical_id in expected_logical:
+            owner = str(expected_logical_to_owner[logical_id])
+            exact_upstream(
+                logical_by_id[logical_id],
+                (physical_by_owner[owner].artifact_id,),
+                label=f"logical binding {logical_id}",
+            )
+
+        row_maps = artifacts_of_kind("row_map")
+        if len(row_maps) != 1:
+            raise ValueError(
+                "Stage 1 granular row-map edge coverage changed"
+            )
+        exact_upstream(
+            row_maps[0],
+            tuple(
+                logical_by_id[logical_id].artifact_id
+                for logical_id in expected_logical
+            ),
+            label="row map",
+        )
+        return
+
+    if phase != "stage2_inference":
+        return
+    if len(external) != len(
+        PORTABLE_CHECKPOINT_PHASE_SPECS[phase]["upstream_phases"]
+    ):
+        raise ValueError(
+            "Stage 2 granular validation requires its exact authenticated "
+            "workflow parents"
+        )
+    responses = artifacts_of_kind("stage2_response_component")
+    extractions = artifacts_of_kind("stage2_extraction_component")
+    if len(responses) != 1 or len(extractions) != 1:
+        raise ValueError(
+            "Stage 2 granular response/extraction edge coverage changed"
+        )
+    response = responses[0]
+    extraction = extractions[0]
+    exact_upstream(
+        response,
+        external,
+        label="response component",
+    )
+    exact_upstream(
+        extraction,
+        (response.artifact_id,),
+        label="extraction component",
+    )
+
+    def fold_map(
+        artifact_kind: str,
+    ) -> dict[int, ValidatedPortableArtifact]:
+        output: dict[int, ValidatedPortableArtifact] = {}
+        for artifact in artifacts_of_kind(artifact_kind):
+            outer_fold = artifact.artifact_metadata.get("outer_fold")
+            if (
+                isinstance(outer_fold, bool)
+                or not isinstance(outer_fold, int)
+                or outer_fold in output
+            ):
+                raise ValueError(
+                    "Stage 2 granular fold edge coverage is invalid"
+                )
+            output[int(outer_fold)] = artifact
+        return output
+
+    reviews = fold_map("stage2_review_component")
+    folds = fold_map("stage2_fold")
+    expected_reviews = tuple(
+        int(value) for value in plan["stage2_review_fold_ids"]
+    )
+    expected_folds = tuple(
+        int(value) for value in plan["stage2_fold_ids"]
+    )
+    if tuple(reviews) != expected_reviews or tuple(folds) != expected_folds:
+        raise ValueError(
+            "Stage 2 granular fold/review edge coverage changed"
+        )
+    for outer_fold in expected_reviews:
+        exact_upstream(
+            reviews[outer_fold],
+            (extraction.artifact_id,),
+            label=f"review component outer fold {outer_fold}",
+        )
+    for outer_fold in expected_folds:
+        exact_upstream(
+            folds[outer_fold],
+            (
+                response.artifact_id,
+                extraction.artifact_id,
+                reviews[outer_fold].artifact_id,
+            ),
+            label=f"fold outer fold {outer_fold}",
+        )
+
+
+def _validate_granular_handles_against_plan(
+    *,
+    phase: str,
+    artifacts: Sequence[ValidatedPortableArtifact],
+    expected_plan: Mapping[str, Any],
+    expected_stage1_scope_plan: Any | None = None,
+    expected_external_upstream_artifact_ids: Sequence[str] | None = None,
+) -> None:
+    plan = _validate_expected_granular_checkpoint_plan(expected_plan)
+    counts: dict[str, int] = {}
+    for artifact in artifacts:
+        kind = str(artifact.manifest["artifact_kind"])
+        counts[kind] = counts.get(kind, 0) + 1
+    expected_counts = dict(
+        plan[
+            (
+                "stage1_artifact_kind_counts"
+                if phase == "stage1_modeling"
+                else "stage2_artifact_kind_counts"
+            )
+        ]
+    )
+    if phase not in {"stage1_modeling", "stage2_inference"}:
+        return
+    if dict(sorted(counts.items())) != expected_counts:
+        raise ValueError(
+            f"{phase} granular checkpoint differs from the request plan"
+        )
+    if phase == "stage1_modeling":
+        if expected_stage1_scope_plan is None:
+            raise ValueError(
+                "Stage 1 granular validation requires the authenticated "
+                "current scope plan"
+            )
+        exact_projection = _stage1_scope_plan_granular_expectations(
+            scope_plan=expected_stage1_scope_plan,
+            expected_granular_checkpoint_plan=plan,
+        )
+        expected_key_records = exact_projection[
+            "physical_fit_key_records_by_owner"
+        ]
+        for artifact in artifacts:
+            if artifact.manifest["artifact_kind"] not in {
+                "tfidf_component",
+                "neural_query_component",
+                "physical_scope_fit",
+                "logical_scope_bindings",
+            }:
+                continue
+            owner = str(
+                artifact.artifact_metadata.get(
+                    "physical_owner_scope_id", ""
+                )
+            )
+            expected_record = expected_key_records.get(owner)
+            if not isinstance(expected_record, Mapping):
+                raise ValueError(
+                    "Stage 1 granular owner is absent from the "
+                    "authenticated current scope plan"
+                )
+            _validated_stage1_granular_physical_fit_key(
+                metadata=artifact.artifact_metadata,
+                expected_identity=(
+                    expected_stage1_scope_plan.physical_fit_identity
+                ),
+                expected_key_record=expected_record,
+            )
+        expected_owners = list(
+            plan["stage1_physical_owner_scope_ids"]
+        )
+        for kind in (
+            "tfidf_component",
+            "neural_query_component",
+            "physical_scope_fit",
+        ):
+            owners = [
+                str(
+                    artifact.artifact_metadata.get(
+                        "physical_owner_scope_id"
+                    )
+                )
+                for artifact in artifacts
+                if artifact.manifest["artifact_kind"] == kind
+            ]
+            if owners != expected_owners:
+                raise ValueError(
+                    "Stage 1 granular physical-owner coverage changed"
+                )
+        logical_to_owner = {
+            str(artifact.artifact_metadata.get("logical_scope_id")): str(
+                artifact.artifact_metadata.get(
+                    "physical_owner_scope_id"
+                )
+            )
+            for artifact in artifacts
+            if artifact.manifest["artifact_kind"]
+            == "logical_scope_bindings"
+        }
+        if (
+            list(logical_to_owner)
+            != list(plan["stage1_logical_scope_ids"])
+            or logical_to_owner
+            != dict(plan["stage1_logical_to_physical_owner"])
+        ):
+            raise ValueError(
+                "Stage 1 granular logical coverage changed"
+            )
+    else:
+        folds = [
+            artifact.artifact_metadata.get("outer_fold")
+            for artifact in artifacts
+            if artifact.manifest["artifact_kind"] == "stage2_fold"
+        ]
+        reviews = [
+            artifact.artifact_metadata.get("outer_fold")
+            for artifact in artifacts
+            if artifact.manifest["artifact_kind"]
+            == "stage2_review_component"
+        ]
+        if (
+            folds != list(plan["stage2_fold_ids"])
+            or reviews != list(plan["stage2_review_fold_ids"])
+        ):
+            raise ValueError(
+                "Stage 2 granular fold/review coverage changed"
+            )
+    if expected_external_upstream_artifact_ids is None:
+        raise ValueError(
+            f"{phase} granular validation lacks its authenticated external "
+            "parents"
+        )
+    _validate_exact_granular_upstream_edges(
+        phase=phase,
+        artifacts=artifacts,
+        expected_plan=plan,
+        expected_external_upstream_artifact_ids=(
+            expected_external_upstream_artifact_ids
+        ),
+    )
+
+
+def _validate_granular_checkpoint_index_from_paths(
+    *,
+    work_root: Path,
+    phase: str,
+    compatibility: ArtifactCompatibility,
+    payload_authentication_cache: MutableMapping[
+        str, tuple[tuple[int, ...], str, int]
+    ]
+    | None = None,
+    expected_granular_checkpoint_plan: Mapping[str, Any] | None = None,
+    expected_stage1_scope_plan: Any | None = None,
+    expected_external_upstream_artifact_ids: Sequence[str] | None = None,
+) -> tuple[Mapping[str, Any], tuple[ValidatedPortableArtifact, ...]]:
+    """Freshly reopen one locator-separated granular checkpoint index."""
+
+    root, index_path, locator_path = _granular_checkpoint_index_paths(
+        work_root=work_root,
+        phase=phase,
+    )
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"{phase} granular checkpoint root is invalid")
+    index = _read_private_json_object(
+        index_path,
+        label=f"{phase} granular checkpoint index",
+    )
+    index_fields = {
+        "schema_version",
+        "phase",
+        "node_count",
+        "nodes",
+        "coverage",
+        "relative_filesystem_layout_included",
+        "content_sha256",
+    }
+    index_body = {
+        key: copy.deepcopy(value)
+        for key, value in index.items()
+        if key != "content_sha256"
+    }
+    nodes = index.get("nodes")
+    if (
+        set(index) != index_fields
+        or index.get("schema_version")
+        != WORKFLOW_GRANULAR_CHECKPOINT_INDEX_SCHEMA
+        or index.get("phase") != phase
+        or not isinstance(nodes, list)
+        or not nodes
+        or index.get("node_count") != len(nodes)
+        or index.get("relative_filesystem_layout_included") is not False
+        or index.get("content_sha256") != _sha(index_body)
+    ):
+        raise ValueError(f"{phase} granular checkpoint index is invalid")
+    expected_node_fields = {
+        "node_ordinal",
+        "node_key",
+        "artifact_id",
+        "artifact_kind",
+        "artifact_schema",
+        "upstream_artifact_ids",
+        "artifact_metadata",
+    }
+    artifact_ids: list[str] = []
+    node_keys: list[str] = []
+    for ordinal, node in enumerate(nodes):
+        if (
+            not isinstance(node, Mapping)
+            or set(node) != expected_node_fields
+            or node.get("node_ordinal") != ordinal
+            or not isinstance(node.get("node_key"), str)
+            or not str(node["node_key"])
+            or str(node.get("artifact_kind"))
+            not in GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS
+            or node.get("artifact_schema")
+            != GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS[
+                str(node["artifact_kind"])
+            ]
+            or CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.get(
+                str(node["artifact_kind"])
+            )
+            != phase
+            or not isinstance(node.get("upstream_artifact_ids"), list)
+            or not isinstance(node.get("artifact_metadata"), Mapping)
+        ):
+            raise ValueError(
+                f"{phase} granular checkpoint node descriptor is invalid"
+            )
+        artifact_ids.append(str(node["artifact_id"]))
+        node_keys.append(str(node["node_key"]))
+    if (
+        len(set(artifact_ids)) != len(artifact_ids)
+        or len(set(node_keys)) != len(node_keys)
+        or index.get("coverage") != _granular_checkpoint_coverage(nodes)
+    ):
+        raise ValueError(
+            f"{phase} granular checkpoint coverage is duplicated or changed"
+        )
+
+    locator = _read_private_json_object(
+        locator_path,
+        label=f"{phase} granular checkpoint locator",
+    )
+    locator_fields = {
+        "schema_version",
+        "phase",
+        "index_content_sha256",
+        "index_path",
+        "phase_manifest_path",
+        "phase_manifest_sha256",
+        "phase_manifest_size_bytes",
+        "node_controls",
+        "content_sha256",
+    }
+    locator_body = {
+        key: copy.deepcopy(value)
+        for key, value in locator.items()
+        if key != "content_sha256"
+    }
+    controls = locator.get("node_controls")
+    if (
+        set(locator) != locator_fields
+        or locator.get("schema_version")
+        != WORKFLOW_GRANULAR_CHECKPOINT_LOCATOR_SCHEMA
+        or locator.get("phase") != phase
+        or locator.get("index_content_sha256")
+        != index["content_sha256"]
+        or locator.get("index_path")
+        != str(index_path.resolve(strict=True))
+        or not isinstance(controls, list)
+        or len(controls) != len(nodes)
+        or locator.get("content_sha256") != _sha(locator_body)
+    ):
+        raise ValueError(f"{phase} granular checkpoint locator is invalid")
+    phase_manifest_path = Path(str(locator["phase_manifest_path"]))
+    phase_manifest_sha, phase_manifest_size = stable_file_sha256(
+        phase_manifest_path.resolve(strict=True)
+    )
+    if (
+        phase_manifest_path
+        != (work_root / "phases" / phase / "complete_manifest.json").resolve(
+            strict=True
+        )
+        or phase_manifest_sha != locator.get("phase_manifest_sha256")
+        or phase_manifest_size
+        != int(locator.get("phase_manifest_size_bytes", -1))
+    ):
+        raise ValueError(
+            f"{phase} granular checkpoint phase-manifest locator changed"
+        )
+    expected_control_fields = {
+        "node_ordinal",
+        "artifact_id",
+        "control_root",
+    }
+    handles: list[ValidatedPortableArtifact] = []
+    observed_control_names: set[str] = set()
+    prior_granular_ids: set[str] = set()
+    all_granular_ids = set(artifact_ids)
+    for ordinal, (node, control) in enumerate(
+        zip(nodes, controls, strict=True)
+    ):
+        if (
+            not isinstance(control, Mapping)
+            or set(control) != expected_control_fields
+            or control.get("node_ordinal") != ordinal
+            or control.get("artifact_id") != node["artifact_id"]
+        ):
+            raise ValueError(
+                f"{phase} granular checkpoint control mapping is invalid"
+            )
+        control_root = Path(str(control["control_root"]))
+        if (
+            not control_root.is_absolute()
+            or control_root.is_symlink()
+            or control_root.resolve(strict=True).parent
+            != (root / "nodes").resolve(strict=True)
+        ):
+            raise ValueError(
+                f"{phase} granular checkpoint control escaped its index"
+            )
+        observed_control_names.add(control_root.name)
+        upstream = tuple(str(value) for value in node["upstream_artifact_ids"])
+        if (set(upstream) & all_granular_ids) - prior_granular_ids:
+            raise ValueError(
+                f"{phase} granular checkpoint index is not topological"
+            )
+        artifact = validate_portable_artifact(
+            control_root,
+            expected_kind=str(node["artifact_kind"]),
+            expected_compatibility_key=compatibility.key,
+            expected_upstream_artifact_ids=upstream,
+            payload_authentication_cache=payload_authentication_cache,
+        )
+        if (
+            artifact.artifact_id != node["artifact_id"]
+            or artifact.manifest.get("artifact_schema")
+            != node["artifact_schema"]
+            or dict(artifact.artifact_metadata)
+            != dict(node["artifact_metadata"])
+        ):
+            raise ValueError(
+                f"{phase} granular checkpoint artifact changed"
+            )
+        handles.append(artifact)
+        prior_granular_ids.add(artifact.artifact_id)
+    nodes_root = root / "nodes"
+    if nodes_root.is_symlink() or not nodes_root.is_dir():
+        raise ValueError(
+            f"{phase} granular checkpoint controls are invalid"
+        )
+    actual_control_names = {
+        child.name
+        for child in nodes_root.iterdir()
+        if child.is_dir() and not child.is_symlink()
+    }
+    if (
+        actual_control_names != observed_control_names
+        or any(
+            child.is_symlink() or not child.is_dir()
+            for child in nodes_root.iterdir()
+        )
+        or {
+            child.name for child in root.iterdir()
+        }
+        != {
+            "nodes",
+            index_path.name,
+            locator_path.name,
+        }
+    ):
+        raise ValueError(
+            f"{phase} granular checkpoint controls contain missing or extra entries"
+        )
+    if expected_granular_checkpoint_plan is not None:
+        _validate_granular_handles_against_plan(
+            phase=phase,
+            artifacts=tuple(handles),
+            expected_plan=expected_granular_checkpoint_plan,
+            expected_stage1_scope_plan=expected_stage1_scope_plan,
+            expected_external_upstream_artifact_ids=(
+                expected_external_upstream_artifact_ids
+            ),
+        )
+    return copy.deepcopy(index), tuple(handles)
 
 
 def _persist_legacy_preflight_recompute_decision(
@@ -889,6 +4703,119 @@ def _attempt_tree_artifacts(attempt_dir: Path) -> list[dict[str, Any]]:
     return artifacts
 
 
+def _complete_regular_file_tree(root: Path) -> tuple[str, ...]:
+    tree = Path(root).resolve(strict=True)
+    if tree.is_symlink() or not tree.is_dir():
+        raise ValueError("terminal payload tree must be a real directory")
+    output: list[str] = []
+    for path in sorted(tree.rglob("*")):
+        state = os.lstat(path)
+        if stat.S_ISLNK(state.st_mode):
+            raise ValueError("terminal payload tree contains a symlink")
+        if stat.S_ISDIR(state.st_mode):
+            continue
+        if not stat.S_ISREG(state.st_mode) or int(state.st_nlink) != 1:
+            raise ValueError(
+                "terminal payload tree contains non-private data"
+            )
+        output.append(str(path.resolve(strict=True)))
+    return tuple(output)
+
+
+def _portable_stage1_terminal_file_inventory(
+    *,
+    execution_root: Path,
+    bundle_root: Path,
+    numerical_bank_root: Path,
+    binding_path: Path,
+) -> tuple[str, ...]:
+    """Return every Stage 1 byte claimed by granular/handoff checkpoints."""
+
+    values = (
+        *_complete_regular_file_tree(execution_root),
+        *_complete_regular_file_tree(bundle_root),
+        *_complete_regular_file_tree(numerical_bank_root),
+        str(Path(binding_path).resolve(strict=True)),
+    )
+    if len(values) != len(set(values)):
+        raise RuntimeError(
+            "Stage 1 terminal payload roots overlap or duplicate bytes"
+        )
+    return tuple(values)
+
+
+def _portable_stage2_terminal_file_inventory(
+    *,
+    result: Mapping[str, Any],
+    prediction_path: Path,
+    run_manifest_path: Path,
+    attestation_path: Path,
+) -> tuple[str, ...]:
+    """Return exact Stage 2-owned response/review/extraction/fold bytes."""
+
+    required_lists = {
+        "fold_manifest_paths": result.get("fold_manifest_paths"),
+        "fold_prediction_paths": result.get("fold_prediction_paths"),
+        "complete_paged_ledger_artifact_paths": result.get(
+            "complete_paged_ledger_artifact_paths"
+        ),
+    }
+    if any(
+        not isinstance(paths, list)
+        or not paths
+        or any(not isinstance(path, str) for path in paths)
+        for paths in required_lists.values()
+    ):
+        raise RuntimeError(
+            "direct Stage 2 result omitted fold terminal artifacts"
+        )
+    batch_result_path = Path(
+        str(result["hierarchical_batch_result_path"])
+    ).resolve(strict=True)
+    review_terminals: list[str] = []
+    for raw_fold_manifest in required_lists["fold_manifest_paths"]:
+        review_root = (
+            Path(raw_fold_manifest).resolve(strict=True).parent
+            / "post_extraction_review"
+        )
+        if review_root.exists():
+            review_terminals.extend(
+                _complete_regular_file_tree(review_root)
+            )
+    raw = [
+        str(
+            Path(
+                str(result["runner_input_manifest_path"])
+            ).resolve(strict=True)
+        ),
+        *_complete_regular_file_tree(batch_result_path.parent),
+        *[
+            str(Path(path).resolve(strict=True))
+            for path in required_lists["fold_manifest_paths"]
+        ],
+        *[
+            str(Path(path).resolve(strict=True))
+            for path in required_lists["fold_prediction_paths"]
+        ],
+        *[
+            str(Path(path).resolve(strict=True))
+            for path in required_lists[
+                "complete_paged_ledger_artifact_paths"
+            ]
+        ],
+        *review_terminals,
+        str(Path(prediction_path).resolve(strict=True)),
+        str(Path(run_manifest_path).resolve(strict=True)),
+        str(Path(attestation_path).resolve(strict=True)),
+    ]
+    values = tuple(dict.fromkeys(raw))
+    if len(values) != len(set(values)):
+        raise RuntimeError(
+            "Stage 2 terminal payload inventory is duplicated"
+        )
+    return values
+
+
 def _rewrite_attempt_locators(
     value: Any,
     *,
@@ -970,6 +4897,58 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _remove_owned_scratch_tree_after_publication(path: Path) -> None:
+    """Best-effort cleanup after the durable tree has already committed.
+
+    Terminal producers may deliberately seal nested artifacts read-only.  The
+    workflow owns its scratch attempt, so make only its directories removable
+    before deleting it.  A cleanup failure after the durable rename must not
+    turn the already-committed publication into a failed phase; the uniquely
+    named scratch attempt can safely remain for an operator to inspect.
+    """
+
+    try:
+        for current, directory_names, _file_names in os.walk(
+            path,
+            topdown=True,
+            followlinks=False,
+        ):
+            current_path = Path(current)
+            current_state = os.lstat(current_path)
+            if (
+                stat.S_ISLNK(current_state.st_mode)
+                or not stat.S_ISDIR(current_state.st_mode)
+            ):
+                raise OSError(
+                    f"owned scratch cleanup encountered a non-directory: "
+                    f"{current_path}"
+                )
+            os.chmod(
+                current_path,
+                stat.S_IMODE(current_state.st_mode) | stat.S_IRWXU,
+            )
+            for name in directory_names:
+                child = current_path / name
+                child_state = os.lstat(child)
+                if (
+                    stat.S_ISLNK(child_state.st_mode)
+                    or not stat.S_ISDIR(child_state.st_mode)
+                ):
+                    raise OSError(
+                        "owned scratch cleanup encountered a non-directory: "
+                        f"{child}"
+                    )
+        shutil.rmtree(path)
+        _fsync_directory(path.parent)
+    except OSError:
+        LOGGER.warning(
+            "durable phase publication committed but scratch cleanup was "
+            "incomplete: %s",
+            path,
+            exc_info=True,
+        )
 
 
 def _phase_payload_stat_inventory(
@@ -1061,6 +5040,7 @@ def _publish_attempt_tree(
             source_file = source / relative
             destination_file = temporary / relative
             destination_file.parent.mkdir(parents=True, exist_ok=True)
+            source_mode = stat.S_IMODE(os.lstat(source_file).st_mode)
             digest = hashlib.sha256()
             copied = 0
             with source_file.open("rb") as source_handle, destination_file.open(
@@ -1074,6 +5054,7 @@ def _publish_attempt_tree(
                     digest.update(block)
                     copied += len(block)
                 destination_handle.flush()
+                os.fchmod(destination_handle.fileno(), source_mode)
                 os.fsync(destination_handle.fileno())
             if copied != int(row["size_bytes"]) or digest.hexdigest() != str(row["sha256"]):
                 raise RuntimeError(f"phase payload changed while publishing: {relative.as_posix()}")
@@ -1090,11 +5071,21 @@ def _publish_attempt_tree(
             key=lambda item: len(item.relative_to(temporary).parts),
             reverse=True,
         ):
+            source_directory = source / directory.relative_to(temporary)
+            source_state = os.lstat(source_directory)
+            if (
+                stat.S_ISLNK(source_state.st_mode)
+                or not stat.S_ISDIR(source_state.st_mode)
+            ):
+                raise ValueError(
+                    "phase attempt directory changed during durable "
+                    f"publication: {source_directory}"
+                )
+            os.chmod(directory, stat.S_IMODE(source_state.st_mode))
             _fsync_directory(directory)
         os.replace(temporary, published)
         _fsync_directory(durable_root)
-        shutil.rmtree(source)
-        _fsync_directory(source.parent)
+        _remove_owned_scratch_tree_after_publication(source)
     except BaseException:
         if temporary.exists() and not temporary.is_symlink():
             shutil.rmtree(temporary)
@@ -1104,6 +5095,488 @@ def _publish_attempt_tree(
         published,
         counters,
         _phase_payload_stat_inventory(published, artifacts),
+    )
+
+
+def _operator_trusted_adoption_selected(
+    record: Mapping[str, Any],
+) -> bool:
+    policy = record.get("adoption_validation_policy")
+    if policy is None:
+        return False
+    if policy != OPERATOR_TRUSTED_VALIDATION_POLICY:
+        raise ValueError("checkpoint adoption validation policy is unsupported")
+    prior = record.get("prior_adoption_attestation_path")
+    if not isinstance(prior, str) or not prior.strip():
+        raise ValueError(
+            "operator-trusted checkpoint adoption lacks its prior attestation"
+        )
+    if record.get("payload_bytes_reauthenticated") is not False:
+        raise ValueError(
+            "operator-trusted checkpoint adoption has an invalid byte-audit claim"
+        )
+    return True
+
+
+def _operator_trusted_legacy_migration_expectation(
+    artifact: ValidatedPortableArtifact,
+    *,
+    expected_phase: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any], str]:
+    """Open the small sealed typed expectation without reading payload bytes."""
+
+    binding = artifact.phase_binding
+    result = (
+        binding.get("result_template")
+        if isinstance(binding, Mapping)
+        else None
+    )
+    migration = (
+        result.get("legacy_terminal_migration_identity")
+        if isinstance(result, Mapping)
+        else None
+    )
+    if not isinstance(migration, Mapping):
+        raise ValueError(
+            f"operator-trusted {expected_phase} artifact lacks its sealed "
+            "legacy migration identity"
+        )
+    migration_body = {
+        key: copy.deepcopy(value)
+        for key, value in migration.items()
+        if key != "content_sha256"
+    }
+    typed = migration.get("typed_expectation")
+    typed_identity = migration.get("typed_expectation_identity")
+    if (
+        migration.get("schema_version")
+        != "legacy_terminal_typed_request_migration_identity_v1"
+        or migration.get("phase") != expected_phase
+        or migration.get("content_sha256") != _sha(migration_body)
+        or not isinstance(typed, Mapping)
+        or typed_identity != identity_sha256(typed)
+        or migration.get("source_tree_mutated") is not False
+        or migration.get("legacy_payload_copies_materialized") is not False
+    ):
+        raise ValueError(
+            f"operator-trusted {expected_phase} migration identity is invalid"
+        )
+    if expected_phase == "input_preparation":
+        required_true = (
+            "byte_affecting_preprocessing_policy_matched",
+            "configured_columns_reopened_exactly",
+            "current_preparation_transform_replayed",
+            "prepared_projection_recomputed",
+            "unit_id_order_recomputed",
+        )
+    elif expected_phase == "embedding_cache":
+        required_true = (
+            "chunk_and_tokenization_capacity_nonbinding",
+            "dense_array_shape_dtype_and_finiteness_reopened",
+            "ordered_text_identity_recomputed",
+            "prepared_projection_recomputed",
+            "upstream_prepared_identity_reauthenticated",
+            "word_chunk_registry_recomputed_exactly",
+        )
+    else:
+        raise ValueError(
+            "operator-trusted legacy phase projection supports only "
+            "input preparation and embedding cache"
+        )
+    if any(migration.get(field) is not True for field in required_true):
+        raise ValueError(
+            f"operator-trusted {expected_phase} migration proof is incomplete"
+        )
+    return migration, typed, str(typed_identity)
+
+
+def _operator_trusted_legacy_phase_projection_proof(
+    *,
+    artifact: ValidatedPortableArtifact,
+    request: Mapping[str, Any],
+    adopted_artifacts: Mapping[str, ValidatedPortableArtifact],
+) -> Mapping[str, Any]:
+    """Prove current phase inputs against a trusted V5 typed expectation.
+
+    Historical V5 portable manifests used one whole-workflow configuration
+    digest for every phase.  This proof permits that legacy digest alone to
+    differ after checking every input that can affect preparation or cached
+    embeddings.  It deliberately does not authenticate payload bytes again.
+    """
+
+    artifact_kind = str(artifact.manifest.get("artifact_kind") or "")
+    phase_by_kind = {
+        "prepared_cohort": "input_preparation",
+        "embedding_cache": "embedding_cache",
+    }
+    phase = phase_by_kind.get(artifact_kind)
+    if phase is None:
+        raise ValueError(
+            "operator-trusted legacy phase projection received an "
+            "unsupported artifact kind"
+        )
+    compatibility_rows = request.get(
+        "expected_checkpoint_compatibilities_by_phase"
+    )
+    expected_compatibility = (
+        compatibility_rows.get(phase)
+        if isinstance(compatibility_rows, Mapping)
+        else None
+    )
+    if not isinstance(expected_compatibility, Mapping):
+        raise ValueError(
+            f"operator-trusted {phase} projection lacks request compatibility"
+        )
+    migration, typed, typed_identity = (
+        _operator_trusted_legacy_migration_expectation(
+            artifact,
+            expected_phase=phase,
+        )
+    )
+    dataset_path = Path(str(request.get("dataset_path") or ""))
+    if (
+        not dataset_path.is_absolute()
+        or dataset_path.is_symlink()
+        or not dataset_path.is_file()
+    ):
+        raise ValueError(
+            "operator-trusted legacy phase projection lacks the current dataset"
+        )
+    dataset_size = int(dataset_path.stat().st_size)
+    columns = {
+        "unit_id": request.get("unit_id_column"),
+        "text": request.get("text_column"),
+        "treatment": request.get("treatment_column"),
+        "outcome": request.get("outcome_column"),
+    }
+    preprocessing = {
+        "empty_text_policy": request.get("empty_text_policy"),
+        "repeated_character_policy": request.get(
+            "repeated_character_policy"
+        ),
+        "repeated_character_threshold": request.get(
+            "repeated_character_threshold"
+        ),
+        "source_text_temporally_valid_by_design": request.get(
+            "source_text_temporally_valid_by_design"
+        ),
+    }
+    prepared_dependencies = {
+        "schema_version": "legacy_prepared_migration_expectation_v1",
+        "dataset_sha256": request.get("source_sha256"),
+        "dataset_size_bytes": dataset_size,
+        "columns": columns,
+        "preprocessing": preprocessing,
+        "row_order_identity": expected_compatibility.get(
+            "row_order_identity"
+        ),
+    }
+    if request.get("outcome_type") != "binary":
+        raise ValueError(
+            "operator-trusted legacy preparation/cache reuse requires the "
+            "binary v1 workflow"
+        )
+
+    if phase == "input_preparation":
+        dependencies = prepared_dependencies
+    else:
+        upstream_ids = tuple(
+            str(value)
+            for value in artifact.manifest.get(
+                "upstream_artifact_ids"
+            )
+            or ()
+        )
+        if len(upstream_ids) != 1:
+            raise ValueError(
+                "operator-trusted embedding cache must name exactly one "
+                "prepared upstream artifact"
+            )
+        prepared_artifact = adopted_artifacts.get(upstream_ids[0])
+        if (
+            prepared_artifact is None
+            or prepared_artifact.manifest.get("artifact_kind")
+            != "prepared_cohort"
+        ):
+            raise ValueError(
+                "operator-trusted embedding cache lacks its exact adopted "
+                "prepared artifact"
+            )
+        (
+            _prepared_migration,
+            prepared_typed,
+            prepared_typed_identity,
+        ) = _operator_trusted_legacy_migration_expectation(
+            prepared_artifact,
+            expected_phase="input_preparation",
+        )
+        if any(
+            prepared_typed.get(key) != value
+            for key, value in prepared_dependencies.items()
+        ):
+            raise ValueError(
+                "operator-trusted prepared artifact differs from the current "
+                "preparation inputs"
+            )
+        raw_encoder = request.get("embedding_encoder")
+        if not isinstance(raw_encoder, Mapping):
+            raise ValueError(
+                "operator-trusted embedding-cache projection lacks its "
+                "encoder configuration"
+            )
+        chunk_configuration = {
+            "chunk_size_words": request.get(
+                "embedding_chunk_size_words"
+            ),
+            "chunk_overlap_words": request.get(
+                "embedding_chunk_overlap_words"
+            ),
+            "max_chunks": request.get("embedding_max_chunks"),
+            "chunk_selection": request.get(
+                "embedding_chunk_selection"
+            ),
+            "normalize_embeddings": request.get(
+                "embedding_normalize"
+            ),
+            "max_seq_length": request.get(
+                "embedding_max_seq_length"
+            ),
+            **copy.deepcopy(dict(raw_encoder)),
+        }
+        dependencies = {
+            "schema_version": (
+                "legacy_embedding_cache_migration_expectation_v2"
+            ),
+            "prepared_expectation_identity": prepared_typed_identity,
+            "embedding_model_name": request.get(
+                "embedding_model_name"
+            ),
+            "embedding_model_tree_sha256": request.get(
+                "embedding_model_builder_tree_sha256"
+            ),
+            "chunk_configuration": chunk_configuration,
+        }
+        if (
+            migration.get("upstream_prepared_artifact_id")
+            != upstream_ids[0]
+        ):
+            raise ValueError(
+                "operator-trusted embedding-cache migration names the wrong "
+                "prepared artifact"
+            )
+
+    if any(typed.get(key) != value for key, value in dependencies.items()):
+        raise ValueError(
+            f"operator-trusted {phase} artifact differs from the current "
+            "phase-specific scientific inputs"
+        )
+    observed_compatibility = artifact.manifest.get("compatibility")
+    if not isinstance(observed_compatibility, Mapping):
+        raise ValueError(
+            "operator-trusted legacy phase artifact lacks compatibility"
+        )
+    body = {
+        "schema_version": (
+            OPERATOR_TRUSTED_LEGACY_PHASE_PROJECTION_SCHEMA
+        ),
+        "status": "exact_phase_dependencies_match",
+        "phase": phase,
+        "artifact_id": artifact.artifact_id,
+        "artifact_kind": artifact_kind,
+        "migration_identity_sha256": migration.get(
+            "content_sha256"
+        ),
+        "typed_expectation_identity": typed_identity,
+        "phase_dependency_projection": dependencies,
+        "superseded_legacy_compatibility_fields": [
+            "configuration_identity"
+        ],
+        "observed_legacy_configuration_identity": (
+            observed_compatibility.get("configuration_identity")
+        ),
+        "requested_configuration_identity": (
+            expected_compatibility.get("configuration_identity")
+        ),
+        "payload_bytes_reauthenticated": False,
+        "global_release_certified": False,
+    }
+    return {**body, "content_sha256": _sha(body)}
+
+
+def _validate_operator_trusted_legacy_phase_projection_record(
+    *,
+    artifact: ValidatedPortableArtifact,
+    requested: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> bool:
+    proof = record.get(
+        "legacy_phase_compatibility_projection_proof"
+    )
+    if proof is None:
+        return False
+    if not isinstance(proof, Mapping):
+        raise ValueError(
+            "operator-trusted legacy phase projection proof is invalid"
+        )
+    body = {
+        key: copy.deepcopy(value)
+        for key, value in proof.items()
+        if key != "content_sha256"
+    }
+    expected_keys = {
+        "schema_version",
+        "status",
+        "phase",
+        "artifact_id",
+        "artifact_kind",
+        "migration_identity_sha256",
+        "typed_expectation_identity",
+        "phase_dependency_projection",
+        "superseded_legacy_compatibility_fields",
+        "observed_legacy_configuration_identity",
+        "requested_configuration_identity",
+        "payload_bytes_reauthenticated",
+        "global_release_certified",
+        "content_sha256",
+    }
+    observed_compatibility = artifact.manifest.get("compatibility")
+    phase = CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.get(
+        str(artifact.manifest.get("artifact_kind") or "")
+    )
+    if (
+        set(proof) != expected_keys
+        or proof.get("schema_version")
+        != OPERATOR_TRUSTED_LEGACY_PHASE_PROJECTION_SCHEMA
+        or proof.get("status") != "exact_phase_dependencies_match"
+        or proof.get("phase") != phase
+        or proof.get("artifact_id") != artifact.artifact_id
+        or proof.get("artifact_kind")
+        != artifact.manifest.get("artifact_kind")
+        or proof.get("superseded_legacy_compatibility_fields")
+        != ["configuration_identity"]
+        or proof.get("observed_legacy_configuration_identity")
+        != (
+            observed_compatibility.get("configuration_identity")
+            if isinstance(observed_compatibility, Mapping)
+            else None
+        )
+        or proof.get("requested_configuration_identity")
+        != requested.get("configuration_identity")
+        or proof.get("payload_bytes_reauthenticated") is not False
+        or proof.get("global_release_certified") is not False
+        or proof.get("content_sha256") != _sha(body)
+    ):
+        raise ValueError(
+            "operator-trusted legacy phase projection proof failed validation"
+        )
+    return True
+
+
+def _adopted_compatibility_matches_request(
+    *,
+    artifact: ValidatedPortableArtifact,
+    expected: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> bool:
+    observed = dict(artifact.manifest["compatibility"])
+    requested = dict(expected)
+    if observed == requested:
+        return True
+    if not _operator_trusted_adoption_selected(record):
+        return False
+    # The exception is deliberately limited to producer-code identity. The
+    # trusted artifact was produced by the earlier frozen source snapshot;
+    # every scientific, model, prompt, seed, row, and runtime axis must still
+    # match the current request exactly unless a sealed legacy phase
+    # projection proves that the historical whole-workflow configuration
+    # digest is the sole remaining mismatch.
+    observed.pop("producer_code_identity", None)
+    requested.pop("producer_code_identity", None)
+    if observed.get("configuration_identity") != requested.get(
+        "configuration_identity"
+    ):
+        if not _validate_operator_trusted_legacy_phase_projection_record(
+            artifact=artifact,
+            requested=requested,
+            record=record,
+        ):
+            return False
+        observed.pop("configuration_identity", None)
+        requested.pop("configuration_identity", None)
+    return observed == requested
+
+
+def _open_adopted_artifact(
+    *,
+    record: Mapping[str, Any],
+    locator: Path,
+    expected_compatibility: Mapping[str, Any],
+    payload_authentication_cache: MutableMapping[
+        str, tuple[tuple[int, ...], str, int]
+    ]
+    | None = None,
+) -> ValidatedPortableArtifact:
+    kind = str(record.get("artifact_kind") or "")
+    upstream = tuple(
+        str(value)
+        for value in record.get("upstream_artifact_ids") or ()
+    )
+    if _operator_trusted_adoption_selected(record):
+        trusted = validate_operator_trusted_portable_artifact(
+            source=locator,
+            prior_attestation_path=Path(
+                str(record["prior_adoption_attestation_path"])
+            ),
+            expected_kind=kind,
+            expected_upstream_artifact_ids=upstream,
+        )
+        artifact = trusted.artifact
+    else:
+        artifact = validate_portable_artifact(
+            locator,
+            expected_kind=kind,
+            expected_compatibility_key=ArtifactCompatibility(
+                **dict(expected_compatibility)
+            ).key,
+            expected_upstream_artifact_ids=upstream,
+            payload_authentication_cache=payload_authentication_cache,
+        )
+    if not _adopted_compatibility_matches_request(
+        artifact=artifact,
+        expected=expected_compatibility,
+        record=record,
+    ):
+        raise ValueError(
+            "adopted checkpoint compatibility differs from its request"
+        )
+    return artifact
+
+
+def _validate_adoption_attestation_for_record(
+    *,
+    attestation_path: Path,
+    artifact: ValidatedPortableArtifact,
+    record: Mapping[str, Any],
+    consumer_request_sha256: str,
+) -> Mapping[str, Any]:
+    if _operator_trusted_adoption_selected(record):
+        return validate_operator_trusted_checkpoint_adoption(
+            attestation_path=attestation_path,
+            source=artifact.root,
+            prior_attestation_path=Path(
+                str(record["prior_adoption_attestation_path"])
+            ),
+            consumer_request_sha256=consumer_request_sha256,
+            expected_kind=str(record["artifact_kind"]),
+            expected_upstream_artifact_ids=tuple(
+                str(value)
+                for value in record.get("upstream_artifact_ids") or ()
+            ),
+        )
+    return validate_checkpoint_adoption(
+        attestation_path=attestation_path,
+        artifact=artifact,
+        consumer_request_sha256=consumer_request_sha256,
     )
 
 
@@ -1177,19 +5650,32 @@ def _validate_adopted_phase_manifest_from_paths(
 
     artifact_id = str(value["artifact_id"])
     artifact = None if authenticated_adoptions is None else authenticated_adoptions.get(artifact_id)
+    compatibility_rows = request.get(
+        "expected_checkpoint_compatibilities_by_phase"
+    )
+    expected_compatibility = (
+        compatibility_rows.get(phase)
+        if isinstance(compatibility_rows, Mapping)
+        else None
+    )
+    if not isinstance(expected_compatibility, Mapping):
+        raise ValueError("adopted phase compatibility is absent from its request")
     if artifact is None:
-        artifact = validate_portable_artifact(
-            Path(str(locator)),
-            expected_kind=str(value["artifact_kind"]),
-            expected_compatibility_key=str(value["compatibility_key"]),
-            expected_upstream_artifact_ids=tuple(value["upstream_artifact_ids"]),
+        artifact = _open_adopted_artifact(
+            record=expected,
+            locator=Path(str(locator)),
+            expected_compatibility=expected_compatibility,
         )
     else:
         assert_validated_artifact_unchanged(artifact)
     if artifact.artifact_id != artifact_id:
         raise ValueError("adopted phase artifact ID changed")
-    if dict(artifact.manifest["compatibility"]) != dict(
-        request.get("expected_checkpoint_compatibility") or {}
+    if (
+        not _adopted_compatibility_matches_request(
+            artifact=artifact,
+            expected=expected_compatibility,
+            record=expected,
+        )
     ):
         raise ValueError("adopted phase compatibility differs from its request")
     if phase == "stage1_preflight":
@@ -1205,9 +5691,10 @@ def _validate_adopted_phase_manifest_from_paths(
     supplied_attestation = Path(str(value["adoption_attestation_path"])).resolve(strict=True)
     if supplied_attestation != expected_attestation:
         raise ValueError("adopted phase attestation locator was substituted")
-    validate_checkpoint_adoption(
+    _validate_adoption_attestation_for_record(
         attestation_path=expected_attestation,
         artifact=artifact,
+        record=expected,
         consumer_request_sha256=request_sha256,
     )
     materialized = materialize_portable_phase(
@@ -1229,7 +5716,16 @@ def _validate_adopted_phase_manifest_from_paths(
             "compatibility_key": artifact.compatibility_key,
             "upstream_artifact_ids": list(artifact.manifest["upstream_artifact_ids"]),
             "adoption_attestation_path": str(expected_attestation),
-            "fresh_full_byte_validation": authenticated_adoptions is None,
+            "fresh_full_byte_validation": (
+                authenticated_adoptions is None
+                and not _operator_trusted_adoption_selected(expected)
+            ),
+            "operator_trusted_prior_full_byte_attestation": (
+                _operator_trusted_adoption_selected(expected)
+            ),
+            "payload_bytes_reauthenticated": (
+                not _operator_trusted_adoption_selected(expected)
+            ),
         },
     }
 
@@ -1420,11 +5916,10 @@ def _stable_path_identity(
 ) -> Mapping[str, Any]:
     """Bind one file or directory tree without trusting names alone.
 
-    Imported embedding caches never load the embedding model after its first
-    full provenance authentication. For that one lifecycle, callers may reuse
-    a PID-scoped content identity while every logical check still compares the
-    complete filesystem inventory. Fresh cache builds and live HTR models
-    always retain full byte-tree reauthentication.
+    Callers may reuse a PID-scoped content identity after one full provenance
+    authentication while every logical check still compares the complete
+    filesystem inventory. Callers that do not opt in retain full byte-tree
+    reauthentication.
     """
 
     supplied = Path(path)
@@ -1521,8 +6016,45 @@ def _revalidate_request_bound_external_inputs(
     request: Mapping[str, Any],
     *,
     authenticated_adoptions: Mapping[str, ValidatedPortableArtifact] | None = None,
+    identity_memo: _ScientificIdentityMemo | None = None,
 ) -> None:
     """Reopen every external input whose bytes were bound into the run request."""
+
+    authenticated_files: dict[Path, tuple[str, int]] = {}
+
+    def authenticate_file(path: Path) -> tuple[str, int]:
+        resolved = Path(path).resolve(strict=True)
+        cached = authenticated_files.get(resolved)
+        if cached is not None:
+            return cached
+        observed = (
+            stable_file_sha256(resolved)
+            if identity_memo is None
+            else _memoized_scientific_file_digest(
+                resolved,
+                identity_memo=identity_memo,
+            )
+        )
+        normalized = (str(observed[0]), int(observed[1]))
+        authenticated_files[resolved] = normalized
+        return normalized
+
+    expected_granular_plan = _derive_expected_granular_checkpoint_plan(
+        outer_folds=int(request["outer_folds"]),
+        initial_training_partitions=int(
+            request["initial_training_partitions"]
+        ),
+        review_rounds=int(request["review_rounds"]),
+    )
+    if (
+        _validate_expected_granular_checkpoint_plan(
+            request.get("expected_granular_checkpoint_plan")
+        )
+        != expected_granular_plan
+    ):
+        raise ValueError(
+            "immutable workflow request granular plan changed"
+        )
 
     def require_file_hash(
         *,
@@ -1534,7 +6066,7 @@ def _revalidate_request_bound_external_inputs(
         expected = request.get(sha_field)
         if not isinstance(raw_path, str) or not isinstance(expected, str):
             raise ValueError(f"immutable workflow request lacks {label} identity")
-        observed, _size = stable_file_sha256(Path(raw_path).resolve(strict=True))
+        observed, _size = authenticate_file(Path(raw_path))
         if observed != expected:
             raise RuntimeError(f"{label} changed after workflow initialization")
 
@@ -1603,6 +6135,14 @@ def _revalidate_request_bound_external_inputs(
         or len(adoption_records) != len(adoption_locators)
     ):
         raise ValueError("immutable workflow request has invalid checkpoint adoptions")
+    compatibility_rows = request.get(
+        "expected_checkpoint_compatibilities_by_phase"
+    )
+    if not isinstance(compatibility_rows, Mapping):
+        raise ValueError(
+            "immutable workflow request lacks checkpoint compatibilities"
+        )
+    reopened_adoptions: dict[str, ValidatedPortableArtifact] = {}
     for locator, expected in zip(adoption_locators, adoption_records):
         if not isinstance(expected, Mapping):
             raise ValueError("checkpoint adoption request is invalid")
@@ -1611,17 +6151,68 @@ def _revalidate_request_bound_external_inputs(
             None if authenticated_adoptions is None else authenticated_adoptions.get(artifact_id)
         )
         if artifact is None:
-            artifact = validate_portable_artifact(Path(str(locator)))
+            compatibility_phase = str(
+                expected.get("compatibility_phase") or ""
+            )
+            expected_compatibility = compatibility_rows.get(
+                compatibility_phase
+            )
+            if not isinstance(expected_compatibility, Mapping):
+                raise ValueError(
+                    "checkpoint adoption compatibility phase is invalid"
+                )
+            artifact = _open_adopted_artifact(
+                record=expected,
+                locator=Path(str(locator)),
+                expected_compatibility=expected_compatibility,
+            )
         else:
             assert_validated_artifact_unchanged(artifact)
+        reopened_adoptions[artifact.artifact_id] = artifact
         if (
             artifact.artifact_id != expected.get("artifact_id")
             or artifact.manifest["artifact_kind"] != expected.get("artifact_kind")
             or artifact.compatibility_key != expected.get("compatibility_key")
             or list(artifact.manifest["upstream_artifact_ids"])
             != expected.get("upstream_artifact_ids")
+            or expected.get("compatibility_phase")
+            != CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.get(
+                str(artifact.manifest["artifact_kind"])
+            )
+            or expected.get("artifact_metadata")
+            != dict(artifact.artifact_metadata)
         ):
             raise RuntimeError("adopted checkpoint changed after workflow initialization")
+    for expected in adoption_records:
+        if (
+            not isinstance(expected, Mapping)
+            or not _operator_trusted_adoption_selected(expected)
+        ):
+            continue
+        artifact = reopened_adoptions.get(
+            str(expected.get("artifact_id") or "")
+        )
+        if artifact is None:
+            raise RuntimeError(
+                "operator-trusted legacy phase projection lost its artifact"
+            )
+        recomputed_projection = (
+            _operator_trusted_legacy_phase_projection_proof(
+                artifact=artifact,
+                request=request,
+                adopted_artifacts=reopened_adoptions,
+            )
+        )
+        if (
+            expected.get(
+                "legacy_phase_compatibility_projection_proof"
+            )
+            != recomputed_projection
+        ):
+            raise RuntimeError(
+                "operator-trusted legacy phase projection changed after "
+                "workflow initialization"
+            )
 
     legacy_migrations = request.get("legacy_checkpoint_migration_sources")
     if not isinstance(legacy_migrations, list):
@@ -1653,7 +6244,7 @@ def _revalidate_request_bound_external_inputs(
         ):
             raise ValueError("immutable legacy-migration source ledger is invalid")
         manifest_path = Path(str(row["legacy_manifest_path"])).resolve(strict=True)
-        observed_sha, observed_size = stable_file_sha256(manifest_path)
+        observed_sha, observed_size = authenticate_file(manifest_path)
         if (
             observed_sha != row["legacy_manifest_sha256"]
             or observed_size != row["legacy_manifest_size_bytes"]
@@ -1680,7 +6271,7 @@ def _revalidate_request_bound_external_inputs(
         from .legacy_checkpoint_migration import validate_legacy_preflight_manifest
 
         path = Path(str(legacy_preflight_identity.get("manifest_path", ""))).resolve(strict=True)
-        observed_sha, observed_size = stable_file_sha256(path)
+        observed_sha, observed_size = authenticate_file(path)
         observed = validate_legacy_preflight_manifest(
             path,
             authenticate_registered_payload_bytes=False,
@@ -1694,12 +6285,7 @@ def _revalidate_request_bound_external_inputs(
             raise RuntimeError("legacy preflight candidate changed after workflow initialization")
 
     cache_inputs = request.get("embedding_cache_import_inputs")
-    imported_embedding_cache = cache_inputs is not None
-    expected_model_policy = (
-        AUTHENTICATED_DIRECTORY_TREE_POLICY
-        if imported_embedding_cache
-        else "full_byte_tree_reauthentication_v1"
-    )
+    expected_model_policy = AUTHENTICATED_DIRECTORY_TREE_POLICY
     if request.get("embedding_model_revalidation_policy") != expected_model_policy:
         raise ValueError(
             "immutable workflow request has an invalid embedding-model " "revalidation policy"
@@ -1717,12 +6303,18 @@ def _revalidate_request_bound_external_inputs(
         expected = request.get(field)
         if not isinstance(expected, Mapping) or not isinstance(expected.get("path"), str):
             raise ValueError(f"immutable workflow request lacks {label} identity")
-        if _stable_path_identity(
-            Path(str(expected["path"])),
-            reuse_process_authenticated_tree=(
-                field == "embedding_model_tree" and imported_embedding_cache
-            ),
-        ) != dict(expected):
+        try:
+            observed_model_tree = _stable_path_identity(
+                Path(str(expected["path"])),
+                reuse_process_authenticated_tree=(
+                    field == "embedding_model_tree"
+                ),
+            )
+        except AuthenticatedDirectoryTreeDriftError as exc:
+            raise RuntimeError(
+                f"{label} changed after workflow initialization"
+            ) from exc
+        if observed_model_tree != dict(expected):
             raise RuntimeError(f"{label} changed after workflow initialization")
     expected_embedding_tree = request.get("embedding_model_tree")
     expected_builder_tree_sha256 = request.get("embedding_model_builder_tree_sha256")
@@ -1756,8 +6348,174 @@ def _revalidate_request_bound_external_inputs(
     implementation_files = request.get("implementation_files")
     if not isinstance(implementation_files, Mapping) or not implementation_files:
         raise ValueError("immutable workflow request lacks implementation identities")
+    phase_code_records = request.get(
+        "phase_transitive_producer_code"
+    )
+    phase_code_ids = request.get("phase_producer_code_identities")
+    if (
+        not isinstance(phase_code_records, Mapping)
+        or set(phase_code_records) != set(
+            PORTABLE_CHECKPOINT_PHASE_SPECS
+        )
+        or not isinstance(phase_code_ids, Mapping)
+        or set(phase_code_ids) != set(
+            PORTABLE_CHECKPOINT_PHASE_SPECS
+        )
+    ):
+        raise ValueError(
+            "immutable workflow request lacks phase producer identities"
+        )
+    repository_root = Path(__file__).resolve().parents[2]
+    for phase, raw_record in phase_code_records.items():
+        if not isinstance(raw_record, Mapping):
+            raise ValueError(
+                "immutable phase producer record is invalid"
+            )
+        record_body = {
+            key: copy.deepcopy(value)
+            for key, value in raw_record.items()
+            if key != "content_sha256"
+        }
+        constant_identity = raw_record.get(
+            "workflow_constant_identity"
+        )
+        if (
+            raw_record.get("phase") != phase
+            or raw_record.get("content_sha256")
+            != _sha(record_body)
+            or phase_code_ids.get(phase)
+            != raw_record.get("content_sha256")
+            or not isinstance(constant_identity, Mapping)
+        ):
+            raise ValueError(
+                f"immutable {phase} producer identity is invalid"
+            )
+        constant_body = {
+            key: copy.deepcopy(value)
+            for key, value in constant_identity.items()
+            if key != "content_sha256"
+        }
+        if constant_identity.get("content_sha256") != _sha(
+            constant_body
+        ):
+            raise ValueError(
+                f"immutable {phase} workflow constants are invalid"
+            )
+        for inventory_name in (
+            "transitive_source_inventory",
+            "dependency_lock_inventory",
+        ):
+            inventory = raw_record.get(inventory_name)
+            if not isinstance(inventory, list) or not inventory:
+                raise ValueError(
+                    f"immutable {phase} {inventory_name} is invalid"
+                )
+            for row in inventory:
+                if (
+                    not isinstance(row, Mapping)
+                    or set(row)
+                    != {
+                        "relative_path",
+                        "sha256",
+                        "size_bytes",
+                    }
+                ):
+                    raise ValueError(
+                        f"immutable {phase} producer inventory is invalid"
+                    )
+                path = (
+                    repository_root / str(row["relative_path"])
+                ).resolve(strict=True)
+                if implementation_files.get(str(path)) != row.get(
+                    "sha256"
+                ):
+                    raise ValueError(
+                        f"immutable {phase} producer inventory is unbound"
+                    )
+    aggregate_identity = identity_sha256(
+        {
+            "schema_version": (
+                "workflow_phase_producer_code_aggregate_v1"
+            ),
+            "phase_producer_code_identities": dict(phase_code_ids),
+        }
+    )
+    if request.get("workflow_producer_code_identity") != aggregate_identity:
+        raise ValueError(
+            "immutable aggregate workflow producer identity is invalid"
+        )
+    scientific_configuration = request.get(
+        "scientific_configuration_identity"
+    )
+    scientific_identity = request.get("scientific_identity")
+    if (
+        not isinstance(scientific_configuration, Mapping)
+        or not isinstance(scientific_identity, Mapping)
+    ):
+        raise ValueError(
+            "immutable workflow scientific identities are invalid"
+        )
+    configuration_body = {
+        key: copy.deepcopy(value)
+        for key, value in scientific_configuration.items()
+        if key != "scientific_configuration_sha256"
+    }
+    scientific_body = {
+        key: copy.deepcopy(value)
+        for key, value in scientific_identity.items()
+        if key != "scientific_sha256"
+    }
+    if (
+        scientific_configuration.get(
+            "scientific_configuration_sha256"
+        )
+        != identity_sha256(configuration_body)
+        or scientific_identity.get("scientific_sha256")
+        != identity_sha256(scientific_body)
+        or scientific_identity.get(
+            "scientific_configuration_sha256"
+        )
+        != scientific_configuration.get(
+            "scientific_configuration_sha256"
+        )
+        or scientific_identity.get(
+            "workflow_producer_code_identity"
+        )
+        != aggregate_identity
+        or scientific_identity.get(
+            "phase_producer_code_identities"
+        )
+        != phase_code_ids
+    ):
+        raise ValueError(
+            "immutable workflow scientific identity binding is invalid"
+        )
+    compatibility_rows = request.get(
+        "expected_checkpoint_compatibilities_by_phase"
+    )
+    if (
+        not isinstance(compatibility_rows, Mapping)
+        or set(compatibility_rows)
+        != set(PORTABLE_CHECKPOINT_PHASE_SPECS)
+    ):
+        raise ValueError(
+            "immutable checkpoint compatibility domains are invalid"
+        )
+    for phase, raw_compatibility in compatibility_rows.items():
+        if (
+            not isinstance(raw_compatibility, Mapping)
+            or raw_compatibility.get("configuration_identity")
+            != scientific_configuration[
+                "scientific_configuration_sha256"
+            ]
+            or raw_compatibility.get("producer_code_identity")
+            != phase_code_ids[phase]
+        ):
+            raise ValueError(
+                f"immutable {phase} checkpoint compatibility is invalid"
+            )
     for raw_path, expected_sha in implementation_files.items():
-        observed_sha, _size = stable_file_sha256(Path(str(raw_path)).resolve(strict=True))
+        observed_sha, _size = authenticate_file(Path(str(raw_path)))
         if observed_sha != expected_sha:
             raise RuntimeError("workflow implementation changed after workflow initialization")
 
@@ -1773,17 +6531,38 @@ def _revalidate_request_bound_external_inputs(
                     f"immutable workflow request has invalid {collection_name} identity"
                 )
             source_file = identity.get("source_file")
-            if source_file is None:
-                continue
-            if not isinstance(source_file, Mapping) or not isinstance(source_file.get("path"), str):
-                raise ValueError(f"immutable workflow request has invalid {collection_name} source")
-            observed_sha, observed_size = stable_file_sha256(
-                Path(str(source_file["path"])).resolve(strict=True)
-            )
-            if observed_sha != source_file.get("sha256") or observed_size != int(
-                source_file.get("size_bytes", -1)
-            ):
-                raise RuntimeError(f"{collection_name} implementation changed after initialization")
+            if source_file is not None:
+                if not isinstance(source_file, Mapping) or not isinstance(source_file.get("path"), str):
+                    raise ValueError(f"immutable workflow request has invalid {collection_name} source")
+                observed_sha, observed_size = authenticate_file(
+                    Path(str(source_file["path"]))
+                )
+                if observed_sha != source_file.get("sha256") or observed_size != int(
+                    source_file.get("size_bytes", -1)
+                ):
+                    raise RuntimeError(f"{collection_name} implementation changed after initialization")
+            for row in _repository_import_closure_rows(identity):
+                if set(row) != {
+                    "relative_path",
+                    "sha256",
+                    "size_bytes",
+                }:
+                    raise ValueError(
+                        f"immutable {collection_name} import closure is invalid"
+                    )
+                closure_path = (
+                    repository_root / str(row["relative_path"])
+                ).resolve(strict=True)
+                observed_sha, observed_size = authenticate_file(
+                    closure_path
+                )
+                if (
+                    observed_sha != row["sha256"]
+                    or observed_size != int(row["size_bytes"])
+                ):
+                    raise RuntimeError(
+                        f"{collection_name} dependency changed after initialization"
+                    )
 
     source_snapshot = request.get("source_snapshot")
     if source_snapshot is not None:
@@ -1796,6 +6575,61 @@ def _revalidate_request_bound_external_inputs(
         ).as_dict()
         if observed_snapshot != dict(source_snapshot):
             raise RuntimeError("source snapshot changed after workflow initialization")
+
+
+def _canary_stage1_gpu_ids_from_request(
+    request: Mapping[str, Any],
+) -> tuple[int, int]:
+    raw = request.get("resolved_stage1_gpu_ids")
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 2
+        or any(type(value) is not int or value < 0 for value in raw)
+        or len(set(raw)) != 2
+    ):
+        raise ValueError(
+            "canary preparation request must bind exactly two ordered, "
+            "distinct nonnegative Stage 1 GPU IDs"
+        )
+    return int(raw[0]), int(raw[1])
+
+
+def _select_configured_canary_descriptor(
+    descriptors: Mapping[str, Any],
+    *,
+    configured_gpu_ids: tuple[int, int],
+) -> Any:
+    if not isinstance(descriptors, Mapping) or not descriptors:
+        raise ValueError("canonical canary descriptor set is empty")
+    assignment_ids: set[int] = set()
+    for descriptor in descriptors.values():
+        gpu_id = getattr(getattr(descriptor, "assignment", None), "gpu_id", None)
+        if type(gpu_id) is not int or gpu_id < 0:
+            raise ValueError(
+                "canonical canary descriptor set contains an invalid GPU assignment"
+            )
+        assignment_ids.add(gpu_id)
+    if assignment_ids != set(configured_gpu_ids):
+        raise ValueError(
+            "canonical canary descriptor assignments disagree with the "
+            "configured Stage 1 GPU inventory"
+        )
+    selected_gpu_id = configured_gpu_ids[0]
+    selected = next(
+        (
+            descriptor
+            for descriptor in descriptors.values()
+            if descriptor.scope.scope_kind == "full_outer"
+            and int(descriptor.assignment.gpu_id) == selected_gpu_id
+        ),
+        None,
+    )
+    if selected is None:
+        raise ValueError(
+            "canonical canary descriptor set has no full-outer scope assigned "
+            f"to configured cuda:{selected_gpu_id}"
+        )
+    return selected
 
 
 def validate_stage1_canary_descriptor_preparation(
@@ -1825,6 +6659,7 @@ def validate_stage1_canary_descriptor_preparation(
         or not isinstance(request.get("source_snapshot"), Mapping)
     ):
         raise ValueError("canary preparation workflow request is invalid")
+    configured_gpu_ids = _canary_stage1_gpu_ids_from_request(request)
     _revalidate_request_bound_external_inputs(request)
     prefix = ("input_preparation", "embedding_cache", "stage1_preflight")
     phase_records = {
@@ -1855,7 +6690,7 @@ def validate_stage1_canary_descriptor_preparation(
         "descriptor_count",
         "selected_scope_id",
         "selected_scope_kind",
-        "selected_logical_gpu_id",
+        "selected_configured_gpu_id",
         "selected_descriptor_manifest",
         "supervised_stage1_fits_started",
         "tfidf_component_started",
@@ -1866,14 +6701,15 @@ def validate_stage1_canary_descriptor_preparation(
     }
     if (
         set(manifest) != expected_fields
-        or manifest.get("schema_version") != "production_stage1_canary_descriptor_preparation_v1"
+        or manifest.get("schema_version") != "production_stage1_canary_descriptor_preparation_v2"
         or manifest.get("status") != "complete"
         or manifest.get("content_sha256") != _sha(body)
         or manifest.get("workflow_request_sha256") != request_sha
         or manifest.get("source_snapshot") != request.get("source_snapshot")
         or manifest.get("completed_workflow_prefix") != list(prefix)
         or manifest.get("selected_scope_kind") != "full_outer"
-        or manifest.get("selected_logical_gpu_id") != 0
+        or type(manifest.get("selected_configured_gpu_id")) is not int
+        or manifest.get("selected_configured_gpu_id") != configured_gpu_ids[0]
         or manifest.get("supervised_stage1_fits_started") is not False
         or manifest.get("tfidf_component_started") is not False
         or manifest.get("neural_query_component_started") is not False
@@ -1948,15 +6784,20 @@ def validate_stage1_canary_descriptor_preparation(
     )
     selected_scope_id = str(manifest["selected_scope_id"])
     selected = descriptor_set.descriptors.get(selected_scope_id)
+    expected_selected = _select_configured_canary_descriptor(
+        descriptor_set.descriptors,
+        configured_gpu_ids=configured_gpu_ids,
+    )
     if (
         len(descriptor_set.descriptors) != expected_count
         or manifest.get("descriptor_count") != expected_count
         or descriptor_set.manifest.get("content_sha256")
         != manifest.get("descriptor_set_content_sha256")
         or selected is None
+        or selected.scope_id != expected_selected.scope_id
         or selected.manifest_path != selected_manifest
         or selected.scope.scope_kind != "full_outer"
-        or int(selected.assignment.gpu_id) != 0
+        or int(selected.assignment.gpu_id) != configured_gpu_ids[0]
     ):
         raise ValueError("canary descriptor set or selected scope changed")
     if (root / "phases" / "stage1_modeling").exists() or (
@@ -1985,6 +6826,22 @@ def validate_published_workflow_checkpoint_dag(
         or _sha(request_body) != expected_request_sha256
     ):
         raise ValueError("checkpoint DAG request identity changed")
+    expected_plan = _derive_expected_granular_checkpoint_plan(
+        outer_folds=int(request["outer_folds"]),
+        initial_training_partitions=int(
+            request["initial_training_partitions"]
+        ),
+        review_rounds=int(request["review_rounds"]),
+    )
+    if (
+        _validate_expected_granular_checkpoint_plan(
+            request.get("expected_granular_checkpoint_plan")
+        )
+        != expected_plan
+    ):
+        raise ValueError(
+            "checkpoint DAG granular plan differs from fold configuration"
+        )
     phases = tuple(str(value) for value in expected_phases)
     configured_sequence = STAGE1_ONLY_PHASES if request.get("stage1_only") is True else PHASES
     if (
@@ -1993,9 +6850,25 @@ def validate_published_workflow_checkpoint_dag(
         or phases != configured_sequence[: len(phases)]
     ):
         raise ValueError("checkpoint DAG phases must be an ordered workflow prefix")
-    compatibility = ArtifactCompatibility(
-        **dict(request.get("expected_checkpoint_compatibility") or {})
+    compatibility_rows = request.get(
+        "expected_checkpoint_compatibilities_by_phase"
     )
+    if not isinstance(compatibility_rows, Mapping):
+        raise ValueError(
+            "checkpoint DAG request lacks phase-specific compatibilities"
+        )
+    compatibilities = {
+        phase: ArtifactCompatibility(**dict(value))
+        for phase, value in compatibility_rows.items()
+        if isinstance(value, Mapping)
+    }
+    if set(compatibilities) != set(PORTABLE_CHECKPOINT_PHASE_SPECS):
+        raise ValueError(
+            "checkpoint DAG phase-specific compatibility coverage changed"
+        )
+    payload_authentication_cache: dict[
+        str, tuple[tuple[int, ...], str, int]
+    ] = {}
     artifacts_by_phase: dict[str, ValidatedPortableArtifact] = {}
     local_phases: list[str] = []
     skipped_phases: list[str] = []
@@ -2010,6 +6883,84 @@ def validate_published_workflow_checkpoint_dag(
         or len(adoption_records) != len(adoption_locators)
     ):
         raise ValueError("checkpoint DAG request has invalid adoptions")
+    adopted_handles: dict[str, ValidatedPortableArtifact] = {}
+    for record, locator in zip(
+        adoption_records,
+        adoption_locators,
+        strict=True,
+    ):
+        if not isinstance(record, Mapping):
+            raise ValueError(
+                "checkpoint DAG request has an invalid adoption record"
+            )
+        kind = str(record.get("artifact_kind") or "")
+        compatibility_phase = (
+            CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.get(kind)
+        )
+        if (
+            compatibility_phase is None
+            or record.get("compatibility_phase")
+            != compatibility_phase
+        ):
+            raise ValueError(
+                "adopted checkpoint compatibility domain changed"
+            )
+        artifact = _open_adopted_artifact(
+            record=record,
+            locator=Path(str(locator)),
+            expected_compatibility=compatibilities[
+                compatibility_phase
+            ].as_dict(),
+            payload_authentication_cache=payload_authentication_cache,
+        )
+        if (
+            artifact.artifact_id != record.get("artifact_id")
+            or artifact.compatibility_key
+            != record.get("compatibility_key")
+            or dict(artifact.artifact_metadata)
+            != dict(record.get("artifact_metadata") or {})
+            or artifact.artifact_id in adopted_handles
+        ):
+            raise ValueError(
+                "adopted checkpoint record changed during DAG validation"
+            )
+        attestation_path = (
+            root
+            / "checkpoint_adoptions"
+            / f"{artifact.artifact_id}.adoption.json"
+        )
+        _validate_adoption_attestation_for_record(
+            attestation_path=attestation_path,
+            artifact=artifact,
+            record=record,
+            consumer_request_sha256=expected_request_sha256,
+        )
+        adopted_handles[artifact.artifact_id] = artifact
+    if adopted_handles:
+        _validate_adopted_checkpoint_graph(
+            tuple(adopted_handles.values()),
+            allowed_phases=phases,
+            expected_granular_checkpoint_plan=(
+                _validate_expected_granular_checkpoint_plan(
+                    request.get(
+                        "expected_granular_checkpoint_plan"
+                    )
+                )
+            ),
+            expected_stage1_physical_fit_identity=dict(
+                request.get("stage1_physical_fit_identity") or {}
+            ),
+            expected_global_seed=int(request["seed"]),
+            require_prepared_stage1_context=(
+                request.get("portable_typed_workflow") is True
+            ),
+        )
+
+    typed_workflow = request.get("portable_typed_workflow") is True
+    granular_indexes: dict[str, Mapping[str, Any]] = {}
+    granular_handles_by_phase: dict[
+        str, tuple[ValidatedPortableArtifact, ...]
+    ] = {}
 
     for phase in phases:
         spec = PORTABLE_CHECKPOINT_PHASE_SPECS.get(phase)
@@ -2043,9 +6994,129 @@ def validate_published_workflow_checkpoint_dag(
             raise ValueError(
                 f"{phase} checkpoint lacks upstream phase checkpoints: " f"{missing_upstream}"
             )
-        expected_upstream = tuple(
+        base_upstream = tuple(
             artifacts_by_phase[parent].artifact_id for parent in spec["upstream_phases"]
         )
+        local_granular_index: Mapping[str, Any] | None = None
+        local_granular_handles: tuple[
+            ValidatedPortableArtifact, ...
+        ] = ()
+        if (
+            typed_workflow
+            and phase in {"stage1_modeling", "stage2_inference"}
+            and not isinstance(adopted, Mapping)
+        ):
+            current_stage1_scope_plan = None
+            granular_external_upstream = base_upstream
+            if phase == "stage1_modeling":
+                prepared_contexts = tuple(
+                    granular_handles_by_phase.get(
+                        "stage1_preflight", ()
+                    )
+                )
+                if (
+                    len(prepared_contexts) != 1
+                    or prepared_contexts[0].manifest.get(
+                        "artifact_kind"
+                    )
+                    != "prepared_stage1_context"
+                ):
+                    raise ValueError(
+                        "local Stage 1 validation lacks its authenticated "
+                        "prepared context"
+                    )
+                current_stage1_scope_plan = (
+                    _load_authenticated_current_stage1_scope_plan(
+                        prepared_context_artifact=prepared_contexts[0],
+                        expected_granular_checkpoint_plan=expected_plan,
+                        expected_stage1_physical_fit_identity=dict(
+                            request.get(
+                                "stage1_physical_fit_identity"
+                            )
+                            or {}
+                        ),
+                        expected_global_seed=int(request["seed"]),
+                    )
+                )
+                granular_external_upstream = (
+                    prepared_contexts[0].artifact_id,
+                )
+            (
+                local_granular_index,
+                local_granular_handles,
+            ) = _validate_granular_checkpoint_index_from_paths(
+                work_root=root,
+                phase=phase,
+                compatibility=compatibilities[phase],
+                payload_authentication_cache=(
+                    payload_authentication_cache
+                ),
+                expected_granular_checkpoint_plan=expected_plan,
+                expected_stage1_scope_plan=(
+                    current_stage1_scope_plan
+                ),
+                expected_external_upstream_artifact_ids=(
+                    granular_external_upstream
+                ),
+            )
+            primary_metadata = _granular_primary_metadata_from_index(
+                phase=phase,
+                index=local_granular_index,
+            )
+            expected_upstream = (
+                *base_upstream,
+                *tuple(
+                    primary_metadata[
+                        "granular_terminal_artifact_ids"
+                    ]
+                ),
+            )
+        elif typed_workflow and phase in {
+            "stage1_modeling",
+            "stage2_inference",
+        }:
+            matching_primary = [
+                handle
+                for handle in adopted_handles.values()
+                if handle.artifact_id == adopted.get("artifact_id")
+            ]
+            if len(matching_primary) != 1:
+                raise ValueError(
+                    f"{phase} adopted primary checkpoint is absent"
+                )
+            primary_metadata = dict(
+                matching_primary[0].artifact_metadata
+            )
+            all_ids = primary_metadata.get(
+                "granular_artifact_ids"
+            )
+            terminal_ids = primary_metadata.get(
+                "granular_terminal_artifact_ids"
+            )
+            if (
+                not isinstance(all_ids, list)
+                or not all_ids
+                or not isinstance(terminal_ids, list)
+                or not terminal_ids
+                or any(
+                    artifact_id not in adopted_handles
+                    for artifact_id in all_ids
+                )
+                or not set(terminal_ids).issubset(set(all_ids))
+            ):
+                raise ValueError(
+                    f"{phase} adopted granular coverage is incomplete"
+                )
+            local_granular_handles = tuple(
+                adopted_handles[str(artifact_id)]
+                for artifact_id in all_ids
+            )
+            expected_upstream = (
+                *base_upstream,
+                *tuple(str(value) for value in terminal_ids),
+            )
+        else:
+            expected_upstream = base_upstream
         if isinstance(adopted, Mapping):
             matching = [
                 (record, locator)
@@ -2059,20 +7130,39 @@ def validate_published_workflow_checkpoint_dag(
             ]
             if len(matching) != 1:
                 raise ValueError(f"{phase} adopted checkpoint is not uniquely requested")
-            artifact = validate_portable_artifact(
-                Path(str(matching[0][1])),
-                expected_kind=str(spec["artifact_kind"]),
-                expected_compatibility_key=compatibility.key,
-                expected_upstream_artifact_ids=expected_upstream,
+            artifact = adopted_handles.get(
+                str(adopted["artifact_id"])
             )
+            if artifact is None:
+                raise ValueError(
+                    f"{phase} adopted checkpoint is absent"
+                )
+            adoption_record = matching[0][0]
+            if (
+                artifact.manifest.get("artifact_kind")
+                != spec["artifact_kind"]
+                or not _adopted_compatibility_matches_request(
+                    artifact=artifact,
+                    expected=compatibilities[phase].as_dict(),
+                    record=adoption_record,
+                )
+                or tuple(
+                    artifact.manifest["upstream_artifact_ids"]
+                )
+                != expected_upstream
+            ):
+                raise ValueError(
+                    f"{phase} adopted checkpoint DAG changed"
+                )
         else:
             assert isinstance(rows, list) and rows
             control_root = root / "portable_checkpoints" / phase
             artifact = validate_portable_artifact(
                 control_root,
                 expected_kind=str(spec["artifact_kind"]),
-                expected_compatibility_key=compatibility.key,
+                expected_compatibility_key=compatibilities[phase].key,
                 expected_upstream_artifact_ids=expected_upstream,
+                payload_authentication_cache=payload_authentication_cache,
             )
             if (
                 artifact.root != control_root.resolve(strict=True)
@@ -2083,6 +7173,17 @@ def validate_published_workflow_checkpoint_dag(
                 or artifact.phase_binding.get("phase") != phase
             ):
                 raise ValueError(f"{phase} portable checkpoint binding is invalid")
+            if (
+                local_granular_index is not None
+                and dict(artifact.artifact_metadata)
+                != _granular_primary_metadata_from_index(
+                    phase=phase,
+                    index=local_granular_index,
+                )
+            ):
+                raise ValueError(
+                    f"{phase} primary granular coverage binding changed"
+                )
             expected_inventory = [
                 (
                     str(row["relative_path"]),
@@ -2125,6 +7226,64 @@ def validate_published_workflow_checkpoint_dag(
                 raise ValueError(f"{phase} checkpoint publication attestation changed")
             local_phases.append(phase)
         artifacts_by_phase[phase] = artifact
+        if typed_workflow and phase == "stage1_preflight":
+            if isinstance(adopted, Mapping):
+                prepared = tuple(
+                    handle
+                    for handle in adopted_handles.values()
+                    if handle.manifest.get("artifact_kind")
+                    == "prepared_stage1_context"
+                    and handle.artifact_metadata.get("producer_phase")
+                    == phase
+                )
+                if (
+                    len(prepared) != 1
+                    or tuple(
+                        prepared[0].manifest[
+                            "upstream_artifact_ids"
+                        ]
+                    )
+                    != (artifact.artifact_id,)
+                ):
+                    raise ValueError(
+                        "adopted prepared Stage 1 context binding changed"
+                    )
+                local_granular_handles = prepared
+            else:
+                (
+                    local_granular_index,
+                    local_granular_handles,
+                ) = _validate_granular_checkpoint_index_from_paths(
+                    work_root=root,
+                    phase=phase,
+                    compatibility=compatibilities[phase],
+                    payload_authentication_cache=(
+                        payload_authentication_cache
+                    ),
+                    expected_granular_checkpoint_plan=expected_plan,
+                )
+                if (
+                    len(local_granular_handles) != 1
+                    or local_granular_handles[
+                        0
+                    ].manifest.get("artifact_kind")
+                    != "prepared_stage1_context"
+                    or tuple(
+                        local_granular_handles[
+                            0
+                        ].manifest["upstream_artifact_ids"]
+                    )
+                    != (artifact.artifact_id,)
+                ):
+                    raise ValueError(
+                        "prepared Stage 1 context granular DAG changed"
+                    )
+        if local_granular_index is not None:
+            granular_indexes[phase] = local_granular_index
+        if local_granular_handles:
+            granular_handles_by_phase[phase] = (
+                local_granular_handles
+            )
 
     checkpoint_root = root / "portable_checkpoints"
     observed_controls: set[str] = set()
@@ -2137,6 +7296,23 @@ def validate_published_workflow_checkpoint_dag(
             observed_controls.add(child.name)
     if observed_controls != set(local_phases):
         raise ValueError("portable checkpoint controls contain missing or extra phases")
+    granular_root = root / "portable_granular_checkpoints"
+    observed_granular_phases: set[str] = set()
+    if granular_root.exists() or granular_root.is_symlink():
+        if granular_root.is_symlink() or not granular_root.is_dir():
+            raise ValueError(
+                "portable granular checkpoint root is invalid"
+            )
+        for child in granular_root.iterdir():
+            if child.is_symlink() or not child.is_dir():
+                raise ValueError(
+                    "portable granular checkpoint root contains an invalid entry"
+                )
+            observed_granular_phases.add(child.name)
+    if observed_granular_phases != set(granular_indexes):
+        raise ValueError(
+            "portable granular checkpoint indexes contain missing or extra phases"
+        )
     attestation_root = root / "execution_attestations" / "portable_checkpoint_publications"
     observed_attestations: set[str] = set()
     if attestation_root.exists() or attestation_root.is_symlink():
@@ -2158,6 +7334,13 @@ def validate_published_workflow_checkpoint_dag(
             "portable checkpoint publication attestations contain missing " "or extra phases"
         )
 
+    operator_trusted_phases = [
+        str(record.get("substituted_phase"))
+        for record in adoption_records
+        if isinstance(record, Mapping)
+        and _operator_trusted_adoption_selected(record)
+        and record.get("substituted_phase") in phases
+    ]
     body = {
         "schema_version": WORKFLOW_CHECKPOINT_DAG_VALIDATION_SCHEMA,
         "status": "accepted",
@@ -2167,6 +7350,29 @@ def validate_published_workflow_checkpoint_dag(
             phase: artifacts_by_phase[phase].artifact_id
             for phase in phases
             if phase in artifacts_by_phase
+        },
+        "granular_checkpoint_artifact_ids": {
+            phase: [
+                artifact.artifact_id
+                for artifact in granular_handles_by_phase[phase]
+            ]
+            for phase in phases
+            if phase in granular_handles_by_phase
+        },
+        "granular_checkpoint_indexes": {
+            phase: {
+                "content_sha256": granular_indexes[phase][
+                    "content_sha256"
+                ],
+                "coverage_content_sha256": granular_indexes[phase][
+                    "coverage"
+                ]["content_sha256"],
+                "node_count": granular_indexes[phase][
+                    "node_count"
+                ],
+            }
+            for phase in phases
+            if phase in granular_indexes
         },
         "local_publication_phases": local_phases,
         "adopted_publication_phases": [
@@ -2178,74 +7384,86 @@ def validate_published_workflow_checkpoint_dag(
             or tuple(artifacts_by_phase["oracle_evaluation"].manifest["upstream_artifact_ids"])
             == (artifacts_by_phase["stage2_inference"].artifact_id,)
         ),
-        "fresh_full_byte_validation": True,
+        "fresh_full_byte_validation": not operator_trusted_phases,
+        "operator_trusted_checkpoint_reuse": bool(
+            operator_trusted_phases
+        ),
+        "operator_trusted_checkpoint_phases": operator_trusted_phases,
+        "payload_bytes_reauthenticated_for_all_adoptions": (
+            not operator_trusted_phases
+        ),
+        "global_release_certified": False,
     }
     return {**body, "content_sha256": _sha(body)}
 
 
-def _hook_identity(hook: WorkflowPhaseHook | None) -> Mapping[str, Any] | None:
+def _hook_identity(
+    hook: WorkflowPhaseHook | None,
+    *,
+    identity_memo: _ScientificIdentityMemo | None = None,
+) -> Mapping[str, Any] | None:
     if hook is None:
         return None
-    target = hook if inspect.isfunction(hook) else hook.__call__
-    source = inspect.getsourcefile(target)
-    identity: dict[str, Any] = {
-        "module": str(getattr(target, "__module__", type(hook).__module__)),
-        "qualname": str(getattr(target, "__qualname__", type(hook).__qualname__)),
-    }
-    if source is not None and Path(source).is_file():
-        digest, size = stable_file_sha256(Path(source).resolve())
-        identity["source_file"] = {
-            "path": str(Path(source).resolve()),
-            "sha256": digest,
-            "size_bytes": size,
-        }
-    return identity
+    return _callable_behavior_identity(
+        hook,
+        identity_memo=identity_memo,
+    )
 
 
 def _scientific_callable_identity(
     value: Any,
     *,
     method_name: str | None = None,
+    explicit_scientific_identity: Mapping[str, Any] | None = None,
+    identity_memo: _ScientificIdentityMemo | None = None,
 ) -> Mapping[str, Any]:
     """Return a path-neutral source identity for injected scientific code."""
 
     target = getattr(value, method_name) if method_name is not None else value
-    if not callable(target):
-        raise TypeError("scientific integration capability is not callable")
-    identity: dict[str, Any] = {
-        "module": str(getattr(target, "__module__", type(value).__module__)),
-        "qualname": str(getattr(target, "__qualname__", type(value).__qualname__)),
-    }
-    try:
-        source = inspect.getsourcefile(target)
-    except (TypeError, OSError):
-        source = None
-    if source is None:
-        raise ValueError(
-            "portable role-neutral integration callables must have an " "inspectable source file"
+    return _path_neutral_injected_identity(
+        _callable_behavior_identity(
+            target,
+            explicit_scientific_identity=(
+                explicit_scientific_identity
+            ),
+            identity_memo=identity_memo,
         )
-    resolved = Path(source).resolve(strict=True)
-    digest, size = stable_file_sha256(resolved)
-    identity["source_sha256"] = digest
-    identity["source_size_bytes"] = size
-    return identity
+    )
 
 
 def _role_neutral_stage1_integration_identity(
     integration: ProductionRoleNeutralStage1Integration | None,
+    *,
+    identity_memo: _ScientificIdentityMemo | None = None,
 ) -> Mapping[str, Any] | None:
     if integration is None:
         return None
     body = {
-        "schema_version": ("production_role_neutral_stage1_integration_code_identity_v1"),
+        "schema_version": (
+            "production_role_neutral_stage1_integration_code_identity_v2"
+        ),
         "producer_factories_builder": _scientific_callable_identity(
-            integration.producer_factories_builder
+            integration.producer_factories_builder,
+            explicit_scientific_identity=(
+                integration.producer_factories_scientific_identity
+            ),
+            identity_memo=identity_memo,
         ),
         "physical_owner_executor": _scientific_callable_identity(
             integration.executor,
             method_name="execute",
+            explicit_scientific_identity=(
+                integration.physical_owner_executor_scientific_identity
+            ),
+            identity_memo=identity_memo,
         ),
-        "stage2_handoff_publisher": _scientific_callable_identity(integration.handoff_publisher),
+        "stage2_handoff_publisher": _scientific_callable_identity(
+            integration.handoff_publisher,
+            explicit_scientific_identity=(
+                integration.handoff_publisher_scientific_identity
+            ),
+            identity_memo=identity_memo,
+        ),
     }
     return {**body, "content_sha256": identity_sha256(body)}
 
@@ -2322,9 +7540,9 @@ def _validate_portable_role_neutral_stage1_phase_result(
         or result.get("deduplicated_fit_count")
         != int(result["logical_scope_count"]) - int(result["physical_fit_count"])
         or result.get("every_physical_owner_executed_once") is not True
-        or result.get("productive_compute_canary_completed") is not True
-        or result.get("selected_canary_replica_adopted_as_production") is not True
-        or result.get("compute_canary_scientific_equality") is not True
+        or result.get("productive_compute_canary_completed") is not False
+        or result.get("selected_canary_replica_adopted_as_production") is not False
+        or result.get("compute_canary_scientific_equality") is not None
         or result.get("all_ten_families_bound_per_logical_context") is not True
         or result.get("legacy_bundle_build_invoked") is not False
         or result.get("stage2_handoff_derived_exclusively_from_role_neutral_execution") is not True
@@ -2557,10 +7775,27 @@ class ProductionAllEvidenceWorkflow:
                 "bypass its full-byte recompute decision"
             )
         self.request: dict[str, Any] = {}
+        self._scientific_identity_memo = _ScientificIdentityMemo()
         self._adopted_artifact_handles: dict[str, ValidatedPortableArtifact] = {}
+        self._operator_trusted_checkpoint_handles: dict[
+            str, OperatorTrustedCheckpoint
+        ] = {}
         self._published_checkpoint_handles: dict[str, ValidatedPortableArtifact] = {}
+        self._published_granular_checkpoint_handles: dict[
+            str, ValidatedPortableArtifact
+        ] = {}
+        self._published_granular_checkpoint_indexes: dict[
+            str, Mapping[str, Any]
+        ] = {}
         self._phase_payload_stat_inventories: dict[str, Mapping[str, tuple[int, ...]]] = {}
         self._validate_options()
+        self._validation_policy = _resolve_validation_depth_policy(
+            self.options.run_control.validation_depth
+        )
+        self._run_control_selection_attestation: Mapping[str, Any] | None = None
+        self._run_control_selection_attestation_path: Path | None = None
+        self._validation_achievement_attestation: Mapping[str, Any] | None = None
+        self._validation_achievement_attestation_path: Path | None = None
         telemetry_devices = tuple(f"cuda:{gpu_id}" for gpu_id in self.stage1_gpu_ids)
         if not telemetry_devices and self.options.stage1_device == "cpu":
             telemetry_devices = ("cpu",)
@@ -2959,7 +8194,7 @@ class ProductionAllEvidenceWorkflow:
     def _resolve_requested_checkpoint_sources(
         self,
         *,
-        expected_compatibility: Mapping[str, Any],
+        expected_compatibilities_by_phase: Mapping[str, Mapping[str, Any]],
         embedding_model_builder_tree_sha256: str,
     ) -> tuple[
         list[ValidatedPortableArtifact],
@@ -2983,10 +8218,73 @@ class ProductionAllEvidenceWorkflow:
             validate_migrated_legacy_terminal_phase_reference,
         )
 
-        compatibility = ArtifactCompatibility(**dict(expected_compatibility))
+        compatibilities = {
+            phase: ArtifactCompatibility(**dict(value))
+            for phase, value in expected_compatibilities_by_phase.items()
+        }
+        if set(compatibilities) != set(PORTABLE_CHECKPOINT_PHASE_SPECS):
+            raise ValueError(
+                "checkpoint compatibility mapping does not cover every producer phase"
+            )
         portable: list[ValidatedPortableArtifact] = []
+        payload_authentication_cache: dict[
+            str, tuple[tuple[int, ...], str, int]
+        ] = {}
         legacy: dict[str, tuple[Path, Mapping[str, Any]]] = {}
         selected_preflight: tuple[Path, Mapping[str, Any], str] | None = None
+        for raw_attestation in (
+            self.options.run_control
+            .trust_prior_adoption_attestations
+        ):
+            prior_path = Path(raw_attestation)
+            if prior_path.is_symlink() or not prior_path.is_file():
+                raise ValueError(
+                    "operator-trusted checkpoint reuse requires an exact "
+                    "prior adoption attestation file"
+                )
+            prior = _read_json_object(
+                prior_path,
+                label="operator-trusted prior adoption attestation selector",
+            )
+            producer_locator = prior.get("producer_locator")
+            if (
+                not isinstance(producer_locator, str)
+                or not Path(producer_locator).is_absolute()
+            ):
+                raise ValueError(
+                    "operator-trusted prior adoption attestation lacks its "
+                    "producer locator"
+                )
+            locator_path = Path(producer_locator)
+            if locator_path.name != "artifact_locator.json":
+                raise ValueError(
+                    "operator-trusted prior adoption attestation names an "
+                    "invalid producer locator"
+                )
+            trusted = validate_operator_trusted_portable_artifact(
+                source=locator_path.parent,
+                prior_attestation_path=prior_path,
+            )
+            artifact = trusted.artifact
+            if artifact.manifest["artifact_kind"] not in {
+                "prepared_cohort",
+                "embedding_cache",
+            }:
+                raise ValueError(
+                    "operator-trusted reuse is narrowly limited to prepared "
+                    "cohort and embedding-cache checkpoints"
+                )
+            if (
+                artifact.artifact_id
+                in self._operator_trusted_checkpoint_handles
+            ):
+                raise ValueError(
+                    "operator-trusted checkpoint was selected more than once"
+                )
+            self._operator_trusted_checkpoint_handles[
+                artifact.artifact_id
+            ] = trusted
+            portable.append(artifact)
         for raw_source in self.options.run_control.adopt_checkpoints:
             source = Path(raw_source)
             if source.is_symlink():
@@ -3039,7 +8337,19 @@ class ProductionAllEvidenceWorkflow:
                     "checkpoint adoption files must be artifact_manifest.json "
                     "or a supported legacy complete_manifest.json"
                 )
-            portable.append(validate_portable_artifact(source))
+            portable.append(
+                validate_portable_artifact(
+                    source,
+                    payload_authentication_cache=payload_authentication_cache,
+                )
+            )
+
+        artifact_ids = [artifact.artifact_id for artifact in portable]
+        if len(artifact_ids) != len(set(artifact_ids)):
+            raise ValueError(
+                "checkpoint adoption selected the same artifact through "
+                "multiple trust paths"
+            )
 
         if self.options.legacy_preflight_candidate is not None:
             if selected_preflight is not None:
@@ -3092,6 +8402,7 @@ class ProductionAllEvidenceWorkflow:
                 continue
             manifest_path, validated_legacy = candidate
             spec = PORTABLE_CHECKPOINT_PHASE_SPECS[phase]
+            compatibility = compatibilities[phase]
             if phase == "input_preparation":
                 prepared_expectation = derive_legacy_prepared_migration_expectation(
                     manifest_path=manifest_path,
@@ -3197,6 +8508,8 @@ class ProductionAllEvidenceWorkflow:
 
     def _request_body(self) -> dict[str, Any]:
         self._adopted_artifact_handles.clear()
+        self._operator_trusted_checkpoint_handles.clear()
+        identity_memo = self._scientific_identity_memo
         values = json.loads(json.dumps(asdict(self.options), default=str))
         values.pop("run_control")
         values["schema_version"] = WORKFLOW_SCHEMA
@@ -3214,6 +8527,15 @@ class ProductionAllEvidenceWorkflow:
         values["extraction_context_strategy"] = "complete_paged_v1"
         values["final_estimator"] = "strict_outer_honest_final_context_fit_causal_forest_v2"
         values["phase_sequence"] = list(self._phase_sequence())
+        values["expected_granular_checkpoint_plan"] = (
+            _derive_expected_granular_checkpoint_plan(
+                outer_folds=int(self.options.outer_folds),
+                initial_training_partitions=int(
+                    self.options.initial_training_partitions
+                ),
+                review_rounds=int(self.options.review_rounds),
+            )
+        )
         values["resolved_stage1_gpu_ids"] = list(self.stage1_gpu_ids)
         values["resolved_query_devices"] = list(self.query_devices)
         values["stage1_resource_contract"] = {
@@ -3231,9 +8553,22 @@ class ProductionAllEvidenceWorkflow:
             "scope_seed_policy": self.options.stage1_seed_policy,
             "exclusive_gpu_preflight_required": bool(self.stage1_gpu_ids),
         }
-        values["source_sha256"] = stable_file_sha256(self.options.dataset_path)[0]
-        values["stage1_profile_sha256"] = stable_file_sha256(self.options.stage1_profile_path)[0]
-        values["query_profile_sha256"] = stable_file_sha256(self.options.query_profile_path)[0]
+        values["source_sha256"] = _memoized_scientific_file_digest(
+            self.options.dataset_path,
+            identity_memo=identity_memo,
+        )[0]
+        values["stage1_profile_sha256"] = (
+            _memoized_scientific_file_digest(
+                self.options.stage1_profile_path,
+                identity_memo=identity_memo,
+            )[0]
+        )
+        values["query_profile_sha256"] = (
+            _memoized_scientific_file_digest(
+                self.options.query_profile_path,
+                identity_memo=identity_memo,
+            )[0]
+        )
         values["stage1_profile_scientific_identity"] = scientific_profile_file_identity(
             self.options.stage1_profile_path,
             profile_kind="stage1",
@@ -3243,31 +8578,37 @@ class ProductionAllEvidenceWorkflow:
             profile_kind="neural_query",
         )
         if self.options.scientific_spec_path is not None:
-            values["scientific_spec_source_sha256"] = stable_file_sha256(
-                self.options.scientific_spec_path
-            )[0]
+            values["scientific_spec_source_sha256"] = (
+                _memoized_scientific_file_digest(
+                    self.options.scientific_spec_path,
+                    identity_memo=identity_memo,
+                )[0]
+            )
         if self.options.deployment_profile_path is not None:
-            values["deployment_profile_source_sha256"] = stable_file_sha256(
-                self.options.deployment_profile_path
-            )[0]
+            values["deployment_profile_source_sha256"] = (
+                _memoized_scientific_file_digest(
+                    self.options.deployment_profile_path,
+                    identity_memo=identity_memo,
+                )[0]
+            )
         imported_embedding_cache = self.options.embedding_cache_import is not None
         values["embedding_model_revalidation_policy"] = (
             AUTHENTICATED_DIRECTORY_TREE_POLICY
-            if imported_embedding_cache
-            else "full_byte_tree_reauthentication_v1"
         )
         values["embedding_model_tree"] = _stable_path_identity(
             self.options.embedding_local_model_path,
-            reuse_process_authenticated_tree=imported_embedding_cache,
+            reuse_process_authenticated_tree=True,
         )
         values["embedding_model_builder_tree_sha256"] = _embedding_builder_tree_sha256(
             root=self.options.embedding_local_model_path,
             workflow_tree_identity=values["embedding_model_tree"],
         )
-        values["htr_model_tree"] = _stable_path_identity(self.options.htr_local_model_path)
+        values["htr_model_tree"] = _stable_path_identity(
+            self.options.htr_local_model_path,
+        )
         if self.options.stage2_tokenizer_locator is not None:
             values["stage2_tokenizer_tree"] = _stable_path_identity(
-                self.options.stage2_tokenizer_locator
+                self.options.stage2_tokenizer_locator,
             )
         if imported_embedding_cache:
             source_prepared, source_manifest = self._resolved_cache_import_sources()
@@ -3286,89 +8627,92 @@ class ProductionAllEvidenceWorkflow:
                 self.options.source_snapshot_root
             ).as_dict()
         values["integration_hooks"] = {
-            "embedding_cache": _hook_identity(self.hooks.embedding_cache),
-            "stage1_preflight": _hook_identity(self.hooks.stage1_preflight),
-            "stage1_modeling": _hook_identity(self.hooks.stage1_modeling),
+            "embedding_cache": _hook_identity(
+                self.hooks.embedding_cache,
+                identity_memo=identity_memo,
+            ),
+            "stage1_preflight": _hook_identity(
+                self.hooks.stage1_preflight,
+                identity_memo=identity_memo,
+            ),
+            "stage1_modeling": _hook_identity(
+                self.hooks.stage1_modeling,
+                identity_memo=identity_memo,
+            ),
             "role_neutral_stage1": _role_neutral_stage1_integration_identity(
-                self.hooks.role_neutral_stage1
+                self.hooks.role_neutral_stage1,
+                identity_memo=identity_memo,
             ),
         }
         values["phase_overrides"] = {
-            phase: _hook_identity(self.phase_overrides.get(phase))
+            phase: _hook_identity(
+                self.phase_overrides.get(phase),
+                identity_memo=identity_memo,
+            )
             for phase in self._phase_sequence()
         }
-        implementation_files = (
-            Path(__file__).resolve(),
-            Path(__file__).with_name("production_text_preparation.py").resolve(),
-            Path(__file__).with_name("production_oracle_evaluation.py").resolve(),
-            Path(__file__).with_name("production_authenticated_tree_cache.py").resolve(),
-            Path(__file__).with_name("production_embedding_cache_builder.py").resolve(),
-            Path(__file__).with_name("production_embedding_cache_process.py").resolve(),
-            Path(__file__).with_name("production_embedding_cache_relocation.py").resolve(),
-            Path(__file__).parents[1] / "extraction" / "complete_paged.py",
-            Path(__file__).with_name("production_source_snapshot.py").resolve(),
-            Path(__file__).with_name("production_stage1_cluster_preflight_artifact.py").resolve(),
-            Path(__file__).with_name(
-                "production_stage1_cluster_preflight_artifact_v2.py"
-            ).resolve(),
-            Path(__file__).with_name("production_stage1_bundle.py").resolve(),
-            Path(__file__).with_name("production_stage1_scope_scheduler.py").resolve(),
-            Path(__file__).with_name("production_stage1_role_neutral_execution.py").resolve(),
-            Path(__file__).with_name("production_stage1_role_neutral_coordinator.py").resolve(),
-            Path(__file__).with_name(
-                "production_role_neutral_process_executor.py"
-            ).resolve(),
-            Path(__file__).with_name(
-                "production_role_neutral_persistent_executor.py"
-            ).resolve(),
-            Path(__file__).with_name(
-                "production_role_neutral_producer_factories.py"
-            ).resolve(),
-            Path(__file__).with_name("prepared_stage1_context.py").resolve(),
-            Path(__file__).with_name("role_neutral_all_ten_binding.py").resolve(),
-            Path(__file__).with_name("role_neutral_bow_group_execution.py").resolve(),
-            Path(__file__).with_name("role_neutral_htr_group_execution.py").resolve(),
-            Path(__file__).with_name("role_neutral_matched_pair_group_execution.py").resolve(),
-            Path(__file__).with_name("role_neutral_embedding_group_execution.py").resolve(),
-            Path(__file__).with_name("role_neutral_tfidf_group_execution.py").resolve(),
-            Path(__file__).with_name("role_neutral_neural_query_group_execution.py").resolve(),
-            Path(__file__).with_name("production_neural_query_binary_layout.py").resolve(),
-            Path(__file__).with_name("production_role_neutral_stage2_handoff.py").resolve(),
-            Path(__file__).with_name("direct_upstream_numerical_reference_bank.py").resolve(),
-            Path(__file__).with_name("tfidf_safe_artifacts.py").resolve(),
-            Path(__file__).with_name("production_stage1_legacy_scope_adapter.py").resolve(),
-            Path(__file__).with_name("production_stage1_legacy_scope_fragments.py").resolve(),
-            Path(__file__).with_name("portable_artifacts.py").resolve(),
-            Path(__file__).with_name("portable_workflow_spec.py").resolve(),
-            Path(__file__).with_name("physical_fit_deduplication.py").resolve(),
-            Path(__file__).with_name("legacy_checkpoint_migration.py").resolve(),
-            Path(__file__).with_name("portable_resource_scheduler.py").resolve(),
-            Path(__file__).with_name("scoped_embedding_cache.py").resolve(),
-            Path(__file__).with_name("performance_telemetry.py").resolve(),
-            Path(__file__).with_name("scientific_profile_identity.py").resolve(),
-            Path(__file__).with_name("production_stage1_hierarchy_one_shot.py").resolve(),
-            Path(__file__).with_name("production_stage1_hierarchy_handoff.py").resolve(),
-            Path(__file__).with_name("production_stage1_hierarchy_contract.py").resolve(),
-            Path(__file__).with_name("hierarchical_all_architecture_discovery.py").resolve(),
-            Path(__file__).with_name("hierarchical_discovery_response_contract.py").resolve(),
-            Path(__file__).with_name("openai_compatible_json_discovery_job_runner.py").resolve(),
-            Path(__file__).with_name("adaptive_hierarchical_stage1_reconsideration.py").resolve(),
-            Path(__file__).with_name("stage2_prompt_nontruncation.py").resolve(),
-            Path(__file__).with_name("all_evidence_post_extraction_review.py").resolve(),
-            Path(__file__).with_name("production_terminal_artifact_validation.py").resolve(),
-            Path(__file__).with_name("all_evidence_fusion_runner.py").resolve(),
-            Path(__file__).with_name("final_context_fit_causal_forest_adapter.py").resolve(),
-            Path(__file__).parents[1] / "models" / "causal_forest_head.py",
-            Path(__file__).parents[1] / "models" / "strict_causal_forest_runtime.py",
-            Path(__file__).parents[1] / "models" / "lossless_tokenization.py",
-            Path(__file__).parents[1] / "config.py",
-            Path(__file__).parents[2] / "scripts" / "run_production_all_evidence_workflow.py",
-            Path(__file__).parents[2] / "scripts" / "canary_production_stage1_hierarchy.py",
+        phase_code_records = _phase_transitive_producer_code_records(
+            workflow_type=type(self),
+            integration_hooks=values["integration_hooks"],
+            phase_overrides=values["phase_overrides"],
+            identity_memo=identity_memo,
         )
-        values["implementation_files"] = {
-            str(path.resolve()): stable_file_sha256(path.resolve())[0]
-            for path in implementation_files
+        values["phase_transitive_producer_code"] = phase_code_records
+        values["phase_producer_code_identities"] = {
+            phase: record["content_sha256"]
+            for phase, record in phase_code_records.items()
         }
+        repository_root = Path(__file__).resolve().parents[2]
+        implementation_files: dict[str, str] = {
+            str(Path(__file__).resolve()): (
+                identity_memo.file_digest(
+                    Path(__file__).resolve(),
+                    repository_root=repository_root,
+                )[0]
+            )
+        }
+
+        def register_implementation_file(
+            path: Path,
+            digest: str,
+        ) -> None:
+            key = str(path)
+            prior = implementation_files.setdefault(key, str(digest))
+            if prior != str(digest):
+                raise RuntimeError(
+                    "workflow implementation changed while its transitive "
+                    "producer identity was being constructed"
+                )
+
+        for record in phase_code_records.values():
+            for row in (
+                *record["transitive_source_inventory"],
+                *record["dependency_lock_inventory"],
+            ):
+                path = (
+                    repository_root / str(row["relative_path"])
+                ).resolve(strict=True)
+                register_implementation_file(
+                    path,
+                    str(row["sha256"]),
+                )
+        for collection_name in (
+            "integration_hooks",
+            "phase_overrides",
+        ):
+            for row in _repository_import_closure_rows(
+                values[collection_name]
+            ):
+                path = (
+                    repository_root / str(row["relative_path"])
+                ).resolve(strict=True)
+                register_implementation_file(
+                    path,
+                    str(row["sha256"]),
+                )
+        values["implementation_files"] = dict(
+            sorted(implementation_files.items())
+        )
         values["stage1_recovery_contract"] = {
             "scope_attempt_root": str(
                 (self.options.work_root / "recovery" / "stage1_scope_attempts").resolve()
@@ -3448,17 +8792,13 @@ class ProductionAllEvidenceWorkflow:
                 "seed": self.options.seed,
                 "seed_policy": self.options.stage1_seed_policy,
             }
-        producer_code_inputs: dict[str, Any] = {
-            "implementation_file_sha256": sorted(values["implementation_files"].values())
-        }
-        role_neutral_integration_identity = values["integration_hooks"].get("role_neutral_stage1")
-        if role_neutral_integration_identity is not None:
-            producer_code_inputs["role_neutral_stage1_integration"] = (
-                role_neutral_integration_identity
-            )
-        producer_code_identity = identity_sha256(producer_code_inputs)
-        scientific_body = {
-            "schema_version": "portable_all_evidence_scientific_identity_v2",
+        values["portable_typed_workflow"] = (
+            self.options.portable_scientific_spec is not None
+        )
+        scientific_configuration_body = {
+            "schema_version": (
+                "portable_all_evidence_scientific_configuration_identity_v1"
+            ),
             "scientific_settings": scientific_settings,
             "dataset_content_sha256": values["source_sha256"],
             "stage1_profile_scientific_identity": (values["stage1_profile_scientific_identity"]),
@@ -3472,18 +8812,18 @@ class ProductionAllEvidenceWorkflow:
             ),
             "embedding_model_name": self.options.embedding_model_name,
             "stage2_model_name": self.options.model_name,
-            "producer_code_identity": producer_code_identity,
-            "source_snapshot_content_sha256": (
-                values.get("source_snapshot", {}).get("content_sha256")
-                if isinstance(values.get("source_snapshot"), Mapping)
-                else None
-            ),
             "runtime_compatibility_class": (self.options.runtime_compatibility_class),
         }
-        values["scientific_identity"] = {
-            **scientific_body,
-            "scientific_sha256": identity_sha256(scientific_body),
-        }
+        identity_binding = _bind_workflow_scientific_identity(
+            scientific_configuration_body=(
+                scientific_configuration_body
+            ),
+            phase_code_records=phase_code_records,
+        )
+        values.update(identity_binding)
+        workflow_producer_code_identity = str(
+            identity_binding["workflow_producer_code_identity"]
+        )
         folds_identity = identity_sha256(scientific_settings.get("folds", {}))
         seed_identity = identity_sha256(
             {
@@ -3514,7 +8854,7 @@ class ProductionAllEvidenceWorkflow:
                 neutral_stage2_tokenizer
             )
         expected_prompt_identities = dict(scientific_settings.get("prompt_identities") or {})
-        expected_checkpoint_compatibility = {
+        expected_checkpoint_compatibility_base = {
             "dataset_identity": values["source_sha256"],
             "split_identity": folds_identity,
             "row_order_identity": identity_sha256(
@@ -3528,28 +8868,157 @@ class ProductionAllEvidenceWorkflow:
             ),
             "model_identities": expected_model_identities,
             "prompt_identities": expected_prompt_identities,
-            "configuration_identity": values["scientific_identity"]["scientific_sha256"],
+            "configuration_identity": values[
+                "scientific_configuration_identity"
+            ]["scientific_configuration_sha256"],
             "seed_identity": seed_identity,
-            "producer_code_identity": producer_code_identity,
             "runtime_compatibility_class": (self.options.runtime_compatibility_class),
         }
+        expected_checkpoint_compatibilities_by_phase = {
+            phase: {
+                **expected_checkpoint_compatibility_base,
+                "producer_code_identity": values[
+                    "phase_producer_code_identities"
+                ][phase],
+            }
+            for phase in PORTABLE_CHECKPOINT_PHASE_SPECS
+        }
+        expected_checkpoint_compatibility = {
+            **expected_checkpoint_compatibility_base,
+            "producer_code_identity": workflow_producer_code_identity,
+        }
         values["expected_checkpoint_compatibility"] = expected_checkpoint_compatibility
+        values["expected_checkpoint_compatibilities_by_phase"] = (
+            expected_checkpoint_compatibilities_by_phase
+        )
+        from .production_stage1_scope_scheduler import (
+            Stage1PhysicalFitIdentity,
+        )
+
+        architecture_profiles = scientific_settings.get(
+            "architecture_profiles"
+        )
+        if isinstance(architecture_profiles, Mapping):
+            architecture_identity = identity_sha256(
+                {
+                    "schema_version": "all_ten_architecture_profiles_v1",
+                    "family_order": list(EVIDENCE_FAMILIES),
+                    "architecture_profiles": {
+                        family: copy.deepcopy(
+                            dict(architecture_profiles[family])
+                        )
+                        for family in EVIDENCE_FAMILIES
+                    },
+                }
+            )
+        else:
+            architecture_identity = identity_sha256(
+                {
+                    "schema_version": (
+                        "compiled_legacy_all_ten_architecture_profiles_v1"
+                    ),
+                    "stage1_profile": values[
+                        "stage1_profile_scientific_identity"
+                    ],
+                    "query_profile": values[
+                        "query_profile_scientific_identity"
+                    ],
+                }
+            )
+        values["stage1_physical_fit_identity"] = Stage1PhysicalFitIdentity(
+            architecture_identity=architecture_identity,
+            target="all_ten_stage1_context_fit_v1",
+            scientific_configuration_identity=values[
+                "scientific_configuration_identity"
+            ]["scientific_configuration_sha256"],
+            producer_identity=values["phase_producer_code_identities"][
+                "stage1_modeling"
+            ],
+            runtime_compatibility_class=(
+                self.options.runtime_compatibility_class
+            ),
+        ).as_dict()
         (
             validated_adoptions,
             legacy_migration_records,
             legacy_preflight_identity,
         ) = self._resolve_requested_checkpoint_sources(
-            expected_compatibility=expected_checkpoint_compatibility,
+            expected_compatibilities_by_phase=(
+                expected_checkpoint_compatibilities_by_phase
+            ),
             embedding_model_builder_tree_sha256=values["embedding_model_builder_tree_sha256"],
         )
         if legacy_preflight_identity is not None:
             values["legacy_preflight_candidate_identity"] = legacy_preflight_identity
+        validated_adoptions_by_id = {
+            artifact.artifact_id: artifact
+            for artifact in validated_adoptions
+        }
+        trusted_legacy_projection_proofs: dict[
+            str, Mapping[str, Any]
+        ] = {}
         for artifact in validated_adoptions:
-            compatibility = artifact.manifest["compatibility"]
-            observed_compatibility = {
-                key: compatibility.get(key) for key in expected_checkpoint_compatibility
+            if (
+                artifact.artifact_id
+                in self._operator_trusted_checkpoint_handles
+            ):
+                trusted_legacy_projection_proofs[
+                    artifact.artifact_id
+                ] = (
+                    _operator_trusted_legacy_phase_projection_proof(
+                        artifact=artifact,
+                        request=values,
+                        adopted_artifacts=validated_adoptions_by_id,
+                    )
+                )
+        for artifact in validated_adoptions:
+            artifact_kind = str(artifact.manifest["artifact_kind"])
+            compatibility_phase = (
+                CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND.get(
+                    artifact_kind
+                )
+            )
+            if compatibility_phase is None:
+                raise ValueError(
+                    "adopted checkpoint kind has no producer compatibility domain"
+                )
+            expected_artifact_compatibility = (
+                expected_checkpoint_compatibilities_by_phase[
+                    compatibility_phase
+                ]
+            )
+            trusted_checkpoint = (
+                self._operator_trusted_checkpoint_handles.get(
+                    artifact.artifact_id
+                )
+            )
+            compatibility_record = {
+                "adoption_validation_policy": (
+                    None
+                    if trusted_checkpoint is None
+                    else OPERATOR_TRUSTED_VALIDATION_POLICY
+                ),
+                "prior_adoption_attestation_path": (
+                    None
+                    if trusted_checkpoint is None
+                    else str(
+                        trusted_checkpoint.prior_attestation_path
+                    )
+                ),
+                "payload_bytes_reauthenticated": (
+                    trusted_checkpoint is None
+                ),
+                "legacy_phase_compatibility_projection_proof": (
+                    trusted_legacy_projection_proofs.get(
+                        artifact.artifact_id
+                    )
+                ),
             }
-            if observed_compatibility != expected_checkpoint_compatibility:
+            if not _adopted_compatibility_matches_request(
+                artifact=artifact,
+                expected=expected_artifact_compatibility,
+                record=compatibility_record,
+            ):
                 raise ValueError(
                     "adopted checkpoint is incompatible with the configured "
                     "dataset, splits, models, prompts, scientific settings, "
@@ -3570,6 +9039,16 @@ class ProductionAllEvidenceWorkflow:
         phase_artifact_ids = _validate_adopted_checkpoint_graph(
             validated_adoptions,
             allowed_phases=self._phase_sequence(),
+            expected_granular_checkpoint_plan=values[
+                "expected_granular_checkpoint_plan"
+            ],
+            expected_stage1_physical_fit_identity=values[
+                "stage1_physical_fit_identity"
+            ],
+            expected_global_seed=int(self.options.seed),
+            require_prepared_stage1_context=bool(
+                values["portable_typed_workflow"]
+            ),
         )
         artifact_phases = {artifact_id: phase for phase, artifact_id in phase_artifact_ids.items()}
         adopted: list[dict[str, Any]] = []
@@ -3579,6 +9058,11 @@ class ProductionAllEvidenceWorkflow:
             key=lambda value: value.artifact_id,
         ):
             substituted_phase = artifact_phases.get(artifact.artifact_id)
+            trusted_checkpoint = (
+                self._operator_trusted_checkpoint_handles.get(
+                    artifact.artifact_id
+                )
+            )
             if substituted_phase == "stage1_preflight":
                 self._require_adopted_preflight_storage_compatibility(
                     artifact
@@ -3590,6 +9074,34 @@ class ProductionAllEvidenceWorkflow:
                     "compatibility_key": artifact.compatibility_key,
                     "upstream_artifact_ids": list(artifact.manifest["upstream_artifact_ids"]),
                     "substituted_phase": substituted_phase,
+                    "compatibility_phase": (
+                        CHECKPOINT_COMPATIBILITY_PHASE_BY_ARTIFACT_KIND[
+                            str(artifact.manifest["artifact_kind"])
+                        ]
+                    ),
+                    "artifact_metadata": copy.deepcopy(
+                        dict(artifact.artifact_metadata)
+                    ),
+                    "adoption_validation_policy": (
+                        None
+                        if trusted_checkpoint is None
+                        else OPERATOR_TRUSTED_VALIDATION_POLICY
+                    ),
+                    "prior_adoption_attestation_path": (
+                        None
+                        if trusted_checkpoint is None
+                        else str(
+                            trusted_checkpoint.prior_attestation_path
+                        )
+                    ),
+                    "payload_bytes_reauthenticated": (
+                        trusted_checkpoint is None
+                    ),
+                    "legacy_phase_compatibility_projection_proof": (
+                        trusted_legacy_projection_proofs.get(
+                            artifact.artifact_id
+                        )
+                    ),
                 }
             )
             self._adopted_artifact_handles[artifact.artifact_id] = artifact
@@ -3597,7 +9109,341 @@ class ProductionAllEvidenceWorkflow:
         values["requested_checkpoint_adoptions"] = adopted
         values["checkpoint_adoption_locators"] = adoption_locators
         values["legacy_checkpoint_migration_sources"] = legacy_migration_records
-        return values
+        try:
+            normalized = json.loads(
+                json.dumps(
+                    values,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise TypeError(
+                "immutable workflow request must be closed finite JSON"
+            ) from exc
+        if not isinstance(normalized, dict):
+            raise TypeError(
+                "immutable workflow request must be one JSON object"
+            )
+        return normalized
+
+    def _run_control_attestation_root(self) -> Path:
+        parent = self.options.work_root / "execution_attestations"
+        target = parent / "run_control"
+        for candidate in (parent, target):
+            if candidate.exists() or candidate.is_symlink():
+                if candidate.is_symlink() or not candidate.is_dir():
+                    raise ValueError(
+                        "run-control attestation root is not a regular directory"
+                    )
+        target.mkdir(parents=True, exist_ok=True)
+        return target.resolve(strict=True)
+
+    def _write_run_control_selection_attestation(
+        self,
+    ) -> Mapping[str, Any]:
+        request_sha256 = self.request.get("request_sha256")
+        if not isinstance(request_sha256, str):
+            raise RuntimeError(
+                "run-control selection requires an initialized request"
+            )
+        body = {
+            "schema_version": WORKFLOW_RUN_CONTROL_SELECTION_SCHEMA,
+            "request_sha256": request_sha256,
+            "run_control_schema_version": (
+                self.options.run_control.schema_version
+            ),
+            "resume_requested": self.options.run_control.resume,
+            "stop_after": self.options.run_control.stop_after,
+            "log_level": self.options.run_control.log_level,
+            "validation_policy": copy.deepcopy(
+                dict(self._validation_policy)
+            ),
+            "terminal_phase_override_present": (
+                "terminal_validation" in self.phase_overrides
+            ),
+            "scientific_request_identity_affected": False,
+            "portable_artifact_identity_affected": False,
+            "achievement_requires_separate_fresh_validation_attestation": (
+                True
+            ),
+        }
+        record = {**body, "content_sha256": _sha(body)}
+        path = (
+            self._run_control_attestation_root()
+            / f"selection.{record['content_sha256']}.json"
+        )
+        _write_immutable_json(path, record)
+        if (
+            _read_json_object(
+                path,
+                label="run-control selection attestation",
+            )
+            != record
+        ):
+            raise RuntimeError(
+                "run-control selection attestation changed after writing"
+            )
+        self._run_control_selection_attestation = record
+        self._run_control_selection_attestation_path = path
+        return record
+
+    def _write_validation_achievement_attestation(
+        self,
+        terminal_phase_manifest: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Bind the published terminal phase and its fresh validator report."""
+
+        if "terminal_validation" in self.phase_overrides:
+            raise RuntimeError(
+                "a terminal phase override cannot satisfy the fresh terminal "
+                "audit minimum"
+            )
+        selection = self._run_control_selection_attestation
+        if selection is None:
+            raise RuntimeError(
+                "validation achievement lacks its run-control selection"
+            )
+        manifest_body = {
+            key: copy.deepcopy(value)
+            for key, value in terminal_phase_manifest.items()
+            if key != "content_sha256"
+        }
+        result = terminal_phase_manifest.get("result")
+        artifacts = terminal_phase_manifest.get("artifacts")
+        if (
+            terminal_phase_manifest.get("schema_version")
+            != WORKFLOW_PHASE_MANIFEST_SCHEMA
+            or terminal_phase_manifest.get("phase")
+            != "terminal_validation"
+            or terminal_phase_manifest.get("status") != "complete"
+            or terminal_phase_manifest.get("request_sha256")
+            != self.request["request_sha256"]
+            or terminal_phase_manifest.get("content_sha256")
+            != _sha(manifest_body)
+            or not isinstance(result, Mapping)
+            or not isinstance(artifacts, list)
+        ):
+            raise RuntimeError(
+                "validation achievement requires the published terminal "
+                "phase manifest"
+            )
+        complete_manifest_path = self._phase_manifest(
+            "terminal_validation"
+        ).resolve(strict=True)
+        reopened_complete_manifest = _read_json_object(
+            complete_manifest_path,
+            label="published terminal phase manifest",
+        )
+        if reopened_complete_manifest != dict(
+            terminal_phase_manifest
+        ):
+            raise RuntimeError(
+                "published terminal phase manifest differs from the "
+                "process-authenticated result"
+            )
+        complete_manifest_sha256, complete_manifest_size = (
+            stable_file_sha256(complete_manifest_path)
+        )
+        terminal_files = result.get("terminal_files")
+        if (
+            not isinstance(terminal_files, list)
+            or len(terminal_files) != 1
+            or not isinstance(terminal_files[0], str)
+        ):
+            raise RuntimeError(
+                "published terminal validation must register one report"
+            )
+        matching_artifacts = [
+            row
+            for row in artifacts
+            if isinstance(row, Mapping)
+            and row.get("path") == terminal_files[0]
+            and row.get("relative_path") == "validation.json"
+        ]
+        if len(matching_artifacts) != 1:
+            raise RuntimeError(
+                "published terminal report is not uniquely registered"
+            )
+        report_artifact = matching_artifacts[0]
+        report_path = Path(str(report_artifact["path"]))
+        observed_sha256, observed_size = stable_file_sha256(
+            report_path.resolve(strict=True)
+        )
+        if (
+            observed_sha256 != report_artifact.get("sha256")
+            or observed_size != report_artifact.get("size_bytes")
+        ):
+            raise RuntimeError(
+                "published terminal report changed after phase publication"
+            )
+        report = _read_json_object(
+            report_path,
+            label="published fresh terminal validation report",
+        )
+        result_report = {
+            key: copy.deepcopy(value)
+            for key, value in result.items()
+            if key != "terminal_files"
+        }
+        if result_report != report:
+            raise RuntimeError(
+                "published terminal phase result differs from its report"
+            )
+        report_body = {
+            key: copy.deepcopy(value)
+            for key, value in report.items()
+            if key != "content_sha256"
+        }
+        checkpoint_validation = report.get(
+            "portable_checkpoint_dag_validation"
+        )
+        prefix_validation = report.get("read_only_prefix_validation")
+        checkpoint_content_sha256 = (
+            None
+            if not isinstance(checkpoint_validation, Mapping)
+            else checkpoint_validation.get("content_sha256")
+        )
+        operator_trusted_reuse = (
+            isinstance(checkpoint_validation, Mapping)
+            and checkpoint_validation.get(
+                "operator_trusted_checkpoint_reuse"
+            )
+            is True
+        )
+        if (
+            report.get("schema_version")
+            != "production_all_evidence_fresh_terminal_validation_report_v2"
+            or report.get("execution_completed") is not True
+            or report.get("run_validation_status") != "accepted"
+            or report.get("global_release_certified") is not False
+            or report.get("validated_phase_sequence")
+            != list(self._phase_sequence())
+            or report.get("live_runner_objects_received") is not False
+            or report.get("content_sha256") != _sha(report_body)
+            or not isinstance(prefix_validation, Mapping)
+            or prefix_validation.get("status") != "accepted"
+            or not isinstance(checkpoint_validation, Mapping)
+            or checkpoint_validation.get("status") != "accepted"
+            or checkpoint_validation.get(
+                "fresh_full_byte_validation"
+            )
+            is operator_trusted_reuse
+            or checkpoint_validation.get(
+                "payload_bytes_reauthenticated_for_all_adoptions"
+            )
+            is operator_trusted_reuse
+            or checkpoint_validation.get(
+                "global_release_certified"
+            )
+            is not False
+            or (
+                operator_trusted_reuse
+                and not checkpoint_validation.get(
+                    "operator_trusted_checkpoint_phases"
+                )
+            )
+            or checkpoint_validation.get(
+                "oracle_evaluation_after_frozen_prediction"
+            )
+            is not True
+            or not isinstance(checkpoint_content_sha256, str)
+            or len(checkpoint_content_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in checkpoint_content_sha256
+            )
+        ):
+            raise RuntimeError(
+                "terminal validation report does not match its declared "
+                "fresh or operator-trusted checkpoint policy"
+            )
+        achieved_minimum = (
+            "full_operator_trusted_terminal_audit"
+            if operator_trusted_reuse
+            else "fresh_terminal_audit"
+        )
+        body = {
+            "schema_version": WORKFLOW_VALIDATION_ACHIEVEMENT_SCHEMA,
+            "request_sha256": self.request["request_sha256"],
+            "run_control_selection_content_sha256": selection[
+                "content_sha256"
+            ],
+            "requested_minimum": self._validation_policy[
+                "requested_minimum"
+            ],
+            "production_minimum": self._validation_policy[
+                "production_minimum"
+            ],
+            "effective_minimum": self._validation_policy[
+                "effective_minimum"
+            ],
+            "achieved_minimum": achieved_minimum,
+            "effective_minimum_satisfied": (
+                not operator_trusted_reuse
+            ),
+            "fresh_path_only_terminal_audit_achieved": (
+                not operator_trusted_reuse
+            ),
+            "operator_trusted_checkpoint_reuse": (
+                operator_trusted_reuse
+            ),
+            "payload_bytes_reauthenticated_for_all_adoptions": (
+                not operator_trusted_reuse
+            ),
+            "fresh_terminal_validation_report_content_sha256": report[
+                "content_sha256"
+            ],
+            "published_terminal_phase_manifest_content_sha256": (
+                terminal_phase_manifest["content_sha256"]
+            ),
+            "published_terminal_complete_manifest_sha256": (
+                complete_manifest_sha256
+            ),
+            "published_terminal_complete_manifest_size_bytes": (
+                complete_manifest_size
+            ),
+            "published_terminal_report_sha256": report_artifact[
+                "sha256"
+            ],
+            "published_terminal_report_size_bytes": report_artifact[
+                "size_bytes"
+            ],
+            "published_checkpoint_dag_validation_content_sha256": (
+                checkpoint_content_sha256
+            ),
+            "terminal_phase_portable_checkpoint_published": False,
+            "terminal_phase_portable_checkpoint_artifact_id": None,
+            "terminal_phase_portable_checkpoint_content_root": None,
+            "terminal_publication_identity_policy": (
+                "complete_manifest_report_and_checkpoint_dag_v1"
+            ),
+            "execution_completed": True,
+            "run_validation_status": "accepted",
+            "global_release_certified": False,
+            "terminal_phase_override_present": False,
+            "scientific_request_identity_affected": False,
+            "portable_artifact_identity_affected": False,
+        }
+        record = {**body, "content_sha256": _sha(body)}
+        path = (
+            self._run_control_attestation_root()
+            / f"achievement.{record['content_sha256']}.json"
+        )
+        _write_immutable_json(path, record)
+        if (
+            _read_json_object(
+                path,
+                label="validation achievement attestation",
+            )
+            != record
+        ):
+            raise RuntimeError(
+                "validation achievement attestation changed after writing"
+            )
+        self._validation_achievement_attestation = record
+        self._validation_achievement_attestation_path = path
+        return record
 
     def _initialize(self) -> None:
         root = self.options.work_root
@@ -3660,6 +9506,7 @@ class ProductionAllEvidenceWorkflow:
             finally:
                 os.close(parent_fd)
         self.request = request
+        self._write_run_control_selection_attestation()
         self._publish_checkpoint_adoptions()
         self._write_progress(status="initialized", completed=(), current_phase=None)
 
@@ -3674,26 +9521,1110 @@ class ProductionAllEvidenceWorkflow:
                 self._require_adopted_preflight_storage_compatibility(
                     handle
                 )
-            attestation = adopt_checkpoint(
-                source=Path(str(source)),
-                attestation_root=self.options.work_root / "checkpoint_adoptions",
-                consumer_request_sha256=self.request["request_sha256"],
-                expected_kind=str(expected["artifact_kind"]),
-                expected_compatibility_key=str(expected["compatibility_key"]),
-                expected_upstream_artifact_ids=tuple(expected["upstream_artifact_ids"]),
-                validated_artifact=handle,
+            trusted = self._operator_trusted_checkpoint_handles.get(
+                str(expected["artifact_id"])
             )
+            if _operator_trusted_adoption_selected(expected):
+                if trusted is None:
+                    raise RuntimeError(
+                        "operator-trusted checkpoint lost its stat-guarded handle"
+                    )
+                attestation = (
+                    adopt_checkpoint_from_prior_full_byte_attestation(
+                        source=Path(str(source)),
+                        prior_attestation_path=(
+                            trusted.prior_attestation_path
+                        ),
+                        attestation_root=(
+                            self.options.work_root
+                            / "checkpoint_adoptions"
+                        ),
+                        consumer_request_sha256=self.request[
+                            "request_sha256"
+                        ],
+                        expected_kind=str(expected["artifact_kind"]),
+                        expected_upstream_artifact_ids=tuple(
+                            expected["upstream_artifact_ids"]
+                        ),
+                        trusted_checkpoint=trusted,
+                    )
+                )
+            else:
+                if trusted is not None:
+                    raise RuntimeError(
+                        "operator-trusted handle lacks its immutable request policy"
+                    )
+                attestation = adopt_checkpoint(
+                    source=Path(str(source)),
+                    attestation_root=self.options.work_root / "checkpoint_adoptions",
+                    consumer_request_sha256=self.request["request_sha256"],
+                    expected_kind=str(expected["artifact_kind"]),
+                    expected_compatibility_key=str(expected["compatibility_key"]),
+                    expected_upstream_artifact_ids=tuple(expected["upstream_artifact_ids"]),
+                    validated_artifact=handle,
+                )
             if attestation.get("producer_artifact_id") != expected["artifact_id"]:
                 raise RuntimeError("checkpoint adoption attestation bound the wrong artifact")
 
-    def _checkpoint_compatibility(self) -> ArtifactCompatibility:
-        raw = self.request.get("expected_checkpoint_compatibility")
+    def _checkpoint_compatibility(self, phase: str) -> ArtifactCompatibility:
+        rows = self.request.get("expected_checkpoint_compatibilities_by_phase")
+        raw = rows.get(phase) if isinstance(rows, Mapping) else None
         if not isinstance(raw, Mapping):
-            raise RuntimeError("immutable request lacks checkpoint compatibility")
+            raise RuntimeError(
+                f"immutable request lacks {phase} checkpoint compatibility"
+            )
         return ArtifactCompatibility(**dict(raw))
 
     def _checkpoint_control_root(self, phase: str) -> Path:
         return self.options.work_root / "portable_checkpoints" / phase
+
+    def _phase_payload_authentication_cache(
+        self,
+        *,
+        phase: str,
+        phase_manifest: Mapping[str, Any],
+    ) -> dict[str, tuple[tuple[int, ...], str, int]]:
+        payload_root = Path(str(phase_manifest["attempt_dir"])).resolve(
+            strict=True
+        )
+        stats = self._phase_payload_stat_inventories.get(phase)
+        if stats is None:
+            return {}
+        output: dict[str, tuple[tuple[int, ...], str, int]] = {}
+        for row in phase_manifest.get("artifacts") or ():
+            relative = str(row["relative_path"])
+            state = stats.get(relative)
+            if state is None:
+                raise RuntimeError(
+                    f"{phase} authenticated stat inventory is incomplete"
+                )
+            output[str((payload_root / relative).resolve(strict=True))] = (
+                tuple(int(value) for value in state),
+                str(row["sha256"]),
+                int(row["size_bytes"]),
+            )
+        return output
+
+    def _expected_granular_checkpoint_plan(
+        self,
+    ) -> Mapping[str, Any]:
+        return _validate_expected_granular_checkpoint_plan(
+            self.request.get("expected_granular_checkpoint_plan")
+        )
+
+    def _publish_granular_checkpoint_node(
+        self,
+        *,
+        phase: str,
+        phase_manifest: Mapping[str, Any],
+        node_ordinal: int,
+        node_key: str,
+        artifact_kind: str,
+        payload_root: Path,
+        payload_files: Sequence[Path],
+        upstream_artifact_ids: Sequence[str],
+        artifact_metadata: Mapping[str, Any],
+        payload_inventory_policy: str,
+    ) -> ValidatedPortableArtifact:
+        if artifact_kind not in GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS:
+            raise ValueError(
+                f"unsupported granular checkpoint kind: {artifact_kind}"
+            )
+        phase_root = Path(str(phase_manifest["attempt_dir"])).resolve(
+            strict=True
+        )
+        root = Path(payload_root).resolve(strict=True)
+        try:
+            root.relative_to(phase_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"{phase} granular payload root escaped its immutable phase"
+            ) from exc
+        phase_rows = phase_manifest.get("artifacts")
+        if not isinstance(phase_rows, list):
+            raise RuntimeError(
+                f"{phase} phase has no authenticated artifact inventory"
+            )
+        registration_by_path = {
+            Path(str(row["path"])).resolve(strict=True): row
+            for row in phase_rows
+            if isinstance(row, Mapping)
+        }
+        files = tuple(
+            sorted(
+                {Path(path).resolve(strict=True) for path in payload_files},
+                key=lambda path: path.as_posix(),
+            )
+        )
+        if not files:
+            raise ValueError(
+                f"{phase}/{node_key} granular payload inventory is empty"
+            )
+        if any(path not in registration_by_path for path in files):
+            raise ValueError(
+                f"{phase}/{node_key} granular payload was not phase-authenticated"
+            )
+        relative_paths: list[str] = []
+        expected: dict[str, tuple[str, int]] = {}
+        trusted: dict[str, tuple[int, ...]] = {}
+        phase_stats = self._phase_payload_stat_inventories.get(phase)
+        for path in files:
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError as exc:
+                raise ValueError(
+                    f"{phase}/{node_key} granular payload escaped its root"
+                ) from exc
+            row = registration_by_path[path]
+            phase_relative = path.relative_to(phase_root).as_posix()
+            relative_paths.append(relative)
+            expected[relative] = (
+                str(row["sha256"]),
+                int(row["size_bytes"]),
+            )
+            if phase_stats is not None:
+                state = phase_stats.get(phase_relative)
+                if state is None:
+                    raise RuntimeError(
+                        f"{phase}/{node_key} lost its authenticated stat"
+                    )
+                trusted[relative] = tuple(int(value) for value in state)
+        metadata = {
+            "schema_version": WORKFLOW_GRANULAR_CHECKPOINT_NODE_SCHEMA,
+            "producer_phase": phase,
+            "node_ordinal": int(node_ordinal),
+            "node_key": str(node_key),
+            **copy.deepcopy(dict(artifact_metadata)),
+        }
+        granular_root, _index_path, _locator_path = (
+            _granular_checkpoint_index_paths(
+                work_root=self.options.work_root,
+                phase=phase,
+            )
+        )
+        controls_root = granular_root / "nodes"
+        controls_root.mkdir(parents=True, exist_ok=True)
+        control_root = controls_root / (
+            f"{int(node_ordinal):05d}-"
+            f"{_sha({'node_key': str(node_key)})[:16]}"
+        )
+        if control_root.exists() or control_root.is_symlink():
+            artifact = validate_portable_artifact(
+                control_root,
+                expected_kind=artifact_kind,
+                expected_compatibility_key=self._checkpoint_compatibility(
+                    phase
+                ).key,
+                expected_upstream_artifact_ids=tuple(
+                    str(value) for value in upstream_artifact_ids
+                ),
+            )
+            if (
+                artifact.manifest.get("artifact_schema")
+                != GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS[artifact_kind]
+                or dict(artifact.artifact_metadata) != metadata
+            ):
+                raise RuntimeError(
+                    f"{phase}/{node_key} granular checkpoint conflicts"
+                )
+        else:
+            artifact = publish_portable_reference_artifact(
+                control_root=control_root,
+                payload_root=root,
+                artifact_kind=artifact_kind,
+                artifact_schema=(
+                    GRANULAR_CHECKPOINT_ARTIFACT_SCHEMAS[artifact_kind]
+                ),
+                compatibility=self._checkpoint_compatibility(phase),
+                upstream_artifact_ids=tuple(
+                    str(value) for value in upstream_artifact_ids
+                ),
+                payload_paths=tuple(relative_paths),
+                expected_payload_identities=expected,
+                process_authenticated_stat_inventory=(
+                    trusted if phase_stats is not None else None
+                ),
+                artifact_metadata=metadata,
+                payload_inventory_policy=payload_inventory_policy,
+            )
+        self._published_granular_checkpoint_handles[
+            artifact.artifact_id
+        ] = artifact
+        return artifact
+
+    def _seal_granular_checkpoint_index(
+        self,
+        *,
+        phase: str,
+        phase_manifest: Mapping[str, Any],
+        nodes: Sequence[ValidatedPortableArtifact],
+        expected_external_upstream_artifact_ids: Sequence[str] | None = None,
+    ) -> Mapping[str, Any]:
+        descriptors: list[dict[str, Any]] = []
+        for ordinal, artifact in enumerate(nodes):
+            metadata = dict(artifact.artifact_metadata)
+            if (
+                metadata.get("producer_phase") != phase
+                or metadata.get("node_ordinal") != ordinal
+            ):
+                raise RuntimeError(
+                    f"{phase} granular checkpoint node order changed"
+                )
+            descriptors.append(
+                {
+                    "node_ordinal": ordinal,
+                    "node_key": metadata["node_key"],
+                    "artifact_id": artifact.artifact_id,
+                    "artifact_kind": artifact.manifest["artifact_kind"],
+                    "artifact_schema": artifact.manifest[
+                        "artifact_schema"
+                    ],
+                    "upstream_artifact_ids": list(
+                        artifact.manifest["upstream_artifact_ids"]
+                    ),
+                    "artifact_metadata": metadata,
+                }
+            )
+        coverage = _granular_checkpoint_coverage(descriptors)
+        body = {
+            "schema_version": WORKFLOW_GRANULAR_CHECKPOINT_INDEX_SCHEMA,
+            "phase": phase,
+            "node_count": len(descriptors),
+            "nodes": descriptors,
+            "coverage": coverage,
+            "relative_filesystem_layout_included": False,
+        }
+        index = {**body, "content_sha256": _sha(body)}
+        root, index_path, locator_path = _granular_checkpoint_index_paths(
+            work_root=self.options.work_root,
+            phase=phase,
+        )
+        phase_manifest_path = self._phase_manifest(phase).resolve(
+            strict=True
+        )
+        phase_manifest_sha, phase_manifest_size = stable_file_sha256(
+            phase_manifest_path
+        )
+        locator_body = {
+            "schema_version": (
+                WORKFLOW_GRANULAR_CHECKPOINT_LOCATOR_SCHEMA
+            ),
+            "phase": phase,
+            "index_content_sha256": index["content_sha256"],
+            "index_path": str(index_path.resolve()),
+            "phase_manifest_path": str(phase_manifest_path),
+            "phase_manifest_sha256": phase_manifest_sha,
+            "phase_manifest_size_bytes": phase_manifest_size,
+            "node_controls": [
+                {
+                    "node_ordinal": ordinal,
+                    "artifact_id": artifact.artifact_id,
+                    "control_root": str(artifact.root),
+                }
+                for ordinal, artifact in enumerate(nodes)
+            ],
+        }
+        locator = {
+            **locator_body,
+            "content_sha256": _sha(locator_body),
+        }
+        root.mkdir(parents=True, exist_ok=True)
+        _write_immutable_json(index_path, index)
+        _write_immutable_json(locator_path, locator)
+        validated_index, validated_nodes = (
+            _validate_granular_checkpoint_index_from_paths(
+                work_root=self.options.work_root.resolve(strict=True),
+                phase=phase,
+                compatibility=self._checkpoint_compatibility(phase),
+                payload_authentication_cache=(
+                    self._phase_payload_authentication_cache(
+                        phase=phase,
+                        phase_manifest=phase_manifest,
+                    )
+                ),
+                expected_granular_checkpoint_plan=(
+                    self._expected_granular_checkpoint_plan()
+                ),
+                expected_stage1_scope_plan=(
+                    self._authenticated_current_stage1_scope_plan()
+                    if phase == "stage1_modeling"
+                    else None
+                ),
+                expected_external_upstream_artifact_ids=(
+                    expected_external_upstream_artifact_ids
+                ),
+            )
+        )
+        if (
+            validated_index != index
+            or tuple(
+                artifact.artifact_id for artifact in validated_nodes
+            )
+            != tuple(artifact.artifact_id for artifact in nodes)
+        ):
+            raise RuntimeError(
+                f"{phase} granular checkpoint index changed after sealing"
+            )
+        self._published_granular_checkpoint_indexes[phase] = (
+            validated_index
+        )
+        for artifact in validated_nodes:
+            self._published_granular_checkpoint_handles[
+                artifact.artifact_id
+            ] = artifact
+        return validated_index
+
+    def _granular_checkpoint_index(
+        self,
+        phase: str,
+        *,
+        required: bool,
+    ) -> Mapping[str, Any] | None:
+        cached = self._published_granular_checkpoint_indexes.get(phase)
+        if cached is not None:
+            return cached
+        root, _index_path, _locator_path = (
+            _granular_checkpoint_index_paths(
+                work_root=self.options.work_root,
+                phase=phase,
+            )
+        )
+        if not root.exists() and not root.is_symlink():
+            if required:
+                raise RuntimeError(
+                    f"required granular checkpoint index is absent: {phase}"
+                )
+            return None
+        expected_external_upstream_artifact_ids: (
+            tuple[str, ...] | None
+        ) = None
+        if phase == "stage1_modeling":
+            prepared_context = self._granular_artifact_for_kind(
+                phase="stage1_preflight",
+                artifact_kind="prepared_stage1_context",
+                required=True,
+            )
+            assert prepared_context is not None
+            expected_external_upstream_artifact_ids = (
+                prepared_context.artifact_id,
+            )
+        elif phase == "stage2_inference":
+            stage1 = self._checkpoint_artifact_for_phase(
+                "stage1_modeling",
+                required=True,
+            )
+            canary = self._checkpoint_artifact_for_phase(
+                "stage2_canary",
+                required=True,
+            )
+            assert stage1 is not None and canary is not None
+            expected_external_upstream_artifact_ids = (
+                stage1.artifact_id,
+                canary.artifact_id,
+            )
+        index, handles = _validate_granular_checkpoint_index_from_paths(
+            work_root=self.options.work_root.resolve(strict=True),
+            phase=phase,
+            compatibility=self._checkpoint_compatibility(phase),
+            expected_granular_checkpoint_plan=(
+                self._expected_granular_checkpoint_plan()
+            ),
+            expected_stage1_scope_plan=(
+                self._authenticated_current_stage1_scope_plan()
+                if phase == "stage1_modeling"
+                else None
+            ),
+            expected_external_upstream_artifact_ids=(
+                expected_external_upstream_artifact_ids
+            ),
+        )
+        self._published_granular_checkpoint_indexes[phase] = index
+        for artifact in handles:
+            self._published_granular_checkpoint_handles[
+                artifact.artifact_id
+            ] = artifact
+        return index
+
+    def _granular_artifact_for_kind(
+        self,
+        *,
+        phase: str,
+        artifact_kind: str,
+        required: bool,
+    ) -> ValidatedPortableArtifact | None:
+        index = self._granular_checkpoint_index(
+            phase,
+            required=False,
+        )
+        candidates: list[ValidatedPortableArtifact] = []
+        if index is not None:
+            candidates.extend(
+                self._published_granular_checkpoint_handles[
+                    str(node["artifact_id"])
+                ]
+                for node in index["nodes"]
+                if node["artifact_kind"] == artifact_kind
+            )
+        candidates.extend(
+            artifact
+            for artifact in self._adopted_artifact_handles.values()
+            if artifact.manifest.get("artifact_kind") == artifact_kind
+            and artifact.artifact_metadata.get("producer_phase") == phase
+            and artifact not in candidates
+        )
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"{phase} has multiple granular {artifact_kind} artifacts"
+            )
+        if not candidates:
+            if required:
+                raise RuntimeError(
+                    f"{phase} lacks granular {artifact_kind}"
+                )
+            return None
+        assert_validated_artifact_unchanged(candidates[0])
+        return candidates[0]
+
+    def _authenticated_current_stage1_scope_plan(self) -> Any:
+        prepared_context = self._granular_artifact_for_kind(
+            phase="stage1_preflight",
+            artifact_kind="prepared_stage1_context",
+            required=True,
+        )
+        assert prepared_context is not None
+        return _load_authenticated_current_stage1_scope_plan(
+            prepared_context_artifact=prepared_context,
+            expected_granular_checkpoint_plan=(
+                self._expected_granular_checkpoint_plan()
+            ),
+            expected_stage1_physical_fit_identity=self.request[
+                "stage1_physical_fit_identity"
+            ],
+            expected_global_seed=int(self.options.seed),
+        )
+
+    def _publish_prepared_stage1_context_checkpoint(
+        self,
+        *,
+        phase_manifest: Mapping[str, Any],
+        clustered_preflight: ValidatedPortableArtifact,
+    ) -> Mapping[str, Any]:
+        result = phase_manifest.get("result")
+        if not isinstance(result, Mapping):
+            raise RuntimeError("Stage 1 preflight result is invalid")
+        raw_manifest = result.get(
+            "prepared_stage1_context_manifest_path"
+        )
+        if not isinstance(raw_manifest, str) or not raw_manifest:
+            raise RuntimeError(
+                "typed Stage 1 preflight omitted its prepared context"
+            )
+        context_manifest = Path(raw_manifest).resolve(strict=True)
+        context_root = context_manifest.parent
+        files = tuple(
+            path.resolve(strict=True)
+            for path in sorted(context_root.rglob("*"))
+            if path.is_file()
+        )
+        artifact = self._publish_granular_checkpoint_node(
+            phase="stage1_preflight",
+            phase_manifest=phase_manifest,
+            node_ordinal=0,
+            node_key="prepared_stage1_context",
+            artifact_kind="prepared_stage1_context",
+            payload_root=context_root,
+            payload_files=files,
+            upstream_artifact_ids=(clustered_preflight.artifact_id,),
+            artifact_metadata={
+                "coverage_role": "prepared_stage1_context",
+                "scientific_content_root_sha256": result.get(
+                    "prepared_stage1_context_scientific_content_root_sha256"
+                ),
+            },
+            payload_inventory_policy=COMPLETE_PAYLOAD_TREE,
+        )
+        return self._seal_granular_checkpoint_index(
+            phase="stage1_preflight",
+            phase_manifest=phase_manifest,
+            nodes=(artifact,),
+        )
+
+    def _publish_stage1_modeling_granular_checkpoints(
+        self,
+        *,
+        phase_manifest: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        result = phase_manifest.get("result")
+        if (
+            not isinstance(result, Mapping)
+            or result.get("schema_version")
+            != PORTABLE_ROLE_NEUTRAL_STAGE1_PHASE_SCHEMA
+        ):
+            raise RuntimeError(
+                "typed Stage 1 modeling lacks its role-neutral result"
+            )
+        prepared_context = self._granular_artifact_for_kind(
+            phase="stage1_preflight",
+            artifact_kind="prepared_stage1_context",
+            required=True,
+        )
+        assert prepared_context is not None
+        phase_root = Path(str(phase_manifest["attempt_dir"])).resolve(
+            strict=True
+        )
+        execution_root = Path(
+            str(result["role_neutral_execution_root"])
+        ).resolve(strict=True)
+        try:
+            execution_root.relative_to(phase_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "role-neutral Stage 1 execution escaped its phase"
+            ) from exc
+        binding_root = (
+            execution_root
+            / "coordination_gate"
+            / "scientific_bindings"
+        )
+        binding = _read_private_json_object(
+            binding_root / "role_neutral_binding_set.json",
+            label="role-neutral Stage 1 granular binding set",
+        )
+        physical_rows = binding.get("physical_payloads")
+        logical_rows = binding.get("logical_views")
+        granular_plan = self._expected_granular_checkpoint_plan()
+        expected_physical_owners = list(
+            granular_plan["stage1_physical_owner_scope_ids"]
+        )
+        expected_logical_scopes = list(
+            granular_plan["stage1_logical_scope_ids"]
+        )
+        if (
+            not isinstance(physical_rows, list)
+            or not physical_rows
+            or not isinstance(logical_rows, list)
+            or not logical_rows
+            or len(physical_rows)
+            != int(
+                granular_plan["stage1_physical_fit_count"]
+            )
+            or len(logical_rows)
+            != int(
+                granular_plan["stage1_logical_scope_count"]
+            )
+            or result.get("physical_fit_count")
+            != granular_plan["stage1_physical_fit_count"]
+            or result.get("logical_scope_count")
+            != granular_plan["stage1_logical_scope_count"]
+            or [
+                str(row.get("physical_owner_scope_id"))
+                for row in physical_rows
+                if isinstance(row, Mapping)
+            ]
+            != expected_physical_owners
+            or [
+                str(row.get("logical_scope_id"))
+                for row in logical_rows
+                if isinstance(row, Mapping)
+            ]
+            != expected_logical_scopes
+        ):
+            raise RuntimeError(
+                "role-neutral Stage 1 granular binding coverage changed"
+            )
+        nodes: list[ValidatedPortableArtifact] = []
+        component_by_owner: dict[
+            str, dict[str, ValidatedPortableArtifact]
+        ] = {}
+        physical_by_owner: dict[str, ValidatedPortableArtifact] = {}
+        from .physical_fit_deduplication import (
+            PhysicalFitKey,
+            ordered_row_identity,
+        )
+        from .production_stage1_scope_scheduler import (
+            Stage1PhysicalFitIdentity,
+        )
+
+        physical_identity = Stage1PhysicalFitIdentity.from_mapping(
+            self.request["stage1_physical_fit_identity"]
+        )
+        authenticated_scope_plan = (
+            self._authenticated_current_stage1_scope_plan()
+        )
+        exact_scope_projection = (
+            _stage1_scope_plan_granular_expectations(
+                scope_plan=authenticated_scope_plan,
+                expected_granular_checkpoint_plan=granular_plan,
+            )
+        )
+        expected_key_records = exact_scope_projection[
+            "physical_fit_key_records_by_owner"
+        ]
+        physical_key_by_owner: dict[str, PhysicalFitKey] = {}
+        for physical_row in physical_rows:
+            if not isinstance(physical_row, Mapping):
+                raise RuntimeError(
+                    "role-neutral physical binding is invalid"
+                )
+            owner = str(physical_row["physical_owner_scope_id"])
+            physical_descriptor = (
+                binding_root / str(physical_row["relative_path"])
+            ).resolve(strict=True)
+            physical_payload = _read_private_json_object(
+                physical_descriptor,
+                label=f"{owner} physical fit binding",
+            )
+            fit_row_ids = tuple(
+                physical_payload.get("fit_row_ids") or ()
+            )
+            physical_key = PhysicalFitKey(
+                architecture_identity=(
+                    physical_identity.architecture_identity
+                ),
+                target=physical_identity.target,
+                fit_row_order_identity=ordered_row_identity(
+                    fit_row_ids
+                ),
+                scientific_configuration_identity=(
+                    physical_identity.scientific_configuration_identity
+                ),
+                canonical_group_seed=physical_payload[
+                    "canonical_group_seed"
+                ],
+                producer_identity=(
+                    physical_identity.producer_identity
+                ),
+                runtime_compatibility_class=(
+                    physical_identity.runtime_compatibility_class
+                ),
+            )
+            if (
+                physical_payload.get("physical_owner_scope_id")
+                != owner
+                or physical_payload.get(
+                    "fit_row_order_fingerprint"
+                )
+                != physical_key.fit_row_order_identity
+                or (
+                    physical_payload.get(
+                        "physical_fit_key_record"
+                    )
+                    is not None
+                    and physical_payload.get(
+                        "physical_fit_key_record"
+                    )
+                    != physical_key.as_dict()
+                )
+                or physical_key.as_dict()
+                != expected_key_records.get(owner)
+            ):
+                raise RuntimeError(
+                    f"{owner} physical fit key differs from its binding"
+                )
+            physical_key_by_owner[owner] = physical_key
+            component_by_owner[owner] = {}
+            for component, kind in (
+                ("tfidf", "tfidf_component"),
+                ("neural_query", "neural_query_component"),
+            ):
+                component_root = (
+                    execution_root / "components" / owner / component
+                ).resolve(strict=True)
+                files = tuple(
+                    path.resolve(strict=True)
+                    for path in sorted(component_root.rglob("*"))
+                    if path.is_file()
+                )
+                artifact = self._publish_granular_checkpoint_node(
+                    phase="stage1_modeling",
+                    phase_manifest=phase_manifest,
+                    node_ordinal=len(nodes),
+                    node_key=f"{kind}:{owner}",
+                    artifact_kind=kind,
+                    payload_root=component_root,
+                    payload_files=files,
+                    upstream_artifact_ids=(
+                        prepared_context.artifact_id,
+                    ),
+                    artifact_metadata={
+                        "coverage_role": kind,
+                        "physical_owner_scope_id": owner,
+                        "physical_fit_key": physical_key.key,
+                        "physical_fit_key_record": (
+                            physical_key.as_dict()
+                        ),
+                    },
+                    payload_inventory_policy=COMPLETE_PAYLOAD_TREE,
+                )
+                nodes.append(artifact)
+                component_by_owner[owner][component] = artifact
+            owner_root = (
+                execution_root / "components" / owner
+            ).resolve(strict=True)
+            owner_files = [
+                path.resolve(strict=True)
+                for path in sorted(owner_root.rglob("*"))
+                if path.is_file()
+            ]
+            artifact = self._publish_granular_checkpoint_node(
+                phase="stage1_modeling",
+                phase_manifest=phase_manifest,
+                node_ordinal=len(nodes),
+                node_key=f"physical_scope_fit:{owner}",
+                artifact_kind="physical_scope_fit",
+                payload_root=phase_root,
+                payload_files=(
+                    *owner_files,
+                    physical_descriptor,
+                ),
+                upstream_artifact_ids=(
+                    prepared_context.artifact_id,
+                    component_by_owner[owner]["tfidf"].artifact_id,
+                    component_by_owner[owner][
+                        "neural_query"
+                    ].artifact_id,
+                ),
+                artifact_metadata={
+                    "coverage_role": "physical_scope_fit",
+                    "physical_owner_scope_id": owner,
+                    "physical_fit_key": physical_key.key,
+                    "physical_fit_key_record": (
+                        physical_key.as_dict()
+                    ),
+                },
+                payload_inventory_policy=(
+                    REGISTERED_PAYLOAD_PATHS_ONLY
+                ),
+            )
+            nodes.append(artifact)
+            physical_by_owner[owner] = artifact
+
+        logical_nodes: list[ValidatedPortableArtifact] = []
+        for logical_row in logical_rows:
+            if not isinstance(logical_row, Mapping):
+                raise RuntimeError(
+                    "role-neutral logical binding is invalid"
+                )
+            logical_id = str(logical_row["logical_scope_id"])
+            logical_path = (
+                binding_root / str(logical_row["relative_path"])
+            ).resolve(strict=True)
+            logical = _read_private_json_object(
+                logical_path,
+                label=f"{logical_id} logical binding",
+            )
+            owner = str(logical["physical_owner_scope_id"])
+            physical = physical_by_owner.get(owner)
+            expected_owner = granular_plan[
+                "stage1_logical_to_physical_owner"
+            ][logical_id]
+            if (
+                physical is None
+                or owner != expected_owner
+                or logical.get("logical_scope_id") != logical_id
+            ):
+                raise RuntimeError(
+                    f"{logical_id} references a changed physical owner"
+                )
+            artifact = self._publish_granular_checkpoint_node(
+                phase="stage1_modeling",
+                phase_manifest=phase_manifest,
+                node_ordinal=len(nodes),
+                node_key=f"logical_scope_binding:{logical_id}",
+                artifact_kind="logical_scope_bindings",
+                payload_root=phase_root,
+                payload_files=(logical_path,),
+                upstream_artifact_ids=(physical.artifact_id,),
+                artifact_metadata={
+                    "coverage_role": "logical_scope_binding",
+                    "logical_scope_id": logical_id,
+                    "physical_owner_scope_id": owner,
+                    "physical_fit_key": (
+                        physical_key_by_owner[owner].key
+                    ),
+                    "physical_fit_key_record": (
+                        physical_key_by_owner[owner].as_dict()
+                    ),
+                    "logical_purpose": logical.get(
+                        "logical_purpose"
+                    ),
+                },
+                payload_inventory_policy=(
+                    REGISTERED_PAYLOAD_PATHS_ONLY
+                ),
+            )
+            nodes.append(artifact)
+            logical_nodes.append(artifact)
+
+        bundle_manifest = Path(
+            str(result["bundle_manifest_path"])
+        ).resolve(strict=True)
+        row_map = (bundle_manifest.parent / "row_registry.parquet").resolve(
+            strict=True
+        )
+        row_map_artifact = self._publish_granular_checkpoint_node(
+            phase="stage1_modeling",
+            phase_manifest=phase_manifest,
+            node_ordinal=len(nodes),
+            node_key="stage1_row_map",
+            artifact_kind="row_map",
+            payload_root=phase_root,
+            payload_files=(row_map,),
+            upstream_artifact_ids=tuple(
+                artifact.artifact_id for artifact in logical_nodes
+            ),
+            artifact_metadata={
+                "coverage_role": "row_map",
+                "logical_scope_count": len(logical_nodes),
+            },
+            payload_inventory_policy=REGISTERED_PAYLOAD_PATHS_ONLY,
+        )
+        nodes.append(row_map_artifact)
+        observed_counts = _granular_checkpoint_coverage(
+            [
+                {
+                    "artifact_kind": artifact.manifest[
+                        "artifact_kind"
+                    ],
+                    "artifact_id": artifact.artifact_id,
+                }
+                for artifact in nodes
+            ]
+        )["artifact_kind_counts"]
+        if observed_counts != granular_plan[
+            "stage1_artifact_kind_counts"
+        ]:
+            raise RuntimeError(
+                "Stage 1 granular component coverage differs from the plan"
+            )
+        return self._seal_granular_checkpoint_index(
+            phase="stage1_modeling",
+            phase_manifest=phase_manifest,
+            nodes=tuple(nodes),
+            expected_external_upstream_artifact_ids=(
+                prepared_context.artifact_id,
+            ),
+        )
+
+    def _publish_stage2_inference_granular_checkpoints(
+        self,
+        *,
+        phase_manifest: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        result = phase_manifest.get("result")
+        if (
+            not isinstance(result, Mapping)
+            or result.get("mode")
+            != "reference_only_role_neutral_stage2"
+        ):
+            raise RuntimeError(
+                "typed Stage 2 inference lacks its reference-only result"
+            )
+        phase_root = Path(str(phase_manifest["attempt_dir"])).resolve(
+            strict=True
+        )
+        granular_plan = self._expected_granular_checkpoint_plan()
+        stage1 = self._checkpoint_artifact_for_phase(
+            "stage1_modeling",
+            required=True,
+        )
+        canary = self._checkpoint_artifact_for_phase(
+            "stage2_canary",
+            required=True,
+        )
+        assert stage1 is not None and canary is not None
+        base_upstream = (stage1.artifact_id, canary.artifact_id)
+        nodes: list[ValidatedPortableArtifact] = []
+
+        batch_path = Path(
+            str(result["hierarchical_batch_result_path"])
+        ).resolve(strict=True)
+        response_root = batch_path.parent
+        response_files = tuple(
+            path.resolve(strict=True)
+            for path in sorted(response_root.rglob("*"))
+            if path.is_file()
+        )
+        response = self._publish_granular_checkpoint_node(
+            phase="stage2_inference",
+            phase_manifest=phase_manifest,
+            node_ordinal=len(nodes),
+            node_key="stage2_response_component",
+            artifact_kind="stage2_response_component",
+            payload_root=response_root,
+            payload_files=response_files,
+            upstream_artifact_ids=base_upstream,
+            artifact_metadata={
+                "coverage_role": "stage2_response_component",
+            },
+            payload_inventory_policy=COMPLETE_PAYLOAD_TREE,
+        )
+        nodes.append(response)
+
+        ledger_paths = result.get(
+            "complete_paged_ledger_artifact_paths"
+        )
+        if (
+            not isinstance(ledger_paths, list)
+            or not ledger_paths
+            or any(not isinstance(path, str) for path in ledger_paths)
+        ):
+            raise RuntimeError(
+                "Stage 2 inference omitted complete extraction ledgers"
+            )
+        extraction = self._publish_granular_checkpoint_node(
+            phase="stage2_inference",
+            phase_manifest=phase_manifest,
+            node_ordinal=len(nodes),
+            node_key="stage2_extraction_component",
+            artifact_kind="stage2_extraction_component",
+            payload_root=phase_root,
+            payload_files=tuple(
+                Path(path).resolve(strict=True) for path in ledger_paths
+            ),
+            upstream_artifact_ids=(response.artifact_id,),
+            artifact_metadata={
+                "coverage_role": "stage2_extraction_component",
+                "ledger_artifact_count": len(ledger_paths),
+            },
+            payload_inventory_policy=REGISTERED_PAYLOAD_PATHS_ONLY,
+        )
+        nodes.append(extraction)
+
+        manifest_paths = result.get("fold_manifest_paths")
+        prediction_paths = result.get("fold_prediction_paths")
+        if (
+            not isinstance(manifest_paths, list)
+            or not isinstance(prediction_paths, list)
+            or not manifest_paths
+            or len(manifest_paths) != len(prediction_paths)
+        ):
+            raise RuntimeError(
+                "Stage 2 inference fold registrations are incomplete"
+            )
+        fold_records: list[tuple[int, Path, Path]] = []
+        for raw_manifest, raw_prediction in zip(
+            manifest_paths,
+            prediction_paths,
+            strict=True,
+        ):
+            manifest_path = Path(str(raw_manifest)).resolve(strict=True)
+            wrapper = _read_private_json_object(
+                manifest_path,
+                label="Stage 2 fold manifest",
+            )
+            fold_body = wrapper.get("body")
+            if not isinstance(fold_body, Mapping):
+                raise RuntimeError(
+                    "Stage 2 fold manifest wrapper is invalid"
+                )
+            outer_fold = int(fold_body["outer_fold"])
+            fold_records.append(
+                (
+                    outer_fold,
+                    manifest_path,
+                    Path(str(raw_prediction)).resolve(strict=True),
+                )
+            )
+        fold_records.sort(key=lambda row: row[0])
+        if [row[0] for row in fold_records] != list(
+            granular_plan["stage2_fold_ids"]
+        ):
+            raise RuntimeError(
+                "Stage 2 fold registrations are incomplete, duplicated, "
+                "or differ from the request-derived plan"
+            )
+
+        reviews: dict[int, ValidatedPortableArtifact] = {}
+        for outer_fold, manifest_path, _prediction_path in fold_records:
+            review_root = manifest_path.parent / "post_extraction_review"
+            if not review_root.exists():
+                raise RuntimeError(
+                    f"outer fold {outer_fold} review tree is absent"
+                )
+            review_root = review_root.resolve(strict=True)
+            review_files = tuple(
+                path.resolve(strict=True)
+                for path in sorted(review_root.rglob("*"))
+                if path.is_file()
+            )
+            if not review_files:
+                raise RuntimeError(
+                    f"outer fold {outer_fold} review tree is empty"
+                )
+            review = self._publish_granular_checkpoint_node(
+                phase="stage2_inference",
+                phase_manifest=phase_manifest,
+                node_ordinal=len(nodes),
+                node_key=(
+                    f"stage2_review_component:outer_{outer_fold:03d}"
+                ),
+                artifact_kind="stage2_review_component",
+                payload_root=review_root,
+                payload_files=review_files,
+                upstream_artifact_ids=(extraction.artifact_id,),
+                artifact_metadata={
+                    "coverage_role": "stage2_review_component",
+                    "outer_fold": outer_fold,
+                },
+                payload_inventory_policy=COMPLETE_PAYLOAD_TREE,
+            )
+            nodes.append(review)
+            reviews[outer_fold] = review
+        if list(reviews) != list(
+            granular_plan["stage2_review_fold_ids"]
+        ):
+            raise RuntimeError(
+                "Stage 2 review coverage differs from the request-derived plan"
+            )
+
+        for outer_fold, manifest_path, prediction_path in fold_records:
+            upstream = [
+                response.artifact_id,
+                extraction.artifact_id,
+            ]
+            upstream.append(reviews[outer_fold].artifact_id)
+            fold = self._publish_granular_checkpoint_node(
+                phase="stage2_inference",
+                phase_manifest=phase_manifest,
+                node_ordinal=len(nodes),
+                node_key=f"stage2_fold:outer_{outer_fold:03d}",
+                artifact_kind="stage2_fold",
+                payload_root=phase_root,
+                payload_files=(manifest_path, prediction_path),
+                upstream_artifact_ids=tuple(upstream),
+                artifact_metadata={
+                    "coverage_role": "stage2_fold",
+                    "outer_fold": outer_fold,
+                },
+                payload_inventory_policy=(
+                    REGISTERED_PAYLOAD_PATHS_ONLY
+                ),
+            )
+            nodes.append(fold)
+        observed_counts = _granular_checkpoint_coverage(
+            [
+                {
+                    "artifact_kind": artifact.manifest[
+                        "artifact_kind"
+                    ],
+                    "artifact_id": artifact.artifact_id,
+                }
+                for artifact in nodes
+            ]
+        )["artifact_kind_counts"]
+        if observed_counts != granular_plan[
+            "stage2_artifact_kind_counts"
+        ]:
+            raise RuntimeError(
+                "Stage 2 granular component coverage differs from the plan"
+            )
+        return self._seal_granular_checkpoint_index(
+            phase="stage2_inference",
+            phase_manifest=phase_manifest,
+            nodes=tuple(nodes),
+            expected_external_upstream_artifact_ids=base_upstream,
+        )
 
     def _checkpoint_publication_attestation_path(self, phase: str) -> Path:
         return (
@@ -3733,12 +10664,109 @@ class ProductionAllEvidenceWorkflow:
         if not isinstance(spec, Mapping):
             raise ValueError(f"workflow phase has no portable checkpoint: {phase}")
         upstream_phases = tuple(str(value) for value in spec["upstream_phases"])
-        return tuple(
+        base_upstream = tuple(
             self._checkpoint_artifact_for_phase(
                 upstream_phase,
                 required=True,
             ).artifact_id
             for upstream_phase in upstream_phases
+        )
+        if (
+            self.request.get("portable_typed_workflow") is not True
+            or phase not in {"stage1_modeling", "stage2_inference"}
+        ):
+            return base_upstream
+        index = self._granular_checkpoint_index(
+            phase,
+            required=False,
+        )
+        if index is not None:
+            terminal_kinds = (
+                {"logical_scope_bindings", "row_map"}
+                if phase == "stage1_modeling"
+                else {"stage2_fold"}
+            )
+            granular_upstream = tuple(
+                str(node["artifact_id"])
+                for node in index["nodes"]
+                if node["artifact_kind"] in terminal_kinds
+            )
+        else:
+            adopted = self._adopted_record_for_phase(phase)
+            metadata = (
+                adopted[0].get("artifact_metadata")
+                if adopted is not None
+                else None
+            )
+            raw = (
+                metadata.get("granular_terminal_artifact_ids")
+                if isinstance(metadata, Mapping)
+                else None
+            )
+            if (
+                not isinstance(raw, list)
+                or not raw
+                or any(not isinstance(value, str) for value in raw)
+            ):
+                raise RuntimeError(
+                    f"{phase} lacks its granular terminal dependencies"
+                )
+            granular_upstream = tuple(raw)
+        if (
+            not granular_upstream
+            or len(granular_upstream) != len(set(granular_upstream))
+        ):
+            raise RuntimeError(
+                f"{phase} granular terminal dependencies are invalid"
+            )
+        return (*base_upstream, *granular_upstream)
+
+    def _primary_granular_artifact_metadata(
+        self,
+        phase: str,
+    ) -> Mapping[str, Any] | None:
+        if (
+            self.request.get("portable_typed_workflow") is not True
+            or phase not in {"stage1_modeling", "stage2_inference"}
+        ):
+            return None
+        index = self._granular_checkpoint_index(
+            phase,
+            required=True,
+        )
+        assert index is not None
+        return _granular_primary_metadata_from_index(
+            phase=phase,
+            index=index,
+        )
+
+    def _expected_primary_artifact_metadata(
+        self,
+        phase: str,
+    ) -> Mapping[str, Any]:
+        if (
+            self.request.get("portable_typed_workflow") is True
+            and phase in {"stage1_modeling", "stage2_inference"}
+        ):
+            index = self._granular_checkpoint_index(
+                phase,
+                required=False,
+            )
+            if index is not None:
+                return _granular_primary_metadata_from_index(
+                    phase=phase,
+                    index=index,
+                )
+        adopted = self._adopted_record_for_phase(phase)
+        metadata = (
+            adopted[0].get("artifact_metadata")
+            if adopted is not None
+            else None
+        )
+        return (
+            {}
+            if not isinstance(metadata, Mapping)
+            else copy.deepcopy(dict(metadata))
         )
 
     def _validate_checkpoint_publication_attestation(
@@ -3778,12 +10806,30 @@ class ProductionAllEvidenceWorkflow:
                 raise ValueError(f"workflow phase has no portable checkpoint: {phase}")
             return None
         upstream_ids = self._expected_checkpoint_upstream_ids(phase)
+        expected_metadata = self._expected_primary_artifact_metadata(
+            phase
+        )
+        adopted_reference = self._adopted_record_for_phase(phase)
         adopted = self._adopted_checkpoint_handle_for_phase(phase)
         if adopted is not None:
+            if adopted_reference is None:
+                raise RuntimeError(
+                    f"adopted {phase} checkpoint lost its immutable request record"
+                )
+            adopted_record, _adopted_locator = adopted_reference
+            expected_compatibility = self._checkpoint_compatibility(phase)
             if (
                 adopted.manifest.get("artifact_kind") != spec["artifact_kind"]
-                or adopted.compatibility_key != self._checkpoint_compatibility().key
+                or str(adopted_record.get("artifact_id"))
+                != adopted.artifact_id
+                or not _adopted_compatibility_matches_request(
+                    artifact=adopted,
+                    expected=expected_compatibility.as_dict(),
+                    record=adopted_record,
+                )
                 or tuple(adopted.manifest.get("upstream_artifact_ids") or ()) != upstream_ids
+                or dict(adopted.artifact_metadata)
+                != dict(expected_metadata)
                 or not isinstance(adopted.phase_binding, Mapping)
                 or adopted.phase_binding.get("phase") != phase
             ):
@@ -3796,8 +10842,10 @@ class ProductionAllEvidenceWorkflow:
             if (
                 cached.manifest.get("artifact_kind") != spec["artifact_kind"]
                 or cached.manifest.get("artifact_schema") != spec["artifact_schema"]
-                or cached.compatibility_key != self._checkpoint_compatibility().key
+                or cached.compatibility_key != self._checkpoint_compatibility(phase).key
                 or tuple(cached.manifest.get("upstream_artifact_ids") or ()) != upstream_ids
+                or dict(cached.artifact_metadata)
+                != dict(expected_metadata)
             ):
                 raise RuntimeError(f"cached {phase} checkpoint differs from the requested DAG")
             return cached
@@ -3809,7 +10857,7 @@ class ProductionAllEvidenceWorkflow:
         artifact = validate_portable_artifact(
             control_root,
             expected_kind=str(spec["artifact_kind"]),
-            expected_compatibility_key=self._checkpoint_compatibility().key,
+            expected_compatibility_key=self._checkpoint_compatibility(phase).key,
             expected_upstream_artifact_ids=upstream_ids,
         )
         authenticated_payload_bytes = sum(row.size_bytes for row in artifact.payloads)
@@ -3819,6 +10867,8 @@ class ProductionAllEvidenceWorkflow:
         )
         if (
             artifact.manifest.get("artifact_schema") != spec["artifact_schema"]
+            or dict(artifact.artifact_metadata)
+            != dict(expected_metadata)
             or not isinstance(artifact.phase_binding, Mapping)
             or artifact.phase_binding.get("phase") != phase
         ):
@@ -3849,6 +10899,23 @@ class ProductionAllEvidenceWorkflow:
             ):
                 return None
             raise RuntimeError(f"{phase} completed without checkpointable payload bytes")
+        typed = self.request.get("portable_typed_workflow") is True
+        if typed and phase == "stage1_modeling":
+            if self._granular_checkpoint_index(
+                phase,
+                required=False,
+            ) is None:
+                self._publish_stage1_modeling_granular_checkpoints(
+                    phase_manifest=phase_manifest,
+                )
+        if typed and phase == "stage2_inference":
+            if self._granular_checkpoint_index(
+                phase,
+                required=False,
+            ) is None:
+                self._publish_stage2_inference_granular_checkpoints(
+                    phase_manifest=phase_manifest,
+                )
         upstream_ids = self._expected_checkpoint_upstream_ids(phase)
         existing = self._checkpoint_artifact_for_phase(
             phase,
@@ -3860,6 +10927,19 @@ class ProductionAllEvidenceWorkflow:
                 phase_manifest=phase_manifest,
                 artifact=existing,
             )
+            if (
+                typed
+                and phase == "stage1_preflight"
+                and self._granular_checkpoint_index(
+                    phase,
+                    required=False,
+                )
+                is None
+            ):
+                self._publish_prepared_stage1_context_checkpoint(
+                    phase_manifest=phase_manifest,
+                    clustered_preflight=existing,
+                )
             return existing
         payload_root = Path(str(phase_manifest["attempt_dir"])).resolve(strict=True)
         payload_paths: list[str] = []
@@ -3885,13 +10965,16 @@ class ProductionAllEvidenceWorkflow:
             payload_root=payload_root,
             artifact_kind=str(spec["artifact_kind"]),
             artifact_schema=str(spec["artifact_schema"]),
-            compatibility=self._checkpoint_compatibility(),
+            compatibility=self._checkpoint_compatibility(phase),
             upstream_artifact_ids=upstream_ids,
             payload_paths=tuple(payload_paths),
             expected_payload_identities=expected_payload_identities,
             process_authenticated_stat_inventory=(self._phase_payload_stat_inventories.get(phase)),
             workflow_phase=phase,
             workflow_phase_result=result,
+            artifact_metadata=(
+                self._primary_granular_artifact_metadata(phase)
+            ),
         )
         if phase not in self._phase_payload_stat_inventories:
             published_payload_bytes = sum(int(row["size_bytes"]) for row in artifacts)
@@ -3905,6 +10988,11 @@ class ProductionAllEvidenceWorkflow:
             phase_manifest=phase_manifest,
             artifact=artifact,
         )
+        if typed and phase == "stage1_preflight":
+            self._publish_prepared_stage1_context_checkpoint(
+                phase_manifest=phase_manifest,
+                clustered_preflight=artifact,
+            )
         return artifact
 
     def _adopted_record_for_phase(
@@ -4007,6 +11095,64 @@ class ProductionAllEvidenceWorkflow:
         }
         target = self.options.work_root / "workflow_progress.json"
         _atomic_write_json(target, body)
+        achievement = self._validation_achievement_attestation
+        event = {
+            "schema_version": WORKFLOW_STRUCTURED_LOG_EVENT_SCHEMA,
+            "event": "workflow_progress",
+            "request_sha256": self.request.get("request_sha256"),
+            "status": status,
+            "current_phase": current_phase,
+            "completed_phase_count": len(completed),
+            "remaining_phase_count": len(sequence) - len(completed),
+            "updated_at": body["updated_at"],
+            "error": error,
+            "configured_log_level": (
+                self.options.run_control.log_level
+            ),
+            "run_control_selection_content_sha256": (
+                None
+                if self._run_control_selection_attestation is None
+                else self._run_control_selection_attestation[
+                    "content_sha256"
+                ]
+            ),
+            "validation_requested_minimum": self._validation_policy[
+                "requested_minimum"
+            ],
+            "validation_effective_minimum": self._validation_policy[
+                "effective_minimum"
+            ],
+            "fresh_path_only_terminal_audit_required": True,
+            "fresh_path_only_terminal_audit_achieved": (
+                False
+                if achievement is None
+                else bool(
+                    achievement[
+                        "fresh_path_only_terminal_audit_achieved"
+                    ]
+                )
+            ),
+            "validation_achievement_content_sha256": (
+                None
+                if achievement is None
+                else achievement["content_sha256"]
+            ),
+            "terminal_phase_override_present": (
+                "terminal_validation" in self.phase_overrides
+            ),
+        }
+        event_level = (
+            logging.ERROR
+            if error is not None or status == "failed"
+            else logging.WARNING
+            if status == "paused"
+            else logging.INFO
+        )
+        _emit_structured_workflow_log(
+            configured_threshold=self.options.run_control.log_level,
+            event_level=event_level,
+            payload=event,
+        )
 
     def _phase_manifest(self, phase: str) -> Path:
         return self.options.work_root / "phases" / phase / "complete_manifest.json"
@@ -4649,6 +11795,93 @@ class ProductionAllEvidenceWorkflow:
         cluster_preflight_manifest_path: Path | None = None,
         cluster_preflight_state_bundle_manifest_path: Path | None = None,
     ) -> Stage1BundleBuildOptions:
+        from .production_stage1_scope_scheduler import (
+            Stage1PhysicalFitIdentity,
+        )
+
+        physical_fit_identity = self.request.get(
+            "stage1_physical_fit_identity"
+        )
+        if not isinstance(physical_fit_identity, Mapping):
+            raise RuntimeError(
+                "immutable request lacks its Stage 1 physical-fit identity"
+            )
+        cache_phase = self._validated_complete("embedding_cache")
+        if cache_phase is None:
+            raise RuntimeError(
+                "Stage 1 options require the completed embedding-cache phase"
+            )
+        cache_phase_result = cache_phase.get("result")
+        if not isinstance(cache_phase_result, Mapping):
+            raise RuntimeError(
+                "embedding-cache phase result is invalid"
+            )
+        legacy_migration_identity = cache_phase_result.get(
+            "legacy_terminal_migration_identity"
+        )
+        if (
+            legacy_migration_identity is not None
+            and not isinstance(legacy_migration_identity, Mapping)
+        ):
+            raise RuntimeError(
+                "embedding-cache legacy migration identity is invalid"
+            )
+        trusted_cache_read_proof: Mapping[str, Any] | None = None
+        adopted_cache = self._adopted_record_for_phase(
+            "embedding_cache"
+        )
+        if adopted_cache is not None:
+            adopted_cache_record, _locator = adopted_cache
+            if _operator_trusted_adoption_selected(
+                adopted_cache_record
+            ):
+                artifact_id = str(
+                    adopted_cache_record["artifact_id"]
+                )
+                trusted_checkpoint = (
+                    self._operator_trusted_checkpoint_handles.get(
+                        artifact_id
+                    )
+                )
+                cache_identity = cache_phase_result.get(
+                    "cache_identity"
+                )
+                cache_build_identity = (
+                    cache_identity.get("cache_build_identity")
+                    if isinstance(cache_identity, Mapping)
+                    else None
+                )
+                provider_identity = (
+                    cache_build_identity.get("provider_identity")
+                    if isinstance(cache_build_identity, Mapping)
+                    else None
+                )
+                if (
+                    trusted_checkpoint is None
+                    or not isinstance(cache_build_identity, Mapping)
+                    or not isinstance(provider_identity, Mapping)
+                    or not isinstance(
+                        legacy_migration_identity,
+                        Mapping,
+                    )
+                ):
+                    raise RuntimeError(
+                        "operator-trusted embedding-cache phase lacks its "
+                        "cache identity, migration proof, or live trust handle"
+                    )
+                from .operator_trusted_embedding_cache_reader import (
+                    build_operator_trusted_cache_read_proof,
+                )
+
+                trusted_cache_read_proof = (
+                    build_operator_trusted_cache_read_proof(
+                        trusted_checkpoint,
+                        cache_dir=cache,
+                        cache_build_identity=cache_build_identity,
+                        provider_identity=provider_identity,
+                        migration_identity=legacy_migration_identity,
+                    )
+                )
         values: dict[str, Any] = {
             "dataset_path": dataset,
             "config_path": profile,
@@ -4658,8 +11891,23 @@ class ProductionAllEvidenceWorkflow:
             "embedding_cache_configuration": copy.deepcopy(
                 dict(self._embedding_chunk_configuration())
             ),
+            "embedding_cache_legacy_migration_identity": (
+                None
+                if legacy_migration_identity is None
+                else copy.deepcopy(dict(legacy_migration_identity))
+            ),
+            "embedding_cache_operator_trusted_read_proof": (
+                None
+                if trusted_cache_read_proof is None
+                else copy.deepcopy(dict(trusted_cache_read_proof))
+            ),
             "output_dir": output,
             "unit_id_column": self.options.unit_id_column,
+            "physical_fit_identity": (
+                Stage1PhysicalFitIdentity.from_mapping(
+                    physical_fit_identity
+                )
+            ),
             "seed": self.options.seed,
             "initial_training_partitions": (self.options.initial_training_partitions),
             "device": self.options.stage1_device,
@@ -4674,9 +11922,13 @@ class ProductionAllEvidenceWorkflow:
             "dry_run": dry_run,
         }
         if "embedding_cache_relocation" in Stage1BundleBuildOptions.__dataclass_fields__:
-            values["embedding_cache_relocation"] = self._embedding_cache_relocation_options(
-                cache=cache,
-                prepared=dataset,
+            values["embedding_cache_relocation"] = (
+                None
+                if trusted_cache_read_proof is not None
+                else self._embedding_cache_relocation_options(
+                    cache=cache,
+                    prepared=dataset,
+                )
             )
         # Parallel scheduler fields are passed automatically as soon as the
         # Stage1BundleBuildOptions API exposes them.  This keeps the workflow
@@ -5100,6 +12352,14 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         }
         prefix_validation = value.get("read_only_prefix_validation")
         checkpoint_validation = value.get("portable_checkpoint_dag_validation")
+        operator_trusted_reuse = any(
+            isinstance(record, Mapping)
+            and _operator_trusted_adoption_selected(record)
+            for record in (
+                self.request.get("requested_checkpoint_adoptions")
+                or ()
+            )
+        )
         if (
             set(value) != expected_keys
             or value.get("schema_version")
@@ -5117,7 +12377,22 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             or not isinstance(checkpoint_validation, Mapping)
             or checkpoint_validation.get("status") != "accepted"
             or checkpoint_validation.get("request_sha256") != self.request["request_sha256"]
-            or checkpoint_validation.get("fresh_full_byte_validation") is not True
+            or checkpoint_validation.get(
+                "fresh_full_byte_validation"
+            )
+            is operator_trusted_reuse
+            or checkpoint_validation.get(
+                "operator_trusted_checkpoint_reuse"
+            )
+            is not operator_trusted_reuse
+            or checkpoint_validation.get(
+                "payload_bytes_reauthenticated_for_all_adoptions"
+            )
+            is operator_trusted_reuse
+            or checkpoint_validation.get(
+                "global_release_certified"
+            )
+            is not False
             or checkpoint_validation.get("oracle_evaluation_after_frozen_prediction") is not True
         ):
             raise RuntimeError("fresh terminal validation report is invalid")
@@ -5162,10 +12437,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             load_reference_only_role_neutral_stage1_handoff,
         )
         from .production_stage1_role_neutral_execution import (
-            DISTINCT_RESOURCE_CANARY_REPLICA_POLICY,
-            EARLIEST_CANONICAL_OWNER_CANARY_SELECTION,
             ROLE_NEUTRAL_EXECUTION_MANIFEST,
-            RoleNeutralComputeCanaryPolicy,
             RoleNeutralProducerFactories,
             RoleNeutralStage1ExecutionPolicy,
             execute_and_publish_role_neutral_stage1,
@@ -5269,17 +12541,42 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             cpu_supported=True,
             resource_performance_safety=(self.options.resource_performance_safety),
         )
-        max_parallel_owners = min(
-            int(resource_plan.cpu_budget),
-            len(resource_plan.devices) * int(self.options.stage1_scope_workers_per_gpu),
+        stage1_execution_profile = self.options.stage1_execution_profile
+        if not isinstance(
+            stage1_execution_profile,
+            Stage1ExecutionProfile,
+        ):
+            raise RuntimeError(
+                "typed portable Stage 1 requires its complete execution profile"
+            )
+        if (
+            len(resource_plan.devices)
+            != stage1_execution_profile.device_count
+            or int(self.options.stage1_scope_workers_per_gpu)
+            != stage1_execution_profile.scope_workers_per_device
+            or stage1_execution_profile.max_parallel_owners
+            > int(resource_plan.cpu_budget)
+        ):
+            raise RuntimeError(
+                "resolved Stage 1 resources differ from the authenticated "
+                "execution profile"
+            )
+        neural_query_topologies = (
+            stage1_execution_profile.neural_query_topology
+            .runtime_topologies(resource_plan.devices)
         )
         execution_policy = RoleNeutralStage1ExecutionPolicy(
             resource_plan=resource_plan,
-            max_parallel_owners=max_parallel_owners,
-            compute_canary=RoleNeutralComputeCanaryPolicy(
-                canonical_scope_selection=(EARLIEST_CANONICAL_OWNER_CANARY_SELECTION),
-                replica_resource_selection=(DISTINCT_RESOURCE_CANARY_REPLICA_POLICY),
+            max_parallel_owners=(
+                stage1_execution_profile.max_parallel_owners
             ),
+            neural_query_execution_topologies=(
+                neural_query_topologies
+            ),
+            htr_operational_controls=(
+                stage1_execution_profile.htr_operational_controls
+            ),
+            compute_canary=None,
         )
         execution_executor = integration.executor
         bind_context = getattr(execution_executor, "bind_context", None)
@@ -5310,9 +12607,9 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             or execution_manifest.get("every_physical_owner_executed_once") is not True
             or execution_manifest.get("every_component_executed_and_authenticated_once_per_owner")
             is not True
-            or execution_manifest.get("productive_compute_canary_completed") is not True
-            or execution_manifest.get("selected_canary_replica_adopted_as_production") is not True
-            or execution_manifest.get("compute_canary_scientific_equality") is not True
+            or execution_manifest.get("productive_compute_canary_completed") is not False
+            or execution_manifest.get("selected_canary_replica_adopted_as_production") is not False
+            or execution_manifest.get("compute_canary_scientific_equality") is not None
         ):
             raise RuntimeError(
                 "role-neutral Stage 1 execution returned an incomplete "
@@ -5427,9 +12724,9 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             "physical_fit_count": len(plan.physical_scopes),
             "logical_scope_count": len(plan.scopes),
             "deduplicated_fit_count": (len(plan.scopes) - len(plan.physical_scopes)),
-            "productive_compute_canary_completed": True,
-            "selected_canary_replica_adopted_as_production": True,
-            "compute_canary_scientific_equality": True,
+            "productive_compute_canary_completed": False,
+            "selected_canary_replica_adopted_as_production": False,
+            "compute_canary_scientific_equality": None,
             "legacy_bundle_build_invoked": False,
             "all_ten_role_neutral_execution_is_exclusive_evidence_source": True,
             "stage2_loader_validation": ("reference_only_role_neutral_provider_accepted"),
@@ -5441,6 +12738,14 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         binding_path = attempt / "role_neutral_handoff_binding.json"
         _atomic_write_json(binding_path, binding)
 
+        stage1_terminal_paths = list(
+            _portable_stage1_terminal_file_inventory(
+                execution_root=execution_root,
+                bundle_root=bundle_root,
+                numerical_bank_root=numerical_bank_root,
+                binding_path=binding_path,
+            )
+        )
         result = {
             "schema_version": PORTABLE_ROLE_NEUTRAL_STAGE1_PHASE_SCHEMA,
             "execution_mode": "deduplicated_role_neutral_all_ten_v1",
@@ -5461,20 +12766,14 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             "logical_scope_count": len(plan.scopes),
             "deduplicated_fit_count": (len(plan.scopes) - len(plan.physical_scopes)),
             "every_physical_owner_executed_once": True,
-            "productive_compute_canary_completed": True,
-            "selected_canary_replica_adopted_as_production": True,
-            "compute_canary_scientific_equality": True,
+            "productive_compute_canary_completed": False,
+            "selected_canary_replica_adopted_as_production": False,
+            "compute_canary_scientific_equality": None,
             "all_ten_families_bound_per_logical_context": True,
             "legacy_bundle_build_invoked": False,
             "stage2_handoff_derived_exclusively_from_role_neutral_execution": (True),
             "resource_preflight": resource_plan.execution_attestation(),
-            "terminal_files": [
-                str(execution_manifest_path),
-                str(binding_path.resolve()),
-                str(bundle_manifest_path),
-                str(numerical_bank_manifest_path),
-                str(numerical_bank_locator_path),
-            ],
+            "terminal_files": stage1_terminal_paths,
         }
         return _validate_portable_role_neutral_stage1_phase_result(result)
 
@@ -5541,7 +12840,9 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     prepared_build.request["effective_stage1_config"]
                 )
                 producer_identity = str(
-                    self.request["expected_checkpoint_compatibility"]["producer_code_identity"]
+                    self.request["expected_checkpoint_compatibilities_by_phase"][
+                        "stage1_preflight"
+                    ]["producer_code_identity"]
                 )
                 logical_contexts = tuple(
                     LogicalContext(
@@ -5549,8 +12850,8 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                         scope_id=scope.scope_id,
                         purpose=scope.scope_kind,
                         outer_fold=int(scope.outer_fold),
-                        fit_row_ids=tuple(str(row_id) for row_id in scope.fit_row_ids),
-                        heldout_row_ids=tuple(str(row_id) for row_id in scope.heldout_row_ids),
+                        fit_row_ids=tuple(scope.fit_row_ids),
+                        heldout_row_ids=tuple(scope.heldout_row_ids),
                         architecture_identity=architecture_identity,
                         target="cluster_preflight",
                         scientific_configuration_identity=(configuration_identity),
@@ -5581,7 +12882,8 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             scope_input_identity = prepared_build.cluster_preflight_scope_input_set_identity
             if not isinstance(scope_input_identity, Mapping):
                 raise RuntimeError(
-                    "Stage 1 preflight omitted its recoverable private " "scope-input identity"
+                    "Stage 1 preflight omitted its recoverable row-restricted "
+                    "scope-input identity"
                 )
             if prepared_build.options.portable_cluster_preflight_v2:
                 from .production_stage1_cluster_preflight_artifact_v2 import (
@@ -5863,42 +13165,14 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             manifest = options.output_dir / "immutable_run_manifest.json"
             attestation = Path(str(result["attestation_path"])).resolve(strict=True)
             if result.get("mode") == "reference_only_role_neutral_stage2":
-                required_lists = {
-                    "fold_manifest_paths": result.get("fold_manifest_paths"),
-                    "fold_prediction_paths": result.get("fold_prediction_paths"),
-                    "complete_paged_ledger_artifact_paths": result.get(
-                        "complete_paged_ledger_artifact_paths"
-                    ),
-                }
-                if any(
-                    not isinstance(paths, list)
-                    or not paths
-                    or any(not isinstance(path, str) for path in paths)
-                    for paths in required_lists.values()
-                ):
-                    raise RuntimeError("direct Stage 2 result omitted fold terminal artifacts")
-                direct_terminals = [
-                    str(Path(str(result["runner_input_manifest_path"])).resolve(strict=True)),
-                    str(Path(str(result["hierarchical_batch_result_path"])).resolve(strict=True)),
-                    str(Path(str(result["prepared_cohort_path"])).resolve(strict=True)),
-                    *[
-                        str(Path(path).resolve(strict=True))
-                        for path in required_lists["fold_manifest_paths"]
-                    ],
-                    *[
-                        str(Path(path).resolve(strict=True))
-                        for path in required_lists["fold_prediction_paths"]
-                    ],
-                    *[
-                        str(Path(path).resolve(strict=True))
-                        for path in required_lists["complete_paged_ledger_artifact_paths"]
-                    ],
-                    str(prediction.resolve(strict=True)),
-                    str(manifest.resolve(strict=True)),
-                    str(attestation),
-                ]
-                if len(direct_terminals) != len(set(direct_terminals)):
-                    raise RuntimeError("direct Stage 2 terminal artifact inventory is duplicated")
+                direct_terminals = list(
+                    _portable_stage2_terminal_file_inventory(
+                        result=result,
+                        prediction_path=prediction,
+                        run_manifest_path=manifest,
+                        attestation_path=attestation,
+                    )
+                )
                 return {
                     **result,
                     "terminal_files": direct_terminals,
@@ -5952,6 +13226,12 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
 
     def _stage2_options(self, attempt: Path, *, prefix: str) -> Any:
         from .all_evidence_post_extraction_review import CausalReviewConfig
+        from .first_untouched_gate_direct_numerical_preparation import (
+            FirstUntouchedGatePreparationBounds,
+        )
+        from .hierarchical_discovery_job_cache import (
+            HierarchicalDiscoveryJobCacheConfig,
+        )
         from .hierarchical_discovery_response_contract import (
             HierarchyWireBudget,
         )
@@ -6018,6 +13298,50 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             tfidf_nested_calibration_folds=o.tfidf_nested_calibration_folds,
             review_stage1_device=o.review_device,
             review_neural_query_devices=(o.review_device,),
+            hierarchical_discovery_job_cache_config=(
+                HierarchicalDiscoveryJobCacheConfig(
+                    max_entry_bytes=(
+                        o.resource_performance_safety
+                        .hierarchical_job_cache_max_entry_bytes
+                    )
+                )
+            ),
+            first_untouched_gate_preparation_bounds=(
+                FirstUntouchedGatePreparationBounds(
+                    max_initial_spent_rows=(
+                        o.resource_performance_safety
+                        .first_untouched_gate_max_initial_spent_rows
+                    ),
+                    max_first_gate_rows=(
+                        o.resource_performance_safety
+                        .first_untouched_gate_max_first_gate_rows
+                    ),
+                    max_total_text_utf8_bytes=(
+                        o.resource_performance_safety
+                        .first_untouched_gate_max_total_text_utf8_bytes
+                    ),
+                    max_catalog_atoms=(
+                        o.resource_performance_safety
+                        .first_untouched_gate_max_catalog_atoms
+                    ),
+                    max_source_manifest_bytes=(
+                        o.resource_performance_safety
+                        .first_untouched_gate_max_source_manifest_bytes
+                    ),
+                    max_direct_numerical_signals=(
+                        o.resource_performance_safety
+                        .first_untouched_gate_max_direct_numerical_signals
+                    ),
+                    max_single_matrix_file_bytes=(
+                        o.resource_performance_safety
+                        .first_untouched_gate_max_single_matrix_file_bytes
+                    ),
+                    max_total_matrix_file_bytes=(
+                        o.resource_performance_safety
+                        .first_untouched_gate_max_total_matrix_file_bytes
+                    ),
+                )
+            ),
             max_candidates=int(o.max_candidate_variables),
             seed=o.seed,
             forest_runtime_config=o.forest_runtime_config,
@@ -6076,6 +13400,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             _revalidate_request_bound_external_inputs(
                 self.request,
                 authenticated_adoptions=self._adopted_artifact_handles,
+                identity_memo=self._scientific_identity_memo,
             )
             adopted = self._adopted_record_for_phase(phase)
             if adopted is not None:
@@ -6141,6 +13466,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     _revalidate_request_bound_external_inputs(
                         self.request,
                         authenticated_adoptions=self._adopted_artifact_handles,
+                        identity_memo=self._scientific_identity_memo,
                     )
                     completed_manifest = self._complete(
                         phase,
@@ -6277,6 +13603,7 @@ print(json.dumps({
         _revalidate_request_bound_external_inputs(
             self.request,
             authenticated_adoptions=self._adopted_artifact_handles,
+            identity_memo=self._scientific_identity_memo,
         )
         prefix = ("input_preparation", "embedding_cache", "stage1_preflight")
         completed = self._execute_phase_sequence(prefix)
@@ -6315,25 +13642,23 @@ print(json.dumps({
                 expected_stage1_request_sha256=prepared.request_sha256,
                 prepared=prepared,
             )
-            selected = next(
-                (
-                    descriptor
-                    for descriptor in descriptor_set.descriptors.values()
-                    if descriptor.scope.scope_kind == "full_outer"
-                    and int(descriptor.assignment.gpu_id) == 0
-                ),
-                None,
+            configured_gpu_ids = _canary_stage1_gpu_ids_from_request(
+                self.request
             )
-            if selected is None:
+            if configured_gpu_ids != tuple(self.stage1_gpu_ids):
                 raise RuntimeError(
-                    "the canonical descriptor set has no full-outer logical cuda:0 scope"
+                    "immutable canary GPU inventory differs from resolved workflow devices"
                 )
+            selected = _select_configured_canary_descriptor(
+                descriptor_set.descriptors,
+                configured_gpu_ids=configured_gpu_ids,
+            )
             descriptor_set_manifest = (
                 descriptor_set.root / LEGACY_STAGE1_SCOPE_DESCRIPTOR_SET_MANIFEST
             )
             preflight_phase_manifest = self._phase_manifest("stage1_preflight")
             body = {
-                "schema_version": ("production_stage1_canary_descriptor_preparation_v1"),
+                "schema_version": ("production_stage1_canary_descriptor_preparation_v2"),
                 "status": "complete",
                 "workflow_request_sha256": self.request["request_sha256"],
                 "stage1_request_sha256": prepared.request_sha256,
@@ -6350,7 +13675,7 @@ print(json.dumps({
                 "descriptor_count": len(descriptor_set.descriptors),
                 "selected_scope_id": selected.scope_id,
                 "selected_scope_kind": selected.scope.scope_kind,
-                "selected_logical_gpu_id": int(selected.assignment.gpu_id),
+                "selected_configured_gpu_id": int(selected.assignment.gpu_id),
                 "selected_descriptor_manifest": self._registered_file_identity(
                     selected.manifest_path
                 ),
@@ -6385,6 +13710,7 @@ print(json.dumps({
             _revalidate_request_bound_external_inputs(
                 self.request,
                 authenticated_adoptions=self._adopted_artifact_handles,
+                identity_memo=self._scientific_identity_memo,
             )
         except BaseException as exc:
             self._write_progress(
@@ -6406,6 +13732,7 @@ print(json.dumps({
         _revalidate_request_bound_external_inputs(
             self.request,
             authenticated_adoptions=self._adopted_artifact_handles,
+            identity_memo=self._scientific_identity_memo,
         )
         full_sequence = self._phase_sequence()
         if self.options.run_control.stop_after is None:
@@ -6429,12 +13756,68 @@ print(json.dumps({
                 "scientific_sha256": self.request["scientific_identity"]["scientific_sha256"],
                 "resume_requires_identical_immutable_request": True,
             }
+        terminal_result = completed["terminal_validation"].get("result")
+        if not isinstance(terminal_result, Mapping):
+            raise RuntimeError(
+                "terminal validation phase lacks one closed result"
+            )
         self._write_progress(
             status="complete",
             completed=tuple(completed),
             current_phase=None,
         )
-        return completed["terminal_validation"]["result"]
+        if "terminal_validation" not in self.phase_overrides:
+            try:
+                achievement = (
+                    self._write_validation_achievement_attestation(
+                        completed["terminal_validation"]
+                    )
+                )
+            except BaseException as exc:
+                self._write_progress(
+                    status="failed",
+                    completed=tuple(completed),
+                    current_phase=None,
+                    error=(
+                        "validation achievement attestation failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+                raise
+            _emit_structured_workflow_log(
+                configured_threshold=(
+                    self.options.run_control.log_level
+                ),
+                event_level=logging.INFO,
+                payload={
+                    "schema_version": (
+                        WORKFLOW_STRUCTURED_LOG_EVENT_SCHEMA
+                    ),
+                    "event": "validation_achievement",
+                    "request_sha256": self.request[
+                        "request_sha256"
+                    ],
+                    "status": "accepted",
+                    "validation_requested_minimum": (
+                        self._validation_policy[
+                            "requested_minimum"
+                        ]
+                    ),
+                    "validation_effective_minimum": (
+                        self._validation_policy[
+                            "effective_minimum"
+                        ]
+                    ),
+                    "validation_achieved_minimum": achievement[
+                        "achieved_minimum"
+                    ],
+                    "validation_achievement_content_sha256": (
+                        achievement["content_sha256"]
+                    ),
+                    "global_release_certified": False,
+                },
+            )
+        return terminal_result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -6500,6 +13883,43 @@ def build_parser() -> argparse.ArgumentParser:
             "device; excluded from scientific identity."
         ),
     )
+    parser.add_argument(
+        "--stage1-persistent-slot-startup-timeout-seconds",
+        type=float,
+        help=(
+            "Finite positive deployment-only deadline for persistent Stage 1 "
+            "slots to reconstruct their authenticated context and report ready."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-max-parallel-owners",
+        type=int,
+        help=(
+            "Effective complete-owner concurrency after accounting for "
+            "multi-device learned-query reservations."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-neural-query-topology",
+        choices=tuple(sorted(SUPPORTED_STAGE1_EXECUTION_TOPOLOGY_MODES)),
+        help=(
+            "Deployment-only learned-query context topology; explicit in "
+            "direct deployment mode."
+        ),
+    )
+    parser.add_argument("--stage1-htr-training-batch-size", type=int)
+    parser.add_argument("--stage1-htr-sentence-encoder-batch-size", type=int)
+    parser.add_argument("--stage1-htr-data-loader-workers", type=int)
+    parser.add_argument(
+        "--stage1-htr-reuse-tokenizer-and-chunk-plans",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--stage1-htr-chunk-plan-cache-max-entries", type=int)
+    parser.add_argument(
+        "--stage1-htr-tokenized-chunk-cache-max-entries",
+        type=int,
+    )
     parser.add_argument("--cpu-budget", type=int)
     parser.add_argument(
         "--forest-operational",
@@ -6530,6 +13950,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--fail-on-external-gpu-occupants",
         action=argparse.BooleanOptionalAction,
         default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--hierarchical-job-cache-max-entry-bytes",
+        type=int,
+    )
+    parser.add_argument(
+        "--first-untouched-gate-max-initial-spent-rows",
+        type=int,
+    )
+    parser.add_argument(
+        "--first-untouched-gate-max-first-gate-rows",
+        type=int,
+    )
+    parser.add_argument(
+        "--first-untouched-gate-max-total-text-utf8-bytes",
+        type=int,
+    )
+    parser.add_argument(
+        "--first-untouched-gate-max-catalog-atoms",
+        type=int,
+    )
+    parser.add_argument(
+        "--first-untouched-gate-max-source-manifest-bytes",
+        type=int,
+    )
+    parser.add_argument(
+        "--first-untouched-gate-max-direct-numerical-signals",
+        type=int,
+    )
+    parser.add_argument(
+        "--first-untouched-gate-max-single-matrix-file-bytes",
+        type=int,
+    )
+    parser.add_argument(
+        "--first-untouched-gate-max-total-matrix-file-bytes",
+        type=int,
     )
     parser.add_argument("--max-candidate-variables", type=int)
     parser.add_argument(
@@ -6731,14 +14187,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--trust-prior-adoption-attestation",
+        action="append",
+        default=[],
+        type=Path,
+        help=(
+            "Explicitly reuse the producer artifact named by a prior v3 "
+            "full-byte adoption attestation without rereading its payload "
+            "bytes. Repeatable. This operator-trusted research mode validates "
+            "controls and filesystem-stat continuity, records "
+            "payload_bytes_reauthenticated=false, and cannot satisfy fresh "
+            "full-byte or global-release certification."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-        help="Operational logging threshold; excluded from scientific identity.",
+        help=(
+            "Orchestrator lifecycle logging threshold; durable progress is "
+            "always written and the setting is excluded from scientific "
+            "identity."
+        ),
     )
     parser.add_argument(
         "--validation-depth",
         choices=("standard", "full", "fresh_terminal_audit"),
-        help="Operational validation depth; excluded from scientific identity.",
+        help=(
+            "Requested operational validation minimum. Production acceptance "
+            "always enforces and separately attests a fresh path-only terminal "
+            "audit; excluded from scientific identity."
+        ),
     )
     parser.add_argument(
         "--legacy-preflight-candidate",
@@ -6811,12 +14289,19 @@ _DIRECT_RESOURCE_SAFETY_FIELDS = (
     "minimum_benchmark_repetitions_per_scope",
     "performance_read_counter_source",
     "fail_on_external_gpu_occupants",
+    "hierarchical_job_cache_max_entry_bytes",
+    "first_untouched_gate_max_initial_spent_rows",
+    "first_untouched_gate_max_first_gate_rows",
+    "first_untouched_gate_max_total_text_utf8_bytes",
+    "first_untouched_gate_max_catalog_atoms",
+    "first_untouched_gate_max_source_manifest_bytes",
+    "first_untouched_gate_max_direct_numerical_signals",
+    "first_untouched_gate_max_single_matrix_file_bytes",
+    "first_untouched_gate_max_total_matrix_file_bytes",
 )
 
 _DIRECT_DEPLOYMENT_SHIMS = (
     "dataset",
-    "work_root",
-    "scratch_root",
     "stage1_profile",
     "query_profile",
     "embedding_model_name",
@@ -6826,6 +14311,15 @@ _DIRECT_DEPLOYMENT_SHIMS = (
     "devices",
     "stage1_device_count",
     "stage1_scope_workers_per_device",
+    "stage1_persistent_slot_startup_timeout_seconds",
+    "stage1_max_parallel_owners",
+    "stage1_neural_query_topology",
+    "stage1_htr_training_batch_size",
+    "stage1_htr_sentence_encoder_batch_size",
+    "stage1_htr_data_loader_workers",
+    "stage1_htr_reuse_tokenizer_and_chunk_plans",
+    "stage1_htr_chunk_plan_cache_max_entries",
+    "stage1_htr_tokenized_chunk_cache_max_entries",
     "cpu_budget",
     "forest_operational",
     "response_concurrency",
@@ -6840,6 +14334,11 @@ _DIRECT_DEPLOYMENT_SHIMS = (
     "oracle_ite_column",
     *_DIRECT_RESOURCE_SAFETY_FIELDS,
 )
+
+_TYPED_DEPLOYMENT_OPERATIONAL_ROOT_OVERRIDES: Mapping[str, str] = {
+    "work_root": "durable_artifact_root",
+    "scratch_root": "scratch_root",
+}
 
 _UNSUPPORTED_LEGACY_EXECUTION_SHIMS = (
     "stage1_device",
@@ -6868,6 +14367,9 @@ def _run_control_from_namespace(values: Mapping[str, Any]) -> RunControl:
         resume=values.get("resume", defaults.resume),
         stop_after=values.get("stop_after", defaults.stop_after),
         adopt_checkpoints=tuple(values.get("adopt_checkpoint", ())),
+        trust_prior_adoption_attestations=tuple(
+            values.get("trust_prior_adoption_attestation", ())
+        ),
         log_level=values.get("log_level", defaults.log_level),
         validation_depth=values.get(
             "validation_depth",
@@ -6893,6 +14395,15 @@ def _compile_direct_deployment_profile(
         "devices",
         "stage1_device_count",
         "stage1_scope_workers_per_device",
+        "stage1_persistent_slot_startup_timeout_seconds",
+        "stage1_max_parallel_owners",
+        "stage1_neural_query_topology",
+        "stage1_htr_training_batch_size",
+        "stage1_htr_sentence_encoder_batch_size",
+        "stage1_htr_data_loader_workers",
+        "stage1_htr_reuse_tokenizer_and_chunk_plans",
+        "stage1_htr_chunk_plan_cache_max_entries",
+        "stage1_htr_tokenized_chunk_cache_max_entries",
         "cpu_budget",
         "forest_operational",
         "response_concurrency",
@@ -6936,6 +14447,33 @@ def _compile_direct_deployment_profile(
         minimum_benchmark_repetitions_per_scope=(values["minimum_benchmark_repetitions_per_scope"]),
         read_counter_source=values["performance_read_counter_source"],
         fail_on_external_gpu_occupants=(values["fail_on_external_gpu_occupants"]),
+        hierarchical_job_cache_max_entry_bytes=(
+            values["hierarchical_job_cache_max_entry_bytes"]
+        ),
+        first_untouched_gate_max_initial_spent_rows=(
+            values["first_untouched_gate_max_initial_spent_rows"]
+        ),
+        first_untouched_gate_max_first_gate_rows=(
+            values["first_untouched_gate_max_first_gate_rows"]
+        ),
+        first_untouched_gate_max_total_text_utf8_bytes=(
+            values["first_untouched_gate_max_total_text_utf8_bytes"]
+        ),
+        first_untouched_gate_max_catalog_atoms=(
+            values["first_untouched_gate_max_catalog_atoms"]
+        ),
+        first_untouched_gate_max_source_manifest_bytes=(
+            values["first_untouched_gate_max_source_manifest_bytes"]
+        ),
+        first_untouched_gate_max_direct_numerical_signals=(
+            values["first_untouched_gate_max_direct_numerical_signals"]
+        ),
+        first_untouched_gate_max_single_matrix_file_bytes=(
+            values["first_untouched_gate_max_single_matrix_file_bytes"]
+        ),
+        first_untouched_gate_max_total_matrix_file_bytes=(
+            values["first_untouched_gate_max_total_matrix_file_bytes"]
+        ),
     )
     forest_operational = StrictCausalForestOperationalSpec.from_mapping(
         _read_json_object(
@@ -6963,13 +14501,45 @@ def _compile_direct_deployment_profile(
             scope_workers_per_device=(
                 values["stage1_scope_workers_per_device"]
             ),
+            max_parallel_owners=values["stage1_max_parallel_owners"],
             executor_mode="persistent_slots",
+            persistent_slot_startup_timeout_seconds=values[
+                "stage1_persistent_slot_startup_timeout_seconds"
+            ],
+            neural_query_topology=Stage1ExecutionTopologyPolicy(
+                mode=values["stage1_neural_query_topology"],
+            ),
+            htr_operational_controls=(
+                RoleNeutralHTROperationalControls(
+                    training_batch_size=values[
+                        "stage1_htr_training_batch_size"
+                    ],
+                    sentence_encoder_batch_size=values[
+                        "stage1_htr_sentence_encoder_batch_size"
+                    ],
+                    data_loader_workers=values[
+                        "stage1_htr_data_loader_workers"
+                    ],
+                    reuse_tokenizer_and_chunk_plans=values[
+                        "stage1_htr_reuse_tokenizer_and_chunk_plans"
+                    ],
+                    chunk_plan_cache_max_entries=values[
+                        "stage1_htr_chunk_plan_cache_max_entries"
+                    ],
+                    tokenized_chunk_cache_max_entries=values[
+                        "stage1_htr_tokenized_chunk_cache_max_entries"
+                    ],
+                )
+            ),
             selection_method="operator_configured",
+            benchmark_evidence_kind="none",
             selected_candidate=None,
             benchmark_result_sha256=None,
             benchmark_result_locator=None,
             benchmark_workload_deployment_sha256=None,
             benchmark_workload_deployment_locator=None,
+            benchmark_publication_sha256=None,
+            benchmark_publication_locator=None,
         ),
         embedding_model_name=values["embedding_model_name"],
         endpoint=values.get("endpoint"),
@@ -6993,6 +14563,32 @@ def _compile_direct_deployment_profile(
         oracle_ite_column=values.get("oracle_ite_column"),
         runtime_compatibility_class=values["runtime_compatibility_class"],
     )
+
+
+def _apply_typed_deployment_operational_root_overrides(
+    *,
+    values: Mapping[str, Any],
+    deployment: DeploymentProfile,
+) -> DeploymentProfile:
+    """Return a copied profile with only its run-local roots replaced.
+
+    Dataset/model/profile locators and every resource or scientific setting
+    remain owned by the typed deployment profile.  These two roots are
+    operational locators: resolving them at the CLI boundary changes the
+    immutable run request and resume target, but not scientific compatibility.
+    """
+
+    replacements: dict[str, Path] = {}
+    for argument_name, profile_field in (
+        _TYPED_DEPLOYMENT_OPERATIONAL_ROOT_OVERRIDES.items()
+    ):
+        if argument_name in values:
+            replacements[profile_field] = Path(
+                values[argument_name]
+            ).resolve()
+    if not replacements:
+        return deployment
+    return replace(deployment, **replacements)
 
 
 def _compile_production_options(
@@ -7052,6 +14648,49 @@ def _compile_production_options(
     ):
         raise RuntimeError(
             "resolved Stage 1 resources differ from the deployment resource_kind"
+        )
+    if (
+        deployment.stage1_execution.max_parallel_owners
+        > deployment.cpu_budget
+        or deployment.stage1_execution.max_parallel_owners
+        != deployment.stage1_execution.neural_query_topology
+        .effective_parallel_owners(
+            devices=selected_devices,
+            workers_per_device=(
+                deployment.stage1_execution.scope_workers_per_device
+            ),
+        )
+    ):
+        raise ValueError(
+            "Stage 1 effective owner concurrency differs from the resolved "
+            "resource topology or exceeds the host CPU budget"
+        )
+    # Bind the repeated optimizer batch to the authenticated scientific HTR
+    # profile before any output root is created.
+    htr_profile = scientific.architecture_profiles.get(
+        "hierarchical_transformer"
+    )
+    htr_producer_configuration = (
+        htr_profile.get("producer_configuration")
+        if isinstance(htr_profile, Mapping)
+        else None
+    )
+    htr_training_batch = (
+        htr_producer_configuration.get("batch_size")
+        if isinstance(htr_producer_configuration, Mapping)
+        else None
+    )
+    if (
+        isinstance(htr_training_batch, bool)
+        or not isinstance(htr_training_batch, int)
+        or htr_training_batch < 1
+        or deployment.stage1_execution.htr_operational_controls
+        .training_batch_size
+        != htr_training_batch
+    ):
+        raise ValueError(
+            "Stage 1 HTR operational training batch differs from the "
+            "authenticated scientific optimizer batch"
         )
     first_device = selected_devices[0]
     gpu_ids = tuple(
@@ -7221,6 +14860,10 @@ def options_from_args(
             )
         deployment_path = Path(deployment_value).resolve(strict=True)
         deployment = DeploymentProfile.from_json(deployment_path)
+        deployment = _apply_typed_deployment_operational_root_overrides(
+            values=values,
+            deployment=deployment,
+        )
     else:
         deployment_path = None
         deployment = _compile_direct_deployment_profile(values)
@@ -7373,6 +15016,9 @@ def _default_portable_role_neutral_hooks(
             max_workers_per_resource=(
                 options.stage1_scope_workers_per_gpu
             ),
+            startup_timeout_seconds=(
+                execution_profile.persistent_slot_startup_timeout_seconds
+            ),
         )
     elif execution_profile.executor_mode == "fresh_per_fit":
         physical_executor = ProcessIsolatedRoleNeutralPhysicalOwnerExecutor(
@@ -7396,6 +15042,47 @@ def _default_portable_role_neutral_hooks(
                 semantic_member_batch_size=semantic_member_batch_size,
             )
         ),
+        producer_factories_scientific_identity={
+            "schema_version": (
+                "prepared_role_neutral_factories_scientific_identity_v1"
+            ),
+            "architecture_profiles": copy.deepcopy(
+                dict(architecture_profiles)
+            ),
+            "runtime_compatibility_class": (
+                options.runtime_compatibility_class
+            ),
+        },
+        physical_owner_executor_scientific_identity={
+            "schema_version": (
+                "role_neutral_executor_scientific_identity_v1"
+            ),
+            "executor_mode": execution_profile.executor_mode,
+            "worker_target": str(physical_executor.worker_target),
+            "production_worker_required": bool(
+                physical_executor.production_worker_required
+            ),
+            "worker_lifecycle_mode": getattr(
+                physical_executor,
+                "worker_lifecycle_mode",
+                "fresh_process_per_physical_fit_v1",
+            ),
+            "process_isolated_physical_owners": bool(
+                physical_executor.process_isolated_physical_owners
+            ),
+            "operational_state_fields_excluded": [
+                "max_workers_per_resource",
+                "poll_interval_seconds",
+                "startup_timeout_seconds",
+                "worker_parameters",
+            ],
+        },
+        handoff_publisher_scientific_identity={
+            "schema_version": (
+                "role_neutral_handoff_publisher_scientific_identity_v1"
+            ),
+            "semantic_member_batch_size": semantic_member_batch_size,
+        },
     )
     return ProductionAllEvidenceWorkflowHooks(
         role_neutral_stage1=integration,
@@ -7409,6 +15096,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         _reexec_from_source_snapshot(parsed_args=args, raw_argv=raw_argv)
         options = options_from_args(args)
+        _configure_cli_logging(options.run_control.log_level)
     except (RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     try:

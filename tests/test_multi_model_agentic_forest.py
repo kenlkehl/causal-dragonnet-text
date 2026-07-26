@@ -13,6 +13,7 @@ from oci.config import (
     AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
     BoWViewConfig,
+    ClusterLocalEmbeddingScientificConfig,
     EmbeddingContrastDiscoveryConfig,
     ExperimentConfig,
     ExplicitFeatureExtractionConfig,
@@ -55,12 +56,68 @@ from oci.inference.multi_model_forest import (
     resolve_multi_model_forest_parallel_plan,
 )
 from oci.inference.multi_model_forest_stage1 import MultiModelForestStage1Runner
+from oci.inference.production_stage1_scope_scheduler import derive_stage1_group_seed
 from oci.models.concept_embedding_utils import chunk_text_words
 
 
 _CONCEPT_CLUSTER_LABEL_PROMPT_VERSION = "multi_model_agentic_cluster_labeling_v2"
 _CONCEPT_INVENTORY_SCHEMA_VERSION = "multi_model_agentic_clustered_concept_inventory_v2"
 _EVIDENCE_DIGEST_ROLE_PROMPT_VERSION = "multi_model_agentic_evidence_digest_role_v1"
+_TEST_PHYSICAL_GLOBAL_SEED = 1701
+
+
+def _cluster_local_test_scientific(
+    *,
+    requested_cluster_count: int,
+    maximum_components_per_family: int,
+    minimum_cluster_size: int,
+    minimum_group_size: int,
+    minimum_cell_size: int,
+) -> ClusterLocalEmbeddingScientificConfig:
+    return ClusterLocalEmbeddingScientificConfig(
+        requested_cluster_count=requested_cluster_count,
+        cluster_count_policy="require_exact_configured_count_v1",
+        maximum_components_per_family=maximum_components_per_family,
+        loading_evidence_capacity=None,
+        loading_evidence_overflow_policy="fail_closed_no_truncation_v1",
+        minimum_cluster_size=minimum_cluster_size,
+        minimum_group_size=minimum_group_size,
+        minimum_cell_size=minimum_cell_size,
+        minimum_distinct_local_clusters_per_family=2,
+        minimum_numerical_rank_per_family=2,
+        patient_pooling_policy="arithmetic_mean_all_authenticated_chunks_v1",
+        computation_dtype="float32",
+        normalize_patient_embeddings=True,
+        normalization_epsilon=1e-12,
+        zero_vector_policy="reject",
+        local_direction_weighting_policy="sqrt_cluster_size_times_unit_direction_v1",
+        kmeans_init="k-means++",
+        kmeans_max_iter=300,
+        kmeans_batch_size_policy="clamp_usable_rows_to_configured_bounds_v1",
+        kmeans_batch_size_lower_bound=1,
+        kmeans_batch_size_upper_bound=1024,
+        kmeans_verbose=0,
+        kmeans_compute_labels=True,
+        kmeans_seed_derivation_policy="canonical_ordered_fit_rows_group_seed_v1",
+        kmeans_tol=0.0,
+        kmeans_max_no_improvement=10,
+        kmeans_init_size=None,
+        kmeans_n_init=20,
+        kmeans_reassignment_ratio=0.01,
+        svd_full_matrices=False,
+        svd_compute_uv=True,
+        svd_hermitian=False,
+        svd_sign_canonicalization_policy="largest_absolute_coordinate_positive_v1",
+        svd_rank_tolerance_policy=(
+            "dtype_epsilon_times_max_shape_times_largest_singular_v1"
+        ),
+        svd_rank_tolerance_dtype="float32",
+        svd_rank_tolerance_multiplier=1.0,
+        replay_comparison_policy="allclose_and_exact_discrete_state_v1",
+        replay_relative_tolerance=2e-6,
+        replay_absolute_tolerance=2e-7,
+        exception_policy="abort_scope_no_skip_or_fallback_v1",
+    )
 
 
 def _linear_test_bow_views() -> list[BoWViewConfig]:
@@ -849,6 +906,7 @@ def _embedding_contrast_cache_test_config(tmp_path: Path) -> AppliedInferenceCon
                     min_probe_auc=0.0,
                     top_k_chunks_per_tail=3,
                     max_chunks_per_patient=1,
+                    include_cluster_contrast_vectors=False,
                     concept_phrases=["brain metastases", "liver lesion"],
                     include_bow_phrases_as_concepts=False,
                 ),
@@ -880,6 +938,7 @@ def _build_embedding_contrast_cache_test_evidence(
     generator: EmbeddingContrastEvidenceGenerator,
     dataset: pd.DataFrame,
 ):
+    _bind_embedding_test_physical_fit_authority(generator, dataset)
     return generator.build_evidence(
         discovery_df=dataset,
         y=np.asarray([0, 1, 0, 0, 1, 0, 1, 0], dtype=float),
@@ -887,6 +946,20 @@ def _build_embedding_contrast_cache_test_evidence(
         pseudo_target=np.asarray([1, 1, -1, -1, 1, -1, 1, -1], dtype=float),
         t_resid=np.ones(8, dtype=float),
         importance={},
+    )
+
+
+def _bind_embedding_test_physical_fit_authority(
+    generator: EmbeddingContrastEvidenceGenerator,
+    dataset: pd.DataFrame,
+) -> None:
+    rows = tuple(dataset["_oci_row_id"].astype(int).tolist())
+    generator.bind_cluster_physical_fit_authority(
+        ordered_fit_row_ids=rows,
+        canonical_group_seed=derive_stage1_group_seed(
+            _TEST_PHYSICAL_GLOBAL_SEED,
+            rows,
+        ),
     )
 
 
@@ -1071,6 +1144,7 @@ def test_embedding_contrast_evidence_retrieves_aligned_chunks(tmp_path: Path):
                     min_probe_auc=0.0,
                     top_k_chunks_per_tail=3,
                     max_chunks_per_patient=1,
+                    include_cluster_contrast_vectors=False,
                     concept_phrases=["brain metastases", "liver lesion"],
                 ),
                 **_disable_htr_test_kwargs(),
@@ -1083,6 +1157,7 @@ def test_embedding_contrast_evidence_retrieves_aligned_chunks(tmp_path: Path):
         embedding_provider=KeywordEmbeddingProvider(),
     )
     generator.prepare(dataset)
+    _bind_embedding_test_physical_fit_authority(generator, dataset)
     evidence = generator.build_evidence(
         discovery_df=dataset,
         y=np.asarray([0, 1, 0, 0, 1, 0, 1, 0], dtype=float),
@@ -1126,6 +1201,7 @@ def test_embedding_contrast_adds_cell_and_orthogonal_r_score_contrasts(
         }
     )
     config = AppliedInferenceConfig(
+        seed=_TEST_PHYSICAL_GLOBAL_SEED,
         outcome_type="binary",
         text_column="clinical_text",
         treatment_column="treatment_indicator",
@@ -1142,6 +1218,7 @@ def test_embedding_contrast_adds_cell_and_orthogonal_r_score_contrasts(
                     min_probe_auc=0.0,
                     top_k_chunks_per_tail=3,
                     max_chunks_per_patient=1,
+                    include_cluster_contrast_vectors=False,
                     concept_phrases=["brain metastases", "liver lesion"],
                 ),
                 **_disable_htr_test_kwargs(),
@@ -1154,6 +1231,7 @@ def test_embedding_contrast_adds_cell_and_orthogonal_r_score_contrasts(
         embedding_provider=KeywordEmbeddingProvider(),
     )
     generator.prepare(dataset)
+    _bind_embedding_test_physical_fit_authority(generator, dataset)
     evidence = generator.build_evidence(
         discovery_df=dataset,
         y=np.asarray([1, 1, 0, 0, 1, 1, 0, 0], dtype=float),
@@ -1234,6 +1312,7 @@ def test_embedding_contrast_residualized_interaction_does_not_require_r_targets(
                     min_probe_auc=0.0,
                     top_k_chunks_per_tail=3,
                     max_chunks_per_patient=1,
+                    include_cluster_contrast_vectors=False,
                 ),
                 **_disable_htr_test_kwargs(),
             ),
@@ -1245,6 +1324,7 @@ def test_embedding_contrast_residualized_interaction_does_not_require_r_targets(
         embedding_provider=KeywordEmbeddingProvider(),
     )
     generator.prepare(dataset)
+    _bind_embedding_test_physical_fit_authority(generator, dataset)
     evidence = generator.build_evidence(
         discovery_df=dataset,
         y=np.asarray([1, 1, 0, 0, 1, 1, 0, 0], dtype=float),
@@ -1281,8 +1361,8 @@ def test_embedding_contrast_adds_cluster_local_contrast_components(tmp_path: Pat
                 "liver liver liver pd-l1 high",
                 "liver liver liver pd-l1 low",
                 "liver liver liver pd-l1 low",
-                "liver liver liver cachexia high",
-                "liver liver liver cachexia high",
+                "liver liver liver age high",
+                "liver liver liver age high",
                 "liver liver liver stable low",
                 "liver liver liver stable low",
             ],
@@ -1313,6 +1393,13 @@ def test_embedding_contrast_adds_cluster_local_contrast_components(tmp_path: Pat
                     cluster_contrast_min_cell_size=1,
                     cluster_contrast_top_loadings=2,
                     cluster_contrast_random_state=7,
+                    cluster_local_scientific=_cluster_local_test_scientific(
+                        requested_cluster_count=2,
+                        maximum_components_per_family=2,
+                        minimum_cluster_size=4,
+                        minimum_group_size=2,
+                        minimum_cell_size=1,
+                    ),
                 ),
                 **_disable_htr_test_kwargs(),
             ),
@@ -1324,10 +1411,11 @@ def test_embedding_contrast_adds_cluster_local_contrast_components(tmp_path: Pat
         embedding_provider=KeywordEmbeddingProvider(),
     )
     generator.prepare(dataset)
+    _bind_embedding_test_physical_fit_authority(generator, dataset)
     evidence = generator.build_evidence(
         discovery_df=dataset,
         y=np.asarray([1, 1, 0, 0, 1, 1, 0, 0] * 2, dtype=float),
-        t=np.asarray([1, 1, 0, 0, 1, 1, 0, 0] * 2, dtype=float),
+        t=np.asarray([1, 1, 1, 1, 0, 0, 0, 0] * 2, dtype=float),
         pseudo_target=None,
         t_resid=None,
         importance={},
@@ -1683,6 +1771,7 @@ def test_multi_model_agentic_forest_adds_embedding_contrast_context(
         }
     )
     config = AppliedInferenceConfig(
+        seed=_TEST_PHYSICAL_GLOBAL_SEED,
         outcome_type="binary",
         text_column="clinical_text",
         treatment_column="treatment_indicator",
@@ -1715,6 +1804,7 @@ def test_multi_model_agentic_forest_adds_embedding_contrast_context(
                     min_probe_auc=0.0,
                     top_k_chunks_per_tail=2,
                     max_chunks_per_patient=1,
+                    include_cluster_contrast_vectors=False,
                     concept_phrases=["brain metastases", "liver lesion"],
                 ),
                 **_disable_htr_test_kwargs(),
@@ -2088,6 +2178,19 @@ def test_multi_model_agent_context_compacts_large_evidence_payload():
 def test_multi_model_bow_fold_uses_prespecified_explicit_features():
     texts = ["same baseline note"] * 6
     labels = np.asarray([0, 0, 0, 1, 1, 1], dtype=float)
+    view = BoWViewConfig(
+        name="closed_fixture",
+        bow_model="linear",
+        ngram_range_min=1,
+        ngram_range_max=1,
+        min_df=1,
+        max_df=1.0,
+        sublinear_tf=True,
+        max_features=100,
+        logistic_c=1.0,
+        logistic_max_iter=1000,
+        ridge_alpha=1.0,
+    )
     explicit_values = [
         {"age": 30.0, "age_missing": False},
         {"age": 31.0, "age_missing": False},
@@ -2101,20 +2204,8 @@ def test_multi_model_bow_fold_uses_prespecified_explicit_features():
         labels,
         fit_pos=np.asarray([0, 1, 3, 4]),
         heldout_pos=np.asarray([2, 5]),
-        vectorizer_params={
-            "ngram_range_min": 1,
-            "ngram_range_max": 1,
-            "min_df": 1,
-            "max_df": 1.0,
-            "sublinear_tf": True,
-            "max_features": 100,
-        },
-        model_params={
-            "bow_model": "linear",
-            "logistic_c": 1.0,
-            "logistic_max_iter": 1000,
-            "ridge_alpha": 1.0,
-        },
+        vectorizer_params=multi_model_agentic_module._bow_vectorizer_params(view),
+        model_params=multi_model_agentic_module._bow_model_params(view),
         explicit_feature_dicts=explicit_values,
         explicit_specs=[
             ExplicitFeatureSpec(

@@ -16,6 +16,7 @@ import pytest
 import oci.inference.production_stage1_scope_scheduler as scope_scheduler
 from oci.inference.production_stage1_scope_scheduler import (
     SpawnedStage1ScopeOrchestrator,
+    Stage1PhysicalFitIdentity,
     Stage1ScopePlan,
     Stage1ScopeAttemptStore,
     Stage1ScopeExecutionRequest,
@@ -31,6 +32,13 @@ from oci.inference.production_stage1_scope_scheduler import (
 
 
 _REGISTRY_SHA = "a" * 64
+_PHYSICAL_FIT_IDENTITY = Stage1PhysicalFitIdentity(
+    architecture_identity="1" * 64,
+    target="test_all_ten_stage1_context_fit_v1",
+    scientific_configuration_identity="2" * 64,
+    producer_identity="3" * 64,
+    runtime_compatibility_class="test-python-posix-v1",
+)
 
 
 class _SubprocessProcessAdapter:
@@ -98,6 +106,7 @@ def _plan(*, gpu_ids: tuple[int, ...] = (0, 1)):
         registry=registry,
         registry_content_sha256=_REGISTRY_SHA,
         global_seed=42,
+        physical_fit_identity=_PHYSICAL_FIT_IDENTITY,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,
@@ -112,6 +121,7 @@ def test_plan_supports_configured_nonbenchmark_initial_partition_count():
         registry=registry,
         registry_content_sha256=_REGISTRY_SHA,
         global_seed=42,
+        physical_fit_identity=_PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         review_rounds=3,
         initial_training_partitions=2,
@@ -157,6 +167,7 @@ def test_role_neutral_plan_accepts_positive_operational_concurrency_but_legacy_s
         registry=registry,
         registry_content_sha256=_REGISTRY_SHA,
         global_seed=42,
+        physical_fit_identity=_PHYSICAL_FIT_IDENTITY,
         gpu_ids=(0, 1),
         review_rounds=2,
         initial_training_partitions=3,
@@ -185,6 +196,7 @@ def test_scope_plan_rejects_nonpositive_or_noninteger_concurrency(invalid):
             registry=_registry(),
             registry_content_sha256=_REGISTRY_SHA,
             global_seed=42,
+            physical_fit_identity=_PHYSICAL_FIT_IDENTITY,
             gpu_ids=(0,),
             review_rounds=2,
             initial_training_partitions=3,
@@ -213,6 +225,7 @@ def _subset_scope_plan(count: int) -> Stage1ScopePlan:
         global_seed=base.global_seed,
         review_rounds=base.review_rounds,
         initial_training_partitions=base.initial_training_partitions,
+        physical_fit_identity=base.physical_fit_identity,
         gpu_ids=(),
         scope_workers_per_gpu=1,
         scopes=scopes,
@@ -223,6 +236,7 @@ def _subset_scope_plan(count: int) -> Stage1ScopePlan:
         global_seed=base.global_seed,
         review_rounds=base.review_rounds,
         initial_training_partitions=base.initial_training_partitions,
+        physical_fit_identity=base.physical_fit_identity,
         gpu_ids=(),
         scope_workers_per_gpu=1,
         scopes=scopes,
@@ -376,6 +390,7 @@ def test_plan_is_schedule_independent_closed_and_contains_no_labels():
         registry=registry,
         registry_content_sha256=_REGISTRY_SHA,
         global_seed=42,
+        physical_fit_identity=_PHYSICAL_FIT_IDENTITY,
         gpu_ids=(0, 1),
         review_rounds=2,
         initial_training_partitions=3,
@@ -392,12 +407,167 @@ def test_plan_is_schedule_independent_closed_and_contains_no_labels():
             registry=registry,
             registry_content_sha256=_REGISTRY_SHA,
             global_seed=42,
+            physical_fit_identity=_PHYSICAL_FIT_IDENTITY,
             gpu_ids=(0, 1),
             review_rounds=2,
             initial_training_partitions=3,
             expected_outer_fold_count=5,
             expected_inner_fold_count=5,
         )
+
+
+def test_immutable_plan_memoizes_exact_scientific_identity_and_fit_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(gpu_ids=(0, 1))
+    expected_groups = scope_scheduler._physical_fit_groups(
+        scopes=plan.scopes,
+        physical_fit_identity=plan.physical_fit_identity,
+    )
+    expected_scientific_identity = scope_scheduler._sha256_json(
+        scope_scheduler._stage1_scope_scientific_plan_body(
+            registry_content_sha256=plan.registry_content_sha256,
+            global_seed=plan.global_seed,
+            review_rounds=plan.review_rounds,
+            initial_training_partitions=(
+                plan.initial_training_partitions
+            ),
+            physical_fit_identity=plan.physical_fit_identity,
+            scopes=plan.scopes,
+        )
+    )
+    original = scope_scheduler._physical_fit_groups
+    calls = 0
+
+    def counted_physical_fit_groups(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        scope_scheduler,
+        "_physical_fit_groups",
+        counted_physical_fit_groups,
+    )
+
+    assert plan.scientific_content_sha256 == expected_scientific_identity
+    assert plan.scientific_content_sha256 == expected_scientific_identity
+    assert plan.physical_fit_groups == expected_groups
+    assert plan.physical_fit_groups == expected_groups
+    assert calls == 2
+
+    first_record = plan.as_dict()
+    second_record = plan.as_dict()
+    assert first_record == second_record
+    assert first_record["scientific_content_sha256"] == (
+        expected_scientific_identity
+    )
+    assert calls == 2
+
+
+def test_physical_fit_key_binds_every_scientific_axis_and_excludes_resources():
+    cpu = _plan(gpu_ids=())
+    gpu = _plan(gpu_ids=(9, 4))
+    owner_id = cpu.physical_scopes[0].scope_id
+    baseline = cpu.physical_fit_key(owner_id)
+
+    assert baseline == gpu.physical_fit_key(owner_id)
+    assert baseline.as_dict() == (
+        cpu.as_dict()["physical_fit_groups"][0][
+            "physical_fit_key_record"
+        ]
+    )
+    assert cpu.as_dict()["physical_fit_groups"][0][
+        "physical_fit_key"
+    ] == baseline.key
+    assert set(baseline.as_dict()) == {
+        "schema_version",
+        "architecture_identity",
+        "target",
+        "fit_row_order_identity",
+        "scientific_configuration_identity",
+        "canonical_group_seed",
+        "producer_identity",
+        "runtime_compatibility_class",
+        "content_sha256",
+    }
+
+    mutations = (
+        replace(
+            _PHYSICAL_FIT_IDENTITY,
+            architecture_identity="4" * 64,
+        ),
+        replace(
+            _PHYSICAL_FIT_IDENTITY,
+            target="test_all_ten_stage1_context_fit_v2",
+        ),
+        replace(
+            _PHYSICAL_FIT_IDENTITY,
+            scientific_configuration_identity="5" * 64,
+        ),
+        replace(
+            _PHYSICAL_FIT_IDENTITY,
+            producer_identity="6" * 64,
+        ),
+        replace(
+            _PHYSICAL_FIT_IDENTITY,
+            runtime_compatibility_class="test-python-posix-v2",
+        ),
+    )
+    for changed_identity in mutations:
+        changed = build_canonical_stage1_scope_plan(
+            registry=_registry(),
+            registry_content_sha256=_REGISTRY_SHA,
+            global_seed=42,
+            physical_fit_identity=changed_identity,
+            gpu_ids=(),
+            review_rounds=2,
+            initial_training_partitions=3,
+            expected_outer_fold_count=5,
+            expected_inner_fold_count=5,
+        )
+        assert changed.physical_fit_key(owner_id).key != baseline.key
+        assert (
+            changed.scientific_content_sha256
+            != cpu.scientific_content_sha256
+        )
+        assert len(changed.physical_scopes) == 35
+
+    owner = cpu.scope(owner_id)
+    reordered = replace(
+        owner,
+        fit_row_ids=tuple(reversed(owner.fit_row_ids)),
+    )
+    changed_seed = replace(owner, scope_seed=owner.scope_seed + 1)
+    assert (
+        cpu.physical_fit_identity.key_for_scope(reordered).key
+        != baseline.key
+    )
+    assert (
+        cpu.physical_fit_identity.key_for_scope(changed_seed).key
+        != baseline.key
+    )
+
+
+def test_physical_group_rejects_seed_drift_and_uses_earliest_content_owner():
+    plan = _plan(gpu_ids=())
+    alias_id = "outer_001_hierarchy_epoch_001"
+    alias = plan.scope(alias_id)
+    changed_scopes = tuple(
+        replace(scope, scope_seed=scope.scope_seed + 1)
+        if scope.scope_id == alias_id
+        else scope
+        for scope in plan.scopes
+    )
+    changed = replace(plan, scopes=changed_scopes)
+    with pytest.raises(ValueError, match="canonical group seed"):
+        _ = changed.physical_fit_groups
+
+    reordered = replace(plan, scopes=tuple(reversed(plan.scopes)))
+    assert (
+        reordered.physical_owner(alias_id).scope_id
+        == "outer_001_inner_005"
+    )
 
 
 def test_plan_rejects_reordered_or_incomplete_partitions():
@@ -408,6 +578,7 @@ def test_plan_rejects_reordered_or_incomplete_partitions():
             registry=registry,
             registry_content_sha256=_REGISTRY_SHA,
             global_seed=42,
+            physical_fit_identity=_PHYSICAL_FIT_IDENTITY,
             review_rounds=2,
             initial_training_partitions=3,
         )
@@ -419,6 +590,7 @@ def test_plan_rejects_reordered_or_incomplete_partitions():
             registry=registry,
             registry_content_sha256=_REGISTRY_SHA,
             global_seed=42,
+            physical_fit_identity=_PHYSICAL_FIT_IDENTITY,
             review_rounds=2,
             initial_training_partitions=3,
         )
@@ -1127,6 +1299,7 @@ def test_spawn_orchestrator_seals_scopes_and_resume_does_not_add_attempts(
         registry=registry,
         registry_content_sha256=_REGISTRY_SHA,
         global_seed=42,
+        physical_fit_identity=_PHYSICAL_FIT_IDENTITY,
         gpu_ids=(),
         review_rounds=1,
         initial_training_partitions=3,
