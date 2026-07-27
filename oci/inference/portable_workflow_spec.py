@@ -1463,84 +1463,15 @@ class Stage1ExecutionProfile:
             self.benchmark_publication_sha256,
             self.benchmark_publication_locator,
         )
-        if self.selection_method not in {
-            "operator_configured",
-            "measured_role_neutral_benchmark_v1",
-        }:
+        if self.selection_method != "operator_configured":
             raise ValueError("unsupported Stage 1 execution selection method")
-        if self.selection_method == "operator_configured":
-            if (
-                self.benchmark_evidence_kind != "none"
-                or any(value is not None for value in evidence)
-            ):
-                raise ValueError(
-                    "operator-configured Stage 1 execution cannot claim "
-                    "benchmark selection evidence"
-                )
-        else:
-            if (
-                self.benchmark_evidence_kind
-                not in {"raw_result_v1", "durable_publication_v1"}
-                or not isinstance(self.selected_candidate, str)
-                or not self.selected_candidate.strip()
-                or not isinstance(self.benchmark_result_sha256, str)
-                or _SHA256.fullmatch(self.benchmark_result_sha256) is None
-                or not isinstance(
-                    self.benchmark_workload_deployment_sha256,
-                    str,
-                )
-                or _SHA256.fullmatch(
-                    self.benchmark_workload_deployment_sha256
-                )
-                is None
-            ):
-                raise ValueError(
-                    "measured Stage 1 execution requires a selected candidate "
-                    "and exact benchmark evidence hashes"
-                )
-            if self.benchmark_evidence_kind == "raw_result_v1":
-                if (
-                    not isinstance(self.benchmark_result_locator, Path)
-                    or not self.benchmark_result_locator.is_absolute()
-                    or not isinstance(
-                        self.benchmark_workload_deployment_locator,
-                        Path,
-                    )
-                    or not self.benchmark_workload_deployment_locator.is_absolute()
-                    or self.benchmark_publication_sha256 is not None
-                    or self.benchmark_publication_locator is not None
-                ):
-                    raise ValueError(
-                        "raw benchmark evidence requires exact absolute result "
-                        "and workload locators and forbids publication evidence"
-                    )
-            else:
-                if (
-                    self.benchmark_result_locator is not None
-                    or self.benchmark_workload_deployment_locator is not None
-                    or not isinstance(
-                        self.benchmark_publication_sha256,
-                        str,
-                    )
-                    or _SHA256.fullmatch(
-                        self.benchmark_publication_sha256
-                    )
-                    is None
-                    or not isinstance(
-                        self.benchmark_publication_locator,
-                        Path,
-                    )
-                    or not self.benchmark_publication_locator.is_absolute()
-                ):
-                    raise ValueError(
-                        "durable benchmark evidence requires one exact absolute "
-                        "publication manifest locator/hash and forbids historical "
-                        "scratch result/workload locators"
-                    )
-            object.__setattr__(
-                self,
-                "selected_candidate",
-                self.selected_candidate.strip(),
+        if (
+            self.benchmark_evidence_kind != "none"
+            or any(value is not None for value in evidence)
+        ):
+            raise ValueError(
+                "operator-configured Stage 1 execution cannot claim "
+                "benchmark selection evidence"
             )
 
     def as_dict(self) -> dict[str, Any]:

@@ -95,7 +95,6 @@ oci/inference/staged_all_evidence_fusion_agent.py
 oci/inference/tfidf_orphan_evidence_adapter.py
 oci/inference/tfidf_topic_agentic_forest.py
 oci/inference/tfidf_topic_discovery.py
-oci/inference/tfidf_topic_handoff_reseal.py
 oci/inference/tfidf_topic_score_forest.py
 oci/inference/tfidf_topic_score_selection.py
 oci/inference/tfidf_topic_split_registry.py
@@ -166,7 +165,6 @@ tests/test_authenticated_coordinate_preserving_nuisance_bridge.py
 tests/test_authenticated_semantic_retrieval_compatibility_current.py
 tests/test_authenticated_stable_nuisance_bridge.py
 tests/test_calibration.py
-tests/test_causal_forest_tuning.py
 tests/test_concept_embedding_cnn.py
 tests/test_concept_token_cnn.py
 tests/test_context_fit_upstream_cache_overlay.py
@@ -177,7 +175,6 @@ tests/test_contrastive_effect.py
 tests/test_coordinate_preserving_context_fit_upstream_backend.py
 tests/test_direct_upstream_numerical_manifest.py
 tests/test_dragonnet_drlearner.py
-tests/test_e2e_workflows.py
 tests/test_explicit_confounders_e2e.py
 tests/test_explicit_features.py
 tests/test_extraction_grounding_diagnostics.py
@@ -200,9 +197,7 @@ tests/test_hierarchical_preparation_cache_replay.py
 tests/test_hierarchical_preparation_prefix_salvage.py
 tests/test_lossless_stage1_evidence_catalog.py
 tests/test_minimal_staged_selection_postprocessor.py
-tests/test_multi_model_agentic_evaluator_selection.py
 tests/test_multi_model_agentic_forest.py
-tests/test_multi_model_forest_config.py
 tests/test_nested_fold_signal_producer.py
 tests/test_neural_cohort_witness.py
 tests/test_neural_query_agentic_forest.py
@@ -213,8 +208,6 @@ tests/test_numeric_inventory.py
 tests/test_offline_hierarchical_discovery_review_packet.py
 tests/test_openai_compatible_json_discovery_job_runner.py
 tests/test_post_extraction_review_providers.py
-tests/test_probe_hierarchical_keyed_first_job_remote.py
-tests/test_probe_hierarchical_keyed_first_job_repair_remote.py
 tests/test_production_coordinate_preserving_upstream_schema.py
 tests/test_query_moment_evidence_adapter.py
 tests/test_review_spent_evidence_cache_overlay.py

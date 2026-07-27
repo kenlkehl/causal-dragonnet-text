@@ -10,7 +10,6 @@ import pytest
 import torch
 
 import oci.inference.prepared_stage1_context as prepared_context_module
-import oci.inference.production_stage1_role_neutral_execution as execution_module
 from oci.inference.production_role_neutral_process_executor import (
     ProcessIsolatedRoleNeutralPhysicalOwnerExecutor,
     _execute_production_role_neutral_owner,
@@ -20,14 +19,9 @@ from oci.inference.production_role_neutral_persistent_executor import (
     PersistentSpawnRoleNeutralPhysicalOwnerExecutor,
 )
 from oci.inference.production_stage1_role_neutral_execution import (
-    DISTINCT_RESOURCE_CANARY_REPLICA_POLICY,
-    EARLIEST_CANONICAL_OWNER_CANARY_SELECTION,
-    RoleNeutralComputeCanaryPolicy,
     RoleNeutralPhysicalOwnerTask,
-    RoleNeutralStage1ExecutionPolicy,
     _execute_one_owner,
     _freshly_reauthenticate_owner_result,
-    execute_and_publish_role_neutral_stage1,
 )
 from oci.inference.role_neutral_all_ten_binding import (
     EXPECTED_COMPONENT_FAMILIES,
@@ -37,7 +31,6 @@ from oci.inference.role_neutral_all_ten_binding import (
 from tests.test_production_stage1_role_neutral_execution import (
     _ProducerRecorder,
     _plan,
-    _resource_plan,
 )
 
 
@@ -486,145 +479,3 @@ def test_parent_reauthentication_rejects_child_tree_mutation(
             receipt=result.sources[0].receipt,
             expected_component="bow",
         )
-
-
-class _CanaryRoutingExecutor:
-    process_isolated_physical_owners = True
-
-    def __init__(self, factories):
-        self.factories = factories.as_mapping()
-        self.calls = []
-
-    def execute(self, *, tasks, worker, max_workers, cpu_budget):
-        self.calls.append(
-            tuple(
-                (
-                    task.physical_owner.scope_id,
-                    task.component_parent,
-                    task.resource,
-                )
-                for task in tasks
-            )
-        )
-        return tuple(
-            _execute_one_owner(task=task, factories=self.factories)
-            for task in tasks
-        )
-
-
-def test_productive_canary_uses_isolated_executor_for_both_replicas(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    plan = _plan(gpu_ids=())
-    factories = _ProducerRecorder().factories()
-    executor = _CanaryRoutingExecutor(factories)
-    reauthentication_calls = 0
-    original_reauthenticate = (
-        execution_module._freshly_reauthenticate_owner_result
-    )
-
-    def counted_reauthenticate(*, task, result):
-        nonlocal reauthentication_calls
-        reauthentication_calls += 1
-        return original_reauthenticate(task=task, result=result)
-
-    monkeypatch.setattr(
-        execution_module,
-        "_freshly_reauthenticate_owner_result",
-        counted_reauthenticate,
-    )
-    root = (tmp_path / "isolated_canary").resolve()
-    manifest = execute_and_publish_role_neutral_stage1(
-        root=root,
-        plan=plan,
-        producer_factories=factories,
-        policy=RoleNeutralStage1ExecutionPolicy(
-            resource_plan=_resource_plan(
-                devices=("cpu",),
-                cpu_budget=4,
-            ),
-            max_parallel_owners=2,
-            compute_canary=RoleNeutralComputeCanaryPolicy(
-                canonical_scope_selection=(
-                    EARLIEST_CANONICAL_OWNER_CANARY_SELECTION
-                ),
-                replica_resource_selection=(
-                    DISTINCT_RESOURCE_CANARY_REPLICA_POLICY
-                ),
-            ),
-        ),
-        executor=executor,
-    )
-
-    selected = min(
-        plan.physical_scopes,
-        key=lambda owner: owner.canonical_index,
-    )
-    assert len(executor.calls) == 3
-    assert executor.calls[0][0][0] == selected.scope_id
-    assert executor.calls[1][0][0] == selected.scope_id
-    assert executor.calls[0][0][1] != executor.calls[1][0][1]
-    assert {row[0] for row in executor.calls[2]} == {
-        owner.scope_id
-        for owner in plan.physical_scopes
-        if owner.scope_id != selected.scope_id
-    }
-    assert manifest["productive_compute_canary_completed"] is True
-    assert manifest["compute_canary_scientific_equality"] is True
-    # Every accepted physical owner plus the discarded canary replica crosses
-    # the parent trust boundary exactly once.
-    assert reauthentication_calls == len(plan.physical_scopes) + 1
-
-
-def test_productive_canary_and_production_share_persistent_session(
-    tmp_path: Path,
-) -> None:
-    plan = _plan(gpu_ids=())
-    executor = PersistentSpawnRoleNeutralPhysicalOwnerExecutor(
-        max_workers_per_resource=2,
-        startup_timeout_seconds=30.0,
-        worker_target=f"{__name__}:_fake_spawn_owner_worker",
-        worker_parameters={"test_token": "mixed-seed-isolation"},
-        production_worker_required=False,
-        poll_interval_seconds=0.01,
-    )
-    root = (tmp_path / "persistent_productive_canary").resolve()
-    manifest = execute_and_publish_role_neutral_stage1(
-        root=root,
-        plan=plan,
-        producer_factories=_ProducerRecorder().factories(),
-        policy=RoleNeutralStage1ExecutionPolicy(
-            resource_plan=_resource_plan(
-                devices=("cpu",),
-                cpu_budget=4,
-            ),
-            max_parallel_owners=2,
-            compute_canary=RoleNeutralComputeCanaryPolicy(
-                canonical_scope_selection=(
-                    EARLIEST_CANONICAL_OWNER_CANARY_SELECTION
-                ),
-                replica_resource_selection=(
-                    DISTINCT_RESOURCE_CANARY_REPLICA_POLICY
-                ),
-            ),
-        ),
-        executor=executor,
-    )
-    telemetry = manifest["owner_execution_telemetry"]
-    owner_rows = telemetry["physical_owners"]
-    replica_rows = telemetry["compute_canary_replicas"]
-    all_rows = [*owner_rows, *replica_rows]
-    pids = {
-        row["telemetry"]["pid"]
-        for row in all_rows
-        if row["telemetry"] is not None
-    }
-    assert len(pids) <= 2
-    assert any(
-        row["telemetry"]["slot_owner_ordinal"] > 1
-        for row in all_rows
-        if row["telemetry"] is not None
-    )
-    assert manifest["productive_compute_canary_completed"] is True
-    assert not (root / ".persistent-owner-execution-session").exists()

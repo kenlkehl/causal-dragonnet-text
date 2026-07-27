@@ -12,7 +12,6 @@ import pytest
 
 import oci.inference.production_authenticated_tree_cache as tree_module
 import oci.inference.production_all_evidence_workflow as workflow_module
-import oci.inference.role_neutral_benchmark_deployment_selection as selection_module
 from oci.inference.portable_artifacts import (
     ArtifactCompatibility,
     publish_portable_artifact,
@@ -1612,7 +1611,7 @@ def test_adopted_checkpoint_substitutes_phase_and_fresh_reader_reopens_bytes(
         ).run()
 
 
-def test_operator_trusted_legacy_prefix_allows_only_downstream_configuration_drift(
+def test_operator_trusted_legacy_prefix_allows_only_downstream_configuration_and_stage2_drift(
     tmp_path: Path,
 ) -> None:
     dataset = tmp_path / "configured-cohort.parquet"
@@ -1652,6 +1651,12 @@ def test_operator_trusted_legacy_prefix_allows_only_downstream_configuration_dri
     cache_expected = compatibility(
         new_configuration,
         "current cache producer",
+    )
+    prepared_expected["model_identities"]["stage2_model_name"] = digest(
+        "current downstream stage2 model"
+    )
+    cache_expected["model_identities"]["stage2_model_name"] = digest(
+        "current downstream stage2 model"
     )
     prepared_compatibility = compatibility(
         old_configuration,
@@ -1861,6 +1866,15 @@ def test_operator_trusted_legacy_prefix_allows_only_downstream_configuration_dri
         artifact=cache,
         expected=cache_expected,
         record=record(cache_proof),
+    )
+    changed_htr = deepcopy(prepared_expected)
+    changed_htr["model_identities"]["htr_model_tree"] = digest(
+        "wrong current HTR model"
+    )
+    assert not workflow_module._adopted_compatibility_matches_request(
+        artifact=prepared,
+        expected=changed_htr,
+        record=record(prepared_proof),
     )
 
     changed_preparation = deepcopy(request)
@@ -4162,130 +4176,6 @@ def test_typed_portable_scope_concurrency_is_deployment_selected(
     )
     with pytest.raises(ValueError, match="historical Stage 1 requires exactly one"):
         ProductionAllEvidenceWorkflow(historical)
-
-
-def test_resume_revalidation_reopens_measured_benchmark_authorities(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    paths = {}
-    for name in ("dataset", "stage1-profile", "query-profile", "scientific"):
-        path = (tmp_path / f"{name}.json").resolve()
-        path.write_text(name, encoding="utf-8")
-        paths[name] = path
-    safety = resource_safety_policy(
-        gpu_max_allocation_fraction=0.85,
-        gpu_minimum_headroom_bytes=6 * 1024**3,
-        minimum_multi_device_throughput_ratio=1.5,
-        maximum_coordination_proof_overhead_ratio=0.3,
-        maximum_ordinary_read_amplification=2.0,
-        minimum_benchmark_repetitions_per_scope=2,
-        read_counter_source="process_read_bytes",
-        fail_on_external_gpu_occupants=True,
-    )
-    outer_folds = 5
-    initial_training_partitions = 3
-    review_rounds = 2
-    request = {
-        "outer_folds": outer_folds,
-        "initial_training_partitions": initial_training_partitions,
-        "review_rounds": review_rounds,
-        "expected_granular_checkpoint_plan": (
-            workflow_module._derive_expected_granular_checkpoint_plan(
-                outer_folds=outer_folds,
-                initial_training_partitions=initial_training_partitions,
-                review_rounds=review_rounds,
-            )
-        ),
-        "dataset_path": str(paths["dataset"]),
-        "source_sha256": workflow_module.stable_file_sha256(
-            paths["dataset"]
-        )[0],
-        "stage1_profile_path": str(paths["stage1-profile"]),
-        "stage1_profile_sha256": workflow_module.stable_file_sha256(
-            paths["stage1-profile"]
-        )[0],
-        "query_profile_path": str(paths["query-profile"]),
-        "query_profile_sha256": workflow_module.stable_file_sha256(
-            paths["query-profile"]
-        )[0],
-        "scientific_spec_path": str(paths["scientific"]),
-        "scientific_spec_source_sha256": (
-            workflow_module.stable_file_sha256(paths["scientific"])[0]
-        ),
-        "deployment_profile_path": None,
-        "stage1_execution_profile": {
-            "schema_version": "portable_stage1_execution_profile_v8",
-            "resource_kind": "accelerator",
-            "device_count": 2,
-            "scope_workers_per_device": 1,
-            "max_parallel_owners": 2,
-            "executor_mode": "persistent_slots",
-            "persistent_slot_startup_timeout_seconds": 30.0,
-            "neural_query_topology": {
-                "schema_version": (
-                    "portable_stage1_execution_topology_policy_v1"
-                ),
-                "mode": "one_context_per_selected_device",
-            },
-            "htr_operational_controls": {
-                "schema_version": (
-                "production_role_neutral_htr_operational_controls_v2"
-                ),
-                "training_batch_size": 4,
-                "sentence_encoder_batch_size": 8,
-                "data_loader_workers": 0,
-                "fold_parallelism": 2,
-                "fold_parallel_backend": "processes",
-                "fold_slots_per_device": 1,
-                "reuse_tokenizer_and_chunk_plans": True,
-                "chunk_plan_cache_max_entries": 100,
-                "tokenized_chunk_cache_max_entries": 1000,
-            },
-            "neural_query_operational_controls": {
-                "schema_version": (
-                    "production_role_neutral_neural_query_operational_controls_v1"
-                ),
-                "inner_fold_parallelism": 1,
-                "fold_parallel_backend": "threads",
-                "fold_slots_per_device": 1,
-                "bank_parallelism": 1,
-                "worker_cpu_threads": 1,
-            },
-            "tfidf_parallel_backend": "processes",
-            "selection_method": "measured_role_neutral_benchmark_v1",
-            "benchmark_evidence_kind": "raw_result_v1",
-            "selected_candidate": "measured-x2",
-            "benchmark_result_sha256": "a" * 64,
-            "benchmark_result_locator": str(
-                (tmp_path / "benchmark-result.json").resolve()
-            ),
-            "benchmark_workload_deployment_sha256": "b" * 64,
-            "benchmark_workload_deployment_locator": str(
-                (tmp_path / "workload-deployment.json").resolve()
-            ),
-            "benchmark_publication_sha256": None,
-            "benchmark_publication_locator": None,
-        },
-        "resource_performance_safety": safety.as_dict(),
-        "cpu_budget": 8,
-    }
-
-    def reached(**kwargs):
-        assert kwargs["profile"].scope_workers_per_device == 1
-        assert kwargs["resource_performance_safety"] == safety
-        raise RuntimeError("measured-benchmark-revalidation-reached")
-
-    monkeypatch.setattr(
-        selection_module,
-        "validate_benchmarked_stage1_execution_profile",
-        reached,
-    )
-    with pytest.raises(
-        RuntimeError,
-        match="measured-benchmark-revalidation-reached",
-    ):
-        workflow_module._revalidate_request_bound_external_inputs(request)
 
 
 @pytest.mark.parametrize("injection_kind", ("hook", "override"))

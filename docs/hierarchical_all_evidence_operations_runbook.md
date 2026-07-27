@@ -97,9 +97,7 @@ scripts/run_tfidf_topic_stage1_from_primary_splits.py
 
 The TF-IDF producer writes `split_registry.json`,
 `handoff/discovery_contexts.jsonl`, `primary_predictions.parquet`,
-`stage1_invocation_audit.json`, and `stage1_result.json`. The migration-only
-`scripts/reseal_tfidf_topic_handoff.py` may reseal an older compatible handoff; it
-is not a substitute for fitting Stage 1 on a new cohort.
+`stage1_invocation_audit.json`, and `stage1_result.json`.
 
 The stable general-purpose arbitrary-cohort builder is now
 `scripts/build_all_evidence_stage1_bundle.py`. It fits all ten native

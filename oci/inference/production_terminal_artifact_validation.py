@@ -20,8 +20,6 @@ from typing import Any, Mapping, Sequence
 from .fold_honest_signal_fusion import row_set_fingerprint
 from .portable_workflow_spec import (
     PostExtractionCausalReviewSpec,
-    ResourcePerformanceSafetyPolicy,
-    Stage1ExecutionProfile,
     Stage2PromptProtocolSpec,
 )
 from .production_text_preparation import stable_file_sha256
@@ -70,40 +68,6 @@ _STAGE2_CLIENT_PATHS = {
     "hierarchical_discovery",
     "proposal_and_post_extraction_review",
 }
-
-
-def _validate_benchmarked_execution_authority(
-    request: Mapping[str, Any],
-) -> Mapping[str, Any] | None:
-    raw_profile = request.get("stage1_execution_profile")
-    if (
-        not isinstance(raw_profile, Mapping)
-        or raw_profile.get("selection_method")
-        != "measured_role_neutral_benchmark_v1"
-    ):
-        return None
-    scientific_spec_path = request.get("scientific_spec_path")
-    raw_safety = request.get("resource_performance_safety")
-    if (
-        not isinstance(scientific_spec_path, str)
-        or not scientific_spec_path
-        or not isinstance(raw_safety, Mapping)
-    ):
-        raise ValueError(
-            "benchmark-selected terminal request lacks its authorities"
-        )
-    from .role_neutral_benchmark_deployment_selection import (
-        validate_benchmarked_stage1_execution_profile,
-    )
-
-    return validate_benchmarked_stage1_execution_profile(
-        profile=Stage1ExecutionProfile.from_mapping(raw_profile),
-        scientific_spec_path=Path(scientific_spec_path),
-        resource_performance_safety=(
-            ResourcePerformanceSafetyPolicy.from_mapping(raw_safety)
-        ),
-        cpu_budget=int(request["cpu_budget"]),
-    )
 
 
 def _canonical_sha256(
@@ -3582,17 +3546,11 @@ def validate_real_stage2_terminal_artifacts(
 ) -> Mapping[str, Any]:
     """Reopen all real Stage 2 artifacts and prove their terminal contract."""
 
-    benchmark_execution_validation = (
-        _validate_benchmarked_execution_authority(request)
-    )
     by_phase = _phase_map(phase_records)
     if "stage2_inference" not in by_phase:
         return {
             "real_stage2_artifacts_detected": False,
             "reason": "stage2_inference_phase_absent",
-            "benchmark_execution_validation": (
-                benchmark_execution_validation
-            ),
         }
     # Authenticate the inference publication first.  Evaluation artifacts can
     # contain oracle values, so do not reopen those bytes until the phase
@@ -3606,9 +3564,6 @@ def validate_real_stage2_terminal_artifacts(
         return {
             "real_stage2_artifacts_detected": False,
             "reason": "injected_stage2_phase_without_real_prediction_outputs",
-            "benchmark_execution_validation": (
-                benchmark_execution_validation
-            ),
         }
     phase_positions = _validate_terminal_phase_order(
         phase_records,
@@ -3954,7 +3909,6 @@ def validate_real_stage2_terminal_artifacts(
         "stage1_row_map_sha256": row_map_sha,
         "row_order_validated": True,
         "oracle_validation": oracle_validation,
-        "benchmark_execution_validation": benchmark_execution_validation,
     }
 
 

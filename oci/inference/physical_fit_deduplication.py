@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import re
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
-from .portable_workflow_spec import EVIDENCE_FAMILIES, canonical_json, identity_sha256
+from .portable_workflow_spec import EVIDENCE_FAMILIES, identity_sha256
 
 
 PHYSICAL_FIT_KEY_SCHEMA = "portable_stage1_physical_fit_key_v2"
 LOGICAL_CONTEXT_PLAN_SCHEMA = "portable_stage1_logical_context_plan_v2"
 LOGICAL_BINDING_SCHEMA = "portable_stage1_logical_scope_binding_v2"
-COMPUTE_CANARY_SCHEMA = "portable_stage1_compute_canary_v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RowId = str | int
 
@@ -414,47 +412,7 @@ def build_logical_binding_records(
     return {**body, "content_sha256": identity_sha256(body)}
 
 
-def compare_compute_canary_replicas(
-    *,
-    physical_fit_key: PhysicalFitKey,
-    replica_a: Mapping[str, Any],
-    replica_b: Mapping[str, Any],
-    device_a: str,
-    device_b: str,
-) -> Mapping[str, Any]:
-    """Compare complete scientific artifacts and select the first replica."""
-
-    for label, replica in (("replica_a", replica_a), ("replica_b", replica_b)):
-        if not isinstance(replica, Mapping):
-            raise ValueError(f"{label} must be one scientific artifact manifest")
-        if set(replica.get("family_artifact_ids") or {}) != set(EVIDENCE_FAMILIES):
-            raise ValueError(f"{label} lacks all ten evidence families")
-    comparable_a = {
-        key: copy.deepcopy(value)
-        for key, value in replica_a.items()
-        if key not in {"locator", "execution_attestation", "device", "recorded_at"}
-    }
-    comparable_b = {
-        key: copy.deepcopy(value)
-        for key, value in replica_b.items()
-        if key not in {"locator", "execution_attestation", "device", "recorded_at"}
-    }
-    equal = canonical_json(comparable_a) == canonical_json(comparable_b)
-    body = {
-        "schema_version": COMPUTE_CANARY_SCHEMA,
-        "physical_fit_key": physical_fit_key.key,
-        "replica_devices": [str(device_a), str(device_b)],
-        "scientific_artifacts_exactly_equal": equal,
-        "selected_replica": "replica_a" if equal else None,
-        "selected_scientific_artifact": comparable_a if equal else None,
-    }
-    if not equal:
-        raise RuntimeError("Stage 1 compute canary replicas are scientifically unequal")
-    return {**body, "content_sha256": identity_sha256(body)}
-
-
 __all__ = [
-    "COMPUTE_CANARY_SCHEMA",
     "LOGICAL_BINDING_SCHEMA",
     "LOGICAL_CONTEXT_PLAN_SCHEMA",
     "PHYSICAL_FIT_KEY_SCHEMA",
@@ -462,7 +420,6 @@ __all__ = [
     "PhysicalFitGroup",
     "PhysicalFitKey",
     "build_logical_binding_records",
-    "compare_compute_canary_replicas",
     "derive_logical_context_plan",
     "group_equivalent_contexts",
     "ordered_row_identity",

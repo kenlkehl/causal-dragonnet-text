@@ -866,8 +866,6 @@ def test_hierarchical_prepare_only_uses_strict_json_runner_without_remote_call(
     assert result["remote_execution_authorized_by_review_packet"] is False
     assert result["review_spent_evidence_cache_registrations"] == list(spent_registrations)
     assert result["new_preparation_review_spent_registrations"] == list(spent_registrations)
-    assert result["hierarchical_preparation_cache_replay_exported"] is False
-    assert result["hierarchical_preparation_cache_replay_registration"] is None
     assert result["authoritative_replay_review_spent_registrations"] == []
     assert result["authoritative_replay_context_fit_index_registration"] is None
     assert result["authoritative_execution_review_spent_registrations"] == []

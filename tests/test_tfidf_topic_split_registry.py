@@ -1,5 +1,4 @@
 import json
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -12,24 +11,8 @@ from oci.config import (
     MultiModelForestConfig,
     TfidfTopicDiscoveryConfig,
 )
-from oci.inference.tfidf_topic_agentic_forest import (
-    validate_tfidf_topic_stage2_handoff,
-)
 from oci.inference.tfidf_topic_discovery import (
-    HANDOFF_SCHEMA_VERSION,
     row_set_fingerprint,
-    stable_hash,
-)
-from oci.inference.tfidf_topic_handoff_reseal import (
-    PRE_ORPHAN_TOPIC_SCORE_TEST_SCHEMA_VERSION,
-    _expected_stack_hashes,
-    derive_tfidf_topic_split_registry_from_handoff,
-    legacy_tfidf_topic_stage1_config_hash,
-    pre_orphan_tfidf_topic_stage1_config_hash,
-    reseal_tfidf_topic_handoff,
-)
-from oci.inference.tfidf_topic_score_selection import (
-    TOPIC_SCORE_TEST_SCHEMA_VERSION,
 )
 from oci.inference.tfidf_topic_split_registry import (
     TFIDF_TOPIC_SPLIT_REGISTRY_SCHEMA_VERSION,
@@ -42,7 +25,6 @@ from oci.inference.tfidf_topic_stage1 import (
     _outer_split_plan,
     tfidf_topic_stage1_config_hash,
 )
-from oci.inference.tfidf_safe_artifacts import write_named_array_bank
 
 
 def _dataset() -> pd.DataFrame:
@@ -161,33 +143,6 @@ def test_registry_controls_outer_inner_plans_and_stage1_identity(tmp_path):
     )
 
 
-def test_pre_orphan_legacy_hash_omits_only_orphan_controls(tmp_path):
-    config = _config(_write_registry(tmp_path / "registry.json"))
-    nn_config = config.architecture.multi_model_forest
-    topic = {
-        key: value
-        for key, value in asdict(nn_config.tfidf_topic).items()
-        if not key.startswith("orphan_ngram_")
-    }
-    expected = stable_hash(
-        {
-            "schema": HANDOFF_SCHEMA_VERSION,
-            "topic_score_test_schema": PRE_ORPHAN_TOPIC_SCORE_TEST_SCHEMA_VERSION,
-            "views": [asdict(view) for view in nn_config.bow_views],
-            "nuisance_folds": nn_config.nuisance_folds,
-            "topic": topic,
-            "text_column": config.text_column,
-            "treatment_column": config.treatment_column,
-            "outcome_column": config.outcome_column,
-            "outcome_type": config.outcome_type,
-        }
-    )
-    assert pre_orphan_tfidf_topic_stage1_config_hash(config) == expected
-    assert pre_orphan_tfidf_topic_stage1_config_hash(config) != (
-        legacy_tfidf_topic_stage1_config_hash(config)
-    )
-
-
 @pytest.mark.parametrize("failure", ["outer_overlap", "out_of_bounds", "inner_coverage"])
 def test_registry_rejects_invalid_partitions(tmp_path, failure):
     payload = _registry_payload()
@@ -207,285 +162,7 @@ def test_registry_rejects_invalid_partitions(tmp_path, failure):
             inner_fold_count=2,
         )
 
-
-def _score_test_payload(*, fit_n: int, heldout_n: int) -> dict:
-    return {
-        "schema_version": TOPIC_SCORE_TEST_SCHEMA_VERSION,
-        "status": "completed",
-        "uses_heldout_treatment_and_outcome": True,
-        "fits_patient_level_cate_model": False,
-        "constructs_divided_pseudo_target": False,
-        "fit_n": int(fit_n),
-        "heldout_n": int(heldout_n),
-        "banks": {
-            bank: {
-                "topic_tests": [],
-                "selected_topic_ids": [],
-                "ngram_selection_count": 0,
-                "bootstrap_calibration": {
-                    "complete_topic_family": True,
-                    "complete_term_group_family": True,
-                    "complete_ngram_family": True,
-                },
-            }
-            for bank in ("treatment", "outcome", "effect")
-        },
-    }
-
-
-def _source_context_row(
-    *,
-    base_dir: Path,
-    config: AppliedInferenceConfig,
-    outer_fold: int,
-    inner_fold: int | None,
-    fit_ids: list[int],
-    heldout_ids: list[int],
-    source_hash: str,
-) -> dict:
-    scope = "full_outer_train" if inner_fold is None else "candidate_selection_inner_fit"
-    fold_key = outer_fold if inner_fold is None else 1000 * outer_fold + inner_fold
-    context_dir = base_dir / f"context-{fold_key}"
-    context_dir.mkdir(parents=True)
-    fitted_path = context_dir / "fitted_context.joblib"
-    fitted_path.write_bytes(b"sealed fitted context placeholder")
-    ngram_paths = {}
-    for bank in ("treatment", "outcome", "effect"):
-        path = context_dir / f"{bank}_scores.parquet"
-        path.write_bytes(b"sealed score placeholder")
-        ngram_paths[bank] = str(path)
-    fit_topic_path = write_named_array_bank(
-        {},
-        context_dir / "fit_topics",
-        row_count=len(fit_ids),
-    )
-    heldout_topic_path = write_named_array_bank(
-        {},
-        context_dir / "heldout_topics",
-        row_count=len(heldout_ids),
-    )
-
-    nuisance_rows = []
-    for row_id in fit_ids:
-        nuisance_rows.append(
-            {
-                "_oci_row_id": row_id,
-                "prediction_scope": "fit_oof",
-                "fit_row_ids": [value for value in fit_ids if value != row_id],
-                "treatment_stacked": 0.5,
-                "outcome_stacked": 0.5,
-            }
-        )
-    for row_id in heldout_ids:
-        nuisance_rows.append(
-            {
-                "_oci_row_id": row_id,
-                "prediction_scope": "external_heldout",
-                "fit_row_ids": list(fit_ids),
-                "treatment_stacked": 0.5,
-                "outcome_stacked": 0.5,
-            }
-        )
-    nuisance_path = context_dir / "nuisance.parquet"
-    pd.DataFrame(nuisance_rows).to_parquet(nuisance_path, index=False)
-    if inner_fold is None:
-        score_path = None
-        compact_score = {
-            "status": "not_run",
-            "uses_heldout_treatment_and_outcome": False,
-        }
-    else:
-        score_path = context_dir / "topic_scores.json"
-        score_path.write_text(
-            json.dumps(
-                _score_test_payload(
-                    fit_n=len(fit_ids),
-                    heldout_n=len(heldout_ids),
-                )
-            ),
-            encoding="utf-8",
-        )
-        compact_score = {
-            "status": "completed",
-            "uses_heldout_treatment_and_outcome": True,
-        }
-    stack_hashes = _expected_stack_hashes(config)
-    discovery = {
-        "scope_id": f"scope-{fold_key}",
-        "fit_row_ids": list(fit_ids),
-        "heldout_row_ids": list(heldout_ids),
-        "fit_row_fingerprint": row_set_fingerprint(fit_ids),
-        "heldout_row_fingerprint": row_set_fingerprint(heldout_ids),
-        "config_hash": stable_hash(asdict(config.architecture.multi_model_forest.tfidf_topic)),
-        "common_vocabulary_size": 0,
-        "common_vocabulary": [],
-        "nuisance": {
-            target: {"stack_config_hash": stack_hashes[target]}
-            for target in ("treatment", "outcome")
-        },
-        "topic_banks": {bank: {"topics": []} for bank in ("treatment", "outcome", "effect")},
-        "topic_score_tests": compact_score,
-        "artifacts": {
-            "fitted_context": str(fitted_path),
-            "fit_topic_values": str(fit_topic_path),
-            "heldout_topic_values": str(heldout_topic_path),
-            "nuisance_predictions": str(nuisance_path),
-            "ngram_scores": ngram_paths,
-            "topic_score_tests": None if score_path is None else str(score_path),
-        },
-    }
-    return {
-        "schema_version": HANDOFF_SCHEMA_VERSION,
-        "stage1_config_hash": source_hash,
-        "fold_key": fold_key,
-        "outer_fold": outer_fold,
-        "inner_fold": inner_fold,
-        "scope": scope,
-        "fit_row_ids": list(fit_ids),
-        "heldout_row_ids": list(heldout_ids),
-        "fit_row_fingerprint": row_set_fingerprint(fit_ids),
-        "heldout_row_fingerprint": row_set_fingerprint(heldout_ids),
-        "discovery": discovery,
-    }
-
-
-def test_reseal_is_non_mutating_and_stage2_accepts_registry_seal(tmp_path):
-    registry_path = tmp_path / "registry.json"
-    config = _config(registry_path)
-    data = _dataset()
-    source_dir = tmp_path / "legacy"
-    source_dir.mkdir()
-    source_path = source_dir / "handoff.jsonl"
-    source_hash = pre_orphan_tfidf_topic_stage1_config_hash(config)
-    rows = []
-    for outer in _registry_payload()["outer_folds"]:
-        for inner in outer["inner_folds"]:
-            rows.append(
-                _source_context_row(
-                    base_dir=source_dir,
-                    config=config,
-                    outer_fold=outer["outer_fold"],
-                    inner_fold=inner["inner_fold"],
-                    fit_ids=inner["fit_row_ids"],
-                    heldout_ids=inner["heldout_row_ids"],
-                    source_hash=source_hash,
-                )
-            )
-        rows.append(
-            _source_context_row(
-                base_dir=source_dir,
-                config=config,
-                outer_fold=outer["outer_fold"],
-                inner_fold=None,
-                fit_ids=outer["fit_row_ids"],
-                heldout_ids=outer["heldout_row_ids"],
-                source_hash=source_hash,
-            )
-        )
-    for row in rows:
-        if row["scope"] != "candidate_selection_inner_fit":
-            continue
-        score_path = Path(row["discovery"]["artifacts"]["topic_score_tests"])
-        score = json.loads(score_path.read_text(encoding="utf-8"))
-        score["schema_version"] = PRE_ORPHAN_TOPIC_SCORE_TEST_SCHEMA_VERSION
-        score_path.write_text(json.dumps(score), encoding="utf-8")
-        row["discovery"]["topic_score_tests"][
-            "schema_version"
-        ] = PRE_ORPHAN_TOPIC_SCORE_TEST_SCHEMA_VERSION
-    source_path.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows),
-        encoding="utf-8",
-    )
-    source_manifest = source_dir / "manifest.json"
-    source_manifest.write_text(
-        json.dumps(
-            {
-                "schema_version": HANDOFF_SCHEMA_VERSION,
-                "stage1_config_hash": source_hash,
-            }
-        ),
-        encoding="utf-8",
-    )
-    derived = derive_tfidf_topic_split_registry_from_handoff(
-        source_handoff_path=source_path,
-        output_registry_path=registry_path,
-        dataset_row_count=len(data),
-        outer_fold_count=config.cv_folds,
-        inner_fold_count=config.architecture.multi_model_forest.candidate_consistency_inner_folds,
-    )
-    assert derived["dataset_row_count"] == len(data)
-    assert derived["outer_folds"] == _registry_payload()["outer_folds"]
-    raw_registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    assert raw_registry["provenance"]["folds_regenerated_from_seed"] is False
-    assert raw_registry["provenance"]["source_stage1_config_hash"] == source_hash
-    before_handoff = source_path.read_bytes()
-    before_manifest = source_manifest.read_bytes()
-    before_scores = {
-        Path(row["discovery"]["artifacts"]["topic_score_tests"]): Path(
-            row["discovery"]["artifacts"]["topic_score_tests"]
-        ).read_bytes()
-        for row in rows
-        if row["scope"] == "candidate_selection_inner_fit"
-    }
-
-    output_path = tmp_path / "resealed" / "handoff.jsonl"
-    manifest = reseal_tfidf_topic_handoff(
-        source_handoff_path=source_path,
-        output_handoff_path=output_path,
-        dataset=data,
-        config=config,
-    )
-
-    assert source_path.read_bytes() == before_handoff
-    assert source_manifest.read_bytes() == before_manifest
-    assert all(path.read_bytes() == content for path, content in before_scores.items())
-    assert manifest["migration"]["source_artifacts_mutated"] is False
-    score_migrations = manifest["migration"]["score_test_schema_migrations"]
-    assert len(score_migrations) == 6
-    assert all(not item["statistics_recomputed"] for item in score_migrations)
-    assert all(not item["labels_read"] for item in score_migrations)
-    assert manifest["stage1_config_hash"] == tfidf_topic_stage1_config_hash(config, data)
-    output_rows = [
-        json.loads(line) for line in output_path.read_text().splitlines() if line.strip()
-    ]
-    assert {row["stage1_config_hash"] for row in output_rows} == {manifest["stage1_config_hash"]}
-    assert all(
-        Path(row["discovery"]["artifacts"]["nuisance_predictions"]).is_absolute()
-        for row in output_rows
-    )
-    inner_rows = [
-        row for row in output_rows if row["scope"] == "candidate_selection_inner_fit"
-    ]
-    assert all(
-        Path(row["discovery"]["artifacts"]["topic_score_tests"]).parent.name
-        == "migrated_score_tests"
-        for row in inner_rows
-    )
-    migrated_scores = [
-        json.loads(
-            Path(row["discovery"]["artifacts"]["topic_score_tests"]).read_text(
-                encoding="utf-8"
-            )
-        )
-        for row in inner_rows
-    ]
-    assert all(
-        score["schema_version"] == TOPIC_SCORE_TEST_SCHEMA_VERSION
-        and score["effect_orphan_ngram_branch"]["status"] == "disabled"
-        and not score["schema_migration"]["statistics_recomputed"]
-        and not score["schema_migration"]["labels_read"]
-        for score in migrated_scores
-    )
-    preflight = validate_tfidf_topic_stage2_handoff(
-        dataset=data,
-        config=config,
-        handoff_path=output_path,
-    )
-    assert preflight["status"] == "passed"
-    assert preflight["outer_test_rows_predicted_once"] is True
-
-
-def test_reseal_rejects_a_registry_artifact_split_mismatch(tmp_path):
+def test_registry_rejects_an_artifact_split_order_mismatch(tmp_path):
     registry_path = _write_registry(tmp_path / "registry.json")
     registry = load_tfidf_topic_split_registry(
         registry_path,

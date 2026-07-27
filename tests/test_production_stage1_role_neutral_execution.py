@@ -26,14 +26,10 @@ from oci.inference.production_stage1_role_neutral_coordinator import (
 )
 from oci.inference.production_stage1_role_neutral_execution import (
     BoundRoleNeutralComponentProducer,
-    DISTINCT_RESOURCE_CANARY_REPLICA_POLICY,
-    EARLIEST_CANONICAL_OWNER_CANARY_SELECTION,
     LocalThreadRoleNeutralPhysicalOwnerExecutor,
     NeuralQueryExecutionTopology,
-    ROLE_NEUTRAL_COMPUTE_CANARY_ATTESTATION,
     ROLE_NEUTRAL_COORDINATION_DIRECTORY,
     ROLE_NEUTRAL_EXECUTION_MANIFEST,
-    RoleNeutralComputeCanaryPolicy,
     RoleNeutralOperationalComponentReport,
     RoleNeutralPhysicalOwnerTask,
     RoleNeutralProducerFactories,
@@ -577,79 +573,6 @@ def test_local_single_node_executor_runs_the_complete_physical_plan(
     assert len(recorder.events) == (
         len(plan.physical_scopes) * len(EXPECTED_COMPONENT_FAMILIES) * 3
     )
-
-
-def test_productive_compute_canary_adopts_first_replica_without_third_fit(
-    tmp_path: Path,
-) -> None:
-    plan = _plan(gpu_ids=(3, 8))
-    recorder = _ProducerRecorder()
-    executor = _RecordingExecutor()
-    root = (tmp_path / "canary_execution").resolve()
-    manifest = execute_and_publish_role_neutral_stage1(
-        root=root,
-        plan=plan,
-        producer_factories=recorder.factories(),
-        policy=RoleNeutralStage1ExecutionPolicy(
-            resource_plan=_resource_plan(
-                devices=("cuda:3", "cuda:8"),
-                cpu_budget=8,
-            ),
-            max_parallel_owners=4,
-            compute_canary=RoleNeutralComputeCanaryPolicy(
-                canonical_scope_selection=(
-                    EARLIEST_CANONICAL_OWNER_CANARY_SELECTION
-                ),
-                replica_resource_selection=(
-                    DISTINCT_RESOURCE_CANARY_REPLICA_POLICY
-                ),
-            ),
-        ),
-        executor=executor,
-    )
-
-    selected_owner = min(
-        plan.physical_scopes,
-        key=lambda owner: int(owner.canonical_index),
-    )
-    assert selected_owner.scope_id not in executor.submitted
-    assert set(executor.submitted) == {
-        owner.scope_id
-        for owner in plan.physical_scopes
-        if owner.scope_id != selected_owner.scope_id
-    }
-    assert manifest["productive_compute_canary_completed"] is True
-    assert manifest["selected_canary_replica_adopted_as_production"] is True
-    assert manifest["compute_canary_scientific_equality"] is True
-    canary = json.loads(
-        (root / ROLE_NEUTRAL_COMPUTE_CANARY_ATTESTATION).read_text(
-            encoding="utf-8"
-        )
-    )
-    assert canary["physical_owner_scope_id"] == selected_owner.scope_id
-    assert canary["replica_resources"][0] != canary["replica_resources"][1]
-    assert canary["selected_replica"] == "replica_a"
-    assert canary["third_fit_executed"] is False
-    assert (
-        canary["replica_b_model_tree_published_to_durable_storage"] is False
-    )
-    selected_counts = Counter(
-        (component, event)
-        for owner, component, event, _resource in recorder.events
-        if owner == selected_owner.scope_id
-    )
-    assert set(selected_counts.values()) == {2}
-    other_counts = Counter(
-        (owner, component, event)
-        for owner, component, event, _resource in recorder.events
-        if owner != selected_owner.scope_id
-    )
-    assert set(other_counts.values()) == {1}
-    assert not any(
-        child.name.startswith(".role-neutral-compute-canary-")
-        for child in root.iterdir()
-    )
-    assert validate_role_neutral_stage1_execution(root=root, plan=plan) == manifest
 
 
 def test_scientific_identity_is_path_device_worker_and_completion_neutral(

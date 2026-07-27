@@ -719,6 +719,16 @@ def test_typed_deployment_requires_every_operational_safety_field(
     with pytest.raises(ValueError, match="configure every field exactly"):
         DeploymentProfile.from_mapping(missing_execution_field)
 
+    retired_benchmark_selection = dict(payload)
+    retired_benchmark_selection["stage1_execution"] = dict(
+        payload["stage1_execution"]
+    )
+    retired_benchmark_selection["stage1_execution"]["selection_method"] = (
+        "measured_role_neutral_benchmark_v1"
+    )
+    with pytest.raises(ValueError, match="unsupported Stage 1 execution"):
+        DeploymentProfile.from_mapping(retired_benchmark_selection)
+
     missing_safety_field = dict(payload)
     missing_safety_field["resource_performance_safety"] = dict(
         payload["resource_performance_safety"]
@@ -762,54 +772,6 @@ def test_nsclc_page_sizes_are_configuration_only_not_production_literals() -> No
     }
 
     assert offenders == set()
-
-
-def test_measured_stage1_execution_requires_reopenable_evidence_locators(
-    tmp_path: Path,
-) -> None:
-    measured = stage1_execution_profile(
-        resource_kind="accelerator",
-        device_count=2,
-        scope_workers_per_device=1,
-        executor_mode="persistent_slots",
-        selection_method="measured_role_neutral_benchmark_v1",
-        benchmark_evidence_kind="raw_result_v1",
-        selected_candidate="measured-x2",
-        benchmark_result_sha256="a" * 64,
-        benchmark_result_locator=(
-            tmp_path / "benchmark-result.json"
-        ).resolve(),
-        benchmark_workload_deployment_sha256="b" * 64,
-        benchmark_workload_deployment_locator=(
-            tmp_path / "workload-deployment.json"
-        ).resolve(),
-    )
-    assert Stage1ExecutionProfile.from_mapping(
-        asdict(measured)
-    ) == measured
-    json.dumps(measured.as_dict(), allow_nan=False)
-    with pytest.raises(ValueError, match="raw benchmark evidence"):
-        replace(measured, benchmark_workload_deployment_locator=None)
-    with pytest.raises(ValueError, match="cannot claim benchmark"):
-        replace(
-            measured,
-            selection_method="operator_configured",
-            benchmark_evidence_kind="none",
-        )
-
-    durable = replace(
-        measured,
-        benchmark_evidence_kind="durable_publication_v1",
-        benchmark_result_locator=None,
-        benchmark_workload_deployment_locator=None,
-        benchmark_publication_sha256="c" * 64,
-        benchmark_publication_locator=(
-            tmp_path / "publication" / "publication_manifest.json"
-        ).resolve(),
-    )
-    assert Stage1ExecutionProfile.from_mapping(asdict(durable)) == durable
-    with pytest.raises(ValueError, match="forbids historical scratch"):
-        replace(durable, benchmark_result_locator=measured.benchmark_result_locator)
 
 
 def test_scientific_mapping_requires_text_window_and_forest_configuration() -> None:

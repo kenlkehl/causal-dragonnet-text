@@ -2455,8 +2455,6 @@ def run_benchmark(args: argparse.Namespace) -> Mapping[str, Any]:
             "first_gate_numerical_materialization_deferred": True,
             "review_spent_evidence_cache_registrations": list(spent_cache_registrations),
             "new_preparation_review_spent_registrations": list(spent_cache_registrations),
-            "hierarchical_preparation_cache_replay_exported": False,
-            "hierarchical_preparation_cache_replay_registration": None,
             "authoritative_replay_review_spent_registrations": list(
                 authoritative_spent_registrations
             ),

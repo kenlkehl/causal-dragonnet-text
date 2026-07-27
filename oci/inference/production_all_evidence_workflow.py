@@ -5488,14 +5488,15 @@ def _adopted_compatibility_matches_request(
         return True
     if not _operator_trusted_adoption_selected(record):
         return False
-    # The exception is deliberately limited to producer-code identity. The
-    # trusted artifact was produced by the earlier frozen source snapshot;
-    # every scientific, model, prompt, seed, row, and runtime axis must still
-    # match the current request exactly unless a sealed legacy phase
-    # projection proves that the historical whole-workflow configuration
-    # digest is the sole remaining mismatch.
+    # The trusted artifact was produced by the earlier frozen source snapshot.
+    # Producer-code identity may differ, while a sealed legacy phase projection
+    # may additionally prove that the historical whole-workflow configuration
+    # digest and the downstream-only Stage 2 model name are irrelevant to
+    # preparation/cache bytes. Every data, split, row, seed, prompt, runtime,
+    # embedding, HTR, and tokenizer axis remains exact.
     observed.pop("producer_code_identity", None)
     requested.pop("producer_code_identity", None)
+    legacy_projection_validated = False
     if observed.get("configuration_identity") != requested.get(
         "configuration_identity"
     ):
@@ -5505,8 +5506,34 @@ def _adopted_compatibility_matches_request(
             record=record,
         ):
             return False
+        legacy_projection_validated = True
         observed.pop("configuration_identity", None)
         requested.pop("configuration_identity", None)
+    observed_models = observed.get("model_identities")
+    requested_models = requested.get("model_identities")
+    if observed_models != requested_models:
+        if (
+            not legacy_projection_validated
+            and not _validate_operator_trusted_legacy_phase_projection_record(
+                artifact=artifact,
+                requested=requested,
+                record=record,
+            )
+        ):
+            return False
+        if not isinstance(observed_models, Mapping) or not isinstance(
+            requested_models,
+            Mapping,
+        ):
+            return False
+        observed_upstream_models = dict(observed_models)
+        requested_upstream_models = dict(requested_models)
+        observed_upstream_models.pop("stage2_model_name", None)
+        requested_upstream_models.pop("stage2_model_name", None)
+        if observed_upstream_models != requested_upstream_models:
+            return False
+        observed["model_identities"] = observed_upstream_models
+        requested["model_identities"] = requested_upstream_models
     return observed == requested
 
 
@@ -6100,36 +6127,6 @@ def _revalidate_request_bound_external_inputs(
             path_field="deployment_profile_path",
             sha_field="deployment_profile_source_sha256",
             label="deployment profile",
-        )
-    raw_execution_profile = request.get("stage1_execution_profile")
-    if (
-        isinstance(raw_execution_profile, Mapping)
-        and raw_execution_profile.get("selection_method")
-        == "measured_role_neutral_benchmark_v1"
-    ):
-        scientific_spec_path = request.get("scientific_spec_path")
-        raw_safety = request.get("resource_performance_safety")
-        if (
-            not isinstance(scientific_spec_path, str)
-            or not scientific_spec_path
-            or not isinstance(raw_safety, Mapping)
-        ):
-            raise ValueError(
-                "benchmark-selected request lacks scientific or safety authority"
-            )
-        from .role_neutral_benchmark_deployment_selection import (
-            validate_benchmarked_stage1_execution_profile,
-        )
-
-        validate_benchmarked_stage1_execution_profile(
-            profile=Stage1ExecutionProfile.from_mapping(
-                raw_execution_profile
-            ),
-            scientific_spec_path=Path(scientific_spec_path),
-            resource_performance_safety=(
-                ResourcePerformanceSafetyPolicy.from_mapping(raw_safety)
-            ),
-            cpu_budget=int(request["cpu_budget"]),
         )
     adoption_records = request.get("requested_checkpoint_adoptions") or []
     adoption_locators = request.get("checkpoint_adoption_locators") or []
@@ -14714,23 +14711,6 @@ def _compile_production_options(
             "deployment must explicitly configure embedding_model_name; "
             "model locator basenames are not scientific model identities"
         )
-    if (
-        deployment.stage1_execution.selection_method
-        == "measured_role_neutral_benchmark_v1"
-    ):
-        from .role_neutral_benchmark_deployment_selection import (
-            validate_benchmarked_stage1_execution_profile,
-        )
-
-        validate_benchmarked_stage1_execution_profile(
-            profile=deployment.stage1_execution,
-            scientific_spec_path=scientific_path,
-            resource_performance_safety=(
-                deployment.resource_performance_safety
-            ),
-            cpu_budget=deployment.cpu_budget,
-        )
-
     def deployment_locator(path: Path) -> Path:
         candidate = Path(path)
         if not candidate.is_absolute() and deployment_path is not None:

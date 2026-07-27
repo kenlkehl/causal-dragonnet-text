@@ -20,9 +20,6 @@ from oci.inference.production_all_evidence_workflow import (
     build_parser,
     options_from_args,
 )
-from oci.inference.role_neutral_performance_benchmark import (
-    RoleNeutralBenchmarkConfig,
-)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -36,20 +33,10 @@ DEPLOYMENT_PROFILE = (
     / "example_configs"
     / "portable_all_evidence_deployment_nsclc.acceptance.json"
 )
-BENCHMARK_STAGING_PROFILE = (
-    REPOSITORY_ROOT
-    / "example_configs"
-    / "portable_all_evidence_deployment_nsclc.benchmark-staging.json"
-)
 R14_HIGH_POWERED_PROFILE = (
     REPOSITORY_ROOT
     / "example_configs"
     / "portable_all_evidence_deployment_nsclc.r14-high-powered.json"
-)
-BENCHMARK_CONFIG = (
-    REPOSITORY_ROOT
-    / "example_configs"
-    / "portable_role_neutral_performance_benchmark_nsclc.deployment.json"
 )
 V5_PREPARATION = (
     REPOSITORY_ROOT
@@ -188,44 +175,6 @@ def test_acceptance_deployment_is_closed_full_workflow_configuration() -> None:
     ):
         assert field not in deployment_payload
         assert field not in scientific_payload
-
-
-def test_benchmark_staging_and_final_deployments_have_distinct_fresh_roots() -> None:
-    staging = DeploymentProfile.from_json(BENCHMARK_STAGING_PROFILE)
-    final = DeploymentProfile.from_json(DEPLOYMENT_PROFILE)
-    benchmark = RoleNeutralBenchmarkConfig.from_json(BENCHMARK_CONFIG)
-
-    assert staging.durable_artifact_root != final.durable_artifact_root
-    assert staging.scratch_root != final.scratch_root
-    assert staging.stage1_execution.selection_method == "operator_configured"
-    assert final.stage1_execution.selection_method == "operator_configured"
-    assert staging.stage1_execution.resource_kind == "accelerator"
-    assert final.stage1_execution.resource_kind == "accelerator"
-    assert staging.devices == final.devices == ("auto",)
-    assert (
-        staging.stage2_tokenizer_locator
-        == final.stage2_tokenizer_locator
-        == Path(
-            "../artifacts/local_models/"
-            "gemma4_26b_a4b_it_fp8_dynamic_tokenizer_materialized"
-        )
-    )
-    assert (
-        staging.resource_performance_safety
-        == final.resource_performance_safety
-    )
-    assert (
-        staging.resource_performance_safety.read_counter_source
-        == "process_read_bytes"
-    )
-    assert staging.cpu_budget == final.cpu_budget == 8
-    assert (
-        benchmark.resource_performance_safety
-        == staging.resource_performance_safety
-    )
-    assert {
-        candidate.host_cpu_budget for candidate in benchmark.candidates
-    } == {staging.cpu_budget}
 
 
 def test_acceptance_cli_compiles_offline_stage1_prefix_without_server_access(

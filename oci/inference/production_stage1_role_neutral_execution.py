@@ -30,9 +30,7 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import stat
-import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -689,36 +687,6 @@ class LocalThreadRoleNeutralPhysicalOwnerExecutor:
 
 
 @dataclass(frozen=True)
-class RoleNeutralComputeCanaryPolicy:
-    """Operational policy for the productive two-replica Stage 1 canary.
-
-    Both choices are content/resource policies rather than fixed scope names
-    or device identifiers.  Consequently an identical scientific request can
-    execute on CPU-only, one-GPU, or multi-GPU hosts without changing its
-    scientific identity.
-    """
-
-    canonical_scope_selection: str
-    replica_resource_selection: str
-
-    def __post_init__(self) -> None:
-        if (
-            self.canonical_scope_selection
-            != EARLIEST_CANONICAL_OWNER_CANARY_SELECTION
-        ):
-            raise ValueError(
-                "unsupported role-neutral compute-canary scope selection"
-            )
-        if (
-            self.replica_resource_selection
-            != DISTINCT_RESOURCE_CANARY_REPLICA_POLICY
-        ):
-            raise ValueError(
-                "unsupported role-neutral compute-canary resource selection"
-            )
-
-
-@dataclass(frozen=True)
 class RoleNeutralFirstOwnerValidationPolicy:
     """Deployment-only hard gate before the second physical owner starts."""
 
@@ -823,7 +791,6 @@ class RoleNeutralFirstOwnerValidationPolicy:
 class RoleNeutralStage1ExecutionPolicy:
     resource_plan: ResourcePlan
     max_parallel_owners: int
-    compute_canary: RoleNeutralComputeCanaryPolicy | None = None
     neural_query_execution_topologies: Mapping[
         str,
         NeuralQueryExecutionTopology,
@@ -844,13 +811,6 @@ class RoleNeutralStage1ExecutionPolicy:
             raise ValueError("max_parallel_owners must be positive")
         if workers > int(self.resource_plan.cpu_budget):
             raise ValueError("max_parallel_owners cannot exceed the configured CPU budget")
-        if self.compute_canary is not None and not isinstance(
-            self.compute_canary,
-            RoleNeutralComputeCanaryPolicy,
-        ):
-            raise TypeError(
-                "compute_canary must be a typed RoleNeutralComputeCanaryPolicy"
-            )
         gate = self.first_owner_validation
         if gate is not None and not isinstance(
             gate,
@@ -860,11 +820,6 @@ class RoleNeutralStage1ExecutionPolicy:
                 "first_owner_validation must use its typed deployment policy"
             )
         if gate is not None:
-            if self.compute_canary is not None:
-                raise ValueError(
-                    "first-owner validation and the two-replica canary are "
-                    "mutually exclusive"
-                )
             if tuple(self.resource_plan.devices) != gate.devices:
                 raise ValueError(
                     "first-owner validation devices differ from the resource plan"
@@ -2093,78 +2048,6 @@ def _first_owner_memory_observation(
     }
 
 
-def _compare_role_neutral_compute_canary(
-    *,
-    plan: Stage1ScopePlan,
-    replica_a: RoleNeutralPhysicalOwnerResult,
-    replica_b: RoleNeutralPhysicalOwnerResult,
-    policy: RoleNeutralComputeCanaryPolicy,
-) -> dict[str, Any]:
-    """Compare complete scientific replicas and select A for production."""
-
-    if replica_a.physical_owner_scope_id != replica_b.physical_owner_scope_id:
-        raise ValueError("compute-canary replicas name different physical owners")
-    scientific_a = _compute_canary_scientific_replica(replica_a)
-    scientific_b = _compute_canary_scientific_replica(replica_b)
-    equal = _canonical_json(scientific_a) == _canonical_json(scientific_b)
-    body = {
-        "schema_version": ROLE_NEUTRAL_COMPUTE_CANARY_SCHEMA,
-        "plan_scientific_content_sha256": plan.scientific_content_sha256,
-        "physical_owner_scope_id": replica_a.physical_owner_scope_id,
-        "canonical_scope_selection": policy.canonical_scope_selection,
-        "replica_resource_selection": policy.replica_resource_selection,
-        "replica_resources": [replica_a.resource, replica_b.resource],
-        "replica_a_scientific_artifact": scientific_a,
-        "replica_b_scientific_content_sha256": scientific_b["content_sha256"],
-        "complete_scientific_artifacts_exactly_equal": equal,
-        "selected_replica": "replica_a" if equal else None,
-        "selected_replica_adopted_as_production_result": equal,
-        "third_fit_executed": False,
-        "replica_b_model_tree_published_to_durable_storage": False,
-        "resource_paths_and_devices_in_scientific_identity": False,
-    }
-    if not equal:
-        raise RuntimeError(
-            "role-neutral Stage 1 compute-canary replicas are scientifically unequal"
-        )
-    return {**body, "content_sha256": _sha256_json(body)}
-
-
-def _canary_owner(
-    *,
-    plan: Stage1ScopePlan,
-    policy: RoleNeutralComputeCanaryPolicy,
-) -> Stage1ScopeSpec:
-    if (
-        policy.canonical_scope_selection
-        != EARLIEST_CANONICAL_OWNER_CANARY_SELECTION
-    ):
-        raise ValueError("compute-canary scope-selection policy changed")
-    owners = tuple(plan.physical_scopes)
-    if not owners:
-        raise ValueError("compute canary requires at least one physical owner")
-    return min(owners, key=lambda owner: int(owner.canonical_index))
-
-
-def _canary_replica_resource(
-    *,
-    primary_resource: str,
-    policy: RoleNeutralComputeCanaryPolicy,
-    resource_plan: ResourcePlan,
-) -> str:
-    if (
-        policy.replica_resource_selection
-        != DISTINCT_RESOURCE_CANARY_REPLICA_POLICY
-    ):
-        raise ValueError("compute-canary resource-selection policy changed")
-    alternatives = tuple(
-        device
-        for device in resource_plan.devices
-        if str(device) != str(primary_resource)
-    )
-    return alternatives[0] if alternatives else str(primary_resource)
-
-
 def _normalize_executor_results(
     *,
     plan: Stage1ScopePlan,
@@ -2774,100 +2657,6 @@ def execute_and_publish_role_neutral_stage1(
                     )
             preexecuted_results.append(selected_result)
             executor_tasks = tasks[1:]
-
-        if policy.compute_canary is not None:
-            selected_owner = _canary_owner(
-                plan=plan,
-                policy=policy.compute_canary,
-            )
-            selected_task = task_by_owner[selected_owner.scope_id]
-            if process_isolated:
-                replica_a = execute_isolated_tasks(
-                    (selected_task,),
-                    max_workers=1,
-                )[0]
-            else:
-                with claim_lock:
-                    claimed.add(selected_owner.scope_id)
-                replica_a = _execute_one_owner(
-                    task=selected_task,
-                    factories=factories,
-                )
-            scratch_tree = Path(
-                tempfile.mkdtemp(
-                    prefix=".role-neutral-compute-canary-",
-                    dir=destination,
-                )
-            )
-            try:
-                replica_b_resource = _canary_replica_resource(
-                    primary_resource=selected_task.resource,
-                    policy=policy.compute_canary,
-                    resource_plan=policy.resource_plan,
-                )
-                replica_b_task = RoleNeutralPhysicalOwnerTask(
-                    plan=plan,
-                    physical_owner=selected_task.physical_owner,
-                    logical_members=selected_task.logical_members,
-                    component_parent=(
-                        scratch_tree / selected_task.physical_owner.scope_id
-                    ),
-                    resource=replica_b_resource,
-                    htr_operational_controls=(
-                        policy.htr_operational_controls
-                    ),
-                    neural_query_operational_controls=(
-                        policy.neural_query_operational_controls
-                    ),
-                    htr_fold_devices=(
-                        tuple(policy.resource_plan.devices)
-                        if policy.htr_operational_controls is not None
-                        else (replica_b_resource,)
-                    ),
-                    owner_cpu_budget=selected_task.owner_cpu_budget,
-                )
-                replica_b_task = replace(
-                    replica_b_task,
-                    neural_query_execution_topology=(
-                        policy.neural_query_topology_for(
-                            replica_b_task.resource
-                        )
-                    ),
-                )
-                if process_isolated:
-                    replica_b = execute_isolated_tasks(
-                        (replica_b_task,),
-                        max_workers=1,
-                    )[0]
-                else:
-                    replica_b = _execute_one_owner(
-                        task=replica_b_task,
-                        factories=factories,
-                    )
-                canary_result = _compare_role_neutral_compute_canary(
-                    plan=plan,
-                    replica_a=replica_a,
-                    replica_b=replica_b,
-                    policy=policy.compute_canary,
-                )
-                canary_replica_results = (replica_a, replica_b)
-                if process_isolated:
-                    with claim_lock:
-                        claimed.add(selected_owner.scope_id)
-            finally:
-                # Replica B is deliberately ephemeral; replica A already
-                # occupies the canonical production root.
-                shutil.rmtree(scratch_tree)
-            _write_new_json(
-                destination / ROLE_NEUTRAL_COMPUTE_CANARY_ATTESTATION,
-                canary_result,
-            )
-            preexecuted_results.append(replica_a)
-            executor_tasks = tuple(
-                task
-                for task in tasks
-                if task.physical_owner.scope_id != selected_owner.scope_id
-            )
 
         if process_isolated:
             results = execute_isolated_tasks(
@@ -4036,7 +3825,6 @@ __all__ = [
     "ROLE_NEUTRAL_STAGE1_EXECUTION_ATTESTATION_SCHEMA",
     "ROLE_NEUTRAL_STAGE1_EXECUTION_SCHEMA",
     "RoleNeutralComponentInvocation",
-    "RoleNeutralComputeCanaryPolicy",
     "RoleNeutralFirstOwnerValidationPolicy",
     "LocalThreadRoleNeutralPhysicalOwnerExecutor",
     "NeuralQueryExecutionTopology",

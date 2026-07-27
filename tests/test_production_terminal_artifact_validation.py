@@ -6,13 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tests.resource_safety_test_support import resource_safety_policy
-
 import oci.inference.production_terminal_artifact_validation as terminal_module
-import oci.inference.role_neutral_benchmark_deployment_selection as selection_module
-from oci.inference.portable_workflow_spec import (
-    ResourcePerformanceSafetyPolicy,
-)
 from oci.inference.production_oracle_evaluation import (
     evaluate_frozen_predictions_posthoc,
 )
@@ -102,100 +96,6 @@ def _rewrite_flat_content_hash(path: Path, value):
 def _rewrite_wrapper_content_hash(path: Path, value):
     value["content_sha256"] = _sha(value["body"])
     _write_json(path, value)
-
-
-def test_terminal_path_reopens_measured_benchmark_authorities(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    safety = resource_safety_policy(
-        gpu_max_allocation_fraction=0.85,
-        gpu_minimum_headroom_bytes=6 * 1024**3,
-        minimum_multi_device_throughput_ratio=1.5,
-        maximum_coordination_proof_overhead_ratio=0.3,
-        maximum_ordinary_read_amplification=2.0,
-        minimum_benchmark_repetitions_per_scope=2,
-        read_counter_source="process_read_bytes",
-        fail_on_external_gpu_occupants=True,
-    )
-    observed = {}
-
-    def validate(**kwargs):
-        observed.update(kwargs)
-        return {"content_sha256": "f" * 64}
-
-    monkeypatch.setattr(
-        selection_module,
-        "validate_benchmarked_stage1_execution_profile",
-        validate,
-    )
-    request = {
-        "stage1_execution_profile": {
-            "schema_version": "portable_stage1_execution_profile_v8",
-            "resource_kind": "accelerator",
-            "device_count": 2,
-            "scope_workers_per_device": 2,
-            "max_parallel_owners": 4,
-            "executor_mode": "persistent_slots",
-            "persistent_slot_startup_timeout_seconds": 30.0,
-            "neural_query_topology": {
-                "schema_version": (
-                    "portable_stage1_execution_topology_policy_v1"
-                ),
-                "mode": "one_context_per_selected_device",
-            },
-            "htr_operational_controls": {
-                "schema_version": (
-                    "production_role_neutral_htr_operational_controls_v2"
-                ),
-                "training_batch_size": 4,
-                "sentence_encoder_batch_size": 8,
-                "data_loader_workers": 0,
-                "fold_parallelism": 2,
-                "fold_parallel_backend": "processes",
-                "fold_slots_per_device": 1,
-                "reuse_tokenizer_and_chunk_plans": True,
-                "chunk_plan_cache_max_entries": 100,
-                "tokenized_chunk_cache_max_entries": 1000,
-            },
-            "neural_query_operational_controls": {
-                "schema_version": (
-                    "production_role_neutral_neural_query_operational_controls_v1"
-                ),
-                "inner_fold_parallelism": 1,
-                "fold_parallel_backend": "threads",
-                "fold_slots_per_device": 1,
-                "bank_parallelism": 1,
-                "worker_cpu_threads": 1,
-            },
-            "tfidf_parallel_backend": "processes",
-            "selection_method": "measured_role_neutral_benchmark_v1",
-            "benchmark_evidence_kind": "raw_result_v1",
-            "selected_candidate": "measured-x2",
-            "benchmark_result_sha256": "a" * 64,
-            "benchmark_result_locator": str(
-                (tmp_path / "benchmark-result.json").resolve()
-            ),
-            "benchmark_workload_deployment_sha256": "b" * 64,
-            "benchmark_workload_deployment_locator": str(
-                (tmp_path / "workload-deployment.json").resolve()
-            ),
-            "benchmark_publication_sha256": None,
-            "benchmark_publication_locator": None,
-        },
-        "scientific_spec_path": str(
-            (tmp_path / "scientific.json").resolve()
-        ),
-        "resource_performance_safety": safety.as_dict(),
-        "cpu_budget": 8,
-    }
-    result = terminal_module._validate_benchmarked_execution_authority(
-        request
-    )
-    assert result == {"content_sha256": "f" * 64}
-    assert observed["profile"].scope_workers_per_device == 2
-    assert observed["resource_performance_safety"] == safety
-    assert observed["cpu_budget"] == 8
 
 
 def _wire_budget():

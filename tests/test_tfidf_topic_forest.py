@@ -7,9 +7,6 @@ import pandas as pd
 import pytest
 from scipy import sparse
 
-from oracle_experiment_scripts.audit_tfidf_topic_oracle_recovery import (
-    topic_oracle_associations,
-)
 from oci.config import (
     AgenticFeatureSearchConfig,
     AppliedInferenceConfig,
@@ -82,28 +79,6 @@ def _dense_contrast_reference(x, t, y, e, m):
     se = np.sqrt(np.maximum(0.0, np.mean(z**2, axis=0) - moment**2) / len(t))
     score = np.divide(moment, se, out=np.zeros_like(moment), where=se > 0)
     return moment, se, score
-
-
-def test_posthoc_topic_oracle_associations_are_absolute_and_row_order_invariant():
-    topics = np.asarray(
-        [
-            [0.0, 1.0, 4.0],
-            [1.0, 0.0, 4.0],
-            [2.0, 1.0, 4.0],
-            [3.0, 0.0, 4.0],
-            [4.0, 1.0, 4.0],
-            [5.0, 0.0, 4.0],
-        ]
-    )
-    oracle = np.column_stack([topics[:, 0], 1.0 - topics[:, 1]])
-    observed = topic_oracle_associations(topics, oracle)
-    assert observed[0] == pytest.approx(1.0)
-    assert observed[1] == pytest.approx(1.0)
-    assert observed[2] == pytest.approx(0.0)
-    order = np.asarray([4, 1, 5, 0, 3, 2])
-    np.testing.assert_allclose(
-        topic_oracle_associations(topics[order], oracle[order]), observed
-    )
 
 
 @pytest.mark.parametrize("continuous", [False, True])
