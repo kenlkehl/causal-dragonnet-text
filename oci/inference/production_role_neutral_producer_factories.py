@@ -17,6 +17,7 @@ completed sibling BoW artifact.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import tempfile
 from dataclasses import asdict, dataclass, fields
@@ -52,6 +53,8 @@ from .review_spent_evidence_provider import (
     SemanticWitnessTfidfVectorizerConfig,
 )
 from .role_neutral_all_ten_binding import (
+    _bind_completed_component_request,
+    _with_component_plan_identity,
     authenticate_role_neutral_bow_component,
     authenticate_role_neutral_embedding_component,
     authenticate_role_neutral_htr_component,
@@ -65,6 +68,7 @@ from .role_neutral_bow_group_execution import (
     execute_role_neutral_bow_physical_group,
     load_authenticated_role_neutral_bow_nuisance_bank,
 )
+from .multi_model_forest_stage1 import _bow_view_to_dict
 from .role_neutral_embedding_group_execution import (
     EmbeddingContrastSpec,
     ExactHeldoutEmbeddingBatch,
@@ -91,6 +95,7 @@ from .role_neutral_neural_query_group_execution import (
 )
 from .role_neutral_tfidf_group_execution import (
     RoleNeutralTfidfPhysicalGroupRequest,
+    _configuration as _tfidf_execution_configuration,
     execute_role_neutral_tfidf_physical_group,
 )
 
@@ -246,6 +251,10 @@ def _canonical(value: Any) -> str:
         ensure_ascii=False,
         allow_nan=False,
     )
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
 def _profile(
@@ -1803,6 +1812,59 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
             prepared=prepared,
             profiles=self.architecture_profiles,
         )
+        def bow_configuration_identity() -> str:
+            return _sha256_json(
+                {
+                    "view_configs": [
+                        _bow_view_to_dict(view)
+                        for view in bindings.bow_views
+                    ],
+                    "nuisance_folds": bindings.bow_nuisance_folds,
+                    "effect_folds": bindings.bow_effect_folds,
+                    "e_clip": bindings.bow_e_clip,
+                    "outcome_type": "binary",
+                    "nuisance_source_policy": (
+                        "mean_of_fit_row_oof_bow_views_v1"
+                    ),
+                    "pseudo_target_formula": (
+                        "(outcome-m_hat)/(treatment-clipped_e_hat)"
+                    ),
+                    "r_weight_formula": "(treatment-clipped_e_hat)^2",
+                    "residual_effect_objectives": [
+                        "effect_pseudo_target",
+                        "effect_weighted_r",
+                    ],
+                    "text_truncation_applied": False,
+                }
+            )
+
+        def htr_configuration_identity() -> str:
+            return _sha256_json(
+                {
+                    "configuration": bindings.htr.as_dict(),
+                    "runtime_compatibility_class": (
+                        self.runtime_compatibility_class
+                    ),
+                }
+            )
+
+        def matched_configuration_identity() -> str:
+            return _sha256_json(
+                {
+                    "matched_pair": bindings.matched_pair.as_dict(),
+                    "bow_views": [
+                        _bow_view_to_dict(view)
+                        for view in bindings.bow_views
+                    ],
+                    "outcome_type": "binary",
+                    "matching_input_scale": "probability",
+                    "scaling_state_policy": (
+                        "no_separate_scaler_probability_inputs_v1"
+                    ),
+                    "text_truncation_applied": False,
+                    "top_k_evidence_applied": False,
+                }
+            )
         preflight = getattr(
             prepared,
             "cluster_preflight_artifact_handle",
@@ -1874,6 +1936,9 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                     plan=invocation.plan,
                     physical_owner_scope_id=(
                         invocation.physical_owner.scope_id
+                    ),
+                    expected_configuration_identity_sha256=(
+                        bow_configuration_identity()
                     ),
                 ),
             )
@@ -1973,6 +2038,9 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                     ),
                     htr_model_path=prepared.htr_model_path,
                     device=invocation.resource,
+                    expected_configuration_identity_sha256=(
+                        htr_configuration_identity()
+                    ),
                 ),
             )
 
@@ -1983,9 +2051,20 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                 plan=invocation.plan,
                 physical_owner_scope_id=invocation.physical_owner.scope_id,
             )
+            bow_root = invocation.output_root.parent / "bow"
+            if bow_root.is_dir():
+                bow_request = _bind_completed_component_request(
+                    root=bow_root,
+                    request=bow_request,
+                    component="bow",
+                    plan_field="plan_scientific_content_sha256",
+                    expected_configuration_identity_sha256=(
+                        bow_configuration_identity()
+                    ),
+                )
             nuisance_bank = (
                 load_authenticated_role_neutral_bow_nuisance_bank(
-                    root=invocation.output_root.parent / "bow",
+                    root=bow_root,
                     request=bow_request,
                 )
             )
@@ -2005,6 +2084,17 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                     self.runtime_compatibility_class
                 ),
             )
+            if (
+                request.scientific_plan_content_sha256
+                != nuisance_bank.plan_scientific_content_sha256
+            ):
+                request = _with_component_plan_identity(
+                    request=request,
+                    plan_field="scientific_plan_content_sha256",
+                    plan_identity=(
+                        nuisance_bank.plan_scientific_content_sha256
+                    ),
+                )
             inputs = _group_inputs(prepared, invocation)
             heldout_loader = _text_loader(
                 owner_rows=request.physical_owner.heldout_row_ids,
@@ -2086,6 +2176,9 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                         runtime_compatibility_class=(
                             self.runtime_compatibility_class
                         ),
+                        expected_configuration_identity_sha256=(
+                            matched_configuration_identity()
+                        ),
                     )
                 ),
             )
@@ -2101,9 +2194,20 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                 plan=invocation.plan,
                 physical_owner_scope_id=invocation.physical_owner.scope_id,
             )
+            bow_root = invocation.output_root.parent / "bow"
+            if bow_root.is_dir():
+                bow_request = _bind_completed_component_request(
+                    root=bow_root,
+                    request=bow_request,
+                    component="bow",
+                    plan_field="plan_scientific_content_sha256",
+                    expected_configuration_identity_sha256=(
+                        bow_configuration_identity()
+                    ),
+                )
             nuisance_bank = (
                 load_authenticated_role_neutral_bow_nuisance_bank(
-                    root=invocation.output_root.parent / "bow",
+                    root=bow_root,
                     request=bow_request,
                 )
             )
@@ -2222,6 +2326,14 @@ class PreparedBuildRoleNeutralProducerFactoriesBuilder:
                     plan=invocation.plan,
                     physical_owner_scope_id=(
                         invocation.physical_owner.scope_id
+                    ),
+                    expected_configuration_identity_sha256=(
+                        _sha256_json(
+                            _tfidf_execution_configuration(
+                                prepared.config,
+                                request=request,
+                            )
+                        )
                     ),
                 ),
             )

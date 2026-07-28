@@ -482,7 +482,7 @@ def test_builder_binds_matched_and_embedding_to_prior_bow_without_heldout_labels
         bow_nuisance_folds=5,
         bow_effect_folds=5,
         bow_e_clip=0.01,
-        matched_pair=object(),
+        matched_pair=SimpleNamespace(as_dict=lambda: {}),
         embedding=object(),
         embedding_target_sources={
             "cell": "fit_treatment_outcome_cell_code",

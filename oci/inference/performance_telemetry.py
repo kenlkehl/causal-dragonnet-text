@@ -11,6 +11,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from .portable_resource_scheduler import (
+    _logical_to_physical_cuda_indices,
+)
+
 TELEMETRY_SCHEMA = "portable_workflow_subphase_telemetry_v1"
 _ACTIVITY_KINDS = frozenset(
     {
@@ -94,6 +98,11 @@ def sample_nvidia_gpus(devices: Sequence[str]) -> tuple[Mapping[str, Any], ...]:
     ]
     if not indices:
         return ()
+    logical_to_physical = _logical_to_physical_cuda_indices(indices)
+    physical_to_logical = {
+        physical: logical
+        for logical, physical in logical_to_physical.items()
+    }
     try:
         completed = subprocess.run(
             [
@@ -108,19 +117,20 @@ def sample_nvidia_gpus(devices: Sequence[str]) -> tuple[Mapping[str, Any], ...]:
         )
     except (OSError, subprocess.SubprocessError):
         return ()
-    requested = set(indices)
+    requested = set(physical_to_logical)
     rows: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
         if len(parts) != 5:
             continue
         try:
-            index = int(parts[0])
-            if index not in requested:
+            physical_index = int(parts[0])
+            if physical_index not in requested:
                 continue
+            logical_index = physical_to_logical[physical_index]
             rows.append(
                 {
-                    "device": f"cuda:{index}",
+                    "device": f"cuda:{logical_index}",
                     "uuid": parts[1],
                     "utilization_percent": float(parts[2]),
                     "memory_used_bytes": int(parts[3]) * 1024 * 1024,

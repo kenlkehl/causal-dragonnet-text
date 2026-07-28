@@ -884,6 +884,14 @@ class PersistentRoleNeutralExecutionSession:
         if getattr(self, "_marker_root", None) is not None:
             shutil.rmtree(self._marker_root, ignore_errors=True)
 
+    def interrupt(self) -> None:
+        """Stop every owned worker group without waiting for active calls."""
+
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        self._terminate()
+
     def close(self) -> None:
         with self._condition:
             if self._closed:

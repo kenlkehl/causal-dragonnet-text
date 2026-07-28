@@ -1544,8 +1544,10 @@ class OpenAICompatibleJsonDiscoveryJobRunner:
             raise ValueError("discovery response choices must be a sequence")
         if len(choices) != 1:
             raise ValueError("discovery response must contain exactly one choice")
-        if _field(response, "model") != self.model_name:
-            raise ValueError("discovery response model differs from the configured model")
+        _llm_routing.validate_stage2_response_model(
+            _field(response, "model"),
+            requested_model=self.model_name,
+        )
         choice = choices[0]
         if _field(choice, "finish_reason") != "stop":
             raise ValueError("discovery response finish_reason must be exactly 'stop'")

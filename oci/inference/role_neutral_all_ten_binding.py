@@ -19,7 +19,7 @@ import hashlib
 import json
 import os
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -89,6 +89,7 @@ EXPECTED_COMPONENT_FAMILIES = MappingProxyType(
 
 _HEX = frozenset("0123456789abcdef")
 _COMPONENT_TERMINAL_FILE = "execution_manifest.json"
+_COMPONENT_FIT_METADATA_FILE = "fit_state/metadata.json"
 
 
 def _validate_static_family_contract() -> None:
@@ -331,6 +332,150 @@ def _read_registered_component_json(
     ):
         raise ValueError(f"{label} differs from its terminal registration")
     return value
+
+
+def _bind_completed_component_request(
+    *,
+    root: Path | str,
+    request: Any,
+    component: str,
+    plan_field: str,
+    expected_configuration_identity_sha256: str | None = None,
+    configuration_bound_by_validator: bool = False,
+) -> Any:
+    """Bind a current request to an otherwise identical completed component.
+
+    Historical component requests included the aggregate all-ten Stage 1 plan
+    hash.  That made a completed BoW/HTR/etc. fit unusable when an unrelated
+    producer changed.  For resume only, accept the artifact's historical plan
+    hash after proving every component-local request field is unchanged.
+
+    Components whose typed request does not carry its scientific
+    configuration must additionally supply the configuration identity
+    expected by the current factory.  This keeps the compatibility relaxation
+    component-local and fail-closed.
+    """
+
+    source = Path(root)
+    if source.is_symlink():
+        raise ValueError(f"{component} artifact root cannot be a symbolic link")
+    tree = source.resolve(strict=True)
+    if tree != source.absolute() or not tree.is_dir():
+        raise ValueError(
+            f"{component} artifact root must be one canonical directory"
+        )
+    terminal, _digest, _size = _read_component_json(
+        tree,
+        _COMPONENT_TERMINAL_FILE,
+        label=f"{component} execution terminal",
+    )
+    stored = terminal.get("group_request")
+    if not isinstance(stored, Mapping):
+        raise ValueError(f"{component} terminal lacks its typed group request")
+    current = request.as_dict()
+    if stored == current:
+        return request
+    if set(stored) != set(current) or plan_field not in stored:
+        raise ValueError(
+            f"{component} completed request schema differs from the current request"
+        )
+    stored_projection = {
+        key: copy.deepcopy(value)
+        for key, value in stored.items()
+        if key not in {plan_field, "content_sha256"}
+    }
+    current_projection = {
+        key: copy.deepcopy(value)
+        for key, value in current.items()
+        if key not in {plan_field, "content_sha256"}
+    }
+    if stored_projection != current_projection:
+        raise ValueError(
+            f"{component} completed request differs in component-local science"
+        )
+    if (
+        expected_configuration_identity_sha256 is None
+        and "scientific_configuration" not in current_projection
+        and not configuration_bound_by_validator
+    ):
+        raise ValueError(
+            f"{component} plan-independent resume requires the current "
+            "component configuration identity"
+        )
+    if expected_configuration_identity_sha256 is not None:
+        fit_metadata, _metadata_digest, _metadata_size = _read_component_json(
+            tree,
+            _COMPONENT_FIT_METADATA_FILE,
+            label=f"{component} fit metadata",
+        )
+        expected_configuration = _require_sha256(
+            expected_configuration_identity_sha256,
+            label=f"{component} expected configuration identity",
+        )
+        if (
+            fit_metadata.get("configuration_identity_sha256")
+            != expected_configuration
+        ):
+            raise ValueError(
+                f"{component} completed configuration differs from the "
+                "current request"
+            )
+    historical_plan_identity = _require_sha256(
+        stored.get(plan_field),
+        label=f"{component} historical plan identity",
+    )
+    rebound = _with_component_plan_identity(
+        request=request,
+        plan_field=plan_field,
+        plan_identity=historical_plan_identity,
+    )
+    if rebound.content_sha256 != _require_sha256(
+        stored.get("content_sha256"),
+        label=f"{component} historical request identity",
+    ):
+        raise ValueError(
+            f"{component} historical request content identity is invalid"
+        )
+    if rebound.as_dict() != dict(stored):
+        raise ValueError(
+            f"{component} historical request cannot be reconstructed exactly"
+        )
+    return rebound
+
+
+def _with_component_plan_identity(
+    *,
+    request: Any,
+    plan_field: str,
+    plan_identity: str,
+) -> Any:
+    """Rebind only the aggregate plan field of one typed component request."""
+
+    identity = _require_sha256(
+        plan_identity,
+        label="component plan identity",
+    )
+    body = request.as_dict()
+    body.pop("content_sha256")
+    if plan_field not in body:
+        raise ValueError("component request does not contain its plan field")
+    body[plan_field] = identity
+    replacements = {
+        plan_field: identity,
+        "content_sha256": _sha256_json(body),
+    }
+    authority_plan = getattr(request, "authority_plan", None)
+    if isinstance(authority_plan, Stage1ScopePlan):
+        historical_authority = replace(authority_plan)
+        object.__setattr__(
+            historical_authority,
+            "scientific_content_sha256",
+            identity,
+        )
+        replacements["authority_plan"] = historical_authority
+    rebound = replace(request, **replacements)
+    rebound.as_dict()
+    return rebound
 
 
 def _require_terminal_false(
@@ -999,7 +1144,25 @@ def _standard_component_receipt(
             registration,
             label=f"{family} fit-only seal",
         )
-        seals[family] = seal
+        # The component validator has authenticated the historical seal
+        # against its original request.  Re-express that same sealed payload
+        # under the current aggregate plan for the in-memory receipt only;
+        # artifact bytes remain immutable.
+        seals[family] = build_role_neutral_fit_only_family_seal(
+            plan=plan,
+            physical_owner_scope_id=owner.scope_id,
+            family=family,
+            evidence_payload=seal.get("evidence_payload") or {},
+            producer_identity_sha256=seal.get(
+                "producer_identity_sha256"
+            ),
+            configuration_identity_sha256=seal.get(
+                "configuration_identity_sha256"
+            ),
+            fit_state_artifact_sha256=seal.get(
+                "fit_state_artifact_sha256"
+            ),
+        )
     return AuthenticatedRoleNeutralComponentReceipt.create(
         plan=plan,
         physical_owner_scope_id=owner.scope_id,
@@ -1040,6 +1203,7 @@ def authenticate_role_neutral_bow_component(
     root: Path | str,
     plan: Stage1ScopePlan,
     physical_owner_scope_id: str,
+    expected_configuration_identity_sha256: str | None = None,
 ) -> AuthenticatedRoleNeutralComponentReceipt:
     """Freshly validate and adapt the two complete BoW families."""
 
@@ -1051,6 +1215,15 @@ def authenticate_role_neutral_bow_component(
     request = RoleNeutralBoWPhysicalGroupRequest.from_plan(
         plan=plan,
         physical_owner_scope_id=physical_owner_scope_id,
+    )
+    request = _bind_completed_component_request(
+        root=root,
+        request=request,
+        component="bow",
+        plan_field="plan_scientific_content_sha256",
+        expected_configuration_identity_sha256=(
+            expected_configuration_identity_sha256
+        ),
     )
     terminal = validate_role_neutral_bow_group_execution(
         root=root,
@@ -1078,6 +1251,7 @@ def authenticate_role_neutral_htr_component(
     physical_owner_scope_id: str,
     htr_model_path: Path | str | None = None,
     device: Any = "cpu",
+    expected_configuration_identity_sha256: str | None = None,
 ) -> AuthenticatedRoleNeutralComponentReceipt:
     """Freshly replay, validate, and adapt the complete HTR family."""
 
@@ -1089,6 +1263,15 @@ def authenticate_role_neutral_htr_component(
     request = RoleNeutralHTRPhysicalGroupRequest.from_plan(
         plan=plan,
         physical_owner_scope_id=physical_owner_scope_id,
+    )
+    request = _bind_completed_component_request(
+        root=root,
+        request=request,
+        component="htr",
+        plan_field="plan_scientific_content_sha256",
+        expected_configuration_identity_sha256=(
+            expected_configuration_identity_sha256
+        ),
     )
     terminal = validate_role_neutral_htr_group_execution(
         root=root,
@@ -1119,6 +1302,7 @@ def authenticate_role_neutral_matched_pair_component(
     htr_model_identity_sha256: str,
     nuisance_artifact_identity_sha256: str,
     runtime_compatibility_class: str,
+    expected_configuration_identity_sha256: str | None = None,
 ) -> AuthenticatedRoleNeutralComponentReceipt:
     """Validate both matched-pair subproducers and derive one common seal."""
 
@@ -1136,6 +1320,15 @@ def authenticate_role_neutral_matched_pair_component(
         htr_model_identity_sha256=htr_model_identity_sha256,
         nuisance_artifact_identity_sha256=nuisance_artifact_identity_sha256,
         runtime_compatibility_class=runtime_compatibility_class,
+    )
+    request = _bind_completed_component_request(
+        root=root,
+        request=request,
+        component="matched_pair",
+        plan_field="scientific_plan_content_sha256",
+        expected_configuration_identity_sha256=(
+            expected_configuration_identity_sha256
+        ),
     )
     terminal = validate_role_neutral_matched_pair_group_execution(
         root=root,
@@ -1241,6 +1434,7 @@ def authenticate_role_neutral_tfidf_component(
     root: Path | str,
     plan: Stage1ScopePlan,
     physical_owner_scope_id: str,
+    expected_configuration_identity_sha256: str | None = None,
 ) -> AuthenticatedRoleNeutralComponentReceipt:
     """Freshly validate and adapt topics plus residual TF-IDF n-grams."""
 
@@ -1252,6 +1446,15 @@ def authenticate_role_neutral_tfidf_component(
     request = RoleNeutralTfidfPhysicalGroupRequest.from_plan(
         plan=plan,
         physical_owner_scope_id=physical_owner_scope_id,
+    )
+    request = _bind_completed_component_request(
+        root=root,
+        request=request,
+        component="tfidf",
+        plan_field="plan_scientific_content_sha256",
+        expected_configuration_identity_sha256=(
+            expected_configuration_identity_sha256
+        ),
     )
     terminal = validate_role_neutral_tfidf_group_execution(
         root=root,
@@ -1289,13 +1492,17 @@ def authenticate_role_neutral_neural_query_component(
         request, RoleNeutralNeuralQueryPhysicalGroupRequest
     ):
         raise TypeError("neural-query adapter requires its typed request")
+    request = _bind_completed_component_request(
+        root=root,
+        request=request,
+        component="neural_query",
+        plan_field="plan_scientific_content_sha256",
+    )
     owner, members = _owner_group(
         plan, request.physical_owner.scope_id
     )
     if (
-        request.plan_scientific_content_sha256
-        != plan.scientific_content_sha256
-        or request.physical_owner != owner
+        request.physical_owner != owner
         or request.logical_members != members
     ):
         raise ValueError("neural-query request belongs to another plan/group")
@@ -1341,11 +1548,16 @@ def authenticate_role_neutral_embedding_component(
 
     if not isinstance(request, RoleNeutralEmbeddingPhysicalGroupRequest):
         raise TypeError("embedding adapter requires its typed request")
+    request = _bind_completed_component_request(
+        root=root,
+        request=request,
+        component="embeddings",
+        plan_field="plan_scientific_content_sha256",
+        configuration_bound_by_validator=True,
+    )
     owner, members = _owner_group(plan, request.physical_owner.scope_id)
     if (
-        request.plan_scientific_content_sha256
-        != plan.scientific_content_sha256
-        or request.physical_owner != owner
+        request.physical_owner != owner
         or request.logical_members != members
     ):
         raise ValueError("embedding request belongs to another plan/group")

@@ -501,26 +501,6 @@ and repeated runs share the same chunk embeddings.
 Use a smaller model or pre-populated local Hugging Face cache for constrained
 hardware.
 
-You can also retrieve background chunks from an external embedded corpus, such
-as PubMed abstracts, using the same embedding model and chunking setup:
-
-```bash
-python -m oci.inference.build_embedding_chunk_cache \
-  --input pubmed_abstracts.parquet \
-  --text-column abstract \
-  --output-cache-dir /data1/ken/pubmed_embedding_cache \
-  --model-name Qwen/Qwen3-Embedding-8B \
-  --corpus-name pubmed_abstracts \
-  --source-id-column pmid
-```
-
-Then set
-`architecture.multi_model_agentic_forest.embedding_contrast.external_corpus_cache_dirs`
-to that cache path, or pass `--embedding-external-cache-dir` to the oracle
-script. External chunks are retrieved for the positive and negative tails of
-each derived direction and are included as background naming evidence; they do
-not alter the study-cohort contrast vectors.
-
 The proposal-agent prompt receives a compact evidence payload: BoW rows are
 capped per view, embedding retrieval chunks are clipped, and JSON is serialized
 compactly. This keeps prompt length controlled while leaving
@@ -785,9 +765,7 @@ Use `--feature-discovery-methods bow htr embedding_contrast` to select the
 oracle run's discovery sources explicitly.
 Use `--embedding-disable-cell-contrasts` or
 `--embedding-disable-orthogonal-r-score-contrasts` to fall back to the smaller
-contrast set. Use `--embedding-external-cache-dir /path/to/cache` to retrieve
-background chunks from an external cache built with
-`python -m oci.inference.build_embedding_chunk_cache`.
+contrast set.
 
 Agentic attention-variable forest smoke test, assuming a Qwen vLLM server is
 already running with `--reasoning-parser qwen3`:

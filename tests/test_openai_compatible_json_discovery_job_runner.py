@@ -335,6 +335,118 @@ def test_identity_is_stable_authenticated_secret_free_and_transport_is_lazy():
     assert first["identity_sha256"] == runner_module.content_sha256(body)
 
 
+def test_stage2_endpoint_authentication_supports_bearer_and_google_adc_without_secret_identity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    none = llm_routing.resolve_stage2_endpoint_authentication({})
+    assert none.api_key == "EMPTY"
+    assert none.identity["mode"] == "none"
+
+    static = llm_routing.resolve_stage2_endpoint_authentication(
+        {
+            llm_routing.STAGE2_ENDPOINT_AUTH_MODE_ENV: "api_key",
+            llm_routing.STAGE2_ENDPOINT_API_KEY_ENV: "remote-secret",
+        }
+    )
+    assert static.api_key == "env:OCI_STAGE2_ENDPOINT_API_KEY"
+    assert static.identity == {
+        "schema_version": "stage2_endpoint_authentication_v1",
+        "mode": "api_key",
+        "credential_source": "OCI_STAGE2_ENDPOINT_API_KEY",
+    }
+    assert "remote-secret" not in json.dumps(static.identity)
+    assert llm_routing.resolve_openai_api_key(
+        static.api_key,
+        {llm_routing.STAGE2_ENDPOINT_API_KEY_ENV: "rotated-secret"},
+    ) == "rotated-secret"
+    constructions = []
+    monkeypatch.setenv(
+        llm_routing.STAGE2_ENDPOINT_API_KEY_ENV,
+        "runtime-secret",
+    )
+    pool = llm_routing.OpenAIClientPool(
+        server_urls="https://remote.example/v1",
+        api_key=static.api_key,
+        client_factory=lambda **kwargs: constructions.append(kwargs)
+        or SimpleNamespace(close=lambda: None),
+    )
+    pool.client_for_url("https://remote.example/v1")
+    assert constructions[0]["api_key"] == "runtime-secret"
+
+    google = llm_routing.resolve_stage2_endpoint_authentication(
+        {llm_routing.STAGE2_ENDPOINT_AUTH_MODE_ENV: "google_adc"}
+    )
+    assert google.api_key == "GOOGLE_ADC"
+    assert google.identity["mode"] == "google_adc"
+
+    with pytest.raises(ValueError, match="required for api_key"):
+        llm_routing.resolve_stage2_endpoint_authentication(
+            {llm_routing.STAGE2_ENDPOINT_AUTH_MODE_ENV: "api_key"}
+        )
+
+
+def test_stage2_transport_projects_portable_requests_and_keeps_response_identity_separate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv(
+        llm_routing.STAGE2_ENDPOINT_TRANSPORT_ENV,
+        "openai_compatible",
+    )
+    transport = llm_routing.resolve_stage2_endpoint_transport()
+    assert transport.identity == {
+        "schema_version": "stage2_endpoint_transport_v1",
+        "mode": "openai_compatible",
+    }
+
+    factory = _ClientFactory([_response("{}", model="provider/canonical-v4")])
+    pool = llm_routing.OpenAIClientPool(
+        server_urls="https://remote.example/v1",
+        api_key="EMPTY",
+        client_factory=factory,
+    )
+    response = pool.client_for_url(
+        "https://remote.example/v1"
+    ).chat.completions.create(
+        model="deployment-alias",
+        messages=[{"role": "user", "content": "JSON"}],
+        max_tokens=100,
+        stop=[],
+        logprobs=False,
+        top_logprobs=0,
+        logit_bias={},
+        parallel_tool_calls=False,
+        tool_choice="none",
+        reasoning_effort="medium",
+        extra_body={
+            "top_k": 20,
+            "min_p": 0.1,
+            "chat_template_kwargs": {"enable_thinking": True},
+            "thinking_token_budget": 5000,
+        },
+    )
+
+    assert response.model == "provider/canonical-v4"
+    assert factory.calls == [
+        {
+            "model": "deployment-alias",
+            "messages": [{"role": "user", "content": "JSON"}],
+            "max_tokens": 100,
+            "logprobs": False,
+            "reasoning_effort": "medium",
+        }
+    ]
+    assert llm_routing.validate_stage2_response_model(
+        response.model,
+        requested_model="deployment-alias",
+    ) == "provider/canonical-v4"
+    with pytest.raises(ValueError, match="exact requested vLLM model"):
+        llm_routing.validate_stage2_response_model(
+            response.model,
+            requested_model="deployment-alias",
+            transport_mode="vllm",
+        )
+
+
 def test_identity_recomputes_implementation_hash(monkeypatch):
     factory = _ClientFactory([])
     runner = _runner(factory)

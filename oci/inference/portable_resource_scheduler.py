@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping, Protocol, Sequence
 
 from .portable_workflow_spec import (
@@ -18,6 +18,52 @@ RESOURCE_INVENTORY_SCHEMA = "portable_single_node_resource_inventory_v1"
 RESOURCE_PLAN_SCHEMA = "portable_single_node_resource_plan_v1"
 EXECUTION_ATTESTATION_SCHEMA = "portable_execution_attestation_v1"
 GIB = 1024**3
+
+
+def _numeric_cuda_visible_devices() -> tuple[int, ...] | None:
+    """Return logical-to-physical CUDA indices for a numeric visibility mask."""
+
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value or value == "-1":
+        return ()
+    parts = tuple(part.strip() for part in value.split(","))
+    if any(not part or not part.isdigit() for part in parts):
+        raise ValueError(
+            "CUDA_VISIBLE_DEVICES must use unique numeric GPU indices; "
+            "UUID and MIG masks are not supported by resource accounting"
+        )
+    indices = tuple(int(part) for part in parts)
+    if len(indices) != len(set(indices)):
+        raise ValueError(
+            "CUDA_VISIBLE_DEVICES must use unique numeric GPU indices; "
+            "UUID and MIG masks are not supported by resource accounting"
+        )
+    if os.environ.get("CUDA_DEVICE_ORDER", "").strip().upper() != "PCI_BUS_ID":
+        raise ValueError(
+            "numeric CUDA_VISIBLE_DEVICES resource accounting requires "
+            "CUDA_DEVICE_ORDER=PCI_BUS_ID"
+        )
+    return indices
+
+
+def _logical_to_physical_cuda_indices(
+    logical_indices: Sequence[int],
+) -> dict[int, int]:
+    requested = tuple(int(index) for index in logical_indices)
+    if any(index < 0 for index in requested):
+        raise ValueError("logical CUDA indices must be nonnegative")
+    visible = _numeric_cuda_visible_devices()
+    if visible is None:
+        return {index: index for index in requested}
+    if any(index >= len(visible) for index in requested):
+        raise RuntimeError(
+            "requested logical CUDA device is excluded by "
+            "CUDA_VISIBLE_DEVICES"
+        )
+    return {index: visible[index] for index in requested}
 
 
 class Executor(Protocol):
@@ -81,6 +127,7 @@ def discover_resources() -> ResourceInventory:
     """Discover CPU/GPU resources without assuming a GPU count or fixed IDs."""
 
     cpu_count = max(1, int(os.cpu_count() or 1))
+    visible = _numeric_cuda_visible_devices()
     try:
         completed = subprocess.run(
             [
@@ -123,25 +170,44 @@ def discover_resources() -> ResourceInventory:
                 continue
     except (OSError, subprocess.SubprocessError):
         pass
-    gpus: list[GPUResource] = []
+    physical_gpus: dict[int, GPUResource] = {}
     for line in completed.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
         if len(parts) != 5:
             continue
         try:
-            gpus.append(
-                GPUResource(
-                    device=f"cuda:{int(parts[0])}",
-                    uuid=parts[1],
-                    total_memory_bytes=int(parts[2]) * 1024 * 1024,
-                    free_memory_bytes=int(parts[3]) * 1024 * 1024,
-                    utilization_percent=float(parts[4]),
-                    external_processes=tuple(process_map.get(parts[1], ())),
-                )
+            physical_index = int(parts[0])
+            physical_gpus[physical_index] = GPUResource(
+                device=f"cuda:{physical_index}",
+                uuid=parts[1],
+                total_memory_bytes=int(parts[2]) * 1024 * 1024,
+                free_memory_bytes=int(parts[3]) * 1024 * 1024,
+                utilization_percent=float(parts[4]),
+                external_processes=tuple(process_map.get(parts[1], ())),
             )
         except ValueError:
             continue
-    return ResourceInventory(cpu_count=cpu_count, gpus=tuple(gpus))
+    if visible is None:
+        gpus = tuple(physical_gpus.values())
+    else:
+        missing = [
+            physical_index
+            for physical_index in visible
+            if physical_index not in physical_gpus
+        ]
+        if missing:
+            raise RuntimeError(
+                "CUDA_VISIBLE_DEVICES references unavailable physical GPUs: "
+                f"{missing}"
+            )
+        gpus = tuple(
+            replace(
+                physical_gpus[physical_index],
+                device=f"cuda:{logical_index}",
+            )
+            for logical_index, physical_index in enumerate(visible)
+        )
+    return ResourceInventory(cpu_count=cpu_count, gpus=gpus)
 
 
 @dataclass(frozen=True)

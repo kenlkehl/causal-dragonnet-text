@@ -7,6 +7,8 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Mapping, Sequence
 
+from .llm_routing import validate_stage2_response_model
+
 COMPLETE_PAGED_VERSION = "complete_paged_v1"
 COMPLETE_PAGED_REQUEST_PLAN_SCHEMA = "complete_paged_request_plan_v1"
 COMPLETE_PAGED_RESPONSE_SCHEMA = "complete_paged_closed_response_v1"
@@ -718,13 +720,13 @@ def validate_response_envelope(
     choice = choices[0]
     message = _response_field(choice, "message")
     content = _response_field(message, "content")
-    if (
-        _response_field(response, "model") != configured_model
-        or _response_field(choice, "finish_reason") != "stop"
-        or not isinstance(content, str)
-    ):
+    validate_stage2_response_model(
+        _response_field(response, "model"),
+        requested_model=configured_model,
+    )
+    if _response_field(choice, "finish_reason") != "stop" or not isinstance(content, str):
         raise ValueError(
-            "complete-page response has wrong model, non-stop finish, or invalid content"
+            "complete-page response has non-stop finish or invalid content"
         )
     return content
 
@@ -748,12 +750,13 @@ def execute_zero_retry_with_one_schema_repair(
         initial_response,
         configured_model=configured_model,
     )
+    initial_response_model = _response_field(initial_response, "model")
     attempts = [
         {
             "kind": "initial",
             "request_sha256": _value_sha(initial_request),
             "response_sha256": _sha(initial_content),
-            "model": configured_model,
+            "model": initial_response_model,
             "finish_reason": "stop",
         }
     ]
@@ -766,12 +769,13 @@ def execute_zero_retry_with_one_schema_repair(
             repair_response,
             configured_model=configured_model,
         )
+        repair_response_model = _response_field(repair_response, "model")
         attempts.append(
             {
                 "kind": "fixed_schema_repair",
                 "request_sha256": _value_sha(repair_request),
                 "response_sha256": _sha(repair_content),
-                "model": configured_model,
+                "model": repair_response_model,
                 "finish_reason": "stop",
             }
         )

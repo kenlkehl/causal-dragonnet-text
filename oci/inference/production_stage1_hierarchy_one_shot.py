@@ -7,12 +7,13 @@ approval seam.  Preparation, process-local authorization, and execution remain
 inside :func:`run_internal_production_stage1_hierarchy_one_shot`.
 
 The caller supplies one canonical OpenAI-compatible base URL and one exact
-model name. Pools, fallback endpoints, model autodiscovery, and caller-provided
-deployment digests are not accepted. Every live hierarchy, proposal/review, and
-explicit-extraction response must report that exact model and
-``finish_reason=stop`` before response content is parsed or made available to
-semantic/cache handling. Final output, hierarchy preparation, and the
-non-authorizing run-result audit record are distinct fresh roots.
+requested model name. Pools, fallback endpoints, model autodiscovery, and
+caller-provided deployment digests are not accepted. vLLM responses must echo
+that exact model; portable providers may report a canonical/versioned model
+identity, which is validated and recorded separately from the requested route.
+Every response must report ``finish_reason=stop`` before content is parsed or
+made available to semantic/cache handling. Final output, hierarchy preparation,
+and the non-authorizing run-result audit record are distinct fresh roots.
 """
 
 from __future__ import annotations
@@ -60,6 +61,12 @@ from ..extraction import (
     reconcile_complete_page_responses,
 )
 from ..extraction import VLLMFeatureExtractor
+from ..extraction.llm_routing import (
+    resolve_stage2_endpoint_authentication,
+    resolve_stage2_endpoint_transport,
+    validate_stage2_endpoint_runtime_configuration,
+    validate_stage2_response_model,
+)
 from .adaptive_hierarchical_stage1_reconsideration import (
     AdaptiveReconsiderationConfig,
     adaptive_hierarchical_stage1_reconsideration_identity,
@@ -77,7 +84,7 @@ from .all_evidence_post_extraction_review import (
     CONDITIONAL_CONTEXT_AND_GATE_REVIEW_POLICY,
     CausalReviewConfig,
 )
-from .all_evidence_fusion_cli import (
+from .production_coordinate_preserving_upstream_schema import (
     build_coordinate_preserving_final_upstream_schema_config,
 )
 from .approved_hierarchical_discovery_batch import FrozenReviewEvidencePolicyBinding
@@ -391,10 +398,20 @@ def _assert_exact_completion_response_metadata(
         if isinstance(choice, Mapping)
         else getattr(choice, "finish_reason", None)
     )
-    if response_model != expected_model:
-        raise ValueError("production response model differs from the exact requested model")
+    validate_stage2_response_model(
+        response_model,
+        requested_model=expected_model,
+    )
     if finish_reason != "stop":
         raise ValueError("production response finish_reason must be exactly 'stop'")
+
+
+def _required_response_model_identity(requested_model: str) -> str | None:
+    return (
+        requested_model
+        if resolve_stage2_endpoint_transport().mode == "vllm"
+        else None
+    )
 
 
 class _ProductionResponseMetadataAbort(BaseException):
@@ -1412,7 +1429,9 @@ class ProductionSingleEndpointJsonDiscoveryJobRunner(OpenAICompatibleJsonDiscove
             "exact_model_contract": self.model_name,
             "response_metadata_policy": {
                 "checked_before_content_semantics_and_cache": True,
-                "required_response_model": self.model_name,
+                "required_response_model": (
+                    _required_response_model_identity(self.model_name)
+                ),
                 "required_finish_reason": "stop",
                 "applies_to_initial_invalid_and_repair_responses": True,
             },
@@ -1734,6 +1753,8 @@ class ProductionStage1HierarchyOneShotOptions:
     outcome_type: str | None = None
     direct_numerical_bank_manifest_path: Path | None = None
     upstream_review_policy: str | None = None
+    resume: bool = False
+    endpoint_api_key: str = "EMPTY"
 
     @property
     def proposal_max_tokens(self) -> int:
@@ -1890,6 +1911,10 @@ def _validate_options(options: ProductionStage1HierarchyOneShotOptions) -> None:
             raise TypeError(f"{name} must be a pathlib.Path")
     if not isinstance(options.stage2_protocol, Stage2HierarchyPromptProtocol):
         raise TypeError("stage2_protocol must be the required Stage2HierarchyPromptProtocol")
+    if not isinstance(options.resume, bool):
+        raise TypeError("resume must be boolean")
+    if not isinstance(options.endpoint_api_key, str) or not options.endpoint_api_key:
+        raise TypeError("endpoint_api_key must be a nonempty string")
     if not isinstance(options.post_extraction_review_config, CausalReviewConfig):
         raise TypeError("post_extraction_review_config must be the required " "CausalReviewConfig")
     if not isinstance(
@@ -2356,9 +2381,16 @@ def _validate_fresh_roots(options: ProductionStage1HierarchyOneShotOptions) -> N
         ):
             raise ValueError(f"{label} must be separate from the authenticated Stage-1 bundle")
     for label, path in roots.items():
-        if path.exists():
-            raise ValueError(f"{label} must be a fresh nonexistent path")
-        if not path.parent.is_dir():
+        if path.exists() and (
+            not options.resume
+            or path.is_symlink()
+            or not path.is_dir()
+        ):
+            raise ValueError(
+                f"{label} must be a fresh nonexistent path unless "
+                "resuming a real directory"
+            )
+        if not path.exists() and not path.parent.is_dir():
             raise ValueError(f"{label} parent directory must already exist")
 
 
@@ -2652,7 +2684,7 @@ def build_production_stage1_hierarchy_runner(
         max_additions_per_iter=options.max_candidates,
         agent_server_url=endpoint,
         agent_model_name=options.model_name,
-        agent_api_key="EMPTY",
+        agent_api_key=options.endpoint_api_key,
         agent_temperature=proposal_generation.temperature,
         agent_max_tokens=proposal_generation.max_tokens,
         agent_enable_thinking=proposal_generation.thinking_enabled,
@@ -2681,7 +2713,7 @@ def build_production_stage1_hierarchy_runner(
             vllm_mode="server",
             vllm_server_url=endpoint,
             vllm_model_name=options.model_name,
-            vllm_api_key="EMPTY",
+            vllm_api_key=options.endpoint_api_key,
             vllm_tensor_parallel_size=1,
             vllm_enable_thinking=patient_generation.thinking_enabled,
             extraction_batch_size=options.extraction_batch_size,
@@ -2712,7 +2744,7 @@ def build_production_stage1_hierarchy_runner(
     hierarchy_runner = ProductionSingleEndpointJsonDiscoveryJobRunner(
         server_urls=endpoint,
         model_name=model_name,
-        api_key="EMPTY",
+        api_key=options.endpoint_api_key,
         request_timeout=options.request_timeout,
         max_retries=(
             options.stage2_protocol.generation_policy.interpret_architecture_chunk.transport_max_retries
@@ -2930,7 +2962,7 @@ def _construct_reference_only_role_neutral_stage2_runner(
         max_additions_per_iter=options.max_candidates,
         agent_server_url=endpoint,
         agent_model_name=model_name,
-        agent_api_key="EMPTY",
+        agent_api_key=options.endpoint_api_key,
         agent_temperature=proposal_generation.temperature,
         agent_max_tokens=proposal_generation.max_tokens,
         agent_enable_thinking=proposal_generation.thinking_enabled,
@@ -2964,7 +2996,7 @@ def _construct_reference_only_role_neutral_stage2_runner(
             vllm_mode="server",
             vllm_server_url=endpoint,
             vllm_model_name=model_name,
-            vllm_api_key="EMPTY",
+            vllm_api_key=options.endpoint_api_key,
             vllm_tensor_parallel_size=1,
             vllm_enable_thinking=patient_generation.thinking_enabled,
             extraction_batch_size=options.extraction_batch_size,
@@ -2995,7 +3027,7 @@ def _construct_reference_only_role_neutral_stage2_runner(
     hierarchy_runner = ProductionSingleEndpointJsonDiscoveryJobRunner(
         server_urls=endpoint,
         model_name=model_name,
-        api_key="EMPTY",
+        api_key=options.endpoint_api_key,
         request_timeout=options.request_timeout,
         max_retries=(
             options.stage2_protocol.generation_policy.interpret_architecture_chunk.transport_max_retries
@@ -3284,7 +3316,9 @@ def _seal_result_attestation(
             ],
             "endpoint_pool_or_fallback_allowed": False,
             "model_autodiscovery_or_substitution_allowed": False,
-            "required_response_model": options.model_name,
+            "required_response_model": (
+                _required_response_model_identity(options.model_name)
+            ),
             "required_finish_reason": "stop",
             "response_metadata_checked_before_content_semantics_and_cache": True,
             "prompt_nontruncation_guard": runner_identity.get("prompt_nontruncation_guard"),
@@ -3327,26 +3361,37 @@ def _seal_result_attestation(
         raise RuntimeError("global production certification must remain false during candidate run")
     payload = {**body, "content_sha256": _content_sha256(body)}
     target = options.attestation_dir
+    serialized = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    result_name = "production_stage1_hierarchy_one_shot_result.json"
     if target.exists():
-        raise FileExistsError("attestation_dir appeared before atomic publication")
-    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent))
-    try:
-        result_path = temporary / "production_stage1_hierarchy_one_shot_result.json"
-        serialized = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        with result_path.open("x", encoding="utf-8") as handle:
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if target.exists():
-            raise FileExistsError("attestation_dir appeared before atomic publication")
-        temporary.rename(target)
-    except Exception:
-        if temporary.exists():
-            shutil.rmtree(temporary)
-        raise
+        prior = target / result_name
+        if (
+            not options.resume
+            or target.is_symlink()
+            or not prior.is_file()
+            or prior.read_text(encoding="utf-8") != serialized
+        ):
+            raise FileExistsError(
+                "attestation_dir differs from resumed terminal result"
+            )
+    else:
+        temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent))
+        try:
+            result_path = temporary / result_name
+            with result_path.open("x", encoding="utf-8") as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if target.exists():
+                raise FileExistsError("attestation_dir appeared before atomic publication")
+            temporary.rename(target)
+        except Exception:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            raise
     return {
         "status": "completed",
-        "attestation_path": str(target / "production_stage1_hierarchy_one_shot_result.json"),
+        "attestation_path": str(target / result_name),
         "attestation_content_sha256": payload["content_sha256"],
         "prediction_path": str(prediction_path),
         "prediction_sha256": prediction_sha,
@@ -3853,29 +3898,42 @@ def _seal_reference_only_result_attestation(
     }
     payload = {**body, "content_sha256": _content_sha256(body)}
     target = options.attestation_dir
-    if target.exists() or target.is_symlink():
-        raise FileExistsError("direct attestation directory appeared before publication")
-    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent))
-    try:
-        result_path = temporary / PRODUCTION_ROLE_NEUTRAL_STAGE2_ONE_SHOT_ATTESTATION_FILENAME
-        serialized = (
-            json.dumps(
-                payload,
-                indent=2,
-                sort_keys=True,
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            + "\n"
+    serialized = (
+        json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
         )
-        with result_path.open("x", encoding="utf-8") as handle:
-            handle.write(serialized)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.rename(target)
-    except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
+        + "\n"
+    )
+    if target.exists() or target.is_symlink():
+        prior = (
+            target
+            / PRODUCTION_ROLE_NEUTRAL_STAGE2_ONE_SHOT_ATTESTATION_FILENAME
+        )
+        if (
+            not options.resume
+            or target.is_symlink()
+            or not prior.is_file()
+            or prior.read_text(encoding="utf-8") != serialized
+        ):
+            raise FileExistsError(
+                "direct attestation directory differs from resumed result"
+            )
+    else:
+        temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent))
+        try:
+            result_path = temporary / PRODUCTION_ROLE_NEUTRAL_STAGE2_ONE_SHOT_ATTESTATION_FILENAME
+            with result_path.open("x", encoding="utf-8") as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.rename(target)
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
     attestation_path = target / PRODUCTION_ROLE_NEUTRAL_STAGE2_ONE_SHOT_ATTESTATION_FILENAME
     attestation_sha = _stable_sha256(
         attestation_path,
@@ -4329,6 +4387,12 @@ def options_from_args(args: argparse.Namespace) -> ProductionStage1HierarchyOneS
     scientific_policy = PostExtractionScientificPolicy.from_mapping(
         json.loads(Path(args.post_extraction_scientific_policy).read_text(encoding="utf-8"))
     )
+    endpoint_auth = resolve_stage2_endpoint_authentication()
+    endpoint_transport = resolve_stage2_endpoint_transport()
+    validate_stage2_endpoint_runtime_configuration(
+        authentication=endpoint_auth,
+        transport=endpoint_transport,
+    )
     options = ProductionStage1HierarchyOneShotOptions(
         bundle_manifest_path=args.bundle_manifest,
         output_dir=args.output_dir,
@@ -4336,6 +4400,7 @@ def options_from_args(args: argparse.Namespace) -> ProductionStage1HierarchyOneS
         attestation_dir=args.attestation_dir,
         endpoint=str(args.endpoint),
         model_name=str(args.model),
+        endpoint_api_key=endpoint_auth.api_key,
         review_rounds=int(args.review_rounds),
         initial_training_partitions=int(args.initial_training_partitions),
         stage2_protocol=stage2_hierarchy_prompt_protocol_from_namespace(args),

@@ -136,7 +136,6 @@ a manual approval ceremony; that is retained for historical operator tooling and
 must not be exposed as the arbitrary-cohort production workflow.
 
 A deployment/container/model-tree pin is not required execution authority.
-`production_served_model_attestation.py` is optional static audit tooling only.
 
 ### 2.5 Final estimator and execution order
 
@@ -745,15 +744,10 @@ Verified checkpoints during this work include:
   tests/test_matched_pair_native_proof_capture.py
   tests/test_tfidf_nested_calibration_production.py
   tests/test_production_stage1_bundle.py` -> 83 passed, 369 warnings, 188.47s.
-- Fresh current-tree hierarchy contract/loader/one-shot/security/canary/JSON-runner
-  gate: `uv run --frozen pytest -q
-  tests/test_production_stage1_hierarchy_contract.py
-  tests/test_production_stage1_hierarchy_loader.py
-  tests/test_production_stage1_hierarchy_one_shot.py
-  tests/test_production_stage1_hierarchy_one_shot_security_audit.py
-  tests/test_canary_production_stage1_hierarchy.py
-  tests/test_openai_compatible_json_discovery_job_runner.py` -> 177 passed,
-  234.68s.
+- The historical hierarchy checkpoint included broader contract, loader,
+  security, and canary suites that have since been removed. Current focused
+  coverage remains in `tests/test_production_stage1_hierarchy_one_shot.py` and
+  `tests/test_openai_compatible_json_discovery_job_runner.py`.
 - Earlier combined generic production offline regression: 281/281 passed.
 - Relevant embedding/cache/raw-projection regression checkpoint: 171 passed.
 - BoW native proof plus adjacent combined checkpoint: 193 passed.

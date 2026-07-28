@@ -635,6 +635,36 @@ def _write_deployment_profile(
     return path
 
 
+def test_stage2_endpoint_authentication_is_secret_free_and_request_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _options(tmp_path)
+    monkeypatch.delenv("OCI_STAGE2_ENDPOINT_AUTH", raising=False)
+    monkeypatch.delenv("OCI_STAGE2_ENDPOINT_API_KEY", raising=False)
+    monkeypatch.delenv("OCI_STAGE2_ENDPOINT_TRANSPORT", raising=False)
+    baseline = ProductionAllEvidenceWorkflow(options)._request_body()
+    assert "stage2_endpoint_authentication" not in baseline
+    assert "stage2_endpoint_transport" not in baseline
+
+    monkeypatch.setenv("OCI_STAGE2_ENDPOINT_AUTH", "api_key")
+    monkeypatch.setenv("OCI_STAGE2_ENDPOINT_API_KEY", "remote-secret")
+    monkeypatch.setenv("OCI_STAGE2_ENDPOINT_TRANSPORT", "openai_compatible")
+
+    request = ProductionAllEvidenceWorkflow(options)._request_body()
+
+    assert request["stage2_endpoint_authentication"] == {
+        "schema_version": "stage2_endpoint_authentication_v1",
+        "mode": "api_key",
+        "credential_source": "OCI_STAGE2_ENDPOINT_API_KEY",
+    }
+    assert request["stage2_endpoint_transport"] == {
+        "schema_version": "stage2_endpoint_transport_v1",
+        "mode": "openai_compatible",
+    }
+    assert "remote-secret" not in json.dumps(request)
+
+
 def test_stage2_options_propagate_complete_forest_spec_and_cpu_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2572,6 +2602,40 @@ def test_phase_uses_configured_scratch_then_publishes_durable_locators(tmp_path)
     assert manifest["result"]["terminal_files"] == [str(published / "nested" / "payload.bin")]
 
 
+def test_resume_reuses_attempt_only_for_in_place_resumable_phases(tmp_path):
+    workflow = object.__new__(ProductionAllEvidenceWorkflow)
+    workflow.options = SimpleNamespace(
+        scratch_root=tmp_path / "scratch",
+        work_root=tmp_path / "durable",
+        run_control=SimpleNamespace(resume=True),
+    )
+    workflow.request = {"request_sha256": "a" * 64}
+    resumable = {"stage1_modeling", "stage2_canary", "stage2_inference"}
+
+    for phase in PHASES:
+        phase_root = (
+            workflow.options.scratch_root
+            / "production_all_evidence_workflow"
+            / workflow.request["request_sha256"]
+            / phase
+        )
+        prior = phase_root / "attempt_20000101T000000000000Z"
+        prior.mkdir(parents=True)
+        (prior / "partial.bin").write_bytes(b"preserved")
+
+        first = workflow._attempt_dir(phase)
+        second = workflow._attempt_dir(phase)
+
+        if phase in resumable:
+            assert first == prior
+            assert second == prior
+        else:
+            assert len({prior, first, second}) == 3
+            assert first.is_dir()
+            assert second.is_dir()
+        assert (prior / "partial.bin").read_bytes() == b"preserved"
+
+
 def test_direct_only_scientific_cli_fails_before_work_root_creation(tmp_path):
     o = _options(tmp_path)
     args = build_parser().parse_args(
@@ -4390,6 +4454,92 @@ def test_default_role_neutral_callable_identity_is_closed_and_worker_neutral(
             baseline_identity["physical_owner_executor"],
             baseline_identity["stage2_handoff_publisher"],
         )
+    )
+
+
+def test_stage1_preflight_identity_excludes_later_factory_implementation(
+) -> None:
+    integration = {
+        "producer_factories_builder": {
+            "callable_kind": "callable_instance",
+            "module": "oci.inference.production_role_neutral_producer_factories",
+            "qualname": "PreparedBuildRoleNeutralProducerFactoriesBuilder",
+            "source_file": {"sha256": "1" * 64},
+            "behavior_state": {
+                "state_policy": "explicit_closed_scientific_identity_v1",
+                "scientific_identity": {
+                    "families": list(EVIDENCE_FAMILIES),
+                    "runtime_compatibility_class": "test-runtime",
+                },
+            },
+        },
+        "physical_owner_executor": {"source_sha256": "1" * 64},
+        "stage2_handoff_publisher": {"source_sha256": "1" * 64},
+    }
+    changed_later_factory = deepcopy(integration)
+    changed_later_factory["producer_factories_builder"]["source_file"][
+        "sha256"
+    ] = "2" * 64
+    changed_later_factory["physical_owner_executor"][
+        "source_sha256"
+    ] = "2" * 64
+
+    memo = workflow_module._ScientificIdentityMemo()
+    baseline = workflow_module._phase_transitive_producer_code_records(
+        workflow_type=ProductionAllEvidenceWorkflow,
+        integration_hooks={"role_neutral_stage1": integration},
+        phase_overrides={},
+        identity_memo=memo,
+    )
+    changed = (
+        workflow_module._phase_transitive_producer_code_records(
+            workflow_type=ProductionAllEvidenceWorkflow,
+            integration_hooks={
+                "role_neutral_stage1": changed_later_factory,
+            },
+            phase_overrides={},
+            identity_memo=memo,
+        )
+    )
+
+    assert (
+        baseline["stage1_preflight"]["content_sha256"]
+        == changed["stage1_preflight"]["content_sha256"]
+    )
+    assert (
+        baseline["stage1_modeling"]["content_sha256"]
+        != changed["stage1_modeling"]["content_sha256"]
+    )
+    preflight_sources = {
+        row["relative_path"]
+        for row in baseline["stage1_preflight"][
+            "transitive_source_inventory"
+        ]
+    }
+    assert "oci/inference/prepared_stage1_context.py" in preflight_sources
+    assert (
+        "oci/inference/production_role_neutral_producer_factories.py"
+        not in preflight_sources
+    )
+    assert (
+        "oci/inference/production_role_neutral_process_executor.py"
+        not in preflight_sources
+    )
+
+    changed_configuration = deepcopy(integration)
+    changed_configuration["producer_factories_builder"]["behavior_state"][
+        "scientific_identity"
+    ]["runtime_compatibility_class"] = "different-runtime"
+    changed_projection = (
+        workflow_module._stage1_preflight_integration_identity(
+            changed_configuration
+        )
+    )
+    assert (
+        baseline["stage1_preflight"][
+            "role_neutral_stage1_integration"
+        ]["content_sha256"]
+        != changed_projection["content_sha256"]
     )
 
 

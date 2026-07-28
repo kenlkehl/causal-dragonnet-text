@@ -333,12 +333,14 @@ def _validated_registration(
 
 
 class _AuthenticatedNumericalPayloadCache:
-    """One-trust-boundary cache of authenticated mmap-backed payloads.
+    """One-trust-boundary cache of authenticated numerical payloads.
 
-    Manifest construction is the byte-authentication pass.  The retained
-    arrays are then guarded by their exact file/stat identities, and ordinary
-    fold/gate consumers only look up these handles.  They never reopen,
-    rehash, or repeat a whole-array finite scan.
+    Manifest construction is the byte-authentication pass.  Each temporary
+    mmap is copied into a read-only in-memory array and closed immediately, so
+    authenticating many logical contexts does not retain one file descriptor
+    per payload.  The arrays are then guarded by their exact file/stat
+    identities, and ordinary fold/gate consumers never reopen, rehash, or
+    repeat a whole-array finite scan.
     """
 
     def __init__(self) -> None:
@@ -353,8 +355,25 @@ class _AuthenticatedNumericalPayloadCache:
         self._neural_array_set_keys_by_root: dict[Path, tuple[Path, str]] = {}
         self._byte_authenticated_file_count = 0
         self._externally_authenticated_file_count = 0
+        self._unique_payload_file_count = 0
+        self._unique_neural_array_set_count = 0
         self._npy_open_count = 0
         self._ordinary_materialization_file_open_count = 0
+
+    @staticmethod
+    def _close_memmap(array: np.ndarray) -> None:
+        mapping = getattr(array, "_mmap", None)
+        if mapping is not None and not mapping.closed:
+            mapping.close()
+
+    @classmethod
+    def _detach_memmap(cls, array: np.ndarray) -> np.ndarray:
+        try:
+            detached = np.array(array, copy=True, order="K", subok=False)
+        finally:
+            cls._close_memmap(array)
+        detached.setflags(write=False)
+        return detached
 
     def validate_neural_array_set_once(
         self,
@@ -379,9 +398,18 @@ class _AuthenticatedNumericalPayloadCache:
             expected_order=("gate_row_ids", "feature_values"),
             expected_inventory=expected_inventory,
         )
-        retained = (descriptor, arrays)
+        try:
+            detached = {
+                name: self._detach_memmap(array)
+                for name, array in arrays.items()
+            }
+        finally:
+            for array in arrays.values():
+                self._close_memmap(array)
+        retained = (descriptor, detached)
         self._neural_array_sets[key] = retained
         self._neural_array_set_keys_by_root[root] = key
+        self._unique_neural_array_set_count += 1
         return retained
 
     @staticmethod
@@ -485,9 +513,11 @@ class _AuthenticatedNumericalPayloadCache:
             or not np.isfinite(np.asarray(array)).all()
         ):
             raise ValueError(f"{label} array metadata or finite-value contract changed")
+        array.setflags(write=False)
         self._arrays[key] = array
         self._path_keys[path] = key
         self._file_stats[path] = self._stat_identity(path)
+        self._unique_payload_file_count += 1
         if externally_authenticated:
             self._externally_authenticated_file_count += 1
         else:
@@ -523,9 +553,10 @@ class _AuthenticatedNumericalPayloadCache:
         if authenticated_path != path:
             raise RuntimeError(f"{label} locator changed during authentication")
         try:
-            array = np.load(path, mmap_mode="r", allow_pickle=False)
+            mapped = np.load(path, mmap_mode="r", allow_pickle=False)
         except (OSError, ValueError) as exc:
             raise ValueError(f"{label} is not one safe NPY array") from exc
+        array = self._detach_memmap(mapped)
         self._npy_open_count += 1
         self._register_path(
             key=key,
@@ -667,6 +698,12 @@ class _AuthenticatedNumericalPayloadCache:
         self._prepared_blocks[key] = prepared
         return prepared
 
+    def release_authentication_buffers(self) -> None:
+        """Drop arrays no longer needed after every block is prepared."""
+
+        self._arrays.clear()
+        self._neural_array_sets.clear()
+
     def prepared_block(
         self,
         *,
@@ -689,7 +726,7 @@ class _AuthenticatedNumericalPayloadCache:
     def audit_counters(self) -> Mapping[str, Any]:
         return {
             "schema_version": "direct_numerical_payload_cache_audit_v1",
-            "unique_payload_file_count": len(self._arrays),
+            "unique_payload_file_count": self._unique_payload_file_count,
             "unique_prepared_block_count": len(self._prepared_blocks),
             "byte_authenticated_payload_file_count": (
                 self._byte_authenticated_file_count
@@ -697,7 +734,9 @@ class _AuthenticatedNumericalPayloadCache:
             "externally_authenticated_payload_file_count": (
                 self._externally_authenticated_file_count
             ),
-            "unique_neural_query_array_set_count": len(self._neural_array_sets),
+            "unique_neural_query_array_set_count": (
+                self._unique_neural_array_set_count
+            ),
             "npy_open_count_during_fresh_audit": self._npy_open_count,
             "ordinary_materialization_payload_file_open_count": (
                 self._ordinary_materialization_file_open_count
@@ -2261,6 +2300,7 @@ class AuthenticatedRoleNeutralDirectNumericalBank:
                     projection=projection,
                     block=block,
                 )
+        payload_cache.release_authentication_buffers()
         payload_cache.validate_guarded_files()
         after = _tree_stat_inventory(execution_root)
         if before != after:

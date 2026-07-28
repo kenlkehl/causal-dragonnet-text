@@ -1194,6 +1194,7 @@ def test_roots_are_absolute_fresh_nonnested_and_outside_bundle(tmp_path: Path) -
     with pytest.raises(ValueError, match="fresh nonexistent"):
         options.attestation_dir.mkdir()
         _validate_fresh_roots(options)
+    _validate_fresh_roots(replace(options, resume=True))
     options.attestation_dir.rmdir()
     nested = ProductionStage1HierarchyOneShotOptions(
         **{
@@ -1361,7 +1362,10 @@ def test_fixed_endpoint_is_explicitly_propagated_to_all_three_client_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    options = _options(tmp_path)
+    options = replace(
+        _options(tmp_path),
+        endpoint_api_key="remote-secret",
+    )
     dataset_path = tmp_path / "cohort.parquet"
     applied = AppliedInferenceConfig(dataset_path=str(dataset_path), cv_folds=2)
     provider = SimpleNamespace(
@@ -1449,6 +1453,7 @@ def test_fixed_endpoint_is_explicitly_propagated_to_all_three_client_paths(
         assert generation_parameters == _generation_policy().feature_proposal_review
         observed["review_endpoint"] = config.agent_server_url
         observed["review_model"] = config.agent_model_name
+        observed["review_api_key"] = config.agent_api_key
         return object()
 
     def capture_extraction(
@@ -1462,6 +1467,7 @@ def test_fixed_endpoint_is_explicitly_propagated_to_all_three_client_paths(
         assert generation_parameters == _generation_policy().patient_feature_extraction
         observed["extraction_endpoint"] = config.explicit_features.vllm_server_url
         observed["extraction_model"] = config.explicit_features.vllm_model_name
+        observed["extraction_api_key"] = config.explicit_features.vllm_api_key
         return object()
 
     def capture_hierarchy(**kwargs: object) -> object:
@@ -1469,6 +1475,7 @@ def test_fixed_endpoint_is_explicitly_propagated_to_all_three_client_paths(
         assert kwargs["generation_policy"] == _generation_policy()
         observed["hierarchy_endpoint"] = kwargs["server_urls"]
         observed["hierarchy_model"] = kwargs["model_name"]
+        observed["hierarchy_api_key"] = kwargs["api_key"]
         body = {
             "endpoint_urls": [kwargs["server_urls"]],
             "model": {"name": kwargs["model_name"]},
@@ -1500,10 +1507,13 @@ def test_fixed_endpoint_is_explicitly_propagated_to_all_three_client_paths(
     assert observed == {
         "review_endpoint": TEST_ENDPOINT,
         "review_model": TEST_MODEL,
+        "review_api_key": "remote-secret",
         "extraction_endpoint": TEST_ENDPOINT,
         "extraction_model": TEST_MODEL,
+        "extraction_api_key": "remote-secret",
         "hierarchy_endpoint": TEST_ENDPOINT,
         "hierarchy_model": TEST_MODEL,
+        "hierarchy_api_key": "remote-secret",
     }
     assert runner.review_spent_evidence_provider is provider
     assert runner.review_partition_provider is provider

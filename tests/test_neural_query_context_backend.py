@@ -34,7 +34,6 @@ from oci.inference.neural_query_context_backend import (
 from oci.inference.neural_query_operational_controls import (
     RoleNeutralNeuralQueryTaskResourcePlan,
 )
-from oci.inference.neural_query_signal_artifact import query_signal_columns
 from oci.inference.stable_context_fit_upstream_backend import (
     CrossFitStableUpstreamBackend,
     CrossFitStableUpstreamSchemaConfig,
@@ -51,6 +50,21 @@ _TEST_TEXTS = (
     "liver metastasis present",
     "future sealed wording",
 )
+
+
+def _query_signal_columns(query_counts):
+    return tuple(
+        name
+        for bank in ("treatment", "outcome", "effect")
+        for name in (
+            f"neural_query_{bank}_signed_mean",
+            f"neural_query_{bank}_absolute_max",
+            *(
+                f"neural_query_{bank}_signed_order_{rank:02d}"
+                for rank in range(1, query_counts[bank] + 1)
+            ),
+        )
+    )
 
 
 class _FakeBoundFrozenEmbeddings:
@@ -257,13 +271,30 @@ def test_safe_evidence_preserves_second_ranked_chunk_semantics(tmp_path):
         assert row["top_chunks"] == []
 
 
-def test_safe_evidence_term_bound_fails_instead_of_omitting_witness():
-    with pytest.raises(ValueError, match="refusing silent omission"):
-        query_context_module._safe_query_ngram_rows(
-            [{"term": "clinically meaningful second ranked witness"}],
-            max_tokens=3,
-            max_chars=160,
-        )
+def test_safe_evidence_preserves_underscore_expanded_ngram():
+    rows = query_context_module._safe_query_ngram_rows(
+        [
+            {
+                "term": (
+                    "patient_reported_outcomes eortc_qlq_c30 "
+                    "physical_function"
+                ),
+                "tfidf_contrast": 0.7,
+            }
+        ],
+        max_tokens=6,
+        max_chars=160,
+    )
+
+    assert rows == [
+        {
+            "term": (
+                "patient reported outcomes eortc qlq c30 physical function"
+            ),
+            "tfidf_contrast": 0.7,
+        }
+    ]
+    assert len(rows[0]["term"].split()) == 8
 
 
 def _patch_discovery(monkeypatch, calls: list[tuple[int, ...]]) -> None:
@@ -400,7 +431,7 @@ def _moment_schema(config: NeuralQueryAgenticForestConfig):
         "outcome": OUTCOME_NUISANCE_FEATURE_ROLE,
         "effect": UNCALIBRATED_EFFECT_MODIFIER_ROLE,
     }
-    artifact_names = query_signal_columns(
+    artifact_names = _query_signal_columns(
         {bank: config.query_count(bank) for bank in ("treatment", "outcome", "effect")}
     )
     return CrossFitStableUpstreamSchemaConfig(
@@ -514,7 +545,7 @@ def test_exact_neural_moments_are_permutation_invariant_and_not_double_summarize
     permuted = _moment_prediction(permuted_child, tmp_path)
     np.testing.assert_array_equal(direct.feature_values, permuted.feature_values)
     assert direct.feature_names == permuted.feature_names
-    assert direct.feature_names == query_signal_columns(
+    assert direct.feature_names == _query_signal_columns(
         {bank: config.query_count(bank) for bank in ("treatment", "outcome", "effect")}
     )
     assert direct.feature_kinds == (

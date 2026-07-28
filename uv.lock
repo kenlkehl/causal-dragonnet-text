@@ -2862,6 +2862,7 @@ dev = [
     { name = "pytest" },
 ]
 extraction = [
+    { name = "google-auth", extra = ["requests"] },
     { name = "openai" },
     { name = "openai-harmony" },
 ]
@@ -2878,6 +2879,7 @@ requires-dist = [
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=6.0.0" },
     { name = "google-cloud-storage", marker = "extra == 'gemini'", specifier = ">=2.0.0" },
     { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=1.0.0" },
+    { name = "google-auth", extras = ["requests"], marker = "extra == 'extraction'", specifier = ">=2.0.0" },
     { name = "joblib", specifier = ">=1.2.0" },
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "llvmlite", specifier = ">=0.46.0" },

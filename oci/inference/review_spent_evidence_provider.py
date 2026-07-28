@@ -727,7 +727,12 @@ def _safe_concept_phrase(
         )
     if not text:
         return ""
-    if _IDENTIFIER_NOISE.search(text):
+    # Vectorizer terms can contain identifier-like phrases joined by
+    # underscores or punctuation.  Probe a separator-normalized form before
+    # returning the ordinary lexical normalization so ``patient_id`` receives
+    # the same privacy treatment as ``patient id``.
+    privacy_probe = re.sub(r"[\W_]+", " ", text).strip()
+    if _IDENTIFIER_NOISE.search(privacy_probe):
         return ""
     if _EMAIL_URL_LONG_ID.search(text):
         return ""

@@ -17,6 +17,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from ..extraction.llm_routing import validate_stage2_response_model
 from .fold_honest_signal_fusion import row_set_fingerprint
 from .portable_workflow_spec import (
     PostExtractionCausalReviewSpec,
@@ -68,6 +69,20 @@ _STAGE2_CLIENT_PATHS = {
     "hierarchical_discovery",
     "proposal_and_post_extraction_review",
 }
+
+
+def _request_stage2_transport_mode(request: Mapping[str, Any]) -> str:
+    identity = request.get("stage2_endpoint_transport")
+    if identity is None:
+        return "vllm"
+    if (
+        not isinstance(identity, Mapping)
+        or set(identity) != {"schema_version", "mode"}
+        or identity.get("schema_version") != "stage2_endpoint_transport_v1"
+        or identity.get("mode") not in {"openai_compatible", "google_vertex"}
+    ):
+        raise ValueError("immutable request has an invalid Stage 2 transport identity")
+    return str(identity["mode"])
 
 
 def _canonical_sha256(
@@ -1339,6 +1354,7 @@ def validate_real_stage2_canary(
         or outcomes[-1] != "validated_response"
     ):
         raise ValueError("Stage 2 canary response validation trace is invalid")
+    transport_mode = _request_stage2_transport_mode(request)
     for record in transports:
         attempts = record.get("attempts") if isinstance(record, Mapping) else None
         if not isinstance(attempts, list) or len(attempts) != 1:
@@ -1352,12 +1368,16 @@ def validate_real_stage2_canary(
             or record.get("request_sha256") != attempt.get("request_sha256")
             or attempt.get("endpoint") != request.get("endpoint")
             or attempt.get("model") != request.get("model_name")
-            or attempt.get("response_model") != request.get("model_name")
             or attempt.get("finish_reason") != "stop"
             or attempt.get("outcome") != "success"
             or not isinstance(attempt.get("usage"), Mapping)
         ):
             raise ValueError("Stage 2 canary response metadata is invalid")
+        validate_stage2_response_model(
+            attempt.get("response_model"),
+            requested_model=str(request.get("model_name")),
+            transport_mode=transport_mode,
+        )
         validated_audit = _validate_prompt_nontruncation_audit(
             audit,
             guard_identity_sha256=prompt_guard_identity_sha256,
@@ -1420,6 +1440,7 @@ def _validate_complete_paged_transport_audit(
     value: Any,
     *,
     configured_model: str,
+    transport_mode: str,
     label: str,
 ) -> Mapping[str, Any]:
     from ..extraction.complete_paged import (
@@ -1465,10 +1486,14 @@ def _validate_complete_paged_transport_audit(
                 "finish_reason",
             }
             or attempt.get("kind") != ("initial" if index == 0 else "fixed_schema_repair")
-            or attempt.get("model") != configured_model
             or attempt.get("finish_reason") != "stop"
         ):
             raise ValueError(f"{label} transport attempt is invalid")
+        validate_stage2_response_model(
+            attempt.get("model"),
+            requested_model=configured_model,
+            transport_mode=transport_mode,
+        )
         _require_sha256(
             attempt.get("request_sha256"),
             label=f"{label} request identity",
@@ -2132,6 +2157,7 @@ def _validate_direct_stage2_one_shot_attestation(
             validated_transport = _validate_complete_paged_transport_audit(
                 transport,
                 configured_model=str(request["model_name"]),
+                transport_mode=_request_stage2_transport_mode(request),
                 label=(f"complete-paged invocation {invocation_index} " f"page {request_index}"),
             )
             if request_row.get("transport_audit_sha256") != _canonical_sha256(validated_transport):
@@ -2231,6 +2257,7 @@ def _validate_direct_stage2_one_shot_attestation(
                 validated_transport = _validate_complete_paged_transport_audit(
                     transport,
                     configured_model=str(request["model_name"]),
+                    transport_mode=_request_stage2_transport_mode(request),
                     label=(
                         f"complete-paged invocation "
                         f"{invocation_index} patient {patient_id} "
@@ -2737,7 +2764,12 @@ def validate_real_stage2_one_shot_attestation(
         ]
         or runtime.get("endpoint_pool_or_fallback_allowed") is not False
         or runtime.get("model_autodiscovery_or_substitution_allowed") is not False
-        or runtime.get("required_response_model") != request.get("model_name")
+        or runtime.get("required_response_model")
+        != (
+            request.get("model_name")
+            if _request_stage2_transport_mode(request) == "vllm"
+            else None
+        )
         or runtime.get("required_finish_reason") != "stop"
         or runtime.get("response_metadata_checked_before_content_semantics_and_cache") is not True
         or runtime.get("local_prompt_tokens_plus_generation_within_context_required") is not True

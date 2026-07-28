@@ -21,8 +21,7 @@ oci/
 ├── inference/
 │   ├── applied.py             # Applied inference (CV or fixed split)
 │   ├── applied_forest.py      # Causal forest inference pipeline
-│   ├── applied_tfidf_forest.py  # TF-IDF forest baseline pipeline
-│   └── applied_confounder_forest.py  # Legacy confounders-only forest pipeline
+│   └── applied_tfidf_forest.py  # TF-IDF forest baseline pipeline
 ├── models/
 │   ├── causal_text.py                # Main model (extractor + causal head)
 │   ├── causal_text_forest.py         # Two-stage neural + causal forest model
@@ -757,7 +756,7 @@ python -m synthetic_data.cli --config my_config.json
 | Hidden state cache | `oci/models/hidden_state_cache.py`, `oci/models/gpu_hidden_state_store.py` |
 | Explicit features | `oci/extraction/explicit_confounders.py`, `oci/extraction/cache.py`, `oci/models/explicit_confounder_featurizer.py` |
 | Propensity/Outcome models | `oci/models/propensity_model.py`, `oci/models/outcome_model.py` |
-| Training | `oci/inference/applied.py`, `oci/inference/applied_forest.py`, `oci/inference/applied_tfidf_forest.py`, `oci/inference/applied_confounder_forest.py` |
+| Training | `oci/inference/applied.py`, `oci/inference/applied_forest.py`, `oci/inference/applied_tfidf_forest.py` |
 | Semi-synthetic simulation | `oracle_experiment_scripts/semisynthetic_dgp.py`, `run_semisynthetic_experiments.py` |
 | Config | `oci/config.py` |
 | PSM | `oci/analysis/psm_analysis.py`, `oci/analysis/statistical_analysis.py`, `oci/matching/propensity_matcher.py` |

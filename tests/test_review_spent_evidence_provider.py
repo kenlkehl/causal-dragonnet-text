@@ -69,6 +69,12 @@ def test_temporal_wording_is_not_filtered_from_spent_concepts():
     assert _safe_concept_phrase("account number 12345678") == ""
 
 
+def test_safe_concept_phrase_filters_separator_joined_identifiers():
+    assert _safe_concept_phrase("patient_id 12345") == ""
+    assert _safe_concept_phrase("account/number 12345") == ""
+    assert _safe_concept_phrase("medical-record 12345") == ""
+
+
 def test_safe_concept_phrase_has_no_hidden_length_or_token_cutoff():
     phrase = " ".join(f"biomarkersegment{index}" for index in range(40))
     assert len(phrase) > 120

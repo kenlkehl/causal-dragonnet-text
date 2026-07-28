@@ -37,6 +37,7 @@ from oci.inference.production_stage1_scope_scheduler import (
 )
 from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_all_ten_binding import (
+    _bind_completed_component_request,
     authenticate_role_neutral_bow_component,
     validate_authenticated_role_neutral_component_receipt,
 )
@@ -72,12 +73,16 @@ def _registry() -> dict:
     return {"dataset_row_count": row_count, "outer_folds": outer_rows}
 
 
-def _plan(*, gpu_ids: tuple[int, ...] = ()):
+def _plan(
+    *,
+    gpu_ids: tuple[int, ...] = (),
+    physical_fit_identity=PHYSICAL_FIT_IDENTITY,
+):
     return build_canonical_stage1_scope_plan(
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
-        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
+        physical_fit_identity=physical_fit_identity,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,
@@ -407,6 +412,77 @@ def test_authenticated_nuisance_bank_is_label_free_and_location_neutral(
         request=request,
     )
     assert reopened == bank
+
+
+def test_component_resume_ignores_only_unrelated_aggregate_plan_identity(
+    tmp_path: Path,
+):
+    original_plan = _plan()
+    owner = next(
+        owner
+        for owner, members in original_plan.physical_scope_groups
+        if len(members) > 1
+    )
+    request = RoleNeutralBoWPhysicalGroupRequest.from_plan(
+        plan=original_plan,
+        physical_owner_scope_id=owner.scope_id,
+    )
+    _fit_texts, _treatment, _outcome, heldout_texts, _views = _inputs(request)
+    root = (tmp_path / "completed_bow").resolve()
+    _execute(
+        root=root,
+        request=request,
+        loader=lambda row_ids: (
+            heldout_texts if row_ids == owner.heldout_row_ids else ()
+        ),
+    )
+    expected_configuration = json.loads(
+        (root / "fit_state" / "metadata.json").read_text(encoding="utf-8")
+    )["configuration_identity_sha256"]
+    changed_plan = _plan(
+        physical_fit_identity=dataclasses.replace(
+            PHYSICAL_FIT_IDENTITY,
+            scientific_configuration_identity="4" * 64,
+        )
+    )
+    assert changed_plan.scientific_content_sha256 != (
+        original_plan.scientific_content_sha256
+    )
+    assert changed_plan.scope(owner.scope_id) == owner
+
+    receipt = authenticate_role_neutral_bow_component(
+        root=root,
+        plan=changed_plan,
+        physical_owner_scope_id=owner.scope_id,
+        expected_configuration_identity_sha256=expected_configuration,
+    )
+    assert receipt.plan_scientific_content_sha256 == (
+        changed_plan.scientific_content_sha256
+    )
+    migrated_request = RoleNeutralBoWPhysicalGroupRequest.from_plan(
+        plan=changed_plan,
+        physical_owner_scope_id=owner.scope_id,
+    )
+    migrated_request = _bind_completed_component_request(
+        root=root,
+        request=migrated_request,
+        component="bow",
+        plan_field="plan_scientific_content_sha256",
+        expected_configuration_identity_sha256=expected_configuration,
+    )
+    bank = load_authenticated_role_neutral_bow_nuisance_bank(
+        root=root,
+        request=migrated_request,
+    )
+    assert bank.fit_row_ids == owner.fit_row_ids
+
+    with pytest.raises(ValueError, match="configuration differs"):
+        authenticate_role_neutral_bow_component(
+            root=root,
+            plan=changed_plan,
+            physical_owner_scope_id=owner.scope_id,
+            expected_configuration_identity_sha256="5" * 64,
+        )
 
 
 def test_fit_seals_before_loader_and_replays_without_live_models(

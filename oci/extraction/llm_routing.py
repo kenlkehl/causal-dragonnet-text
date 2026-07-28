@@ -7,13 +7,299 @@ import os
 import random
 import threading
 import time
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 _RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
 _GOOGLE_ADC_API_KEY_VALUES = {"google_adc", "google-adc", "adc", "application_default"}
+STAGE2_ENDPOINT_AUTH_MODE_ENV = "OCI_STAGE2_ENDPOINT_AUTH"
+STAGE2_ENDPOINT_API_KEY_ENV = "OCI_STAGE2_ENDPOINT_API_KEY"
+STAGE2_ENDPOINT_AUTH_IDENTITY_SCHEMA = "stage2_endpoint_authentication_v1"
+STAGE2_ENDPOINT_TRANSPORT_ENV = "OCI_STAGE2_ENDPOINT_TRANSPORT"
+STAGE2_ENDPOINT_TRANSPORT_IDENTITY_SCHEMA = "stage2_endpoint_transport_v1"
+_API_KEY_ENV_REFERENCE_PREFIX = "env:"
+_STAGE2_ENDPOINT_TRANSPORT_MODES = {
+    "vllm",
+    "openai_compatible",
+    "google_vertex",
+}
+
+
+@dataclass(frozen=True)
+class ResolvedStage2EndpointAuthentication:
+    """Runtime credential plus a secret-free immutable-request identity."""
+
+    api_key: str
+    identity: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class ResolvedStage2EndpointTransport:
+    """Secret-free transport policy selected for Stage 2 requests."""
+
+    mode: str
+    identity: Mapping[str, str]
+
+
+def resolve_stage2_endpoint_transport(
+    environment: Mapping[str, str] | None = None,
+) -> ResolvedStage2EndpointTransport:
+    """Resolve the outbound Chat Completions dialect.
+
+    ``vllm`` is the compatibility default for existing deployments.
+    ``openai_compatible`` and ``google_vertex`` project the authenticated
+    scientific generation policy onto portable OpenAI Chat Completions fields
+    immediately before transport, omitting vLLM-only extension fields.
+    """
+
+    source = os.environ if environment is None else environment
+    raw_mode = str(source.get(STAGE2_ENDPOINT_TRANSPORT_ENV, "vllm"))
+    mode = raw_mode.strip().lower().replace("-", "_")
+    if (
+        raw_mode != raw_mode.strip()
+        or mode not in _STAGE2_ENDPOINT_TRANSPORT_MODES
+    ):
+        raise ValueError(
+            f"{STAGE2_ENDPOINT_TRANSPORT_ENV} must be vllm, "
+            "openai_compatible, or google_vertex"
+        )
+    return ResolvedStage2EndpointTransport(
+        mode=mode,
+        identity={
+            "schema_version": STAGE2_ENDPOINT_TRANSPORT_IDENTITY_SCHEMA,
+            "mode": mode,
+        },
+    )
+
+
+def resolve_stage2_endpoint_authentication(
+    environment: Mapping[str, str] | None = None,
+) -> ResolvedStage2EndpointAuthentication:
+    """Resolve optional production endpoint auth without storing credentials.
+
+    ``none`` preserves the historical local-vLLM behavior. ``api_key`` uses
+    the OpenAI SDK's bearer authorization header, while ``google_adc`` selects
+    the refreshable Vertex AI/OpenAI-compatible ADC client.
+    """
+
+    source = os.environ if environment is None else environment
+    raw_mode = str(source.get(STAGE2_ENDPOINT_AUTH_MODE_ENV, "none"))
+    mode = raw_mode.strip().lower().replace("-", "_")
+    if raw_mode != raw_mode.strip() or mode not in {
+        "none",
+        "api_key",
+        "google_adc",
+    }:
+        raise ValueError(
+            f"{STAGE2_ENDPOINT_AUTH_MODE_ENV} must be none, api_key, or google_adc"
+        )
+    configured_key = source.get(STAGE2_ENDPOINT_API_KEY_ENV)
+    if mode == "none":
+        if configured_key not in {None, ""}:
+            raise ValueError(
+                f"{STAGE2_ENDPOINT_API_KEY_ENV} is set while endpoint auth is none"
+            )
+        api_key = "EMPTY"
+    elif mode == "google_adc":
+        if configured_key not in {None, ""}:
+            raise ValueError(
+                f"{STAGE2_ENDPOINT_API_KEY_ENV} cannot accompany google_adc"
+            )
+        api_key = "GOOGLE_ADC"
+    else:
+        if not isinstance(configured_key, str) or not configured_key:
+            raise ValueError(
+                f"{STAGE2_ENDPOINT_API_KEY_ENV} is required for api_key auth"
+            )
+        if (
+            configured_key != configured_key.strip()
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in configured_key)
+        ):
+            raise ValueError(
+                f"{STAGE2_ENDPOINT_API_KEY_ENV} must be nonempty without "
+                "surrounding whitespace or control characters"
+            )
+        api_key = _API_KEY_ENV_REFERENCE_PREFIX + STAGE2_ENDPOINT_API_KEY_ENV
+    return ResolvedStage2EndpointAuthentication(
+        api_key=api_key,
+        identity={
+            "schema_version": STAGE2_ENDPOINT_AUTH_IDENTITY_SCHEMA,
+            "mode": mode,
+            "credential_source": (
+                STAGE2_ENDPOINT_API_KEY_ENV
+                if mode == "api_key"
+                else mode
+            ),
+        },
+    )
+
+
+def resolve_openai_api_key(
+    configured: str,
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve an environment-backed bearer key immediately before use."""
+
+    if not isinstance(configured, str) or not configured:
+        raise ValueError("OpenAI-compatible api_key must be a nonempty string")
+    if not configured.startswith(_API_KEY_ENV_REFERENCE_PREFIX):
+        return configured
+    name = configured[len(_API_KEY_ENV_REFERENCE_PREFIX) :]
+    if name != STAGE2_ENDPOINT_API_KEY_ENV:
+        raise ValueError("unsupported OpenAI-compatible API-key environment reference")
+    source = os.environ if environment is None else environment
+    value = source.get(name)
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise ValueError(f"{name} must contain one nonempty bearer credential")
+    return value
+
+
+def validate_stage2_endpoint_runtime_configuration(
+    *,
+    authentication: ResolvedStage2EndpointAuthentication,
+    transport: ResolvedStage2EndpointTransport,
+) -> None:
+    """Reject credential/transport combinations that would use the wrong wire dialect."""
+
+    if (
+        authentication.identity.get("mode") == "google_adc"
+        and transport.mode != "google_vertex"
+    ):
+        raise ValueError(
+            "google_adc endpoint authentication requires "
+            f"{STAGE2_ENDPOINT_TRANSPORT_ENV}=google_vertex"
+        )
+
+
+def project_stage2_chat_completion_request(
+    request: Mapping[str, Any],
+    *,
+    transport_mode: str,
+) -> dict[str, Any]:
+    """Project one validated request onto the selected endpoint dialect."""
+
+    if transport_mode not in _STAGE2_ENDPOINT_TRANSPORT_MODES:
+        raise ValueError("unsupported Stage 2 endpoint transport mode")
+    projected = dict(request)
+    if transport_mode == "vllm":
+        return projected
+
+    # These extensions are authenticated as part of the scientific generation
+    # policy, but they are vLLM server controls rather than OpenAI Chat
+    # Completions fields. Portable endpoints receive the closest standard
+    # representation (including reasoning_effort) without leaking those
+    # implementation-specific fields onto the wire.
+    projected.pop("extra_body", None)
+
+    # Avoid transmitting inactive optional controls. Some otherwise compatible
+    # endpoints reject them instead of treating their empty values as no-ops.
+    stop = projected.get("stop")
+    if stop is None or stop == () or stop == []:
+        projected.pop("stop", None)
+    if projected.get("logit_bias") == {}:
+        projected.pop("logit_bias", None)
+    if projected.get("logprobs") is not True:
+        projected.pop("top_logprobs", None)
+    if "tools" not in projected:
+        projected.pop("parallel_tool_calls", None)
+        if projected.get("tool_choice") == "none":
+            projected.pop("tool_choice", None)
+    return projected
+
+
+def validate_stage2_response_model(
+    response_model: Any,
+    *,
+    requested_model: str,
+    transport_mode: str | None = None,
+) -> str:
+    """Validate provider metadata without confusing an alias with the request ID."""
+
+    mode = (
+        resolve_stage2_endpoint_transport().mode
+        if transport_mode is None
+        else transport_mode
+    )
+    if mode not in _STAGE2_ENDPOINT_TRANSPORT_MODES:
+        raise ValueError("unsupported Stage 2 endpoint transport mode")
+    if (
+        not isinstance(response_model, str)
+        or not response_model
+        or response_model != response_model.strip()
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in response_model)
+    ):
+        raise ValueError("Stage 2 response must report one nonempty model identity")
+    if mode == "vllm" and response_model != requested_model:
+        raise ValueError(
+            "Stage 2 response model differs from the exact requested vLLM model"
+        )
+    return response_model
+
+
+class _ProjectedCompletions:
+    def __init__(self, completions: Any, *, transport_mode: str) -> None:
+        self._completions = completions
+        self._transport_mode = transport_mode
+
+    def create(self, *args: Any, **kwargs: Any) -> Any:
+        if args:
+            return self._completions.create(*args, **kwargs)
+        return self._completions.create(
+            **project_stage2_chat_completion_request(
+                kwargs,
+                transport_mode=self._transport_mode,
+            )
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._completions, name)
+
+
+class _ProjectedChat:
+    def __init__(self, chat: Any, *, transport_mode: str) -> None:
+        self._chat = chat
+        self._transport_mode = transport_mode
+
+    @property
+    def completions(self) -> _ProjectedCompletions:
+        return _ProjectedCompletions(
+            self._chat.completions,
+            transport_mode=self._transport_mode,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._chat, name)
+
+
+class Stage2TransportOpenAIClient:
+    """Thin client adapter that changes only the outbound request dialect."""
+
+    def __init__(self, client: Any, *, transport_mode: str) -> None:
+        self._client = client
+        self.transport_mode = transport_mode
+
+    @property
+    def chat(self) -> _ProjectedChat:
+        return _ProjectedChat(
+            self._client.chat,
+            transport_mode=self.transport_mode,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    def close(self) -> None:
+        close_client = getattr(self._client, "close", None)
+        if callable(close_client):
+            close_client()
 
 
 def parse_server_urls(
@@ -245,6 +531,14 @@ class OpenAIClientPool:
         self.api_key = api_key
         self.timeout = timeout
         self.max_retries = max_retries
+        self.endpoint_transport = resolve_stage2_endpoint_transport()
+        if (
+            uses_google_adc_api_key(api_key)
+            and self.endpoint_transport.mode != "google_vertex"
+        ):
+            raise ValueError(
+                "GOOGLE_ADC requires OCI_STAGE2_ENDPOINT_TRANSPORT=google_vertex"
+            )
         self._client_factory = client_factory
         self._clients: dict[str, Any] = {}
         self._lock = threading.Lock()
@@ -279,6 +573,11 @@ class OpenAIClientPool:
                     max_retries=self.max_retries,
                     client_factory=self._client_factory,
                 )
+                if self.endpoint_transport.mode != "vllm":
+                    client = Stage2TransportOpenAIClient(
+                        client,
+                        transport_mode=self.endpoint_transport.mode,
+                    )
                 self._clients[url] = client
                 logger.info("Connected to Google ADC OpenAI-compatible endpoint at: %s", url)
                 return client
@@ -290,12 +589,18 @@ class OpenAIClientPool:
                         "openai package is required for OpenAI-compatible LLM clients"
                     ) from exc
                 self._client_factory = OpenAI
+            api_key = resolve_openai_api_key(self.api_key)
             client = self._client_factory(
                 base_url=url,
-                api_key=self.api_key,
+                api_key=api_key,
                 timeout=self.timeout,
                 max_retries=self.max_retries,
             )
+            if self.endpoint_transport.mode != "vllm":
+                client = Stage2TransportOpenAIClient(
+                    client,
+                    transport_mode=self.endpoint_transport.mode,
+                )
             self._clients[url] = client
             logger.info("Connected to OpenAI-compatible LLM server at: %s", url)
             return client

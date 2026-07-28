@@ -30,6 +30,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import stat
 import threading
 import time
@@ -55,6 +56,8 @@ from .production_stage1_role_neutral_coordinator import (
 from .production_stage1_scope_scheduler import (
     Stage1ScopePlan,
     Stage1ScopeSpec,
+    _WORKER_PROCESS_GROUP_MARKER_SCHEMA,
+    _linux_process_start_time_ticks,
 )
 from .neural_query_execution_topology import (
     NeuralQueryExecutionTopology,
@@ -110,6 +113,11 @@ DISTINCT_RESOURCE_CANARY_REPLICA_POLICY = (
 )
 
 _HEX = frozenset("0123456789abcdef")
+_STALE_SESSION_MARKER_DIRECTORY = ".persistent-owner-execution-session"
+_PROCESS_GROUP_MARKER_PREFIXES = (
+    ".process-group-",
+    ".persistent-process-group-slot-",
+)
 
 ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SCHEMA = (
     "production_role_neutral_component_execution_interval_v1"
@@ -143,6 +151,9 @@ _ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_FIELDS = frozenset(
 )
 _ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SEMANTICS = (
     "architecture_phase_execution_envelope_not_kernel_occupancy_v1"
+)
+_ROLE_NEUTRAL_COMPONENT_RESUME_INTERVAL_SEMANTICS = (
+    "component_receipt_reauthentication_no_model_execution_v1"
 )
 _ROLE_NEUTRAL_COMPONENT_EXECUTION_REPORT_SEMANTICS = (
     "direct_monotonic_architecture_phase_envelopes_not_kernel_occupancy_v1"
@@ -275,6 +286,114 @@ def _canonical_fresh_root(value: Path | str) -> Path:
     if parent.is_symlink() or parent.resolve(strict=True) != parent or not parent.is_dir():
         raise ValueError("role-neutral execution parent must be canonical")
     return root
+
+
+class _RoleNeutralStage1ParentSignal(BaseException):
+    """Turn SIGTERM into deterministic persistent-worker cleanup."""
+
+
+def _marker_process_identity_is_not_live(path: Path) -> None:
+    value = _read_json(path, label="stale Stage 1 process-group marker")
+    expected_fields = {
+        "schema_version",
+        "pid",
+        "process_group_id",
+        "process_start_time_ticks",
+        "content_sha256",
+    }
+    body = dict(value)
+    declared = body.pop("content_sha256", None)
+    pid = value.get("pid")
+    start_time = value.get("process_start_time_ticks")
+    if (
+        set(value) != expected_fields
+        or value.get("schema_version")
+        != _WORKER_PROCESS_GROUP_MARKER_SCHEMA
+        or type(pid) is not int
+        or pid <= 0
+        or value.get("process_group_id") != pid
+        or type(start_time) is not int
+        or start_time < 0
+        or declared != _sha256_json(body)
+    ):
+        raise ValueError(
+            "stale Stage 1 process-group marker is not authenticated"
+        )
+    observed_start = _linux_process_start_time_ticks(pid)
+    if observed_start == start_time:
+        raise RuntimeError(
+            "cannot resume while an authenticated Stage 1 worker is live"
+        )
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise RuntimeError(
+            "cannot confirm that the stale Stage 1 worker group has exited"
+        ) from exc
+    raise RuntimeError(
+        "cannot resume while the stale Stage 1 worker group still exists"
+    )
+
+
+def _archive_stale_process_markers_for_resume(destination: Path) -> None:
+    marker_root = destination / _STALE_SESSION_MARKER_DIRECTORY
+    marker_paths: list[Path] = []
+    if marker_root.exists() or marker_root.is_symlink():
+        if (
+            marker_root.is_symlink()
+            or not marker_root.is_dir()
+            or marker_root.resolve(strict=True) != marker_root
+        ):
+            raise ValueError(
+                "stale persistent-owner session marker must be one "
+                "canonical directory"
+            )
+        marker_paths.extend(sorted(marker_root.iterdir()))
+        if any(
+            path.is_symlink() or not path.is_file()
+            for path in marker_paths
+        ):
+            raise ValueError(
+                "stale persistent-owner session contains an unexpected entry"
+            )
+
+    component_root = destination / ROLE_NEUTRAL_COMPONENT_DIRECTORY
+    loose_markers: list[Path] = []
+    if component_root.is_dir() and not component_root.is_symlink():
+        loose_markers = sorted(
+            path
+            for path in component_root.iterdir()
+            if path.name.startswith(_PROCESS_GROUP_MARKER_PREFIXES)
+        )
+        if any(path.is_symlink() or not path.is_file() for path in loose_markers):
+            raise ValueError(
+                "stale Stage 1 process-group marker is not a regular file"
+            )
+        marker_paths.extend(loose_markers)
+
+    for path in marker_paths:
+        _marker_process_identity_is_not_live(path)
+    if marker_root.exists():
+        for path in marker_paths:
+            if path.parent == marker_root:
+                _marker_process_identity_is_not_live(path)
+        recovery_root = (
+            destination.parent / "interrupted_role_neutral_process_markers"
+        )
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        marker_root.rename(
+            recovery_root
+            / f"{_STALE_SESSION_MARKER_DIRECTORY}.{time.time_ns()}"
+        )
+    for path in loose_markers:
+        _marker_process_identity_is_not_live(path)
+        recovery_root = (
+            destination.parent / "interrupted_role_neutral_process_markers"
+        )
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        path.rename(recovery_root / f"{path.name}.{time.time_ns()}")
 
 
 def _owner_group(
@@ -506,6 +625,7 @@ class RoleNeutralPhysicalOwnerTask:
     ) = None
     htr_fold_devices: tuple[str, ...] = ()
     owner_cpu_budget: int | None = None
+    resume: bool = False
 
     def __post_init__(self) -> None:
         owner, members = _owner_group(
@@ -576,6 +696,8 @@ class RoleNeutralPhysicalOwnerTask:
             raise ValueError(
                 "physical-owner task CPU budget must be positive"
             )
+        if not isinstance(self.resume, bool):
+            raise TypeError("physical-owner task resume must be boolean")
         if self.neural_query_operational_controls is not None:
             if self.owner_cpu_budget is None:
                 raise ValueError(
@@ -921,14 +1043,78 @@ def _execute_one_owner(
     *,
     task: RoleNeutralPhysicalOwnerTask,
     factories: Mapping[str, RoleNeutralProducerFactory],
+    resume: bool = False,
 ) -> RoleNeutralPhysicalOwnerResult:
-    task.component_parent.mkdir(parents=True, exist_ok=False)
+    resume = bool(resume or task.resume)
+    task.component_parent.mkdir(parents=True, exist_ok=resume)
+    if (
+        task.component_parent.is_symlink()
+        or not task.component_parent.is_dir()
+        or task.component_parent.resolve(strict=True)
+        != task.component_parent
+    ):
+        raise ValueError(
+            "physical-owner component root must be one canonical directory"
+        )
     sources: list[RoleNeutralComponentArtifactSource] = []
     component_order: list[str] = []
     operational_reports: dict[str, Mapping[str, Any]] = {}
     component_execution_intervals: list[dict[str, Any]] = []
+    resumed_components: list[str] = []
+
+    def execution_resources(
+        component: str,
+    ) -> tuple[bool, tuple[str, ...]]:
+        accelerator_associated = (
+            task.resource != "cpu"
+            and component in _ACCELERATOR_ASSOCIATED_COMPONENTS
+        )
+        if component == "neural_query" and accelerator_associated:
+            resource_ids = tuple(
+                task.neural_query_execution_topology.devices
+            )
+        elif (
+            component in {"htr", "matched_pair"}
+            and accelerator_associated
+        ):
+            resource_ids = tuple(task.htr_fold_devices)
+        elif accelerator_associated:
+            resource_ids = (task.resource,)
+        else:
+            resource_ids = ("host_cpu",)
+        return accelerator_associated, resource_ids
+
     for component in EXPECTED_COMPONENT_FAMILIES:
         component_root = task.component_parent / component
+        terminal_path = (
+            component_root / ROLE_NEUTRAL_EXECUTION_MANIFEST
+        )
+        completed_resume_candidate = (
+            resume
+            and component_root.is_dir()
+            and not component_root.is_symlink()
+            and terminal_path.is_file()
+            and not terminal_path.is_symlink()
+        )
+        if (
+            resume
+            and not completed_resume_candidate
+            and (component_root.exists() or component_root.is_symlink())
+        ):
+            if component_root.is_symlink() or not component_root.is_dir():
+                raise ValueError(
+                    f"{task.physical_owner.scope_id}/{component} incomplete "
+                    "resume output is not a real directory"
+                )
+            recovery_root = (
+                task.component_parent.parent.parent.parent
+                / "interrupted_role_neutral_components"
+                / task.physical_owner.scope_id
+            )
+            recovery_root.mkdir(parents=True, exist_ok=True)
+            component_root.rename(
+                recovery_root / f"{component}.{time.time_ns()}"
+            )
         invocation = RoleNeutralComponentInvocation(
             plan=task.plan,
             physical_owner=task.physical_owner,
@@ -952,6 +1138,61 @@ def _execute_one_owner(
                 f"{task.physical_owner.scope_id}/{component} factory "
                 "did not return a typed bound producer"
             )
+        if completed_resume_candidate:
+            interval_started_monotonic_ns = time.monotonic_ns()
+            receipt = bound.authenticate()
+            receipt = validate_authenticated_role_neutral_component_receipt(
+                root=component_root,
+                plan=task.plan,
+                physical_owner_scope_id=task.physical_owner.scope_id,
+                receipt=receipt,
+                expected_component=component,
+            )
+            interval_finished_monotonic_ns = max(
+                time.monotonic_ns(),
+                interval_started_monotonic_ns + 1,
+            )
+            accelerator_associated, resource_ids = (
+                execution_resources(component)
+            )
+            component_execution_intervals.append(
+                {
+                    "schema_version": (
+                        ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SCHEMA
+                    ),
+                    "physical_owner_scope_id": (
+                        task.physical_owner.scope_id
+                    ),
+                    "component": component,
+                    "lane_kind": (
+                        "gpu" if accelerator_associated else "cpu"
+                    ),
+                    "resource_ids": list(resource_ids),
+                    "clock_domain_id": (
+                        ROLE_NEUTRAL_COMPONENT_EXECUTION_CLOCK_DOMAIN
+                    ),
+                    "started_monotonic_ns": (
+                        interval_started_monotonic_ns
+                    ),
+                    "finished_monotonic_ns": (
+                        interval_finished_monotonic_ns
+                    ),
+                    "status": "resumed",
+                    "timestamps_measured_directly": True,
+                    "interval_semantics": (
+                        _ROLE_NEUTRAL_COMPONENT_RESUME_INTERVAL_SEMANTICS
+                    ),
+                }
+            )
+            sources.append(
+                RoleNeutralComponentArtifactSource(
+                    root=component_root,
+                    receipt=receipt,
+                )
+            )
+            component_order.append(component)
+            resumed_components.append(component)
+            continue
         if component_root.exists() or component_root.is_symlink():
             raise FileExistsError(
                 f"{task.physical_owner.scope_id}/{component} output "
@@ -964,23 +1205,9 @@ def _execute_one_owner(
             raise RuntimeError(
                 "role-neutral component execution interval did not advance"
             )
-        accelerator_associated = (
-            task.resource != "cpu"
-            and component in _ACCELERATOR_ASSOCIATED_COMPONENTS
+        accelerator_associated, resource_ids = execution_resources(
+            component
         )
-        if component == "neural_query" and accelerator_associated:
-            resource_ids = tuple(
-                task.neural_query_execution_topology.devices
-            )
-        elif (
-            component in {"htr", "matched_pair"}
-            and accelerator_associated
-        ):
-            resource_ids = tuple(task.htr_fold_devices)
-        elif accelerator_associated:
-            resource_ids = (task.resource,)
-        else:
-            resource_ids = ("host_cpu",)
         component_execution_intervals.append(
             {
                 "schema_version": (
@@ -1080,6 +1307,7 @@ def _execute_one_owner(
                 name: operational_reports[name]
                 for name in sorted(operational_reports)
             },
+            "resumed_components": resumed_components,
             "component_execution_interval_semantics": (
                 _ROLE_NEUTRAL_COMPONENT_EXECUTION_REPORT_SEMANTICS
             ),
@@ -1133,6 +1361,17 @@ def validate_role_neutral_component_execution_intervals(
     ):
         raise ValueError(
             "role-neutral component execution report is incomplete"
+        )
+    resumed_components = report.get("resumed_components", [])
+    if (
+        not isinstance(resumed_components, list)
+        or len(resumed_components) != len(set(resumed_components))
+        or not set(resumed_components).issubset(
+            EXPECTED_COMPONENT_FAMILIES
+        )
+    ):
+        raise ValueError(
+            "role-neutral resumed component list is invalid"
         )
     owner_scope_id = str(expected_physical_owner_scope_id)
     primary_resource = str(expected_primary_resource)
@@ -1208,10 +1447,22 @@ def validate_role_neutral_component_execution_intervals(
                 previous_finish is not None
                 and int(row["started_monotonic_ns"]) < previous_finish
             )
-            or row.get("status") != "completed"
+            or row.get("status") not in {"completed", "resumed"}
+            or (
+                (component in resumed_components)
+                is not (row.get("status") == "resumed")
+            )
             or row.get("timestamps_measured_directly") is not True
-            or row.get("interval_semantics")
-            != _ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SEMANTICS
+            or (
+                row.get("status") == "completed"
+                and row.get("interval_semantics")
+                != _ROLE_NEUTRAL_COMPONENT_EXECUTION_INTERVAL_SEMANTICS
+            )
+            or (
+                row.get("status") == "resumed"
+                and row.get("interval_semantics")
+                != _ROLE_NEUTRAL_COMPONENT_RESUME_INTERVAL_SEMANTICS
+            )
         ):
             raise ValueError(
                 "role-neutral component execution interval changed, "
@@ -1609,53 +1860,13 @@ def _validate_first_owner_task_phase(
     }
 
 
-def _validate_first_owner_component_reports(
+def _validate_first_owner_htr_report(
+    value: Any,
     *,
-    result: RoleNeutralPhysicalOwnerResult | None = None,
-    execution_telemetry: Mapping[str, Any] | None = None,
-    policy: RoleNeutralStage1ExecutionPolicy | None = None,
     gate: RoleNeutralFirstOwnerValidationPolicy,
 ) -> dict[str, Any]:
-    del policy
-    if (result is None) is (execution_telemetry is None):
-        raise ValueError(
-            "first-owner component validation requires exactly one "
-            "telemetry source"
-        )
-    telemetry = (
-        result.execution_telemetry
-        if result is not None
-        else execution_telemetry
-    )
-    if not isinstance(telemetry, Mapping):
-        raise ValueError("first owner omitted execution telemetry")
-    worker_report: Any = telemetry
-    if worker_report.get("schema_version") != (
-        "production_role_neutral_component_operational_reports_v2"
-    ):
-        worker_report = telemetry.get("worker_report")
-    if (
-        not isinstance(worker_report, Mapping)
-        or worker_report.get("schema_version")
-        != "production_role_neutral_component_operational_reports_v2"
-    ):
-        raise ValueError(
-            "first owner omitted its authenticated component reports"
-        )
-    reports = worker_report.get("component_reports")
-    expected_reports = {
-        "htr",
-        "matched_pair",
-        "tfidf",
-        "neural_query",
-    }
-    if not isinstance(reports, Mapping) or set(reports) != expected_reports:
-        raise ValueError(
-            "first owner did not attest every parallel producer"
-        )
-
     htr = _validated_operational_attestation(
-        reports["htr"],
+        value,
         label="HTR",
         schema=ROLE_NEUTRAL_HTR_OPERATIONAL_ATTESTATION_SCHEMA,
     )
@@ -1703,9 +1914,21 @@ def _validate_first_owner_component_reports(
         )
     ):
         raise ValueError("first-owner HTR folds serialized")
+    return {
+        "content_sha256": htr["content_sha256"],
+        "nuisance_maximum_concurrent_leases": htr_nuisance_overlap,
+        "effect_maximum_concurrent_leases": htr_effect_overlap,
+        "devices": list(gate.devices),
+    }
 
+
+def _validate_first_owner_matched_report(
+    value: Any,
+    *,
+    gate: RoleNeutralFirstOwnerValidationPolicy,
+) -> dict[str, Any]:
     matched = _validated_operational_attestation(
-        reports["matched_pair"],
+        value,
         label="matched-pair",
         schema=_MATCHED_PAIR_OPERATIONAL_ATTESTATION_SCHEMA,
     )
@@ -1750,9 +1973,20 @@ def _validate_first_owner_component_reports(
         )
     ):
         raise ValueError("first-owner matched-pair folds serialized")
+    return {
+        "content_sha256": matched["content_sha256"],
+        "maximum_concurrent_leases": matched_overlap,
+        "devices": list(gate.devices),
+    }
 
+
+def _validate_first_owner_tfidf_report(
+    value: Any,
+    *,
+    gate: RoleNeutralFirstOwnerValidationPolicy,
+) -> dict[str, Any]:
     tfidf = _validated_operational_attestation(
-        reports["tfidf"],
+        value,
         label="TF-IDF",
         schema=_TFIDF_NUISANCE_EXECUTION_ATTESTATION_SCHEMA,
     )
@@ -1785,9 +2019,21 @@ def _validate_first_owner_component_reports(
         )
     ):
         raise ValueError("first-owner TF-IDF folds serialized")
+    return {
+        "content_sha256": tfidf["content_sha256"],
+        "effective_workers": tfidf_effective,
+        "maximum_concurrent_leases": tfidf_overlap,
+        "backend": gate.required_tfidf_parallel_backend,
+    }
 
+
+def _validate_first_owner_neural_report(
+    value: Any,
+    *,
+    gate: RoleNeutralFirstOwnerValidationPolicy,
+) -> dict[str, Any]:
     neural = _validated_operational_attestation(
-        reports["neural_query"],
+        value,
         label="neural-query",
         schema=(
             "production_role_neutral_neural_query_operational_attestation_v1"
@@ -1868,35 +2114,116 @@ def _validate_first_owner_component_reports(
             phase=phase,
             devices=gate.devices,
         )
-
     return {
-        "htr": {
-            "content_sha256": htr["content_sha256"],
-            "nuisance_maximum_concurrent_leases": (
-                htr_nuisance_overlap
-            ),
-            "effect_maximum_concurrent_leases": htr_effect_overlap,
-            "devices": list(gate.devices),
-        },
-        "matched_pair": {
-            "content_sha256": matched["content_sha256"],
-            "maximum_concurrent_leases": matched_overlap,
-            "devices": list(gate.devices),
-        },
-        "tfidf": {
-            "content_sha256": tfidf["content_sha256"],
-            "effective_workers": tfidf_effective,
-            "maximum_concurrent_leases": tfidf_overlap,
-            "backend": gate.required_tfidf_parallel_backend,
-        },
-        "neural_query": {
-            "content_sha256": neural["content_sha256"],
-            "phases": neural_summaries,
-            "devices": list(gate.devices),
-        },
+        "content_sha256": neural["content_sha256"],
+        "phases": neural_summaries,
+        "devices": list(gate.devices),
+    }
+
+
+def _validate_first_owner_component_reports(
+    *,
+    result: RoleNeutralPhysicalOwnerResult | None = None,
+    execution_telemetry: Mapping[str, Any] | None = None,
+    policy: RoleNeutralStage1ExecutionPolicy | None = None,
+    gate: RoleNeutralFirstOwnerValidationPolicy,
+) -> dict[str, Any]:
+    del policy
+    if (result is None) is (execution_telemetry is None):
+        raise ValueError(
+            "first-owner component validation requires exactly one "
+            "telemetry source"
+        )
+    telemetry = (
+        result.execution_telemetry
+        if result is not None
+        else execution_telemetry
+    )
+    if not isinstance(telemetry, Mapping):
+        raise ValueError("first owner omitted execution telemetry")
+    worker_report: Any = telemetry
+    if worker_report.get("schema_version") != (
+        "production_role_neutral_component_operational_reports_v2"
+    ):
+        worker_report = telemetry.get("worker_report")
+    if (
+        not isinstance(worker_report, Mapping)
+        or worker_report.get("schema_version")
+        != "production_role_neutral_component_operational_reports_v2"
+    ):
+        raise ValueError(
+            "first owner omitted its authenticated component reports"
+        )
+    resumed_raw = worker_report.get("resumed_components", [])
+    if (
+        not isinstance(resumed_raw, list)
+        or len(resumed_raw) != len(set(resumed_raw))
+        or not set(resumed_raw).issubset(EXPECTED_COMPONENT_FAMILIES)
+    ):
+        raise ValueError("first owner resumed component telemetry is invalid")
+    resumed = frozenset(resumed_raw)
+    intervals = worker_report.get("component_execution_intervals")
+    interval_by_component = {
+        str(row.get("component")): row
+        for row in (intervals if isinstance(intervals, list) else ())
+        if isinstance(row, Mapping)
+    }
+    if resumed and (
+        not isinstance(intervals, list)
+        or len(interval_by_component) != len(intervals)
+        or any(
+            component not in interval_by_component
+            or interval_by_component[component].get("status") != "resumed"
+            or interval_by_component[component].get("interval_semantics")
+            != _ROLE_NEUTRAL_COMPONENT_RESUME_INTERVAL_SEMANTICS
+            for component in resumed
+        )
+    ):
+        raise ValueError(
+            "first owner resumed component lacks its valid resume interval"
+        )
+    operational_components = frozenset(
+        {"htr", "matched_pair", "tfidf", "neural_query"}
+    )
+    reports = worker_report.get("component_reports")
+    expected_fresh_reports = operational_components - resumed
+    if (
+        not isinstance(reports, Mapping)
+        or set(reports) != expected_fresh_reports
+    ):
+        raise ValueError(
+            "first owner did not attest every fresh parallel producer"
+        )
+
+    validators = {
+        "htr": _validate_first_owner_htr_report,
+        "matched_pair": _validate_first_owner_matched_report,
+        "tfidf": _validate_first_owner_tfidf_report,
+        "neural_query": _validate_first_owner_neural_report,
+    }
+    summaries: dict[str, Any] = {}
+    for component in ("htr", "matched_pair", "tfidf", "neural_query"):
+        if component in resumed:
+            summaries[component] = {
+                "operational_overlap_status": "not_replayed_on_resume",
+            }
+        else:
+            summaries[component] = validators[component](
+                reports[component],
+                gate=gate,
+            )
+    summary = {
+        **summaries,
         "every_parallel_component_report_self_authenticated": True,
         "configured_parallel_work_did_not_serialize": True,
     }
+    if resumed:
+        summary["resumed_parallel_components"] = [
+            component
+            for component in ("htr", "matched_pair", "tfidf", "neural_query")
+            if component in resumed
+        ]
+    return summary
 
 
 def _first_owner_memory_observation(
@@ -2292,6 +2619,7 @@ def execute_and_publish_role_neutral_stage1(
     producer_factories: RoleNeutralProducerFactories,
     policy: RoleNeutralStage1ExecutionPolicy,
     executor: RoleNeutralPhysicalOwnerExecutor,
+    resume: bool = False,
 ) -> dict[str, Any]:
     """Execute canonical owners and publish the authenticated all-ten gate."""
 
@@ -2304,8 +2632,48 @@ def execute_and_publish_role_neutral_stage1(
     execute = getattr(executor, "execute", None)
     if not callable(execute):
         raise TypeError("role-neutral execution requires a configured executor")
+    if not isinstance(resume, bool):
+        raise TypeError("role-neutral execution resume must be boolean")
     factories = producer_factories.as_mapping()
-    destination = _canonical_fresh_root(root)
+    requested_root = Path(root)
+    if resume and requested_root.is_dir():
+        if (
+            not requested_root.is_absolute()
+            or requested_root.is_symlink()
+            or requested_root.resolve(strict=True) != requested_root
+        ):
+            raise ValueError(
+                "resumable role-neutral execution root must be canonical"
+            )
+        destination = requested_root
+        if (destination / ROLE_NEUTRAL_EXECUTION_MANIFEST).is_file():
+            return validate_role_neutral_stage1_execution(
+                root=destination,
+                plan=plan,
+            )
+        _archive_stale_process_markers_for_resume(destination)
+        stale_gate = _first_owner_gate_path(destination)
+        if stale_gate.is_file():
+            recovery_root = (
+                destination.parent
+                / "interrupted_role_neutral_components"
+            )
+            recovery_root.mkdir(parents=True, exist_ok=True)
+            stale_gate.rename(
+                recovery_root / f"{stale_gate.name}.{time.time_ns()}"
+            )
+        unexpected = {
+            child.name
+            for child in destination.iterdir()
+            if child.name != ROLE_NEUTRAL_COMPONENT_DIRECTORY
+        }
+        if unexpected:
+            raise ValueError(
+                "resumable role-neutral execution root has unexpected "
+                f"entries: {sorted(unexpected)}"
+            )
+    else:
+        destination = _canonical_fresh_root(root)
 
     physical_order = tuple(plan.physical_execution_order)
     expected_physical_ids = tuple(owner.scope_id for owner in plan.physical_scopes)
@@ -2329,9 +2697,9 @@ def execute_and_publish_role_neutral_stage1(
         // effective_owner_concurrency,
     )
 
-    destination.mkdir(exist_ok=False)
+    destination.mkdir(exist_ok=resume)
     component_root = destination / ROLE_NEUTRAL_COMPONENT_DIRECTORY
-    component_root.mkdir(exist_ok=False)
+    component_root.mkdir(exist_ok=resume)
     tasks = tuple(
         RoleNeutralPhysicalOwnerTask(
             plan=plan,
@@ -2354,6 +2722,7 @@ def execute_and_publish_role_neutral_stage1(
                 else (assigned_resources[owner_scope_id],)
             ),
             owner_cpu_budget=owner_cpu_budget,
+            resume=resume,
         )
         for owner_scope_id in physical_order
     )
@@ -2676,20 +3045,53 @@ def execute_and_publish_role_neutral_stage1(
         )
 
     open_session = getattr(executor, "open_session", None)
-    if process_isolated and callable(open_session):
-        session_marker_root = (
-            destination / ".persistent-owner-execution-session"
-        )
-        with open_session(
-            resources=tuple(policy.resource_plan.devices),
-            max_workers=effective_owner_concurrency,
-            cpu_budget=int(policy.resource_plan.cpu_budget),
-            marker_root=session_marker_root,
-        ) as persistent_session:
-            execute = persistent_session.execute
+    previous_sigterm_handler: Any = None
+    sigterm_handler_installed = False
+    persistent_session: Any = None
+    try:
+        if (
+            process_isolated
+            and threading.current_thread() is threading.main_thread()
+        ):
+            previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+            def _interrupt_parent(signum: int, _frame: Any) -> None:
+                if persistent_session is not None:
+                    interrupt = getattr(
+                        persistent_session,
+                        "interrupt",
+                        None,
+                    )
+                    if callable(interrupt):
+                        interrupt()
+                raise _RoleNeutralStage1ParentSignal(
+                    "role-neutral Stage 1 received "
+                    f"signal {int(signum)}"
+                )
+
+            signal.signal(signal.SIGTERM, _interrupt_parent)
+            sigterm_handler_installed = True
+        if process_isolated and callable(open_session):
+            session_marker_root = (
+                destination / _STALE_SESSION_MARKER_DIRECTORY
+            )
+            persistent_session = open_session(
+                resources=tuple(policy.resource_plan.devices),
+                max_workers=effective_owner_concurrency,
+                cpu_budget=int(policy.resource_plan.cpu_budget),
+                marker_root=session_marker_root,
+            )
+            with persistent_session:
+                execute = persistent_session.execute
+                executed_results = run_productive_compute()
+        else:
             executed_results = run_productive_compute()
-    else:
-        executed_results = run_productive_compute()
+    finally:
+        if sigterm_handler_installed:
+            signal.signal(
+                signal.SIGTERM,
+                previous_sigterm_handler,
+            )
     raw_results = tuple(preexecuted_results) + tuple(executed_results)
     if claimed != set(expected_physical_ids):
         raise ValueError("configured executor did not execute every physical owner")

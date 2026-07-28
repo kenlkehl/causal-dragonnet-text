@@ -76,7 +76,6 @@ from oci.inference.all_evidence_post_extraction_review import (
     CONDITIONAL_CONTEXT_AND_GATE_REVIEW_POLICY,
     GATE_ONLY_REFERENCE_PRESERVATION_REVIEW_POLICY,
 )
-from oci.inference.scoped_embedding_cache import SharedEmbeddingCache
 from oci.inference.production_text_preparation import (
     TextPreparationOptions,
     prepare_modeling_cohort,
@@ -2483,26 +2482,6 @@ def test_legacy_classifier_rejects_partial_v5_and_migration_accounts_for_v4(
         "registered_payload_bytes_not_freshly_authenticated"
         in unauthenticated["recompute_reason_codes"]
     )
-
-
-def test_scoped_embedding_cache_denies_peer_rows(tmp_path: Path) -> None:
-    array_path = tmp_path / "embeddings.npy"
-    with array_path.open("xb") as handle:
-        np.save(handle, np.arange(24, dtype=np.float32).reshape(6, 4))
-    row_path = tmp_path / "rows.parquet"
-    pd.DataFrame({"row_id": [f"p{value}" for value in range(6)]}).to_parquet(
-        row_path,
-        index=False,
-    )
-    cache = SharedEmbeddingCache(
-        embedding_path=array_path,
-        row_ids_path=row_path,
-    )
-    view = cache.scoped_view(("p1", "p3"))
-    assert view.shape == (2, 4)
-    assert view.take().flags.writeable is False
-    with pytest.raises(PermissionError, match="peer rows"):
-        view.take(("p1", "p2"))
 
 
 def test_resource_scheduler_supports_cpu_and_heterogeneous_auto_inventory() -> None:

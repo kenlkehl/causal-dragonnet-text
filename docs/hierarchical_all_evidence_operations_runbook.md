@@ -20,11 +20,10 @@ caches are the sources of truth.
 
 ## Scope
 
-The historical low-level entry point described by the replay sections is:
-
-```text
-scripts/run_all_evidence_fusion_benchmark.py
-```
+The historical low-level entry point described by the replay sections has been
+removed. The sections below document old artifacts only; they are not runnable
+instructions. New production work uses
+`scripts/run_production_all_evidence_workflow.py`.
 
 It orchestrates the pipeline from an **authenticated Stage 1 artifact bundle**
 through:
@@ -121,10 +120,6 @@ Run from the repository root. Use the project lock file or the exact previously
 recorded environment. `uv run --frozen` is the recommended generic invocation;
 an already approved batch must use the interpreter and package identities bound
 into its preparation manifest.
-
-```bash
-uv run --frozen python scripts/run_all_evidence_fusion_benchmark.py --help
-```
 
 Before an expensive run, check the relevant devices and endpoint independently.
 Do not start a local language-model server through this CLI.
@@ -600,22 +595,7 @@ Dry run validates files, fold registries, endpoint identity, configuration,
 authenticated overlays, and the fresh-output rule. It constructs no client and
 makes no remote call.
 
-```bash
-uv run --frozen python scripts/run_all_evidence_fusion_benchmark.py \
-  "${AE_COMMON_ARGS[@]}" \
-  --output-dir "$AE_PREP_SCRATCH" \
-  --review-neural-query-cache-dir \
-    "$AE_PREP_SCRATCH/post_extraction_review_neural_query_cache" \
-  --hierarchical-preparation-dir "$AE_PREPARATION" \
-  --hierarchical-job-cache-root "$AE_PREPARATION/hierarchical_job_cache" \
-  --hierarchical-offline-review-packet-dir "$AE_PREPARATION/offline_review_packet" \
-  --historical-discovery-prompt \
-    "${AE_HISTORICAL_PROMPT}::${AE_HISTORICAL_PROMPT_SHA256}" \
-  --old-hierarchy-prompt \
-    "${AE_OLD_HIERARCHY_PROMPT}::${AE_OLD_HIERARCHY_PROMPT_SHA256}" \
-  --dry-run \
-  | tee "$AE_CONTROL_DIR/dry_run.json"
-```
+The retired dry-run command has been removed with its low-level entry point.
 
 Require all of the following in the output:
 
@@ -638,22 +618,8 @@ Preparation may perform expensive local Stage 1 work and create output-local
 provider caches, but it must execute zero hierarchical JSON jobs and zero remote
 model calls.
 
-```bash
-uv run --frozen python scripts/run_all_evidence_fusion_benchmark.py \
-  "${AE_COMMON_ARGS[@]}" \
-  --output-dir "$AE_PREP_SCRATCH" \
-  --review-neural-query-cache-dir \
-    "$AE_PREP_SCRATCH/post_extraction_review_neural_query_cache" \
-  --hierarchical-preparation-dir "$AE_PREPARATION" \
-  --hierarchical-job-cache-root "$AE_PREPARATION/hierarchical_job_cache" \
-  --hierarchical-offline-review-packet-dir "$AE_PREPARATION/offline_review_packet" \
-  --historical-discovery-prompt \
-    "${AE_HISTORICAL_PROMPT}::${AE_HISTORICAL_PROMPT_SHA256}" \
-  --old-hierarchy-prompt \
-    "${AE_OLD_HIERARCHY_PROMPT}::${AE_OLD_HIERARCHY_PROMPT_SHA256}" \
-  --prepare-hierarchical-discovery \
-  | tee "$AE_CONTROL_DIR/prepare_result.json"
-```
+The retired preparation command has been removed with its low-level entry
+point.
 
 A valid result has:
 
@@ -717,19 +683,7 @@ Use the exact prepared configuration and a fresh final output. Do not pass the t
 historical prompt-control arguments during live execution; they were inputs to the
 offline comparison packet, not permission to change the approved hierarchy.
 
-```bash
-uv run --frozen python scripts/run_all_evidence_fusion_benchmark.py \
-  "${AE_COMMON_ARGS[@]}" \
-  --output-dir "$AE_EXECUTION" \
-  --review-neural-query-cache-dir \
-    "$AE_EXECUTION/post_extraction_review_neural_query_cache" \
-  --hierarchical-preparation-dir "$AE_PREPARATION" \
-  --hierarchical-job-cache-root "$AE_PREPARATION/hierarchical_job_cache" \
-  --hierarchical-offline-review-packet-dir "$AE_PREPARATION/offline_review_packet" \
-  --hierarchical-approved-batch-sha256 "$AE_APPROVAL_SHA256" \
-  "${AE_REPLAY_ARGS[@]}" \
-  | tee "$AE_CONTROL_DIR/execution_result.json"
-```
+The retired execution command has been removed with its low-level entry point.
 
 For a synthetic benchmark, add `--evaluate-oracle-posthoc` to this live
 invocation if the separate post-hoc report is required. That flag does not expose

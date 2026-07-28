@@ -794,10 +794,6 @@ def _validate_safe_evidence(
         )
     if len(query_ids) != len(set(query_ids)):
         raise ValueError("safe neural-query evidence query IDs are not unique")
-    if maximum_term_chars > int(query["evidence_safe_term_max_chars"]) or (
-        maximum_term_tokens > int(query["evidence_safe_term_max_tokens"])
-    ):
-        raise ValueError("safe neural-query evidence exceeded its declared term transport")
     body = {
         "expected_query_count_by_bank": expected_by_bank,
         "observed_query_count_by_bank": observed_by_bank,
@@ -808,6 +804,7 @@ def _validate_safe_evidence(
         "maximum_term_tokens": maximum_term_tokens,
         "term_count_capacity_nonbinding": True,
         "term_transport_capacity_nonbinding": True,
+        "legacy_safe_term_limits_applied": False,
         "row_level_chunks_removed_after_complete_fit_side_contrast": True,
     }
     return rows, {**body, "content_sha256": _sha256_json(body)}
@@ -1696,6 +1693,7 @@ def _validate_fit_side(
         or evidence_coverage.get("all_configured_queries_retained") is not True
         or evidence_coverage.get("term_count_capacity_nonbinding") is not True
         or evidence_coverage.get("term_transport_capacity_nonbinding") is not True
+        or evidence_coverage.get("legacy_safe_term_limits_applied") is not False
         or evidence_coverage.get(
             "row_level_chunks_removed_after_complete_fit_side_contrast"
         )

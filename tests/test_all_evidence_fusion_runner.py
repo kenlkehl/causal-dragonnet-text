@@ -6419,7 +6419,7 @@ def _run_with_exact_runtime_forest(tmp_path, monkeypatch, *, mode):
         "derive_exact_nuisance_from_runtime_stable_stage1",
         _test_exact_nuisance_derivation,
     )
-    result = AllEvidenceFusionRunner(
+    runner = AllEvidenceFusionRunner(
         dataset_path=dataset_path,
         legacy_handoff_path=legacy_path,
         tfidf_handoff_path=tfidf_path,
@@ -6438,20 +6438,20 @@ def _run_with_exact_runtime_forest(tmp_path, monkeypatch, *, mode):
             require_final_causal_forest=True,
             final_upstream_meta_inner_folds=3,
         ),
-    ).run()
-    return backend, result
+    )
+    return backend, runner.run(), runner
 
 
 def test_exact_raw_runtime_uses_causal_forest_role_routing_and_never_s_head(
     tmp_path,
     monkeypatch,
 ):
-    signal_backend, signal_result = _run_with_exact_runtime_forest(
+    signal_backend, signal_result, _ = _run_with_exact_runtime_forest(
         tmp_path,
         monkeypatch,
         mode="signal",
     )
-    _, constant_result = _run_with_exact_runtime_forest(
+    _, constant_result, _ = _run_with_exact_runtime_forest(
         tmp_path,
         monkeypatch,
         mode="constant",
@@ -6482,6 +6482,59 @@ def test_exact_raw_runtime_uses_causal_forest_role_routing_and_never_s_head(
     signal = pd.read_parquet(signal_result.prediction_path).sort_values("_oci_row_id")
     constant = pd.read_parquet(constant_result.prediction_path).sort_values("_oci_row_id")
     assert not np.allclose(signal["pred_ite_prob"], constant["pred_ite_prob"])
+
+
+def test_strict_forest_resume_reuses_complete_folds_and_recomputes_only_partial_fold(
+    tmp_path,
+    monkeypatch,
+):
+    backend, first, runner = _run_with_exact_runtime_forest(
+        tmp_path,
+        monkeypatch,
+        mode="signal",
+    )
+    assert len(backend.calls) == 2
+
+    input_manifest = json.loads(
+        (runner.output_dir / "immutable_input_manifest.json").read_text()
+    )
+    first_fold_path = first.fold_manifest_paths[0]
+    first_fold = json.loads(first_fold_path.read_text())
+    assert first_fold["body"]["input_manifest_content_sha256"] == (
+        input_manifest["content_sha256"]
+    )
+
+    backend.calls.clear()
+    resumed = runner.run()
+    assert backend.calls == []
+    assert resumed.prediction_sha256 == first.prediction_sha256
+
+    # Simulate interruption after the fold prediction was frozen but before
+    # its completion manifest was written. The existing prediction is kept,
+    # the incomplete fold is recomputed, and the other fold remains reused.
+    first_fold_path.unlink()
+    backend.calls.clear()
+    resumed_partial = runner.run()
+    assert len(backend.calls) == 1
+    assert resumed_partial.prediction_sha256 == first.prediction_sha256
+    rebuilt_fold = json.loads(first_fold_path.read_text())
+    assert rebuilt_fold["body"]["input_manifest_content_sha256"] == (
+        input_manifest["content_sha256"]
+    )
+
+    # A content-hash-valid manifest with a different selected-variable record
+    # is not eligible for reuse.
+    rebuilt_fold["body"]["selected_contract_sha256"] = ["0" * 64]
+    rebuilt_fold["content_sha256"] = fusion_runner_module._content_sha256(
+        rebuilt_fold["body"]
+    )
+    first_fold_path.write_text(
+        json.dumps(rebuilt_fold, indent=2, sort_keys=True) + "\n"
+    )
+    backend.calls.clear()
+    with pytest.raises(RuntimeError, match="selected-variable checkpoint"):
+        runner.run()
+    assert backend.calls == []
 
 
 def test_binary_forest_reconstruction_audits_clipped_final_estimand(tmp_path):

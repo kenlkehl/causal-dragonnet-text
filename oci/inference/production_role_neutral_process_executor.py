@@ -34,7 +34,7 @@ import signal
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -52,6 +52,10 @@ from .production_stage1_scope_scheduler import (
     _observe_stage1_torch_determinism,
     _terminate_process_and_descendants,
     seed_stage1_scope_rngs,
+)
+from .prepared_stage1_context import (
+    _option_mapping,
+    _options_from_mapping,
 )
 
 
@@ -71,34 +75,6 @@ _TARGET = re.compile(
 )
 _HEX = frozenset("0123456789abcdef")
 _PROCESS_START_ENVIRONMENT_LOCK = threading.Lock()
-_PATH_OPTION_FIELDS = frozenset(
-    {
-        "dataset_path",
-        "config_path",
-        "embedding_cache_dir",
-        "output_dir",
-        "embedding_local_model_path",
-        "embedding_cache_output_dir",
-        "query_config_path",
-        "cluster_preflight_manifest_path",
-        "cluster_preflight_state_bundle_manifest_path",
-        "stage1_scope_descriptor_root",
-        "stage1_scope_attempt_root",
-        "stage1_scope_progress_path",
-    }
-)
-_TUPLE_OPTION_FIELDS = frozenset({"gpu_ids", "query_devices"})
-_RELOCATION_PATH_FIELDS = frozenset(
-    {
-        "source_cache_dir",
-        "source_prepared_cohort_path",
-        "source_preparation_manifest_path",
-        "fresh_prepared_cohort_path",
-        "fresh_preparation_manifest_path",
-        "local_model_path",
-        "target_dir",
-    }
-)
 _NATIVE_THREAD_ENVIRONMENT = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -137,134 +113,6 @@ def _require_sha256(value: Any, *, label: str) -> str:
     if len(text) != 64 or any(character not in _HEX for character in text):
         raise ValueError(f"{label} must be one lowercase SHA-256")
     return text
-
-
-def _option_mapping(prepared: Any) -> dict[str, Any]:
-    """Serialize every build-option field without invoking a default."""
-
-    from .production_embedding_cache_relocation import (
-        ProductionEmbeddingCacheRelocationOptions,
-    )
-    from .production_stage1_bundle import Stage1BundleBuildOptions
-
-    options = prepared.options
-    if not isinstance(options, Stage1BundleBuildOptions):
-        raise TypeError("process authority requires typed Stage1BundleBuildOptions")
-    expected = {value.name for value in fields(Stage1BundleBuildOptions)}
-    result: dict[str, Any] = {}
-    for value in fields(Stage1BundleBuildOptions):
-        name = value.name
-        raw = getattr(options, name)
-        if name in _PATH_OPTION_FIELDS:
-            result[name] = None if raw is None else str(Path(raw))
-        elif name in _TUPLE_OPTION_FIELDS:
-            result[name] = list(raw)
-        elif name == "embedding_cache_relocation":
-            if raw is None:
-                result[name] = None
-            else:
-                if not isinstance(
-                    raw,
-                    ProductionEmbeddingCacheRelocationOptions,
-                ):
-                    raise TypeError(
-                        "process authority cache relocation must be typed"
-                    )
-                relocation: dict[str, Any] = {}
-                for child in fields(ProductionEmbeddingCacheRelocationOptions):
-                    child_value = getattr(raw, child.name)
-                    relocation[child.name] = (
-                        str(Path(child_value))
-                        if child.name in _RELOCATION_PATH_FIELDS
-                        else _json_copy(
-                            child_value,
-                            label=f"relocation.{child.name}",
-                        )
-                    )
-                result[name] = relocation
-        elif name == "semantic_witness_scientific_config":
-            if raw is None:
-                result[name] = None
-            elif isinstance(raw, Mapping):
-                result[name] = _json_copy(raw, label=name)
-            else:
-                as_dict = getattr(raw, "as_dict", None)
-                if not callable(as_dict):
-                    raise TypeError(
-                        "semantic witness scientific config lacks as_dict()"
-                    )
-                result[name] = _json_copy(as_dict(), label=name)
-        elif name == "physical_fit_identity":
-            from .production_stage1_scope_scheduler import (
-                Stage1PhysicalFitIdentity,
-            )
-
-            if not isinstance(raw, Stage1PhysicalFitIdentity):
-                raise TypeError(
-                    "physical_fit_identity must be one closed typed identity"
-                )
-            result[name] = _json_copy(raw.as_dict(), label=name)
-        else:
-            result[name] = _json_copy(raw, label=name)
-    if set(result) != expected:
-        raise RuntimeError("process authority omitted a Stage 1 build option")
-    return result
-
-
-def _options_from_mapping(value: Mapping[str, Any]) -> Any:
-    """Reconstruct typed build options from an exact closed field mapping."""
-
-    from .production_embedding_cache_relocation import (
-        ProductionEmbeddingCacheRelocationOptions,
-    )
-    from .production_stage1_bundle import Stage1BundleBuildOptions
-
-    expected = {child.name for child in fields(Stage1BundleBuildOptions)}
-    if not isinstance(value, Mapping) or set(value) != expected:
-        raise ValueError(
-            "process authority must contain every Stage1BundleBuildOptions "
-            "field exactly"
-        )
-    kwargs: dict[str, Any] = {}
-    for child in fields(Stage1BundleBuildOptions):
-        name = child.name
-        raw = copy.deepcopy(value[name])
-        if name in _PATH_OPTION_FIELDS:
-            kwargs[name] = None if raw is None else Path(str(raw))
-        elif name in _TUPLE_OPTION_FIELDS:
-            if not isinstance(raw, list):
-                raise TypeError(f"process authority option {name} must be a list")
-            kwargs[name] = tuple(raw)
-        elif name == "embedding_cache_relocation":
-            if raw is None:
-                kwargs[name] = None
-            else:
-                relocation_fields = {
-                    value.name
-                    for value in fields(
-                        ProductionEmbeddingCacheRelocationOptions
-                    )
-                }
-                if not isinstance(raw, Mapping) or set(raw) != relocation_fields:
-                    raise ValueError(
-                        "process authority relocation fields are incomplete"
-                    )
-                relocation = {
-                    key: (
-                        Path(str(raw[key]))
-                        if key in _RELOCATION_PATH_FIELDS
-                        else copy.deepcopy(raw[key])
-                    )
-                    for key in relocation_fields
-                }
-                kwargs[name] = ProductionEmbeddingCacheRelocationOptions(
-                    **relocation
-                )
-        else:
-            kwargs[name] = raw
-    # Every dataclass field is supplied.  No constructor default can participate
-    # in reconstruction.
-    return Stage1BundleBuildOptions(**kwargs)
 
 
 @dataclass(frozen=True)

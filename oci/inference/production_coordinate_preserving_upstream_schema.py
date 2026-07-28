@@ -16,6 +16,7 @@ concept-discovery view elsewhere.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .all_evidence_post_extraction_review import (
@@ -32,6 +33,8 @@ from .coordinate_preserving_context_fit_upstream_backend import (
     PrecommittedNamedRawCoordinate,
     PrecommittedVolatileRawFeatureFamily,
 )
+from .neural_query_agentic_forest import NeuralQueryAgenticForestConfig
+from .stage1_upstream_gate_backend import HistoricalStage1ConfigSnapshot
 
 PRODUCTION_COORDINATE_PRESERVING_REGISTRY_VERSION = (
     "production_all_architecture_coordinate_registry_v1"
@@ -326,6 +329,66 @@ def build_production_coordinate_preserving_schema(
     return config
 
 
+def build_coordinate_preserving_final_upstream_schema_config(
+    stage1_config_path: Path | str,
+    *,
+    stage1_config_snapshot: HistoricalStage1ConfigSnapshot | None = None,
+    neural_query_config: NeuralQueryAgenticForestConfig | None = None,
+    max_orphan_features: int,
+) -> CoordinatePreservingUpstreamSchemaConfig:
+    """Build the production registry directly from the frozen Stage-1 config."""
+
+    path = Path(stage1_config_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"historical Stage-1 review config does not exist or is not a file: {path}"
+        )
+    snapshot = stage1_config_snapshot or HistoricalStage1ConfigSnapshot.from_path(path)
+    if snapshot.source_path != path:
+        raise ValueError("final upstream schema config path does not match exact snapshot")
+    snapshot.verify_source()
+    applied = snapshot.applied_config()
+    forest = applied.architecture.multi_model_forest
+    required_flags = {
+        "bow_discovery_enabled": bool(forest.bow_discovery_enabled),
+        "htr_evidence_enabled": bool(forest.htr_evidence_enabled),
+        "embedding_contrast.enabled": bool(forest.embedding_contrast.enabled),
+        "embedding_contrast.include_cluster_contrast_vectors": bool(
+            forest.embedding_contrast.include_cluster_contrast_vectors
+        ),
+        "matched_pair_uplift_enabled": bool(forest.matched_pair_uplift_enabled),
+        "matched_pair_bow_enabled": bool(forest.matched_pair_bow_enabled),
+        "matched_pair_htr_enabled": bool(forest.matched_pair_htr_enabled),
+    }
+    disabled = sorted(name for name, enabled in required_flags.items() if not enabled)
+    if disabled:
+        raise ValueError(
+            "all-architecture coordinate registry requires enabled Stage-1 paths: "
+            + ", ".join(disabled)
+        )
+    if bool(applied.architecture.htr_freeze_sentence_encoder):
+        raise ValueError(
+            "the all-architecture workflow requires the HTR sentence encoder to be trainable"
+        )
+    views = tuple(str(view.name).strip() for view in forest.bow_views)
+    query_config = neural_query_config or NeuralQueryAgenticForestConfig()
+    if not isinstance(query_config, NeuralQueryAgenticForestConfig):
+        raise TypeError("neural_query_config must be NeuralQueryAgenticForestConfig")
+    query_config.validate()
+    return build_production_coordinate_preserving_schema(
+        namespace="all_evidence_upstream",
+        bow_view_names=views,
+        source_config_sha256=snapshot.sha256,
+        cluster_max_components=int(forest.embedding_contrast.cluster_contrast_max_components),
+        tfidf_topic_count=int(forest.tfidf_topic.topic_count),
+        max_orphan_features=max_orphan_features,
+        neural_query_counts={
+            bank: query_config.query_count(bank)
+            for bank in ("treatment", "outcome", "effect")
+        },
+    )
+
+
 def production_coordinate_preserving_registry_audit(
     config: CoordinatePreservingUpstreamSchemaConfig,
 ) -> dict[str, Any]:
@@ -392,6 +455,7 @@ def production_coordinate_preserving_registry_audit(
 
 __all__ = [
     "PRODUCTION_COORDINATE_PRESERVING_REGISTRY_VERSION",
+    "build_coordinate_preserving_final_upstream_schema_config",
     "build_production_coordinate_preserving_schema",
     "production_coordinate_preserving_registry_audit",
 ]

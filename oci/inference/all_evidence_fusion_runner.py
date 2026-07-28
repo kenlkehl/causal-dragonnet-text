@@ -12034,6 +12034,127 @@ class AllEvidenceFusionRunner:
                 scope="outer_train",
                 artifact_id=f"all-evidence-outer-{outer_fold}",
             )
+            completed_fold_manifest = (
+                fold_dir / "immutable_fold_manifest.json"
+            )
+            completed_fold_prediction = (
+                fold_dir / "frozen_predictions.parquet"
+            )
+            if completed_fold_manifest.is_file():
+                try:
+                    wrapped = json.loads(
+                        completed_fold_manifest.read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        f"completed fold {outer_fold} manifest is unreadable"
+                    ) from exc
+                body = wrapped.get("body") if isinstance(wrapped, Mapping) else None
+                if (
+                    not isinstance(body, Mapping)
+                    or wrapped.get("schema_version")
+                    != FOLD_MANIFEST_SCHEMA_VERSION
+                    or wrapped.get("content_sha256")
+                    != _content_sha256(body)
+                    or body.get("input_manifest_content_sha256")
+                    != input_manifest_hash
+                    or body.get("outer_fold") != outer_fold
+                    or body.get("split_fingerprint")
+                    != provenance.split_fingerprint
+                    or body.get("train_row_fingerprint")
+                    != row_set_fingerprint(train_ids)
+                    or body.get("heldout_row_fingerprint")
+                    != row_set_fingerprint(heldout_ids)
+                    or body.get("stage1_reference_source")
+                    != reference_source
+                    or body.get("outer_heldout_outcomes_used") is not False
+                    or body.get("oracle_columns_written") is not False
+                    or Path(str(body.get("prediction_path", ""))).resolve()
+                    != completed_fold_prediction.resolve()
+                    or not completed_fold_prediction.is_file()
+                    or body.get("prediction_sha256")
+                    != sha256_file(completed_fold_prediction)
+                ):
+                    raise RuntimeError(
+                        f"completed fold {outer_fold} checkpoint is invalid"
+                    )
+                selected_contracts = body.get("selected_contracts")
+                if (
+                    not isinstance(selected_contracts, list)
+                    or not all(
+                        isinstance(contract, Mapping)
+                        for contract in selected_contracts
+                    )
+                    or body.get("selected_contract_sha256")
+                    != [
+                        extraction_contract_sha256(contract)
+                        for contract in selected_contracts
+                    ]
+                ):
+                    raise RuntimeError(
+                        f"completed fold {outer_fold} selected-variable "
+                        "checkpoint is invalid"
+                    )
+                expected_strict_forest = bool(
+                    self.raw_final_upstream_producer is not None
+                    or self.reference_only_stage1_mode
+                )
+                completed_estimator = body.get("final_ite_estimator")
+                if (
+                    not isinstance(completed_estimator, Mapping)
+                    or completed_estimator.get("mode")
+                    != (
+                        FINAL_CONTEXT_FIT_CAUSAL_FOREST_ADAPTER_ID
+                        if expected_strict_forest
+                        else "structured_interaction_head_degraded_fallback"
+                    )
+                    or completed_estimator.get("strict_causal_forest_active")
+                    != expected_strict_forest
+                    or (
+                        expected_strict_forest
+                        and completed_estimator.get("forest_backend_identity")
+                        != self.final_causal_forest_backend_identity
+                    )
+                ):
+                    raise RuntimeError(
+                        f"completed fold {outer_fold} final-estimator "
+                        "checkpoint is invalid"
+                    )
+                prediction = pd.read_parquet(
+                    completed_fold_prediction
+                )
+                _reject_forbidden_columns(
+                    prediction.columns,
+                    source=f"resumed fold {outer_fold} prediction",
+                )
+                if (
+                    not {
+                        "_oci_row_id",
+                        "outer_fold",
+                        "pred_ite_prob",
+                    }.issubset(prediction.columns)
+                    or body.get("prediction_columns")
+                    != list(prediction.columns)
+                    or tuple(
+                        map(int, prediction["_oci_row_id"].tolist())
+                    )
+                    != heldout_ids
+                    or set(
+                        map(int, prediction["outer_fold"].tolist())
+                    )
+                    != {outer_fold}
+                    or not np.isfinite(
+                        prediction["pred_ite_prob"].to_numpy(dtype=float)
+                    ).all()
+                ):
+                    raise RuntimeError(
+                        f"completed fold {outer_fold} prediction is invalid"
+                    )
+                fold_predictions.append(prediction)
+                fold_manifests.append(completed_fold_manifest)
+                continue
             legacy_row = (
                 None
                 if legacy is None
@@ -13017,6 +13138,7 @@ class AllEvidenceFusionRunner:
             fold_prediction_path = fold_dir / "frozen_predictions.parquet"
             fold_prediction_sha = _write_immutable_parquet(fold_prediction_path, prediction)
             fold_manifest_body = {
+                "input_manifest_content_sha256": input_manifest_hash,
                 "outer_fold": outer_fold,
                 "source_text_temporal_policy": source_text_temporal_policy_audit(),
                 "spent_evidence_context_epoch_policy": (

@@ -60,6 +60,9 @@ from .operator_trusted_checkpoint_adoption import (
     validate_operator_trusted_portable_artifact,
 )
 from .performance_telemetry import TelemetryLedger
+from .portable_resource_scheduler import (
+    _logical_to_physical_cuda_indices,
+)
 from .portable_workflow_spec import (
     BINARY_PROBABILITY_DIFFERENCE,
     DeploymentProfile,
@@ -109,6 +112,9 @@ PHASES = (
     "terminal_validation",
 )
 STAGE1_ONLY_PHASES = PHASES[:5] + ("terminal_validation",)
+IN_PLACE_RESUMABLE_PHASES = frozenset(
+    {"stage1_modeling", "stage2_canary", "stage2_inference"}
+)
 EMBEDDING_CACHE_PHASE_SCHEMA = "production_embedding_cache_phase_result_v1"
 STAGE1_PREFLIGHT_PHASE_SCHEMA = "production_stage1_preflight_phase_result_v2"
 PORTABLE_ROLE_NEUTRAL_STAGE1_PHASE_SCHEMA = (
@@ -182,6 +188,18 @@ WORKFLOW_STRUCTURED_LOG_EVENT_SCHEMA = (
     "production_all_evidence_structured_log_event_v1"
 )
 SOURCE_SNAPSHOT_EXECUTION_ENV = "OCI_PRODUCTION_SOURCE_SNAPSHOT_SHA256"
+
+# Stage 1 component artifacts already seal their own implementation,
+# configuration, model, row, and seed identities.  Keep the scope-plan
+# namespace stable across orchestration-only changes so that a completed
+# component remains reusable when an unrelated component or resume plumbing
+# changes.  This value is the namespace used by the first released all-ten
+# role-neutral production plan; changing scientific component code still
+# changes that component's own producer identity and therefore its seal.
+ROLE_NEUTRAL_STAGE1_COMPONENT_PLAN_NAMESPACE_IDENTITY = (
+    "195ebe1a8229410f20144ddecef0b5cea"
+    "3b73f7948813938b5eadf5c0a90f45d"
+)
 
 ADOPTABLE_PHASE_BY_ARTIFACT_KIND = {
     "prepared_cohort": "input_preparation",
@@ -1551,6 +1569,14 @@ _PHASE_TRANSITIVE_IMPORT_LEAVES: Mapping[str, frozenset[str]] = {
             "oci/inference/production_stage1_scope_scheduler.py",
             "oci/inference/review_spent_evidence_provider.py",
         }
+    ),
+    # This artifact module contains both the preflight sealer and the later
+    # worker-side reconstruction method.  Preflight executes only the local
+    # sealing/option-wire code; its scientific dependencies are already
+    # explicit phase roots.  Do not traverse reconstruction-only imports into
+    # the six modeling producers.
+    "stage1_preflight": frozenset(
+        {"oci/inference/prepared_stage1_context.py"}
     ),
 }
 _PHASE_WORKFLOW_METHODS: Mapping[str, tuple[str, ...]] = {
@@ -3158,6 +3184,58 @@ def _path_neutral_injected_identity(value: Any) -> Any:
     return value
 
 
+def _stage1_preflight_integration_identity(
+    value: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    """Project the all-ten integration to what preflight actually consumes.
+
+    The default preflight stores only the producer-factory architecture
+    profiles and runtime compatibility class in the prepared-context locator.
+    It does not invoke a component factory, physical-owner executor, or Stage 2
+    handoff publisher.  When the producer builder supplies the existing
+    explicit closed scientific identity, bind that configuration and its
+    stable callable interface without binding later modeling implementation
+    bytes.  Custom integrations without that explicit identity retain the full
+    source-bound identity as a fail-closed fallback.
+    """
+
+    if value is None:
+        return None
+    builder = value.get("producer_factories_builder")
+    if not isinstance(builder, Mapping):
+        return copy.deepcopy(dict(value))
+    behavior = builder.get("behavior_state")
+    if (
+        not isinstance(behavior, Mapping)
+        or behavior.get("state_policy")
+        != "explicit_closed_scientific_identity_v1"
+        or not isinstance(behavior.get("scientific_identity"), Mapping)
+    ):
+        return copy.deepcopy(dict(value))
+    interface = {
+        key: builder.get(key)
+        for key in ("callable_kind", "module", "qualname")
+    }
+    if not all(
+        isinstance(child, str) and child
+        for child in interface.values()
+    ):
+        return copy.deepcopy(dict(value))
+    body = {
+        "schema_version": (
+            "production_stage1_preflight_integration_identity_v1"
+        ),
+        "producer_factories_builder_interface": interface,
+        "producer_factories_scientific_identity": copy.deepcopy(
+            dict(behavior["scientific_identity"])
+        ),
+        "component_factories_invoked_during_preflight": False,
+        "physical_owner_executor_invoked_during_preflight": False,
+        "stage2_handoff_publisher_invoked_during_preflight": False,
+    }
+    return {**body, "content_sha256": _sha(body)}
+
+
 def _phase_transitive_producer_code_records(
     *,
     workflow_type: type,
@@ -3219,13 +3297,15 @@ def _phase_transitive_producer_code_records(
         callable_identities = dict(
             same_file_dependencies["callable_ast_sha256"]
         )
-        role_neutral = (
-            _path_neutral_injected_identity(
+        role_neutral = None
+        if phase == "stage1_preflight":
+            role_neutral = _stage1_preflight_integration_identity(
                 integration_hooks.get("role_neutral_stage1")
             )
-            if phase in {"stage1_preflight", "stage1_modeling"}
-            else None
-        )
+        elif phase == "stage1_modeling":
+            role_neutral = _path_neutral_injected_identity(
+                integration_hooks.get("role_neutral_stage1")
+            )
         phase_constant_body = {
             "schema_version": (
                 "phase_workflow_constant_identity_v1"
@@ -8513,6 +8593,27 @@ class ProductionAllEvidenceWorkflow:
         identity_memo = self._scientific_identity_memo
         values = json.loads(json.dumps(asdict(self.options), default=str))
         values.pop("run_control")
+        if self.options.endpoint is not None:
+            from ..extraction.llm_routing import (
+                resolve_stage2_endpoint_authentication,
+                resolve_stage2_endpoint_transport,
+                validate_stage2_endpoint_runtime_configuration,
+            )
+
+            endpoint_auth = resolve_stage2_endpoint_authentication()
+            endpoint_transport = resolve_stage2_endpoint_transport()
+            validate_stage2_endpoint_runtime_configuration(
+                authentication=endpoint_auth,
+                transport=endpoint_transport,
+            )
+            if endpoint_auth.identity["mode"] != "none":
+                values["stage2_endpoint_authentication"] = dict(
+                    endpoint_auth.identity
+                )
+            if endpoint_transport.mode != "vllm":
+                values["stage2_endpoint_transport"] = dict(
+                    endpoint_transport.identity
+                )
         values["schema_version"] = WORKFLOW_SCHEMA
         # ``dataclasses.asdict`` exposes internal tuple-backed fields from the
         # generation parameter objects and omits the policy's wire schema.
@@ -8932,9 +9033,9 @@ class ProductionAllEvidenceWorkflow:
             scientific_configuration_identity=values[
                 "scientific_configuration_identity"
             ]["scientific_configuration_sha256"],
-            producer_identity=values["phase_producer_code_identities"][
-                "stage1_modeling"
-            ],
+            producer_identity=(
+                ROLE_NEUTRAL_STAGE1_COMPONENT_PLAN_NAMESPACE_IDENTITY
+            ),
             runtime_compatibility_class=(
                 self.options.runtime_compatibility_class
             ),
@@ -11180,6 +11281,17 @@ class ProductionAllEvidenceWorkflow:
             / phase
         )
         phase_root.mkdir(parents=True, exist_ok=True)
+        if (
+            self.options.run_control.resume
+            and phase in IN_PLACE_RESUMABLE_PHASES
+        ):
+            prior_attempts = sorted(
+                path
+                for path in phase_root.glob("attempt_*")
+                if path.is_dir() and not path.is_symlink()
+            )
+            if prior_attempts:
+                return prior_attempts[-1]
         attempt = phase_root / (
             "attempt_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         )
@@ -11268,6 +11380,7 @@ class ProductionAllEvidenceWorkflow:
                 "resource_performance_safety_sha256": safety.content_sha256,
                 "checked_at": _utc_now(),
             }
+        logical_to_physical = _logical_to_physical_cuda_indices(requested)
         completed = subprocess.run(
             [
                 "nvidia-smi",
@@ -11288,7 +11401,7 @@ class ProductionAllEvidenceWorkflow:
             text=True,
             check=True,
         )
-        resources: dict[int, dict[str, Any]] = {}
+        physical_resources: dict[int, dict[str, Any]] = {}
         for line in gpu.stdout.splitlines():
             fields = [field.strip() for field in line.split(",")]
             if (
@@ -11299,12 +11412,17 @@ class ProductionAllEvidenceWorkflow:
                 or not fields[4].isdigit()
             ):
                 continue
-            resources[int(fields[0])] = {
+            physical_resources[int(fields[0])] = {
                 "uuid": fields[1],
                 "memory_total_mib": int(fields[2]),
                 "memory_used_mib": int(fields[3]),
                 "utilization_percent": int(fields[4]),
             }
+        resources = {
+            logical_id: physical_resources[physical_id]
+            for logical_id, physical_id in logical_to_physical.items()
+            if physical_id in physical_resources
+        }
         mapping = {gpu_id: str(resource["uuid"]) for gpu_id, resource in resources.items()}
         missing = [gpu_id for gpu_id in requested if gpu_id not in mapping]
         if missing:
@@ -12607,7 +12725,6 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                 == "accelerator"
                 else None
             ),
-            compute_canary=None,
         )
         execution_executor = integration.executor
         bind_context = getattr(execution_executor, "bind_context", None)
@@ -12630,6 +12747,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             producer_factories=producer_factories,
             policy=execution_policy,
             executor=execution_executor,
+            resume=self.options.run_control.resume,
         )
         if (
             int(execution_manifest.get("physical_fit_count", -1)) != len(plan.physical_scopes)
@@ -13274,6 +13392,40 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         o = self.options
         if not isinstance(o.endpoint, str) or not isinstance(o.model_name, str):
             raise RuntimeError("Stage 2 options were requested without endpoint/model identity")
+        from ..extraction.llm_routing import (
+            resolve_stage2_endpoint_authentication,
+            resolve_stage2_endpoint_transport,
+            validate_stage2_endpoint_runtime_configuration,
+        )
+
+        endpoint_auth = resolve_stage2_endpoint_authentication()
+        endpoint_transport = resolve_stage2_endpoint_transport()
+        validate_stage2_endpoint_runtime_configuration(
+            authentication=endpoint_auth,
+            transport=endpoint_transport,
+        )
+        expected_auth = self.request.get(
+            "stage2_endpoint_authentication"
+        )
+        if endpoint_auth.identity["mode"] == "none":
+            if expected_auth is not None:
+                raise RuntimeError(
+                    "Stage 2 endpoint authentication changed after request creation"
+                )
+        elif expected_auth != dict(endpoint_auth.identity):
+            raise RuntimeError(
+                "Stage 2 endpoint authentication changed after request creation"
+            )
+        expected_transport = self.request.get("stage2_endpoint_transport")
+        if endpoint_transport.mode == "vllm":
+            if expected_transport is not None:
+                raise RuntimeError(
+                    "Stage 2 endpoint transport changed after request creation"
+                )
+        elif expected_transport != dict(endpoint_transport.identity):
+            raise RuntimeError(
+                "Stage 2 endpoint transport changed after request creation"
+            )
         stage1 = self._validated_complete("stage1_modeling")
         stage1_artifact_paths = tuple(Path(row["path"]) for row in stage1["artifacts"])
         bundle_manifest = next(
@@ -13313,6 +13465,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             attestation_dir=attempt / f"{prefix}_attestation",
             endpoint=o.endpoint,
             model_name=o.model_name,
+            endpoint_api_key=endpoint_auth.api_key,
             stage2_tokenizer_locator=o.stage2_tokenizer_locator,
             review_rounds=o.review_rounds,
             initial_training_partitions=o.initial_training_partitions,
@@ -13411,6 +13564,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             outcome_type=(o.outcome_type if prepared_cohort_path is not None else None),
             direct_numerical_bank_manifest_path=(direct_numerical_bank_manifest),
             upstream_review_policy=upstream_review_policy,
+            resume=o.run_control.resume,
         )
 
     def _execute_phase_sequence(

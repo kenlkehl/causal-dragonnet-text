@@ -306,13 +306,11 @@ retain its operator approval ceremony without changing production behavior.
   concept-grounding prompt;
 - oracle evaluation remains impossible until the frozen prediction hash exists.
 
-The isolated canary suites in `tests/test_stage1_exact_inner_evidence.py`,
-`tests/test_stage1_exact_inner_family_adapters.py`, and
-`tests/test_tfidf_nested_calibration_production.py` cover the contract, all-ten
-native adapter bindings to real artifact bytes, catalog-derived full-outer clone
-registration, rejection of old label-leaky TF-IDF metadata, TF-IDF held-out-label
-permutation invariance, and the nested TF-IDF Stage 1-to-Stage 2 validator round
-trip. Topic/orphan proofs additionally require the registered held-out projection
+The retained nested TF-IDF coverage in
+`tests/test_tfidf_nested_calibration_production.py` checks rejection of
+label-leaky metadata, held-out-label permutation invariance, and the Stage 1 to
+Stage 2 validator round trip. Topic/orphan proofs additionally require the
+registered held-out projection
 to be exactly row ID plus the configuration-bound text column and bind the raw
 score-selection JSON as their source artifact. Embedding tests additionally
 recompute canonical split/data/label lineage and reject treatment, outcome,

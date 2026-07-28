@@ -19,6 +19,54 @@ from oci.inference.production_embedding_cache_process import (
 _SUPPORT = "tests.embedding_cache_process_test_support"
 
 
+def test_spawn_start_discovers_and_prepends_active_venv_native_libraries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = tmp_path / "active-venv"
+    site_packages = prefix / "lib/python/site-packages"
+    py_nv_video_codec = site_packages / "PyNvVideoCodec"
+    torch_lib = site_packages / "torch/lib"
+    cuda_bundle = site_packages / "nvidia/cu13/lib"
+    cudnn_lib = site_packages / "nvidia/cudnn/lib"
+    for path in (py_nv_video_codec, torch_lib, cuda_bundle, cudnn_lib):
+        path.mkdir(parents=True)
+    existing = tmp_path / "operator-lib"
+    existing.mkdir()
+    monkeypatch.setattr(process_module.sys, "prefix", str(prefix))
+    monkeypatch.setattr(
+        process_module.sysconfig,
+        "get_paths",
+        lambda: {
+            "purelib": str(site_packages),
+            "platlib": str(site_packages),
+        },
+    )
+    monkeypatch.setenv(
+        "LD_LIBRARY_PATH",
+        os.pathsep.join((str(existing), str(torch_lib))),
+    )
+    observed = {}
+
+    class Process:
+        @staticmethod
+        def start() -> None:
+            observed["loader_path"] = os.environ["LD_LIBRARY_PATH"]
+
+    process_module._start_with_environment(Process(), cpu_budget=2)
+
+    assert observed["loader_path"].split(os.pathsep) == [
+        str(py_nv_video_codec.resolve()),
+        str(torch_lib.resolve()),
+        str(cuda_bundle.resolve()),
+        str(cudnn_lib.resolve()),
+        str(existing),
+    ]
+    assert os.environ["LD_LIBRARY_PATH"] == os.pathsep.join(
+        (str(existing), str(torch_lib))
+    )
+
+
 def test_spawn_boundary_returns_only_after_worker_exit_and_binds_cpu_budget() -> None:
     parent_pid = os.getpid()
     result = _run_spawned_target(

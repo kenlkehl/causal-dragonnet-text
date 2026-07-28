@@ -339,6 +339,10 @@ def _safe_query_ngram_rows(
     max_tokens: int,
     max_chars: int,
 ) -> list[dict[str, Any]]:
+    # These arguments remain in the closed configuration for compatibility
+    # with existing prepared contexts.  They are legacy transport settings,
+    # not privacy controls, and must not reject a complete safe n-gram after
+    # separators such as underscores are normalized into lexical words.
     if int(max_tokens) < 1 or int(max_chars) < 1:
         raise ValueError("neural-query safe-term bounds must be positive")
     if not isinstance(values, (list, tuple)):
@@ -348,28 +352,7 @@ def _safe_query_ngram_rows(
         if not isinstance(raw, Mapping):
             continue
         raw_term = raw.get("term") or raw.get("feature") or raw.get("ngram")
-        # First apply identifier/privacy filtering without a length ceiling.
-        # Configured transport bounds are then hard failures rather than
-        # silently dropping an otherwise safe semantic witness.
-        probe_bound = max(32 * len(str(raw_term or "")), 1)
-        unbounded = _safe_concept_phrase(
-            raw_term,
-            max_tokens=probe_bound,
-            max_chars=probe_bound,
-        )
-        if unbounded and (
-            len(unbounded) > int(max_chars)
-            or len(unbounded.split()) > int(max_tokens)
-        ):
-            raise ValueError(
-                "neural-query semantic witness exceeds configured safe-term "
-                "transport bounds; refusing silent omission"
-            )
-        term = _safe_concept_phrase(
-            raw_term,
-            max_tokens=int(max_tokens),
-            max_chars=int(max_chars),
-        )
+        term = _safe_concept_phrase(raw_term)
         if not term:
             continue
         row: dict[str, Any] = {"term": term}

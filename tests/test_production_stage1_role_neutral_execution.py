@@ -3,7 +3,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import signal
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -34,12 +37,16 @@ from oci.inference.production_stage1_role_neutral_execution import (
     RoleNeutralPhysicalOwnerTask,
     RoleNeutralProducerFactories,
     RoleNeutralStage1ExecutionPolicy,
+    _RoleNeutralStage1ParentSignal,
+    _archive_stale_process_markers_for_resume,
     _execute_one_owner,
     execute_and_publish_role_neutral_stage1,
     validate_role_neutral_component_execution_intervals,
     validate_role_neutral_stage1_execution,
 )
 from oci.inference.production_stage1_scope_scheduler import (
+    _WORKER_PROCESS_GROUP_MARKER_SCHEMA,
+    _linux_process_start_time_ticks,
     build_canonical_stage1_scope_plan,
 )
 from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
@@ -92,12 +99,17 @@ def _registry() -> dict:
     }
 
 
-def _plan(*, gpu_ids: tuple[int, ...]):
+def _plan(
+    *,
+    gpu_ids: tuple[int, ...],
+    registry_content_sha256: str = "a" * 64,
+    physical_fit_identity=PHYSICAL_FIT_IDENTITY,
+):
     return build_canonical_stage1_scope_plan(
         registry=_registry(),
-        registry_content_sha256="a" * 64,
+        registry_content_sha256=registry_content_sha256,
         global_seed=42,
-        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
+        physical_fit_identity=physical_fit_identity,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,
@@ -310,6 +322,17 @@ class _ProducerRecorder:
                 terminal = json.loads(
                     (invocation.output_root / "execution_manifest.json").read_text(encoding="utf-8")
                 )
+                if (
+                    terminal.get("plan_scientific_content_sha256")
+                    != invocation.plan.scientific_content_sha256
+                    or terminal.get("physical_owner_scope_id")
+                    != owner_scope_id
+                    or terminal.get("component")
+                    != expected_component
+                ):
+                    raise ValueError(
+                        "component terminal belongs to another request identity"
+                    )
                 seals = {}
                 views = {}
                 for family in EXPECTED_COMPONENT_FAMILIES[expected_component]:
@@ -467,6 +490,389 @@ def test_accelerator_owner_emits_six_direct_closed_component_intervals(
                 expected_primary_resource="cuda:3",
                 expected_neural_query_resources=("cuda:3", "cuda:8"),
             )
+
+
+def test_owner_resume_reuses_complete_component_prefix(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    owner, members = plan.physical_scope_groups[0]
+    task = RoleNeutralPhysicalOwnerTask(
+        plan=plan,
+        physical_owner=owner,
+        logical_members=members,
+        component_parent=(
+            tmp_path
+            / "attempt"
+            / "role_neutral_stage1_execution"
+            / "components"
+            / owner.scope_id
+        ).resolve(),
+        resource="cpu",
+    )
+    first = _ProducerRecorder()
+    first_factories = first.factories()
+
+    def failing_neural(invocation):
+        bound = first_factories.neural_query(invocation)
+
+        def fail():
+            invocation.output_root.mkdir(parents=True)
+            (invocation.output_root / "partial.bin").write_bytes(
+                b"interrupted"
+            )
+            raise RuntimeError("simulated neural interruption")
+
+        return BoundRoleNeutralComponentProducer(
+            execute=fail,
+            authenticate=bound.authenticate,
+        )
+
+    failed = RoleNeutralProducerFactories(
+        bow=first_factories.bow,
+        htr=first_factories.htr,
+        matched_pair=first_factories.matched_pair,
+        embeddings=first_factories.embeddings,
+        tfidf=first_factories.tfidf,
+        neural_query=failing_neural,
+    )
+    with pytest.raises(RuntimeError, match="neural interruption"):
+        _execute_one_owner(
+            task=task,
+            factories=failed.as_mapping(),
+        )
+
+    resumed = _ProducerRecorder()
+    resumed_factories = resumed.factories()
+
+    def bind_fresh_neural(invocation):
+        assert not invocation.output_root.exists()
+        return resumed_factories.neural_query(invocation)
+
+    result = _execute_one_owner(
+        task=replace(task, resume=True),
+        factories=RoleNeutralProducerFactories(
+            bow=resumed_factories.bow,
+            htr=resumed_factories.htr,
+            matched_pair=resumed_factories.matched_pair,
+            embeddings=resumed_factories.embeddings,
+            tfidf=resumed_factories.tfidf,
+            neural_query=bind_fresh_neural,
+        ).as_mapping(),
+    )
+    intervals = validate_role_neutral_component_execution_intervals(
+        execution_telemetry=result.execution_telemetry,
+        expected_physical_owner_scope_id=owner.scope_id,
+        expected_primary_resource="cpu",
+        expected_neural_query_resources=("cpu",),
+    )
+
+    assert [row["status"] for row in intervals] == [
+        "resumed",
+        "resumed",
+        "resumed",
+        "resumed",
+        "resumed",
+        "completed",
+    ]
+    assert [
+        event
+        for _owner, component, event, _resource in resumed.events
+        if component != "neural_query"
+    ] == ["factory", "authenticate"] * 5
+    assert [
+        event
+        for _owner, component, event, _resource in resumed.events
+        if component == "neural_query"
+    ] == ["factory", "execute", "authenticate"]
+    interrupted = tuple(
+        (
+            tmp_path
+            / "attempt"
+            / "interrupted_role_neutral_components"
+            / owner.scope_id
+        ).glob("neural_query.*")
+    )
+    assert len(interrupted) == 1
+    assert (interrupted[0] / "partial.bin").read_bytes() == b"interrupted"
+
+
+def test_owner_resume_rejects_completed_components_from_another_identity(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    owner, members = plan.physical_scope_groups[0]
+    component_parent = (
+        tmp_path
+        / "attempt"
+        / "role_neutral_stage1_execution"
+        / "components"
+        / owner.scope_id
+    ).resolve()
+    _execute_one_owner(
+        task=RoleNeutralPhysicalOwnerTask(
+            plan=plan,
+            physical_owner=owner,
+            logical_members=members,
+            component_parent=component_parent,
+            resource="cpu",
+        ),
+        factories=_ProducerRecorder().factories().as_mapping(),
+    )
+    original_terminal = (
+        component_parent / "bow" / "execution_manifest.json"
+    ).read_bytes()
+
+    drifted_plans = (
+        _plan(
+            gpu_ids=(),
+            registry_content_sha256="b" * 64,
+        ),
+        _plan(
+            gpu_ids=(),
+            physical_fit_identity=replace(
+                PHYSICAL_FIT_IDENTITY,
+                architecture_identity="b" * 64,
+            ),
+        ),
+    )
+    for drifted_plan in drifted_plans:
+        drifted_owner, drifted_members = (
+            drifted_plan.physical_scope_groups[0]
+        )
+        recorder = _ProducerRecorder()
+        with pytest.raises(
+            ValueError,
+            match="another request identity",
+        ):
+            _execute_one_owner(
+                task=RoleNeutralPhysicalOwnerTask(
+                    plan=drifted_plan,
+                    physical_owner=drifted_owner,
+                    logical_members=drifted_members,
+                    component_parent=component_parent,
+                    resource="cpu",
+                    resume=True,
+                ),
+                factories=recorder.factories().as_mapping(),
+            )
+        assert [
+            event
+            for _owner, _component, event, _resource in recorder.events
+        ] == ["factory", "authenticate"]
+        assert (
+            component_parent / "bow" / "execution_manifest.json"
+        ).read_bytes() == original_terminal
+
+
+def test_stage1_resume_finishes_partial_execution_root(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    root = (tmp_path / "partial-execution").resolve()
+    component_root = root / "components"
+    component_root.mkdir(parents=True)
+    owner, members = plan.physical_scope_groups[0]
+    task = RoleNeutralPhysicalOwnerTask(
+        plan=plan,
+        physical_owner=owner,
+        logical_members=members,
+        component_parent=component_root / owner.scope_id,
+        resource="cpu",
+    )
+    first = _ProducerRecorder()
+    first_factories = first.factories()
+
+    def failing_neural(invocation):
+        bound = first_factories.neural_query(invocation)
+        return BoundRoleNeutralComponentProducer(
+            execute=lambda: (_ for _ in ()).throw(
+                RuntimeError("simulated interruption")
+            ),
+            authenticate=bound.authenticate,
+        )
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        _execute_one_owner(
+            task=task,
+            factories=RoleNeutralProducerFactories(
+                bow=first_factories.bow,
+                htr=first_factories.htr,
+                matched_pair=first_factories.matched_pair,
+                embeddings=first_factories.embeddings,
+                tfidf=first_factories.tfidf,
+                neural_query=failing_neural,
+            ).as_mapping(),
+        )
+
+    resumed = _ProducerRecorder()
+    manifest = execute_and_publish_role_neutral_stage1(
+        root=root,
+        plan=plan,
+        producer_factories=resumed.factories(),
+        policy=RoleNeutralStage1ExecutionPolicy(
+            resource_plan=_resource_plan(
+                devices=("cpu",),
+                cpu_budget=4,
+            ),
+            max_parallel_owners=1,
+        ),
+        executor=_RecordingExecutor(),
+        resume=True,
+    )
+
+    assert manifest["status"] == "complete"
+    first_owner_events = [
+        (component, event)
+        for event_owner, component, event, _resource in resumed.events
+        if event_owner == owner.scope_id
+    ]
+    assert first_owner_events == [
+        *((component, event) for component in tuple(EXPECTED_COMPONENT_FAMILIES)[:-1]
+          for event in ("factory", "authenticate")),
+        ("neural_query", "factory"),
+        ("neural_query", "execute"),
+        ("neural_query", "authenticate"),
+    ]
+
+
+def test_resume_archives_only_process_markers_confirmed_not_live(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "execution").resolve()
+    session_root = root / ".persistent-owner-execution-session"
+    session_root.mkdir(parents=True)
+
+    def write_marker(path: Path, pid: int, start_time: int) -> None:
+        body = {
+            "schema_version": _WORKER_PROCESS_GROUP_MARKER_SCHEMA,
+            "pid": pid,
+            "process_group_id": pid,
+            "process_start_time_ticks": start_time,
+        }
+        path.write_text(
+            json.dumps(
+                {**body, "content_sha256": _sha(body)},
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+    dead_pid = 2**30
+    write_marker(session_root / "process-group-slot-0.json", dead_pid, 1)
+    _archive_stale_process_markers_for_resume(root)
+    assert not session_root.exists()
+    archived = tuple(
+        (tmp_path / "interrupted_role_neutral_process_markers").glob(
+            ".persistent-owner-execution-session.*"
+        )
+    )
+    assert len(archived) == 1
+
+    session_root.mkdir()
+    current_start = _linux_process_start_time_ticks(os.getpid())
+    assert current_start is not None
+    live_marker = session_root / "process-group-slot-0.json"
+    write_marker(live_marker, os.getpid(), current_start)
+    with pytest.raises(RuntimeError, match="worker is live"):
+        _archive_stale_process_markers_for_resume(root)
+    assert live_marker.is_file()
+
+
+def test_parent_sigterm_interrupts_persistent_stage1_session(
+    tmp_path: Path,
+) -> None:
+    class Session:
+        interrupted = False
+        exited = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback_value):
+            self.exited = True
+            return False
+
+        def interrupt(self):
+            self.interrupted = True
+
+        def execute(self, **_kwargs):
+            signal.raise_signal(signal.SIGTERM)
+            raise AssertionError("SIGTERM handler did not interrupt execution")
+
+    class Executor:
+        process_isolated_physical_owners = True
+
+        def __init__(self):
+            self.session = Session()
+
+        def execute(self, **_kwargs):
+            raise AssertionError("unscoped executor path was used")
+
+        def open_session(self, **_kwargs):
+            return self.session
+
+    executor = Executor()
+    previous = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(
+        _RoleNeutralStage1ParentSignal,
+        match="received signal",
+    ):
+        execute_and_publish_role_neutral_stage1(
+            root=(tmp_path / "sigterm-execution").resolve(),
+            plan=_plan(gpu_ids=()),
+            producer_factories=_ProducerRecorder().factories(),
+            policy=RoleNeutralStage1ExecutionPolicy(
+                resource_plan=_resource_plan(
+                    devices=("cpu",),
+                    cpu_budget=2,
+                ),
+                max_parallel_owners=1,
+            ),
+            executor=executor,
+        )
+    assert executor.session.interrupted is True
+    assert executor.session.exited is True
+    assert signal.getsignal(signal.SIGTERM) is previous
+
+
+def test_parent_sigterm_reaches_fresh_executor_cleanup(
+    tmp_path: Path,
+) -> None:
+    class Executor:
+        process_isolated_physical_owners = True
+        cleanup_reached = False
+
+        def execute(self, **_kwargs):
+            try:
+                signal.raise_signal(signal.SIGTERM)
+                raise AssertionError(
+                    "SIGTERM handler did not interrupt execution"
+                )
+            finally:
+                self.cleanup_reached = True
+
+    executor = Executor()
+    previous = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(
+        _RoleNeutralStage1ParentSignal,
+        match="received signal",
+    ):
+        execute_and_publish_role_neutral_stage1(
+            root=(tmp_path / "fresh-sigterm-execution").resolve(),
+            plan=_plan(gpu_ids=()),
+            producer_factories=_ProducerRecorder().factories(),
+            policy=RoleNeutralStage1ExecutionPolicy(
+                resource_plan=_resource_plan(
+                    devices=("cpu",),
+                    cpu_budget=2,
+                ),
+                max_parallel_owners=1,
+            ),
+            executor=executor,
+        )
+    assert executor.cleanup_reached is True
+    assert signal.getsignal(signal.SIGTERM) is previous
 
 
 def test_executes_derived_physical_owners_once_and_publishes_all_ten(

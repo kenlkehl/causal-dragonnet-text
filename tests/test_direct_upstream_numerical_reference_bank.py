@@ -105,6 +105,40 @@ def _array_registration(
     return registration
 
 
+def test_authentication_cache_does_not_retain_one_fd_per_payload(
+    tmp_path: Path,
+) -> None:
+    fd_root = Path("/proc/self/fd")
+    if not fd_root.is_dir():
+        pytest.skip("open-file accounting requires Linux procfs")
+
+    cache = reference_module._AuthenticatedNumericalPayloadCache()
+    registrations = [
+        _array_registration(
+            tmp_path,
+            f"payloads/payload_{index:03d}.npy",
+            np.asarray([[float(index)]], dtype=np.float64),
+        )
+        for index in range(64)
+    ]
+    before = len(tuple(fd_root.iterdir()))
+    for index, registration in enumerate(registrations):
+        _normalized, array = cache.authenticate_array(
+            tmp_path,
+            registration,
+            label=f"payload {index}",
+        )
+        assert not isinstance(array, np.memmap)
+    after = len(tuple(fd_root.iterdir()))
+
+    assert after - before <= 2
+    audit = cache.audit_counters()
+    assert audit["unique_payload_file_count"] == len(registrations)
+    cache.release_authentication_buffers()
+    assert cache.audit_counters() == audit
+    np.testing.assert_array_equal(array, np.asarray([[63.0]]))
+
+
 def _view_registration(root: Path, relative_path: str, body: dict) -> dict:
     view = _closed(body)
     path = root / relative_path

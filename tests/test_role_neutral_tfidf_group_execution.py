@@ -3,11 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
+import oci.inference.production_role_neutral_producer_factories as factories_module
 from oci.config import (
     AppliedInferenceConfig,
     BoWViewConfig,
@@ -24,6 +28,13 @@ from oci.inference.production_stage1_legacy_scope_fragments import (
 )
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
+)
+from oci.inference.production_stage1_bundle import _PreparedBuild
+from oci.inference.production_stage1_role_neutral_execution import (
+    RoleNeutralComponentInvocation,
+)
+from oci.inference.production_role_neutral_producer_factories import (
+    PreparedBuildRoleNeutralProducerFactoriesBuilder,
 )
 from tests.stage1_test_support import PHYSICAL_FIT_IDENTITY
 from oci.inference.role_neutral_tfidf_group_execution import (
@@ -72,12 +83,16 @@ def _registry() -> dict:
     return {"dataset_row_count": row_count, "outer_folds": outer_rows}
 
 
-def _plan(*, gpu_ids: tuple[int, ...] = ()):
+def _plan(
+    *,
+    gpu_ids: tuple[int, ...] = (),
+    physical_fit_identity=PHYSICAL_FIT_IDENTITY,
+):
     return build_canonical_stage1_scope_plan(
         registry=_registry(),
         registry_content_sha256="a" * 64,
         global_seed=42,
-        physical_fit_identity=PHYSICAL_FIT_IDENTITY,
+        physical_fit_identity=physical_fit_identity,
         gpu_ids=gpu_ids,
         review_rounds=2,
         initial_training_partitions=3,
@@ -246,6 +261,96 @@ def test_request_scientific_identity_is_device_independent():
 
     assert cpu.content_sha256 != gpu.content_sha256
     assert cpu_request.as_dict() == gpu_request.as_dict()
+
+
+def test_factory_authenticates_completed_tfidf_across_aggregate_plan_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    historical_plan = _plan()
+    historical_request = _request(plan=historical_plan)
+    _texts, _treatment, _outcome, heldout = _inputs(historical_request)
+    root = (tmp_path / "completed_tfidf").resolve()
+    _execute(
+        root=root,
+        request=historical_request,
+        loader=lambda _rows: heldout,
+    )
+
+    current_plan = _plan(
+        physical_fit_identity=replace(
+            PHYSICAL_FIT_IDENTITY,
+            scientific_configuration_identity="4" * 64,
+        )
+    )
+    current_request = _request(plan=current_plan)
+    assert current_plan.scientific_content_sha256 != (
+        historical_plan.scientific_content_sha256
+    )
+    assert current_request.physical_owner == historical_request.physical_owner
+
+    class StateBundle:
+        states = {
+            scope.scope_id: object()
+            for scope in current_plan.physical_scopes
+        }
+
+        def manifest_path_for_owner(self, scope_id):
+            return tmp_path / f"{scope_id}.cluster-state.json"
+
+    config = _config()
+    prepared = object.__new__(_PreparedBuild)
+    prepared.cluster_preflight_manifest_path = tmp_path / "preflight.json"
+    prepared.cluster_preflight_artifact_handle = object()
+    prepared.cluster_preflight_state_bundle = StateBundle()
+    prepared.config = config
+    prepared.options = SimpleNamespace(
+        num_workers=1,
+        tfidf_workers=1,
+        tfidf_parallel_backend="threads",
+    )
+    prepared.stage1_scope_plan = current_plan
+    prepared.modeling_data = pd.DataFrame(
+        {
+            config.text_column: [
+                f"complete note {row}" for row in range(60)
+            ],
+            config.treatment_column: [
+                float(row % 2) for row in range(60)
+            ],
+            config.outcome_column: [
+                float((row // 2) % 2) for row in range(60)
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        factories_module,
+        "_scientific_bindings",
+        lambda **_kwargs: SimpleNamespace(),
+    )
+    builder = PreparedBuildRoleNeutralProducerFactoriesBuilder(
+        architecture_profiles={
+            name: {} for name in factories_module._PROFILE_ORDER
+        },
+        runtime_compatibility_class="test-runtime",
+    )
+    producers = builder(prepared)
+    invocation = RoleNeutralComponentInvocation(
+        plan=current_plan,
+        physical_owner=current_request.physical_owner,
+        logical_members=current_request.logical_members,
+        component="tfidf",
+        output_root=root,
+        resource="cpu",
+        owner_cpu_budget=1,
+    )
+
+    receipt = producers.tfidf(invocation).authenticate()
+
+    assert receipt.component == "tfidf"
+    assert receipt.plan_scientific_content_sha256 == (
+        current_plan.scientific_content_sha256
+    )
 
 
 @pytest.mark.parametrize("owner_kind", ("full_outer", "cumulative_spent"))

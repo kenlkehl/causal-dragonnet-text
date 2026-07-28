@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
+from ..extraction.llm_routing import validate_stage2_response_model
 from .all_evidence_discovery_interfaces import (
     ACTIVE_STAGE1_CONCEPT_FAMILIES,
     ACTIVE_STAGE1_CONCEPT_FAMILY_SET,
@@ -1098,8 +1099,10 @@ def _validate_remote_response_record(
         if final:
             if attempt["retryable"] is not False or attempt["will_retry"] is not False:
                 raise ValueError("final response attempt cannot request a transport retry")
-            if attempt.get("response_model") != model_name:
-                raise ValueError("runner response model differs from the exact requested model")
+            validate_stage2_response_model(
+                attempt.get("response_model"),
+                requested_model=model_name,
+            )
             if attempt.get("finish_reason") != "stop":
                 raise ValueError("runner response finish_reason must be exactly 'stop'")
             content_sha256 = _require_sha256(

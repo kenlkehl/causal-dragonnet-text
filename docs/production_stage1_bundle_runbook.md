@@ -437,17 +437,6 @@ uv run --frozen python scripts/run_production_stage1_hierarchy_one_shot.py \
   --review-neural-query-device cuda:0
 ```
 
-`scripts/build_production_served_model_attestation.py` remains available for an
-operator who separately wants a strict static deployment certificate covering
-model/server files, process namespaces, container/image data, packages, and the
-listener. That collector is optional certification tooling. Its inputs and
-output are not accepted as runtime authority, are not required by the canary or
-one-shot wrapper, and cannot authorize or block Stage 1. A bare-metal service,
-repository-ID launch, or symlinked model cache may be incompatible with that
-optional collector without being incompatible with the required exact
-endpoint/model runtime checks. Deployment and version metadata may still be
-archived for audit when available.
-
 For every model-produced response, including a schema-invalid response eligible
 for the single bounded repair and the repair response itself, authenticated
 per-call metadata must report the exact requested served-model name and

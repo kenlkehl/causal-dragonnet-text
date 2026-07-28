@@ -22,6 +22,8 @@ import os
 import re
 import resource
 import stat
+import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -104,6 +106,76 @@ def _positive_integer(value: Any, *, label: str) -> int:
 def _native_thread_environment(cpu_budget: int) -> dict[str, str]:
     count = _positive_integer(cpu_budget, label="embedding-cache CPU budget")
     return {name: str(count) for name in _NATIVE_THREAD_ENVIRONMENT}
+
+
+def _active_environment_runtime_library_directories() -> tuple[Path, ...]:
+    """Find packaged native-library directories owned by this interpreter."""
+
+    prefix = Path(sys.prefix).resolve()
+    site_roots: list[Path] = []
+    configured_paths = sysconfig.get_paths()
+    for name in ("purelib", "platlib"):
+        raw = configured_paths.get(name)
+        if not raw:
+            continue
+        candidate = Path(raw).resolve()
+        if (
+            candidate.is_dir()
+            and candidate.is_relative_to(prefix)
+            and candidate not in site_roots
+        ):
+            site_roots.append(candidate)
+
+    discovered: list[Path] = []
+
+    def add(candidate: Path) -> None:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            return
+        if (
+            resolved.is_dir()
+            and resolved.is_relative_to(prefix)
+            and resolved not in discovered
+        ):
+            discovered.append(resolved)
+
+    for site_root in site_roots:
+        add(site_root / "PyNvVideoCodec")
+        add(site_root / "torch" / "lib")
+        nvidia = site_root / "nvidia"
+        # Prefer the active CUDA-major bundle before dependency packages that
+        # may also contain libraries for another installed CUDA major.
+        if nvidia.is_dir():
+            cuda_major_bundles = sorted(
+                (
+                    path
+                    for path in nvidia.glob("cu*/lib")
+                    if path.parent.name[2:].isdigit()
+                ),
+                key=lambda path: int(path.parent.name[2:]),
+                reverse=True,
+            )
+            for bundle in cuda_major_bundles:
+                add(bundle)
+            for dependency_lib in sorted(nvidia.glob("*/lib")):
+                add(dependency_lib)
+    return tuple(discovered)
+
+
+def _spawn_environment(cpu_budget: int) -> dict[str, str]:
+    replacements = _native_thread_environment(cpu_budget)
+    runtime_libraries = _active_environment_runtime_library_directories()
+    if not runtime_libraries:
+        return replacements
+    entries = [str(path) for path in runtime_libraries]
+    entries.extend(
+        entry
+        for entry in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        if entry
+    )
+    replacements["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(entries))
+    return replacements
 
 
 def _process_io_counters() -> dict[str, int] | None:
@@ -294,7 +366,7 @@ def _start_with_environment(
     *,
     cpu_budget: int,
 ) -> None:
-    replacements = _native_thread_environment(cpu_budget)
+    replacements = _spawn_environment(cpu_budget)
     with _START_ENVIRONMENT_LOCK:
         prior = {name: os.environ.get(name) for name in replacements}
         try:
