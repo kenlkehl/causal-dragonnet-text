@@ -2096,6 +2096,253 @@ class HierarchicalTransformerExtractor(nn.Module):
             )
         return results
 
+    def complete_attention_inventory(
+        self,
+        texts: Sequence[str],
+        *,
+        role: Optional[str] = None,
+        normalization_tolerance: float = 1e-5,
+    ) -> Dict[str, Any]:
+        """Return every model-native token and chunk attention occurrence.
+
+        This is a lossless evidence boundary, not a post-hoc attribution
+        method.  It exposes the learned gated token-pooler weights and the
+        final document-transformer pool-token weights that were used by the
+        fitted model.  Padding is never part of the returned token domain;
+        special tokens remain present and are explicitly marked.
+        """
+
+        values = [str(text) for text in texts]
+        if not values:
+            raise ValueError("complete HTR attention requires at least one note")
+        if (
+            not math.isfinite(float(normalization_tolerance))
+            or float(normalization_tolerance) <= 0.0
+        ):
+            raise ValueError("attention normalization tolerance must be positive")
+        if self._effective_sentence_pooling() != "token_attention":
+            raise RuntimeError(
+                "complete token evidence requires effective token_attention pooling"
+            )
+        self.eval()
+        with torch.no_grad():
+            _features, raw = self.forward(
+                values,
+                return_attention_tensors=True,
+            )
+        selected_role = self._attention_role_from_stage(role) or role
+        token_alpha = raw.get("token_alpha")
+        chunk_alpha = raw.get("chunk_alpha")
+        if selected_role in {"w", "x"}:
+            selected_token = (raw.get("role_token_alpha") or {}).get(
+                selected_role
+            )
+            selected_chunk = (raw.get("role_chunk_alpha") or {}).get(
+                selected_role
+            )
+            if selected_token is not None:
+                token_alpha = selected_token
+            if selected_chunk is not None:
+                chunk_alpha = selected_chunk
+        input_ids = raw.get("input_ids")
+        attention_mask = raw.get("attention_mask")
+        offset_mapping = raw.get("offset_mapping")
+        batch_chunks = raw.get("batch_chunks")
+        if (
+            token_alpha is None
+            or chunk_alpha is None
+            or input_ids is None
+            or attention_mask is None
+            or offset_mapping is None
+            or not isinstance(batch_chunks, list)
+        ):
+            raise RuntimeError(
+                "token_attention extractor omitted a native attention tensor"
+            )
+        if (
+            token_alpha.ndim != 2
+            or input_ids.shape != token_alpha.shape
+            or attention_mask.shape != token_alpha.shape
+            or offset_mapping.shape
+            != (token_alpha.shape[0], token_alpha.shape[1], 2)
+            or chunk_alpha.ndim != 2
+        ):
+            raise RuntimeError("native HTR attention tensor shapes changed")
+
+        token_values = token_alpha.detach().cpu().to(torch.float64)
+        chunk_values = chunk_alpha.detach().cpu().to(torch.float64)
+        id_values = input_ids.detach().cpu().to(torch.int64)
+        mask_values = attention_mask.detach().cpu().to(torch.int64)
+        offset_values = offset_mapping.detach().cpu().to(torch.int64)
+        flat_chunk_count = sum(len(chunks) for chunks in batch_chunks)
+        if flat_chunk_count != int(token_values.shape[0]):
+            raise RuntimeError("HTR token tensors changed the flat chunk order")
+        if len(batch_chunks) != int(chunk_values.shape[0]):
+            raise RuntimeError("HTR chunk tensor changed the note order")
+
+        tokenizer = self._tokenizer
+        if tokenizer is None:
+            raise RuntimeError("token_attention evidence lacks its fitted tokenizer")
+        special_ids = frozenset(
+            int(value)
+            for value in (getattr(tokenizer, "all_special_ids", None) or ())
+        )
+        try:
+            vocabulary = tokenizer.get_vocab()
+        except Exception as exc:
+            raise RuntimeError(
+                "fitted HTR tokenizer does not expose its vocabulary"
+            ) from exc
+        vocabulary_rows = sorted(
+            (str(token), int(token_id))
+            for token, token_id in vocabulary.items()
+        )
+        tokenizer_identity = {
+            "tokenizer_class": type(tokenizer).__name__,
+            "is_fast": bool(getattr(tokenizer, "is_fast", False)),
+            "vocabulary_size": len(vocabulary_rows),
+            "vocabulary_sha256": hashlib.sha256(
+                json.dumps(
+                    vocabulary_rows,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "all_special_ids": sorted(special_ids),
+            "padding_side": str(getattr(tokenizer, "padding_side", "right")),
+            "pad_token_id": (
+                None
+                if getattr(tokenizer, "pad_token_id", None) is None
+                else int(tokenizer.pad_token_id)
+            ),
+        }
+
+        notes: List[Dict[str, Any]] = []
+        flat_index = 0
+        for note_index, chunks in enumerate(batch_chunks):
+            chunk_count = len(chunks)
+            note_chunk_weights = chunk_values[note_index, :chunk_count]
+            if (
+                chunk_count < 1
+                or not torch.isfinite(note_chunk_weights).all()
+                or torch.any(note_chunk_weights < 0)
+                or abs(float(note_chunk_weights.sum().item()) - 1.0)
+                > float(normalization_tolerance)
+            ):
+                raise RuntimeError(
+                    "document-pool-token attention is not finite and normalized"
+                )
+            chunk_rows: List[Dict[str, Any]] = []
+            for chunk_index, chunk in enumerate(chunks):
+                mask = mask_values[flat_index]
+                valid_positions = torch.nonzero(mask != 0, as_tuple=False).flatten()
+                padding_positions = torch.nonzero(mask == 0, as_tuple=False).flatten()
+                if valid_positions.numel() < 1:
+                    raise RuntimeError("HTR chunk has an empty token pooling domain")
+                weights = token_values[flat_index]
+                valid_weights = weights[valid_positions]
+                if (
+                    not torch.isfinite(valid_weights).all()
+                    or torch.any(valid_weights < 0)
+                    or abs(float(valid_weights.sum().item()) - 1.0)
+                    > float(normalization_tolerance)
+                    or (
+                        padding_positions.numel()
+                        and torch.any(
+                            torch.abs(weights[padding_positions])
+                            > float(normalization_tolerance)
+                        )
+                    )
+                ):
+                    raise RuntimeError(
+                        "learned token-pooler attention is not masked and normalized"
+                    )
+                token_rows: List[Dict[str, Any]] = []
+                token_ids = [
+                    int(id_values[flat_index, int(position)].item())
+                    for position in valid_positions
+                ]
+                decoded = tokenizer.convert_ids_to_tokens(token_ids)
+                if isinstance(decoded, str):
+                    decoded = [decoded]
+                if not isinstance(decoded, list) or len(decoded) != len(token_ids):
+                    raise RuntimeError(
+                        "fitted tokenizer did not losslessly decode token IDs"
+                    )
+                for local_token_position, (
+                    tensor_position,
+                    token_id,
+                    decoded_token,
+                ) in enumerate(
+                    zip(valid_positions.tolist(), token_ids, decoded, strict=True)
+                ):
+                    start = int(
+                        offset_values[flat_index, int(tensor_position), 0].item()
+                    )
+                    end = int(
+                        offset_values[flat_index, int(tensor_position), 1].item()
+                    )
+                    is_special = token_id in special_ids
+                    if is_special:
+                        if start < 0 or end < 0 or end < start:
+                            raise RuntimeError(
+                                "special-token offsets are not representable"
+                            )
+                    elif not (0 <= start < end <= len(chunk)):
+                        raise RuntimeError(
+                            "non-special token offsets do not align to the chunk"
+                        )
+                    token_rows.append(
+                        {
+                            "token_position": int(local_token_position),
+                            "tensor_position": int(tensor_position),
+                            "token_id": token_id,
+                            "decoded_token_text": str(decoded_token),
+                            "char_start": start,
+                            "char_end": end,
+                            "is_special_token": bool(is_special),
+                            "is_padding": False,
+                            "token_attention": float(
+                                weights[int(tensor_position)].item()
+                            ),
+                        }
+                    )
+                chunk_rows.append(
+                    {
+                        "chunk_index": int(chunk_index),
+                        "chunk_text": str(chunk),
+                        "chunk_attention": float(
+                            note_chunk_weights[chunk_index].item()
+                        ),
+                        "tokens": token_rows,
+                        "padding_positions_excluded": int(
+                            padding_positions.numel()
+                        ),
+                    }
+                )
+                flat_index += 1
+            notes.append(
+                {
+                    "note_index": int(note_index),
+                    "chunks": chunk_rows,
+                }
+            )
+        if flat_index != flat_chunk_count:
+            raise RuntimeError("HTR complete attention traversal omitted a chunk")
+        return {
+            "schema_version": "complete_htr_native_attention_inventory_v1",
+            "sentence_pooling": str(self._sentence_pooling),
+            "effective_sentence_pooling": self._effective_sentence_pooling(),
+            "attention_role": selected_role,
+            "normalization_tolerance": float(normalization_tolerance),
+            "tokenizer_identity": tokenizer_identity,
+            "notes": notes,
+            "padding_excluded_from_token_normalization": True,
+            "special_tokens_retained": True,
+            "raw_bert_self_attention_used": False,
+            "post_hoc_attribution_used": False,
+        }
+
     def get_attention_evidence(
         self,
         texts: List[str],

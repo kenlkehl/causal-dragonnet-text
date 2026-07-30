@@ -85,25 +85,25 @@ from .stage1_htr_operational_controls import (
 
 
 ROLE_NEUTRAL_MATCHED_PAIR_GROUP_REQUEST_SCHEMA = (
-    "production_role_neutral_matched_pair_physical_group_request_v1"
+    "production_role_neutral_matched_pair_physical_group_request_v2"
 )
 ROLE_NEUTRAL_MATCHED_PAIR_FIT_STATE_SCHEMA = (
-    "production_role_neutral_matched_pair_fit_state_v1"
+    "production_role_neutral_matched_pair_fit_state_v2"
 )
 ROLE_NEUTRAL_MATCHED_PAIR_FIT_SEAL_SCHEMA = (
-    "production_role_neutral_matched_pair_fit_only_family_seal_v1"
+    "production_role_neutral_matched_pair_fit_only_family_seal_v2"
 )
 ROLE_NEUTRAL_MATCHED_PAIR_LOGICAL_VIEW_SCHEMA = (
-    "production_role_neutral_matched_pair_logical_view_v1"
+    "production_role_neutral_matched_pair_logical_view_v2"
 )
 ROLE_NEUTRAL_MATCHED_PAIR_GROUP_EXECUTION_SCHEMA = (
-    "production_role_neutral_matched_pair_group_execution_v1"
+    "production_role_neutral_matched_pair_group_execution_v2"
 )
 ROLE_NEUTRAL_MATCHED_PAIR_EXACT_INPUT_SCHEMA = (
     "production_role_neutral_matched_pair_exact_transform_input_v1"
 )
 ROLE_NEUTRAL_MATCHED_PAIR_CONFIG_SCHEMA = (
-    "production_role_neutral_matched_pair_config_v3"
+    "production_role_neutral_matched_pair_config_v4"
 )
 ROLE_NEUTRAL_MATCHED_PAIR_OPERATIONAL_ATTESTATION_SCHEMA = (
     "production_role_neutral_matched_pair_operational_attestation_v1"
@@ -510,6 +510,14 @@ def _closed_extractor_config(value: Mapping[str, Any]) -> dict[str, Any]:
         result["sentence_pooling"]
     ).strip():
         raise ValueError("HTR encoder backend/pooling configuration is empty")
+    if (
+        result["sentence_encoder_model"] == "authenticated_local_tree"
+        and result["sentence_pooling"] != "token_attention"
+    ):
+        raise ValueError(
+            "authenticated matched-pair HTR requires learned "
+            "token_attention pooling"
+        )
     return result
 
 
@@ -821,7 +829,7 @@ def _producer_identity() -> str:
     return _sha256_json(
         {
             "schema_version": (
-                "production_role_neutral_matched_pair_producer_identity_v1"
+                "production_role_neutral_matched_pair_producer_identity_v2"
             ),
             "module_file_sha256": module_digest,
             "dependency_sources": [
@@ -1190,7 +1198,15 @@ def _train_htr(
     )
     extractor.fit_tokenizer(initialization_texts)
     descriptor = _extractor_descriptor(extractor)
-    if descriptor.get("constructor") != config["htr_extractor"]:
+    if (
+        descriptor.get("constructor") != config["htr_extractor"]
+        or (
+            config["htr_extractor"]["sentence_encoder_model"]
+            == "authenticated_local_tree"
+            and descriptor.get("effective_sentence_pooling")
+            != "token_attention"
+        )
+    ):
         raise RuntimeError("HTR extractor differs from the configured architecture")
     model = HTRPairUpliftNet(
         extractor=extractor,

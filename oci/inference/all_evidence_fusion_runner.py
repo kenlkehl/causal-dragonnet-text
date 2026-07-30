@@ -13,6 +13,7 @@ import json
 import math
 import re
 import secrets
+import statistics
 import threading
 import unicodedata
 import weakref
@@ -48,6 +49,9 @@ from .all_evidence_fusion import (
     prepare_all_evidence_fusion,
     source_text_temporal_policy_audit,
     validate_all_evidence_fusion_response,
+)
+from .all_evidence_discovery_interfaces import (
+    render_interpret_evidence_chunk_messages,
 )
 from .all_evidence_discovery_interfaces import ACTIVE_STAGE1_CONCEPT_FAMILIES
 from .adaptive_hierarchical_stage1_reconsideration import (
@@ -198,7 +202,7 @@ from .tfidf_orphan_evidence_adapter import (
 )
 from .tfidf_topic_discovery import HANDOFF_SCHEMA_VERSION, row_set_fingerprint
 
-RUNNER_SCHEMA_VERSION = "all_evidence_fusion_outer_runner_v20"
+RUNNER_SCHEMA_VERSION = "all_evidence_fusion_outer_runner_v21"
 FOLD_MANIFEST_SCHEMA_VERSION = "all_evidence_fusion_frozen_fold_v20"
 FUSION_RESPONSE_CACHE_SCHEMA_VERSION = "all_evidence_fusion_response_cache_v4"
 POST_EXTRACTION_REVIEW_RESPONSE_CACHE_SCHEMA_VERSION = (
@@ -241,7 +245,7 @@ SPENT_EVIDENCE_CONTEXT_EPOCH_POLICY_VERSION = (
 FROZEN_PREDICTION_SCHEMA_VERSION = "all_evidence_fusion_predictions_v5"
 POSTHOC_EVALUATION_SCHEMA_VERSION = "all_evidence_fusion_posthoc_oracle_v1"
 HIERARCHICAL_DISCOVERY_PREPARATION_INPUT_SCHEMA_VERSION = (
-    "hierarchical_all_evidence_runner_preparation_input_v2"
+    "hierarchical_all_evidence_runner_preparation_input_v3"
 )
 HIERARCHICAL_DISCOVERY_PREPARATION_FOLD_SCHEMA_VERSION = (
     "hierarchical_all_evidence_runner_fold_preparation_v2"
@@ -478,6 +482,171 @@ def _canonical_json(value: Any) -> str:
 
 def _content_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _build_htr_stage2_prompt_preflight(
+    *,
+    provider: Any,
+    max_atoms_per_chunk: int,
+    max_bytes_per_chunk: int,
+    max_semantic_member_ids_per_chunk: int,
+    family_explanation: str,
+    wire_budget: Any,
+) -> dict[str, Any] | None:
+    """Compile every cumulative HTR map request without invoking a runner."""
+
+    catalogs_method = getattr(
+        provider,
+        "get_htr_stage2_preflight_catalogs",
+        None,
+    )
+    if not callable(catalogs_method):
+        return None
+    rows = tuple(catalogs_method())
+    identity = provider.identity()
+    source_report = identity.get("htr_stage2_call_plan_preflight")
+    if (
+        not rows
+        or not isinstance(source_report, Mapping)
+        or source_report.get("schema_version")
+        != "production_htr_stage2_call_plan_preflight_v2"
+    ):
+        raise ValueError(
+            "authenticated HTR provider lacks its aggregate call plan"
+        )
+    prompt_sizes: list[int] = []
+    content_sizes: list[int] = []
+    per_scope: list[dict[str, Any]] = []
+    delivered_member_ids: set[str] = set()
+    for raw in rows:
+        if (
+            not isinstance(raw, tuple)
+            or len(raw) != 3
+            or isinstance(raw[0], bool)
+            or not isinstance(raw[0], int)
+            or isinstance(raw[1], bool)
+            or not isinstance(raw[1], int)
+            or not isinstance(raw[2], RoleNeutralEvidenceCatalog)
+        ):
+            raise ValueError("HTR prompt-preflight catalog row is malformed")
+        outer_fold, context_epoch, catalog = raw
+        plan = build_complete_architecture_chunks(
+            catalog,
+            max_atoms_per_chunk=max_atoms_per_chunk,
+            max_bytes_per_chunk=max_bytes_per_chunk,
+            max_semantic_member_ids_per_chunk=(
+                max_semantic_member_ids_per_chunk
+            ),
+        )
+        evidence_by_id = {
+            atom.evidence_id: atom.as_discovery_item()
+            for atom in catalog.atoms
+        }
+        scope_calls = 0
+        scope_members = 0
+        for chunk in plan.chunks:
+            if chunk.source_family != HTR_NEURAL:
+                continue
+            evidence = tuple(
+                evidence_by_id[str(row["evidence_id"])]
+                for row in chunk.evidence
+            )
+            messages = render_interpret_evidence_chunk_messages(
+                family_explanation=family_explanation,
+                evidence=evidence,
+                wire_budget=wire_budget,
+            )
+            prompt_sizes.append(
+                len(_canonical_json(list(messages)).encode("utf-8"))
+            )
+            content_sizes.append(
+                sum(
+                    len(str(message["content"]).encode("utf-8"))
+                    for message in messages
+                )
+            )
+            member_ids = tuple(
+                member_id
+                for item in evidence
+                for member_id in item.member_ids
+            )
+            if (
+                not member_ids
+                or len(member_ids) > max_semantic_member_ids_per_chunk
+                or any(
+                    member_id in delivered_member_ids
+                    for member_id in member_ids
+                )
+            ):
+                raise ValueError(
+                    "HTR prompt preflight found invalid aggregate-member "
+                    "delivery"
+                )
+            delivered_member_ids.update(member_ids)
+            scope_members += len(member_ids)
+            scope_calls += 1
+        per_scope.append(
+            {
+                "outer_fold": outer_fold,
+                "context_epoch": context_epoch,
+                "catalog_sha256": catalog.catalog_sha256,
+                "planned_htr_interpretation_call_count": scope_calls,
+                "semantic_aggregate_member_count": scope_members,
+            }
+        )
+    planned_calls = len(prompt_sizes)
+    aggregate_count = len(delivered_member_ids)
+    if (
+        planned_calls
+        != int(source_report["planned_htr_interpretation_call_count"])
+        or aggregate_count
+        != int(source_report["cross_fold_aggregate_count"])
+        or planned_calls < 1
+        or aggregate_count < 1
+    ):
+        raise ValueError(
+            "compiled HTR prompt plan differs from the authenticated "
+            "aggregate inventory"
+        )
+    baseline = int(source_report["one_atom_per_chunk_baseline_call_count"])
+    body = {
+        "schema_version": "production_htr_stage2_prompt_preflight_v1",
+        "source_aggregate_call_plan_content_sha256": _content_sha256(
+            dict(source_report)
+        ),
+        "scope_count": len(rows),
+        "scopes": per_scope,
+        "raw_token_occurrence_count": int(
+            source_report["raw_token_occurrence_count"]
+        ),
+        "raw_chunk_interpretation_count": int(
+            source_report["raw_chunk_interpretation_count"]
+        ),
+        "semantic_aggregate_count": aggregate_count,
+        "planned_htr_interpretation_call_count": planned_calls,
+        "one_atom_per_chunk_baseline_call_count": baseline,
+        "call_reduction_fraction": 1.0 - (planned_calls / baseline),
+        "total_prompt_canonical_message_bytes": sum(prompt_sizes),
+        "maximum_prompt_size_bytes": max(prompt_sizes),
+        "median_prompt_size_bytes": statistics.median(prompt_sizes),
+        "maximum_prompt_content_utf8_bytes": max(content_sizes),
+        "median_prompt_content_utf8_bytes": statistics.median(
+            content_sizes
+        ),
+        "prompt_size_definition": (
+            "canonical_utf8_bytes_of_exact_system_user_message_array_v1"
+        ),
+        "every_semantic_aggregate_delivered_exactly_once": True,
+        "aggregate_member_dispositions_are_exact": True,
+        "raw_token_arrays_copied_into_prompts": False,
+        "top_k_sampling_or_truncation_applied": False,
+        "endpoint_or_runner_calls_during_preflight": 0,
+        "call_plan_on_order_of_hundreds_of_thousands": (
+            planned_calls >= 100_000
+        ),
+        "stage2_endpoint_launch_allowed": planned_calls < 100_000,
+    }
+    return {**body, "content_sha256": _content_sha256(body)}
 
 
 def _numerical_array_sha256(value: Any) -> str:
@@ -6144,6 +6313,29 @@ class AllEvidenceFusionRunner:
         if current_spent_identity != self.review_spent_evidence_provider_identity:
             raise RuntimeError("spent-only evidence provider identity changed")
         semantic_compatibility_identity = current_spent_projection_compatibility_identity()
+        family_explanations = production_stage1_family_explanations()
+        htr_prompt_preflight = _build_htr_stage2_prompt_preflight(
+            provider=self.review_spent_evidence_provider,
+            max_atoms_per_chunk=self.hierarchical_max_atoms_per_chunk,
+            max_bytes_per_chunk=self.hierarchical_max_bytes_per_chunk,
+            max_semantic_member_ids_per_chunk=(
+                self.hierarchical_max_semantic_member_ids_per_chunk
+            ),
+            family_explanation=family_explanations[HTR_NEURAL],
+            wire_budget=self.hierarchical_discovery_config.wire_budget,
+        )
+        if (
+            htr_prompt_preflight is not None
+            and htr_prompt_preflight.get(
+                "stage2_endpoint_launch_allowed"
+            )
+            is not True
+        ):
+            raise RuntimeError(
+                "HTR Stage 2 prompt preflight still plans at least "
+                "100,000 interpretation calls; report the remaining "
+                "semantic redundancy before endpoint use"
+            )
 
         preparation_dir = self.hierarchical_preparation_dir
         companion_body = {
@@ -6166,6 +6358,17 @@ class AllEvidenceFusionRunner:
             schema=RUNNER_SCHEMA_VERSION,
         )
         context_fit_overlay_companion_sha256 = sha256_file(context_fit_overlay_companion_path)
+        htr_prompt_preflight_path: Path | None = None
+        htr_prompt_preflight_file_sha256: str | None = None
+        if htr_prompt_preflight is not None:
+            htr_prompt_preflight_path = (
+                preparation_dir / "htr_stage2_prompt_preflight.json"
+            )
+            htr_prompt_preflight_file_sha256 = _write_immutable_json(
+                htr_prompt_preflight_path,
+                htr_prompt_preflight,
+                schema="production_htr_stage2_prompt_preflight_envelope_v1",
+            )
         input_manifest_body = {
             "runner_schema_version": RUNNER_SCHEMA_VERSION,
             "preparation_schema_version": (HIERARCHICAL_DISCOVERY_PREPARATION_INPUT_SCHEMA_VERSION),
@@ -6236,6 +6439,16 @@ class AllEvidenceFusionRunner:
             "production_family_explanations": production_stage1_family_explanations(),
             "semantic_retrieval_compatibility": semantic_compatibility_identity,
             "spent_evidence_provider": self.review_spent_evidence_provider_identity,
+            "htr_stage2_prompt_preflight": htr_prompt_preflight,
+            "htr_stage2_prompt_preflight_path": (
+                None
+                if htr_prompt_preflight_path is None
+                else str(htr_prompt_preflight_path)
+            ),
+            "htr_stage2_prompt_preflight_file_sha256": (
+                htr_prompt_preflight_file_sha256
+            ),
+            "htr_stage2_endpoint_contacted_during_preflight": False,
             "shared_first_gate_provider": current_shared_identity,
             "frozen_review_evidence_policy": (self.hierarchical_review_evidence_policy.as_dict()),
             "final_upstream_producer": self.final_upstream_producer_identity,
@@ -6264,7 +6477,6 @@ class AllEvidenceFusionRunner:
         prepared_folds: list[PreparedHierarchicalDiscoveryFold] = []
         ordered_agents: list[OrderedFoldDiscoveryAgent] = []
         first_gate_intent_index_entries: list[dict[str, Any]] = []
-        family_explanations = production_stage1_family_explanations()
         for outer_fold in folds:
             fold_dir = preparation_dir / f"outer_fold_{outer_fold:03d}"
             full = split_rows[outer_fold]

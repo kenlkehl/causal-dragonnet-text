@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import subprocess
@@ -16,10 +17,12 @@ from tests.resource_safety_test_support import resource_safety_policy
 import oci.inference.production_role_neutral_stage2_handoff as handoff_module
 from oci.inference.all_evidence_discovery_interfaces import (
     ACTIVE_STAGE1_CONCEPT_FAMILIES,
+    HTR_NEURAL,
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
     build_role_neutral_evidence_catalog,
 )
+from oci.inference.htr_native_proof_capture import _array_sha256
 from oci.inference.portable_workflow_spec import EVIDENCE_FAMILIES
 from oci.inference.portable_workflow_spec import (
     ResourcePerformanceSafetyPolicy,
@@ -35,6 +38,8 @@ from oci.inference.production_role_neutral_stage2_handoff import (
     FailClosedRoleNeutralStage2HandoffPublisher,
     ReferenceOnlyRoleNeutralStage1HandoffPublisher,
     ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_KIND,
+    ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_DIRECTORY,
+    ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_MANIFEST,
     ROLE_NEUTRAL_STAGE1_REFERENCE_LOCATOR,
     ROLE_NEUTRAL_STAGE1_REFERENCE_MANIFEST,
     ROLE_NEUTRAL_STAGE1_REFERENCE_PLAN,
@@ -134,7 +139,83 @@ def _fit_outcome(row_id: int) -> float:
 class _ProviderReadyProducerRecorder(_ProducerRecorder):
     def __init__(self, family_payloads):
         super().__init__()
-        self.family_payloads = family_payloads
+        self.family_payloads = copy.deepcopy(family_payloads)
+        self.htr_arrays: dict[str, np.ndarray] = {}
+        package = self.family_payloads[HTR_NEURAL][
+            "token_attention_evidence"
+        ]
+        for batch in package["fold_batches"]:
+            stage = str(batch["stage"])
+            prefix = f"provider_{stage}_0001"
+            decoded = "[CLS]configured[SEP]".encode("utf-8")
+            values = {
+                "fit_note_position": np.asarray([0, 0, 0], dtype=np.int64),
+                "fit_row_id": np.asarray([10, 10, 10], dtype=np.int64),
+                "chunk_index": np.asarray([0, 0, 0], dtype=np.int32),
+                "token_position": np.asarray([0, 1, 2], dtype=np.int32),
+                "token_id": np.asarray([101, 2001, 102], dtype=np.int32),
+                "decoded_token_text_utf8": np.frombuffer(
+                    decoded, dtype=np.uint8
+                ).copy(),
+                "decoded_token_text_byte_offsets": np.asarray(
+                    [0, 5, 15, 20], dtype=np.int64
+                ),
+                "char_start": np.asarray([0, 0, 0], dtype=np.int32),
+                "char_end": np.asarray([0, 10, 0], dtype=np.int32),
+                "is_special_token": np.asarray(
+                    [1, 0, 1], dtype=np.uint8
+                ),
+                "is_padding": np.asarray([0, 0, 0], dtype=np.uint8),
+                "token_attention": np.asarray(
+                    [0.1, 0.8, 0.1], dtype=np.float64
+                ),
+                "chunk_attention": np.asarray(
+                    [1.0, 1.0, 1.0], dtype=np.float64
+                ),
+                "hierarchical_attention_score": np.asarray(
+                    [0.1, 0.8, 0.1], dtype=np.float64
+                ),
+            }
+            columns: dict[str, dict] = {}
+            for name, value in values.items():
+                array_name = f"{prefix}_{name}"
+                self.htr_arrays[array_name] = value
+                columns[name] = {
+                    "array": array_name,
+                    "content_sha256": _array_sha256(value),
+                    "dtype": value.dtype.str,
+                    "shape": list(value.shape),
+                }
+            batch.update(
+                {
+                    "raw_occurrence_order": (
+                        "fit_note_position_then_chunk_index_then_"
+                        "token_position_v1"
+                    ),
+                    "decoded_token_text_encoding": (
+                        "concatenated_utf8_with_offsets_v1"
+                    ),
+                    "tokenizer_identity": {
+                        "model_name": "prajjwal1/bert-tiny",
+                        "vocabulary_sha256": "d" * 64,
+                    },
+                    "fit_note_positions": [0],
+                    "fit_row_ids": [10],
+                    "columns": columns,
+                }
+            )
+            batch_body = {
+                key: value
+                for key, value in batch.items()
+                if key != "content_sha256"
+            }
+            batch["content_sha256"] = _sha(batch_body)
+        package_body = {
+            key: value
+            for key, value in package.items()
+            if key != "content_sha256"
+        }
+        package["content_sha256"] = _sha(package_body)
 
     def factory(self, expected_component: str):
         base_factory = super().factory(expected_component)
@@ -142,8 +223,68 @@ class _ProviderReadyProducerRecorder(_ProducerRecorder):
         def bind(invocation):
             base = base_factory(invocation)
 
+            def family_seals():
+                owner_id = invocation.physical_owner.scope_id
+                return {
+                    family: build_role_neutral_fit_only_family_seal(
+                        plan=invocation.plan,
+                        physical_owner_scope_id=owner_id,
+                        family=family,
+                        evidence_payload=self.family_payloads[family],
+                        producer_identity_sha256=_sha(
+                            {
+                                "component": expected_component,
+                                "family": family,
+                                "producer": "provider-ready-test",
+                            }
+                        ),
+                        configuration_identity_sha256=_sha(
+                            {
+                                "component": expected_component,
+                                "family": family,
+                                "configuration": "provider-ready-test",
+                            }
+                        ),
+                        fit_state_artifact_sha256=_sha(
+                            {
+                                "owner": owner_id,
+                                "family": family,
+                                "fit_state": "provider-ready-test",
+                            }
+                        ),
+                    )
+                    for family in EXPECTED_COMPONENT_FAMILIES[
+                        expected_component
+                    ]
+                }
+
             def execute():
                 base.execute()
+                if expected_component == "htr":
+                    htr_seal = family_seals()[HTR_NEURAL]
+                    array_root = (
+                        invocation.output_root / "fit_state" / "arrays"
+                    )
+                    array_root.mkdir(parents=True)
+                    for name, value in self.htr_arrays.items():
+                        np.save(
+                            array_root / f"{name}.npy",
+                            value,
+                            allow_pickle=False,
+                        )
+                    (
+                        invocation.output_root
+                        / "fit_only_family_seal.json"
+                    ).write_text(
+                        json.dumps(
+                            htr_seal,
+                            indent=2,
+                            sort_keys=True,
+                            allow_nan=False,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
                 if expected_component != "bow":
                     return
                 path = invocation.output_root / "execution_manifest.json"
@@ -180,36 +321,7 @@ class _ProviderReadyProducerRecorder(_ProducerRecorder):
             def authenticate():
                 base_receipt = base.authenticate()
                 owner_id = invocation.physical_owner.scope_id
-                seals = {
-                    family: build_role_neutral_fit_only_family_seal(
-                        plan=invocation.plan,
-                        physical_owner_scope_id=owner_id,
-                        family=family,
-                        evidence_payload=self.family_payloads[family],
-                        producer_identity_sha256=_sha(
-                            {
-                                "component": expected_component,
-                                "family": family,
-                                "producer": "provider-ready-test",
-                            }
-                        ),
-                        configuration_identity_sha256=_sha(
-                            {
-                                "component": expected_component,
-                                "family": family,
-                                "configuration": "provider-ready-test",
-                            }
-                        ),
-                        fit_state_artifact_sha256=_sha(
-                            {
-                                "owner": owner_id,
-                                "family": family,
-                                "fit_state": "provider-ready-test",
-                            }
-                        ),
-                    )
-                    for family in EXPECTED_COMPONENT_FAMILIES[expected_component]
-                }
+                seals = family_seals()
                 return AuthenticatedRoleNeutralComponentReceipt.create(
                     plan=invocation.plan,
                     physical_owner_scope_id=owner_id,
@@ -236,8 +348,7 @@ def _provider_ready_execution(
     family_payloads=None,
 ):
     if family_payloads is None:
-        source_catalog = build_role_neutral_evidence_catalog(_inputs())
-        family_payloads = _cumulative_family_payloads(source_catalog)
+        family_payloads = _native_payloads()
     assert set(family_payloads) == set(ACTIVE_STAGE1_CONCEPT_FAMILIES)
     registry = _registry()
     plan = build_canonical_stage1_scope_plan(
@@ -262,11 +373,24 @@ def _provider_ready_execution(
         ),
         executor=_RecordingExecutor(),
     )
+    bridge = validate_role_neutral_stage2_bridge(
+        execution_root=root,
+        plan=plan,
+        execution_manifest=manifest,
+    )
+    aggregation_store = handoff_module._build_htr_semantic_aggregation_store(
+        root=(tmp_path / "htr_semantic_aggregation_store").resolve(),
+        execution_root=root,
+        execution_content_sha256=manifest["content_sha256"],
+        plan=plan,
+        bridge=bridge,
+    )
     provider = AuthenticatedRoleNeutralStage2Provider(
         execution_root=root,
         plan=plan,
         execution_manifest=manifest,
         semantic_member_batch_size=3,
+        htr_aggregation_store_root=aggregation_store.root,
     )
     return plan, root, manifest, provider
 
@@ -440,7 +564,10 @@ def test_publisher_fails_closed_before_materializing_legacy_bundle(
         ROLE_NEUTRAL_STAGE2_COMPONENT_EXPORT_INDEX_SCHEMA
     )
     assert "legacy_bundle_build" in requirements["forbidden_compatibility_actions"]
-    assert "evidence_copy" in requirements["forbidden_compatibility_actions"]
+    assert (
+        "raw_evidence_copy"
+        in requirements["forbidden_compatibility_actions"]
+    )
     assert (
         "bind_prepared_request_dataset_split_model_prompt_and_seed_identity"
         in requirements["required_direct_loader_capabilities"]
@@ -448,9 +575,12 @@ def test_publisher_fails_closed_before_materializing_legacy_bundle(
 
 
 def test_current_execution_without_projection_export_fails_closed(
+    tmp_path: Path,
     authenticated_execution,
 ) -> None:
     plan, root, manifest = authenticated_execution
+    aggregate_placeholder = (tmp_path / "aggregate-placeholder").resolve()
+    aggregate_placeholder.mkdir()
 
     with pytest.raises(
         RoleNeutralStage2ProjectionProofUnavailable,
@@ -461,6 +591,7 @@ def test_current_execution_without_projection_export_fails_closed(
             plan=plan,
             execution_manifest=manifest,
             semantic_member_batch_size=3,
+            htr_aggregation_store_root=aggregate_placeholder,
         )
 
     addition = caught.value.required_schema_addition
@@ -565,12 +696,23 @@ def test_authenticated_provider_accepts_real_shaped_native_all_ten_payloads(
         catalog.audit["native_payload_adapter_by_family"][family][
             "adapter_applied"
         ]
-        is True
+        is (family != HTR_NEURAL)
         for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
     )
     assert (
         catalog.audit["native_payload_adapter_selection_or_truncation_applied"]
         is False
+    )
+    token_audit = catalog.audit["native_payload_adapter_by_family"][
+        "htr_neural"
+    ]["complete_token_attention_evidence"]
+    assert token_audit["token_occurrence_count"] == 6
+    assert token_audit["special_token_occurrence_count"] == 4
+    assert (
+        token_audit[
+            "raw_sidecars_authenticated_in_zero_copy_source_graph"
+        ]
+        is True
     )
     assert catalog.audit["family_payload_roundtrip_verified"] is True
 
@@ -642,6 +784,9 @@ def test_provider_authenticates_and_assembles_once_per_trust_boundary(
         plan=plan,
         execution_manifest=manifest,
         semantic_member_batch_size=3,
+        htr_aggregation_store_root=(
+            root.parent / "htr_semantic_aggregation_store"
+        ),
     )
     cumulative_scopes = tuple(
         scope for scope in plan.scopes if scope.scope_kind == "cumulative_spent"
@@ -691,16 +836,39 @@ def test_reference_handoff_is_positive_path_neutral_and_zero_copy(
     assert publication.stage2_provider is not None
     assert publication.source_role_neutral_execution_content_sha256 == (manifest["content_sha256"])
     assert publication.legacy_bundle_build_invoked is False
-    assert set(
+    published_files = set(
         path.relative_to(target).as_posix() for path in target.rglob("*") if path.is_file()
-    ) == {
+    )
+    assert {
         ROLE_NEUTRAL_STAGE1_REFERENCE_MANIFEST,
         ROLE_NEUTRAL_STAGE1_REFERENCE_LOCATOR,
         ROLE_NEUTRAL_STAGE1_REFERENCE_REGISTRY,
         ROLE_NEUTRAL_STAGE1_REFERENCE_PLAN,
         ROLE_NEUTRAL_STAGE1_REFERENCE_ROW_MAP,
-    }
-    assert not tuple(target.rglob("*.npy"))
+        (
+            f"{ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_DIRECTORY}/"
+            f"{ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_MANIFEST}"
+        ),
+    }.issubset(published_files)
+    assert all(
+        path in {
+            ROLE_NEUTRAL_STAGE1_REFERENCE_MANIFEST,
+            ROLE_NEUTRAL_STAGE1_REFERENCE_LOCATOR,
+            ROLE_NEUTRAL_STAGE1_REFERENCE_REGISTRY,
+            ROLE_NEUTRAL_STAGE1_REFERENCE_PLAN,
+            ROLE_NEUTRAL_STAGE1_REFERENCE_ROW_MAP,
+        }
+        or path.startswith(
+            f"{ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_DIRECTORY}/"
+        )
+        for path in published_files
+    )
+    assert tuple(
+        target.glob(
+            f"{ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_DIRECTORY}/"
+            "*/reverse_index/*.npy"
+        )
+    )
     assert not tuple(target.rglob("components"))
     scientific = json.loads(
         (target / ROLE_NEUTRAL_STAGE1_REFERENCE_MANIFEST).read_text(encoding="utf-8")
@@ -730,6 +898,8 @@ def test_reference_handoff_is_positive_path_neutral_and_zero_copy(
     )
     assert locator["references_only"] is True
     assert locator["evidence_payloads_materialized_here"] is False
+    assert locator["derived_htr_aggregate_payloads_materialized_here"] is True
+    assert locator["raw_htr_token_arrays_materialized_here"] is False
     assert locator["role_neutral_execution"]["execution_tree_materialized_here"] is False
 
 

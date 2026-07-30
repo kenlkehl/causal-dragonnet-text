@@ -159,6 +159,9 @@ _ROLE_NEUTRAL_COMPONENT_RESUME_INTERVAL_SEMANTICS = (
 _ROLE_NEUTRAL_COMPONENT_EXECUTION_REPORT_SEMANTICS = (
     "direct_monotonic_architecture_phase_envelopes_not_kernel_occupancy_v1"
 )
+ROLE_NEUTRAL_COMPONENT_IMPORT_ATTESTATION_SCHEMA = (
+    "production_role_neutral_authenticated_component_import_v1"
+)
 
 
 def _canonical_json(value: Any) -> str:
@@ -2663,6 +2666,7 @@ def execute_and_publish_role_neutral_stage1(
     executor: RoleNeutralPhysicalOwnerExecutor,
     resume: bool = False,
     component_store_root: Path | str | None = None,
+    component_reuse_roots: Sequence[Path | str] = (),
 ) -> dict[str, Any]:
     """Execute canonical owners and publish the authenticated all-ten gate."""
 
@@ -2677,6 +2681,19 @@ def execute_and_publish_role_neutral_stage1(
         raise TypeError("role-neutral execution requires a configured executor")
     if not isinstance(resume, bool):
         raise TypeError("role-neutral execution resume must be boolean")
+    if isinstance(
+        component_reuse_roots,
+        (str, bytes, Mapping),
+    ) or not isinstance(component_reuse_roots, Sequence):
+        raise TypeError(
+            "Stage 1 component reuse roots must be one ordered sequence"
+        )
+    requested_component_reuse_roots = tuple(component_reuse_roots)
+    if requested_component_reuse_roots and component_store_root is None:
+        raise ValueError(
+            "Stage 1 component reuse roots require a distinct stable "
+            "component store target"
+        )
     factories = producer_factories.as_mapping()
     requested_root = Path(root)
     if resume and requested_root.is_dir():
@@ -2766,6 +2783,34 @@ def execute_and_publish_role_neutral_stage1(
             _archive_stale_process_markers_for_resume(
                 owner_component_root.parent
             )
+    normalized_component_reuse_roots: list[Path] = []
+    for requested_reuse_root in requested_component_reuse_roots:
+        candidate = Path(requested_reuse_root)
+        if not candidate.is_absolute():
+            raise ValueError(
+                "Stage 1 component reuse root must be absolute"
+            )
+        resolved = candidate.resolve(strict=True)
+        if (
+            candidate.is_symlink()
+            or resolved != candidate
+            or not resolved.is_dir()
+            or resolved == owner_component_root
+            or resolved in owner_component_root.parents
+            or owner_component_root in resolved.parents
+        ):
+            raise ValueError(
+                "Stage 1 component reuse root must be one distinct "
+                "canonical directory"
+            )
+        if resolved in normalized_component_reuse_roots:
+            raise ValueError(
+                "Stage 1 component reuse roots contain a duplicate"
+            )
+        normalized_component_reuse_roots.append(resolved)
+    component_resume_enabled = bool(
+        resume or component_store_root is not None
+    )
     tasks = tuple(
         RoleNeutralPhysicalOwnerTask(
             plan=plan,
@@ -2788,30 +2833,92 @@ def execute_and_publish_role_neutral_stage1(
                 ).devices
             ),
             owner_cpu_budget=owner_cpu_budget,
-            resume=resume,
+            resume=component_resume_enabled,
         )
         for owner_scope_id in physical_order
     )
     task_by_owner = {task.physical_owner.scope_id: task for task in tasks}
-    if (
-        resume
-        and owner_component_root != execution_component_root
-    ):
-        # Upgrade an in-place phase resume to the stable component store
-        # without mutating or removing the original attempt tree.  Only a
-        # component that the current producer can freshly authenticate is
-        # copied; incompatible or incomplete legacy output is left in place
-        # and the ordinary store task recomputes it.
-        for task in tasks:
-            local_owner_root = (
-                execution_component_root
-                / task.physical_owner.scope_id
+    component_import_sources: list[Path] = []
+    if resume and owner_component_root != execution_component_root:
+        component_import_sources.append(execution_component_root)
+    component_import_sources.extend(normalized_component_reuse_roots)
+    if component_import_sources:
+        # Upgrade in-place output and compatible cross-request components
+        # into the current stable store without mutating any source tree.
+        # The current producer authenticates each candidate before and after
+        # a private copy.  Incompatible and incomplete candidates remain
+        # untouched, so ordinary execution recomputes only missing work.
+        import_attestation_root = (
+            owner_component_root.parent
+            / "authenticated_component_imports"
+        )
+        import_attestation_root.mkdir(exist_ok=True)
+        if (
+            import_attestation_root.is_symlink()
+            or import_attestation_root.resolve(strict=True)
+            != import_attestation_root
+        ):
+            raise ValueError(
+                "Stage 1 component import attestation root is not canonical"
             )
-            if (
-                local_owner_root.is_symlink()
-                or not local_owner_root.is_dir()
+
+        def invocation_for(
+            task: RoleNeutralPhysicalOwnerTask,
+            *,
+            component: str,
+            output_root: Path,
+        ) -> RoleNeutralComponentInvocation:
+            return RoleNeutralComponentInvocation(
+                plan=task.plan,
+                physical_owner=task.physical_owner,
+                logical_members=task.logical_members,
+                component=component,
+                output_root=output_root,
+                resource=task.resource,
+                neural_query_execution_topology=(
+                    task.neural_query_execution_topology
+                ),
+                htr_operational_controls=(
+                    task.htr_operational_controls
+                ),
+                neural_query_operational_controls=(
+                    task.neural_query_operational_controls
+                ),
+                htr_fold_devices=task.htr_fold_devices,
+                owner_cpu_budget=task.owner_cpu_budget,
+            )
+
+        def authenticate_candidate(
+            task: RoleNeutralPhysicalOwnerTask,
+            *,
+            component: str,
+            output_root: Path,
+        ) -> AuthenticatedRoleNeutralComponentReceipt:
+            bound = factories[component](
+                invocation_for(
+                    task,
+                    component=component,
+                    output_root=output_root,
+                )
+            )
+            if not isinstance(
+                bound,
+                BoundRoleNeutralComponentProducer,
             ):
-                continue
+                raise TypeError(
+                    "component import factory returned an untyped producer"
+                )
+            return validate_authenticated_role_neutral_component_receipt(
+                root=output_root,
+                plan=task.plan,
+                physical_owner_scope_id=(
+                    task.physical_owner.scope_id
+                ),
+                receipt=bound.authenticate(),
+                expected_component=component,
+            )
+
+        for task in tasks:
             task.component_parent.mkdir(
                 parents=True,
                 exist_ok=True,
@@ -2820,84 +2927,139 @@ def execute_and_publish_role_neutral_stage1(
                 store_target = task.component_parent / component
                 if store_target.exists() or store_target.is_symlink():
                     continue
-                local_source = local_owner_root / component
-                local_terminal = (
-                    local_source
-                    / ROLE_NEUTRAL_EXECUTION_MANIFEST
-                )
-                if (
-                    local_source.is_symlink()
-                    or not local_source.is_dir()
-                    or local_terminal.is_symlink()
-                    or not local_terminal.is_file()
-                ):
-                    continue
-                invocation = RoleNeutralComponentInvocation(
-                    plan=task.plan,
-                    physical_owner=task.physical_owner,
-                    logical_members=task.logical_members,
-                    component=component,
-                    output_root=local_source,
-                    resource=task.resource,
-                    neural_query_execution_topology=(
-                        task.neural_query_execution_topology
-                    ),
-                    htr_operational_controls=(
-                        task.htr_operational_controls
-                    ),
-                    neural_query_operational_controls=(
-                        task.neural_query_operational_controls
-                    ),
-                    htr_fold_devices=task.htr_fold_devices,
-                    owner_cpu_budget=task.owner_cpu_budget,
-                )
-                try:
-                    bound = factories[component](invocation)
-                    if not isinstance(
-                        bound,
-                        BoundRoleNeutralComponentProducer,
-                    ):
-                        raise TypeError(
-                            "component migration factory returned an "
-                            "untyped producer"
-                        )
-                    receipt = (
-                        validate_authenticated_role_neutral_component_receipt(
-                            root=local_source,
-                            plan=task.plan,
-                            physical_owner_scope_id=(
-                                task.physical_owner.scope_id
-                            ),
-                            receipt=bound.authenticate(),
-                            expected_component=component,
-                        )
+                for reuse_root in component_import_sources:
+                    source = (
+                        reuse_root
+                        / task.physical_owner.scope_id
+                        / component
                     )
-                except Exception:
-                    continue
-                temporary = task.component_parent / (
-                    f".{component}.attempt-import-{os.getpid()}-"
-                    f"{time.time_ns()}"
-                )
-                shutil.copytree(local_source, temporary)
-                validate_authenticated_role_neutral_component_receipt(
-                    root=temporary,
-                    plan=task.plan,
-                    physical_owner_scope_id=(
-                        task.physical_owner.scope_id
-                    ),
-                    receipt=receipt,
-                    expected_component=component,
-                )
-                temporary.rename(store_target)
-                validate_authenticated_role_neutral_component_receipt(
-                    root=store_target,
-                    plan=task.plan,
-                    physical_owner_scope_id=(
-                        task.physical_owner.scope_id
-                    ),
-                    receipt=receipt,
-                    expected_component=component,
-                )
+                    source_terminal = (
+                        source / ROLE_NEUTRAL_EXECUTION_MANIFEST
+                    )
+                    if (
+                        source.is_symlink()
+                        or not source.is_dir()
+                        or source_terminal.is_symlink()
+                        or not source_terminal.is_file()
+                    ):
+                        continue
+                    try:
+                        source_receipt = authenticate_candidate(
+                            task,
+                            component=component,
+                            output_root=source,
+                        )
+                    except Exception:
+                        continue
+                    temporary = task.component_parent / (
+                        f".{component}.attempt-import-{os.getpid()}-"
+                        f"{time.time_ns()}"
+                    )
+                    shutil.copytree(source, temporary)
+                    temporary_receipt = authenticate_candidate(
+                        task,
+                        component=component,
+                        output_root=temporary,
+                    )
+                    if (
+                        temporary_receipt.authentication_content_sha256
+                        != source_receipt.authentication_content_sha256
+                        or temporary_receipt.source_tree_sha256
+                        != source_receipt.source_tree_sha256
+                    ):
+                        raise RuntimeError(
+                            "authenticated component changed while importing"
+                        )
+                    temporary.rename(store_target)
+                    target_receipt = authenticate_candidate(
+                        task,
+                        component=component,
+                        output_root=store_target,
+                    )
+                    if (
+                        target_receipt.authentication_content_sha256
+                        != source_receipt.authentication_content_sha256
+                        or target_receipt.source_tree_sha256
+                        != source_receipt.source_tree_sha256
+                    ):
+                        raise RuntimeError(
+                            "authenticated imported component changed after "
+                            "publication"
+                        )
+                    attestation_body = {
+                        "schema_version": (
+                            ROLE_NEUTRAL_COMPONENT_IMPORT_ATTESTATION_SCHEMA
+                        ),
+                        "physical_owner_scope_id": (
+                            task.physical_owner.scope_id
+                        ),
+                        "component": component,
+                        "plan_scientific_content_sha256": (
+                            task.plan.scientific_content_sha256
+                        ),
+                        "source_components_root": str(reuse_root),
+                        "source_terminal_content_sha256": (
+                            source_receipt.source_terminal_content_sha256
+                        ),
+                        "source_tree_sha256": (
+                            source_receipt.source_tree_sha256
+                        ),
+                        "authentication_content_sha256": (
+                            source_receipt.authentication_content_sha256
+                        ),
+                        "current_producer_authenticated_source": True,
+                        "private_copy_not_link_or_reference": True,
+                        "current_producer_reauthenticated_temporary": True,
+                        "current_producer_reauthenticated_published_target": (
+                            True
+                        ),
+                        "source_tree_preserved": True,
+                    }
+                    attestation = {
+                        **attestation_body,
+                        "content_sha256": _sha256_json(
+                            attestation_body
+                        ),
+                    }
+                    attestation_name = (
+                        _sha256_json(
+                            {
+                                "physical_owner_scope_id": (
+                                    task.physical_owner.scope_id
+                                ),
+                                "component": component,
+                            }
+                        )
+                        + ".json"
+                    )
+                    attestation_path = (
+                        import_attestation_root / attestation_name
+                    )
+                    if attestation_path.is_file():
+                        if _read_json(
+                            attestation_path,
+                            label=(
+                                "Stage 1 component import attestation"
+                            ),
+                        ) != attestation:
+                            raise ValueError(
+                                "Stage 1 component import attestation "
+                                "changed"
+                            )
+                    elif (
+                        attestation_path.exists()
+                        or attestation_path.is_symlink()
+                    ):
+                        raise ValueError(
+                            "Stage 1 component import attestation is not "
+                            "regular data"
+                        )
+                    else:
+                        _write_new_json(
+                            attestation_path,
+                            attestation,
+                        )
+                    break
 
     claim_lock = threading.Lock()
     claimed: set[str] = set()

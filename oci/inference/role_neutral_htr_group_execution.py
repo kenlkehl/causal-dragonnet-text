@@ -47,12 +47,22 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    log_loss,
+    roc_auc_score,
+)
 from sklearn.model_selection import KFold
 from threadpoolctl import threadpool_limits
 
 from ..models.hierarchical_transformer_extractor import (
     HierarchicalTransformerExtractor,
     split_text_into_word_chunks,
+)
+from ..models.gated_attention_pooling import (
+    GatedAttentionPooling,
+    MultiHeadGatedAttentionPooling,
 )
 from ..utils.calibration import BinaryProbabilityCalibrator
 from .agentic_attention_variable_forest import _EffectNet, _NuisanceNet
@@ -66,15 +76,19 @@ from .htr_native_proof_capture import (
     _extractor_descriptor,
     _predict_model,
 )
-from .lossless_stage1_evidence_catalog import (
-    NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
+from .htr_attention_evidence_schema import (
+    ROLE_NEUTRAL_HTR_CHUNK_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_READABLE_SPAN_SCHEMA,
+    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_BATCH_SCHEMA,
+    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA,
 )
 from .neural_numerical_replay import (
     neural_float_arrays_within_tolerance,
     validate_neural_replay_settings,
 )
 from .production_stage1_legacy_scope_fragments import (
-    LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA,
+    LEGACY_STAGE1_FIT_ONLY_HTR_FAMILY_SEAL_SCHEMA,
 )
 from .production_stage1_scope_scheduler import (
     Stage1ScopePlan,
@@ -90,24 +104,28 @@ from .stage1_htr_operational_controls import (
 )
 
 ROLE_NEUTRAL_HTR_GROUP_REQUEST_SCHEMA = (
-    "production_role_neutral_htr_physical_group_request_v1"
+    "production_role_neutral_htr_physical_group_request_v2"
 )
-ROLE_NEUTRAL_HTR_CONFIG_SCHEMA = "production_role_neutral_htr_config_v3"
-ROLE_NEUTRAL_HTR_FIT_STATE_SCHEMA = "production_role_neutral_htr_fit_state_v1"
-ROLE_NEUTRAL_HTR_LOGICAL_VIEW_SCHEMA = "production_role_neutral_htr_logical_view_v1"
+ROLE_NEUTRAL_HTR_CONFIG_SCHEMA = "production_role_neutral_htr_config_v4"
+ROLE_NEUTRAL_HTR_FIT_STATE_SCHEMA = "production_role_neutral_htr_fit_state_v2"
+ROLE_NEUTRAL_HTR_LOGICAL_VIEW_SCHEMA = "production_role_neutral_htr_logical_view_v2"
 ROLE_NEUTRAL_HTR_GROUP_EXECUTION_SCHEMA = (
-    "production_role_neutral_htr_group_execution_v1"
+    "production_role_neutral_htr_group_execution_v2"
 )
-ROLE_NEUTRAL_HTR_COVERAGE_SCHEMA = "production_role_neutral_htr_word_coverage_v1"
+ROLE_NEUTRAL_HTR_COVERAGE_SCHEMA = (
+    "production_role_neutral_htr_word_and_token_coverage_v2"
+)
 ROLE_NEUTRAL_HTR_REUSABLE_PLAN_SCHEMA = (
-    "production_role_neutral_htr_reusable_text_plan_v1"
+    "production_role_neutral_htr_reusable_text_plan_v2"
 )
 ROLE_NEUTRAL_HTR_PROCESS_PLAN_SCHEMA = (
-    "production_role_neutral_htr_process_text_plan_v1"
+    "production_role_neutral_htr_process_text_plan_v2"
 )
 ROLE_NEUTRAL_HTR_OPERATIONAL_ATTESTATION_SCHEMA = (
     "production_role_neutral_htr_operational_attestation_v2"
 )
+_ATTENTION_NORMALIZATION_TOLERANCE = 1e-5
+_READABLE_TOKEN_SPANS_PER_CHUNK = 4
 
 _FIT_STATE_DIRECTORY = "fit_state"
 _FIT_STATE_METADATA = "metadata.json"
@@ -451,6 +469,81 @@ def _text_sha256(row_ids: Sequence[int], texts: Sequence[str]) -> str:
 def _float_hex_sha256(values: np.ndarray) -> str:
     array = np.asarray(values, dtype=np.float64).reshape(-1)
     return _sha256_json([float(value).hex() for value in array])
+
+
+def _binary_nuisance_metrics(
+    truth: np.ndarray,
+    probability: np.ndarray,
+) -> dict[str, float | None]:
+    labels = np.asarray(truth, dtype=np.float64)
+    values = np.asarray(probability, dtype=np.float64)
+    if (
+        labels.shape != values.shape
+        or labels.ndim != 1
+        or not set(np.unique(labels)).issubset({0.0, 1.0})
+        or not np.isfinite(values).all()
+        or np.any((values < 0.0) | (values > 1.0))
+    ):
+        raise ValueError(
+            "HTR nuisance performance requires finite binary held-out rows"
+        )
+    epsilon = np.finfo(np.float64).eps
+    clipped = np.clip(values, epsilon, 1.0 - epsilon)
+    both_classes = set(np.unique(labels)) == {0.0, 1.0}
+    return {
+        "auroc": (
+            float(roc_auc_score(labels, values)) if both_classes else None
+        ),
+        "auprc": float(average_precision_score(labels, values)),
+        "brier_score": float(brier_score_loss(labels, values)),
+        "log_loss": float(log_loss(labels, clipped, labels=[0.0, 1.0])),
+    }
+
+
+def _nuisance_oof_performance(
+    *,
+    treatment: np.ndarray,
+    outcome: np.ndarray,
+    e_hat: np.ndarray,
+    m_hat: np.ndarray,
+    nuisance_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    seen = np.zeros(len(treatment), dtype=np.int64)
+    folds: list[dict[str, Any]] = []
+    for record in nuisance_records:
+        positions = np.asarray(record["validation_positions"], dtype=np.int64)
+        seen[positions] += 1
+        folds.append(
+            {
+                "fold": int(record["fold"]),
+                "heldout_row_count": len(positions),
+                "treatment": _binary_nuisance_metrics(
+                    treatment[positions],
+                    e_hat[positions],
+                ),
+                "outcome": _binary_nuisance_metrics(
+                    outcome[positions],
+                    m_hat[positions],
+                ),
+            }
+        )
+    if not np.array_equal(seen, np.ones(len(treatment), dtype=np.int64)):
+        raise RuntimeError(
+            "HTR nuisance performance rows are not exactly-once held out"
+        )
+    body = {
+        "schema_version": "production_htr_nuisance_oof_performance_v1",
+        "evaluation_policy": "exactly_once_fold_heldout_predictions_v1",
+        "patient_count": len(treatment),
+        "folds": folds,
+        "pooled": {
+            "treatment": _binary_nuisance_metrics(treatment, e_hat),
+            "outcome": _binary_nuisance_metrics(outcome, m_hat),
+        },
+        "every_fit_patient_predicted_exactly_once_while_held_out": True,
+        "training_predictions_used_for_metrics": False,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
 
 
 def _binary_vector(values: Sequence[Any], *, label: str, length: int) -> np.ndarray:
@@ -881,6 +974,14 @@ class RoleNeutralHTRConfig:
             "token_attention",
         }:
             raise ValueError("HTR sentence pooling is unsupported")
+        if (
+            self.sentence_encoder_model_kind == "authenticated_local_tree"
+            and self.sentence_pooling != "token_attention"
+        ):
+            raise ValueError(
+                "authenticated production HTR requires "
+                "sentence_pooling=token_attention"
+            )
         if not isinstance(self.freeze_sentence_encoder, bool):
             raise TypeError("HTR freeze_sentence_encoder must be boolean")
         for name, value in (
@@ -2568,6 +2669,16 @@ def _attest_extractor(
             "sentence-encoder backend so truncation=False token counts can be "
             "authenticated before fitting"
         )
+    if config.sentence_encoder_model_kind != "hash" and (
+        config.sentence_pooling != "token_attention"
+        or descriptor.get("effective_sentence_pooling") != "token_attention"
+        or (descriptor.get("constructor") or {}).get("sentence_pooling")
+        != "token_attention"
+    ):
+        raise RuntimeError(
+            "authenticated production HTR did not attest token_attention "
+            "for configured and effective sentence pooling"
+        )
     if config.require_live_unfrozen_encoder_attestation:
         if (
             config.freeze_sentence_encoder is not False
@@ -2880,69 +2991,422 @@ def _train_effect(
             )
 
 
+@dataclass(frozen=True)
+class _CompleteAttentionEvidence:
+    architecture_evidence: tuple[Mapping[str, Any], ...]
+    token_attention_evidence: Mapping[str, Any]
+
+
+def _utf8_column(values: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
+    payload = bytearray()
+    offsets = [0]
+    for value in values:
+        encoded = str(value).encode("utf-8")
+        payload.extend(encoded)
+        offsets.append(len(payload))
+    return (
+        np.frombuffer(bytes(payload), dtype=np.uint8).copy(),
+        np.asarray(offsets, dtype=np.int64),
+    )
+
+
+def _readable_token_spans(
+    *,
+    chunk_text: str,
+    chunk_attention: float,
+    token_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    eligible = [
+        (index, row)
+        for index, row in enumerate(token_rows)
+        if row.get("is_special_token") is False
+        and row.get("is_padding") is False
+        and int(row.get("char_end", -1)) > int(row.get("char_start", -1))
+        and re.search(
+            r"[A-Za-z0-9]",
+            chunk_text[
+                int(row["char_start"]) : int(row["char_end"])
+            ],
+        )
+        and float(row.get("token_attention", 0.0)) > 0.0
+    ]
+    ranked = sorted(
+        eligible,
+        key=lambda item: (
+            -float(item[1]["token_attention"]) * float(chunk_attention),
+            -float(item[1]["token_attention"]),
+            int(item[1]["token_position"]),
+        ),
+    )
+    non_special = [row for _index, row in eligible]
+    by_position = {
+        int(row["token_position"]): local
+        for local, row in enumerate(non_special)
+    }
+    spans: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for _source_index, focus in ranked:
+        local = by_position[int(focus["token_position"])]
+        left = max(0, local - 2)
+        right = min(len(non_special), local + 3)
+        start = min(
+            int(row["char_start"]) for row in non_special[left:right]
+        )
+        end = max(int(row["char_end"]) for row in non_special[left:right])
+        coordinate = (start, end)
+        if coordinate in seen:
+            continue
+        seen.add(coordinate)
+        text = chunk_text[start:end]
+        if not text.strip():
+            continue
+        token_attention = float(focus["token_attention"])
+        spans.append(
+            {
+                "schema_version": ROLE_NEUTRAL_HTR_READABLE_SPAN_SCHEMA,
+                "selection_rank": len(spans) + 1,
+                "text": text,
+                "char_start": start,
+                "char_end": end,
+                "focus_token_position": int(focus["token_position"]),
+                "focus_token_id": int(focus["token_id"]),
+                "focus_decoded_token_text": str(
+                    focus["decoded_token_text"]
+                ),
+                "token_attention": token_attention,
+                "chunk_attention": float(chunk_attention),
+                "hierarchical_attention_score": (
+                    float(chunk_attention) * token_attention
+                ),
+                "special_tokens_excluded_from_readable_projection": True,
+                "raw_special_token_mass_retained_in_sidecar": True,
+                "overlap_handling": (
+                    "retain_each_chunk_local_occurrence_no_note_level_"
+                    "deduplication_v1"
+                ),
+            }
+        )
+        if len(spans) >= _READABLE_TOKEN_SPANS_PER_CHUNK:
+            break
+    return spans
+
+
 def _complete_attention_evidence(
     extractor: HierarchicalTransformerExtractor,
     *,
     texts: Sequence[str],
     coverage: _CoveragePlan,
     row_positions: Sequence[int],
+    row_ids: Sequence[int],
     fold: int,
     stage: str,
     objective: str,
     batch_size: int,
-) -> list[dict[str, Any]]:
+    array_store: _SafeArrayStore,
+    array_prefix: str,
+) -> _CompleteAttentionEvidence:
     values = tuple(str(text) for text in texts)
     positions = tuple(int(position) for position in row_positions)
-    if len(values) != len(positions):
+    authenticated_row_ids = tuple(int(row_id) for row_id in row_ids)
+    if (
+        len(values) != len(positions)
+        or not authenticated_row_ids
+        or any(
+            position < 0 or position >= len(authenticated_row_ids)
+            for position in positions
+        )
+    ):
         raise ValueError("HTR attention rows and texts differ")
-    evidence: list[dict[str, Any]] = []
+    if (
+        stage not in {"nuisance", "effect_modifier"}
+        or not objective
+        or _SAFE_ARRAY_KEY.fullmatch(array_prefix) is None
+    ):
+        raise ValueError("HTR attention evidence identity is invalid")
+    evidence_bases: list[dict[str, Any]] = []
+    fit_note_positions: list[int] = []
+    fit_row_identity: list[int] = []
+    chunk_indexes: list[int] = []
+    token_positions: list[int] = []
+    token_ids: list[int] = []
+    char_starts: list[int] = []
+    char_ends: list[int] = []
+    special_status: list[int] = []
+    padding_status: list[int] = []
+    token_attention: list[float] = []
+    chunk_attention: list[float] = []
+    hierarchical_attention: list[float] = []
+    decoded_token_text: list[str] = []
+    tokenizer_identity: Mapping[str, Any] | None = None
+    special_attention_mass = 0.0
+    normalized_chunk_group_count = 0
     for start in range(0, len(values), int(batch_size)):
         batch_texts = list(values[start : start + int(batch_size)])
         batch_positions = positions[start : start + int(batch_size)]
-        interpretations = extractor.interpret_attention(
+        inventory = extractor.complete_attention_inventory(
             batch_texts,
-            top_k=coverage.summary["configured_max_chunks"],
             role=stage,
+            normalization_tolerance=_ATTENTION_NORMALIZATION_TOLERANCE,
         )
-        if len(interpretations) != len(batch_texts):
+        if (
+            inventory.get("schema_version")
+            != "complete_htr_native_attention_inventory_v1"
+            or inventory.get("sentence_pooling") != "token_attention"
+            or inventory.get("effective_sentence_pooling")
+            != "token_attention"
+            or inventory.get("padding_excluded_from_token_normalization")
+            is not True
+            or inventory.get("special_tokens_retained") is not True
+            or inventory.get("raw_bert_self_attention_used") is not False
+            or inventory.get("post_hoc_attribution_used") is not False
+        ):
+            raise RuntimeError("HTR complete attention inventory changed")
+        observed_tokenizer = inventory.get("tokenizer_identity")
+        if not isinstance(observed_tokenizer, Mapping):
+            raise RuntimeError("HTR token evidence omitted tokenizer identity")
+        if tokenizer_identity is None:
+            tokenizer_identity = copy.deepcopy(dict(observed_tokenizer))
+        elif dict(tokenizer_identity) != dict(observed_tokenizer):
+            raise RuntimeError("HTR fitted tokenizer changed across evidence batches")
+        interpretations = inventory.get("notes")
+        if not isinstance(interpretations, list) or len(interpretations) != len(
+            batch_texts
+        ):
             raise RuntimeError("HTR attention interpretation omitted a note")
         for local_index, (fit_position, interpretation) in enumerate(
             zip(batch_positions, interpretations, strict=True)
         ):
             expected_chunks = coverage.chunks_by_note[fit_position]
-            observed_chunks = tuple(interpretation.get("chunks") or ())
-            if observed_chunks != expected_chunks:
+            observed_chunks = interpretation.get("chunks")
+            if (
+                not isinstance(observed_chunks, list)
+                or tuple(
+                    str(item.get("chunk_text"))
+                    for item in observed_chunks
+                    if isinstance(item, Mapping)
+                )
+                != expected_chunks
+            ):
                 raise RuntimeError("HTR attention changed the complete chunk plan")
-            top = interpretation.get("top_chunks")
-            if not isinstance(top, list) or len(top) != len(expected_chunks):
-                raise RuntimeError("HTR evidence omitted one or more configured chunks")
-            by_index = {
-                int(item["chunk_index"]): item
-                for item in top
-                if isinstance(item, Mapping)
-            }
-            if set(by_index) != set(range(len(expected_chunks))):
-                raise RuntimeError("HTR attention chunk coverage is not exact")
+            note_chunk_sum = sum(
+                float(item["chunk_attention"]) for item in observed_chunks
+            )
+            if (
+                not np.isfinite(note_chunk_sum)
+                or abs(note_chunk_sum - 1.0)
+                > _ATTENTION_NORMALIZATION_TOLERANCE
+            ):
+                raise RuntimeError("HTR chunk attention is not normalized")
+            normalized_chunk_group_count += 1
             for chunk_index, chunk_text in enumerate(expected_chunks):
-                item = by_index[chunk_index]
-                if item.get("chunk") != chunk_text:
+                item = observed_chunks[chunk_index]
+                if (
+                    int(item.get("chunk_index", -1)) != chunk_index
+                    or item.get("chunk_text") != chunk_text
+                    or not isinstance(item.get("tokens"), list)
+                    or not item["tokens"]
+                ):
                     raise RuntimeError("HTR evidence chunk text changed")
-                evidence.append(
+                observed_chunk_attention = float(item["chunk_attention"])
+                rows = item["tokens"]
+                observed_token_sum = sum(
+                    float(row["token_attention"]) for row in rows
+                )
+                if (
+                    not np.isfinite(observed_chunk_attention)
+                    or observed_chunk_attention < 0.0
+                    or not np.isfinite(observed_token_sum)
+                    or abs(observed_token_sum - 1.0)
+                    > _ATTENTION_NORMALIZATION_TOLERANCE
+                ):
+                    raise RuntimeError("HTR raw attention weights are invalid")
+                readable = _readable_token_spans(
+                    chunk_text=chunk_text,
+                    chunk_attention=observed_chunk_attention,
+                    token_rows=rows,
+                )
+                evidence_bases.append(
                     {
                         "witness_kind": "complete_htr_chunk_attention",
+                        "schema_version": (
+                            ROLE_NEUTRAL_HTR_CHUNK_EVIDENCE_SCHEMA
+                        ),
                         "stage": stage,
                         "objective": objective,
                         "fold": int(fold),
                         "fit_note_position": int(fit_position),
+                        "fit_row_id": int(
+                            authenticated_row_ids[int(fit_position)]
+                        ),
                         "chunk_index": int(chunk_index),
                         "chunk_text": chunk_text,
                         "chunk_sha256": hashlib.sha256(
                             chunk_text.encode("utf-8")
                         ).hexdigest(),
-                        "attention": float(item["attention"]),
+                        "attention": observed_chunk_attention,
+                        "readable_token_spans": readable,
+                        "readable_span_policy": {
+                            "schema_version": (
+                                "deterministic_chunk_local_token_span_"
+                                "projection_v1"
+                            ),
+                            "maximum_spans_per_chunk": (
+                                _READABLE_TOKEN_SPANS_PER_CHUNK
+                            ),
+                            "ranking": (
+                                "hierarchical_attention_desc_then_token_"
+                                "attention_desc_then_token_position_asc_v1"
+                            ),
+                            "special_tokens_excluded": True,
+                            "padding_excluded": True,
+                            "note_level_deduplication_applied": False,
+                            "overlapping_chunk_occurrences_retained": True,
+                            "complete_raw_inventory_retained": True,
+                        },
                     }
                 )
-    return evidence
+                for row in rows:
+                    raw_token_attention = float(row["token_attention"])
+                    is_special = bool(row["is_special_token"])
+                    fit_note_positions.append(int(fit_position))
+                    fit_row_identity.append(
+                        int(authenticated_row_ids[int(fit_position)])
+                    )
+                    chunk_indexes.append(int(chunk_index))
+                    token_positions.append(int(row["token_position"]))
+                    token_ids.append(int(row["token_id"]))
+                    char_starts.append(int(row["char_start"]))
+                    char_ends.append(int(row["char_end"]))
+                    special_status.append(int(is_special))
+                    padding_status.append(int(bool(row["is_padding"])))
+                    token_attention.append(raw_token_attention)
+                    chunk_attention.append(observed_chunk_attention)
+                    hierarchical_attention.append(
+                        raw_token_attention * observed_chunk_attention
+                    )
+                    decoded_token_text.append(
+                        str(row["decoded_token_text"])
+                    )
+                    if is_special:
+                        special_attention_mass += raw_token_attention
+    if tokenizer_identity is None or not token_attention:
+        raise RuntimeError("HTR complete token evidence is empty")
+    text_bytes, text_byte_offsets = _utf8_column(decoded_token_text)
+    raw_columns = {
+        "fit_note_position": np.asarray(
+            fit_note_positions,
+            dtype=np.int64,
+        ),
+        "fit_row_id": np.asarray(fit_row_identity, dtype=np.int64),
+        "chunk_index": np.asarray(chunk_indexes, dtype=np.int32),
+        "token_position": np.asarray(token_positions, dtype=np.int32),
+        "token_id": np.asarray(token_ids, dtype=np.int32),
+        "char_start": np.asarray(char_starts, dtype=np.int32),
+        "char_end": np.asarray(char_ends, dtype=np.int32),
+        "is_special_token": np.asarray(special_status, dtype=np.uint8),
+        "is_padding": np.asarray(padding_status, dtype=np.uint8),
+        "token_attention": np.asarray(token_attention, dtype=np.float64),
+        "chunk_attention": np.asarray(chunk_attention, dtype=np.float64),
+        "hierarchical_attention_score": np.asarray(
+            hierarchical_attention,
+            dtype=np.float64,
+        ),
+        "decoded_token_text_utf8": text_bytes,
+        "decoded_token_text_byte_offsets": text_byte_offsets,
+    }
+    column_descriptors: dict[str, dict[str, Any]] = {}
+    for column, values_array in raw_columns.items():
+        key = array_store.add(
+            f"{array_prefix}_{column}",
+            values_array,
+        )
+        column_descriptors[column] = {
+            "array": key,
+            **copy.deepcopy(array_store.inventory[key]),
+        }
+    coordinate_rows = [
+        [
+            fit_note_positions[index],
+            chunk_indexes[index],
+            token_positions[index],
+            token_ids[index],
+        ]
+        for index in range(len(token_ids))
+    ]
+    batch_body = {
+        "schema_version": ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_BATCH_SCHEMA,
+        "witness_kind": "complete_htr_token_attention_inventory",
+        "stage": stage,
+        "objective": objective,
+        "fold": int(fold),
+        "sentence_pooling": "token_attention",
+        "effective_sentence_pooling": "token_attention",
+        "pooler_kind": "learned_gated_attention_pooler",
+        "attention_interpretation": (
+            "attention_based_ranking_heuristic_not_causal_contribution"
+        ),
+        "fit_note_positions": list(positions),
+        "fit_row_ids": [
+            int(authenticated_row_ids[position]) for position in positions
+        ],
+        "note_count": len(positions),
+        "chunk_count": len(evidence_bases),
+        "token_occurrence_count": len(token_ids),
+        "special_token_occurrence_count": int(sum(special_status)),
+        "special_token_attention_mass": float(special_attention_mass),
+        "padding_occurrence_count": int(sum(padding_status)),
+        "padding_excluded_from_normalization": True,
+        "special_tokens_in_normalization_domain": True,
+        "all_overlapping_chunk_occurrences_retained": True,
+        "top_k_applied_to_raw_inventory": False,
+        "raw_subword_occurrences_losslessly_retained": True,
+        "decoded_token_text_encoding": "concatenated_utf8_with_offsets_v1",
+        "chunk_digest_reference": (
+            "join_fit_note_position_and_chunk_index_to_authenticated_"
+            "fit_coverage_chunk_sha256_bytes_v1"
+        ),
+        "chunk_text_reference": (
+            "join_stage_objective_fold_fit_note_position_and_chunk_index_"
+            "to_complete_chunk_atom_v1"
+        ),
+        "raw_occurrence_order": (
+            "fit_note_position_then_chunk_index_then_token_position_v1"
+        ),
+        "tokenizer_identity": copy.deepcopy(dict(tokenizer_identity)),
+        "columns": column_descriptors,
+        "coordinate_content_sha256": _sha256_json(coordinate_rows),
+        "normalization": {
+            "tolerance": _ATTENTION_NORMALIZATION_TOLERANCE,
+            "token_groups_checked": len(evidence_bases),
+            "chunk_groups_checked": normalized_chunk_group_count,
+            "all_token_groups_finite_nonnegative_sum_to_one": True,
+            "all_chunk_groups_finite_nonnegative_sum_to_one": True,
+            "padding_attention_zero": True,
+        },
+        "fold_honesty": {
+            "evidence_rows": "fold_validation_only",
+            "generated_after_fit": True,
+            "validation_rows_used_for_model_fit": False,
+            "fit_and_validation_rows_disjoint": True,
+        },
+    }
+    token_descriptor = {
+        **batch_body,
+        "content_sha256": _sha256_json(batch_body),
+    }
+    evidence = tuple(
+        {
+            **atom,
+            "token_inventory_content_sha256": token_descriptor[
+                "content_sha256"
+            ],
+        }
+        for atom in evidence_bases
+    )
+    return _CompleteAttentionEvidence(
+        architecture_evidence=evidence,
+        token_attention_evidence=token_descriptor,
+    )
 
 
 def _validate_complete_attention_evidence(
@@ -2952,15 +3416,22 @@ def _validate_complete_attention_evidence(
     nuisance_records: Sequence[Mapping[str, Any]],
     effect_records: Sequence[Mapping[str, Any]],
     config: RoleNeutralHTRConfig,
+    arrays: Mapping[str, np.ndarray],
 ) -> None:
     if (
         not isinstance(payload, Mapping)
         or set(payload)
-        != {"schema_version", "family", "architecture_evidence"}
+        != {
+            "schema_version",
+            "family",
+            "architecture_evidence",
+            "token_attention_evidence",
+        }
         or payload.get("schema_version")
-        != NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
+        != ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
         or payload.get("family") != HTR_NEURAL
         or not isinstance(payload.get("architecture_evidence"), list)
+        or not isinstance(payload.get("token_attention_evidence"), Mapping)
     ):
         raise ValueError("HTR native evidence envelope changed")
     note_chunks = np.asarray(coverage["note_chunk_counts"], dtype=np.int64)
@@ -2976,9 +3447,24 @@ def _validate_complete_attention_evidence(
             digests[flat_index].tolist()
         ).hex()
     expected: set[tuple[str, str, int, int, int]] = set()
+    row_id_by_position: dict[int, int] = {}
     for record in nuisance_records:
         fold = int(record["fold"])
-        for note_position in record["validation_positions"]:
+        validation_positions = list(record["validation_positions"])
+        validation_row_ids = list(record["validation_row_ids"])
+        if len(validation_positions) != len(validation_row_ids):
+            raise ValueError("HTR nuisance evidence row identities changed")
+        for note_position, row_id in zip(
+            validation_positions,
+            validation_row_ids,
+            strict=True,
+        ):
+            prior = row_id_by_position.setdefault(
+                int(note_position),
+                int(row_id),
+            )
+            if prior != int(row_id):
+                raise ValueError("HTR evidence row identity is inconsistent")
             for chunk_index in range(note_chunks[int(note_position)]):
                 expected.add(
                     (
@@ -3006,15 +3492,25 @@ def _validate_complete_attention_evidence(
     observed: set[tuple[str, str, int, int, int]] = set()
     expected_atom_keys = {
         "witness_kind",
+        "schema_version",
         "stage",
         "objective",
         "fold",
         "fit_note_position",
+        "fit_row_id",
         "chunk_index",
         "chunk_text",
         "chunk_sha256",
         "attention",
+        "readable_token_spans",
+        "readable_span_policy",
+        "token_inventory_content_sha256",
     }
+    chunk_atom_by_key: dict[
+        tuple[str, str, int, int, int],
+        Mapping[str, Any],
+    ] = {}
+    chunk_sums: dict[tuple[str, str, int, int], float] = {}
     for atom in payload["architecture_evidence"]:
         if not isinstance(atom, Mapping) or set(atom) != expected_atom_keys:
             raise ValueError("HTR attention evidence atom schema changed")
@@ -3030,8 +3526,12 @@ def _validate_complete_attention_evidence(
         expected_digest = digest_by_note_chunk.get((key[3], key[4]))
         if (
             atom.get("witness_kind") != "complete_htr_chunk_attention"
+            or atom.get("schema_version")
+            != ROLE_NEUTRAL_HTR_CHUNK_EVIDENCE_SCHEMA
             or key in observed
             or key not in expected
+            or int(atom.get("fit_row_id", -1))
+            != row_id_by_position.get(key[3])
             or not isinstance(chunk_text, str)
             or expected_digest is None
             or atom.get("chunk_sha256")
@@ -3040,16 +3540,557 @@ def _validate_complete_attention_evidence(
             or isinstance(attention, bool)
             or not isinstance(attention, (int, float))
             or not np.isfinite(float(attention))
+            or float(attention) < 0.0
+            or not isinstance(atom.get("readable_token_spans"), list)
+            or not isinstance(atom.get("readable_span_policy"), Mapping)
+            or set(atom["readable_span_policy"])
+            != {
+                "schema_version",
+                "maximum_spans_per_chunk",
+                "ranking",
+                "special_tokens_excluded",
+                "padding_excluded",
+                "note_level_deduplication_applied",
+                "overlapping_chunk_occurrences_retained",
+                "complete_raw_inventory_retained",
+            }
+            or atom["readable_span_policy"].get(
+                "complete_raw_inventory_retained"
+            )
+            is not True
+            or atom["readable_span_policy"].get(
+                "overlapping_chunk_occurrences_retained"
+            )
+            is not True
+            or len(atom["readable_token_spans"])
+            > _READABLE_TOKEN_SPANS_PER_CHUNK
+            or any(
+                not isinstance(span, Mapping)
+                or set(span)
+                != {
+                    "schema_version",
+                    "selection_rank",
+                    "text",
+                    "char_start",
+                    "char_end",
+                    "focus_token_position",
+                    "focus_token_id",
+                    "focus_decoded_token_text",
+                    "token_attention",
+                    "chunk_attention",
+                    "hierarchical_attention_score",
+                    "special_tokens_excluded_from_readable_projection",
+                    "raw_special_token_mass_retained_in_sidecar",
+                    "overlap_handling",
+                }
+                or span.get("schema_version")
+                != ROLE_NEUTRAL_HTR_READABLE_SPAN_SCHEMA
+                or span.get(
+                    "special_tokens_excluded_from_readable_projection"
+                )
+                is not True
+                or span.get("raw_special_token_mass_retained_in_sidecar")
+                is not True
+                or not isinstance(span.get("text"), str)
+                or not span["text"]
+                or int(span.get("char_start", -1)) < 0
+                or int(span.get("char_end", -1))
+                <= int(span.get("char_start", -1))
+                or int(span["char_end"]) > len(chunk_text)
+                or chunk_text[
+                    int(span["char_start"]) : int(span["char_end"])
+                ]
+                != span["text"]
+                or not np.isclose(
+                    float(span.get("hierarchical_attention_score", np.nan)),
+                    float(span.get("chunk_attention", np.nan))
+                    * float(span.get("token_attention", np.nan)),
+                    rtol=0.0,
+                    atol=1e-15,
+                )
+                for span in atom["readable_token_spans"]
+            )
         ):
             raise ValueError("HTR attention evidence changed or lost coverage")
         observed.add(key)
+        chunk_atom_by_key[key] = atom
+        sum_key = key[:4]
+        chunk_sums[sum_key] = chunk_sums.get(sum_key, 0.0) + float(
+            attention
+        )
     if observed != expected:
         raise ValueError("HTR attention evidence is not complete across fit chunks")
+    if any(
+        not np.isclose(
+            total,
+            1.0,
+            rtol=0.0,
+            atol=_ATTENTION_NORMALIZATION_TOLERANCE,
+        )
+        for total in chunk_sums.values()
+    ):
+        raise ValueError("HTR chunk attention is not normalized by note/model")
     expected_total = int(np.sum(note_chunks)) * (
         1 + len(config.effect_objectives)
     )
     if len(observed) != expected_total:
         raise ValueError("HTR attention evidence count changed")
+
+    package = payload["token_attention_evidence"]
+    package_body = {
+        key: value
+        for key, value in package.items()
+        if key != "content_sha256"
+    }
+    expected_package_keys = {
+        "schema_version",
+        "representation",
+        "sentence_pooling",
+        "effective_sentence_pooling",
+        "fold_batches",
+        "fold_batch_count",
+        "token_occurrence_count",
+        "chunk_interpretation_count",
+        "note_interpretation_count",
+        "special_token_occurrence_count",
+        "special_token_attention_mass",
+        "padding_occurrence_count",
+        "all_raw_token_occurrences_authenticated",
+        "all_chunk_occurrences_authenticated",
+        "top_k_applied_to_raw_inventory",
+        "readable_spans_are_deterministic_projections_only",
+        "hierarchical_attention_is_ranking_not_causal_attribution",
+        "fold_honest_validation_only_evidence",
+        "exact_oof_note_coverage",
+        "content_sha256",
+    }
+    batches = package.get("fold_batches")
+    if (
+        set(package) != expected_package_keys
+        or package.get("schema_version")
+        != ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA
+        or package.get("representation")
+        != "authenticated_columnar_per_array_npy_v1"
+        or package.get("sentence_pooling") != "token_attention"
+        or package.get("effective_sentence_pooling")
+        != "token_attention"
+        or package.get("content_sha256") != _sha256_json(package_body)
+        or not isinstance(batches, list)
+        or package.get("fold_batch_count") != len(batches)
+        or package.get("all_raw_token_occurrences_authenticated") is not True
+        or package.get("all_chunk_occurrences_authenticated") is not True
+        or package.get("top_k_applied_to_raw_inventory") is not False
+        or package.get("fold_honest_validation_only_evidence") is not True
+        or package.get("exact_oof_note_coverage") is not True
+    ):
+        raise ValueError("HTR token-attention package changed")
+    expected_batches: list[
+        tuple[str, str, int, list[int], list[int]]
+    ] = []
+    for record in nuisance_records:
+        expected_batches.append(
+            (
+                "nuisance",
+                "joint_treatment_outcome_nuisance",
+                int(record["fold"]),
+                list(map(int, record["validation_positions"])),
+                list(map(int, record["validation_row_ids"])),
+            )
+        )
+    for record in effect_records:
+        expected_batches.append(
+            (
+                "effect_modifier",
+                str(record["effect_objective"]),
+                int(record["fold"]),
+                list(map(int, record["validation_positions"])),
+                list(map(int, record["validation_row_ids"])),
+            )
+        )
+    if len(batches) != len(expected_batches):
+        raise ValueError("HTR token evidence fold coverage changed")
+
+    column_names = {
+        "fit_note_position",
+        "fit_row_id",
+        "chunk_index",
+        "token_position",
+        "token_id",
+        "char_start",
+        "char_end",
+        "is_special_token",
+        "is_padding",
+        "token_attention",
+        "chunk_attention",
+        "hierarchical_attention_score",
+        "decoded_token_text_utf8",
+        "decoded_token_text_byte_offsets",
+    }
+    batch_totals = {
+        "token_occurrence_count": 0,
+        "chunk_interpretation_count": 0,
+        "note_interpretation_count": 0,
+        "special_token_occurrence_count": 0,
+        "special_token_attention_mass": 0.0,
+        "padding_occurrence_count": 0,
+    }
+    for batch, expected_batch in zip(
+        batches,
+        expected_batches,
+        strict=True,
+    ):
+        if not isinstance(batch, Mapping):
+            raise ValueError("HTR token evidence batch is not an object")
+        body = {
+            key: value
+            for key, value in batch.items()
+            if key != "content_sha256"
+        }
+        stage, objective, fold, expected_positions, expected_row_ids = (
+            expected_batch
+        )
+        columns = batch.get("columns")
+        tokenizer = batch.get("tokenizer_identity")
+        expected_batch_keys = {
+            "schema_version",
+            "witness_kind",
+            "stage",
+            "objective",
+            "fold",
+            "sentence_pooling",
+            "effective_sentence_pooling",
+            "pooler_kind",
+            "attention_interpretation",
+            "fit_note_positions",
+            "fit_row_ids",
+            "note_count",
+            "chunk_count",
+            "token_occurrence_count",
+            "special_token_occurrence_count",
+            "special_token_attention_mass",
+            "padding_occurrence_count",
+            "padding_excluded_from_normalization",
+            "special_tokens_in_normalization_domain",
+            "all_overlapping_chunk_occurrences_retained",
+            "top_k_applied_to_raw_inventory",
+            "raw_subword_occurrences_losslessly_retained",
+            "decoded_token_text_encoding",
+            "chunk_digest_reference",
+            "chunk_text_reference",
+            "raw_occurrence_order",
+            "tokenizer_identity",
+            "columns",
+            "coordinate_content_sha256",
+            "normalization",
+            "fold_honesty",
+            "content_sha256",
+        }
+        if (
+            set(batch) != expected_batch_keys
+            or batch.get("schema_version")
+            != ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_BATCH_SCHEMA
+            or batch.get("witness_kind")
+            != "complete_htr_token_attention_inventory"
+            or (
+                str(batch.get("stage")),
+                str(batch.get("objective")),
+                int(batch.get("fold", 0)),
+            )
+            != (stage, objective, fold)
+            or batch.get("sentence_pooling") != "token_attention"
+            or batch.get("effective_sentence_pooling")
+            != "token_attention"
+            or batch.get("pooler_kind")
+            != "learned_gated_attention_pooler"
+            or batch.get("fit_note_positions") != expected_positions
+            or batch.get("fit_row_ids") != expected_row_ids
+            or int(batch.get("note_count", -1)) != len(expected_positions)
+            or batch.get("padding_excluded_from_normalization") is not True
+            or batch.get("special_tokens_in_normalization_domain") is not True
+            or batch.get("all_overlapping_chunk_occurrences_retained")
+            is not True
+            or batch.get("top_k_applied_to_raw_inventory") is not False
+            or batch.get("raw_subword_occurrences_losslessly_retained")
+            is not True
+            or batch.get("decoded_token_text_encoding")
+            != "concatenated_utf8_with_offsets_v1"
+            or batch.get("chunk_digest_reference")
+            != (
+                "join_fit_note_position_and_chunk_index_to_authenticated_"
+                "fit_coverage_chunk_sha256_bytes_v1"
+            )
+            or batch.get("chunk_text_reference")
+            != (
+                "join_stage_objective_fold_fit_note_position_and_chunk_index_"
+                "to_complete_chunk_atom_v1"
+            )
+            or batch.get("content_sha256") != _sha256_json(body)
+            or not isinstance(columns, Mapping)
+            or set(columns) != column_names
+            or not isinstance(tokenizer, Mapping)
+            or set(tokenizer)
+            != {
+                "tokenizer_class",
+                "is_fast",
+                "vocabulary_size",
+                "vocabulary_sha256",
+                "all_special_ids",
+                "padding_side",
+                "pad_token_id",
+            }
+            or not isinstance(tokenizer.get("all_special_ids"), list)
+            or not isinstance(tokenizer.get("tokenizer_class"), str)
+            or not tokenizer["tokenizer_class"]
+            or type(tokenizer.get("is_fast")) is not bool
+            or int(tokenizer.get("vocabulary_size", 0)) < 1
+            or len(str(tokenizer.get("vocabulary_sha256") or "")) != 64
+            or batch.get("fold_honesty")
+            != {
+                "evidence_rows": "fold_validation_only",
+                "generated_after_fit": True,
+                "validation_rows_used_for_model_fit": False,
+                "fit_and_validation_rows_disjoint": True,
+            }
+        ):
+            raise ValueError("HTR token evidence batch identity changed")
+        loaded_columns: dict[str, np.ndarray] = {}
+        for column_name in sorted(column_names):
+            descriptor = columns[column_name]
+            if (
+                not isinstance(descriptor, Mapping)
+                or set(descriptor)
+                != {"array", "dtype", "shape", "content_sha256"}
+            ):
+                raise ValueError("HTR token column descriptor changed")
+            key = str(descriptor["array"])
+            value = arrays.get(key)
+            if (
+                value is None
+                or value.dtype.str != descriptor.get("dtype")
+                or list(value.shape) != descriptor.get("shape")
+                or _array_sha256(value)
+                != descriptor.get("content_sha256")
+            ):
+                raise ValueError("HTR token column bytes changed")
+            loaded_columns[column_name] = np.asarray(value)
+        count = int(batch.get("token_occurrence_count", -1))
+        vector_columns = column_names - {
+            "decoded_token_text_utf8",
+            "decoded_token_text_byte_offsets",
+        }
+        if (
+            count < 1
+            or any(
+                loaded_columns[name].shape != (count,)
+                for name in vector_columns
+            )
+            or loaded_columns[
+                "decoded_token_text_utf8"
+            ].dtype != np.dtype(np.uint8)
+            or loaded_columns[
+                "decoded_token_text_byte_offsets"
+            ].shape != (count + 1,)
+        ):
+            raise ValueError("HTR token column shapes changed")
+        text_bytes = loaded_columns["decoded_token_text_utf8"].tobytes()
+        text_offsets = loaded_columns[
+            "decoded_token_text_byte_offsets"
+        ].astype(np.int64, copy=False)
+        if (
+            int(text_offsets[0]) != 0
+            or int(text_offsets[-1]) != len(text_bytes)
+            or np.any(np.diff(text_offsets) < 0)
+        ):
+            raise ValueError("HTR token text byte offsets changed")
+        decoded = []
+        try:
+            for index in range(count):
+                decoded.append(
+                    text_bytes[
+                        int(text_offsets[index]) : int(text_offsets[index + 1])
+                    ].decode("utf-8")
+                )
+        except UnicodeDecodeError as exc:
+            raise ValueError("HTR token text is not valid UTF-8") from exc
+        if any(not value for value in decoded):
+            raise ValueError("HTR decoded token text is empty")
+
+        positions = loaded_columns["fit_note_position"].astype(
+            np.int64,
+            copy=False,
+        )
+        row_ids = loaded_columns["fit_row_id"].astype(np.int64, copy=False)
+        chunk_indices = loaded_columns["chunk_index"].astype(
+            np.int64,
+            copy=False,
+        )
+        token_position_values = loaded_columns["token_position"].astype(
+            np.int64,
+            copy=False,
+        )
+        token_id_values = loaded_columns["token_id"].astype(
+            np.int64,
+            copy=False,
+        )
+        starts = loaded_columns["char_start"].astype(np.int64, copy=False)
+        ends = loaded_columns["char_end"].astype(np.int64, copy=False)
+        special = loaded_columns["is_special_token"].astype(
+            np.uint8,
+            copy=False,
+        )
+        padding = loaded_columns["is_padding"].astype(np.uint8, copy=False)
+        token_weights = loaded_columns["token_attention"].astype(
+            np.float64,
+            copy=False,
+        )
+        chunk_weights = loaded_columns["chunk_attention"].astype(
+            np.float64,
+            copy=False,
+        )
+        hierarchical = loaded_columns[
+            "hierarchical_attention_score"
+        ].astype(np.float64, copy=False)
+        if (
+            not np.isfinite(token_weights).all()
+            or not np.isfinite(chunk_weights).all()
+            or not np.isfinite(hierarchical).all()
+            or np.any(token_weights < 0.0)
+            or np.any(chunk_weights < 0.0)
+            or np.any((special != 0) & (special != 1))
+            or np.any(padding != 0)
+            or not np.allclose(
+                hierarchical,
+                token_weights * chunk_weights,
+                rtol=0.0,
+                atol=1e-15,
+            )
+        ):
+            raise ValueError("HTR token attention numerical columns changed")
+        expected_row_by_position = dict(
+            zip(expected_positions, expected_row_ids, strict=True)
+        )
+        if any(
+            int(position) not in expected_row_by_position
+            or int(row_id)
+            != expected_row_by_position[int(position)]
+            for position, row_id in zip(positions, row_ids, strict=True)
+        ):
+            raise ValueError("HTR token evidence includes a non-validation row")
+        special_ids = {
+            int(value) for value in tokenizer["all_special_ids"]
+        }
+        if any(
+            bool(special[index])
+            != (int(token_id_values[index]) in special_ids)
+            for index in range(count)
+        ):
+            raise ValueError("HTR special-token status changed")
+
+        grouped: dict[tuple[int, int], list[int]] = {}
+        for index, coordinate in enumerate(
+            zip(positions, chunk_indices, strict=True)
+        ):
+            grouped.setdefault(
+                (int(coordinate[0]), int(coordinate[1])),
+                [],
+            ).append(index)
+        expected_groups = {
+            (position, chunk_index)
+            for position in expected_positions
+            for chunk_index in range(note_chunks[position])
+        }
+        if set(grouped) != expected_groups:
+            raise ValueError("HTR token evidence chunk coverage is incomplete")
+        coordinate_rows: list[list[int]] = []
+        batch_special_mass = 0.0
+        for position, chunk_index in sorted(grouped):
+            indexes = grouped[(position, chunk_index)]
+            observed_positions = token_position_values[indexes].tolist()
+            if observed_positions != list(range(len(indexes))):
+                raise ValueError("HTR token positions are incomplete or reordered")
+            atom_key = (stage, objective, fold, position, chunk_index)
+            atom = chunk_atom_by_key.get(atom_key)
+            if atom is None or atom.get(
+                "token_inventory_content_sha256"
+            ) != batch.get("content_sha256"):
+                raise ValueError("HTR token inventory is not bound to its chunk")
+            expected_chunk_weight = float(atom["attention"])
+            chunk_text = str(atom["chunk_text"])
+            if (
+                not np.allclose(
+                    chunk_weights[indexes],
+                    expected_chunk_weight,
+                    rtol=0.0,
+                    atol=1e-15,
+                )
+                or not np.isclose(
+                    token_weights[indexes].sum(),
+                    1.0,
+                    rtol=0.0,
+                    atol=_ATTENTION_NORMALIZATION_TOLERANCE,
+                )
+            ):
+                raise ValueError("HTR token/chunk weights are not normalized")
+            for index in indexes:
+                if bool(special[index]):
+                    if starts[index] < 0 or ends[index] < starts[index]:
+                        raise ValueError("HTR special-token offsets changed")
+                    batch_special_mass += float(token_weights[index])
+                elif not (
+                    0 <= starts[index] < ends[index] <= len(chunk_text)
+                ):
+                    raise ValueError("HTR token offsets do not align to chunk")
+                coordinate_rows.append(
+                    [
+                        int(positions[index]),
+                        int(chunk_indices[index]),
+                        int(token_position_values[index]),
+                        int(token_id_values[index]),
+                    ]
+                )
+        if (
+            batch.get("coordinate_content_sha256")
+            != _sha256_json(coordinate_rows)
+            or int(batch.get("chunk_count", -1)) != len(grouped)
+            or int(batch.get("special_token_occurrence_count", -1))
+            != int(special.sum())
+            or int(batch.get("padding_occurrence_count", -1)) != 0
+            or not np.isclose(
+                float(batch.get("special_token_attention_mass", np.nan)),
+                batch_special_mass,
+                rtol=0.0,
+                atol=1e-12,
+            )
+            or batch.get("normalization")
+            != {
+                "tolerance": _ATTENTION_NORMALIZATION_TOLERANCE,
+                "token_groups_checked": len(grouped),
+                "chunk_groups_checked": len(expected_positions),
+                "all_token_groups_finite_nonnegative_sum_to_one": True,
+                "all_chunk_groups_finite_nonnegative_sum_to_one": True,
+                "padding_attention_zero": True,
+            }
+        ):
+            raise ValueError("HTR token evidence coverage summary changed")
+        batch_totals["token_occurrence_count"] += count
+        batch_totals["chunk_interpretation_count"] += len(grouped)
+        batch_totals["note_interpretation_count"] += len(
+            expected_positions
+        )
+        batch_totals["special_token_occurrence_count"] += int(special.sum())
+        batch_totals["special_token_attention_mass"] += batch_special_mass
+    for key, value in batch_totals.items():
+        observed_total = package.get(key)
+        if key == "special_token_attention_mass":
+            if not np.isclose(
+                float(observed_total),
+                float(value),
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError("HTR token package special mass changed")
+        elif int(observed_total) != int(value):
+            raise ValueError(f"HTR token package {key} changed")
 
 
 @dataclass(frozen=True)
@@ -3192,6 +4233,7 @@ class _NuisanceFoldResult:
     validation_e_hat: np.ndarray
     validation_m_hat: np.ndarray
     architecture_evidence: tuple[Mapping[str, Any], ...]
+    token_attention_evidence: Mapping[str, Any]
     extractor_attestation: Mapping[str, Any]
     arrays: Mapping[str, np.ndarray]
     gpu_peak_allocated_bytes: int | None
@@ -3209,6 +4251,7 @@ class _EffectFoldResult:
     model: Mapping[str, Any]
     validation_tau: np.ndarray
     architecture_evidence: tuple[Mapping[str, Any], ...]
+    token_attention_evidence: Mapping[str, Any]
     extractor_attestation: Mapping[str, Any]
     arrays: Mapping[str, np.ndarray]
     gpu_peak_allocated_bytes: int | None
@@ -3372,20 +4415,22 @@ def _run_nuisance_fold(
             outcome_calibrator.transform(validation_raw_m),
             dtype=np.float64,
         )
-        evidence = tuple(
-            _complete_attention_evidence(
-                model.extractor,
-                texts=[
-                    texts[int(position)]
-                    for position in validation_positions
-                ],
-                coverage=coverage,
-                row_positions=validation_positions,
-                fold=task.fold,
-                stage="nuisance",
-                objective="joint_treatment_outcome_nuisance",
-                batch_size=task.config.prediction_batch_size,
-            )
+        local_store = _SafeArrayStore()
+        evidence = _complete_attention_evidence(
+            model.extractor,
+            texts=[
+                texts[int(position)]
+                for position in validation_positions
+            ],
+            coverage=coverage,
+            row_positions=validation_positions,
+            row_ids=row_ids,
+            fold=task.fold,
+            stage="nuisance",
+            objective="joint_treatment_outcome_nuisance",
+            batch_size=task.config.prediction_batch_size,
+            array_store=local_store,
+            array_prefix=f"nuisance_{task.fold:04d}_token_evidence",
         )
         if task.operational_controls is not None:
             _restore_scientific_encoder_batch_size(
@@ -3393,7 +4438,6 @@ def _run_nuisance_fold(
                 config=task.config,
                 controls=task.operational_controls,
             )
-        local_store = _SafeArrayStore()
         prefix = f"nuisance_{task.fold:04d}"
         model_descriptor = _capture_model_state(
             model,
@@ -3428,7 +4472,8 @@ def _run_nuisance_fold(
             outcome_calibrator=outcome_descriptor,
             validation_e_hat=validation_e,
             validation_m_hat=validation_m,
-            architecture_evidence=evidence,
+            architecture_evidence=evidence.architecture_evidence,
+            token_attention_evidence=evidence.token_attention_evidence,
             extractor_attestation=attestation,
             arrays={
                 key: np.ascontiguousarray(value)
@@ -3505,20 +4550,24 @@ def _run_effect_fold(
             batch_size=task.config.prediction_batch_size,
         )
         validation_tau = np.asarray(validation_tau_raw, dtype=np.float64)
-        evidence = tuple(
-            _complete_attention_evidence(
-                model.extractor,
-                texts=[
-                    texts[int(position)]
-                    for position in validation_positions
-                ],
-                coverage=coverage,
-                row_positions=validation_positions,
-                fold=task.fold,
-                stage="effect_modifier",
-                objective=task.objective,
-                batch_size=task.config.prediction_batch_size,
-            )
+        local_store = _SafeArrayStore()
+        evidence = _complete_attention_evidence(
+            model.extractor,
+            texts=[
+                texts[int(position)]
+                for position in validation_positions
+            ],
+            coverage=coverage,
+            row_positions=validation_positions,
+            row_ids=row_ids,
+            fold=task.fold,
+            stage="effect_modifier",
+            objective=task.objective,
+            batch_size=task.config.prediction_batch_size,
+            array_store=local_store,
+            array_prefix=(
+                f"effect_{task.objective}_{task.fold:04d}_token_evidence"
+            ),
         )
         if task.operational_controls is not None:
             _restore_scientific_encoder_batch_size(
@@ -3526,7 +4575,6 @@ def _run_effect_fold(
                 config=task.config,
                 controls=task.operational_controls,
             )
-        local_store = _SafeArrayStore()
         prefix = f"effect_{task.objective}_{task.fold:04d}"
         model_descriptor = _capture_model_state(
             model,
@@ -3550,7 +4598,8 @@ def _run_effect_fold(
             validation_positions=validation_positions,
             model=model_descriptor,
             validation_tau=validation_tau,
-            architecture_evidence=evidence,
+            architecture_evidence=evidence.architecture_evidence,
+            token_attention_evidence=evidence.token_attention_evidence,
             extractor_attestation=attestation,
             arrays={
                 key: np.ascontiguousarray(value)
@@ -3906,6 +4955,7 @@ class _OwnerFoldFitResult:
     nuisance_records: tuple[Mapping[str, Any], ...]
     effect_records: tuple[Mapping[str, Any], ...]
     architecture_evidence: tuple[Mapping[str, Any], ...]
+    token_attention_evidence: tuple[Mapping[str, Any], ...]
     fold_execution_events: tuple[Mapping[str, Any], ...]
 
 
@@ -4173,6 +5223,7 @@ def _fit_owner_htr_folds(
         nuisance_records: list[Mapping[str, Any]] = []
         effect_records: list[Mapping[str, Any]] = []
         evidence: list[Mapping[str, Any]] = []
+        token_evidence: list[Mapping[str, Any]] = []
         effect_oof: dict[str, np.ndarray] = {}
 
         with _HTRFoldExecutor(resource_plan) as fold_executor:
@@ -4230,6 +5281,9 @@ def _fit_owner_htr_folds(
                     result.validation_m_hat
                 )
                 evidence.extend(result.architecture_evidence)
+                token_evidence.append(
+                    copy.deepcopy(dict(result.token_attention_evidence))
+                )
                 prefix = f"nuisance_{result.fold:04d}"
                 nuisance_records.append(
                     {
@@ -4375,6 +5429,9 @@ def _fit_owner_htr_folds(
                     result.validation_positions
                 ] = result.validation_tau
                 evidence.extend(result.architecture_evidence)
+                token_evidence.append(
+                    copy.deepcopy(dict(result.token_attention_evidence))
+                )
                 prefix = f"effect_{result.objective}_{result.fold:04d}"
                 effect_records.append(
                     {
@@ -4445,6 +5502,7 @@ def _fit_owner_htr_folds(
         nuisance_records=tuple(nuisance_records),
         effect_records=tuple(effect_records),
         architecture_evidence=tuple(evidence),
+        token_attention_evidence=tuple(token_evidence),
         fold_execution_events=tuple(fold_events),
     )
 
@@ -4657,14 +5715,19 @@ def _producer_identity() -> str:
         inspect.getsource(_load_materialized_reusable_text_plan),
         inspect.getsource(_train_nuisance),
         inspect.getsource(_train_effect),
+        inspect.getsource(_binary_nuisance_metrics),
+        inspect.getsource(_nuisance_oof_performance),
         inspect.getsource(_run_nuisance_fold),
         inspect.getsource(_run_effect_fold),
         inspect.getsource(_invoke_htr_fold_worker),
         inspect.getsource(_execute_htr_fold_tasks),
         inspect.getsource(_fit_owner_htr_folds),
         inspect.getsource(_complete_attention_evidence),
+        inspect.getsource(_token_attention_package),
         inspect.getsource(execute_role_neutral_htr_physical_group),
         inspect.getsource(HierarchicalTransformerExtractor),
+        inspect.getsource(GatedAttentionPooling),
+        inspect.getsource(MultiHeadGatedAttentionPooling),
         inspect.getsource(_NuisanceNet),
         inspect.getsource(_EffectNet),
         inspect.getsource(_capture_model_state),
@@ -4673,10 +5736,85 @@ def _producer_identity() -> str:
     ]
     return _sha256_json(
         {
-            "schema_version": "production_role_neutral_htr_producer_identity_v1",
+            "schema_version": "production_role_neutral_htr_producer_identity_v2",
             "transitive_sources": sources,
         }
     )
+
+
+def _token_attention_package(
+    batches: Sequence[Mapping[str, Any]],
+    *,
+    config: RoleNeutralHTRConfig,
+) -> dict[str, Any]:
+    rows = [copy.deepcopy(dict(value)) for value in batches]
+    expected = [
+        ("nuisance", "joint_treatment_outcome_nuisance", fold)
+        for fold in range(1, config.nuisance_folds + 1)
+    ]
+    expected.extend(
+        ("effect_modifier", objective, fold)
+        for objective in config.effect_objectives
+        for fold in range(1, config.effect_folds + 1)
+    )
+    observed = [
+        (
+            str(row.get("stage")),
+            str(row.get("objective")),
+            int(row.get("fold", 0)),
+        )
+        for row in rows
+    ]
+    if observed != expected or any(
+        row.get("schema_version")
+        != ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_BATCH_SCHEMA
+        or row.get("sentence_pooling") != "token_attention"
+        or row.get("effective_sentence_pooling") != "token_attention"
+        or row.get("content_sha256")
+        != _sha256_json(
+            {
+                key: value
+                for key, value in row.items()
+                if key != "content_sha256"
+            }
+        )
+        for row in rows
+    ):
+        raise ValueError("HTR token-attention fold package is incomplete")
+    body = {
+        "schema_version": ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA,
+        "representation": "authenticated_columnar_per_array_npy_v1",
+        "sentence_pooling": "token_attention",
+        "effective_sentence_pooling": "token_attention",
+        "fold_batches": rows,
+        "fold_batch_count": len(rows),
+        "token_occurrence_count": sum(
+            int(row["token_occurrence_count"]) for row in rows
+        ),
+        "chunk_interpretation_count": sum(
+            int(row["chunk_count"]) for row in rows
+        ),
+        "note_interpretation_count": sum(
+            int(row["note_count"]) for row in rows
+        ),
+        "special_token_occurrence_count": sum(
+            int(row["special_token_occurrence_count"]) for row in rows
+        ),
+        "special_token_attention_mass": sum(
+            float(row["special_token_attention_mass"]) for row in rows
+        ),
+        "padding_occurrence_count": sum(
+            int(row["padding_occurrence_count"]) for row in rows
+        ),
+        "all_raw_token_occurrences_authenticated": True,
+        "all_chunk_occurrences_authenticated": True,
+        "top_k_applied_to_raw_inventory": False,
+        "readable_spans_are_deterministic_projections_only": True,
+        "hierarchical_attention_is_ranking_not_causal_attribution": True,
+        "fold_honest_validation_only_evidence": True,
+        "exact_oof_note_coverage": True,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
 
 
 def _fit_seal(
@@ -4690,12 +5828,18 @@ def _fit_seal(
     payload = copy.deepcopy(dict(evidence_payload))
     if (
         set(payload)
-        != {"schema_version", "family", "architecture_evidence"}
+        != {
+            "schema_version",
+            "family",
+            "architecture_evidence",
+            "token_attention_evidence",
+        }
         or payload.get("schema_version")
-        != NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
+        != ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
         or payload.get("family") != HTR_NEURAL
         or not isinstance(payload.get("architecture_evidence"), list)
         or not payload["architecture_evidence"]
+        or not isinstance(payload.get("token_attention_evidence"), Mapping)
     ):
         raise ValueError("HTR fit-only seal requires nonempty native evidence")
     payload_sha256 = _sha256_json(payload)
@@ -4720,7 +5864,7 @@ def _fit_seal(
         },
     ]
     body = {
-        "schema_version": LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA,
+        "schema_version": LEGACY_STAGE1_FIT_ONLY_HTR_FAMILY_SEAL_SCHEMA,
         "plan_scientific_content_sha256": (
             request.plan_scientific_content_sha256
         ),
@@ -5017,7 +6161,17 @@ def _validate_fit_side(
         or metadata.get("registered_heldout_text_accessed") is not False
         or metadata.get("registered_heldout_labels_accessed") is not False
         or metadata.get("text_truncation_applied") is not False
-        or metadata.get("array_layout") != "one_npy_per_array_mmap_safe_v1"
+        or metadata.get("array_layout")
+        != "one_npy_per_array_bounded_read_token_attention_v2"
+        or metadata.get("pooling_attestation")
+        != {
+            "sentence_pooling": "token_attention",
+            "effective_sentence_pooling": "token_attention",
+            "pooler_kind": "learned_gated_attention_pooler",
+            "cls_pooling_used": False,
+            "raw_bert_self_attention_used_as_evidence": False,
+            "post_hoc_attribution_used": False,
+        }
     ):
         raise ValueError("HTR fit-state envelope changed")
     config_mapping = metadata.get("configuration")
@@ -5211,6 +6365,15 @@ def _validate_fit_side(
         or not np.array_equal(eligible, expected_eligible.astype(np.uint8))
     ):
         raise ValueError("HTR derived nuisance/R-stage quantities changed")
+    expected_performance = _nuisance_oof_performance(
+        treatment=fit_treatment,
+        outcome=fit_outcome,
+        e_hat=e_hat,
+        m_hat=m_hat,
+        nuisance_records=nuisance_rows,
+    )
+    if metadata.get("nuisance_oof_performance") != expected_performance:
+        raise ValueError("HTR held-out nuisance performance changed")
     for objective in config.effect_objectives:
         split_seed = _derived_seed(
             request.physical_owner.scope_seed,
@@ -5305,6 +6468,7 @@ def _validate_fit_side(
         nuisance_records=nuisance_rows,
         effect_records=effect_rows,
         config=config,
+        arrays=arrays,
     )
     # Reconstruct every native model before permitting registered held-out text.
     replay_device = torch.device(device)
@@ -5529,10 +6693,21 @@ def execute_role_neutral_htr_physical_group(
         copy.deepcopy(dict(value))
         for value in fold_fit.architecture_evidence
     ]
+    token_attention_evidence = _token_attention_package(
+        fold_fit.token_attention_evidence,
+        config=config,
+    )
     if not np.isfinite(nuisance_oof_e).all() or not np.isfinite(
         nuisance_oof_m
     ).all():
         raise RuntimeError("HTR nuisance cross-fit omitted a fit row")
+    nuisance_oof_performance = _nuisance_oof_performance(
+        treatment=treatment,
+        outcome=outcome,
+        e_hat=nuisance_oof_e,
+        m_hat=nuisance_oof_m,
+        nuisance_records=nuisance_records,
+    )
     clipped_e = np.clip(nuisance_oof_e, config.e_clip, 1.0 - config.e_clip)
     y_residual = outcome - nuisance_oof_m
     t_residual = treatment - clipped_e
@@ -5577,9 +6752,10 @@ def execute_role_neutral_htr_physical_group(
         )
 
     evidence_payload = {
-        "schema_version": NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
+        "schema_version": ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
         "family": HTR_NEURAL,
         "architecture_evidence": architecture_evidence,
+        "token_attention_evidence": token_attention_evidence,
     }
     fit_root = root / _FIT_STATE_DIRECTORY
     fit_root.mkdir(parents=True, exist_ok=False)
@@ -5601,16 +6777,27 @@ def execute_role_neutral_htr_physical_group(
         "fit_treatment": fit_treatment_key,
         "fit_outcome": fit_outcome_key,
         "configuration": config.as_dict(),
+        "pooling_attestation": {
+            "sentence_pooling": "token_attention",
+            "effective_sentence_pooling": "token_attention",
+            "pooler_kind": "learned_gated_attention_pooler",
+            "cls_pooling_used": False,
+            "raw_bert_self_attention_used_as_evidence": False,
+            "post_hoc_attribution_used": False,
+        },
         "configuration_identity_sha256": configuration_identity,
         "producer_identity_sha256": producer_identity,
         "runtime_compatibility_class": runtime_class,
         "fit_coverage": coverage_record,
         "nuisance_fold_states": nuisance_records,
+        "nuisance_oof_performance": nuisance_oof_performance,
         "effect_fold_states": effect_records,
         "derived_fit_quantities": derived,
         "evidence_payload": evidence_payload,
         "array_inventory": array_inventory,
-        "array_layout": "one_npy_per_array_mmap_safe_v1",
+        "array_layout": (
+            "one_npy_per_array_bounded_read_token_attention_v2"
+        ),
         "registered_heldout_text_accessed": False,
         "registered_heldout_labels_accessed": False,
         "oracle_fields_accessed": False,
@@ -5930,6 +7117,40 @@ def execute_role_neutral_htr_physical_group(
             "content_sha256": seal["content_sha256"],
         },
         "logical_views": logical_registrations,
+        "pooling_attestation": copy.deepcopy(
+            metadata["pooling_attestation"]
+        ),
+        "attention_evidence_attestation": {
+            "native_evidence_schema": (
+                ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
+            ),
+            "token_evidence_package_schema": (
+                ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA
+            ),
+            "token_occurrence_count": int(
+                token_attention_evidence["token_occurrence_count"]
+            ),
+            "chunk_interpretation_count": int(
+                token_attention_evidence["chunk_interpretation_count"]
+            ),
+            "note_interpretation_count": int(
+                token_attention_evidence["note_interpretation_count"]
+            ),
+            "special_token_occurrence_count": int(
+                token_attention_evidence[
+                    "special_token_occurrence_count"
+                ]
+            ),
+            "padding_occurrence_count": int(
+                token_attention_evidence["padding_occurrence_count"]
+            ),
+            "all_token_and_chunk_attention_normalized": True,
+            "exact_fold_heldout_coverage": True,
+            "complete_raw_inventory_top_k_applied": False,
+        },
+        "nuisance_oof_performance": copy.deepcopy(
+            metadata["nuisance_oof_performance"]
+        ),
         "event_order": events,
         "fit_completed_before_registered_heldout_text_access": True,
         "fit_sealed_before_registered_heldout_text_access": True,
@@ -6251,6 +7472,47 @@ def validate_role_neutral_htr_group_execution(
         or terminal.get("cumulative_views_published_without_sealed_text")
         is not True
         or terminal.get("model_state_reloaded_for_primary_transform") is not True
+        or terminal.get("pooling_attestation")
+        != metadata.get("pooling_attestation")
+        or terminal.get("attention_evidence_attestation")
+        != {
+            "native_evidence_schema": (
+                ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
+            ),
+            "token_evidence_package_schema": (
+                ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA
+            ),
+            "token_occurrence_count": int(
+                metadata["evidence_payload"]["token_attention_evidence"][
+                    "token_occurrence_count"
+                ]
+            ),
+            "chunk_interpretation_count": int(
+                metadata["evidence_payload"]["token_attention_evidence"][
+                    "chunk_interpretation_count"
+                ]
+            ),
+            "note_interpretation_count": int(
+                metadata["evidence_payload"]["token_attention_evidence"][
+                    "note_interpretation_count"
+                ]
+            ),
+            "special_token_occurrence_count": int(
+                metadata["evidence_payload"]["token_attention_evidence"][
+                    "special_token_occurrence_count"
+                ]
+            ),
+            "padding_occurrence_count": int(
+                metadata["evidence_payload"]["token_attention_evidence"][
+                    "padding_occurrence_count"
+                ]
+            ),
+            "all_token_and_chunk_attention_normalized": True,
+            "exact_fold_heldout_coverage": True,
+            "complete_raw_inventory_top_k_applied": False,
+        }
+        or terminal.get("nuisance_oof_performance")
+        != metadata.get("nuisance_oof_performance")
         or terminal.get("registered_heldout_labels_accessed") is not False
         or terminal.get("pickle_or_joblib_loaded") is not False
         or terminal.get("text_truncation_applied") is not False

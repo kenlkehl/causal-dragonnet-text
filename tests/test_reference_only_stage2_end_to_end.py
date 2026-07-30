@@ -86,6 +86,9 @@ from tests.test_direct_upstream_numerical_reference_bank import (
     _write_neural_query_component,
     _write_simple_dense_component,
 )
+from tests.test_native_role_neutral_payload_catalog_adapter import (
+    _native_payloads,
+)
 from tests.test_lossless_stage1_evidence_catalog import (
     _cumulative_family_payloads,
     _inputs,
@@ -1367,6 +1370,7 @@ def test_authenticated_reference_only_stage2_runs_five_folds_two_reviews_and_sea
         _inputs()
     )
     payloads = _cumulative_family_payloads(source_catalog)
+    payloads[HTR_NEURAL] = _native_payloads()[HTR_NEURAL]
     recorder = _NumericalProviderReadyRecorder(payloads)
     execution_root = (tmp_path / "role_neutral_execution").resolve()
     execution_manifest = execute_and_publish_role_neutral_stage1(
@@ -1577,6 +1581,40 @@ def test_authenticated_reference_only_stage2_runs_five_folds_two_reviews_and_sea
     assert len(forest.calls) == 5
     assert len(gate_calls) == 10
     assert len(hierarchy_instances) == 1
+    htr_prompt_preflight_envelope = json.loads(
+        (
+            options.preparation_dir
+            / "htr_stage2_prompt_preflight.json"
+        ).read_text(encoding="utf-8")
+    )
+    htr_prompt_preflight = htr_prompt_preflight_envelope["body"]
+    assert (
+        htr_prompt_preflight[
+            "planned_htr_interpretation_call_count"
+        ]
+        == 20
+    )
+    assert htr_prompt_preflight["semantic_aggregate_count"] == 20
+    assert (
+        htr_prompt_preflight[
+            "every_semantic_aggregate_delivered_exactly_once"
+        ]
+        is True
+    )
+    assert (
+        htr_prompt_preflight["raw_token_arrays_copied_into_prompts"]
+        is False
+    )
+    assert (
+        htr_prompt_preflight[
+            "endpoint_or_runner_calls_during_preflight"
+        ]
+        == 0
+    )
+    assert (
+        htr_prompt_preflight["stage2_endpoint_launch_allowed"]
+        is True
+    )
     assert hierarchy_instances[0].adaptive_drop_page_calls > 0
     assert hierarchy_instances[0].adaptive_noop_page_calls > 0
     assert hierarchy_instances[0].adaptive_proposal_calls == (

@@ -88,7 +88,7 @@ from .hierarchical_discovery_response_contract import (
 HIERARCHICAL_DISCOVERY_ORCHESTRATOR_VERSION = (
     "hierarchical_all_architecture_discovery_orchestrator_v12"
 )
-HIERARCHICAL_DISCOVERY_PRECOMMIT_VERSION = "hierarchical_discovery_precommit_v11"
+HIERARCHICAL_DISCOVERY_PRECOMMIT_VERSION = "hierarchical_discovery_precommit_v12"
 DISCOVERY_JSON_JOB_VERSION = "hierarchical_discovery_json_job_v7"
 DISCOVERY_JOB_LEDGER_VERSION = "hierarchical_discovery_job_ledger_v1"
 DISCOVERY_EXECUTION_LEDGER_VERSION = "hierarchical_discovery_execution_ledger_v6"
@@ -99,7 +99,7 @@ DISCOVERY_RESPONSE_ATTEMPT_TRACE_VERSION = "authenticated_hierarchy_response_att
 AUTHENTICATED_RESPONSE_REPAIR_BINDING = "authenticated_bounded_response_repair"
 AUTHENTICATED_RESPONSE_CONTRACT_BINDING = "authenticated_dynamic_response_contract"
 HIERARCHICAL_DISCOVERY_IMPLEMENTATION_BUNDLE_VERSION = (
-    "hierarchical_discovery_implementation_bundle_v5"
+    "hierarchical_discovery_implementation_bundle_v6"
 )
 HIERARCHICAL_DISCOVERY_IMPLEMENTATION_BUNDLE_BINDING = "hierarchy_implementation_bundle_sha256"
 _HIERARCHICAL_DISCOVERY_IMPLEMENTATION_BUNDLE_FILES = (
@@ -107,6 +107,8 @@ _HIERARCHICAL_DISCOVERY_IMPLEMENTATION_BUNDLE_FILES = (
     "all_evidence_discovery_interfaces.py",
     "hierarchical_discovery_response_contract.py",
     "lossless_stage1_evidence_catalog.py",
+    "htr_stage2_semantic_aggregation.py",
+    "htr_stage2_complete_semantic_aggregation.py",
 )
 MAX_DISCOVERY_RESPONSE_REPAIR_ATTEMPTS = 1
 STRICT_JSON_PARSE_FAILURE = "strict_json_parse_failure"

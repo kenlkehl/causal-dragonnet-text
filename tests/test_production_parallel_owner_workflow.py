@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping
 
 import pytest
 
+import oci.inference.production_all_evidence_workflow as workflow_module
 from oci.inference.neural_query_operational_controls import (
     ROLE_NEUTRAL_NEURAL_QUERY_OPERATIONAL_CONTROLS_SCHEMA,
     RoleNeutralNeuralQueryOperationalControls,
@@ -54,6 +55,7 @@ from tests.test_portable_workflow_contracts import (
 )
 from tests.test_production_stage1_role_neutral_execution import (
     _ProducerRecorder,
+    _RecordingExecutor,
     _plan,
     _resource_plan,
     _sha,
@@ -680,3 +682,223 @@ def test_disjoint_owner_lanes_merge_canonically_and_resume_components(
         for owner in plan.physical_scopes
         for component in EXPECTED_COMPONENT_FAMILIES
     )
+
+
+def test_cross_request_component_import_reuses_only_currently_authenticated_work(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    policy = RoleNeutralStage1ExecutionPolicy(
+        resource_plan=_resource_plan(
+            devices=("cpu",),
+            cpu_budget=4,
+        ),
+        max_parallel_owners=1,
+    )
+    legacy_execution = (tmp_path / "legacy-execution").resolve()
+    execute_and_publish_role_neutral_stage1(
+        root=legacy_execution,
+        plan=plan,
+        producer_factories=_ProducerRecorder().factories(),
+        policy=policy,
+        executor=_RecordingExecutor(),
+    )
+    legacy_components = legacy_execution / "components"
+    first_owner = plan.physical_execution_order[0]
+    preserved_htr_terminal = (
+        legacy_components
+        / first_owner
+        / "htr"
+        / ROLE_NEUTRAL_EXECUTION_MANIFEST
+    ).read_bytes()
+
+    corrected = _ProducerRecorder()
+    corrected_factories = corrected.factories()
+
+    def corrected_htr_factory(invocation):
+        bound = corrected_factories.htr(invocation)
+
+        def authenticate():
+            if (
+                legacy_components in invocation.output_root.parents
+                and invocation.physical_owner.scope_id == first_owner
+            ):
+                raise ValueError(
+                    "legacy HTR is scientifically incompatible"
+                )
+            return bound.authenticate()
+
+        return replace(bound, authenticate=authenticate)
+
+    target_store = (
+        tmp_path / "corrected-component-store" / "components"
+    ).resolve()
+    corrected_execution = (tmp_path / "corrected-execution").resolve()
+    manifest = execute_and_publish_role_neutral_stage1(
+        root=corrected_execution,
+        plan=plan,
+        producer_factories=RoleNeutralProducerFactories(
+            bow=corrected_factories.bow,
+            htr=corrected_htr_factory,
+            matched_pair=corrected_factories.matched_pair,
+            embeddings=corrected_factories.embeddings,
+            tfidf=corrected_factories.tfidf,
+            neural_query=corrected_factories.neural_query,
+        ),
+        policy=policy,
+        executor=_RecordingExecutor(),
+        component_store_root=target_store,
+        component_reuse_roots=(legacy_components,),
+    )
+
+    assert manifest["status"] == "complete"
+    execute_events = [
+        (owner, component)
+        for owner, component, event, _resource
+        in corrected.events
+        if event == "execute"
+    ]
+    assert execute_events == [(first_owner, "htr")]
+    import_attestations = tuple(
+        (
+            target_store.parent
+            / "authenticated_component_imports"
+        ).glob("*.json")
+    )
+    assert len(import_attestations) == (
+        len(plan.physical_scopes)
+        * len(EXPECTED_COMPONENT_FAMILIES)
+        - 1
+    )
+    assert (
+        legacy_components
+        / first_owner
+        / "htr"
+        / ROLE_NEUTRAL_EXECUTION_MANIFEST
+    ).read_bytes() == preserved_htr_terminal
+    assert (
+        target_store
+        / first_owner
+        / "htr"
+        / ROLE_NEUTRAL_EXECUTION_MANIFEST
+    ).is_file()
+
+
+def test_component_store_namespace_excludes_stage2_catalog_identity_and_finds_v1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(gpu_ids=())
+    projection = {
+        field: {"field": field}
+        for field in (
+            "dataset",
+            "effective_stage1_config",
+            "embedding_cache",
+            "exact_inner_contract",
+            "htr_input_nontruncation_audit",
+            "htr_model",
+            "query_config",
+            "semantic_witness_scientific_config",
+            "source_config",
+            "split_registry_content_sha256",
+            "stage1_scope_plan",
+        )
+    }
+    prepared = SimpleNamespace(
+        scientific_identity={
+            "stage1_request_scientific_projection": projection,
+        }
+    )
+    producer_scientific_identity = {
+        "schema_version": "test_component_producer_science_v1",
+        "architecture_profiles": {"all_ten": "unchanged"},
+    }
+
+    def integration_identity(integration):
+        return {
+            "producer_factories_builder": {
+                "behavior_state": {
+                    "state_policy": (
+                        "explicit_closed_scientific_identity_v1"
+                    ),
+                    "scientific_identity": producer_scientific_identity,
+                },
+            },
+            "stage2_handoff_publisher": {
+                "content_sha256": integration.stage2_identity,
+            },
+        }
+
+    monkeypatch.setattr(
+        workflow_module,
+        "_role_neutral_stage1_integration_identity",
+        integration_identity,
+    )
+    workflow = object.__new__(
+        workflow_module.ProductionAllEvidenceWorkflow
+    )
+    workflow.options = SimpleNamespace(
+        scratch_root=(tmp_path / "scratch").resolve(),
+        work_root=(tmp_path / "durable").resolve(),
+    )
+    first = workflow._stage1_component_store_root(
+        prepared_context=prepared,
+        plan=plan,
+        integration=SimpleNamespace(stage2_identity="a" * 64),
+    )
+    second = workflow._stage1_component_store_root(
+        prepared_context=prepared,
+        plan=plan,
+        integration=SimpleNamespace(stage2_identity="b" * 64),
+    )
+    assert first == second
+
+    namespace = first.parent.parent
+    legacy_store = namespace / ("f" * 64)
+    legacy_components = legacy_store / "components"
+    legacy_components.mkdir(parents=True)
+    legacy_compatibility = {
+        "schema_version": (
+            "production_stage1_component_store_compatibility_v1"
+        ),
+        "prepared_stage1_scientific_identity_sha256": "c" * 64,
+        "stage1_scope_plan_scientific_content_sha256": (
+            plan.scientific_content_sha256
+        ),
+        "component_plan_namespace_identity": "legacy",
+        "component_producer_compatibility": {"legacy": True},
+        "evidence_family_order": [],
+        "resource_assignment_included": False,
+        "cpu_budget_included": False,
+        "owner_concurrency_included": False,
+    }
+    legacy_body = {
+        "schema_version": (
+            "production_stage1_scientific_component_store_v1"
+        ),
+        "component_store_key": legacy_store.name,
+        "compatibility": legacy_compatibility,
+        "components_relative_path": "components",
+        "successful_component_marker": "execution_manifest.json",
+        "incomplete_attempts_preserved_for_recovery": True,
+    }
+    (
+        legacy_store
+        / workflow_module.STAGE1_COMPONENT_STORE_MANIFEST
+    ).write_text(
+        json.dumps(
+            {
+                **legacy_body,
+                "content_sha256": _sha(legacy_body),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert workflow._stage1_component_reuse_roots(
+        component_store_root=first,
+        plan=plan,
+    ) == (legacy_components.resolve(strict=True),)

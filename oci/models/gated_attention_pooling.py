@@ -70,12 +70,21 @@ class GatedAttentionPooling(nn.Module):
         # Attention scores
         scores = self.v(self.W(gated)).squeeze(-1)
 
-        # Apply mask if provided
+        # Apply the mask before softmax, then explicitly remove and renormalize
+        # masked mass.  The second step is intentional: it makes the pooling
+        # domain auditable even on runtimes/dtypes where exp(-1e9) is not
+        # represented as an exact zero.
         if attention_mask is not None:
             scores = scores.masked_fill(attention_mask == 0, -1e9)
 
         # Softmax and weighted sum
         weights = F.softmax(scores, dim=-1)
+        if attention_mask is not None:
+            valid = (attention_mask != 0).to(weights.dtype)
+            weights = weights * valid
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
+                torch.finfo(weights.dtype).tiny
+            )
 
         # Handle both single sample and batch
         if chunk_embeddings.dim() == 2:
@@ -144,6 +153,12 @@ class MultiHeadGatedAttentionPooling(nn.Module):
             scores = scores.masked_fill(attention_mask.unsqueeze(1) == 0, -1e9)
 
         weights = F.softmax(scores, dim=-1)
+        if attention_mask is not None:
+            valid = (attention_mask != 0).to(weights.dtype).unsqueeze(1)
+            weights = weights * valid
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
+                torch.finfo(weights.dtype).tiny
+            )
         pooled = torch.einsum("bhl,bld->bhd", weights, chunk_embeddings)
         if squeeze_batch:
             pooled = pooled.squeeze(0)

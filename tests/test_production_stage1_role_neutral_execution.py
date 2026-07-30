@@ -21,6 +21,11 @@ from oci.inference.portable_resource_scheduler import (
 from oci.inference.portable_workflow_spec import (
     ResourcePerformanceSafetyPolicy,
 )
+from oci.inference.all_evidence_discovery_interfaces import HTR_NEURAL
+from oci.inference.htr_attention_evidence_schema import (
+    ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA,
+)
 from oci.inference.production_stage1_legacy_scope_fragments import (
     build_role_neutral_fit_only_family_seal,
 )
@@ -336,17 +341,47 @@ class _ProducerRecorder:
                 seals = {}
                 views = {}
                 for family in EXPECTED_COMPONENT_FAMILIES[expected_component]:
-                    payload = {
-                        "schema_version": ("native_stage1_family_concept_evidence_v1"),
-                        "family": family,
-                        "architecture_evidence": [
-                            {
-                                "kind": "orchestration_contract_atom",
-                                "physical_owner_scope_id": owner_scope_id,
-                                "complete_family_payload": True,
-                            }
-                        ],
-                    }
+                    architecture_evidence = [
+                        {
+                            "kind": "orchestration_contract_atom",
+                            "physical_owner_scope_id": owner_scope_id,
+                            "complete_family_payload": True,
+                        }
+                    ]
+                    payload = (
+                        {
+                            "schema_version": (
+                                ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
+                            ),
+                            "family": family,
+                            "architecture_evidence": (
+                                architecture_evidence
+                            ),
+                            "token_attention_evidence": {
+                                "schema_version": (
+                                    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA
+                                ),
+                                "sentence_pooling": "token_attention",
+                                "effective_sentence_pooling": (
+                                    "token_attention"
+                                ),
+                                "all_raw_token_occurrences_authenticated": (
+                                    True
+                                ),
+                                "top_k_applied_to_raw_inventory": False,
+                            },
+                        }
+                        if family == HTR_NEURAL
+                        else {
+                            "schema_version": (
+                                "native_stage1_family_concept_evidence_v1"
+                            ),
+                            "family": family,
+                            "architecture_evidence": (
+                                architecture_evidence
+                            ),
+                        }
+                    )
                     seals[family] = build_role_neutral_fit_only_family_seal(
                         plan=invocation.plan,
                         physical_owner_scope_id=owner_scope_id,

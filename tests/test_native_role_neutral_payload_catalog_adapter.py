@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from copy import deepcopy
+from pathlib import Path
 
+import numpy as np
 import pytest
 
 from oci.inference.all_evidence_discovery_interfaces import (
@@ -19,6 +22,17 @@ from oci.inference.all_evidence_discovery_interfaces import (
     TFIDF_SEMANTIC_RETRIEVAL,
     TFIDF_TOPICS,
     canonical_json,
+)
+from oci.inference.htr_attention_evidence_schema import (
+    ROLE_NEUTRAL_HTR_CHUNK_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_READABLE_SPAN_SCHEMA,
+    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_BATCH_SCHEMA,
+    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA,
+)
+from oci.inference.htr_native_proof_capture import _array_sha256
+from oci.inference.htr_stage2_complete_semantic_aggregation import (
+    build_htr_semantic_aggregation_scope,
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
     NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
@@ -117,14 +131,113 @@ def _native_payloads() -> dict[str, dict]:
     long_chunk = " ".join(f"configured_chunk_token_{index:04d}" for index in range(700))
     htr_row = {
         "witness_kind": "complete_htr_chunk_attention",
+        "schema_version": ROLE_NEUTRAL_HTR_CHUNK_EVIDENCE_SCHEMA,
         "stage": "nuisance",
         "objective": "joint_treatment_outcome_nuisance",
         "fold": 1,
         "fit_note_position": 0,
+        "fit_row_id": 10,
         "chunk_index": 0,
         "chunk_text": long_chunk,
         "chunk_sha256": hashlib.sha256(long_chunk.encode("utf-8")).hexdigest(),
-        "attention": 0.42,
+        "attention": 1.0,
+        "readable_token_spans": [
+            {
+                "schema_version": ROLE_NEUTRAL_HTR_READABLE_SPAN_SCHEMA,
+                "selection_rank": 1,
+                "text": "configured_chunk_token_0000",
+                "char_start": 0,
+                "char_end": len("configured_chunk_token_0000"),
+                "focus_token_position": 1,
+                "focus_token_id": 101,
+                "focus_decoded_token_text": "configured",
+                "token_attention": 0.25,
+                "chunk_attention": 1.0,
+                "hierarchical_attention_score": 0.25,
+                "special_tokens_excluded_from_readable_projection": True,
+                "raw_special_token_mass_retained_in_sidecar": True,
+                "overlap_handling": (
+                    "retain_each_chunk_local_occurrence_no_note_level_"
+                    "deduplication_v1"
+                ),
+            }
+        ],
+        "readable_span_policy": {
+            "schema_version": (
+                "deterministic_chunk_local_token_span_projection_v1"
+            ),
+            "maximum_spans_per_chunk": 4,
+            "ranking": (
+                "hierarchical_attention_desc_then_token_attention_desc_"
+                "then_token_position_asc_v1"
+            ),
+            "special_tokens_excluded": True,
+            "padding_excluded": True,
+            "note_level_deduplication_applied": False,
+            "overlapping_chunk_occurrences_retained": True,
+            "complete_raw_inventory_retained": True,
+        },
+        "token_inventory_content_sha256": "e" * 64,
+    }
+    effect_row = deepcopy(htr_row)
+    effect_row["stage"] = "effect_modifier"
+    effect_row["objective"] = "pseudo_outcome_mse"
+    token_fold_batches = [
+        {
+            "schema_version": ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_BATCH_SCHEMA,
+            "stage": stage,
+            "objective": objective,
+            "fold": 1,
+            "sentence_pooling": "token_attention",
+            "effective_sentence_pooling": "token_attention",
+            "fold_honesty": {
+                "evidence_rows": "fold_validation_only",
+                "fit_and_validation_rows_disjoint": True,
+                "generated_after_fit": True,
+                "validation_rows_used_for_model_fit": False,
+            },
+            "top_k_applied_to_raw_inventory": False,
+            "all_overlapping_chunk_occurrences_retained": True,
+            "token_occurrence_count": 3,
+            "chunk_count": 1,
+            "note_count": 1,
+            "special_token_occurrence_count": 2,
+            "padding_occurrence_count": 0,
+            "special_token_attention_mass": 0.2,
+        }
+        for stage, objective in (
+            ("nuisance", "joint_treatment_outcome_nuisance"),
+            ("effect_modifier", "pseudo_outcome_mse"),
+        )
+    ]
+    token_package_body = {
+        "schema_version": ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA,
+        "sentence_pooling": "token_attention",
+        "effective_sentence_pooling": "token_attention",
+        "fold_batches": token_fold_batches,
+        "fold_batch_count": len(token_fold_batches),
+        "token_occurrence_count": 6,
+        "chunk_interpretation_count": 2,
+        "note_interpretation_count": 2,
+        "special_token_occurrence_count": 4,
+        "special_token_attention_mass": 0.4,
+        "padding_occurrence_count": 0,
+        "all_raw_token_occurrences_authenticated": True,
+        "all_chunk_occurrences_authenticated": True,
+        "top_k_applied_to_raw_inventory": False,
+        "readable_spans_are_deterministic_projections_only": True,
+        "hierarchical_attention_is_ranking_not_causal_attribution": True,
+        "fold_honest_validation_only_evidence": True,
+        "exact_oof_note_coverage": True,
+    }
+    htr_payload = {
+        "schema_version": ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
+        "family": HTR_NEURAL,
+        "architecture_evidence": [htr_row, effect_row],
+        "token_attention_evidence": {
+            **token_package_body,
+            "content_sha256": _sha(token_package_body),
+        },
     }
     matched_seal = "f" * 64
     matched_bow = _matched_proof(
@@ -193,7 +306,7 @@ def _native_payloads() -> dict[str, dict]:
                 }
             ],
         ),
-        HTR_NEURAL: _payload(HTR_NEURAL, [htr_row]),
+        HTR_NEURAL: htr_payload,
         MATCHED_PAIR_UPLIFT: _payload(
             MATCHED_PAIR_UPLIFT,
             [matched_bow, matched_htr],
@@ -281,6 +394,123 @@ def _native_payloads() -> dict[str, dict]:
 
 
 def _assemble(payloads: dict[str, dict]):
+    payloads = deepcopy(payloads)
+    if (
+        payloads[HTR_NEURAL].get("schema_version")
+        == ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
+    ):
+        source_payload = payloads[HTR_NEURAL]
+        with tempfile.TemporaryDirectory(
+            prefix="htr-stage2-catalog-adapter-"
+        ) as temporary:
+            array_root = Path(temporary).resolve() / "raw_arrays"
+            array_root.mkdir()
+            package = source_payload["token_attention_evidence"]
+            for batch in package["fold_batches"]:
+                stage = str(batch["stage"])
+                prefix = f"{stage}_0001"
+                decoded = ("[CLS]", "configured", "[SEP]")
+                utf8 = "".join(decoded).encode("utf-8")
+                offsets = np.asarray(
+                    [
+                        0,
+                        len("[CLS]"),
+                        len("[CLS]configured"),
+                        len("[CLS]configured[SEP]"),
+                    ],
+                    dtype=np.int64,
+                )
+                values = {
+                    "fit_note_position": np.asarray(
+                        [0, 0, 0], dtype=np.int64
+                    ),
+                    "fit_row_id": np.asarray([10, 10, 10], dtype=np.int64),
+                    "chunk_index": np.asarray([0, 0, 0], dtype=np.int32),
+                    "token_position": np.asarray([0, 1, 2], dtype=np.int32),
+                    "token_id": np.asarray([101, 2001, 102], dtype=np.int32),
+                    "decoded_token_text_utf8": np.frombuffer(
+                        utf8, dtype=np.uint8
+                    ).copy(),
+                    "decoded_token_text_byte_offsets": offsets,
+                    "char_start": np.asarray([0, 0, 0], dtype=np.int32),
+                    "char_end": np.asarray(
+                        [0, len("configured"), 0], dtype=np.int32
+                    ),
+                    "is_special_token": np.asarray(
+                        [1, 0, 1], dtype=np.uint8
+                    ),
+                    "is_padding": np.asarray([0, 0, 0], dtype=np.uint8),
+                    "token_attention": np.asarray(
+                        [0.1, 0.8, 0.1], dtype=np.float64
+                    ),
+                    "chunk_attention": np.asarray(
+                        [1.0, 1.0, 1.0], dtype=np.float64
+                    ),
+                    "hierarchical_attention_score": np.asarray(
+                        [0.1, 0.8, 0.1], dtype=np.float64
+                    ),
+                }
+                columns: dict[str, dict] = {}
+                for name, value in values.items():
+                    array_name = f"{prefix}_{name}"
+                    np.save(
+                        array_root / f"{array_name}.npy",
+                        value,
+                        allow_pickle=False,
+                    )
+                    columns[name] = {
+                        "array": array_name,
+                        "content_sha256": _array_sha256(value),
+                        "dtype": value.dtype.str,
+                        "shape": list(value.shape),
+                    }
+                batch.update(
+                    {
+                        "raw_occurrence_order": (
+                            "fit_note_position_then_chunk_index_then_"
+                            "token_position_v1"
+                        ),
+                        "decoded_token_text_encoding": (
+                            "concatenated_utf8_with_offsets_v1"
+                        ),
+                        "tokenizer_identity": {
+                            "model_name": "prajjwal1/bert-tiny",
+                            "vocabulary_sha256": "d" * 64,
+                        },
+                        "fit_note_positions": [0],
+                        "fit_row_ids": [10],
+                        "columns": columns,
+                    }
+                )
+                body = {
+                    key: value
+                    for key, value in batch.items()
+                    if key != "content_sha256"
+                }
+                batch["content_sha256"] = _sha(body)
+            package_body = {
+                key: value
+                for key, value in package.items()
+                if key != "content_sha256"
+            }
+            package["content_sha256"] = _sha(package_body)
+            result = build_htr_semantic_aggregation_scope(
+                root=(Path(temporary) / "aggregate").resolve(),
+                source_payload=source_payload,
+                source_array_store_root=array_root,
+                source_fit_seal_content_sha256="c" * 64,
+                source_payload_content_sha256=_sha(source_payload),
+                source_fit_seal_locator=(
+                    "components/outer_001_inner_001/htr/"
+                    "fit_only_family_seal.json"
+                ),
+                logical_scope_id="outer_001_hierarchy_epoch_000",
+                physical_owner_scope_id="outer_001_inner_001",
+                outer_fold=1,
+                context_epoch=0,
+                scope_binding_sha256="a" * 64,
+            )
+            payloads[HTR_NEURAL] = dict(result.payload)
     hashes = {
         family: hashlib.sha256(f"artifact:{index}:{family}".encode()).hexdigest()
         for index, family in enumerate(ACTIVE_STAGE1_CONCEPT_FAMILIES)
@@ -325,11 +555,17 @@ def test_native_role_neutral_payloads_cover_all_ten_families_without_truncation(
     )
     for family in ACTIVE_STAGE1_CONCEPT_FAMILIES:
         adapter = catalog.audit["native_payload_adapter_by_family"][family]
-        assert adapter["adapter_applied"] is True
+        assert adapter["adapter_applied"] is (family != HTR_NEURAL)
         assert adapter["source_record_count"] == len(
-            payloads[family]["architecture_evidence"]
+            (
+                catalog.family_atoms(family)
+                if family == HTR_NEURAL
+                else payloads[family]["architecture_evidence"]
+            )
         )
         assert adapter["selection_or_truncation_applied"] is False
+        if family == HTR_NEURAL:
+            continue
         units = [
             unit
             for atom in catalog.family_atoms(family)
@@ -348,14 +584,16 @@ def test_native_role_neutral_payloads_cover_all_ten_families_without_truncation(
                 "native_record_json"
             ]
 
-    htr_native = [
-        json.loads(unit["native_record_json"])
-        for atom in catalog.family_atoms(HTR_NEURAL)
-        for unit in _native_units(atom.content)
+    htr_content = [
+        atom.content for atom in catalog.family_atoms(HTR_NEURAL)
     ]
-    assert htr_native[0]["chunk_text"] == payloads[HTR_NEURAL][
-        "architecture_evidence"
-    ][0]["chunk_text"]
+    assert htr_content
+    assert all(
+        content["aggregate_batch"]["complete_semantic_aggregate_delivery"]
+        is True
+        for content in htr_content
+    )
+    assert "complete_htr_chunk_attention" not in canonical_json(htr_content)
 
     plan = build_complete_architecture_chunks(
         catalog,

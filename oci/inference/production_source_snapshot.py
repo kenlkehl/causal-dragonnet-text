@@ -158,6 +158,7 @@ def _required_source_files(repository_root: Path) -> tuple[Path, ...]:
                 raise ValueError(f"source snapshot cannot traverse special files: {path}")
     required.extend(path for path in oci_root.rglob("*.py") if path.is_file())
     required.extend(path for path in scripts_root.rglob("*.py") if path.is_file())
+    required.extend(path for path in scripts_root.rglob("*.sh") if path.is_file())
     for relative in ("pyproject.toml", "uv.lock"):
         path = repository_root / relative
         if not path.is_file():

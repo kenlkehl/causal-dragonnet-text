@@ -26,7 +26,7 @@ from types import ModuleType
 from typing import Any, Mapping
 
 PRODUCTION_STAGE1_HIERARCHY_CONTRACT_SCHEMA_VERSION = (
-    "production_stage1_hierarchical_discovery_contract_v5"
+    "production_stage1_hierarchical_discovery_contract_v7"
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -273,7 +273,7 @@ _REQUIRED_VERSION_ROWS = (
         "CUMULATIVE_SPENT_EVIDENCE_BUNDLE_SCHEMA",
         "cumulative_spent_stage1_evidence_bundle_v1",
     ),
-    ("catalog", "ARCHITECTURE_CHUNK_PLAN_SCHEMA_VERSION", "complete_architecture_chunk_plan_v5"),
+    ("catalog", "ARCHITECTURE_CHUNK_PLAN_SCHEMA_VERSION", "complete_architecture_chunk_plan_v7"),
     (
         "production_handoff",
         "STAGE1_HIERARCHY_HANDOFF_SCHEMA",
@@ -289,7 +289,7 @@ _REQUIRED_VERSION_ROWS = (
         "INTERNAL_HIERARCHY_PREPARATION_BINDING_SCHEMA",
         "production_internal_hierarchy_preparation_binding_v2",
     ),
-    ("fusion_runner", "RUNNER_SCHEMA_VERSION", "all_evidence_fusion_outer_runner_v20"),
+    ("fusion_runner", "RUNNER_SCHEMA_VERSION", "all_evidence_fusion_outer_runner_v21"),
     (
         "fusion_runner",
         "PRODUCTION_HIERARCHY_RUNTIME_BINDING_SCHEMA",
@@ -298,7 +298,7 @@ _REQUIRED_VERSION_ROWS = (
     (
         "fusion_runner",
         "HIERARCHICAL_DISCOVERY_PREPARATION_INPUT_SCHEMA_VERSION",
-        "hierarchical_all_evidence_runner_preparation_input_v2",
+        "hierarchical_all_evidence_runner_preparation_input_v3",
     ),
     (
         "fusion_runner",
@@ -313,6 +313,8 @@ _HIERARCHY_BUNDLE_FILES = frozenset(
         "all_evidence_discovery_interfaces.py",
         "hierarchical_discovery_response_contract.py",
         "lossless_stage1_evidence_catalog.py",
+        "htr_stage2_semantic_aggregation.py",
+        "htr_stage2_complete_semantic_aggregation.py",
     }
 )
 _ADAPTIVE_BUNDLE_FILES = frozenset(
@@ -324,6 +326,8 @@ _ADAPTIVE_BUNDLE_FILES = frozenset(
         "all_evidence_fusion.py",
         "all_evidence_post_extraction_review.py",
         "lossless_stage1_evidence_catalog.py",
+        "htr_stage2_semantic_aggregation.py",
+        "htr_stage2_complete_semantic_aggregation.py",
         "stage1_architecture_explanations.py",
     }
 )

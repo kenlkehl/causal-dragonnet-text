@@ -52,14 +52,25 @@ from .all_evidence_fusion import (
     TFIDF_TOPIC_SOURCE,
     FoldEvidenceInput,
 )
+from .htr_attention_evidence_schema import (
+    ROLE_NEUTRAL_HTR_CHUNK_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_READABLE_SPAN_SCHEMA,
+    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA,
+)
+from .htr_stage2_complete_semantic_aggregation import (
+    HTR_STAGE2_AGGREGATE_BATCH_SCHEMA,
+    HTR_STAGE2_AGGREGATE_PAYLOAD_SCHEMA,
+    HTR_STAGE2_MODEL_AGGREGATE_SCHEMA,
+)
 
-ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION = "role_neutral_stage1_evidence_catalog_v5"
-ARCHITECTURE_CHUNK_SCHEMA_VERSION = "role_neutral_architecture_chunk_v5"
-ARCHITECTURE_CHUNK_PLAN_SCHEMA_VERSION = "complete_architecture_chunk_plan_v5"
+ROLE_NEUTRAL_CATALOG_SCHEMA_VERSION = "role_neutral_stage1_evidence_catalog_v8"
+ARCHITECTURE_CHUNK_SCHEMA_VERSION = "role_neutral_architecture_chunk_v8"
+ARCHITECTURE_CHUNK_PLAN_SCHEMA_VERSION = "complete_architecture_chunk_plan_v8"
 NON_GROUNDING_SUMMARY_SCHEMA_VERSION = "separated_non_grounding_summary_v1"
 NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION = "native_stage1_family_concept_evidence_v1"
 NATIVE_ROLE_NEUTRAL_PAYLOAD_ADAPTER_SCHEMA_VERSION = (
-    "native_role_neutral_family_payload_adapter_v1"
+    "native_role_neutral_family_payload_adapter_v4"
 )
 NATIVE_ROLE_NEUTRAL_UNIT_SCHEMA_VERSION = "native_role_neutral_evidence_unit_v1"
 SEMANTIC_MEMBER_BATCHING_SCHEMA_VERSION = (
@@ -111,7 +122,7 @@ _CUMULATIVE_FAMILY_SOURCE_KIND = {
 _CUMULATIVE_FAMILY_ATOM_KINDS = {
     BOW_NUISANCE: frozenset({"bow_term_group"}),
     BOW_R_LOSS: frozenset({"bow_term_group"}),
-    HTR_NEURAL: frozenset({"htr_phrase"}),
+    HTR_NEURAL: frozenset({"htr_semantic_aggregate_batch"}),
     MATCHED_PAIR_UPLIFT: frozenset({"bow_term_group", "matched_pair_htr_phrase"}),
     EMBEDDING_WHOLE_COHORT: frozenset({"embedding_contrast"}),
     EMBEDDING_CLUSTERED: frozenset({"embedding_contrast"}),
@@ -183,6 +194,9 @@ _CUMULATIVE_ATOM_CONTENT_KEYS = {
         }
     ),
     "htr_phrase": frozenset({"architecture_encoder", "group", "phrase_evidence"}),
+    "htr_semantic_aggregate_batch": frozenset(
+        {"architecture_encoder", "group", "aggregate_batch"}
+    ),
     "matched_pair_htr_phrase": frozenset({"architecture_encoder", "group", "phrase_evidence"}),
 }
 _CUMULATIVE_ATOM_COLLECTION_KEY = {
@@ -195,6 +209,7 @@ _CUMULATIVE_ATOM_COLLECTION_KEY = {
 }
 _CUMULATIVE_ATOM_SINGULAR_KEY = {
     "htr_phrase": "phrase_evidence",
+    "htr_semantic_aggregate_batch": "aggregate_batch",
     "matched_pair_htr_phrase": "phrase_evidence",
 }
 
@@ -457,10 +472,23 @@ def _attach_member_ids(
     singular_key = {
         "htr_phrase": "phrase_evidence",
         "matched_pair_htr_phrase": "phrase_evidence",
+        "htr_semantic_aggregate_batch": "aggregate_batch",
     }.get(atom_kind)
     if collection_key is None and singular_key is None:
         raise ValueError(f"atom kind {atom_kind!r} lacks a closed member-ID adapter")
-    if collection_key is not None:
+    if atom_kind == "htr_semantic_aggregate_batch":
+        batch = projected.get("aggregate_batch")
+        if not isinstance(batch, Mapping):
+            raise ValueError(
+                "htr_semantic_aggregate_batch.aggregate_batch must be an object"
+            )
+        raw_members = batch.get("aggregates")
+        if not isinstance(raw_members, list) or not raw_members:
+            raise ValueError(
+                "htr_semantic_aggregate_batch must contain semantic aggregates"
+            )
+        members = raw_members
+    elif collection_key is not None:
         raw_members = projected.get(collection_key)
         if not isinstance(raw_members, list):
             raise ValueError(f"{atom_kind}.{collection_key} must be a list")
@@ -493,7 +521,11 @@ def _attach_member_ids(
         detached["member_id"] = member_id
         identified.append(detached)
         member_ids.append(member_id)
-    if collection_key is not None:
+    if atom_kind == "htr_semantic_aggregate_batch":
+        projected_batch = _clone(projected["aggregate_batch"])
+        projected_batch["aggregates"] = identified
+        projected["aggregate_batch"] = projected_batch
+    elif collection_key is not None:
         projected[collection_key] = identified
     else:
         projected[str(singular_key)] = identified[0]
@@ -566,6 +598,98 @@ def _validate_partition(item: FoldEvidenceInput) -> None:
             raise ValueError("payload inner_fold does not match fold provenance")
 
 
+def _htr_semantic_aggregate_prompt_content(
+    content: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only clinically interpretable HTR aggregate data.
+
+    The catalog retains the authenticated batch, raw-package hashes, reverse
+    index references, and schema identities.  Those machine fields are not
+    model evidence and therefore never cross the discovery prompt boundary.
+    Each aggregate retains its catalog-local member ID, so the ordinary
+    exhaustive member-disposition contract accounts for every aggregate.
+    """
+
+    batch = content.get("aggregate_batch")
+    if not isinstance(batch, Mapping):
+        raise ValueError("HTR semantic aggregate prompt source is malformed")
+    raw_aggregates = batch.get("aggregates")
+    if not isinstance(raw_aggregates, list) or not raw_aggregates:
+        raise ValueError("HTR semantic aggregate prompt source is empty")
+    aggregates: list[dict[str, Any]] = []
+    for raw in raw_aggregates:
+        if not isinstance(raw, Mapping):
+            raise ValueError("HTR semantic aggregate prompt member is malformed")
+        member_id = str(raw.get("member_id") or "")
+        fold_support = raw.get("fold_support")
+        if (
+            not member_id.startswith("member_")
+            or not isinstance(fold_support, list)
+            or not fold_support
+        ):
+            raise ValueError("HTR semantic aggregate prompt member is unbound")
+        aggregates.append(
+            {
+                "member_id": member_id,
+                "stage": str(raw["stage"]),
+                "objective": str(raw["objective"]),
+                "normalized_focus_text": str(
+                    raw["normalized_focus_text"]
+                ),
+                "wordpiece_kind": str(raw["wordpiece_kind"]),
+                "occurrence_count": int(raw["occurrence_count"]),
+                "unique_note_count": int(raw["unique_note_count"]),
+                "unique_chunk_count": int(raw["unique_chunk_count"]),
+                "attention_summaries": _clone(
+                    raw["attention_summaries"]
+                ),
+                "fold_support": [
+                    {
+                        "fold": int(row["fold"]),
+                        "occurrence_count": int(
+                            row["occurrence_count"]
+                        ),
+                        "unique_note_count": int(
+                            row["unique_note_count"]
+                        ),
+                        "unique_chunk_count": int(
+                            row["unique_chunk_count"]
+                        ),
+                    }
+                    for row in fold_support
+                ],
+                "display_text_variant_count": int(
+                    raw["display_text_variant_count"]
+                ),
+                "context_windows": _clone(raw["context_windows"]),
+                "hierarchical_attention_interpretation": (
+                    "ranking_heuristic_not_causal_attribution"
+                ),
+            }
+        )
+    return {
+        "atom_kind": "htr_semantic_aggregate_batch",
+        "architecture_encoder": (
+            "learned_token_attention_then_document_chunk_transformer"
+        ),
+        "group": _clone(content["group"]),
+        "aggregate_batch": {
+            "stage": str(batch["stage"]),
+            "objective": str(batch["objective"]),
+            "aggregate_count": len(aggregates),
+            "aggregates": aggregates,
+            "complete_semantic_aggregate_delivery": True,
+            "raw_occurrence_inventory_location": (
+                "authenticated_handoff_sidecars_not_copied_into_prompt"
+            ),
+            "special_token_accounting": (
+                "retained_in_authenticated_raw_package_and_excluded_from_"
+                "readable_phrases"
+            ),
+        },
+    }
+
+
 @dataclass(frozen=True)
 class Stage1EvidenceAtom:
     evidence_id: str
@@ -623,11 +747,16 @@ class Stage1EvidenceAtom:
         }
 
     def as_discovery_item(self) -> DiscoveryEvidenceItem:
+        content = (
+            _htr_semantic_aggregate_prompt_content(self.content)
+            if self.atom_kind == "htr_semantic_aggregate_batch"
+            else {"atom_kind": self.atom_kind, **self.content}
+        )
         return DiscoveryEvidenceItem(
             evidence_id=self.evidence_id,
             source_family=self.source_family,
             observable_axes=self.observable_axes,
-            content={"atom_kind": self.atom_kind, **self.content},
+            content=content,
             member_ids=self.member_ids,
         )
 
@@ -2134,14 +2263,19 @@ def _adapt_native_htr_payload(
 ) -> list[dict[str, Any]]:
     expected = {
         "witness_kind",
+        "schema_version",
         "stage",
         "objective",
         "fold",
         "fit_note_position",
+        "fit_row_id",
         "chunk_index",
         "chunk_text",
         "chunk_sha256",
         "attention",
+        "readable_token_spans",
+        "readable_span_policy",
+        "token_inventory_content_sha256",
     }
     output: list[dict[str, Any]] = []
     for source_index, raw in enumerate(evidence):
@@ -2151,6 +2285,8 @@ def _adapt_native_htr_payload(
         stage = str(row.get("stage") or "")
         if (
             row.get("witness_kind") != "complete_htr_chunk_attention"
+            or row.get("schema_version")
+            != ROLE_NEUTRAL_HTR_CHUNK_EVIDENCE_SCHEMA
             or stage not in {"nuisance", "effect_modifier"}
             or not isinstance(row.get("objective"), str)
             or not row["objective"].strip()
@@ -2158,7 +2294,7 @@ def _adapt_native_htr_payload(
             raise ValueError("native HTR evidence changed its witness semantics")
         for key in ("fold",):
             _positive_native_integer(row.get(key), path=f"native HTR {key}")
-        for key in ("fit_note_position", "chunk_index"):
+        for key in ("fit_note_position", "fit_row_id", "chunk_index"):
             _positive_native_integer(
                 row.get(key),
                 path=f"native HTR {key}",
@@ -2172,6 +2308,52 @@ def _adapt_native_htr_payload(
         ):
             raise ValueError("native HTR chunk digest does not authenticate")
         _native_finite(row.get("attention"), path="native HTR attention")
+        spans = row.get("readable_token_spans")
+        policy = row.get("readable_span_policy")
+        token_inventory_sha256 = str(
+            row.get("token_inventory_content_sha256") or ""
+        )
+        if (
+            not isinstance(spans, list)
+            or not isinstance(policy, Mapping)
+            or policy.get("special_tokens_excluded") is not True
+            or policy.get("complete_raw_inventory_retained") is not True
+            or policy.get("overlapping_chunk_occurrences_retained") is not True
+            or _SHA256.fullmatch(token_inventory_sha256) is None
+        ):
+            raise ValueError("native HTR token-span evidence changed")
+        for rank, span in enumerate(spans, start=1):
+            if (
+                not isinstance(span, Mapping)
+                or span.get("schema_version")
+                != ROLE_NEUTRAL_HTR_READABLE_SPAN_SCHEMA
+                or int(span.get("selection_rank", 0)) != rank
+                or not isinstance(span.get("text"), str)
+                or not span["text"]
+                or span.get(
+                    "special_tokens_excluded_from_readable_projection"
+                )
+                is not True
+                or span.get("raw_special_token_mass_retained_in_sidecar")
+                is not True
+                or not math.isclose(
+                    _native_finite(
+                        span.get("hierarchical_attention_score"),
+                        path="native HTR hierarchical attention",
+                    ),
+                    _native_finite(
+                        span.get("chunk_attention"),
+                        path="native HTR span chunk attention",
+                    )
+                    * _native_finite(
+                        span.get("token_attention"),
+                        path="native HTR span token attention",
+                    ),
+                    rel_tol=0.0,
+                    abs_tol=1e-15,
+                )
+            ):
+                raise ValueError("native HTR readable token span changed")
         normalized_stage = "nuisance" if stage == "nuisance" else "effect"
         axes = (
             (TREATMENT_AXIS, OUTCOME_AXIS)
@@ -2190,6 +2372,17 @@ def _adapt_native_htr_payload(
                 "fold": row["fold"],
                 "fit_note_position": row["fit_note_position"],
                 "chunk_index": row["chunk_index"],
+                "readable_token_spans": spans,
+                "token_inventory_content_sha256": (
+                    token_inventory_sha256
+                ),
+                "attention_interpretation": (
+                    "attention_based_ranking_heuristic_not_causal_"
+                    "contribution"
+                ),
+                "raw_token_inventory_location": (
+                    "authenticated_zero_copy_htr_fit_state_sidecars"
+                ),
             },
         )
         output.append(
@@ -2779,14 +2972,67 @@ def _normalize_cumulative_family_payload(
     semantic_member_batch_size: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     payload = _clone(raw_payload)
-    if set(payload) != {"schema_version", "family", "architecture_evidence"}:
+    if (
+        family == HTR_NEURAL
+        and payload.get("schema_version") != HTR_STAGE2_AGGREGATE_PAYLOAD_SCHEMA
+    ):
+        raise ValueError(
+            "raw per-chunk HTR evidence cannot enter Stage 2; "
+            "the authenticated semantic aggregate payload is required"
+        )
+    expected_payload_keys = (
+        {
+            "schema_version",
+            "family",
+            "architecture_evidence",
+            "semantic_aggregation",
+            "content_sha256",
+        }
+        if family == HTR_NEURAL
+        else {
+            "schema_version",
+            "family",
+            "architecture_evidence",
+        }
+    )
+    if set(payload) != expected_payload_keys:
         raise ValueError(f"{family} cumulative family payload is not a closed schema")
     evidence = payload.get("architecture_evidence")
+    expected_schema = (
+        HTR_STAGE2_AGGREGATE_PAYLOAD_SCHEMA
+        if family == HTR_NEURAL
+        else NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
+    )
+    semantic_aggregation = payload.get("semantic_aggregation")
     if (
-        payload.get("schema_version") != NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
+        payload.get("schema_version") != expected_schema
         or payload.get("family") != family
         or not isinstance(evidence, list)
         or not evidence
+        or (
+            family == HTR_NEURAL
+            and (
+                not isinstance(semantic_aggregation, Mapping)
+                or semantic_aggregation.get(
+                    "no_top_k_sampling_or_truncation"
+                )
+                is not True
+                or semantic_aggregation.get(
+                    "every_semantic_aggregate_delivered_exactly_once"
+                )
+                is not True
+                or semantic_aggregation.get("raw_token_arrays_copied")
+                is not False
+                or payload.get("content_sha256")
+                != _sha256_json(
+                    {
+                        key: child
+                        for key, child in payload.items()
+                        if key != "content_sha256"
+                    }
+                )
+            )
+        )
     ):
         raise ValueError(f"{family} cumulative family payload is empty or misbound")
     def is_catalog_shaped(item: Any) -> bool:
@@ -2825,7 +3071,11 @@ def _normalize_cumulative_family_payload(
     if any(catalog_shaped) and not all(catalog_shaped):
         raise ValueError(f"{family} cumulative payload mixes catalog and native schemas")
     if all(catalog_shaped):
-        normalized = payload
+        normalized = {
+            "schema_version": NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
+            "family": family,
+            "architecture_evidence": _clone(evidence),
+        }
         adapter_applied = False
     else:
         adapters = {
@@ -2839,7 +3089,12 @@ def _normalize_cumulative_family_payload(
                 family=BOW_R_LOSS,
                 semantic_member_batch_size=semantic_member_batch_size,
             ),
-            HTR_NEURAL: lambda: _adapt_native_htr_payload(evidence),
+            HTR_NEURAL: lambda: (_ for _ in ()).throw(
+                ValueError(
+                    "raw per-chunk HTR evidence cannot enter Stage 2; "
+                    "the authenticated semantic aggregate payload is required"
+                )
+            ),
             MATCHED_PAIR_UPLIFT: lambda: _adapt_native_matched_pair_payload(
                 evidence,
                 semantic_member_batch_size=semantic_member_batch_size,
@@ -2947,6 +3202,62 @@ def _normalize_cumulative_family_payload(
         "all_source_records_accounted_once_or_by_complete_nested_units": True,
         "native_units_self_authenticated": True,
         "selection_or_truncation_applied": False,
+        "complete_token_attention_evidence": (
+            None
+            if family != HTR_NEURAL
+            else {
+                "schema_version": HTR_STAGE2_AGGREGATE_PAYLOAD_SCHEMA,
+                "source_payload_content_sha256": (
+                    semantic_aggregation["raw_evidence_reference"][
+                        "source_payload_content_sha256"
+                    ]
+                ),
+                "token_attention_package_content_sha256": (
+                    semantic_aggregation["raw_evidence_reference"][
+                        "token_attention_package_content_sha256"
+                    ]
+                ),
+                "token_occurrence_count": int(
+                    semantic_aggregation["raw_evidence_reference"][
+                        "token_occurrence_count"
+                    ]
+                ),
+                "chunk_interpretation_count": int(
+                    semantic_aggregation[
+                        "source_chunk_interpretation_count"
+                    ]
+                ),
+                "readable_token_occurrence_count": int(
+                    semantic_aggregation[
+                        "eligible_readable_token_occurrence_count"
+                    ]
+                ),
+                "special_token_occurrence_count": int(
+                    semantic_aggregation[
+                        "special_token_accounting_bucket"
+                    ][
+                        "occurrence_count"
+                    ]
+                ),
+                "raw_sidecars_authenticated_in_zero_copy_source_graph": True,
+                "aggregate_reverse_index_content_sha256": (
+                    semantic_aggregation["reverse_index_reference"][
+                        "reverse_index_manifest_content_sha256"
+                    ]
+                ),
+                "fold_local_aggregate_count": int(
+                    semantic_aggregation["fold_local_aggregate_count"]
+                ),
+                "cross_fold_aggregate_count": int(
+                    semantic_aggregation["cross_fold_aggregate_count"]
+                ),
+                "model_facing_batch_count": int(
+                    semantic_aggregation["model_facing_batch_count"]
+                ),
+                "selection_or_truncation_applied_to_raw_inventory": False,
+                "selection_or_truncation_applied_to_semantic_aggregates": False,
+            }
+        ),
     }
     return normalized, audit
 
@@ -3010,8 +3321,17 @@ def _validate_cumulative_payload_item(
         _structural_family, observed_axes = _classify_embedding(content["contrast"])
         if observed_axes != axes:
             raise ValueError("cumulative semantic-retrieval observable axes changed")
-    elif atom_kind in {"htr_phrase", "matched_pair_htr_phrase"}:
-        if content.get("architecture_encoder") != "htr" or not isinstance(
+    elif atom_kind in {
+        "htr_phrase",
+        "htr_semantic_aggregate_batch",
+        "matched_pair_htr_phrase",
+    }:
+        expected_encoder = (
+            "htr_token_attention_semantic_aggregation"
+            if atom_kind == "htr_semantic_aggregate_batch"
+            else "htr"
+        )
+        if content.get("architecture_encoder") != expected_encoder or not isinstance(
             content.get("group"), Mapping
         ):
             raise ValueError("cumulative HTR atom changed its architecture binding")
@@ -3026,6 +3346,154 @@ def _validate_cumulative_payload_item(
         }.get(stage)
         if expected != (family, axes):
             raise ValueError("cumulative HTR atom changed its family or observable axes")
+        if atom_kind == "htr_semantic_aggregate_batch":
+            batch = content.get("aggregate_batch")
+            expected_batch_keys = {
+                "schema_version",
+                "stage",
+                "objective",
+                "batch_index",
+                "batch_count",
+                "aggregate_count",
+                "aggregates",
+                "raw_evidence_reference",
+                "reverse_index_reference",
+                "hierarchical_attention_interpretation",
+                "complete_semantic_aggregate_delivery",
+                "content_sha256",
+            }
+            if (
+                not isinstance(batch, Mapping)
+                or set(batch) != expected_batch_keys
+                or batch.get("schema_version")
+                != HTR_STAGE2_AGGREGATE_BATCH_SCHEMA
+                or (
+                    "nuisance"
+                    if batch.get("stage") == "nuisance"
+                    else "effect"
+                    if batch.get("stage") == "effect_modifier"
+                    else None
+                )
+                != stage
+                or batch.get("objective") != group.get("meaning")
+                or batch.get("hierarchical_attention_interpretation")
+                != "ranking_heuristic_not_causal_attribution"
+                or batch.get("complete_semantic_aggregate_delivery") is not True
+                or batch.get("content_sha256")
+                != _sha256_json(
+                    {
+                        key: child
+                        for key, child in batch.items()
+                        if key != "content_sha256"
+                    }
+                )
+            ):
+                raise ValueError("cumulative HTR semantic aggregate batch changed")
+            aggregates = batch.get("aggregates")
+            if (
+                not isinstance(aggregates, list)
+                or not aggregates
+                or batch.get("aggregate_count") != len(aggregates)
+                or isinstance(batch.get("batch_index"), bool)
+                or not isinstance(batch.get("batch_index"), int)
+                or int(batch["batch_index"]) < 1
+                or isinstance(batch.get("batch_count"), bool)
+                or not isinstance(batch.get("batch_count"), int)
+                or int(batch["batch_count"]) < int(batch["batch_index"])
+            ):
+                raise ValueError("cumulative HTR aggregate batch accounting changed")
+            aggregate_ids: set[str] = set()
+            for aggregate in aggregates:
+                if not isinstance(aggregate, Mapping):
+                    raise ValueError("cumulative HTR semantic aggregate is malformed")
+                aggregate_body = {
+                    key: child
+                    for key, child in aggregate.items()
+                    if key != "content_sha256"
+                }
+                expected_aggregate_keys = {
+                    "schema_version",
+                    "aggregate_id",
+                    "source_aggregate_content_sha256",
+                    "stage",
+                    "objective",
+                    "normalized_focus_text",
+                    "wordpiece_kind",
+                    "semantic_occurrence_definition",
+                    "occurrence_count",
+                    "raw_token_occurrence_count",
+                    "unique_note_count",
+                    "unique_chunk_count",
+                    "attention_summaries",
+                    "fold_support",
+                    "display_text_variant_count",
+                    "display_text_variant_content_sha256",
+                    "display_text_variants_authenticated_reference",
+                    "context_windows",
+                    "architecture_chunk_schema_version",
+                    "hierarchical_attention_interpretation",
+                    "complete_semantic_accounting",
+                    "content_sha256",
+                }
+                fold_support = aggregate.get("fold_support")
+                if (
+                    set(aggregate) != expected_aggregate_keys
+                    or aggregate.get("schema_version")
+                    != HTR_STAGE2_MODEL_AGGREGATE_SCHEMA
+                    or aggregate.get("stage") != batch.get("stage")
+                    or aggregate.get("objective") != batch.get("objective")
+                    or aggregate.get("content_sha256")
+                    != _sha256_json(aggregate_body)
+                    or aggregate.get("complete_semantic_accounting")
+                    is not True
+                    or aggregate.get("semantic_occurrence_definition")
+                    != "every_eligible_non_special_raw_token_occurrence_v2"
+                    or aggregate.get("raw_token_occurrence_count")
+                    != aggregate.get("occurrence_count")
+                    or not isinstance(
+                        aggregate.get(
+                            "display_text_variants_authenticated_reference"
+                        ),
+                        Mapping,
+                    )
+                    or not isinstance(
+                        aggregate.get("architecture_chunk_schema_version"),
+                        str,
+                    )
+                    or aggregate.get(
+                        "hierarchical_attention_interpretation"
+                    )
+                    != "ranking_heuristic_not_causal_attribution"
+                    or not isinstance(
+                        aggregate.get("attention_summaries"),
+                        Mapping,
+                    )
+                    or not isinstance(
+                        aggregate.get("context_windows"),
+                        list,
+                    )
+                    or not isinstance(fold_support, list)
+                    or not fold_support
+                    or any(
+                        not isinstance(row, Mapping)
+                        or set(row)
+                        != {
+                            "fold",
+                            "fold_aggregate_id",
+                            "fold_aggregate_content_sha256",
+                            "occurrence_count",
+                            "raw_token_occurrence_count",
+                            "unique_note_count",
+                            "unique_chunk_count",
+                        }
+                        for row in fold_support
+                    )
+                ):
+                    raise ValueError("cumulative HTR semantic aggregate changed")
+                aggregate_id = str(aggregate.get("aggregate_id") or "")
+                if not aggregate_id or aggregate_id in aggregate_ids:
+                    raise ValueError("cumulative HTR aggregate IDs are invalid")
+                aggregate_ids.add(aggregate_id)
     elif atom_kind == "tfidf_topic":
         topic_bank = str(content.get("bank") or "")
         expected_topic_axes = (
@@ -3640,7 +4108,8 @@ def build_complete_architecture_chunks(
                 )
             candidate = [*current, item]
             if current and (
-                len(candidate) > max_atoms_per_chunk
+                family == HTR_NEURAL
+                or len(candidate) > max_atoms_per_chunk
                 or len(_semantic_member_ids(candidate)) > max_semantic_member_ids_per_chunk
                 or _conservative_chunk_size(family, candidate) > max_bytes_per_chunk
             ):
@@ -3822,6 +4291,12 @@ def audit_complete_architecture_delivery(
         "all_catalog_atoms_delivered_exactly_once": True,
         "all_catalog_semantic_member_ids_delivered_exactly_once": True,
         "mixed_architecture_chunks_present": False,
+        "htr_semantic_batches_are_one_per_interpretation_request": all(
+            len(chunk.evidence) == 1
+            for chunk in plan.chunks
+            if chunk.source_family == HTR_NEURAL
+        ),
+        "htr_raw_chunk_atoms_delivered_to_model": False,
         "global_top_k_applied": False,
         "atoms_truncated": False,
         "arbitrary_structural_fragments_emitted": False,

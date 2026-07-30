@@ -39,10 +39,24 @@ import pandas as pd
 from .all_evidence_fusion import FoldEvidenceProvenance
 from .all_evidence_discovery_interfaces import (
     ACTIVE_STAGE1_CONCEPT_FAMILIES,
+    HTR_NEURAL,
 )
 from .lossless_stage1_evidence_catalog import (
     RoleNeutralEvidenceCatalog,
     assemble_cumulative_spent_role_neutral_catalog,
+)
+from .htr_attention_evidence_schema import (
+    ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA,
+)
+from .htr_stage2_complete_semantic_aggregation import (
+    HTR_STAGE2_AGGREGATE_PAYLOAD_SCHEMA,
+    HTR_STAGE2_SCOPE_MANIFEST_SCHEMA,
+    HTR_STAGE2_STORE_MANIFEST_SCHEMA,
+    HtrSemanticAggregationResult,
+    build_htr_semantic_aggregation_scope,
+    summarize_htr_call_plan,
+    validate_htr_semantic_aggregation_scope,
 )
 from .portable_workflow_spec import EVIDENCE_FAMILIES
 from .production_stage1_role_neutral_coordinator import (
@@ -67,13 +81,13 @@ from .role_neutral_all_ten_binding import (
     validate_complete_role_neutral_stage1_bindings,
 )
 
-ROLE_NEUTRAL_STAGE2_BRIDGE_SCHEMA = "authenticated_role_neutral_stage1_to_stage2_bridge_v1"
-ROLE_NEUTRAL_STAGE2_LOADER_REQUIREMENTS_SCHEMA = "role_neutral_stage2_direct_loader_requirements_v1"
-ROLE_NEUTRAL_STAGE2_COMPONENT_EXPORT_INDEX_SCHEMA = "role_neutral_stage2_component_export_index_v1"
-ROLE_NEUTRAL_STAGE2_DIRECT_HANDOFF_SCHEMA = "role_neutral_stage2_direct_handoff_v1"
+ROLE_NEUTRAL_STAGE2_BRIDGE_SCHEMA = "authenticated_role_neutral_stage1_to_stage2_bridge_v4"
+ROLE_NEUTRAL_STAGE2_LOADER_REQUIREMENTS_SCHEMA = "role_neutral_stage2_direct_loader_requirements_v4"
+ROLE_NEUTRAL_STAGE2_COMPONENT_EXPORT_INDEX_SCHEMA = "role_neutral_stage2_component_export_index_v2"
+ROLE_NEUTRAL_STAGE2_DIRECT_HANDOFF_SCHEMA = "role_neutral_stage2_direct_handoff_v4"
 ROLE_NEUTRAL_STAGE2_FIT_PROJECTION_PROOF_SCHEMA = "role_neutral_stage2_fit_projection_proof_v1"
 ROLE_NEUTRAL_STAGE2_FIT_PROJECTION_TERMINAL_FIELD = "stage2_fit_projection_proof"
-ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_SCHEMA = "production_role_neutral_stage1_reference_handoff_v2"
+ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_SCHEMA = "production_role_neutral_stage1_reference_handoff_v5"
 ROLE_NEUTRAL_STAGE1_REFERENCE_LOCATOR_SCHEMA = (
     "production_role_neutral_stage1_reference_locator_attestation_v1"
 )
@@ -83,6 +97,8 @@ ROLE_NEUTRAL_STAGE1_REFERENCE_LOCATOR = "locator_attestation.json"
 ROLE_NEUTRAL_STAGE1_REFERENCE_REGISTRY = "split_registry.json"
 ROLE_NEUTRAL_STAGE1_REFERENCE_PLAN = "stage1_scope_plan.json"
 ROLE_NEUTRAL_STAGE1_REFERENCE_ROW_MAP = "row_registry.parquet"
+ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_DIRECTORY = "htr_semantic_aggregation"
+ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_MANIFEST = "store_manifest.json"
 
 _HEX = frozenset("0123456789abcdef")
 _PREPARED_PROJECTION_BINDING_ISSUER = object()
@@ -1226,6 +1242,15 @@ class AuthenticatedRoleNeutralStage2Bridge:
             "lossy_evidence_selection_applied": False,
             "evidence_payloads_copied": False,
             "evidence_payloads_recomputed": False,
+            "htr_native_evidence_schema": (
+                ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
+            ),
+            "htr_token_evidence_package_schema": (
+                ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA
+            ),
+            "complete_htr_token_and_chunk_evidence_authenticated": True,
+            "complete_htr_raw_token_sidecars_retained_in_source_graph": True,
+            "htr_readable_spans_consumed_through_staged_catalogs": True,
             "legacy_bundle_build_invoked": False,
             "legacy_hierarchy_loader_compatible": False,
         }
@@ -1288,11 +1313,14 @@ class RoleNeutralStage2LoaderRequirements:
                 "keep_whole_cohort_and_cluster_local_embeddings_distinct",
                 "serve_all_logical_contexts_without_refit",
                 "verify_runtime_spent_projection_against_sealed_fit_proof",
+                "authenticate_complete_htr_raw_sidecars_without_prompt_copy",
+                "consume_complete_htr_semantic_aggregates_with_reverse_index",
+                "deliver_content_addressed_htr_batches_exactly_once",
             ],
             "forbidden_compatibility_actions": [
                 "legacy_bundle_build",
-                "evidence_copy",
-                "evidence_recomputation",
+                "raw_evidence_copy",
+                "scientific_htr_refit_or_evidence_recomputation",
                 "loose_file_or_manual_digest_adoption",
                 "lossy_top_k_or_text_truncation",
             ],
@@ -1744,6 +1772,346 @@ def _physical_family_seals(
     return output
 
 
+@dataclass(frozen=True)
+class AuthenticatedHtrSemanticAggregationStore:
+    root: Path
+    manifest: Mapping[str, Any]
+    scope_results: Mapping[str, HtrSemanticAggregationResult]
+
+    @property
+    def content_sha256(self) -> str:
+        return _require_sha256(
+            self.manifest.get("content_sha256"),
+            label="HTR semantic aggregation store",
+        )
+
+    @property
+    def preflight_report(self) -> Mapping[str, Any]:
+        value = self.manifest.get("preflight_report")
+        if not isinstance(value, Mapping):
+            raise ValueError("HTR semantic aggregation store lacks its preflight report")
+        return copy.deepcopy(dict(value))
+
+
+def _cumulative_scope_rows(
+    *,
+    plan: Stage1ScopePlan,
+    bridge: AuthenticatedRoleNeutralStage2Bridge,
+) -> tuple[tuple[Any, Any, Any], ...]:
+    logical_by_scope = {
+        row.logical_scope_id: row for row in bridge.logical_contexts
+    }
+    rows: list[tuple[Any, Any, Any]] = []
+    for scope in plan.scopes:
+        if scope.scope_kind != "cumulative_spent":
+            continue
+        if scope.context_epoch is None or scope.provider_inner_fold is None:
+            raise ValueError("cumulative scope lacks its hierarchy binding")
+        logical = logical_by_scope.get(scope.scope_id)
+        if logical is None:
+            raise ValueError("cumulative scope lacks its logical-view binding")
+        owner = plan.physical_owner(scope.scope_id)
+        rows.append((scope, owner, logical))
+    rows.sort(key=lambda row: (int(row[0].outer_fold), int(row[0].context_epoch)))
+    expected = int(plan.review_rounds) * len(
+        {
+            scope.outer_fold
+            for scope in plan.scopes
+            if scope.scope_kind == "full_outer"
+        }
+    )
+    if len(rows) != expected:
+        raise ValueError("cumulative HTR aggregation scope coverage is incomplete")
+    return tuple(rows)
+
+
+def _htr_fit_seal(
+    *,
+    execution_root: Path,
+    physical_owner_scope_id: str,
+) -> tuple[Path, dict[str, Any]]:
+    path = (
+        execution_root
+        / "components"
+        / physical_owner_scope_id
+        / "htr"
+        / "fit_only_family_seal.json"
+    )
+    seal = _read_closed_json_file(
+        path,
+        label=f"{physical_owner_scope_id} HTR fit-only family seal",
+    )
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in seal.items()
+        if key != "content_sha256"
+    }
+    payload = seal.get("evidence_payload")
+    if (
+        seal.get("family") != "htr_neural"
+        or seal.get("physical_owner_scope_id") != physical_owner_scope_id
+        or seal.get("content_sha256") != _sha256_json(body)
+        or not isinstance(payload, Mapping)
+        or seal.get("evidence_payload_sha256") != _sha256_json(payload)
+        or payload.get("schema_version")
+        != ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
+        or not isinstance(payload.get("token_attention_evidence"), Mapping)
+        or payload["token_attention_evidence"].get("schema_version")
+        != ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA
+        or payload["token_attention_evidence"].get("sentence_pooling")
+        != "token_attention"
+        or payload["token_attention_evidence"].get(
+            "effective_sentence_pooling"
+        )
+        != "token_attention"
+        or payload["token_attention_evidence"].get(
+            "all_raw_token_occurrences_authenticated"
+        )
+        is not True
+        or payload["token_attention_evidence"].get("exact_oof_note_coverage")
+        is not True
+    ):
+        raise ValueError(
+            f"{physical_owner_scope_id} HTR fit seal is not a complete "
+            "token-attention source"
+        )
+    return path, seal
+
+
+def _build_htr_semantic_aggregation_store(
+    *,
+    root: Path,
+    execution_root: Path,
+    execution_content_sha256: str,
+    plan: Stage1ScopePlan,
+    bridge: AuthenticatedRoleNeutralStage2Bridge,
+) -> AuthenticatedHtrSemanticAggregationStore:
+    target = Path(root)
+    if not target.is_absolute():
+        raise ValueError("HTR semantic store target must be absolute")
+    if target.exists() or target.is_symlink():
+        raise FileExistsError("HTR semantic store target must be fresh")
+    execution_sha = _require_sha256(
+        execution_content_sha256,
+        label="HTR semantic store source execution",
+    )
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{target.name}.",
+            dir=target.parent,
+        )
+    )
+    scope_results: dict[str, HtrSemanticAggregationResult] = {}
+    scope_rows: list[dict[str, Any]] = []
+    try:
+        for scope, owner, logical in _cumulative_scope_rows(
+            plan=plan,
+            bridge=bridge,
+        ):
+            fit_path, seal = _htr_fit_seal(
+                execution_root=execution_root,
+                physical_owner_scope_id=owner.scope_id,
+            )
+            scope_root = staging / scope.scope_id
+            result = build_htr_semantic_aggregation_scope(
+                root=scope_root,
+                source_payload=seal["evidence_payload"],
+                source_array_store_root=(
+                    fit_path.parent / "fit_state" / "arrays"
+                ),
+                source_fit_seal_content_sha256=seal["content_sha256"],
+                source_payload_content_sha256=seal[
+                    "evidence_payload_sha256"
+                ],
+                source_fit_seal_locator=fit_path.relative_to(
+                    execution_root
+                ).as_posix(),
+                logical_scope_id=scope.scope_id,
+                physical_owner_scope_id=owner.scope_id,
+                outer_fold=int(scope.outer_fold),
+                context_epoch=int(scope.context_epoch),
+                scope_binding_sha256=(
+                    logical.logical_view_content_sha256
+                ),
+            )
+            scope_results[scope.scope_id] = result
+            scope_rows.append(
+                {
+                    "logical_scope_id": scope.scope_id,
+                    "physical_owner_scope_id": owner.scope_id,
+                    "outer_fold": int(scope.outer_fold),
+                    "context_epoch": int(scope.context_epoch),
+                    "scope_binding_sha256": (
+                        logical.logical_view_content_sha256
+                    ),
+                    "scope_root_relative_path": scope.scope_id,
+                    "scope_manifest": _file_registration(
+                        result.scope_manifest_path,
+                        root=staging,
+                        content_sha256=result.scope_manifest[
+                            "content_sha256"
+                        ],
+                    ),
+                }
+            )
+        preflight = summarize_htr_call_plan(
+            result.scope_manifest for result in scope_results.values()
+        )
+        body = {
+            "schema_version": HTR_STAGE2_STORE_MANIFEST_SCHEMA,
+            "source_execution_content_sha256": execution_sha,
+            "scope_plan_scientific_content_sha256": (
+                plan.scientific_content_sha256
+            ),
+            "scope_count": len(scope_rows),
+            "scopes": scope_rows,
+            "preflight_report": preflight,
+            "raw_htr_token_arrays_copied": False,
+            "raw_htr_chunk_records_copied_to_model_prompts": False,
+            "aggregate_reverse_indexes_complete": True,
+            "derived_store_only": True,
+        }
+        manifest = {**body, "content_sha256": _sha256_json(body)}
+        _write_new_json(
+            staging / ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_MANIFEST,
+            manifest,
+        )
+        os.replace(staging, target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    relocated_results = {
+        scope_id: HtrSemanticAggregationResult(
+            payload=result.payload,
+            scope_manifest=result.scope_manifest,
+            scope_manifest_path=(
+                target / scope_id / "scope_manifest.json"
+            ),
+        )
+        for scope_id, result in scope_results.items()
+    }
+    return AuthenticatedHtrSemanticAggregationStore(
+        root=target,
+        manifest=manifest,
+        scope_results=relocated_results,
+    )
+
+
+def _validate_htr_semantic_aggregation_store(
+    *,
+    root: Path,
+    execution_root: Path,
+    execution_content_sha256: str,
+    plan: Stage1ScopePlan,
+    bridge: AuthenticatedRoleNeutralStage2Bridge,
+) -> AuthenticatedHtrSemanticAggregationStore:
+    target = Path(root)
+    if (
+        not target.is_absolute()
+        or target.is_symlink()
+        or target.resolve(strict=True) != target
+        or not target.is_dir()
+    ):
+        raise ValueError("HTR semantic aggregation store root is not canonical")
+    manifest_path = target / ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_MANIFEST
+    manifest = _read_closed_json_file(
+        manifest_path,
+        label="HTR semantic aggregation store manifest",
+    )
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in manifest.items()
+        if key != "content_sha256"
+    }
+    rows = manifest.get("scopes")
+    expected_scope_rows = _cumulative_scope_rows(plan=plan, bridge=bridge)
+    if (
+        manifest.get("schema_version") != HTR_STAGE2_STORE_MANIFEST_SCHEMA
+        or manifest.get("content_sha256") != _sha256_json(body)
+        or manifest.get("source_execution_content_sha256")
+        != _require_sha256(
+            execution_content_sha256,
+            label="expected HTR semantic source execution",
+        )
+        or manifest.get("scope_plan_scientific_content_sha256")
+        != plan.scientific_content_sha256
+        or not isinstance(rows, list)
+        or len(rows) != len(expected_scope_rows)
+        or manifest.get("scope_count") != len(rows)
+        or manifest.get("raw_htr_token_arrays_copied") is not False
+        or manifest.get("raw_htr_chunk_records_copied_to_model_prompts")
+        is not False
+    ):
+        raise ValueError("HTR semantic aggregation store manifest is invalid")
+    results: dict[str, HtrSemanticAggregationResult] = {}
+    for registration, (scope, owner, logical) in zip(
+        rows,
+        expected_scope_rows,
+        strict=True,
+    ):
+        if not isinstance(registration, Mapping):
+            raise ValueError("HTR semantic scope registration is malformed")
+        expected_root = target / scope.scope_id
+        if (
+            registration.get("logical_scope_id") != scope.scope_id
+            or registration.get("physical_owner_scope_id")
+            != owner.scope_id
+            or registration.get("outer_fold") != int(scope.outer_fold)
+            or registration.get("context_epoch")
+            != int(scope.context_epoch)
+            or registration.get("scope_binding_sha256")
+            != logical.logical_view_content_sha256
+            or registration.get("scope_root_relative_path")
+            != scope.scope_id
+            or not isinstance(registration.get("scope_manifest"), Mapping)
+        ):
+            raise ValueError("HTR semantic scope registration changed")
+        fit_path, seal = _htr_fit_seal(
+            execution_root=execution_root,
+            physical_owner_scope_id=owner.scope_id,
+        )
+        scope_manifest_registration = registration["scope_manifest"]
+        _validate_file_registration(
+            expected_root / "scope_manifest.json",
+            scope_manifest_registration,
+            label=f"{scope.scope_id} HTR semantic scope manifest",
+        )
+        result = validate_htr_semantic_aggregation_scope(
+            root=expected_root,
+            source_payload=seal["evidence_payload"],
+            source_array_store_root=(
+                fit_path.parent / "fit_state" / "arrays"
+            ),
+            expected_source_fit_seal_content_sha256=seal[
+                "content_sha256"
+            ],
+            expected_source_payload_content_sha256=seal[
+                "evidence_payload_sha256"
+            ],
+            expected_scope_binding_sha256=(
+                logical.logical_view_content_sha256
+            ),
+        )
+        if (
+            result.scope_manifest["source_fit_seal_locator"]
+            != fit_path.relative_to(execution_root).as_posix()
+            or result.scope_manifest["content_sha256"]
+            != scope_manifest_registration["content_sha256"]
+        ):
+            raise ValueError("HTR semantic scope source locator changed")
+        results[scope.scope_id] = result
+    preflight = summarize_htr_call_plan(
+        result.scope_manifest for result in results.values()
+    )
+    if preflight != manifest.get("preflight_report"):
+        raise ValueError("HTR semantic aggregation preflight report changed")
+    return AuthenticatedHtrSemanticAggregationStore(
+        root=target,
+        manifest=manifest,
+        scope_results=results,
+    )
+
+
 def _review_partition_assignments(
     plan: Stage1ScopePlan,
     *,
@@ -1769,15 +2137,45 @@ def _review_partition_assignments(
 
 def _cumulative_catalogs(
     *,
+    execution_root: Path,
     plan: Stage1ScopePlan,
     bridge: AuthenticatedRoleNeutralStage2Bridge,
-    seals_by_owner: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    binding_terminal: Mapping[str, Any],
+    htr_aggregation_store: AuthenticatedHtrSemanticAggregationStore,
     semantic_member_batch_size: int,
 ) -> dict[tuple[int, int], RoleNeutralEvidenceCatalog]:
     batch_size = _require_semantic_member_batch_size(
         semantic_member_batch_size
     )
     logical_by_scope = {row.logical_scope_id: row for row in bridge.logical_contexts}
+    physical_registrations = binding_terminal.get("physical_payloads")
+    if (
+        not isinstance(physical_registrations, list)
+        or len(physical_registrations) != len(plan.physical_scopes)
+    ):
+        raise ValueError("scientific binding physical payload coverage changed")
+    registration_by_owner = {
+        owner.scope_id: registration
+        for owner, registration in zip(
+            plan.physical_scopes,
+            physical_registrations,
+            strict=True,
+        )
+    }
+    if any(
+        not isinstance(registration, Mapping)
+        for registration in registration_by_owner.values()
+    ):
+        raise ValueError("scientific binding physical registration is malformed")
+    binding_root = (
+        execution_root
+        / ROLE_NEUTRAL_COORDINATION_DIRECTORY
+        / ROLE_NEUTRAL_SCIENTIFIC_BINDING_DIRECTORY
+    )
+    cached_non_htr: dict[
+        str,
+        tuple[dict[str, Mapping[str, Any]], dict[str, str], str],
+    ] = {}
     catalogs: dict[tuple[int, int], RoleNeutralEvidenceCatalog] = {}
     for scope in plan.scopes:
         if scope.scope_kind != "cumulative_spent":
@@ -1785,21 +2183,61 @@ def _cumulative_catalogs(
         if scope.context_epoch is None or scope.provider_inner_fold is None:
             raise ValueError("cumulative scope lacks its hierarchy epoch binding")
         owner = plan.physical_owner(scope.scope_id)
-        owner_seals = seals_by_owner.get(owner.scope_id)
-        if owner_seals is None:
-            raise ValueError("cumulative scope lacks its physical family seals")
-        payloads: dict[str, Mapping[str, Any]] = {}
-        artifact_hashes: dict[str, str] = {}
-        for family in ACTIVE_STAGE1_CONCEPT_FAMILIES:
-            seal = owner_seals[family]
-            payload = seal.get("evidence_payload")
-            if not isinstance(payload, Mapping):
-                raise ValueError(f"{scope.scope_id}/{family} has no sealed evidence payload")
-            payloads[family] = copy.deepcopy(dict(payload))
-            artifact_hashes[family] = _require_sha256(
-                seal.get("content_sha256"),
-                label=f"{scope.scope_id}/{family} fit seal",
+        cached = cached_non_htr.get(owner.scope_id)
+        if cached is None:
+            registration = registration_by_owner.get(owner.scope_id)
+            if registration is None:
+                raise ValueError("cumulative scope lacks its physical family seals")
+            physical_payload = _read_registered_json(
+                binding_root / str(registration.get("relative_path")),
+                registration,
+                label=f"{owner.scope_id} physical all-ten payload",
             )
+            owner_seals = physical_payload.get("family_fit_seals")
+            if (
+                not isinstance(owner_seals, Mapping)
+                or set(owner_seals) != set(ACTIVE_STAGE1_CONCEPT_FAMILIES)
+            ):
+                raise ValueError(f"{owner.scope_id} physical payload is not all-ten")
+            non_htr_payloads: dict[str, Mapping[str, Any]] = {}
+            artifact_hashes: dict[str, str] = {}
+            for family in ACTIVE_STAGE1_CONCEPT_FAMILIES:
+                seal = owner_seals[family]
+                if not isinstance(seal, Mapping):
+                    raise ValueError(f"{owner.scope_id}/{family} fit seal is malformed")
+                artifact_hashes[family] = _require_sha256(
+                    seal.get("content_sha256"),
+                    label=f"{owner.scope_id}/{family} fit seal",
+                )
+                if family == HTR_NEURAL:
+                    continue
+                source_payload = seal.get("evidence_payload")
+                if not isinstance(source_payload, Mapping):
+                    raise ValueError(
+                        f"{owner.scope_id}/{family} has no sealed evidence payload"
+                    )
+                non_htr_payloads[family] = copy.deepcopy(
+                    dict(source_payload)
+                )
+            cached = (
+                non_htr_payloads,
+                artifact_hashes,
+                artifact_hashes[HTR_NEURAL],
+            )
+            cached_non_htr[owner.scope_id] = cached
+        non_htr_payloads, artifact_hashes, _htr_artifact_hash = cached
+        aggregate_result = htr_aggregation_store.scope_results.get(
+            scope.scope_id
+        )
+        if aggregate_result is None:
+            raise ValueError("cumulative scope lacks its HTR aggregate payload")
+        payloads = {
+            **{
+                family: copy.deepcopy(dict(payload))
+                for family, payload in non_htr_payloads.items()
+            },
+            HTR_NEURAL: copy.deepcopy(dict(aggregate_result.payload)),
+        }
         provenance = FoldEvidenceProvenance(
             outer_fold=scope.outer_fold,
             train_row_ids=scope.fit_row_ids,
@@ -1917,6 +2355,7 @@ class AuthenticatedRoleNeutralStage2Provider:
         plan: Stage1ScopePlan,
         execution_manifest: Mapping[str, Any],
         semantic_member_batch_size: int,
+        htr_aggregation_store_root: Path | str,
         authenticated_row_map_path: Path | str | None = None,
         authenticated_row_map_registration: Mapping[str, Any] | None = None,
         prepared_request_sha256: str | None = None,
@@ -1926,6 +2365,9 @@ class AuthenticatedRoleNeutralStage2Provider:
         if not isinstance(execution_manifest, Mapping):
             raise TypeError("role-neutral Stage 2 provider requires an execution manifest")
         self._execution_root = Path(execution_root)
+        self._htr_aggregation_store_root = Path(
+            htr_aggregation_store_root
+        )
         self._plan = plan
         self._semantic_member_batch_size = (
             _require_semantic_member_batch_size(
@@ -1993,6 +2435,9 @@ class AuthenticatedRoleNeutralStage2Provider:
             self._authenticated_row_map = row_map.copy(deep=True)
             self._authenticated_row_map_sha256 = row_map_sha256
         before = _tree_stat_inventory(self._execution_root)
+        aggregate_before = _tree_stat_inventory(
+            self._htr_aggregation_store_root
+        )
         (
             bridge,
             proofs,
@@ -2000,13 +2445,24 @@ class AuthenticatedRoleNeutralStage2Provider:
             identity,
         ) = self._load_current()
         after = _tree_stat_inventory(self._execution_root)
+        aggregate_after = _tree_stat_inventory(
+            self._htr_aggregation_store_root
+        )
         if before != after:
             raise RuntimeError("role-neutral execution changed across provider " "authentication")
+        if aggregate_before != aggregate_after:
+            raise RuntimeError(
+                "HTR semantic aggregation store changed across provider "
+                "authentication"
+            )
         self._bridge = bridge
         self._proofs = proofs
         self._catalogs = catalogs
         self._identity = identity
         self._authenticated_stat_inventory = after
+        self._authenticated_htr_aggregate_stat_inventory = (
+            aggregate_after
+        )
 
     def _execution_manifest(self) -> dict[str, Any]:
         value = json.loads(self._execution_manifest_json)
@@ -2037,19 +2493,25 @@ class AuthenticatedRoleNeutralStage2Provider:
             plan=self._plan,
             locator_attestation=locator_attestation,
         )
-        seals = _physical_family_seals(
+        htr_aggregation_store = _validate_htr_semantic_aggregation_store(
+            root=self._htr_aggregation_store_root,
             execution_root=self._execution_root,
-            plan=self._plan,
-            binding_terminal=binding_terminal,
-        )
-        catalogs = _cumulative_catalogs(
+            execution_content_sha256=(
+                bridge.source_execution_content_sha256
+            ),
             plan=self._plan,
             bridge=bridge,
-            seals_by_owner=seals,
+        )
+        catalogs = _cumulative_catalogs(
+            execution_root=self._execution_root,
+            plan=self._plan,
+            bridge=bridge,
+            binding_terminal=binding_terminal,
+            htr_aggregation_store=htr_aggregation_store,
             semantic_member_batch_size=self._semantic_member_batch_size,
         )
         body = {
-            "schema_version": ("authenticated_role_neutral_stage2_provider_v2"),
+            "schema_version": ("authenticated_role_neutral_stage2_provider_v4"),
             "bridge_scientific_content_sha256": (bridge.bridge_scientific_content_sha256),
             "plan_scientific_content_sha256": (self._plan.scientific_content_sha256),
             "portable_family_order": list(EVIDENCE_FAMILIES),
@@ -2092,6 +2554,26 @@ class AuthenticatedRoleNeutralStage2Provider:
             "raw_spent_evidence_input_fallback_available": False,
             "independent_runtime_stage1_refit_allowed": False,
             "evidence_payloads_materialized_to_legacy_graph": False,
+            "htr_native_evidence_schema": (
+                ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
+            ),
+            "htr_token_evidence_package_schema": (
+                ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA
+            ),
+            "htr_stage2_aggregate_payload_schema": (
+                HTR_STAGE2_AGGREGATE_PAYLOAD_SCHEMA
+            ),
+            "htr_semantic_aggregation_store_content_sha256": (
+                htr_aggregation_store.content_sha256
+            ),
+            "htr_stage2_call_plan_preflight": (
+                htr_aggregation_store.preflight_report
+            ),
+            "complete_htr_token_and_chunk_evidence_authenticated": True,
+            "complete_htr_raw_token_sidecars_opened_in_place": True,
+            "complete_htr_semantic_reverse_index_authenticated": True,
+            "raw_htr_token_arrays_copied_to_handoff": False,
+            "raw_htr_chunk_atoms_copied_to_model_prompts": False,
             "text_truncation_applied": False,
             "lossy_evidence_selection_applied": False,
         }
@@ -2109,6 +2591,14 @@ class AuthenticatedRoleNeutralStage2Provider:
             raise RuntimeError(
                 "authenticated role-neutral Stage 2 provider byte/stat " "inventory changed"
             )
+        if (
+            _tree_stat_inventory(self._htr_aggregation_store_root)
+            != self._authenticated_htr_aggregate_stat_inventory
+        ):
+            raise RuntimeError(
+                "authenticated HTR semantic aggregate byte/stat inventory "
+                "changed"
+            )
         if self._authenticated_row_map_path is not None and (
             _private_regular_file_stat(
                 self._authenticated_row_map_path,
@@ -2124,6 +2614,21 @@ class AuthenticatedRoleNeutralStage2Provider:
     def identity(self) -> Mapping[str, Any]:
         self._assert_current()
         return copy.deepcopy(self._identity)
+
+    def get_htr_stage2_preflight_catalogs(
+        self,
+    ) -> tuple[tuple[int, int, RoleNeutralEvidenceCatalog], ...]:
+        """Return every authenticated cumulative catalog for offline planning."""
+
+        _bridge, _proofs, catalogs = self._assert_current()
+        return tuple(
+            (
+                int(outer_fold),
+                int(context_epoch),
+                catalogs[(outer_fold, context_epoch)],
+            )
+            for outer_fold, context_epoch in sorted(catalogs)
+        )
 
     def get_outer_fold_assignments(
         self,
@@ -2339,6 +2844,19 @@ class AuthenticatedRoleNeutralStage2Provider:
         """Bind direct runner dataset identity, rows, and meta-fold shapes once."""
 
         self._assert_current()
+        call_plan = self._identity.get("htr_stage2_call_plan_preflight")
+        if (
+            not isinstance(call_plan, Mapping)
+            or call_plan.get("stage2_endpoint_launch_allowed") is not True
+            or call_plan.get(
+                "call_plan_on_order_of_hundreds_of_thousands"
+            )
+            is not False
+        ):
+            raise RuntimeError(
+                "HTR Stage 2 call-plan preflight forbids endpoint launch; "
+                "the remaining semantic redundancy must be reported first"
+            )
         if (
             self._prepared_projection_binding is None
             or prepared_projection_binding is not self._prepared_projection_binding
@@ -2687,7 +3205,15 @@ def _direct_handoff_scientific_body(
     source_execution_content_sha256: str,
     provider_identity_sha256: str,
     semantic_member_batch_size: int,
+    htr_aggregation_store_content_sha256: str,
+    htr_call_plan_preflight: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if (
+        not isinstance(htr_call_plan_preflight, Mapping)
+        or htr_call_plan_preflight.get("schema_version")
+        != "production_htr_stage2_call_plan_preflight_v2"
+    ):
+        raise ValueError("direct handoff lacks its HTR call-plan preflight")
     return {
         "schema_version": ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_SCHEMA,
         "handoff_kind": ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_KIND,
@@ -2712,6 +3238,13 @@ def _direct_handoff_scientific_body(
             provider_identity_sha256,
             label="role-neutral Stage 2 provider",
         ),
+        "htr_semantic_aggregation_store_content_sha256": _require_sha256(
+            htr_aggregation_store_content_sha256,
+            label="HTR semantic aggregation store",
+        ),
+        "htr_stage2_call_plan_preflight": copy.deepcopy(
+            dict(htr_call_plan_preflight)
+        ),
         "semantic_member_batch_size": _require_semantic_member_batch_size(
             semantic_member_batch_size
         ),
@@ -2722,6 +3255,9 @@ def _direct_handoff_scientific_body(
         "native_family_order": list(ACTIVE_STAGE1_CONCEPT_FAMILIES),
         "execution_locator_in_scientific_identity": False,
         "evidence_payloads_copied": False,
+        "derived_htr_aggregate_payloads_materialized_here": True,
+        "raw_htr_token_arrays_materialized_here": False,
+        "raw_htr_chunk_atoms_model_facing": False,
         "legacy_bundle_build_invoked": False,
         "independent_stage1_refit_invoked": False,
         "all_ten_role_neutral_execution_is_exclusive_evidence_source": True,
@@ -2745,6 +3281,8 @@ def _validate_direct_handoff_manifest(value: Any) -> dict[str, Any]:
         "row_map_sha256",
         "source_role_neutral_execution_content_sha256",
         "stage2_provider_identity_sha256",
+        "htr_semantic_aggregation_store_content_sha256",
+        "htr_stage2_call_plan_preflight",
         "semantic_member_batch_size",
         "physical_fit_count",
         "logical_scope_count",
@@ -2753,6 +3291,9 @@ def _validate_direct_handoff_manifest(value: Any) -> dict[str, Any]:
         "native_family_order",
         "execution_locator_in_scientific_identity",
         "evidence_payloads_copied",
+        "derived_htr_aggregate_payloads_materialized_here",
+        "raw_htr_token_arrays_materialized_here",
+        "raw_htr_chunk_atoms_model_facing",
         "legacy_bundle_build_invoked",
         "independent_stage1_refit_invoked",
         "all_ten_role_neutral_execution_is_exclusive_evidence_source",
@@ -2778,6 +3319,7 @@ def _validate_direct_handoff_manifest(value: Any) -> dict[str, Any]:
         "row_map_sha256",
         "source_role_neutral_execution_content_sha256",
         "stage2_provider_identity_sha256",
+        "htr_semantic_aggregation_store_content_sha256",
         "content_sha256",
         "bundle_sha256",
     )
@@ -2803,6 +3345,12 @@ def _validate_direct_handoff_manifest(value: Any) -> dict[str, Any]:
         != manifest.get("semantic_member_batch_size")
         or manifest.get("execution_locator_in_scientific_identity") is not False
         or manifest.get("evidence_payloads_copied") is not False
+        or manifest.get(
+            "derived_htr_aggregate_payloads_materialized_here"
+        )
+        is not True
+        or manifest.get("raw_htr_token_arrays_materialized_here") is not False
+        or manifest.get("raw_htr_chunk_atoms_model_facing") is not False
         or manifest.get("legacy_bundle_build_invoked") is not False
         or manifest.get("independent_stage1_refit_invoked") is not False
         or manifest.get("all_ten_role_neutral_execution_is_exclusive_evidence_source") is not True
@@ -2810,6 +3358,14 @@ def _validate_direct_handoff_manifest(value: Any) -> dict[str, Any]:
         or manifest.get("lossy_evidence_selection_applied") is not False
         or manifest.get("offline_handoff_validation_complete") is not True
         or manifest.get("full_stage2_one_shot_runtime_complete") is not False
+        or not isinstance(
+            manifest.get("htr_stage2_call_plan_preflight"),
+            Mapping,
+        )
+        or manifest["htr_stage2_call_plan_preflight"].get(
+            "schema_version"
+        )
+        != "production_htr_stage2_call_plan_preflight_v2"
         or isinstance(manifest.get("physical_fit_count"), bool)
         or int(manifest.get("physical_fit_count", -1)) < 1
         or isinstance(manifest.get("logical_scope_count"), bool)
@@ -2834,6 +3390,8 @@ def _validate_direct_handoff_locator(value: Any) -> dict[str, Any]:
         "role_neutral_execution",
         "references_only",
         "evidence_payloads_materialized_here",
+        "derived_htr_aggregate_payloads_materialized_here",
+        "raw_htr_token_arrays_materialized_here",
         "content_sha256",
     }
     body = {key: copy.deepcopy(child) for key, child in locator.items() if key != "content_sha256"}
@@ -2843,6 +3401,11 @@ def _validate_direct_handoff_locator(value: Any) -> dict[str, Any]:
         or locator.get("handoff_kind") != ROLE_NEUTRAL_STAGE1_REFERENCE_HANDOFF_KIND
         or locator.get("references_only") is not True
         or locator.get("evidence_payloads_materialized_here") is not False
+        or locator.get(
+            "derived_htr_aggregate_payloads_materialized_here"
+        )
+        is not True
+        or locator.get("raw_htr_token_arrays_materialized_here") is not False
         or locator.get("content_sha256") != _sha256_json(body)
         or not isinstance(locator.get("scientific_manifest"), Mapping)
         or not isinstance(locator.get("metadata_files"), Mapping)
@@ -2897,6 +3460,10 @@ def load_reference_only_role_neutral_stage1_handoff(
         "split_registry": ROLE_NEUTRAL_STAGE1_REFERENCE_REGISTRY,
         "scope_plan": ROLE_NEUTRAL_STAGE1_REFERENCE_PLAN,
         "row_map": ROLE_NEUTRAL_STAGE1_REFERENCE_ROW_MAP,
+        "htr_semantic_aggregation": (
+            f"{ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_DIRECTORY}/"
+            f"{ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_MANIFEST}"
+        ),
     }
     if set(metadata) != set(expected_metadata):
         raise ValueError("direct handoff metadata inventory is incomplete")
@@ -2950,6 +3517,25 @@ def load_reference_only_role_neutral_stage1_handoff(
     row_map_path = root / ROLE_NEUTRAL_STAGE1_REFERENCE_ROW_MAP
     if metadata["row_map"].get("content_sha256") != manifest["row_map_sha256"]:
         raise ValueError("direct handoff row-map identity changed")
+    aggregation_store_root = (
+        root / ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_DIRECTORY
+    )
+    aggregation_registration = metadata[
+        "htr_semantic_aggregation"
+    ]
+    _validate_file_registration(
+        aggregation_store_root
+        / ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_MANIFEST,
+        aggregation_registration,
+        label="HTR semantic aggregation store manifest",
+    )
+    if (
+        aggregation_registration.get("content_sha256")
+        != manifest[
+            "htr_semantic_aggregation_store_content_sha256"
+        ]
+    ):
+        raise ValueError("direct handoff HTR aggregate identity changed")
 
     execution_reference = locator["role_neutral_execution"]
     if set(execution_reference) != {
@@ -3009,6 +3595,7 @@ def load_reference_only_role_neutral_stage1_handoff(
         semantic_member_batch_size=manifest[
             "semantic_member_batch_size"
         ],
+        htr_aggregation_store_root=aggregation_store_root,
         authenticated_row_map_path=row_map_path,
         authenticated_row_map_registration=metadata["row_map"],
         prepared_request_sha256=manifest["request_sha256"],
@@ -3016,6 +3603,11 @@ def load_reference_only_role_neutral_stage1_handoff(
     provider_identity = provider.identity()
     if provider_identity.get("identity_sha256") != manifest["stage2_provider_identity_sha256"]:
         raise ValueError("direct handoff Stage 2 provider identity changed")
+    if (
+        provider_identity.get("htr_stage2_call_plan_preflight")
+        != manifest["htr_stage2_call_plan_preflight"]
+    ):
+        raise ValueError("direct handoff HTR call-plan preflight changed")
 
     from .production_all_evidence_workflow import (
         RoleNeutralStage1HandoffPublication,
@@ -3075,13 +3667,6 @@ class ReferenceOnlyRoleNeutralStage1HandoffPublisher:
         ):
             raise ValueError("prepared split-registry identity changed")
         execution_root = Path(role_neutral_execution_root).resolve(strict=True)
-        provider = AuthenticatedRoleNeutralStage2Provider(
-            execution_root=execution_root,
-            plan=plan,
-            execution_manifest=role_neutral_execution_manifest,
-            semantic_member_batch_size=self.semantic_member_batch_size,
-        )
-        provider_identity = provider.identity()
         source_execution_content_sha256 = _require_sha256(
             role_neutral_execution_manifest.get("content_sha256"),
             label="role-neutral execution",
@@ -3095,6 +3680,31 @@ class ReferenceOnlyRoleNeutralStage1HandoffPublisher:
             )
         )
         try:
+            bridge = validate_role_neutral_stage2_bridge(
+                execution_root=execution_root,
+                plan=plan,
+                execution_manifest=role_neutral_execution_manifest,
+            )
+            aggregation_store = _build_htr_semantic_aggregation_store(
+                root=(
+                    staging
+                    / ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_DIRECTORY
+                ),
+                execution_root=execution_root,
+                execution_content_sha256=(
+                    source_execution_content_sha256
+                ),
+                plan=plan,
+                bridge=bridge,
+            )
+            provider = AuthenticatedRoleNeutralStage2Provider(
+                execution_root=execution_root,
+                plan=plan,
+                execution_manifest=role_neutral_execution_manifest,
+                semantic_member_batch_size=self.semantic_member_batch_size,
+                htr_aggregation_store_root=aggregation_store.root,
+            )
+            provider_identity = provider.identity()
             registry_path = staging / ROLE_NEUTRAL_STAGE1_REFERENCE_REGISTRY
             plan_path = staging / ROLE_NEUTRAL_STAGE1_REFERENCE_PLAN
             row_map_path = staging / ROLE_NEUTRAL_STAGE1_REFERENCE_ROW_MAP
@@ -3113,6 +3723,12 @@ class ReferenceOnlyRoleNeutralStage1HandoffPublisher:
                 source_execution_content_sha256=(source_execution_content_sha256),
                 provider_identity_sha256=provider_identity["identity_sha256"],
                 semantic_member_batch_size=self.semantic_member_batch_size,
+                htr_aggregation_store_content_sha256=(
+                    aggregation_store.content_sha256
+                ),
+                htr_call_plan_preflight=(
+                    aggregation_store.preflight_report
+                ),
             )
             content_sha256 = _sha256_json(scientific_body)
             manifest_without_bundle = {
@@ -3155,6 +3771,14 @@ class ReferenceOnlyRoleNeutralStage1HandoffPublisher:
                         root=staging,
                         content_sha256=row_map_sha256,
                     ),
+                    "htr_semantic_aggregation": _file_registration(
+                        aggregation_store.root
+                        / ROLE_NEUTRAL_STAGE1_HTR_AGGREGATION_MANIFEST,
+                        root=staging,
+                        content_sha256=(
+                            aggregation_store.content_sha256
+                        ),
+                    ),
                 },
                 "role_neutral_execution": {
                     "relative_root_locator": os.path.relpath(
@@ -3169,6 +3793,8 @@ class ReferenceOnlyRoleNeutralStage1HandoffPublisher:
                 },
                 "references_only": True,
                 "evidence_payloads_materialized_here": False,
+                "derived_htr_aggregate_payloads_materialized_here": True,
+                "raw_htr_token_arrays_materialized_here": False,
             }
             locator = {
                 **locator_body,

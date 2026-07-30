@@ -142,8 +142,8 @@ ADAPTIVE_PROPOSER_INTERFACE_VERSION = "adaptive_registry_revision_proposer_v4"
 ADAPTIVE_ROUND_FREEZE_VERSION = "frozen_adaptive_stage1_reconsideration_round_v3"
 ADAPTIVE_AUTHENTICATED_EXECUTION_VERSION = "authenticated_adaptive_hierarchical_stage1_execution_v7"
 ADAPTIVE_EXECUTABLE_BRIDGE_VERSION = "adaptive_executable_extraction_contract_bridge_v3"
-ADAPTIVE_PROMPT_CONTRACT_VERSION = "adaptive_hierarchical_stage1_prompt_contract_v7"
-ADAPTIVE_IMPLEMENTATION_BUNDLE_VERSION = "adaptive_hierarchical_implementation_bundle_v8"
+ADAPTIVE_PROMPT_CONTRACT_VERSION = "adaptive_hierarchical_stage1_prompt_contract_v8"
+ADAPTIVE_IMPLEMENTATION_BUNDLE_VERSION = "adaptive_hierarchical_implementation_bundle_v9"
 
 _ADAPTIVE_PLANNER_NORMALIZATION_AUDIT_VERSION = "adaptive_planner_wire_normalization_audit_v1"
 _ADAPTIVE_PROPOSER_NORMALIZATION_AUDIT_VERSION = "adaptive_proposer_wire_normalization_audit_v1"
@@ -159,6 +159,8 @@ _ADAPTIVE_IMPLEMENTATION_BUNDLE_FILES = (
     "all_evidence_fusion.py",
     "all_evidence_post_extraction_review.py",
     "lossless_stage1_evidence_catalog.py",
+    "htr_stage2_semantic_aggregation.py",
+    "htr_stage2_complete_semantic_aggregation.py",
     "stage1_architecture_explanations.py",
 )
 

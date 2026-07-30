@@ -33,6 +33,11 @@ import numpy as np
 from .all_evidence_discovery_interfaces import (
     ACTIVE_STAGE1_CONCEPT_FAMILIES,
     ACTIVE_STAGE1_CONCEPT_FAMILY_SET,
+    HTR_NEURAL,
+)
+from .htr_attention_evidence_schema import (
+    ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA,
 )
 from .lossless_stage1_evidence_catalog import (
     NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
@@ -65,6 +70,9 @@ LEGACY_STAGE1_ROLE_NEUTRAL_PERSISTED_SET_SCHEMA = (
 )
 LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA = (
     "production_legacy_stage1_fit_only_family_seal_v2"
+)
+LEGACY_STAGE1_FIT_ONLY_HTR_FAMILY_SEAL_SCHEMA = (
+    "production_legacy_stage1_fit_only_htr_family_seal_v3"
 )
 
 _FRAGMENT_MANIFEST_NAME = "fragment_manifest.json"
@@ -481,16 +489,50 @@ def build_role_neutral_fit_only_family_seal(
         dict(evidence_payload),
         path=f"{owner.scope_id}.{family_name}.evidence_payload",
     )
-    if (
-        not isinstance(closed, dict)
-        or set(closed)
-        != {"schema_version", "family", "architecture_evidence"}
-        or closed.get("schema_version")
-        != NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
-        or closed.get("family") != family_name
-        or not isinstance(closed.get("architecture_evidence"), list)
-        or not closed["architecture_evidence"]
-    ):
+    if family_name == HTR_NEURAL:
+        token_evidence = (
+            closed.get("token_attention_evidence")
+            if isinstance(closed, dict)
+            else None
+        )
+        valid_payload = (
+            isinstance(closed, dict)
+            and set(closed)
+            == {
+                "schema_version",
+                "family",
+                "architecture_evidence",
+                "token_attention_evidence",
+            }
+            and closed.get("schema_version")
+            == ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA
+            and closed.get("family") == family_name
+            and isinstance(closed.get("architecture_evidence"), list)
+            and bool(closed["architecture_evidence"])
+            and isinstance(token_evidence, Mapping)
+            and token_evidence.get("schema_version")
+            == ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA
+            and token_evidence.get("sentence_pooling") == "token_attention"
+            and token_evidence.get("effective_sentence_pooling")
+            == "token_attention"
+            and token_evidence.get(
+                "all_raw_token_occurrences_authenticated"
+            )
+            is True
+            and token_evidence.get("top_k_applied_to_raw_inventory") is False
+        )
+    else:
+        valid_payload = (
+            isinstance(closed, dict)
+            and set(closed)
+            == {"schema_version", "family", "architecture_evidence"}
+            and closed.get("schema_version")
+            == NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
+            and closed.get("family") == family_name
+            and isinstance(closed.get("architecture_evidence"), list)
+            and bool(closed["architecture_evidence"])
+        )
+    if not valid_payload:
         raise ValueError("fit-only family seal requires one nonempty native payload")
     producer_id = _require_sha256(
         producer_identity_sha256,
@@ -526,7 +568,11 @@ def build_role_neutral_fit_only_family_seal(
         },
     ]
     body = {
-        "schema_version": LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA,
+        "schema_version": (
+            LEGACY_STAGE1_FIT_ONLY_HTR_FAMILY_SEAL_SCHEMA
+            if family_name == HTR_NEURAL
+            else LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA
+        ),
         "plan_scientific_content_sha256": plan.scientific_content_sha256,
         "physical_owner_scope_id": owner.scope_id,
         "physical_owner_scope_sha256": scope["scope_sha256"],
@@ -2189,6 +2235,7 @@ __all__ = [
     "LEGACY_STAGE1_FRAGMENT_MERGE_ACCUMULATORS_SCHEMA",
     "LEGACY_STAGE1_FRAGMENT_MERGE_SCHEMA",
     "LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA",
+    "LEGACY_STAGE1_FIT_ONLY_HTR_FAMILY_SEAL_SCHEMA",
     "LEGACY_STAGE1_LOGICAL_EVIDENCE_VIEW_SCHEMA",
     "LEGACY_STAGE1_LOGICAL_VIEW_ARTIFACT_SCHEMA",
     "LEGACY_STAGE1_ROLE_NEUTRAL_BINDING_SET_SCHEMA",

@@ -118,13 +118,16 @@ IN_PLACE_RESUMABLE_PHASES = frozenset(
 EMBEDDING_CACHE_PHASE_SCHEMA = "production_embedding_cache_phase_result_v1"
 STAGE1_PREFLIGHT_PHASE_SCHEMA = "production_stage1_preflight_phase_result_v2"
 PORTABLE_ROLE_NEUTRAL_STAGE1_PHASE_SCHEMA = (
-    "production_portable_role_neutral_stage1_phase_result_v1"
+    "production_portable_role_neutral_stage1_phase_result_v2"
 )
 PORTABLE_ROLE_NEUTRAL_STAGE1_HANDOFF_BINDING_SCHEMA = (
-    "production_portable_role_neutral_stage1_handoff_binding_v1"
+    "production_portable_role_neutral_stage1_handoff_binding_v2"
 )
 STAGE1_COMPONENT_STORE_SCHEMA = (
-    "production_stage1_scientific_component_store_v1"
+    "production_stage1_scientific_component_store_v2"
+)
+LEGACY_STAGE1_COMPONENT_STORE_SCHEMAS = frozenset(
+    {"production_stage1_scientific_component_store_v1"}
 )
 STAGE1_COMPONENT_STORE_MANIFEST = "component_store_manifest.json"
 WORKFLOW_PROGRESS_SCHEMA = "production_all_evidence_workflow_progress_v1"
@@ -1348,15 +1351,16 @@ class RoleNeutralStage1HandoffPublication:
         validation can recognize both the legacy and direct-loader modes.
         """
 
+        manifest = _read_json_object(
+            Path(self.bundle_manifest_path),
+            label="role-neutral handoff manifest",
+        )
         bundle_sha256 = self.bundle_sha256
         if bundle_sha256 is None:
-            manifest = _read_json_object(
-                Path(self.bundle_manifest_path),
-                label="role-neutral handoff manifest",
-            )
             bundle_sha256 = str(manifest.get("bundle_sha256") or "")
+        htr_preflight = manifest.get("htr_stage2_call_plan_preflight")
         body = {
-            "schema_version": ("production_role_neutral_stage1_handoff_publication_v1"),
+            "schema_version": ("production_role_neutral_stage1_handoff_publication_v2"),
             "handoff_kind": self.handoff_kind,
             "stage1_inputs": {
                 "bundle_sha256": bundle_sha256,
@@ -1372,6 +1376,12 @@ class RoleNeutralStage1HandoffPublication:
             "manual_digest_approval_required": False,
             "legacy_bundle_build_invoked": False,
             "evidence_payloads_copied": False,
+            "derived_htr_aggregate_payloads_materialized": True,
+            "raw_htr_token_arrays_materialized": False,
+            "raw_htr_chunk_atoms_model_facing": False,
+            "htr_stage2_call_plan_preflight": copy.deepcopy(
+                htr_preflight
+            ),
             "offline_handoff_validation_complete": True,
             "full_stage2_one_shot_runtime_complete": False,
         }
@@ -1530,6 +1540,7 @@ _PHASE_PRODUCER_ROOTS: Mapping[str, tuple[str, ...]] = {
         "oci/inference/production_role_neutral_producer_factories.py",
         "oci/inference/role_neutral_all_ten_binding.py",
         "oci/inference/role_neutral_bow_group_execution.py",
+        "oci/inference/htr_attention_evidence_schema.py",
         "oci/inference/role_neutral_htr_group_execution.py",
         "oci/inference/role_neutral_matched_pair_group_execution.py",
         "oci/inference/role_neutral_embedding_group_execution.py",
@@ -13307,9 +13318,23 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             "scientific_identity",
             None,
         )
-        prepared_scientific_sha256 = (
-            scientific_identity.get("content_sha256")
+        prepared_projection = (
+            scientific_identity.get(
+                "stage1_request_scientific_projection"
+            )
             if isinstance(scientific_identity, Mapping)
+            else None
+        )
+        producer_behavior = (
+            producer_compatibility.get("behavior_state")
+            if isinstance(producer_compatibility, Mapping)
+            else None
+        )
+        producer_scientific_identity = (
+            producer_behavior.get("scientific_identity")
+            if isinstance(producer_behavior, Mapping)
+            and producer_behavior.get("state_policy")
+            == "explicit_closed_scientific_identity_v1"
             else None
         )
         plan_sha256 = getattr(
@@ -13317,10 +13342,27 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             "scientific_content_sha256",
             None,
         )
+        component_input_fields = (
+            "dataset",
+            "effective_stage1_config",
+            "embedding_cache",
+            "exact_inner_contract",
+            "htr_input_nontruncation_audit",
+            "htr_model",
+            "query_config",
+            "semantic_witness_scientific_config",
+            "source_config",
+            "split_registry_content_sha256",
+            "stage1_scope_plan",
+        )
         if (
             not isinstance(producer_compatibility, Mapping)
-            or not isinstance(prepared_scientific_sha256, str)
-            or len(prepared_scientific_sha256) != 64
+            or not isinstance(prepared_projection, Mapping)
+            or any(
+                field not in prepared_projection
+                for field in component_input_fields
+            )
+            or not isinstance(producer_scientific_identity, Mapping)
             or not isinstance(plan_sha256, str)
             or len(plan_sha256) != 64
         ):
@@ -13328,12 +13370,19 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                 "Stage 1 component store compatibility identity is "
                 "incomplete"
             )
+        component_input_projection = {
+            field: copy.deepcopy(prepared_projection[field])
+            for field in component_input_fields
+        }
         compatibility = {
             "schema_version": (
-                "production_stage1_component_store_compatibility_v1"
+                "production_stage1_component_store_compatibility_v2"
             ),
-            "prepared_stage1_scientific_identity_sha256": (
-                prepared_scientific_sha256
+            "prepared_stage1_component_input_projection": (
+                component_input_projection
+            ),
+            "prepared_stage1_component_input_projection_sha256": (
+                _sha(component_input_projection)
             ),
             "stage1_scope_plan_scientific_content_sha256": (
                 plan_sha256
@@ -13341,10 +13390,14 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             "component_plan_namespace_identity": (
                 ROLE_NEUTRAL_STAGE1_COMPONENT_PLAN_NAMESPACE_IDENTITY
             ),
-            "component_producer_compatibility": copy.deepcopy(
-                dict(producer_compatibility)
+            "component_producer_scientific_identity": copy.deepcopy(
+                dict(producer_scientific_identity)
             ),
             "evidence_family_order": list(EVIDENCE_FAMILIES),
+            "component_authentication_is_final_reuse_authority": True,
+            "stage2_handoff_publisher_identity_included": False,
+            "stage2_catalog_identity_included": False,
+            "repository_source_closure_included": False,
             "resource_assignment_included": False,
             "cpu_budget_included": False,
             "owner_concurrency_included": False,
@@ -13407,6 +13460,151 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                 "Stage 1 component store payload root is not canonical"
             )
         return components
+
+    def _stage1_component_reuse_roots(
+        self,
+        *,
+        component_store_root: Path,
+        plan: Any,
+    ) -> tuple[Path, ...]:
+        """Discover prior stores; per-component producers remain authoritative."""
+
+        current = Path(component_store_root).resolve(strict=True)
+        namespace = current.parent.parent
+        if (
+            current.is_symlink()
+            or not current.is_dir()
+            or current.name != "components"
+            or namespace.is_symlink()
+            or namespace.resolve(strict=True) != namespace
+        ):
+            raise ValueError(
+                "Stage 1 component reuse namespace is not canonical"
+            )
+        current_manifest = _read_json_object(
+            current.parent / STAGE1_COMPONENT_STORE_MANIFEST,
+            label="current Stage 1 component store manifest",
+        )
+        current_compatibility = current_manifest.get("compatibility")
+        current_input_sha256 = (
+            current_compatibility.get(
+                "prepared_stage1_component_input_projection_sha256"
+            )
+            if isinstance(current_compatibility, Mapping)
+            else None
+        )
+        plan_sha256 = getattr(
+            plan,
+            "scientific_content_sha256",
+            None,
+        )
+        if (
+            not isinstance(current_input_sha256, str)
+            or len(current_input_sha256) != 64
+            or not isinstance(plan_sha256, str)
+            or len(plan_sha256) != 64
+        ):
+            raise ValueError(
+                "current Stage 1 component store compatibility is incomplete"
+            )
+
+        required_manifest_fields = {
+            "schema_version",
+            "component_store_key",
+            "compatibility",
+            "components_relative_path",
+            "successful_component_marker",
+            "incomplete_attempts_preserved_for_recovery",
+            "content_sha256",
+        }
+        accepted_schemas = {
+            STAGE1_COMPONENT_STORE_SCHEMA,
+            *LEGACY_STAGE1_COMPONENT_STORE_SCHEMAS,
+        }
+        roots: list[Path] = []
+        for candidate_store in sorted(
+            namespace.iterdir(),
+            key=lambda path: path.name,
+        ):
+            if candidate_store == current.parent:
+                continue
+            manifest_path = (
+                candidate_store / STAGE1_COMPONENT_STORE_MANIFEST
+            )
+            if not manifest_path.is_file() or manifest_path.is_symlink():
+                continue
+            if (
+                candidate_store.is_symlink()
+                or not candidate_store.is_dir()
+                or candidate_store.resolve(strict=True)
+                != candidate_store
+            ):
+                raise ValueError(
+                    "prior Stage 1 component store is not canonical"
+                )
+            manifest = _read_json_object(
+                manifest_path,
+                label="prior Stage 1 component store manifest",
+            )
+            body = {
+                key: copy.deepcopy(value)
+                for key, value in manifest.items()
+                if key != "content_sha256"
+            }
+            compatibility = manifest.get("compatibility")
+            if (
+                set(manifest) != required_manifest_fields
+                or manifest.get("schema_version")
+                not in accepted_schemas
+                or manifest.get("component_store_key")
+                != candidate_store.name
+                or manifest.get("components_relative_path")
+                != "components"
+                or manifest.get("successful_component_marker")
+                != "execution_manifest.json"
+                or manifest.get(
+                    "incomplete_attempts_preserved_for_recovery"
+                )
+                is not True
+                or manifest.get("content_sha256") != _sha(body)
+                or not isinstance(compatibility, Mapping)
+            ):
+                raise ValueError(
+                    "prior Stage 1 component store manifest is invalid"
+                )
+            if (
+                compatibility.get(
+                    "stage1_scope_plan_scientific_content_sha256"
+                )
+                != plan_sha256
+            ):
+                continue
+            if (
+                manifest.get("schema_version")
+                == STAGE1_COMPONENT_STORE_SCHEMA
+                and compatibility.get(
+                    "prepared_stage1_component_input_projection_sha256"
+                )
+                != current_input_sha256
+            ):
+                continue
+            candidate_components_path = candidate_store / "components"
+            if (
+                candidate_components_path.is_symlink()
+                or not candidate_components_path.is_dir()
+            ):
+                raise ValueError(
+                    "prior Stage 1 component payload root is not canonical"
+                )
+            candidate_components = (
+                candidate_components_path.resolve(strict=True)
+            )
+            if candidate_components.parent != candidate_store:
+                raise ValueError(
+                    "prior Stage 1 component payload root escaped its store"
+                )
+            roots.append(candidate_components)
+        return tuple(roots)
 
     def _run_portable_role_neutral_stage1_modeling(
         self,
@@ -13598,6 +13796,10 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             plan=plan,
             integration=integration,
         )
+        component_reuse_roots = self._stage1_component_reuse_roots(
+            component_store_root=component_store_root,
+            plan=plan,
+        )
 
         execution_root = (attempt / "role_neutral_stage1_execution").resolve()
         execution_manifest = execute_and_publish_role_neutral_stage1(
@@ -13608,6 +13810,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             executor=execution_executor,
             resume=self.options.run_control.resume,
             component_store_root=component_store_root,
+            component_reuse_roots=component_reuse_roots,
         )
         if (
             int(execution_manifest.get("physical_fit_count", -1)) != len(plan.physical_scopes)
@@ -16219,9 +16422,13 @@ def _default_portable_role_neutral_hooks(
         },
         handoff_publisher_scientific_identity={
             "schema_version": (
-                "role_neutral_handoff_publisher_scientific_identity_v1"
+                "role_neutral_handoff_publisher_scientific_identity_v2"
             ),
             "semantic_member_batch_size": semantic_member_batch_size,
+            "htr_catalog_representation": (
+                "authenticated_semantic_aggregates_with_complete_reverse_index_v2"
+            ),
+            "raw_htr_token_arrays_model_facing": False,
         },
     )
     return ProductionAllEvidenceWorkflowHooks(
