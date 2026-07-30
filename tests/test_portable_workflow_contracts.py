@@ -592,6 +592,7 @@ def test_scientific_identity_changes_for_window_config_not_deployment_metadata(
             resource_kind="cpu",
             device_count=1,
             scope_workers_per_device=2,
+            max_parallel_owners=1,
         ),
         resource_performance_safety=_resource_safety(
             maximum_allocation_fraction=0.7,

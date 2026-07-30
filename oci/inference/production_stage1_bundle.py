@@ -9998,6 +9998,8 @@ class Stage1BundleBuildOptions:
     resume: bool = False
     dry_run: bool = False
     embedding_cache_relocation: ProductionEmbeddingCacheRelocationOptions | None = None
+    embedding_cache_relocation_prepublication_root: Path | None = None
+    embedding_cache_validation_dataset_path: Path | None = None
     embedding_cache_configuration: Mapping[str, Any] | None = None
     embedding_cache_legacy_migration_identity: Mapping[str, Any] | None = None
     embedding_cache_operator_trusted_read_proof: Mapping[str, Any] | None = None
@@ -10110,6 +10112,47 @@ class ProductionStage1BundleBuilder:
         trusted_cache_read_proof = (
             options.embedding_cache_operator_trusted_read_proof
         )
+        cache_validation_dataset_path = (
+            options.embedding_cache_validation_dataset_path
+        )
+        relocation_prepublication_root = (
+            options.embedding_cache_relocation_prepublication_root
+        )
+        if relocation_prepublication_root is not None:
+            relocation_prepublication_root = Path(
+                relocation_prepublication_root
+            )
+            if (
+                not relocation_prepublication_root.is_absolute()
+                or Path(
+                    os.path.normpath(
+                        str(relocation_prepublication_root)
+                    )
+                )
+                != relocation_prepublication_root
+            ):
+                raise ValueError(
+                    "embedding_cache_relocation_prepublication_root must be "
+                    "one absolute lexically canonical historical path"
+                )
+        if cache_validation_dataset_path is not None:
+            supplied_cache_validation_dataset = Path(
+                cache_validation_dataset_path
+            )
+            if (
+                not supplied_cache_validation_dataset.is_absolute()
+                or supplied_cache_validation_dataset.is_symlink()
+                or not supplied_cache_validation_dataset.is_file()
+                or supplied_cache_validation_dataset.resolve(strict=True)
+                != supplied_cache_validation_dataset
+            ):
+                raise ValueError(
+                    "embedding_cache_validation_dataset_path must be one "
+                    "existing absolute non-symlink cohort copy"
+                )
+            cache_validation_dataset_path = (
+                supplied_cache_validation_dataset.resolve(strict=True)
+            )
         if trusted_cache_read_proof is not None:
             if options.embedding_cache_legacy_migration_identity is None:
                 raise ValueError(
@@ -10120,6 +10163,11 @@ class ProductionStage1BundleBuilder:
                 raise ValueError(
                     "operator-trusted embedding-cache reuse already binds the "
                     "adopted cache and cannot also invoke relocation validation"
+                )
+            if cache_validation_dataset_path is not None:
+                raise ValueError(
+                    "operator-trusted embedding-cache reuse already binds its "
+                    "historical cohort provenance"
                 )
         semantic_witness_scientific_config = (
             options.semantic_witness_scientific_config
@@ -10177,6 +10225,11 @@ class ProductionStage1BundleBuilder:
             )
         relocation: AuthenticatedProductionEmbeddingCacheRelocation | None = None
         if options.embedding_cache_relocation is not None:
+            if cache_validation_dataset_path is not None:
+                raise ValueError(
+                    "authenticated embedding-cache relocation already binds "
+                    "its historical cohort provenance"
+                )
             if (
                 options.embedding_cache_dir is None
                 or options.embedding_cache_output_dir is not None
@@ -10186,13 +10239,32 @@ class ProductionStage1BundleBuilder:
                     "a relocated cache requires its configured existing cache path "
                     "and forbids fresh-cache builder inputs"
                 )
-            relocation = validate_relocated_production_embedding_cache(
-                options.embedding_cache_relocation
-            )
+            if relocation_prepublication_root is None:
+                relocation = validate_relocated_production_embedding_cache(
+                    options.embedding_cache_relocation
+                )
+            else:
+                from .production_embedding_cache_phase_publication import (
+                    validate_phase_published_production_embedding_cache_relocation,
+                )
+
+                relocation = (
+                    validate_phase_published_production_embedding_cache_relocation(
+                        options.embedding_cache_relocation,
+                        prepublication_root=(
+                            relocation_prepublication_root
+                        ),
+                    )
+                )
             if dataset_path != relocation.prepared_cohort_path:
                 raise ValueError(
                     "Stage 1 dataset must be the authenticated relocated prepared cohort"
                 )
+        elif relocation_prepublication_root is not None:
+            raise ValueError(
+                "embedding_cache_relocation_prepublication_root requires an "
+                "authenticated relocation"
+            )
         if options.output_dir.is_symlink():
             raise ValueError("output directory cannot be a symlink")
         output_path = options.output_dir.resolve()
@@ -10277,6 +10349,11 @@ class ProductionStage1BundleBuilder:
             raise ValueError(
                 "operator-trusted embedding-cache reuse requires an existing "
                 "cache directory"
+            )
+        if cache_validation_dataset_path is not None and build_fresh_cache:
+            raise ValueError(
+                "fresh embedding-cache construction cannot use a separate "
+                "validation cohort copy"
             )
         canonical_cache_path = cache_dir.resolve(strict=not build_fresh_cache)
         if (
@@ -10486,7 +10563,11 @@ class ProductionStage1BundleBuilder:
         elif relocation is None:
             cache_input_identity = validate_published_production_embedding_cache(
                 cache_dir=cache_dir,
-                dataset_path=dataset_path,
+                dataset_path=(
+                    dataset_path
+                    if cache_validation_dataset_path is None
+                    else cache_validation_dataset_path
+                ),
                 text_column=config.text_column,
                 sentence_model_name=str(
                     config.architecture.multi_model_forest.embedding_contrast.model_name
@@ -10501,6 +10582,10 @@ class ProductionStage1BundleBuilder:
             # prepared cohort.  Re-running the legacy path-bound validator
             # against ``dataset_path`` would reject the correct relocation.
             cache_input_identity = copy.deepcopy(dict(relocation.cache_build_identity))
+        if cache_input_identity.get("dataset_sha256") != dataset_sha:
+            raise ValueError(
+                "embedding cache cohort bytes differ from the Stage 1 cohort"
+            )
         if fresh_result_identity is not None and fresh_result_identity != cache_input_identity:
             raise RuntimeError("fresh embedding-cache result differs from its read-only validation")
         if cache_input_identity.get("provider_identity") != cache_identity:
@@ -11106,7 +11191,12 @@ class ProductionStage1BundleBuilder:
                 )
             current_cache_input_identity = validate_published_production_embedding_cache(
                 cache_dir=prepared.embedding_cache_path,
-                dataset_path=Path(prepared.input_file_identities["dataset"]["path"]),
+                dataset_path=(
+                    Path(prepared.input_file_identities["dataset"]["path"])
+                    if prepared.options.embedding_cache_validation_dataset_path
+                    is None
+                    else prepared.options.embedding_cache_validation_dataset_path
+                ),
                 text_column=prepared.config.text_column,
                 sentence_model_name=str(
                     prepared.config.architecture.multi_model_forest.embedding_contrast.model_name
@@ -11114,9 +11204,28 @@ class ProductionStage1BundleBuilder:
                 chunk_configuration=cache_configuration,
             )
         else:
-            current_relocation = validate_relocated_production_embedding_cache(
-                prepared.options.embedding_cache_relocation
+            relocation_prepublication_root = (
+                prepared.options.embedding_cache_relocation_prepublication_root
             )
+            if relocation_prepublication_root is None:
+                current_relocation = (
+                    validate_relocated_production_embedding_cache(
+                        prepared.options.embedding_cache_relocation
+                    )
+                )
+            else:
+                from .production_embedding_cache_phase_publication import (
+                    validate_phase_published_production_embedding_cache_relocation,
+                )
+
+                current_relocation = (
+                    validate_phase_published_production_embedding_cache_relocation(
+                        prepared.options.embedding_cache_relocation,
+                        prepublication_root=(
+                            relocation_prepublication_root
+                        ),
+                    )
+                )
             if (
                 current_relocation.identity() != prepared.embedding_cache_relocation.identity()
                 or current_relocation.cache_dir != prepared.embedding_cache_path

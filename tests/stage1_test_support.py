@@ -8,6 +8,7 @@ from oci.inference.production_stage1_scope_scheduler import (
 )
 from oci.inference.stage1_execution_topology_policy import (
     ONE_CONTEXT_PER_SELECTED_DEVICE,
+    ONE_CONTEXT_SPANNING_ALL_SELECTED_DEVICES,
     Stage1ExecutionTopologyPolicy,
 )
 from oci.inference.stage1_htr_operational_controls import (
@@ -33,6 +34,7 @@ def stage1_execution_profile(
     resource_kind: str,
     device_count: int,
     scope_workers_per_device: int,
+    max_parallel_owners: int | None = None,
     executor_mode: str = "persistent_slots",
     persistent_slot_startup_timeout_seconds: float = 30.0,
     topology_mode: str = ONE_CONTEXT_PER_SELECTED_DEVICE,
@@ -59,10 +61,18 @@ def stage1_execution_profile(
     benchmark_publication_locator: Path | None = None,
 ) -> Stage1ExecutionProfile:
     topology = Stage1ExecutionTopologyPolicy(mode=topology_mode)
-    max_parallel_owners = topology.effective_parallel_owners_for_shape(
+    topology_capacity = topology.effective_parallel_owners_for_shape(
         resource_kind=resource_kind,
         device_count=device_count,
         workers_per_device=scope_workers_per_device,
+    )
+    if max_parallel_owners is None:
+        max_parallel_owners = topology_capacity
+    lease_device_count = (
+        device_count
+        if topology_mode
+        == ONE_CONTEXT_SPANNING_ALL_SELECTED_DEVICES
+        else 1
     )
     return Stage1ExecutionProfile(
         resource_kind=resource_kind,
@@ -78,9 +88,11 @@ def stage1_execution_profile(
             training_batch_size=training_batch_size,
             sentence_encoder_batch_size=sentence_encoder_batch_size,
             data_loader_workers=data_loader_workers,
-            fold_parallelism=device_count,
+            fold_parallelism=lease_device_count,
             fold_parallel_backend=(
-                "threads" if device_count == 1 else "processes"
+                "threads"
+                if lease_device_count == 1
+                else "processes"
             ),
             fold_slots_per_device=1,
             reuse_tokenizer_and_chunk_plans=(

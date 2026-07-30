@@ -69,6 +69,8 @@ _PATH_OPTION_FIELDS = frozenset(
         "output_dir",
         "embedding_local_model_path",
         "embedding_cache_output_dir",
+        "embedding_cache_relocation_prepublication_root",
+        "embedding_cache_validation_dataset_path",
         "query_config_path",
         "cluster_preflight_manifest_path",
         "cluster_preflight_state_bundle_manifest_path",

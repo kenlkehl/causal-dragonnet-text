@@ -2602,6 +2602,261 @@ def test_phase_uses_configured_scratch_then_publishes_durable_locators(tmp_path)
     assert manifest["result"]["terminal_files"] == [str(published / "nested" / "payload.bin")]
 
 
+def test_fresh_cache_publication_rehydrates_only_its_exact_path_bound_cohort(
+    tmp_path,
+):
+    workflow = object.__new__(ProductionAllEvidenceWorkflow)
+    durable_root = (tmp_path / "durable").resolve()
+    scratch_root = (tmp_path / "scratch").resolve()
+    request_sha256 = "a" * 64
+    attempt_name = "attempt_20260728T002827455911Z"
+    published_root = (
+        durable_root / "phases" / "embedding_cache" / attempt_name
+    )
+    cache = published_root / "embedding_cache"
+    prepared = published_root / "prepared" / "modeling_cohort.parquet"
+    cache.mkdir(parents=True)
+    prepared.parent.mkdir(parents=True)
+    prepared.write_bytes(b"exact byte-authenticated prepared cohort")
+    historical = (
+        scratch_root
+        / "production_all_evidence_workflow"
+        / request_sha256
+        / "embedding_cache"
+        / attempt_name
+        / "prepared"
+        / "modeling_cohort.parquet"
+    )
+    (cache / "metadata.json").write_text(
+        json.dumps(
+            {
+                "production_provenance": {
+                    "dataset": {"path": str(historical)}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    workflow.options = SimpleNamespace(
+        work_root=durable_root,
+        scratch_root=scratch_root,
+    )
+    workflow.request = {"request_sha256": request_sha256}
+    phase = {
+        "schema_version": workflow_module.WORKFLOW_PHASE_MANIFEST_SCHEMA,
+        "attempt_dir": str(published_root),
+        "content_sha256": "b" * 64,
+    }
+    preparation_cohort = (
+        durable_root
+        / "phases"
+        / "input_preparation"
+        / attempt_name
+        / "prepared"
+        / "modeling_cohort.parquet"
+    )
+    preparation_cohort.parent.mkdir(parents=True)
+    preparation_cohort.write_bytes(prepared.read_bytes())
+    input_preparation_root = preparation_cohort.parents[1]
+    input_preparation_phase = {
+        "schema_version": workflow_module.WORKFLOW_PHASE_MANIFEST_SCHEMA,
+        "attempt_dir": str(input_preparation_root),
+        "content_sha256": "c" * 64,
+    }
+    workflow._validated_complete = lambda name: {
+        "embedding_cache": phase,
+        "input_preparation": input_preparation_phase,
+    }.get(name)
+    preparation_body = {
+        "output": {
+            "path": str(
+                scratch_root
+                / "production_all_evidence_workflow"
+                / request_sha256
+                / "input_preparation"
+                / attempt_name
+                / "prepared"
+                / "modeling_cohort.parquet"
+            ),
+            "sha256": workflow_module.stable_file_sha256(
+                preparation_cohort
+            )[0],
+            "size_bytes": preparation_cohort.stat().st_size,
+        }
+    }
+    preparation_manifest = (
+        preparation_cohort.parent / "preparation_manifest.json"
+    )
+    preparation_manifest.write_text(
+        json.dumps(
+            {
+                **preparation_body,
+                "content_sha256": workflow_module._sha(
+                    preparation_body
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    workflow._input_preparation_paths = lambda: (
+        preparation_cohort,
+        preparation_manifest,
+    )
+
+    input_validation_cohort, input_validation_manifest = (
+        workflow._input_preparation_validation_paths()
+    )
+    assert input_validation_cohort.read_bytes() == (
+        preparation_cohort.read_bytes()
+    )
+    assert input_validation_manifest == preparation_manifest
+    assert (
+        durable_root
+        / "recovery"
+        / "input_preparation_dataset_provenance_rehydration.json"
+    ).is_file()
+
+    assert workflow._embedding_cache_validation_dataset_path(
+        cache=cache,
+        prepared=prepared,
+    ) == historical
+    assert historical.read_bytes() == prepared.read_bytes()
+    proof = json.loads(
+        (
+            durable_root
+            / "recovery"
+            / "embedding_cache_dataset_provenance_rehydration.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert proof["dataset_sha256"] == workflow_module.stable_file_sha256(
+        prepared
+    )[0]
+    assert proof["historical_dataset_path"] == str(historical)
+    assert proof["durable_dataset_path"] == str(prepared)
+    recovered_preparation_manifest = (
+        historical.parent / "preparation_manifest.json"
+    )
+    assert recovered_preparation_manifest.is_file()
+    assert proof["historical_preparation_manifest_path"] == str(
+        recovered_preparation_manifest
+    )
+    durable_recovered_preparation_manifest = (
+        durable_root
+        / "recovery"
+        / "embedding_cache_source_preparation_manifest.json"
+    )
+    assert durable_recovered_preparation_manifest.read_bytes() == (
+        recovered_preparation_manifest.read_bytes()
+    )
+    assert proof["durable_recovered_preparation_manifest_path"] == str(
+        durable_recovered_preparation_manifest
+    )
+    assert workflow._embedding_cache_validation_dataset_path(
+        cache=cache,
+        prepared=prepared,
+    ) == historical
+    historical.write_bytes(b"tampered historical cohort")
+    with pytest.raises(
+        RuntimeError,
+        match="historical and durable cohorts differ",
+    ):
+        workflow._embedding_cache_validation_dataset_path(
+            cache=cache,
+            prepared=prepared,
+        )
+
+
+def test_stage1_reopens_adopted_input_preparation_without_republishing_it(
+    tmp_path,
+):
+    workflow = object.__new__(ProductionAllEvidenceWorkflow)
+    durable_root = (tmp_path / "durable").resolve()
+    adopted_root = durable_root / "adopted_input_preparation"
+    prepared = adopted_root / "prepared" / "modeling_cohort.parquet"
+    prepared.parent.mkdir(parents=True)
+    prepared.write_bytes(b"authenticated adopted prepared cohort")
+    historical = (
+        tmp_path
+        / "producer-scratch"
+        / "input_preparation"
+        / "attempt_20260728T162717785010Z"
+        / "prepared"
+        / "modeling_cohort.parquet"
+    ).resolve()
+    historical.parent.mkdir(parents=True)
+    historical.write_bytes(prepared.read_bytes())
+    registration_sha256, registration_size = (
+        workflow_module.stable_file_sha256(prepared)
+    )
+    manifest_body = {
+        "output": {
+            "path": str(historical),
+            "sha256": registration_sha256,
+            "size_bytes": registration_size,
+        }
+    }
+    manifest = prepared.parent / "preparation_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                **manifest_body,
+                "content_sha256": workflow_module._sha(manifest_body),
+            }
+        ),
+        encoding="utf-8",
+    )
+    phase = {
+        "schema_version": (
+            workflow_module.WORKFLOW_ADOPTED_PHASE_MANIFEST_SCHEMA
+        ),
+        "attempt_dir": str(adopted_root),
+        "content_sha256": "b" * 64,
+    }
+    workflow.options = SimpleNamespace(
+        work_root=durable_root,
+        scratch_root=tmp_path / "consumer-scratch",
+    )
+    workflow.request = {"request_sha256": "a" * 64}
+    workflow._validated_complete = lambda name: (
+        phase if name == "input_preparation" else None
+    )
+    workflow._input_preparation_paths = lambda: (
+        prepared.resolve(strict=True),
+        manifest.resolve(strict=True),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires a fresh local preparation",
+    ):
+        workflow._input_preparation_validation_paths()
+
+    reopened, reopened_manifest = (
+        workflow._stage1_input_preparation_validation_paths()
+    )
+    assert reopened == historical
+    assert reopened_manifest == manifest.resolve(strict=True)
+    proof = json.loads(
+        (
+            durable_root
+            / "recovery"
+            / "input_preparation_dataset_provenance_rehydration.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert proof["copy_policy"] == "adopted_producer_path_reopened_v1"
+    assert proof["historical_dataset_path"] == str(historical)
+    assert proof["durable_dataset_path"] == str(
+        prepared.resolve(strict=True)
+    )
+
+    historical.write_bytes(b"tampered adopted historical cohort")
+    with pytest.raises(
+        RuntimeError,
+        match="historical and durable prepared cohorts differ",
+    ):
+        workflow._stage1_input_preparation_validation_paths()
+
+
 def test_resume_reuses_attempt_only_for_in_place_resumable_phases(tmp_path):
     workflow = object.__new__(ProductionAllEvidenceWorkflow)
     workflow.options = SimpleNamespace(
@@ -2760,12 +3015,23 @@ def test_scientific_spec_and_complete_direct_deployment_compile_typed_options(
 ) -> None:
     configured = _options(tmp_path)
     scientific_path = _write_scientific_spec(tmp_path / "scientific.json")
-    args = build_parser().parse_args(
-        _direct_deployment_args(
-            options=configured,
-            scientific_spec=scientific_path,
-            scratch_root=tmp_path / "direct-scratch",
+    deployment_args = _direct_deployment_args(
+        options=configured,
+        scientific_spec=scientific_path,
+        scratch_root=tmp_path / "direct-scratch",
+    )
+    deployment_args[
+        deployment_args.index(
+            "--stage1-scope-workers-per-device"
         )
+        + 1
+    ] = "4"
+    deployment_args[
+        deployment_args.index("--stage1-max-parallel-owners")
+        + 1
+    ] = "2"
+    args = build_parser().parse_args(
+        deployment_args
         + [
             "--resume",
             "--stop-after",
@@ -2785,7 +3051,11 @@ def test_scientific_spec_and_complete_direct_deployment_compile_typed_options(
     assert parsed.embedding_model_name == configured.embedding_model_name
     assert parsed.device_policy == ("cpu",)
     assert parsed.stage1_execution_profile is not None
-    assert parsed.stage1_execution_profile.max_parallel_owners == 1
+    assert (
+        parsed.stage1_execution_profile.scope_workers_per_device
+        == 4
+    )
+    assert parsed.stage1_execution_profile.max_parallel_owners == 2
     assert (
         parsed.stage1_execution_profile
         .persistent_slot_startup_timeout_seconds
@@ -4597,6 +4867,14 @@ def test_relocated_cache_attestation_is_propagated_to_stage1_builder(
         "_embedding_cache_relocation_options",
         lambda **_kwargs: sentinel,
     )
+    prepublication_root = (
+        tmp_path / "historical-scratch" / "relocated-cache"
+    ).resolve()
+    monkeypatch.setattr(
+        workflow,
+        "_embedding_cache_relocation_prepublication_root",
+        lambda **_kwargs: prepublication_root,
+    )
     profile = tmp_path / "effective.json"
     profile.write_text("{}", encoding="utf-8")
     cache = tmp_path / "relocated" / "embedding_cache"
@@ -4612,6 +4890,10 @@ def test_relocated_cache_attestation_is_propagated_to_stage1_builder(
         dry_run=False,
     )
     assert built.embedding_cache_relocation is sentinel
+    assert (
+        built.embedding_cache_relocation_prepublication_root
+        == prepublication_root
+    )
     assert (
         built.stage1_scope_attempt_root
         == (options.work_root / "recovery/stage1_scope_attempts").resolve()
@@ -4661,6 +4943,13 @@ def test_portable_semantic_witness_profile_is_bound_to_stage1_request(
     )
     cache = tmp_path / "embedding-cache"
     cache.mkdir()
+    historical_prepared = tmp_path / "scratch-at-build-time.parquet"
+    historical_prepared.write_bytes(options.dataset_path.read_bytes())
+    monkeypatch.setattr(
+        workflow,
+        "_embedding_cache_validation_dataset_path",
+        lambda **_kwargs: historical_prepared.resolve(),
+    )
     output = tmp_path / "bundle"
 
     built = workflow._stage1_build_options(
@@ -4685,6 +4974,10 @@ def test_portable_semantic_witness_profile_is_bound_to_stage1_request(
         ]["producer_configuration"]
     )
     assert built.portable_cluster_preflight_v2 is True
+    assert (
+        built.embedding_cache_validation_dataset_path
+        == historical_prepared.resolve()
+    )
 
 
 def test_effective_profile_binds_review_tfidf_and_interaction_cli_settings(

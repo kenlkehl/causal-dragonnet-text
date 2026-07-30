@@ -30,6 +30,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import signal
 import stat
 import threading
@@ -962,12 +963,6 @@ class RoleNeutralStage1ExecutionPolicy:
                 "execution policy HTR controls must use the typed "
                 "deployment-only contract"
             )
-        if self.htr_operational_controls is not None:
-            selected_devices = tuple(self.resource_plan.devices)
-            self.htr_operational_controls.bind_fold_resources(
-                devices=selected_devices,
-                owner_cpu_budget=int(self.resource_plan.cpu_budget),
-            )
         if (
             self.neural_query_operational_controls is not None
             and not isinstance(
@@ -1004,21 +999,21 @@ class RoleNeutralStage1ExecutionPolicy:
             "neural_query_execution_topologies",
             topologies,
         )
-        if self.neural_query_operational_controls is not None:
-            effective_owners = (
-                max(1, workers // len(self.resource_plan.devices))
-                if self.htr_operational_controls is not None
-                else workers
-            )
-            owner_cpu_budget = max(
-                1,
-                int(self.resource_plan.cpu_budget) // effective_owners,
-            )
-            runtime_topologies = tuple(topologies.values()) or tuple(
-                NeuralQueryExecutionTopology.single(device)
-                for device in self.resource_plan.devices
-            )
-            for topology in runtime_topologies:
+        owner_cpu_budget = max(
+            1,
+            int(self.resource_plan.cpu_budget) // workers,
+        )
+        runtime_topologies = tuple(topologies.values()) or tuple(
+            NeuralQueryExecutionTopology.single(device)
+            for device in self.resource_plan.devices
+        )
+        for topology in runtime_topologies:
+            if self.htr_operational_controls is not None:
+                self.htr_operational_controls.bind_fold_resources(
+                    devices=topology.devices,
+                    owner_cpu_budget=owner_cpu_budget,
+                )
+            if self.neural_query_operational_controls is not None:
                 self.neural_query_operational_controls.bind_task_resources(
                     devices=topology.devices,
                     owner_cpu_budget=owner_cpu_budget,
@@ -1062,6 +1057,26 @@ def _execute_one_owner(
     component_execution_intervals: list[dict[str, Any]] = []
     resumed_components: list[str] = []
 
+    def archive_incomplete_component(
+        path: Path,
+        *,
+        component: str,
+    ) -> None:
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError(
+                f"{task.physical_owner.scope_id}/{component} incomplete "
+                "resume output is not a real directory"
+            )
+        recovery_root = (
+            task.component_parent.parent.parent.parent
+            / "interrupted_role_neutral_components"
+            / task.physical_owner.scope_id
+        )
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        path.rename(
+            recovery_root / f"{component}.{time.time_ns()}"
+        )
+
     def execution_resources(
         component: str,
     ) -> tuple[bool, tuple[str, ...]]:
@@ -1086,6 +1101,24 @@ def _execute_one_owner(
 
     for component in EXPECTED_COMPONENT_FAMILIES:
         component_root = task.component_parent / component
+        incomplete_attempts = tuple(
+            sorted(
+                task.component_parent.glob(
+                    f".{component}.attempt-*"
+                ),
+                key=lambda path: path.name,
+            )
+        )
+        if incomplete_attempts and not resume:
+            raise FileExistsError(
+                f"{task.physical_owner.scope_id}/{component} has a prior "
+                "temporary producer attempt"
+            )
+        for incomplete_attempt in incomplete_attempts:
+            archive_incomplete_component(
+                incomplete_attempt,
+                component=component,
+            )
         terminal_path = (
             component_root / ROLE_NEUTRAL_EXECUTION_MANIFEST
         )
@@ -1101,26 +1134,22 @@ def _execute_one_owner(
             and not completed_resume_candidate
             and (component_root.exists() or component_root.is_symlink())
         ):
-            if component_root.is_symlink() or not component_root.is_dir():
-                raise ValueError(
-                    f"{task.physical_owner.scope_id}/{component} incomplete "
-                    "resume output is not a real directory"
-                )
-            recovery_root = (
-                task.component_parent.parent.parent.parent
-                / "interrupted_role_neutral_components"
-                / task.physical_owner.scope_id
+            archive_incomplete_component(
+                component_root,
+                component=component,
             )
-            recovery_root.mkdir(parents=True, exist_ok=True)
-            component_root.rename(
-                recovery_root / f"{component}.{time.time_ns()}"
+        producer_root = component_root
+        if not completed_resume_candidate:
+            producer_root = task.component_parent / (
+                f".{component}.attempt-{os.getpid()}-"
+                f"{threading.get_ident()}-{time.time_ns()}"
             )
         invocation = RoleNeutralComponentInvocation(
             plan=task.plan,
             physical_owner=task.physical_owner,
             logical_members=task.logical_members,
             component=component,
-            output_root=component_root,
+            output_root=producer_root,
             resource=task.resource,
             neural_query_execution_topology=(
                 task.neural_query_execution_topology
@@ -1198,6 +1227,11 @@ def _execute_one_owner(
                 f"{task.physical_owner.scope_id}/{component} output "
                 "existed before producer execution"
             )
+        if producer_root.exists() or producer_root.is_symlink():
+            raise FileExistsError(
+                f"{task.physical_owner.scope_id}/{component} temporary "
+                "producer output existed before execution"
+            )
         interval_started_monotonic_ns = time.monotonic_ns()
         execution_result = bound.execute()
         interval_finished_monotonic_ns = time.monotonic_ns()
@@ -1269,15 +1303,23 @@ def _execute_one_owner(
                 "operationally attested"
             )
         if (
-            component_root.is_symlink()
-            or component_root.resolve(strict=True) != component_root
-            or not component_root.is_dir()
+            producer_root.is_symlink()
+            or producer_root.resolve(strict=True) != producer_root
+            or not producer_root.is_dir()
         ):
             raise ValueError(
                 f"{task.physical_owner.scope_id}/{component} producer "
                 "did not publish its requested canonical root"
             )
         receipt = bound.authenticate()
+        receipt = validate_authenticated_role_neutral_component_receipt(
+            root=producer_root,
+            plan=task.plan,
+            physical_owner_scope_id=task.physical_owner.scope_id,
+            receipt=receipt,
+            expected_component=component,
+        )
+        producer_root.rename(component_root)
         receipt = validate_authenticated_role_neutral_component_receipt(
             root=component_root,
             plan=task.plan,
@@ -2620,6 +2662,7 @@ def execute_and_publish_role_neutral_stage1(
     policy: RoleNeutralStage1ExecutionPolicy,
     executor: RoleNeutralPhysicalOwnerExecutor,
     resume: bool = False,
+    component_store_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Execute canonical owners and publish the authenticated all-ten gate."""
 
@@ -2686,11 +2729,7 @@ def execute_and_publish_role_neutral_stage1(
         policy.resource_plan,
     )
     groups = {owner.scope_id: (owner, members) for owner, members in plan.physical_scope_groups}
-    effective_owner_concurrency = (
-        1
-        if policy.htr_operational_controls is not None
-        else int(policy.max_parallel_owners)
-    )
+    effective_owner_concurrency = int(policy.max_parallel_owners)
     owner_cpu_budget = max(
         1,
         int(policy.resource_plan.cpu_budget)
@@ -2698,14 +2737,41 @@ def execute_and_publish_role_neutral_stage1(
     )
 
     destination.mkdir(exist_ok=resume)
-    component_root = destination / ROLE_NEUTRAL_COMPONENT_DIRECTORY
-    component_root.mkdir(exist_ok=resume)
+    execution_component_root = (
+        destination / ROLE_NEUTRAL_COMPONENT_DIRECTORY
+    )
+    execution_component_root.mkdir(exist_ok=resume)
+    if component_store_root is None:
+        owner_component_root = execution_component_root
+    else:
+        owner_component_root = Path(component_store_root)
+        if not owner_component_root.is_absolute():
+            raise ValueError(
+                "Stage 1 component store root must be absolute"
+            )
+        owner_component_root.mkdir(parents=True, exist_ok=True)
+        if (
+            owner_component_root.is_symlink()
+            or owner_component_root.resolve(strict=True)
+            != owner_component_root
+            or owner_component_root == execution_component_root
+            or owner_component_root in destination.parents
+            or destination in owner_component_root.parents
+        ):
+            raise ValueError(
+                "Stage 1 component store must be one distinct canonical "
+                "directory"
+            )
+        if resume:
+            _archive_stale_process_markers_for_resume(
+                owner_component_root.parent
+            )
     tasks = tuple(
         RoleNeutralPhysicalOwnerTask(
             plan=plan,
             physical_owner=groups[owner_scope_id][0],
             logical_members=groups[owner_scope_id][1],
-            component_parent=component_root / owner_scope_id,
+            component_parent=owner_component_root / owner_scope_id,
             resource=assigned_resources[owner_scope_id],
             neural_query_execution_topology=(
                 policy.neural_query_topology_for(
@@ -2717,9 +2783,9 @@ def execute_and_publish_role_neutral_stage1(
                 policy.neural_query_operational_controls
             ),
             htr_fold_devices=(
-                tuple(policy.resource_plan.devices)
-                if policy.htr_operational_controls is not None
-                else (assigned_resources[owner_scope_id],)
+                policy.neural_query_topology_for(
+                    assigned_resources[owner_scope_id]
+                ).devices
             ),
             owner_cpu_budget=owner_cpu_budget,
             resume=resume,
@@ -2727,6 +2793,111 @@ def execute_and_publish_role_neutral_stage1(
         for owner_scope_id in physical_order
     )
     task_by_owner = {task.physical_owner.scope_id: task for task in tasks}
+    if (
+        resume
+        and owner_component_root != execution_component_root
+    ):
+        # Upgrade an in-place phase resume to the stable component store
+        # without mutating or removing the original attempt tree.  Only a
+        # component that the current producer can freshly authenticate is
+        # copied; incompatible or incomplete legacy output is left in place
+        # and the ordinary store task recomputes it.
+        for task in tasks:
+            local_owner_root = (
+                execution_component_root
+                / task.physical_owner.scope_id
+            )
+            if (
+                local_owner_root.is_symlink()
+                or not local_owner_root.is_dir()
+            ):
+                continue
+            task.component_parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            for component in EXPECTED_COMPONENT_FAMILIES:
+                store_target = task.component_parent / component
+                if store_target.exists() or store_target.is_symlink():
+                    continue
+                local_source = local_owner_root / component
+                local_terminal = (
+                    local_source
+                    / ROLE_NEUTRAL_EXECUTION_MANIFEST
+                )
+                if (
+                    local_source.is_symlink()
+                    or not local_source.is_dir()
+                    or local_terminal.is_symlink()
+                    or not local_terminal.is_file()
+                ):
+                    continue
+                invocation = RoleNeutralComponentInvocation(
+                    plan=task.plan,
+                    physical_owner=task.physical_owner,
+                    logical_members=task.logical_members,
+                    component=component,
+                    output_root=local_source,
+                    resource=task.resource,
+                    neural_query_execution_topology=(
+                        task.neural_query_execution_topology
+                    ),
+                    htr_operational_controls=(
+                        task.htr_operational_controls
+                    ),
+                    neural_query_operational_controls=(
+                        task.neural_query_operational_controls
+                    ),
+                    htr_fold_devices=task.htr_fold_devices,
+                    owner_cpu_budget=task.owner_cpu_budget,
+                )
+                try:
+                    bound = factories[component](invocation)
+                    if not isinstance(
+                        bound,
+                        BoundRoleNeutralComponentProducer,
+                    ):
+                        raise TypeError(
+                            "component migration factory returned an "
+                            "untyped producer"
+                        )
+                    receipt = (
+                        validate_authenticated_role_neutral_component_receipt(
+                            root=local_source,
+                            plan=task.plan,
+                            physical_owner_scope_id=(
+                                task.physical_owner.scope_id
+                            ),
+                            receipt=bound.authenticate(),
+                            expected_component=component,
+                        )
+                    )
+                except Exception:
+                    continue
+                temporary = task.component_parent / (
+                    f".{component}.attempt-import-{os.getpid()}-"
+                    f"{time.time_ns()}"
+                )
+                shutil.copytree(local_source, temporary)
+                validate_authenticated_role_neutral_component_receipt(
+                    root=temporary,
+                    plan=task.plan,
+                    physical_owner_scope_id=(
+                        task.physical_owner.scope_id
+                    ),
+                    receipt=receipt,
+                    expected_component=component,
+                )
+                temporary.rename(store_target)
+                validate_authenticated_role_neutral_component_receipt(
+                    root=store_target,
+                    plan=task.plan,
+                    physical_owner_scope_id=(
+                        task.physical_owner.scope_id
+                    ),
+                    receipt=receipt,
+                    expected_component=component,
+                )
 
     claim_lock = threading.Lock()
     claimed: set[str] = set()
@@ -3077,6 +3248,17 @@ def execute_and_publish_role_neutral_stage1(
             )
             persistent_session = open_session(
                 resources=tuple(policy.resource_plan.devices),
+                resource_leases=tuple(
+                    tuple(
+                        dict.fromkeys(
+                            (
+                                *task.neural_query_execution_topology.devices,
+                                *task.htr_fold_devices,
+                            )
+                        )
+                    )
+                    for task in tasks
+                ),
                 max_workers=effective_owner_concurrency,
                 cpu_budget=int(policy.resource_plan.cpu_budget),
                 marker_root=session_marker_root,
@@ -3109,6 +3291,147 @@ def execute_and_publish_role_neutral_stage1(
             )
             for result in raw_results
         )
+    if owner_component_root != execution_component_root:
+        materialized_results: list[
+            RoleNeutralPhysicalOwnerResult
+        ] = []
+        for result in authenticated_results:
+            task = task_by_owner[
+                result.physical_owner_scope_id
+            ]
+            local_owner_root = (
+                execution_component_root
+                / result.physical_owner_scope_id
+            )
+            local_owner_root.mkdir(parents=True, exist_ok=True)
+            local_sources: list[
+                RoleNeutralComponentArtifactSource
+            ] = []
+            for component, source in zip(
+                EXPECTED_COMPONENT_FAMILIES,
+                result.sources,
+                strict=True,
+            ):
+                target = local_owner_root / component
+                recovery_root = (
+                    destination.parent
+                    / "interrupted_role_neutral_materializations"
+                    / result.physical_owner_scope_id
+                )
+                stale_materializations = tuple(
+                    local_owner_root.glob(
+                        f".{component}.materialize-*"
+                    )
+                )
+                stale_producer_attempts = tuple(
+                    local_owner_root.glob(
+                        f".{component}.attempt-*"
+                    )
+                )
+                for stale in sorted(
+                    (
+                        *stale_materializations,
+                        *stale_producer_attempts,
+                    ),
+                    key=lambda path: path.name,
+                ):
+                    if stale.is_symlink() or not stale.is_dir():
+                        raise ValueError(
+                            "incomplete component materialization is not "
+                            "one real directory"
+                        )
+                    recovery_root.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+                    stale.rename(
+                        recovery_root
+                        / f"{component}.{time.time_ns()}"
+                    )
+                receipt = source.receipt
+                if target.exists() or target.is_symlink():
+                    try:
+                        receipt = (
+                            validate_authenticated_role_neutral_component_receipt(
+                                root=target,
+                                plan=plan,
+                                physical_owner_scope_id=(
+                                    result.physical_owner_scope_id
+                                ),
+                                receipt=receipt,
+                                expected_component=component,
+                            )
+                        )
+                    except Exception:
+                        if target.is_symlink() or not target.is_dir():
+                            raise ValueError(
+                                "existing component materialization is not "
+                                "one real directory"
+                            )
+                        recovery_root.mkdir(
+                            parents=True,
+                            exist_ok=True,
+                        )
+                        target.rename(
+                            recovery_root
+                            / f"{component}.{time.time_ns()}"
+                        )
+                    else:
+                        local_sources.append(
+                            RoleNeutralComponentArtifactSource(
+                                root=target,
+                                receipt=receipt,
+                            )
+                        )
+                        continue
+                temporary = local_owner_root / (
+                    f".{component}.materialize-{os.getpid()}-"
+                    f"{threading.get_ident()}-{time.time_ns()}"
+                )
+                shutil.copytree(source.root, temporary)
+                receipt = (
+                    validate_authenticated_role_neutral_component_receipt(
+                        root=temporary,
+                        plan=plan,
+                        physical_owner_scope_id=(
+                            result.physical_owner_scope_id
+                        ),
+                        receipt=receipt,
+                        expected_component=component,
+                    )
+                )
+                temporary.rename(target)
+                receipt = (
+                    validate_authenticated_role_neutral_component_receipt(
+                        root=target,
+                        plan=plan,
+                        physical_owner_scope_id=(
+                            result.physical_owner_scope_id
+                        ),
+                        receipt=receipt,
+                        expected_component=component,
+                    )
+                )
+                local_sources.append(
+                    RoleNeutralComponentArtifactSource(
+                        root=target,
+                        receipt=receipt,
+                    )
+                )
+            local_task = replace(
+                task,
+                component_parent=local_owner_root,
+            )
+            materialized_results.append(
+                _freshly_reauthenticate_owner_result(
+                    task=local_task,
+                    result=replace(
+                        result,
+                        sources=tuple(local_sources),
+                    ),
+                )
+            )
+        authenticated_results = tuple(materialized_results)
     sources_by_owner, completion_order = _normalize_executor_results(
         plan=plan,
         results=authenticated_results,
@@ -3178,9 +3501,7 @@ def execute_and_publish_role_neutral_stage1(
         "effective_max_parallel_owners": effective_owner_concurrency,
         "owner_cpu_budget": owner_cpu_budget,
         "effective_owner_concurrency_policy": (
-            "htr_union_device_owner_serialization_v1"
-            if policy.htr_operational_controls is not None
-            else "configured_topology_capacity_v1"
+            "configured_disjoint_owner_lease_capacity_v2"
         ),
         "cpu_budget": int(policy.resource_plan.cpu_budget),
         "submitted_owner_order": list(physical_order),
@@ -3979,10 +4300,14 @@ def validate_role_neutral_stage1_execution(
         not in {
             "configured_topology_capacity_v1",
             "htr_union_device_owner_serialization_v1",
+            "configured_disjoint_owner_lease_capacity_v2",
         }
         or (
             attestation.get("effective_owner_concurrency_policy")
-            == "configured_topology_capacity_v1"
+            in {
+                "configured_topology_capacity_v1",
+                "configured_disjoint_owner_lease_capacity_v2",
+            }
             and int(attestation["effective_max_parallel_owners"])
             != int(attestation["max_parallel_owners"])
         )

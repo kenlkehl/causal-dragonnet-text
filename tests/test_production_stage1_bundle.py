@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -2157,6 +2158,8 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
     config.architecture.multi_model_forest.htr_fold_parallelism = "2"
     dataset_path = tmp_path / "cohort.parquet"
     dataset_path.write_bytes(b"authenticated parquet container placeholder")
+    validation_dataset_path = tmp_path / "historical-cohort.parquet"
+    validation_dataset_path.write_bytes(dataset_path.read_bytes())
     config_path = tmp_path / "stage1.json"
     config_path.write_text(json.dumps({"applied_inference": asdict(config)}), encoding="utf-8")
     query_config_path = tmp_path / "query.json"
@@ -2215,12 +2218,22 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
         "oci.inference.production_stage1_bundle.SpentOnlyFrozenChunkEmbeddingCache",
         FakeCache,
     )
+    cache_validation_calls = []
+
+    def validate_cache(**kwargs):
+        cache_validation_calls.append(kwargs)
+        assert kwargs["dataset_path"] == validation_dataset_path.resolve()
+        return {
+            "schema_version": "production_arbitrary_cohort_embedding_cache_result_v2",
+            "dataset_sha256": hashlib.sha256(
+                dataset_path.read_bytes()
+            ).hexdigest(),
+            "provider_identity": FakeCache(cache_dir).identity(),
+        }
+
     monkeypatch.setattr(
         "oci.inference.production_stage1_bundle.validate_published_production_embedding_cache",
-        lambda **_kwargs: {
-            "schema_version": "production_arbitrary_cohort_embedding_cache_result_v2",
-            "provider_identity": FakeCache(cache_dir).identity(),
-        },
+        validate_cache,
     )
     cluster_audit = {"test_cluster_preflight": "closed"}
     monkeypatch.setattr(
@@ -2237,6 +2250,9 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
             initial_training_partitions=3,
             physical_fit_identity=PHYSICAL_FIT_IDENTITY,
             query_config_path=query_config_path,
+            embedding_cache_validation_dataset_path=(
+                validation_dataset_path
+            ),
             embedding_cache_configuration=(
                 _embedding_cache_configuration(config)
             ),
@@ -2248,6 +2264,7 @@ def test_prepare_projects_only_id_text_treatment_and_observed_outcome(
             builder.prepare()
         return
     prepared = builder.prepare()
+    assert len(cache_validation_calls) == 1
     effective = prepared.request["effective_stage1_config"]
     legacy_effective = effective["architecture"]["multi_model_agentic_forest"]
     integrated_effective = effective["architecture"]["multi_model_forest"]

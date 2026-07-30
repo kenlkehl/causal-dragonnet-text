@@ -955,12 +955,8 @@ class ProcessIsolatedRoleNeutralPhysicalOwnerExecutor:
         active: list[_ActiveOwner] = []
         completed: list[RoleNeutralPhysicalOwnerResult] = []
         active_by_resource: dict[str, int] = {}
-        widest_reservation = max(
-            len(_task_execution_resources(task))
-            for task in rows
-        )
         maximum_active = min(
-            max(1, workers // widest_reservation),
+            workers,
             len(rows),
         )
         native_threads = max(1, budget // maximum_active)

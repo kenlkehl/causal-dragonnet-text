@@ -1078,6 +1078,40 @@ def completed_htr_group(tmp_path_factory):
     }
 
 
+def test_htr_npy_authentication_uses_one_bounded_in_memory_read(
+    tmp_path: Path,
+    monkeypatch,
+):
+    target = tmp_path / "state.npy"
+    expected = np.arange(24, dtype=np.float64).reshape(4, 6)
+    with target.open("xb") as stream:
+        np.save(stream, expected, allow_pickle=False)
+
+    original_load = np.load
+    observed: list[tuple[object, dict]] = []
+
+    def guarded_load(source, *args, **kwargs):
+        observed.append((source, dict(kwargs)))
+        assert hasattr(source, "read")
+        assert "mmap_mode" not in kwargs
+        return original_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(group_module.np, "load", guarded_load)
+    digest, size, loaded = group_module._read_npy_file_once(
+        target,
+        label="test HTR array",
+        invalid_message="test HTR array is invalid",
+    )
+
+    assert observed and len(observed) == 1
+    assert observed[0][1] == {"allow_pickle": False}
+    assert digest == group_module._sha256_file(target)[0]
+    assert size == target.stat().st_size
+    assert isinstance(loaded, np.ndarray)
+    assert not isinstance(loaded, np.memmap)
+    np.testing.assert_array_equal(loaded, expected)
+
+
 def test_operational_encoder_batch_workers_and_complete_plan_reuse_are_exact(
     completed_htr_group,
     tmp_path: Path,

@@ -123,6 +123,10 @@ PORTABLE_ROLE_NEUTRAL_STAGE1_PHASE_SCHEMA = (
 PORTABLE_ROLE_NEUTRAL_STAGE1_HANDOFF_BINDING_SCHEMA = (
     "production_portable_role_neutral_stage1_handoff_binding_v1"
 )
+STAGE1_COMPONENT_STORE_SCHEMA = (
+    "production_stage1_scientific_component_store_v1"
+)
+STAGE1_COMPONENT_STORE_MANIFEST = "component_store_manifest.json"
 WORKFLOW_PROGRESS_SCHEMA = "production_all_evidence_workflow_progress_v1"
 WORKFLOW_PHASE_MANIFEST_SCHEMA = "production_workflow_phase_manifest_v2"
 WORKFLOW_ADOPTED_PHASE_MANIFEST_SCHEMA = "production_workflow_adopted_phase_manifest_v1"
@@ -1513,11 +1517,13 @@ _PHASE_PRODUCER_ROOTS: Mapping[str, tuple[str, ...]] = {
     ),
     "stage1_preflight": (
         "oci/inference/production_stage1_bundle.py",
+        "oci/inference/production_embedding_cache_phase_publication.py",
         "oci/inference/production_stage1_cluster_preflight_artifact_v2.py",
         "oci/inference/prepared_stage1_context.py",
         "oci/inference/role_neutral_embedding_group_execution.py",
     ),
     "stage1_modeling": (
+        "oci/inference/production_embedding_cache_phase_publication.py",
         "oci/inference/production_stage1_role_neutral_execution.py",
         "oci/inference/production_role_neutral_process_executor.py",
         "oci/inference/production_role_neutral_persistent_executor.py",
@@ -11644,6 +11650,317 @@ class ProductionAllEvidenceWorkflow:
         )
         return output, manifest
 
+    def _input_preparation_validation_paths(
+        self,
+    ) -> tuple[Path, Path]:
+        """Restore the path-bound scratch cohort for strict relocation checks."""
+
+        prepared, manifest_path = self._input_preparation_paths()
+        manifest = _read_json_object(
+            manifest_path,
+            label="published input-preparation manifest",
+        )
+        output = manifest.get("output")
+        raw_historical = (
+            output.get("path")
+            if isinstance(output, Mapping)
+            else None
+        )
+        if not isinstance(raw_historical, str) or not raw_historical.strip():
+            raise RuntimeError(
+                "published input preparation lacks its historical output path"
+            )
+        historical = Path(raw_historical)
+        if historical == prepared:
+            return prepared, manifest_path
+        phase = self._validated_complete("input_preparation")
+        if (
+            phase is None
+            or phase.get("schema_version") != WORKFLOW_PHASE_MANIFEST_SCHEMA
+        ):
+            raise RuntimeError(
+                "an adopted path-relocated input preparation requires a "
+                "fresh local preparation before cache import"
+            )
+        published_root = Path(str(phase["attempt_dir"])).resolve(strict=True)
+        try:
+            relative = prepared.relative_to(published_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "published prepared cohort escaped its phase attempt"
+            ) from exc
+        configured_scratch = self.options.scratch_root
+        if configured_scratch is None:
+            configured_scratch = (
+                self.options.work_root.parent
+                / f".{self.options.work_root.name}.scratch"
+            )
+        configured_scratch.mkdir(parents=True, exist_ok=True)
+        scratch_root = configured_scratch.resolve(strict=True)
+        if configured_scratch.is_symlink() or scratch_root != configured_scratch:
+            raise RuntimeError(
+                "input-preparation provenance recovery requires one canonical "
+                "non-symlink scratch root"
+            )
+        expected = (
+            scratch_root
+            / "production_all_evidence_workflow"
+            / str(self.request["request_sha256"])
+            / "input_preparation"
+            / published_root.name
+            / relative
+        )
+        if (
+            not historical.is_absolute()
+            or Path(os.path.normpath(str(historical))) != historical
+            or historical != expected
+        ):
+            raise RuntimeError(
+                "input-preparation historical path is not owned by this "
+                "workflow request"
+            )
+        current = historical.parent
+        while current != scratch_root:
+            if current.exists() or current.is_symlink():
+                state = os.lstat(current)
+                if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(
+                    state.st_mode
+                ):
+                    raise RuntimeError(
+                        "input-preparation provenance recovery encountered a "
+                        "non-directory scratch ancestor"
+                    )
+            current = current.parent
+        historical.parent.mkdir(parents=True, exist_ok=True)
+        if historical.parent.resolve(strict=True) != historical.parent:
+            raise RuntimeError(
+                "input-preparation provenance recovery parent is not canonical"
+            )
+        prepared_sha256, prepared_size = stable_file_sha256(prepared)
+        output_body = {
+            "path": str(historical),
+            "sha256": prepared_sha256,
+            "size_bytes": prepared_size,
+        }
+        manifest_body = {
+            key: copy.deepcopy(value)
+            for key, value in manifest.items()
+            if key != "content_sha256"
+        }
+        manifest_digest = hashlib.sha256(
+            json.dumps(
+                manifest_body,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+                default=(
+                    lambda item: (
+                        item.item()
+                        if hasattr(item, "item")
+                        else str(item)
+                    )
+                ),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            manifest.get("content_sha256") != manifest_digest
+            or output != output_body
+        ):
+            raise RuntimeError(
+                "published input-preparation manifest is invalid"
+            )
+        if historical.exists() or historical.is_symlink():
+            if historical.is_symlink() or not historical.is_file():
+                raise RuntimeError(
+                    "input-preparation recovery target is not one regular file"
+                )
+        else:
+            temporary = historical.parent / (
+                f".{historical.name}.rehydrating_{os.getpid()}_"
+                f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+            )
+            try:
+                with prepared.open("rb") as source, temporary.open(
+                    "xb"
+                ) as destination:
+                    shutil.copyfileobj(
+                        source,
+                        destination,
+                        length=8 * 1024 * 1024,
+                    )
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                try:
+                    os.link(temporary, historical)
+                except FileExistsError:
+                    pass
+                _fsync_directory(historical.parent)
+            finally:
+                temporary.unlink(missing_ok=True)
+        historical_sha256, historical_size = stable_file_sha256(historical)
+        prepared_final = stable_file_sha256(prepared)
+        if (
+            (historical_sha256, historical_size)
+            != (prepared_sha256, prepared_size)
+            or prepared_final != (prepared_sha256, prepared_size)
+        ):
+            raise RuntimeError(
+                "input-preparation historical and durable cohorts differ"
+            )
+        proof_body = {
+            "schema_version": (
+                "production_input_preparation_dataset_provenance_rehydration_v1"
+            ),
+            "status": "complete",
+            "request_sha256": self.request["request_sha256"],
+            "input_preparation_phase_content_sha256": phase[
+                "content_sha256"
+            ],
+            "historical_dataset_path": str(historical),
+            "durable_dataset_path": str(prepared),
+            "preparation_manifest_path": str(manifest_path),
+            "dataset_sha256": prepared_sha256,
+            "dataset_size_bytes": prepared_size,
+            "copy_policy": "atomic_private_hardlink_publication_v1",
+        }
+        _atomic_write_json(
+            self.options.work_root
+            / "recovery"
+            / "input_preparation_dataset_provenance_rehydration.json",
+            {
+                **proof_body,
+                "content_sha256": _sha(proof_body),
+            },
+        )
+        return historical, manifest_path
+
+    def _stage1_input_preparation_validation_paths(
+        self,
+    ) -> tuple[Path, Path]:
+        """Resolve relocation inputs without changing embedding-phase identity."""
+
+        phase = self._validated_complete("input_preparation")
+        if phase is None:
+            raise RuntimeError("input-preparation phase is not complete")
+        if phase.get("schema_version") != WORKFLOW_ADOPTED_PHASE_MANIFEST_SCHEMA:
+            return self._input_preparation_validation_paths()
+
+        prepared, manifest_path = self._input_preparation_paths()
+        manifest = _read_json_object(
+            manifest_path,
+            label="adopted input-preparation manifest",
+        )
+        output = manifest.get("output")
+        raw_historical = (
+            output.get("path")
+            if isinstance(output, Mapping)
+            else None
+        )
+        if not isinstance(raw_historical, str) or not raw_historical.strip():
+            raise RuntimeError(
+                "adopted input preparation lacks its historical output path"
+            )
+        historical = Path(raw_historical)
+        if historical == prepared:
+            return prepared, manifest_path
+        if (
+            not historical.is_absolute()
+            or Path(os.path.normpath(str(historical))) != historical
+        ):
+            raise RuntimeError(
+                "adopted input-preparation historical path is not canonical"
+            )
+
+        published_root = Path(str(phase["attempt_dir"])).resolve(strict=True)
+        try:
+            prepared.relative_to(published_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "adopted prepared cohort escaped its authenticated payload"
+            ) from exc
+
+        prepared_sha256, prepared_size = stable_file_sha256(prepared)
+        output_body = {
+            "path": str(historical),
+            "sha256": prepared_sha256,
+            "size_bytes": prepared_size,
+        }
+        manifest_body = {
+            key: copy.deepcopy(value)
+            for key, value in manifest.items()
+            if key != "content_sha256"
+        }
+        manifest_digest = hashlib.sha256(
+            json.dumps(
+                manifest_body,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+                default=(
+                    lambda item: (
+                        item.item()
+                        if hasattr(item, "item")
+                        else str(item)
+                    )
+                ),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            manifest.get("content_sha256") != manifest_digest
+            or output != output_body
+        ):
+            raise RuntimeError(
+                "adopted input-preparation manifest is invalid"
+            )
+        if (
+            not historical.exists()
+            or historical.is_symlink()
+            or not historical.is_file()
+        ):
+            raise RuntimeError(
+                "adopted input-preparation historical cohort is unavailable; "
+                "use a fresh local input-preparation phase"
+            )
+        historical_sha256, historical_size = stable_file_sha256(historical)
+        prepared_final = stable_file_sha256(prepared)
+        if (
+            (historical_sha256, historical_size)
+            != (prepared_sha256, prepared_size)
+            or prepared_final != (prepared_sha256, prepared_size)
+        ):
+            raise RuntimeError(
+                "adopted historical and durable prepared cohorts differ"
+            )
+
+        proof_body = {
+            "schema_version": (
+                "production_input_preparation_dataset_provenance_rehydration_v1"
+            ),
+            "status": "complete",
+            "request_sha256": self.request["request_sha256"],
+            "input_preparation_phase_content_sha256": phase[
+                "content_sha256"
+            ],
+            "historical_dataset_path": str(historical),
+            "durable_dataset_path": str(prepared),
+            "preparation_manifest_path": str(manifest_path),
+            "dataset_sha256": prepared_sha256,
+            "dataset_size_bytes": prepared_size,
+            "copy_policy": "adopted_producer_path_reopened_v1",
+        }
+        _atomic_write_json(
+            self.options.work_root
+            / "recovery"
+            / "input_preparation_dataset_provenance_rehydration.json",
+            {
+                **proof_body,
+                "content_sha256": _sha(proof_body),
+            },
+        )
+        return historical, manifest_path
+
     def _embedding_cache_paths(self) -> tuple[Path, Path]:
         phase = self._validated_complete("embedding_cache")
         if phase is None:
@@ -11670,6 +11987,340 @@ class ProductionAllEvidenceWorkflow:
             raise RuntimeError("cache-bound prepared cohort is not terminally registered")
         return cache, prepared
 
+    def _embedding_cache_dataset_provenance_path(
+        self,
+        *,
+        cache: Path,
+    ) -> Path:
+        """Recover the cache's authenticated pre-publication cohort locator.
+
+        Phase payload bytes are authenticated before the scratch attempt is
+        atomically published under the durable root.  Embedded provenance is
+        deliberately immutable payload, so its dataset locator continues to
+        name that historical scratch file even after every byte has moved.
+        Stage 1 still freshly authenticates the durable cohort's bytes, row
+        order, and full text projection; this value supplies only the exact
+        historical path expected in the already sealed cache metadata.
+        """
+
+        metadata_path = (cache / "metadata.json").resolve(strict=True)
+        metadata = _read_json_object(
+            metadata_path,
+            label="published embedding-cache metadata",
+        )
+        provenance = metadata.get("production_provenance")
+        dataset = (
+            provenance.get("dataset")
+            if isinstance(provenance, Mapping)
+            else None
+        )
+        raw_path = (
+            dataset.get("path")
+            if isinstance(dataset, Mapping)
+            else None
+        )
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise RuntimeError(
+                "published embedding cache lacks its historical cohort path"
+            )
+        historical = Path(raw_path)
+        if (
+            not historical.is_absolute()
+            or Path(os.path.normpath(str(historical))) != historical
+        ):
+            raise RuntimeError(
+                "published embedding cache has a noncanonical historical "
+                "cohort path"
+            )
+        return historical
+
+    def _embedding_cache_validation_dataset_path(
+        self,
+        *,
+        cache: Path,
+        prepared: Path,
+    ) -> Path | None:
+        """Rehydrate the exact scratch cohort named by fresh-cache metadata.
+
+        The generic phase publisher moves authenticated bytes from scratch to
+        durable storage without rewriting nested scientific payloads.  A
+        freshly built embedding cache therefore retains the path of its
+        byte-identical scratch cohort.  Restore only that workflow-owned cohort
+        file so the cache's original strict path-bound validator can run
+        unchanged.  Imported/relocated caches use their existing relocation
+        proof instead and never enter this path.
+        """
+
+        historical = self._embedding_cache_dataset_provenance_path(
+            cache=cache,
+        )
+        if historical == prepared:
+            return None
+        phase = self._validated_complete("embedding_cache")
+        if (
+            phase is None
+            or phase.get("schema_version") != WORKFLOW_PHASE_MANIFEST_SCHEMA
+        ):
+            raise RuntimeError(
+                "an adopted path-relocated embedding cache requires the "
+                "authenticated cache-import relocation path"
+            )
+        published_root = Path(str(phase["attempt_dir"])).resolve(strict=True)
+        try:
+            prepared_relative = prepared.relative_to(published_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "published cache-bound cohort escaped its phase attempt"
+            ) from exc
+        configured_scratch = self.options.scratch_root
+        if configured_scratch is None:
+            configured_scratch = (
+                self.options.work_root.parent
+                / f".{self.options.work_root.name}.scratch"
+            )
+        configured_scratch.mkdir(parents=True, exist_ok=True)
+        scratch_root = configured_scratch.resolve(strict=True)
+        if configured_scratch.is_symlink() or scratch_root != configured_scratch:
+            raise RuntimeError(
+                "embedding-cache provenance recovery requires one canonical "
+                "non-symlink scratch root"
+            )
+        expected_historical = (
+            scratch_root
+            / "production_all_evidence_workflow"
+            / str(self.request["request_sha256"])
+            / "embedding_cache"
+            / published_root.name
+            / prepared_relative
+        )
+        if historical != expected_historical:
+            raise RuntimeError(
+                "embedding-cache historical cohort path is not owned by this "
+                "workflow request; use authenticated cache import/relocation"
+            )
+        current = historical.parent
+        while current != scratch_root:
+            if current.exists() or current.is_symlink():
+                state = os.lstat(current)
+                if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(
+                    state.st_mode
+                ):
+                    raise RuntimeError(
+                        "embedding-cache provenance recovery encountered a "
+                        "non-directory scratch ancestor"
+                    )
+            current = current.parent
+        historical.parent.mkdir(parents=True, exist_ok=True)
+        if historical.parent.resolve(strict=True) != historical.parent:
+            raise RuntimeError(
+                "embedding-cache provenance recovery parent is not canonical"
+            )
+
+        prepared_sha256, prepared_size = stable_file_sha256(prepared)
+        if historical.exists() or historical.is_symlink():
+            if historical.is_symlink() or not historical.is_file():
+                raise RuntimeError(
+                    "embedding-cache historical cohort recovery target is not "
+                    "one regular file"
+                )
+            historical_sha256, historical_size = stable_file_sha256(
+                historical
+            )
+        else:
+            temporary = historical.parent / (
+                f".{historical.name}.rehydrating_{os.getpid()}_"
+                f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+            )
+            digest = hashlib.sha256()
+            copied = 0
+            try:
+                with prepared.open("rb") as source, temporary.open(
+                    "xb"
+                ) as destination:
+                    while True:
+                        block = source.read(8 * 1024 * 1024)
+                        if not block:
+                            break
+                        destination.write(block)
+                        digest.update(block)
+                        copied += len(block)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                if (
+                    copied != prepared_size
+                    or digest.hexdigest() != prepared_sha256
+                ):
+                    raise RuntimeError(
+                        "durable cohort changed during provenance recovery"
+                    )
+                try:
+                    os.link(temporary, historical)
+                except FileExistsError:
+                    pass
+                _fsync_directory(historical.parent)
+            finally:
+                temporary.unlink(missing_ok=True)
+            historical_sha256, historical_size = stable_file_sha256(
+                historical
+            )
+        prepared_final_sha256, prepared_final_size = stable_file_sha256(
+            prepared
+        )
+        if (
+            (prepared_final_sha256, prepared_final_size)
+            != (prepared_sha256, prepared_size)
+            or (historical_sha256, historical_size)
+            != (prepared_sha256, prepared_size)
+        ):
+            raise RuntimeError(
+                "embedding-cache historical and durable cohorts differ"
+            )
+        preparation_cohort, preparation_manifest_path = (
+            self._input_preparation_paths()
+        )
+        preparation_sha256, preparation_size = stable_file_sha256(
+            preparation_cohort
+        )
+        if (preparation_sha256, preparation_size) != (
+            prepared_sha256,
+            prepared_size,
+        ):
+            raise RuntimeError(
+                "embedding-cache cohort differs from its authenticated text "
+                "preparation output"
+            )
+        source_preparation_manifest = _read_json_object(
+            preparation_manifest_path,
+            label="embedding-cache source preparation manifest",
+        )
+        source_preparation_body = {
+            key: copy.deepcopy(value)
+            for key, value in source_preparation_manifest.items()
+            if key != "content_sha256"
+        }
+        preparation_digest = lambda value: hashlib.sha256(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+                default=(
+                    lambda item: (
+                        item.item()
+                        if hasattr(item, "item")
+                        else str(item)
+                    )
+                ),
+            ).encode("utf-8")
+        ).hexdigest()
+        source_output = source_preparation_manifest.get("output")
+        input_preparation_phase = self._validated_complete(
+            "input_preparation"
+        )
+        if (
+            input_preparation_phase is None
+            or input_preparation_phase.get("schema_version")
+            != WORKFLOW_PHASE_MANIFEST_SCHEMA
+        ):
+            raise RuntimeError(
+                "embedding-cache source preparation must be a directly "
+                "published workflow phase"
+            )
+        input_preparation_root = Path(
+            str(input_preparation_phase["attempt_dir"])
+        ).resolve(strict=True)
+        try:
+            preparation_relative = preparation_cohort.relative_to(
+                input_preparation_root
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "text-preparation cohort escaped its published phase"
+            ) from exc
+        expected_preparation_output_path = (
+            scratch_root
+            / "production_all_evidence_workflow"
+            / str(self.request["request_sha256"])
+            / "input_preparation"
+            / input_preparation_root.name
+            / preparation_relative
+        )
+        if (
+            source_preparation_manifest.get("content_sha256")
+            != preparation_digest(source_preparation_body)
+            or not isinstance(source_output, Mapping)
+            or source_output
+            != {
+                "path": str(expected_preparation_output_path),
+                "sha256": preparation_sha256,
+                "size_bytes": preparation_size,
+            }
+        ):
+            raise RuntimeError(
+                "embedding-cache source preparation manifest is invalid"
+            )
+        recovered_preparation_body = copy.deepcopy(
+            source_preparation_body
+        )
+        recovered_preparation_body["output"] = {
+            "path": str(historical),
+            "sha256": historical_sha256,
+            "size_bytes": historical_size,
+        }
+        recovered_preparation_manifest = {
+            **recovered_preparation_body,
+            "content_sha256": preparation_digest(
+                recovered_preparation_body
+            ),
+        }
+        recovered_preparation_path = (
+            historical.parent / "preparation_manifest.json"
+        )
+        durable_recovered_preparation_path = (
+            self.options.work_root
+            / "recovery"
+            / "embedding_cache_source_preparation_manifest.json"
+        )
+        _write_immutable_json(
+            durable_recovered_preparation_path,
+            recovered_preparation_manifest,
+        )
+        _write_immutable_json(
+            recovered_preparation_path,
+            recovered_preparation_manifest,
+        )
+        proof_body = {
+            "schema_version": (
+                "production_embedding_cache_dataset_provenance_rehydration_v1"
+            ),
+            "status": "complete",
+            "request_sha256": self.request["request_sha256"],
+            "embedding_cache_phase_content_sha256": phase["content_sha256"],
+            "historical_dataset_path": str(historical),
+            "durable_dataset_path": str(prepared),
+            "dataset_sha256": prepared_sha256,
+            "dataset_size_bytes": prepared_size,
+            "historical_preparation_manifest_path": str(
+                recovered_preparation_path
+            ),
+            "durable_recovered_preparation_manifest_path": str(
+                durable_recovered_preparation_path
+            ),
+            "historical_preparation_manifest_content_sha256": (
+                recovered_preparation_manifest["content_sha256"]
+            ),
+            "copy_policy": "atomic_private_hardlink_publication_v1",
+        }
+        proof = {**proof_body, "content_sha256": _sha(proof_body)}
+        _atomic_write_json(
+            self.options.work_root
+            / "recovery"
+            / "embedding_cache_dataset_provenance_rehydration.json",
+            proof,
+        )
+        return historical
+
     def _embedding_cache_relocation_options(
         self,
         *,
@@ -11694,7 +12345,9 @@ class ProductionAllEvidenceWorkflow:
         target = Path(str(identity.get("root", ""))).resolve(strict=True)
         if cache.parent != target or prepared.parent.parent != target:
             raise RuntimeError("relocated cache result paths differ from its sealed root")
-        fresh_prepared, fresh_manifest = self._input_preparation_paths()
+        fresh_prepared, fresh_manifest = (
+            self._stage1_input_preparation_validation_paths()
+        )
         source_prepared, source_manifest = self._resolved_cache_import_sources()
         return ProductionEmbeddingCacheRelocationOptions(
             source_cache_dir=self.options.embedding_cache_import,
@@ -11711,6 +12364,80 @@ class ProductionAllEvidenceWorkflow:
             sentence_model_name=self.options.embedding_model_name,
             chunk_configuration=self._embedding_chunk_configuration(),
         )
+
+    def _embedding_cache_relocation_prepublication_root(
+        self,
+        *,
+        cache: Path,
+    ) -> Path | None:
+        """Return the exact root sealed before generic phase publication."""
+
+        phase = self._validated_complete("embedding_cache")
+        if phase is None:
+            raise RuntimeError("embedding-cache phase is not complete")
+        result = phase.get("result")
+        if (
+            not isinstance(result, Mapping)
+            or result.get("mode") != "authenticated_relocation"
+        ):
+            return None
+        durable_root = cache.parent
+        terminal_path = (
+            durable_root
+            / "complete_manifest.json"
+        ).resolve(strict=True)
+        terminal = _read_json_object(
+            terminal_path,
+            label="published embedding-cache relocation terminal",
+        )
+        raw_root = terminal.get("root")
+        if not isinstance(raw_root, str) or not raw_root.strip():
+            raise RuntimeError(
+                "published embedding-cache relocation lacks its producer root"
+            )
+        historical = Path(raw_root)
+        if (
+            not historical.is_absolute()
+            or Path(os.path.normpath(str(historical))) != historical
+        ):
+            raise RuntimeError(
+                "published embedding-cache relocation has a noncanonical "
+                "producer root"
+            )
+        if historical == durable_root:
+            return None
+        if phase.get("schema_version") == WORKFLOW_PHASE_MANIFEST_SCHEMA:
+            configured_scratch = self.options.scratch_root
+            if configured_scratch is None:
+                configured_scratch = (
+                    self.options.work_root.parent
+                    / f".{self.options.work_root.name}.scratch"
+                )
+            scratch_root = configured_scratch.resolve(strict=True)
+            published_attempt = Path(
+                str(phase["attempt_dir"])
+            ).resolve(strict=True)
+            expected = (
+                scratch_root
+                / "production_all_evidence_workflow"
+                / str(self.request["request_sha256"])
+                / "embedding_cache"
+                / published_attempt.name
+                / durable_root.relative_to(published_attempt)
+            )
+            if historical != expected:
+                raise RuntimeError(
+                    "embedding-cache relocation producer root is not the "
+                    "exact workflow publication source"
+                )
+        elif (
+            phase.get("schema_version")
+            != WORKFLOW_ADOPTED_PHASE_MANIFEST_SCHEMA
+        ):
+            raise RuntimeError(
+                "embedding-cache relocation phase schema is unsupported"
+            )
+        return historical
 
     def _stage1_preflight_paths(self) -> tuple[Path, Path]:
         phase = self._validated_complete("stage1_preflight")
@@ -12001,12 +12728,36 @@ class ProductionAllEvidenceWorkflow:
                         migration_identity=legacy_migration_identity,
                     )
                 )
+        cache_relocation = (
+            None
+            if trusted_cache_read_proof is not None
+            else self._embedding_cache_relocation_options(
+                cache=cache,
+                prepared=dataset,
+            )
+        )
         values: dict[str, Any] = {
             "dataset_path": dataset,
             "config_path": profile,
             "embedding_cache_dir": cache,
             "embedding_local_model_path": None,
             "embedding_cache_output_dir": None,
+            "embedding_cache_relocation_prepublication_root": (
+                None
+                if cache_relocation is None
+                else self._embedding_cache_relocation_prepublication_root(
+                    cache=cache,
+                )
+            ),
+            "embedding_cache_validation_dataset_path": (
+                None
+                if trusted_cache_read_proof is not None
+                or cache_relocation is not None
+                else self._embedding_cache_validation_dataset_path(
+                    cache=cache,
+                    prepared=dataset,
+                )
+            ),
             "embedding_cache_configuration": copy.deepcopy(
                 dict(self._embedding_chunk_configuration())
             ),
@@ -12042,12 +12793,7 @@ class ProductionAllEvidenceWorkflow:
         }
         if "embedding_cache_relocation" in Stage1BundleBuildOptions.__dataclass_fields__:
             values["embedding_cache_relocation"] = (
-                None
-                if trusted_cache_read_proof is not None
-                else self._embedding_cache_relocation_options(
-                    cache=cache,
-                    prepared=dataset,
-                )
+                cache_relocation
             )
         # Parallel scheduler fields are passed automatically as soon as the
         # Stage1BundleBuildOptions API exposes them.  This keeps the workflow
@@ -12106,6 +12852,10 @@ class ProductionAllEvidenceWorkflow:
         fresh_prepared, fresh_preparation_manifest = self._input_preparation_paths()
         worker_execution: Mapping[str, Any] | None = None
         if o.embedding_cache_import is not None:
+            (
+                fresh_prepared,
+                fresh_preparation_manifest,
+            ) = self._input_preparation_validation_paths()
             from .production_embedding_cache_relocation import (
                 ProductionEmbeddingCacheRelocationOptions,
                 relocate_authenticated_production_embedding_cache,
@@ -12532,6 +13282,132 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             raise RuntimeError("default Stage 1 handoff was not freshly validated")
         return value
 
+    def _stage1_component_store_root(
+        self,
+        *,
+        prepared_context: Any,
+        plan: Any,
+        integration: ProductionRoleNeutralStage1Integration,
+    ) -> Path:
+        """Resolve a resource-neutral, cross-request component namespace."""
+
+        integration_identity = (
+            _role_neutral_stage1_integration_identity(integration)
+        )
+        if integration_identity is None:
+            raise RuntimeError(
+                "Stage 1 component store requires the closed production "
+                "integration identity"
+            )
+        producer_compatibility = integration_identity.get(
+            "producer_factories_builder"
+        )
+        scientific_identity = getattr(
+            prepared_context,
+            "scientific_identity",
+            None,
+        )
+        prepared_scientific_sha256 = (
+            scientific_identity.get("content_sha256")
+            if isinstance(scientific_identity, Mapping)
+            else None
+        )
+        plan_sha256 = getattr(
+            plan,
+            "scientific_content_sha256",
+            None,
+        )
+        if (
+            not isinstance(producer_compatibility, Mapping)
+            or not isinstance(prepared_scientific_sha256, str)
+            or len(prepared_scientific_sha256) != 64
+            or not isinstance(plan_sha256, str)
+            or len(plan_sha256) != 64
+        ):
+            raise RuntimeError(
+                "Stage 1 component store compatibility identity is "
+                "incomplete"
+            )
+        compatibility = {
+            "schema_version": (
+                "production_stage1_component_store_compatibility_v1"
+            ),
+            "prepared_stage1_scientific_identity_sha256": (
+                prepared_scientific_sha256
+            ),
+            "stage1_scope_plan_scientific_content_sha256": (
+                plan_sha256
+            ),
+            "component_plan_namespace_identity": (
+                ROLE_NEUTRAL_STAGE1_COMPONENT_PLAN_NAMESPACE_IDENTITY
+            ),
+            "component_producer_compatibility": copy.deepcopy(
+                dict(producer_compatibility)
+            ),
+            "evidence_family_order": list(EVIDENCE_FAMILIES),
+            "resource_assignment_included": False,
+            "cpu_budget_included": False,
+            "owner_concurrency_included": False,
+        }
+        component_store_key = _sha(compatibility)
+        configured_scratch = self.options.scratch_root
+        if configured_scratch is None:
+            configured_scratch = (
+                self.options.work_root.parent
+                / f".{self.options.work_root.name}.scratch"
+            )
+        root = (
+            Path(configured_scratch)
+            / "production_all_evidence_workflow"
+            / "stage1_component_store"
+            / component_store_key
+        ).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        if (
+            root.is_symlink()
+            or root.resolve(strict=True) != root
+            or not root.is_dir()
+        ):
+            raise ValueError(
+                "Stage 1 component store namespace is not canonical"
+            )
+        manifest_body = {
+            "schema_version": STAGE1_COMPONENT_STORE_SCHEMA,
+            "component_store_key": component_store_key,
+            "compatibility": compatibility,
+            "components_relative_path": "components",
+            "successful_component_marker": (
+                "execution_manifest.json"
+            ),
+            "incomplete_attempts_preserved_for_recovery": True,
+        }
+        manifest = {
+            **manifest_body,
+            "content_sha256": _sha(manifest_body),
+        }
+        manifest_path = root / STAGE1_COMPONENT_STORE_MANIFEST
+        if manifest_path.is_file() and not manifest_path.is_symlink():
+            if _read_json_object(
+                manifest_path,
+                label="Stage 1 component store manifest",
+            ) != manifest:
+                raise ValueError(
+                    "Stage 1 component store manifest changed"
+                )
+        elif manifest_path.exists() or manifest_path.is_symlink():
+            raise ValueError(
+                "Stage 1 component store manifest is not a regular file"
+            )
+        else:
+            _atomic_write_json(manifest_path, manifest)
+        components = (root / "components").resolve()
+        components.mkdir(exist_ok=True)
+        if components.is_symlink() or components.resolve(strict=True) != components:
+            raise ValueError(
+                "Stage 1 component store payload root is not canonical"
+            )
+        return components
+
     def _run_portable_role_neutral_stage1_modeling(
         self,
         attempt: Path,
@@ -12557,8 +13433,6 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         )
         from .production_stage1_role_neutral_execution import (
             ROLE_NEUTRAL_EXECUTION_MANIFEST,
-            ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_POLICY_SCHEMA,
-            RoleNeutralFirstOwnerValidationPolicy,
             RoleNeutralProducerFactories,
             RoleNeutralStage1ExecutionPolicy,
             execute_and_publish_role_neutral_stage1,
@@ -12701,30 +13575,10 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                 stage1_execution_profile
                 .neural_query_operational_controls
             ),
-            first_owner_validation=(
-                RoleNeutralFirstOwnerValidationPolicy(
-                    devices=tuple(resource_plan.devices),
-                    gpu_max_allocation_fraction=(
-                        self.options.resource_performance_safety
-                        .gpu_max_allocation_fraction
-                    ),
-                    gpu_minimum_headroom_bytes=(
-                        self.options.resource_performance_safety
-                        .gpu_minimum_headroom_bytes
-                    ),
-                    gpu_sample_interval_seconds=0.1,
-                    required_tfidf_parallel_backend=(
-                        stage1_execution_profile
-                        .tfidf_parallel_backend
-                    ),
-                    schema_version=(
-                        ROLE_NEUTRAL_FIRST_OWNER_VALIDATION_POLICY_SCHEMA
-                    ),
-                )
-                if stage1_execution_profile.resource_kind
-                == "accelerator"
-                else None
-            ),
+            # Every owner is authenticated at the ordinary component and
+            # handoff boundaries.  Production owner parallelism must not be
+            # preceded by a serial calibration/replica gate.
+            first_owner_validation=None,
         )
         execution_executor = integration.executor
         bind_context = getattr(execution_executor, "bind_context", None)
@@ -12739,6 +13593,11 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                 "role-neutral producer-factories builder returned an "
                 "untyped or incomplete six-producer binding"
             )
+        component_store_root = self._stage1_component_store_root(
+            prepared_context=prepared_context,
+            plan=plan,
+            integration=integration,
+        )
 
         execution_root = (attempt / "role_neutral_stage1_execution").resolve()
         execution_manifest = execute_and_publish_role_neutral_stage1(
@@ -12748,6 +13607,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             policy=execution_policy,
             executor=execution_executor,
             resume=self.options.run_control.resume,
+            component_store_root=component_store_root,
         )
         if (
             int(execution_manifest.get("physical_fit_count", -1)) != len(plan.physical_scopes)
@@ -14892,21 +15752,24 @@ def _compile_production_options(
         raise RuntimeError(
             "resolved Stage 1 resources differ from the deployment resource_kind"
         )
-    if (
-        deployment.stage1_execution.max_parallel_owners
-        > deployment.cpu_budget
-        or deployment.stage1_execution.max_parallel_owners
-        != deployment.stage1_execution.neural_query_topology
+    resolved_owner_capacity = (
+        deployment.stage1_execution.neural_query_topology
         .effective_parallel_owners(
             devices=selected_devices,
             workers_per_device=(
                 deployment.stage1_execution.scope_workers_per_device
             ),
         )
+    )
+    if (
+        deployment.stage1_execution.max_parallel_owners
+        > deployment.cpu_budget
+        or deployment.stage1_execution.max_parallel_owners
+        > resolved_owner_capacity
     ):
         raise ValueError(
-            "Stage 1 effective owner concurrency differs from the resolved "
-            "resource topology or exceeds the host CPU budget"
+            "Stage 1 effective owner concurrency exceeds the resolved "
+            "resource topology or host CPU budget"
         )
     learned_query_profile = scientific.architecture_profiles.get(
         "learned_neural_queries"

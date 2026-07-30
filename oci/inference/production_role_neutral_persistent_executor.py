@@ -545,6 +545,7 @@ class PersistentRoleNeutralExecutionSession:
         *,
         executor: "PersistentSpawnRoleNeutralPhysicalOwnerExecutor",
         resources: Sequence[str],
+        resource_leases: Sequence[Sequence[str]] | None,
         max_workers: int,
         cpu_budget: int,
         marker_root: Path | str | None,
@@ -567,29 +568,54 @@ class PersistentRoleNeutralExecutionSession:
             raise ValueError(
                 "persistent session requires 1 <= max_workers <= cpu_budget"
             )
-        # ``workers`` is the concurrent-owner cap. One owner may atomically
-        # reserve several devices, so the pool still needs at least one
-        # process slot per selected resource when that cap is one.
+        # ``workers`` is the concurrent-owner cap.  A lane is a persistent
+        # process bound to one resource; a multi-device owner atomically
+        # reserves one lane on every resource in its lease and executes from
+        # the lease's primary lane.
         self.max_parallel_owners = workers
-        slots_by_resource = {value: 1 for value in resource_order}
-        remaining = max(0, workers - len(resource_order))
-        while remaining:
-            advanced = False
-            for value in resource_order:
-                if (
-                    slots_by_resource[value]
-                    < executor.max_workers_per_resource
-                ):
-                    slots_by_resource[value] += 1
-                    remaining -= 1
-                    advanced = True
-                    if remaining == 0:
-                        break
-            if not advanced:
-                break
+        if resource_leases is None:
+            leases = tuple((value,) for value in resource_order)
+        else:
+            leases = tuple(
+                tuple(str(resource) for resource in lease)
+                for lease in resource_leases
+            )
+            if (
+                not leases
+                or any(
+                    not lease
+                    or len(lease) != len(set(lease))
+                    or not set(lease).issubset(resource_order)
+                    for lease in leases
+                )
+            ):
+                raise ValueError(
+                    "persistent session owner resource leases are invalid"
+                )
+        used_resources = tuple(
+            value
+            for value in resource_order
+            if any(value in lease for lease in leases)
+        )
+        if not used_resources:
+            raise ValueError(
+                "persistent session resource leases use no selected resource"
+            )
+        # A global cap can be lower than aggregate resource capacity without
+        # making any particular resource the bottleneck.  Provision every
+        # selected resource up to the smaller of its declared capacity and
+        # the global cap; ``_acquire`` separately bounds active owners.
+        lane_count = min(
+            workers,
+            executor.max_workers_per_resource,
+        )
+        slots_by_resource = {
+            value: lane_count for value in used_resources
+        }
+        self._configured_resource_leases = frozenset(leases)
         self.active_slot_count = sum(slots_by_resource.values())
         self.host_cpu_budget = budget
-        self.slot_cpu_budget = max(1, budget // self.active_slot_count)
+        self.slot_cpu_budget = max(1, budget // workers)
         if marker_root is None:
             if executor.production_worker_required:
                 manifest = Path(
@@ -702,6 +728,8 @@ class PersistentRoleNeutralExecutionSession:
     def _acquire(
         self,
         resource_names: Sequence[str],
+        *,
+        max_active_owners: int | None = None,
     ) -> tuple[_PersistentSlot, ...]:
         requested = tuple(str(value) for value in resource_names)
         if not requested or len(requested) != len(set(requested)):
@@ -730,6 +758,30 @@ class PersistentRoleNeutralExecutionSession:
                         "persistent session has no slot for one or more "
                         f"reserved task resources: {missing}"
                     )
+                active_limit = (
+                    getattr(
+                        self,
+                        "max_parallel_owners",
+                        max(1, len(self._slots)),
+                    )
+                    if max_active_owners is None
+                    else int(max_active_owners)
+                )
+                session_limit = getattr(
+                    self,
+                    "max_parallel_owners",
+                    active_limit,
+                )
+                if (
+                    active_limit < 1
+                    or active_limit > session_limit
+                ):
+                    raise ValueError(
+                        "persistent session active-owner limit is invalid"
+                    )
+                if self._active_calls >= active_limit:
+                    self._condition.wait()
+                    continue
                 selected: list[_PersistentSlot] = []
                 for resource_name in requested:
                     available = next(
@@ -772,8 +824,13 @@ class PersistentRoleNeutralExecutionSession:
     def _execute_task(
         self,
         task: RoleNeutralPhysicalOwnerTask,
+        *,
+        max_active_owners: int | None = None,
     ) -> RoleNeutralPhysicalOwnerResult:
-        reserved = self._acquire(_task_execution_resources(task))
+        reserved = self._acquire(
+            _task_execution_resources(task),
+            max_active_owners=max_active_owners,
+        )
         slot = reserved[0]
         if slot.resource != task.resource:
             self._release(reserved, failure=None)
@@ -852,15 +909,51 @@ class PersistentRoleNeutralExecutionSession:
                 raise TypeError(
                     "persistent session received an untyped owner task"
                 )
-            _task_execution_resources(task)
+            lease = _task_execution_resources(task)
+            configured_leases = getattr(
+                self,
+                "_configured_resource_leases",
+                None,
+            )
+            if (
+                configured_leases is not None
+                and lease not in configured_leases
+            ):
+                raise ValueError(
+                    "persistent session task requests an unconfigured "
+                    "resource lease"
+                )
         if len(rows) == 1:
-            return (self._execute_task(rows[0]),)
+            return (
+                self._execute_task(
+                    rows[0],
+                    max_active_owners=requested,
+                ),
+            )
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(requested, len(rows)),
+            # Waiting owner threads participate in resource selection.  A
+            # task whose lease is busy therefore cannot conceal a later task
+            # whose disjoint lease is already free.
+            max_workers=len(rows),
             thread_name_prefix="role-neutral-persistent-session",
         ) as pool:
-            futures = [pool.submit(self._execute_task, task) for task in rows]
-            return tuple(future.result() for future in futures)
+            futures = [
+                pool.submit(
+                    self._execute_task,
+                    task,
+                    max_active_owners=requested,
+                )
+                for task in rows
+            ]
+            completed: list[RoleNeutralPhysicalOwnerResult] = []
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    completed.append(future.result())
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+            return tuple(completed)
 
     def _terminate(self) -> None:
         for slot in tuple(self._slots):
@@ -1072,6 +1165,7 @@ class PersistentSpawnRoleNeutralPhysicalOwnerExecutor:
         self,
         *,
         resources: Sequence[str],
+        resource_leases: Sequence[Sequence[str]] | None = None,
         max_workers: int,
         cpu_budget: int,
         marker_root: Path | str | None = None,
@@ -1081,6 +1175,7 @@ class PersistentSpawnRoleNeutralPhysicalOwnerExecutor:
         return PersistentRoleNeutralExecutionSession(
             executor=self,
             resources=resources,
+            resource_leases=resource_leases,
             max_workers=max_workers,
             cpu_budget=cpu_budget,
             marker_root=marker_root,

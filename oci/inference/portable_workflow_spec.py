@@ -1289,16 +1289,16 @@ class Stage1ExecutionProfile:
             raise TypeError(
                 "Stage 1 execution requires a typed neural-query topology"
             )
-        expected_parallel = (
+        topology_capacity = (
             self.neural_query_topology.effective_parallel_owners_for_shape(
                 resource_kind=self.resource_kind,
                 device_count=self.device_count,
                 workers_per_device=self.scope_workers_per_device,
             )
         )
-        if self.max_parallel_owners != expected_parallel:
+        if self.max_parallel_owners > topology_capacity:
             raise ValueError(
-                "Stage 1 max_parallel_owners differs from the effective "
+                "Stage 1 max_parallel_owners exceeds the effective "
                 "device-topology capacity"
             )
         if not isinstance(
@@ -1309,20 +1309,27 @@ class Stage1ExecutionProfile:
                 "Stage 1 execution requires typed HTR operational controls"
             )
         htr_controls = self.htr_operational_controls
-        if (
-            htr_controls.fold_parallelism
-            > self.device_count * htr_controls.fold_slots_per_device
-        ):
+        devices_per_owner = (
+            self.device_count
+            if self.neural_query_topology.mode
+            == "one_context_spanning_all_selected_devices"
+            else 1
+        )
+        htr_slot_capacity = (
+            devices_per_owner * htr_controls.fold_slots_per_device
+        )
+        if htr_controls.fold_parallelism > htr_slot_capacity:
             raise ValueError(
                 "Stage 1 HTR fold parallelism exceeds the configured "
-                "per-device fold-slot capacity"
+                "per-owner lease fold-slot capacity"
             )
         if (
-            self.device_count > 1
-            and htr_controls.fold_parallelism < self.device_count
+            devices_per_owner > 1
+            and htr_controls.fold_parallelism < devices_per_owner
         ):
             raise ValueError(
-                "Stage 1 HTR fold parallelism must use every selected device"
+                "Stage 1 HTR fold parallelism must use every device in the "
+                "owner lease"
             )
         if (
             htr_controls.fold_parallelism > 1
@@ -1331,17 +1338,6 @@ class Stage1ExecutionProfile:
             raise ValueError(
                 "parallel HTR fold execution requires the "
                 "process-isolated backend"
-            )
-        if (
-            (
-                htr_controls.fold_parallelism > 1
-                or htr_controls.fold_slots_per_device > 1
-            )
-            and self.scope_workers_per_device != 1
-        ):
-            raise ValueError(
-                "per-owner HTR fold slots require exactly one outer owner "
-                "slot per selected device"
             )
         if (
             (
@@ -1363,14 +1359,8 @@ class Stage1ExecutionProfile:
                 "controls"
             )
         neural_controls = self.neural_query_operational_controls
-        neural_devices_per_owner = (
-            self.device_count
-            if self.neural_query_topology.mode
-            == "one_context_spanning_all_selected_devices"
-            else 1
-        )
         neural_slot_capacity = (
-            neural_devices_per_owner
+            devices_per_owner
             * neural_controls.fold_slots_per_device
         )
         if (
@@ -1383,12 +1373,12 @@ class Stage1ExecutionProfile:
                 "per-owner device-slot capacity"
             )
         if (
-            neural_devices_per_owner > 1
+            devices_per_owner > 1
             and (
                 neural_controls.inner_fold_parallelism
-                < neural_devices_per_owner
+                < devices_per_owner
                 or neural_controls.bank_parallelism
-                < neural_devices_per_owner
+                < devices_per_owner
             )
         ):
             raise ValueError(
@@ -1407,18 +1397,6 @@ class Stage1ExecutionProfile:
             raise ValueError(
                 "parallel CUDA neural-query execution requires the "
                 "process-isolated backend"
-            )
-        if (
-            (
-                neural_controls.inner_fold_parallelism > 1
-                or neural_controls.bank_parallelism > 1
-                or neural_controls.fold_slots_per_device > 1
-            )
-            and self.scope_workers_per_device != 1
-        ):
-            raise ValueError(
-                "per-owner neural-query task slots require exactly one "
-                "outer owner slot per selected device"
             )
         tfidf_backend = str(self.tfidf_parallel_backend).strip().lower()
         if tfidf_backend not in {"threads", "processes"}:
@@ -1626,13 +1604,22 @@ class DeploymentProfile:
                 "forest_operational.requested_host_cpu_budget must equal "
                 "the deployment cpu_budget"
             )
+        if self.stage1_execution.max_parallel_owners > self.cpu_budget:
+            raise ValueError(
+                "Stage 1 max_parallel_owners exceeds the configured global "
+                "host CPU budget"
+            )
+        owner_cpu_budget = (
+            self.cpu_budget
+            // self.stage1_execution.max_parallel_owners
+        )
         if (
             self.stage1_execution.htr_operational_controls.fold_parallelism
-            > self.cpu_budget
+            > owner_cpu_budget
         ):
             raise ValueError(
-                "HTR fold parallelism exceeds the configured global host "
-                "CPU budget"
+                "HTR fold parallelism exceeds one parallel owner's host "
+                "CPU lease"
             )
         neural_controls = (
             self.stage1_execution.neural_query_operational_controls
@@ -1643,11 +1630,11 @@ class DeploymentProfile:
                 neural_controls.bank_parallelism,
             )
             * neural_controls.worker_cpu_threads
-            > self.cpu_budget
+            > owner_cpu_budget
         ):
             raise ValueError(
-                "neural-query task CPU threads exceed the configured global "
-                "host CPU budget"
+                "neural-query task CPU threads exceed one parallel owner's "
+                "host CPU lease"
             )
         if self.storage_backend not in {"posix", "local_posix", "sshfs"}:
             raise ValueError("unsupported storage backend")

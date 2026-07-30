@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import concurrent.futures
 import hashlib
+import io
 import inspect
 import json
 import multiprocessing as mp
@@ -251,6 +252,37 @@ def _read_regular_file(
 def _sha256_file(path: Path, *, label: str = "artifact") -> tuple[str, int]:
     payload = _read_regular_file(path, label=label)
     return hashlib.sha256(payload).hexdigest(), len(payload)
+
+
+def _read_npy_file_once(
+    path: Path,
+    *,
+    label: str,
+    invalid_message: str,
+) -> tuple[str, int, np.ndarray]:
+    """Authenticate and parse one ``.npy`` file without a filesystem mmap.
+
+    Production HTR state contains hundreds of immutable arrays.  Keeping one
+    read-only ``numpy.memmap`` per array alive during validation consumes a
+    correspondingly large number of filesystem handles and is not portable to
+    every shared mount.  Read the already-authenticated bytes once and parse
+    them from memory instead.  This also removes the path-level race between
+    hashing an artifact and reopening it for NumPy parsing.
+    """
+
+    payload = _read_regular_file(path, label=label)
+    digest = hashlib.sha256(payload).hexdigest()
+    try:
+        with io.BytesIO(payload) as stream:
+            loaded = np.load(stream, allow_pickle=False)
+    except (OSError, ValueError, EOFError) as exc:
+        raise ValueError(invalid_message) from exc
+    if not isinstance(loaded, np.ndarray) or loaded.dtype.hasobject:
+        close = getattr(loaded, "close", None)
+        if callable(close):
+            close()
+        raise ValueError(invalid_message)
+    return digest, len(payload), loaded
 
 
 def _write_new_bytes(path: Path, payload: bytes) -> None:
@@ -4765,19 +4797,18 @@ def _load_array_store(
             raise ValueError("HTR array path is not canonical")
         expected_paths.add(expected_relative)
         path = fit_root / expected_relative
-        digest, size = _sha256_file(path, label=f"HTR array {key}")
+        digest, size, loaded = _read_npy_file_once(
+            path,
+            label=f"HTR array {key}",
+            invalid_message=f"HTR array is not safe NumPy data: {key}",
+        )
         if (
             digest != row.get("file_sha256")
             or size != int(row.get("size_bytes", -1))
         ):
             raise ValueError(f"HTR array file changed: {key}")
-        try:
-            loaded = np.load(path, allow_pickle=False, mmap_mode="r")
-        except (OSError, ValueError, EOFError) as exc:
-            raise ValueError(f"HTR array is not safe NumPy data: {key}") from exc
         if (
-            loaded.dtype.hasobject
-            or loaded.dtype.str != row.get("dtype")
+            loaded.dtype.str != row.get("dtype")
             or list(loaded.shape) != row.get("shape")
             or _array_sha256(loaded) != row.get("content_sha256")
         ):
@@ -6093,12 +6124,16 @@ def replay_role_neutral_htr_exact_transform(
         if not isinstance(registration, Mapping):
             raise ValueError("replay HTR coverage registration is invalid")
         path = artifact_root / str(registration.get("relative_path") or "")
-        digest, size = _sha256_file(path, label=f"replay HTR coverage {key}")
-        array = np.load(path, allow_pickle=False, mmap_mode="r")
+        digest, size, array = _read_npy_file_once(
+            path,
+            label=f"replay HTR coverage {key}",
+            invalid_message=(
+                f"replay HTR coverage array is not safe NumPy data: {key}"
+            ),
+        )
         if (
             digest != registration.get("sha256")
             or size != int(registration.get("size_bytes", -1))
-            or array.dtype.hasobject
             or array.dtype.str != registration.get("dtype")
             or list(array.shape) != registration.get("shape")
             or _array_sha256(array) != registration.get("content_sha256")
@@ -6134,24 +6169,16 @@ def replay_role_neutral_htr_exact_transform(
     ):
         raise RuntimeError("registered HTR replay output is missing or noncanonical")
     prediction_path = artifact_root / expected_prediction_relative
-    prediction_digest, prediction_size = _sha256_file(
+    prediction_digest, prediction_size, sealed_predictions = _read_npy_file_once(
         prediction_path,
         label="registered exact HTR predictions",
-    )
-    try:
-        sealed_predictions = np.load(
-            prediction_path,
-            allow_pickle=False,
-            mmap_mode="r",
-        )
-    except (OSError, ValueError, EOFError) as exc:
-        raise ValueError(
+        invalid_message=(
             "registered exact HTR predictions are not safe NumPy data"
-        ) from exc
+        ),
+    )
     if (
         prediction_digest != registered.get("sha256")
         or prediction_size != int(registered.get("size_bytes", -1))
-        or sealed_predictions.dtype.hasobject
         or registered.get("columns") != columns
         or registered.get("dtype") != sealed_predictions.dtype.str
         or registered.get("shape") != list(sealed_predictions.shape)
@@ -6353,18 +6380,15 @@ def validate_role_neutral_htr_group_execution(
             raise ValueError("exact HTR view lacks predictions")
         prediction_relative = str(prediction.get("relative_path") or "")
         prediction_path = artifact_root / prediction_relative
-        prediction_digest, prediction_size = _sha256_file(
-            prediction_path,
-            label="exact HTR predictions",
-        )
-        try:
-            prediction_array = np.load(
+        prediction_digest, prediction_size, prediction_array = (
+            _read_npy_file_once(
                 prediction_path,
-                allow_pickle=False,
-                mmap_mode="r",
+                label="exact HTR predictions",
+                invalid_message=(
+                    "exact HTR predictions are not safe NumPy data"
+                ),
             )
-        except (OSError, ValueError, EOFError) as exc:
-            raise ValueError("exact HTR predictions are not safe NumPy data") from exc
+        )
         if (
             view.get("view_input_policy")
             != "heldout_row_id_and_complete_text_no_labels_v1"
@@ -6373,7 +6397,6 @@ def validate_role_neutral_htr_group_execution(
             or view.get("model_state_reloaded_for_primary_transform") is not True
             or prediction_digest != prediction.get("sha256")
             or prediction_size != int(prediction.get("size_bytes", -1))
-            or prediction_array.dtype.hasobject
             or prediction_array.dtype.str != prediction.get("dtype")
             or list(prediction_array.shape) != prediction.get("shape")
             or _array_sha256(prediction_array) != prediction.get("content_sha256")
@@ -6412,15 +6435,16 @@ def validate_role_neutral_htr_group_execution(
                 raise ValueError("exact HTR coverage registration is invalid")
             relative_path = str(registered.get("relative_path") or "")
             array_path = artifact_root / relative_path
-            digest, size = _sha256_file(
+            digest, size, array = _read_npy_file_once(
                 array_path,
                 label=f"exact HTR coverage {key}",
+                invalid_message=(
+                    f"exact HTR coverage array is not safe NumPy data: {key}"
+                ),
             )
-            array = np.load(array_path, allow_pickle=False, mmap_mode="r")
             if (
                 digest != registered.get("sha256")
                 or size != int(registered.get("size_bytes", -1))
-                or array.dtype.hasobject
                 or array.dtype.str != registered.get("dtype")
                 or list(array.shape) != registered.get("shape")
                 or _array_sha256(array) != registered.get("content_sha256")
@@ -6445,7 +6469,7 @@ def validate_role_neutral_htr_group_execution(
             f"missing={sorted(expected_files - files)}, "
             f"extra={sorted(files - expected_files)}"
         )
-    # Ensure fit-state mmap arrays were actually opened by this trust boundary.
+    # Ensure fit-state numerical arrays were authenticated by this trust boundary.
     if not arrays:
         raise RuntimeError("HTR validation did not authenticate numerical state")
     return json.loads(_canonical_json(terminal))

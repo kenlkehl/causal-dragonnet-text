@@ -60,7 +60,7 @@
       "chunk_plan_cache_max_entries": 1000,
       "data_loader_workers": 0,
       "fold_parallel_backend": "processes",
-      "fold_parallelism": 5,
+      "fold_parallelism": 3,
       "fold_slots_per_device": 3,
       "reuse_tokenizer_and_chunk_plans": true,
       "schema_version": "production_role_neutral_htr_operational_controls_v2",
