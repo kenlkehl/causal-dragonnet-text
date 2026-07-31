@@ -5,9 +5,10 @@
 # This launcher defaults to a cold five-confounder/five-modifier workflow.
 # Fresh embedding construction uses all eight selected GPUs concurrently with
 # canonical output ordering. Stage 1 then uses eight disjoint owner lanes, one
-# per GPU. For code-correction recovery, CLOUD_ADOPT_RUN_ROOT may name a
-# preserved prior durable root; only its ordinarily authenticated completed
-# input-preparation and embedding-cache portable checkpoints are considered.
+# per GPU. For code-correction recovery,
+# CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT may name a preserved prior durable root.
+# Input preparation then runs freshly and the old cache passes the workflow's
+# authenticated relocation path; embeddings are not recomputed.
 #
 # Repository preparation on the cloud VM:
 #
@@ -17,6 +18,18 @@
 # Download/prepare the pinned models, validate, and launch:
 #
 #   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh --prepare-only
+#   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh --check-only
+#   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh
+#
+# To recover the completed embedding cache from a preserved failed run after a
+# source correction, keep the old trees intact and use fresh active roots:
+#
+#   unset CLOUD_ADOPT_RUN_ROOT
+#   export CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT="$PWD/artifacts/cloud_runs/five_conf_five_mod"
+#   export CLOUD_RUN_ROOT_BASE="$PWD/artifacts/cloud_runs_relocated"
+#   export CLOUD_SCRATCH_ROOT_BASE="$PWD/artifacts/cloud_scratch_relocated"
+#   export CLOUD_RUNTIME_PROFILE_ROOT="$PWD/artifacts/runtime_profiles/relocated"
+#   export CLOUD_SOURCE_SNAPSHOT_ROOT="$PWD/artifacts/production_source_snapshot_relocated"
 #   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh --check-only
 #   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh
 #

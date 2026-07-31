@@ -357,27 +357,36 @@ else
     note "starting a new durable request"
 fi
 
-cloud_checkpoint_adoption_arguments=()
-cloud_expected_adoption_count=0
-cloud_adopt_run_root=""
-if [[ -n "${CLOUD_ADOPT_RUN_ROOT:-}" ]]; then
-    [[ "${CLOUD_ADOPT_RUN_ROOT}" == /* ]] \
-        || fail "CLOUD_ADOPT_RUN_ROOT must be an absolute path"
-    cloud_adopt_run_root="$(realpath -e -- "${CLOUD_ADOPT_RUN_ROOT}")"
-    require_directory "${cloud_adopt_run_root}"
-    [[ "${cloud_adopt_run_root}" != "$(realpath -m -- "${cloud_durable_root}")" ]] \
-        || fail "CLOUD_ADOPT_RUN_ROOT cannot be the active durable run root"
-    for cloud_adopt_phase in input_preparation embedding_cache; do
-        cloud_adopt_checkpoint="${cloud_adopt_run_root}/portable_checkpoints/${cloud_adopt_phase}"
-        require_directory "${cloud_adopt_checkpoint}"
-        cloud_checkpoint_adoption_arguments+=(
-            --adopt-checkpoint "${cloud_adopt_checkpoint}"
-        )
-        ((cloud_expected_adoption_count += 1))
-    done
-    note "requesting ordinary authenticated adoption of completed input and embedding checkpoints from ${cloud_adopt_run_root}"
+[[ -z "${CLOUD_ADOPT_RUN_ROOT:-}" ]] \
+    || fail "CLOUD_ADOPT_RUN_ROOT is unsafe for path-bound embedding caches; use CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT with fresh active roots"
+cloud_embedding_import_arguments=()
+cloud_expected_embedding_import=0
+cloud_import_run_root=""
+if [[ -n "${CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT:-}" ]]; then
+    [[ "${CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT}" == /* ]] \
+        || fail "CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT must be an absolute path"
+    cloud_import_run_root="$(realpath -e -- "${CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT}")"
+    require_directory "${cloud_import_run_root}"
+    [[ "${cloud_import_run_root}" != "$(realpath -m -- "${cloud_durable_root}")" ]] \
+        || fail "embedding-cache import source cannot be the active durable run root"
+    cloud_embedding_import_paths=()
+    mapfile -t cloud_embedding_import_paths < <(
+        PYTHONPATH="${cloud_snapshot}" \
+            "${cloud_python}" -P \
+            "${cloud_snapshot}/scripts/resolve_production_embedding_cache_import.py" \
+            --run-root "${cloud_import_run_root}"
+    )
+    [[ "${#cloud_embedding_import_paths[@]}" == "3" ]] \
+        || fail "could not resolve the prior run's authenticated embedding-cache relocation inputs"
+    cloud_embedding_import_arguments=(
+        --embedding-cache-import "${cloud_embedding_import_paths[0]}"
+        --embedding-cache-import-source-prepared "${cloud_embedding_import_paths[1]}"
+        --embedding-cache-import-source-preparation-manifest "${cloud_embedding_import_paths[2]}"
+    )
+    cloud_expected_embedding_import=1
+    note "requesting authenticated embedding-cache relocation from ${cloud_import_run_root}; input preparation will run freshly"
 else
-    note "no prior checkpoints requested for adoption"
+    note "no prior embedding cache requested for relocation"
 fi
 
 cloud_stop_arguments=()
@@ -391,7 +400,7 @@ cloud_workflow_arguments=(
     --log-level INFO
     "${cloud_stop_arguments[@]}"
     "${cloud_resume_arguments[@]}"
-    "${cloud_checkpoint_adoption_arguments[@]}"
+    "${cloud_embedding_import_arguments[@]}"
 )
 
 note "dataset: ${cloud_dataset}"
@@ -452,7 +461,7 @@ if (( cloud_check_only == 1 )); then
         "${cloud_snapshot}/scripts/run_local_vllm_stage2_proxy.py" \
         "${cloud_vllm_proxy_arguments[@]}" \
         --check-only >/dev/null
-    CLOUD_EXPECTED_ADOPTION_COUNT="${cloud_expected_adoption_count}" \
+    CLOUD_EXPECTED_EMBEDDING_IMPORT="${cloud_expected_embedding_import}" \
     "${cloud_python}" -P - "${cloud_workflow_arguments[@]}" <<'PY'
 import os
 import sys
@@ -472,17 +481,11 @@ workflow = ProductionAllEvidenceWorkflow(
 )
 request = workflow._request_body()
 adoptions = request["requested_checkpoint_adoptions"]
-expected_adoptions = int(os.environ["CLOUD_EXPECTED_ADOPTION_COUNT"])
-if len(adoptions) != expected_adoptions:
-    raise SystemExit("cloud request compiled an unexpected checkpoint-adoption count")
-if expected_adoptions:
-    if {row["artifact_kind"] for row in adoptions} != {
-        "prepared_cohort",
-        "embedding_cache",
-    }:
-        raise SystemExit("cloud recovery request selected unexpected checkpoint kinds")
-elif adoptions:
+if adoptions:
     raise SystemExit("cold cloud request unexpectedly adopted checkpoints")
+expected_import = bool(int(os.environ["CLOUD_EXPECTED_EMBEDDING_IMPORT"]))
+if ("embedding_cache_import_inputs" in request) is not expected_import:
+    raise SystemExit("cloud request compiled an unexpected embedding-cache import state")
 if workflow.query_devices != tuple(f"cuda:{index}" for index in range(8)):
     raise SystemExit("cloud request did not compile eight devices")
 if "stage2_endpoint_authentication" in request:

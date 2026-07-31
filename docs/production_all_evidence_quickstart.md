@@ -269,25 +269,30 @@ active scratch or durable root.
 If a run completed `input_preparation` and `embedding_cache` but then exposed a
 code defect, preserve its durable and scratch roots. Corrected source cannot
 resume the old immutable request in place. Instead, select distinct corrected
-run, scratch, profile, and source-snapshot roots and ask the launcher to adopt
-only the prior run's portable preparation checkpoints:
+run, scratch, profile, and source-snapshot roots and ask the launcher to import
+the prior cache through the authenticated relocation path:
 
 ```bash
-export CLOUD_ADOPT_RUN_ROOT="$PWD/artifacts/cloud_runs/one_conf_one_mod"
-export CLOUD_RUN_ROOT_BASE="$PWD/artifacts/cloud_runs_corrected"
-export CLOUD_SCRATCH_ROOT_BASE="$PWD/artifacts/cloud_scratch_corrected"
-export CLOUD_RUNTIME_PROFILE_ROOT="$PWD/artifacts/runtime_profiles/corrected"
-export CLOUD_SOURCE_SNAPSHOT_ROOT="$PWD/artifacts/production_source_snapshot_corrected"
+unset CLOUD_ADOPT_RUN_ROOT
+export CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT="$PWD/artifacts/cloud_runs/one_conf_one_mod"
+export CLOUD_RUN_ROOT_BASE="$PWD/artifacts/cloud_runs_relocated"
+export CLOUD_SCRATCH_ROOT_BASE="$PWD/artifacts/cloud_scratch_relocated"
+export CLOUD_RUNTIME_PROFILE_ROOT="$PWD/artifacts/runtime_profiles/relocated"
+export CLOUD_SOURCE_SNAPSHOT_ROOT="$PWD/artifacts/production_source_snapshot_relocated"
 
 SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh --prepare-only
 SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh --check-only
 SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh
 ```
 
-The check-only invocation performs ordinary compatibility and byte
-authentication. Only compatible `prepared_cohort` and `embedding_cache`
-artifacts are admitted; a failed or incomplete preflight is not adopted. Keep
-the same exported values on every subsequent resume of the corrected request.
+Input preparation runs freshly because its manifest is path-bound. The cache
+resolver authenticates the prior portable checkpoint and locates its original
+cache-bound cohort and recovered preparation manifest. The embedding phase then
+uses the ordinary relocation validator to authenticate the source and fresh
+preparations, prove exact row equality, copy the unchanged cache bytes, and
+seal a new relocation attestation. It does not rerun the embedding model. A
+failed or incomplete preflight is not reused. Keep the same exported values on
+every subsequent resume of the corrected request.
 
 ## Starting a genuinely fresh run
 
@@ -377,7 +382,7 @@ The launchers expose a small number of deployment-only controls. Set them before
 | `CLOUD_SCRATCH_ROOT_BASE` | scratch base | `artifacts/cloud_scratch` |
 | `CLOUD_RUNTIME_PROFILE_ROOT` | generated deployment-profile directory | `artifacts/runtime_profiles/current` |
 | `CLOUD_SOURCE_SNAPSHOT_ROOT` | immutable source snapshot | `artifacts/production_source_snapshot_current` |
-| `CLOUD_ADOPT_RUN_ROOT` | optional preserved run supplying authenticated input/embedding checkpoints | unset |
+| `CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT` | optional preserved run supplying a cache through authenticated relocation | unset |
 
 `CLOUD_GPU_COUNT` and `CLOUD_VISIBLE_DEVICES` are validated rather than
 generalized by these wrappers: they must remain `8` and `0,1,2,3,4,5,6,7`.

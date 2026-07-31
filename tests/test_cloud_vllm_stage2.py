@@ -11,6 +11,10 @@ from pathlib import Path
 import pytest
 
 from oci.inference.portable_workflow_spec import ScientificWorkflowSpec
+from oci.inference.portable_artifacts import (
+    ArtifactCompatibility,
+    publish_portable_artifact,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -220,3 +224,81 @@ def test_cloud_scientific_profile_uses_full_context_without_truncation() -> None
     assert protocol.max_rendered_discovery_prompt_bytes == 440_000
     assert protocol.proposal_max_tokens == 25_000
     assert protocol.extraction_max_tokens == 25_000
+
+
+def test_cloud_cache_recovery_resolves_authenticated_relocation_inputs(
+    tmp_path: Path,
+) -> None:
+    resolver = _module(
+        "scripts/resolve_production_embedding_cache_import.py",
+        "test_resolve_production_embedding_cache_import",
+    )
+    prior = tmp_path / "prior_run"
+    checkpoint = prior / "portable_checkpoints" / "embedding_cache"
+    cache = checkpoint / "embedding_cache"
+    prepared = checkpoint / "prepared" / "modeling_cohort.parquet"
+    historical = tmp_path / "prior_scratch" / "prepared" / "modeling_cohort.parquet"
+    historical_manifest = historical.parent / "preparation_manifest.json"
+    cache.mkdir(parents=True)
+    prepared.parent.mkdir(parents=True)
+    historical.parent.mkdir(parents=True)
+    cohort_bytes = b"authenticated prepared cohort fixture"
+    prepared.write_bytes(cohort_bytes)
+    historical.write_bytes(cohort_bytes)
+    historical_manifest.write_text("{}\n", encoding="utf-8")
+    (cache / "metadata.json").write_text(
+        json.dumps(
+            {
+                "production_provenance": {
+                    "dataset": {"path": str(historical)}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    for name in ("chunk_embeddings.npy", "offsets.npy", "chunk_texts.jsonl"):
+        (cache / name).write_bytes(f"fixture:{name}".encode("utf-8"))
+    payloads = tuple(
+        path.relative_to(checkpoint).as_posix()
+        for path in sorted(checkpoint.rglob("*"))
+        if path.is_file()
+    )
+    publish_portable_artifact(
+        root=checkpoint,
+        artifact_kind="embedding_cache",
+        artifact_schema="test_cloud_embedding_cache_v1",
+        compatibility=ArtifactCompatibility(
+            dataset_identity="1" * 64,
+            split_identity="2" * 64,
+            row_order_identity="3" * 64,
+            model_identities={"embedding": "4" * 64},
+            prompt_identities={},
+            configuration_identity="5" * 64,
+            seed_identity="6" * 64,
+            producer_code_identity="7" * 64,
+            runtime_compatibility_class="test-runtime",
+        ),
+        upstream_artifact_ids=(),
+        payload_paths=payloads,
+        workflow_phase="embedding_cache",
+        workflow_phase_result={
+            "schema_version": "test_embedding_cache_phase_v1",
+            "mode": "fresh_build",
+            "cache_path": str(cache),
+            "prepared_cohort_path": str(prepared),
+            "terminal_files": [str(checkpoint / relative) for relative in payloads],
+        },
+    )
+
+    assert resolver.resolve_import_inputs(prior) == (
+        cache,
+        historical,
+        historical_manifest,
+    )
+    (cache / "offsets.npy").write_bytes(b"altered")
+    with pytest.raises(ValueError, match="payload"):
+        resolver.resolve_import_inputs(prior)
+    (cache / "offsets.npy").write_bytes(b"fixture:offsets.npy")
+    historical_manifest.unlink()
+    with pytest.raises(FileNotFoundError):
+        resolver.resolve_import_inputs(prior)
