@@ -302,7 +302,7 @@ cloud_run_base="${CLOUD_RUN_ROOT_BASE:-${cloud_repo_root}/artifacts/cloud_runs}"
 cloud_scratch_base="${CLOUD_SCRATCH_ROOT_BASE:-${cloud_repo_root}/artifacts/cloud_scratch}"
 cloud_durable_root="${cloud_run_base}/${CLOUD_RUN_KEY}"
 cloud_scratch_root="${cloud_scratch_base}/${CLOUD_RUN_KEY}"
-cloud_profile_directory="${cloud_repo_root}/artifacts/runtime_profiles/current"
+cloud_profile_directory="${CLOUD_RUNTIME_PROFILE_ROOT:-${cloud_repo_root}/artifacts/runtime_profiles/current}"
 cloud_deployment="${cloud_profile_directory}/${CLOUD_RUN_KEY}.json"
 cloud_embedding_batch_size="${EMBEDDING_BATCH_SIZE:-8}"
 cloud_vllm_runtime_root="${cloud_scratch_base}/vllm_${CLOUD_RUN_KEY}"
@@ -354,7 +354,30 @@ elif [[ -d "${cloud_durable_root}" ]]; then
 elif [[ -e "${cloud_durable_root}" ]]; then
     fail "durable run root exists but is not a directory"
 else
-    note "starting a new request with no adopted checkpoints or cache imports"
+    note "starting a new durable request"
+fi
+
+cloud_checkpoint_adoption_arguments=()
+cloud_expected_adoption_count=0
+cloud_adopt_run_root=""
+if [[ -n "${CLOUD_ADOPT_RUN_ROOT:-}" ]]; then
+    [[ "${CLOUD_ADOPT_RUN_ROOT}" == /* ]] \
+        || fail "CLOUD_ADOPT_RUN_ROOT must be an absolute path"
+    cloud_adopt_run_root="$(realpath -e -- "${CLOUD_ADOPT_RUN_ROOT}")"
+    require_directory "${cloud_adopt_run_root}"
+    [[ "${cloud_adopt_run_root}" != "$(realpath -m -- "${cloud_durable_root}")" ]] \
+        || fail "CLOUD_ADOPT_RUN_ROOT cannot be the active durable run root"
+    for cloud_adopt_phase in input_preparation embedding_cache; do
+        cloud_adopt_checkpoint="${cloud_adopt_run_root}/portable_checkpoints/${cloud_adopt_phase}"
+        require_directory "${cloud_adopt_checkpoint}"
+        cloud_checkpoint_adoption_arguments+=(
+            --adopt-checkpoint "${cloud_adopt_checkpoint}"
+        )
+        ((cloud_expected_adoption_count += 1))
+    done
+    note "requesting ordinary authenticated adoption of completed input and embedding checkpoints from ${cloud_adopt_run_root}"
+else
+    note "no prior checkpoints requested for adoption"
 fi
 
 cloud_stop_arguments=()
@@ -368,6 +391,7 @@ cloud_workflow_arguments=(
     --log-level INFO
     "${cloud_stop_arguments[@]}"
     "${cloud_resume_arguments[@]}"
+    "${cloud_checkpoint_adoption_arguments[@]}"
 )
 
 note "dataset: ${cloud_dataset}"
@@ -428,7 +452,9 @@ if (( cloud_check_only == 1 )); then
         "${cloud_snapshot}/scripts/run_local_vllm_stage2_proxy.py" \
         "${cloud_vllm_proxy_arguments[@]}" \
         --check-only >/dev/null
+    CLOUD_EXPECTED_ADOPTION_COUNT="${cloud_expected_adoption_count}" \
     "${cloud_python}" -P - "${cloud_workflow_arguments[@]}" <<'PY'
+import os
 import sys
 
 from oci.inference.production_all_evidence_workflow import (
@@ -445,7 +471,17 @@ workflow = ProductionAllEvidenceWorkflow(
     hooks=_default_portable_role_neutral_hooks(options),
 )
 request = workflow._request_body()
-if request["requested_checkpoint_adoptions"]:
+adoptions = request["requested_checkpoint_adoptions"]
+expected_adoptions = int(os.environ["CLOUD_EXPECTED_ADOPTION_COUNT"])
+if len(adoptions) != expected_adoptions:
+    raise SystemExit("cloud request compiled an unexpected checkpoint-adoption count")
+if expected_adoptions:
+    if {row["artifact_kind"] for row in adoptions} != {
+        "prepared_cohort",
+        "embedding_cache",
+    }:
+        raise SystemExit("cloud recovery request selected unexpected checkpoint kinds")
+elif adoptions:
     raise SystemExit("cold cloud request unexpectedly adopted checkpoints")
 if workflow.query_devices != tuple(f"cuda:{index}" for index in range(8)):
     raise SystemExit("cloud request did not compile eight devices")

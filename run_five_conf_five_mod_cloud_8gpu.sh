@@ -2,10 +2,12 @@
 
 # Clean eight-GPU cloud restart
 #
-# This launcher starts the five-confounder/five-modifier workflow without
-# adopting or importing prior checkpoints. Fresh embedding construction uses
-# all eight selected GPUs concurrently with canonical output ordering. Stage 1
-# then uses eight disjoint owner lanes, one per GPU.
+# This launcher defaults to a cold five-confounder/five-modifier workflow.
+# Fresh embedding construction uses all eight selected GPUs concurrently with
+# canonical output ordering. Stage 1 then uses eight disjoint owner lanes, one
+# per GPU. For code-correction recovery, CLOUD_ADOPT_RUN_ROOT may name a
+# preserved prior durable root; only its ordinarily authenticated completed
+# input-preparation and embedding-cache portable checkpoints are considered.
 #
 # Repository preparation on the cloud VM:
 #

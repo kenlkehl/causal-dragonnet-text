@@ -281,6 +281,11 @@ def _write_cluster_preflight_cache(
                 "chunk_overlap_words": 0,
                 "max_chunks": 1,
                 "chunk_selection": "last",
+                "normalize_embeddings": False,
+                "max_seq_length": None,
+                "chunk_cap_nonbinding": True,
+                "semantic_truncation_allowed": False,
+                "tokenizer_truncation_allowed": False,
             }
         ),
         encoding="utf-8",

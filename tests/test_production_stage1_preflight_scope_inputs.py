@@ -735,6 +735,69 @@ def test_scope_inputs_expose_only_fit_rows_and_refuse_nonfit_cache(
     )
 
 
+@pytest.mark.parametrize("label_dtype", [np.int64, np.bool_])
+def test_fit_label_scalar_types_survive_capability_publication_and_reopen(
+    tmp_path: Path,
+    label_dtype,
+):
+    (
+        config,
+        source,
+        modeling,
+        cache,
+        _matrix,
+        scopes,
+        registry,
+        registry_sha,
+    ) = _fixture(tmp_path)
+    modeling[config.treatment_column] = modeling[
+        config.treatment_column
+    ].astype(label_dtype)
+    modeling[config.outcome_column] = modeling[
+        config.outcome_column
+    ].astype(label_dtype)
+
+    published = publish_preflight_scope_inputs(
+        output_root=(tmp_path / "typed_scope_inputs").resolve(),
+        modeling_data=modeling,
+        config=config,
+        embedding_cache=cache,
+        embedding_cache_identity=cache.identity(),
+        registry=registry,
+        registry_content_sha256=registry_sha,
+        scopes=scopes,
+        source_dataset_path=source,
+        global_embedding_cache_path=cache.cache_dir,
+        semantic_witness_scientific_config=_SEMANTIC_WITNESS_CONFIG,
+    )
+
+    for payload in published.worker_payloads():
+        reopened = validate_preflight_scope_input(
+            manifest_path=payload["manifest_path"],
+            expected_scope_id=payload["scope_id"],
+            expected_manifest_content_sha256=payload[
+                "manifest_content_sha256"
+            ],
+        )
+        fit_rows = list(map(int, reopened.scope["fit_row_ids"]))
+        columns = [
+            config.text_column,
+            config.treatment_column,
+            config.outcome_column,
+        ]
+        assert (
+            reopened.modeling_data.iloc[fit_rows][columns].to_dict("records")
+            == modeling.iloc[fit_rows][columns].to_dict("records")
+        )
+        assert reopened.manifest["shared_modeling_view"][
+            "fit_modeling_content_sha256"
+        ] == scope_inputs_module._fit_modeling_content_sha256(
+            modeling_data=modeling,
+            fit_rows=fit_rows,
+            columns=columns,
+        )
+
+
 def test_shared_text_is_written_once_and_scopes_store_only_fit_labels(
     tmp_path: Path,
 ):

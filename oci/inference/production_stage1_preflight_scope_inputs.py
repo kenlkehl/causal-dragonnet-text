@@ -3459,8 +3459,13 @@ def validate_preflight_scope_input(
     modeling = pd.DataFrame(
         {
             config.text_column: np.full(row_count, "", dtype=object),
-            config.treatment_column: np.full(row_count, np.nan, dtype=float),
-            config.outcome_column: np.full(row_count, np.nan, dtype=float),
+            # Object-backed missing values preserve the authenticated scalar
+            # representation from the fit-only Parquet projection.  A float
+            # placeholder coerces integer/bool labels to 0.0/1.0 while
+            # rebuilding the sparse capability and changes the exact
+            # fit-modeling content identity.
+            config.treatment_column: np.full(row_count, None, dtype=object),
+            config.outcome_column: np.full(row_count, None, dtype=object),
         }
     )
     modeling.loc[list(fit_rows), columns] = fit_values.to_numpy(copy=True)
@@ -3908,13 +3913,13 @@ def _validate_preflight_scope_capability(
             config.text_column: np.full(row_count, "", dtype=object),
             config.treatment_column: np.full(
                 row_count,
-                np.nan,
-                dtype=float,
+                None,
+                dtype=object,
             ),
             config.outcome_column: np.full(
                 row_count,
-                np.nan,
-                dtype=float,
+                None,
+                dtype=object,
             ),
         }
     )

@@ -5447,6 +5447,24 @@ def test_stage1_preflight_identity_excludes_later_factory_implementation(
     }
     assert "oci/inference/prepared_stage1_context.py" in preflight_sources
     assert (
+        "oci/inference/production_stage1_preflight_scope_inputs.py"
+        in preflight_sources
+    )
+    for reusable_preparation_phase in (
+        "input_preparation",
+        "embedding_cache",
+    ):
+        reusable_sources = {
+            row["relative_path"]
+            for row in baseline[reusable_preparation_phase][
+                "transitive_source_inventory"
+            ]
+        }
+        assert (
+            "oci/inference/production_stage1_preflight_scope_inputs.py"
+            not in reusable_sources
+        )
+    assert (
         "oci/inference/production_role_neutral_producer_factories.py"
         not in preflight_sources
     )

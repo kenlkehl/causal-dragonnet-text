@@ -264,6 +264,31 @@ Do not edit terminal manifests, generated deployment JSON, model files, or
 sealed payloads. Do not point both hosts or both benchmark launchers at the same
 active scratch or durable root.
 
+### Recovering completed preparation after a source correction
+
+If a run completed `input_preparation` and `embedding_cache` but then exposed a
+code defect, preserve its durable and scratch roots. Corrected source cannot
+resume the old immutable request in place. Instead, select distinct corrected
+run, scratch, profile, and source-snapshot roots and ask the launcher to adopt
+only the prior run's portable preparation checkpoints:
+
+```bash
+export CLOUD_ADOPT_RUN_ROOT="$PWD/artifacts/cloud_runs/one_conf_one_mod"
+export CLOUD_RUN_ROOT_BASE="$PWD/artifacts/cloud_runs_corrected"
+export CLOUD_SCRATCH_ROOT_BASE="$PWD/artifacts/cloud_scratch_corrected"
+export CLOUD_RUNTIME_PROFILE_ROOT="$PWD/artifacts/runtime_profiles/corrected"
+export CLOUD_SOURCE_SNAPSHOT_ROOT="$PWD/artifacts/production_source_snapshot_corrected"
+
+SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh --prepare-only
+SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh --check-only
+SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh
+```
+
+The check-only invocation performs ordinary compatibility and byte
+authentication. Only compatible `prepared_cohort` and `embedding_cache`
+artifacts are admitted; a failed or incomplete preflight is not adopted. Keep
+the same exported values on every subsequent resume of the corrected request.
+
 ## Starting a genuinely fresh run
 
 The default run keys are stable so an ordinary rerun resumes. To create a new
@@ -350,7 +375,9 @@ The launchers expose a small number of deployment-only controls. Set them before
 | `CLOUD_MODEL_ROOT` | materialized pinned model root | `artifacts/local_models/current` |
 | `CLOUD_RUN_ROOT_BASE` | durable run base | `artifacts/cloud_runs` |
 | `CLOUD_SCRATCH_ROOT_BASE` | scratch base | `artifacts/cloud_scratch` |
+| `CLOUD_RUNTIME_PROFILE_ROOT` | generated deployment-profile directory | `artifacts/runtime_profiles/current` |
 | `CLOUD_SOURCE_SNAPSHOT_ROOT` | immutable source snapshot | `artifacts/production_source_snapshot_current` |
+| `CLOUD_ADOPT_RUN_ROOT` | optional preserved run supplying authenticated input/embedding checkpoints | unset |
 
 `CLOUD_GPU_COUNT` and `CLOUD_VISIBLE_DEVICES` are validated rather than
 generalized by these wrappers: they must remain `8` and `0,1,2,3,4,5,6,7`.
