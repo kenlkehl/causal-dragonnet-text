@@ -17,6 +17,8 @@ from tests.resource_safety_test_support import resource_safety_policy
 import oci.inference.production_role_neutral_stage2_handoff as handoff_module
 from oci.inference.all_evidence_discovery_interfaces import (
     ACTIVE_STAGE1_CONCEPT_FAMILIES,
+    BOW_NUISANCE,
+    BOW_R_LOSS,
     HTR_NEURAL,
 )
 from oci.inference.lossless_stage1_evidence_catalog import (
@@ -57,6 +59,7 @@ from oci.inference.production_role_neutral_stage2_handoff import (
     validate_role_neutral_stage2_bridge,
 )
 from oci.inference.production_stage1_legacy_scope_fragments import (
+    ROLE_NEUTRAL_FIT_ONLY_FAMILY_PRIOR_AUTH_REFERENCE_SCHEMA,
     build_role_neutral_fit_only_family_seal,
 )
 from oci.inference.production_stage1_role_neutral_execution import (
@@ -393,6 +396,189 @@ def _provider_ready_execution(
         htr_aggregation_store_root=aggregation_store.root,
     )
     return plan, root, manifest, provider
+
+
+def test_compact_fit_seal_reference_reopens_complete_payload_on_demand(
+    tmp_path,
+):
+    plan = _plan(gpu_ids=())
+    owner = plan.physical_scopes[0]
+    component_root = (tmp_path / "bow").resolve()
+    component_root.mkdir()
+    payloads = _native_payloads()
+    seals = {}
+    registrations = {}
+    for index, family in enumerate((BOW_NUISANCE, BOW_R_LOSS)):
+        seal = build_role_neutral_fit_only_family_seal(
+            plan=plan,
+            physical_owner_scope_id=owner.scope_id,
+            family=family,
+            evidence_payload=payloads[family],
+            producer_identity_sha256=_sha(
+                {"family": family, "identity": "producer"}
+            ),
+            configuration_identity_sha256=_sha(
+                {"family": family, "identity": "configuration"}
+            ),
+            fit_state_artifact_sha256=_sha(
+                {"family": family, "identity": "fit-state"}
+            ),
+        )
+        relative = f"fit_only_{index}.json"
+        encoded = (
+            json.dumps(
+                seal,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        (component_root / relative).write_bytes(encoded)
+        seals[family] = seal
+        registrations[family] = {
+            "relative_path": relative,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "size_bytes": len(encoded),
+            "content_sha256": seal["content_sha256"],
+        }
+    scope_ids = tuple(
+        scope.scope_id
+        for scope in plan.scopes
+        if plan.physical_owner(scope.scope_id).scope_id == owner.scope_id
+    )
+    receipt = AuthenticatedRoleNeutralComponentReceipt.create(
+        plan=plan,
+        physical_owner_scope_id=owner.scope_id,
+        component="bow",
+        family_fit_seals=seals,
+        family_fit_seal_registrations=registrations,
+        family_logical_view_content_sha256={
+            family: {
+                scope_id: _sha(
+                    {
+                        "family": family,
+                        "logical_scope_id": scope_id,
+                    }
+                )
+                for scope_id in scope_ids
+            }
+            for family in (BOW_NUISANCE, BOW_R_LOSS)
+        },
+        source_terminal_content_sha256="a" * 64,
+        source_tree_sha256="b" * 64,
+    )
+    reference = receipt.family_fit_seals[BOW_NUISANCE]
+    assert "evidence_payload" not in reference
+    reopened = handoff_module._resolve_fit_seal_reference(
+        owner_scope_id=owner.scope_id,
+        family=BOW_NUISANCE,
+        seal_or_reference=reference,
+        component_roots={
+            (owner.scope_id, "bow"): component_root,
+        },
+    )
+    assert reopened["evidence_payload"] == payloads[BOW_NUISANCE]
+    assert reopened["content_sha256"] == reference["content_sha256"]
+
+    source_path = (
+        component_root
+        / reference["source_seal_registration"]["relative_path"]
+    )
+    source_path.write_bytes(source_path.read_bytes() + b" ")
+    with pytest.raises(ValueError):
+        handoff_module._resolve_fit_seal_reference(
+            owner_scope_id=owner.scope_id,
+            family=BOW_NUISANCE,
+            seal_or_reference=reference,
+            component_roots={
+                (owner.scope_id, "bow"): component_root,
+            },
+        )
+
+
+def test_prior_authenticated_seal_reference_reopens_complete_payload_on_demand(
+    tmp_path,
+):
+    plan = _plan(gpu_ids=())
+    owner = plan.physical_scopes[0]
+    component_root = (tmp_path / "bow-prior-auth").resolve()
+    component_root.mkdir()
+    payload = _native_payloads()[BOW_NUISANCE]
+    seal = build_role_neutral_fit_only_family_seal(
+        plan=plan,
+        physical_owner_scope_id=owner.scope_id,
+        family=BOW_NUISANCE,
+        evidence_payload=payload,
+        producer_identity_sha256="a" * 64,
+        configuration_identity_sha256="b" * 64,
+        fit_state_artifact_sha256="c" * 64,
+    )
+    encoded = (
+        json.dumps(
+            seal,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    relative = "fit_only_prior.json"
+    (component_root / relative).write_bytes(encoded)
+    registration = {
+        "relative_path": relative,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "size_bytes": len(encoded),
+        "content_sha256": seal["content_sha256"],
+    }
+    body = {
+        "schema_version": (
+            ROLE_NEUTRAL_FIT_ONLY_FAMILY_PRIOR_AUTH_REFERENCE_SCHEMA
+        ),
+        "plan_scientific_content_sha256": (
+            plan.scientific_content_sha256
+        ),
+        "physical_owner_scope_id": owner.scope_id,
+        "family": BOW_NUISANCE,
+        "content_sha256": seal["content_sha256"],
+        "source_seal_registration": registration,
+        "source_evidence_projection": "identity_evidence_payload_v1",
+        "prior_component_import_attestation_content_sha256": "d" * 64,
+        "source_terminal_content_sha256": "e" * 64,
+        "source_tree_sha256": "f" * 64,
+        "complete_evidence_payload_retained_by_reference": True,
+        "evidence_payload_in_receipt": False,
+        "hierarchical_raw_sidecars_retained": True,
+    }
+    reference = {
+        **body,
+        "reference_content_sha256": _sha(body),
+    }
+    reopened = handoff_module._resolve_fit_seal_reference(
+        owner_scope_id=owner.scope_id,
+        family=BOW_NUISANCE,
+        seal_or_reference=reference,
+        component_roots={
+            (owner.scope_id, "bow"): component_root,
+        },
+    )
+    assert reopened["evidence_payload"] == payload
+    assert reopened["content_sha256"] == reference["content_sha256"]
+
+    changed = copy.deepcopy(reference)
+    changed["content_sha256"] = "0" * 64
+    with pytest.raises(
+        ValueError,
+        match="authenticated source identity",
+    ):
+        handoff_module._resolve_fit_seal_reference(
+            owner_scope_id=owner.scope_id,
+            family=BOW_NUISANCE,
+            seal_or_reference=changed,
+            component_roots={
+                (owner.scope_id, "bow"): component_root,
+            },
+        )
 
 
 @pytest.fixture(scope="module")

@@ -40,6 +40,7 @@ certification remains false until a genuine full-cohort one-shot run succeeds.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import hashlib
 import importlib.metadata
@@ -47,10 +48,12 @@ import json
 import os
 import platform
 import re
+import resource
 import stat
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -269,7 +272,7 @@ STAGE1_MATCHED_PAIR_NATIVE_FIT_METADATA_SCHEMA = "production_matched_pair_native
 STAGE1_EXACT_INNER_ADAPTER_GATE_SCHEMA = "production_stage1_exact_inner_adapter_gate_v2"
 STAGE1_RAW_EVIDENCE_SIDECAR_SCHEMA = "production_stage1_raw_evidence_sidecar_v1"
 STAGE1_MATCHED_PAIR_PROOF_SCHEMA = "production_stage1_matched_pair_subproducer_proof_v1"
-STAGE1_BEHAVIOR_IDENTITY_SCHEMA = "production_stage1_behavior_identity_v1"
+STAGE1_BEHAVIOR_IDENTITY_SCHEMA = "production_stage1_behavior_identity_v2"
 STAGE1_NATIVE_FAMILY_PROOF_REGISTRATION_SCHEMA = (
     "production_stage1_native_family_proof_registration_v1"
 )
@@ -293,8 +296,17 @@ STAGE1_CUMULATIVE_ALL_TEN_ROOT_INDEX_SCHEMA = "production_stage1_cumulative_all_
 STAGE1_EXACT_INNER_ROOT_INDEX_SCHEMA = "production_stage1_exact_inner_evidence_index_v2"
 STAGE1_TFIDF_RESUME_POLICY = "sealed_complete_component_only_no_partial_checkpoint_reuse_v1"
 STAGE1_HTR_INPUT_NONTRUNCATION_AUDIT_SCHEMA = "production_stage1_htr_input_nontruncation_audit_v1"
+STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY = (
+    "production_stage1_exact_htr_nontruncation_producer_v2"
+)
+STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY = (
+    "production_stage1_cluster_owner_precomputation_producer_v5"
+)
+STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY = (
+    "production_stage1_reusable_preflight_assembly_producer_v3"
+)
 STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA = (
-    "production_stage1_embedding_cluster_feasibility_audit_v2"
+    "production_stage1_embedding_cluster_feasibility_audit_v3"
 )
 STAGE1_EMBEDDING_CLUSTER_FIT_IDENTITY_SCHEMA = "production_stage1_embedding_cluster_fit_identity_v2"
 STAGE1_EMBEDDING_CLUSTER_FIT_INDEX_SCHEMA = "production_stage1_embedding_cluster_fit_index_v2"
@@ -6952,6 +6964,96 @@ def _htr_model_sequence_limit(model_path: Path, tokenizer: Any) -> int | None:
     return min(candidates) if candidates else None
 
 
+def _htr_tokenizer_scientific_identity(
+    model_path: Path,
+) -> Mapping[str, Any]:
+    """Bind tokenizer assets and runtime semantics without tokenizing notes."""
+
+    tokenizer = _load_local_htr_tokenizer(model_path)
+    try:
+        vocabulary = tokenizer.get_vocab()
+    except Exception as exc:
+        raise ValueError(
+            "local HTR tokenizer has no auditable vocabulary"
+        ) from exc
+    if (
+        not isinstance(vocabulary, Mapping)
+        or not vocabulary
+        or any(
+            not isinstance(token, str)
+            or isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            for token, index in vocabulary.items()
+        )
+    ):
+        raise ValueError("local HTR tokenizer vocabulary is malformed")
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    backend_serialization_sha256 = None
+    if backend is not None and callable(getattr(backend, "to_str", None)):
+        serialized = backend.to_str()
+        if not isinstance(serialized, str):
+            raise ValueError(
+                "local HTR fast-tokenizer serialization is invalid"
+            )
+        backend_serialization_sha256 = hashlib.sha256(
+            serialized.encode("utf-8")
+        ).hexdigest()
+    def installed_version(name: str) -> str | None:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    special_map = getattr(tokenizer, "special_tokens_map", {})
+    body = {
+        "schema_version": (
+            "production_htr_tokenizer_scientific_identity_v1"
+        ),
+        "tokenizer_class_module": type(tokenizer).__module__,
+        "tokenizer_class_name": type(tokenizer).__name__,
+        "vocabulary_sha256": _sha256_json(
+            [
+                {"token": token, "token_id": int(index)}
+                for token, index in sorted(
+                    vocabulary.items(),
+                    key=lambda item: (int(item[1]), str(item[0])),
+                )
+            ]
+        ),
+        "vocabulary_size": len(vocabulary),
+        "special_tokens_map": {
+            str(name): (
+                [str(item) for item in value]
+                if isinstance(value, (list, tuple))
+                else str(value)
+            )
+            for name, value in sorted(dict(special_map).items())
+        },
+        "all_special_ids": [
+            int(value)
+            for value in getattr(tokenizer, "all_special_ids", ())
+        ],
+        "model_input_names": [
+            str(value)
+            for value in getattr(tokenizer, "model_input_names", ())
+        ],
+        "model_max_sequence_length": _htr_model_sequence_limit(
+            model_path,
+            tokenizer,
+        ),
+        "backend_serialization_sha256": (
+            backend_serialization_sha256
+        ),
+        "transformers_version": installed_version("transformers"),
+        "tokenizers_version": installed_version("tokenizers"),
+        "local_only": True,
+        "trust_remote_code": False,
+        "note_tokenization_performed": False,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
+
+
 def _htr_token_lengths_without_truncation(
     tokenizer: Any,
     chunks: Sequence[str],
@@ -7086,6 +7188,7 @@ def _build_htr_input_nontruncation_audit(
     config: AppliedInferenceConfig,
     htr_model_path: Path,
     htr_model_tree_sha256: str,
+    _exact_inventory_sink: dict[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Prove full-cohort HTR inputs are word- and tokenizer-lossless."""
 
@@ -7213,6 +7316,20 @@ def _build_htr_input_nontruncation_audit(
         "applies_to_families": [HTR_NEURAL, MATCHED_PAIR_UPLIFT],
     }
     audit = {**body, "content_sha256": _sha256_json(body)}
+    if _exact_inventory_sink is not None:
+        _exact_inventory_sink.clear()
+        _exact_inventory_sink.update(
+            {
+                "row_text_sha256": [
+                    hashlib.sha256(value.encode("utf-8")).hexdigest()
+                    for value in normalized_texts
+                ],
+                "row_chunk_counts": list(map(int, chunk_counts)),
+                "chunk_token_lengths": list(map(int, token_counts)),
+                "every_row_and_chunk_accounted_once": True,
+                "sampling_or_top_k_used": False,
+            }
+        )
     return validate_htr_input_nontruncation_audit(
         audit,
         config=config,
@@ -8058,6 +8175,103 @@ def _embedding_cluster_configuration(
     return logical
 
 
+def _embedding_cluster_preflight_scientific_configuration(
+    config: AppliedInferenceConfig | Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Return exactly the settings that can alter sealed preflight output.
+
+    The complete embedding evidence profile also carries deployment controls
+    (device and batch size) and settings for whole-cohort/external evidence
+    families that the cluster-only preflight entry point never executes.
+    Binding those fields made identical KMeans/SVD states spuriously
+    incompatible.  This closed projection follows the actual
+    ``build_cluster_only_evidence`` data path.
+    """
+
+    logical = _embedding_cluster_configuration(config)
+    cluster = _cluster_local_scientific_config(logical)
+    required = {
+        "enabled",
+        "model_name",
+        "normalize_embeddings",
+        "include_cluster_contrast_vectors",
+        "residualize_columns",
+        "top_k_chunks_per_tail",
+        "max_chunks_per_patient",
+    }
+    missing = sorted(required - set(logical))
+    if missing:
+        raise ValueError(
+            "cluster-only preflight configuration is incomplete: "
+            f"{missing}"
+        )
+    body = {
+        "schema_version": (
+            "production_stage1_cluster_only_scientific_configuration_v1"
+        ),
+        "cluster_local_scientific": cluster.as_dict(),
+        "cluster_only_evidence_controls": {
+            name: copy.deepcopy(logical[name])
+            for name in sorted(required)
+        },
+        "external_corpus_controls_included": False,
+        "whole_cohort_contrast_controls_included": False,
+        "device_or_batch_controls_included": False,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
+
+
+def _embedding_cache_cluster_preflight_scientific_selector(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Select frozen cache science, excluding adoption/relocation mechanics."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            "embedding-cache preflight selector requires one mapping"
+        )
+    selected: Mapping[str, Any] = value
+    projected_build = selected.get(
+        "production_cache_build_identity"
+    )
+    if isinstance(projected_build, Mapping):
+        selected = projected_build
+    relocated_build = selected.get("cache_build_identity")
+    if isinstance(relocated_build, Mapping):
+        selected = relocated_build
+    required = (
+        "schema_version",
+        "dataset_sha256",
+        "ordered_text_sha256",
+        "sentence_model_name",
+        "local_model_tree_sha256",
+        "chunk_configuration_sha256",
+        "cache_configuration_sha256",
+        "row_count",
+        "chunk_count",
+        "hidden_size",
+        "cache_files",
+        "provider_identity",
+    )
+    missing = [name for name in required if name not in selected]
+    if missing:
+        raise ValueError(
+            "embedding cache lacks cluster-preflight scientific fields: "
+            + ", ".join(missing)
+        )
+    body = {
+        "schema_version": (
+            "production_stage1_cluster_preflight_cache_science_v1"
+        ),
+        "cache_build_science": {
+            name: copy.deepcopy(selected[name])
+            for name in required
+        },
+        "relocation_or_adoption_mechanism_included": False,
+    }
+    return {**body, "content_sha256": _sha256_json(body)}
+
+
 def _embedding_cluster_global_seed(
     config: AppliedInferenceConfig | Mapping[str, Any],
 ) -> int:
@@ -8701,6 +8915,9 @@ def validate_embedding_cluster_feasibility_audit(
     if not isinstance(audit, Mapping):
         raise ValueError("embedding cluster feasibility audit must be one mapping")
     embedding_configuration = _embedding_cluster_configuration(config)
+    preflight_configuration = (
+        _embedding_cluster_preflight_scientific_configuration(config)
+    )
     cluster_scientific = _cluster_local_scientific_config(
         embedding_configuration
     )
@@ -8772,12 +8989,26 @@ def validate_embedding_cluster_feasibility_audit(
     expected_bindings = [_embedding_cluster_scope_binding(scope) for scope in expected_scopes]
     observed_scopes = audit.get("scopes")
     observed_fields = set(audit)
+    audit_schema = audit.get("schema_version")
+    legacy_v2 = (
+        audit_schema
+        == "production_stage1_embedding_cluster_feasibility_audit_v2"
+    )
+    expected_configuration_sha256 = (
+        _sha256_json(embedding_configuration)
+        if legacy_v2
+        else preflight_configuration["content_sha256"]
+    )
     is_physical_deduplicated = observed_fields == (
         legacy_fields | physical_fields
     )
     if (
         frozenset(observed_fields) != frozenset(legacy_fields | physical_fields)
-        or audit.get("schema_version") != STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA
+        or audit_schema
+        not in {
+            STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
+            "production_stage1_embedding_cluster_feasibility_audit_v2",
+        }
         or _HEX_SHA256.fullmatch(
             str(audit.get("content_sha256") or "")
         )
@@ -8788,7 +9019,8 @@ def validate_embedding_cluster_feasibility_audit(
             != _sha256_json_streaming(body)
         )
         or audit.get("split_registry_content_sha256") != str(registry_content_sha256)
-        or audit.get("embedding_configuration_sha256") != _sha256_json(embedding_configuration)
+        or audit.get("embedding_configuration_sha256")
+        != expected_configuration_sha256
         or audit.get("embedding_cache_identity_sha256")
         != _sha256_json(dict(embedding_cache_identity))
         or audit.get("cluster_support_contract_schema_version")
@@ -9004,11 +9236,75 @@ def validate_embedding_cluster_feasibility_audit(
     return copy.deepcopy(dict(audit)) if copy_result else audit
 
 
+def upgrade_embedding_cluster_feasibility_audit_v2(
+    audit: Mapping[str, Any],
+    *,
+    config: AppliedInferenceConfig,
+    registry: Mapping[str, Any],
+    registry_content_sha256: str,
+    embedding_cache_identity: Mapping[str, Any],
+    initial_training_partitions: int,
+) -> Mapping[str, Any]:
+    """Re-key an authenticated v2 aggregate without refitting any owner.
+
+    V2 bound the entire embedding evidence profile, including operational and
+    unrelated-family controls.  Its owner scope records and canonical
+    KMeans/SVD state are already scientifically complete.  After ordinary
+    validation, only the aggregate schema/configuration root is projected to
+    v3 and rehashed.
+    """
+
+    validated = validate_embedding_cluster_feasibility_audit(
+        audit,
+        config=config,
+        registry=registry,
+        registry_content_sha256=registry_content_sha256,
+        embedding_cache_identity=embedding_cache_identity,
+        initial_training_partitions=initial_training_partitions,
+    )
+    if (
+        validated.get("schema_version")
+        == STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA
+    ):
+        return validated
+    if (
+        validated.get("schema_version")
+        != "production_stage1_embedding_cluster_feasibility_audit_v2"
+    ):
+        raise ValueError(
+            "cluster preflight aggregate cannot be upgraded"
+        )
+    body = {
+        key: copy.deepcopy(value)
+        for key, value in validated.items()
+        if key != "content_sha256"
+    }
+    body["schema_version"] = (
+        STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA
+    )
+    body["embedding_configuration_sha256"] = (
+        _embedding_cluster_preflight_scientific_configuration(
+            config
+        )["content_sha256"]
+    )
+    upgraded = {**body, "content_sha256": _sha256_json_streaming(body)}
+    return validate_embedding_cluster_feasibility_audit(
+        upgraded,
+        config=config,
+        registry=registry,
+        registry_content_sha256=registry_content_sha256,
+        embedding_cache_identity=embedding_cache_identity,
+        initial_training_partitions=initial_training_partitions,
+    )
+
+
 def _embedding_cluster_preflight_loky_scope(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Authenticate one scope through the shared row-restricted cache."""
 
+    execution_started_ns = time.monotonic_ns()
+    io_started = _preflight_process_io_counters()
     from .production_stage1_preflight_scope_inputs import (
         validate_preflight_scope_input,
     )
@@ -9018,14 +9314,29 @@ def _embedding_cluster_preflight_loky_scope(
         "scope_id",
         "manifest_path",
         "manifest_content_sha256",
-        "shared_cache_reference_path",
-        "shared_cache_reference_content_sha256",
         "initial_training_partitions",
     }
+    publication = payload.get("reusable_owner_publication")
+    if publication is not None:
+        required.add("reusable_owner_publication")
     if (
         not isinstance(payload, Mapping)
         or set(payload) != required
-        or payload.get("schema_version") != "production_stage1_preflight_worker_payload_v2"
+        or payload.get("schema_version")
+        not in {
+            "production_stage1_preflight_worker_payload_v4",
+            "production_stage1_preflight_worker_payload_v5",
+        }
+        or (
+            publication is None
+            and payload.get("schema_version")
+            != "production_stage1_preflight_worker_payload_v4"
+        )
+        or (
+            publication is not None
+            and payload.get("schema_version")
+            != "production_stage1_preflight_worker_payload_v5"
+        )
     ):
         raise ValueError("cluster preflight worker payload is not closed")
     scope_id = str(payload["scope_id"])
@@ -9033,13 +9344,8 @@ def _embedding_cluster_preflight_loky_scope(
         manifest_path=str(payload["manifest_path"]),
         expected_scope_id=scope_id,
         expected_manifest_content_sha256=str(payload["manifest_content_sha256"]),
-        shared_cache_reference_path=str(
-            payload["shared_cache_reference_path"]
-        ),
-        expected_shared_cache_reference_content_sha256=str(
-            payload["shared_cache_reference_content_sha256"]
-        ),
     )
+    fit_started = time.perf_counter()
     result = build_embedding_cluster_feasibility_audit(
         modeling_data=private.modeling_data,
         config=private.config,
@@ -9057,6 +9363,7 @@ def _embedding_cluster_preflight_loky_scope(
         _scope_subset=(copy.deepcopy(dict(private.scope)),),
         _return_scope_audits=True,
     )
+    fit_seconds = time.perf_counter() - fit_started
     rows = result.get("_scope_audits") if isinstance(result, Mapping) else None
     states = result.get("_scope_states") if isinstance(result, Mapping) else None
     if (
@@ -9067,10 +9374,228 @@ def _embedding_cluster_preflight_loky_scope(
         or set(states) != {scope_id}
     ):
         raise RuntimeError("loky preflight worker returned another scope")
-    return {
+    output = {
         "scope_audit": copy.deepcopy(dict(rows[0])),
         "scope_state": copy.deepcopy(dict(states[scope_id])),
+        "scope_id": scope_id,
+        "owner_fit_seconds": fit_seconds,
     }
+    if publication is not None:
+        if (
+            not isinstance(publication, Mapping)
+            or set(publication)
+            != {
+                "store_root",
+                "compatibility",
+                "producer_identity",
+                "parquet_compression",
+            }
+        ):
+            raise ValueError(
+                "reusable owner publication request is invalid"
+            )
+        from .production_stage1_reusable_preflight import (
+            seal_reusable_owner_artifact,
+        )
+
+        seal_started = time.perf_counter()
+        artifact = seal_reusable_owner_artifact(
+            store_root=Path(str(publication["store_root"])),
+            compatibility=publication["compatibility"],
+            scope_audit=rows[0],
+            captured_state=states[scope_id],
+            producer_identity=str(publication["producer_identity"]),
+            parquet_compression=str(
+                publication["parquet_compression"]
+            ),
+        )
+        output["owner_seal_seconds"] = (
+            time.perf_counter() - seal_started
+        )
+        output["reusable_owner_scientific_key"] = (
+            artifact.scientific_key
+        )
+        output["reusable_owner_artifact_bytes"] = sum(
+            int(row["size_bytes"])
+            for row in artifact.terminal["files"]
+        )
+        # The immutable owner artifact is now the interprocess handoff.  Do not
+        # send its potentially hundreds-of-megabytes concept/state payload back
+        # through loky's result pipe.
+        output.pop("scope_audit", None)
+        output.pop("scope_state", None)
+        output["owner_payload_returned_over_ipc"] = False
+    io_finished = _preflight_process_io_counters()
+    output["owner_execution_started_monotonic_ns"] = (
+        execution_started_ns
+    )
+    output["owner_execution_finished_monotonic_ns"] = (
+        time.monotonic_ns()
+    )
+    output["owner_process_io"] = {
+        name: max(
+            0,
+            int(io_finished.get(name, 0))
+            - int(io_started.get(name, 0)),
+        )
+        for name in sorted(set(io_started) | set(io_finished))
+    }
+    output["owner_peak_rss_kib"] = int(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    )
+    return output
+
+
+def _preflight_process_io_counters() -> dict[str, int]:
+    """Best-effort kernel counters; absence never changes science."""
+
+    path = Path("/proc/self/io")
+    if not path.is_file() or path.is_symlink():
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return {
+            "filesystem_input_blocks": int(usage.ru_inblock),
+            "filesystem_output_blocks": int(usage.ru_oublock),
+        }
+    output: dict[str, int] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            name, value = line.split(":", 1)
+            output[str(name)] = int(value.strip())
+    except (OSError, TypeError, ValueError):
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return {
+            "filesystem_input_blocks": int(usage.ru_inblock),
+            "filesystem_output_blocks": int(usage.ru_oublock),
+        }
+    return output
+
+
+def _actual_interval_concurrency(
+    rows: Sequence[Mapping[str, Any]],
+) -> int:
+    events: list[tuple[int, int]] = []
+    for row in rows:
+        start = row.get("owner_execution_started_monotonic_ns")
+        finish = row.get("owner_execution_finished_monotonic_ns")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(finish, bool)
+            or not isinstance(finish, int)
+            or finish <= start
+        ):
+            continue
+        events.extend(((start, 1), (finish, -1)))
+    active = 0
+    maximum = 0
+    for _timestamp, delta in sorted(
+        events,
+        key=lambda row: (row[0], row[1]),
+    ):
+        active += delta
+        maximum = max(maximum, active)
+    return maximum
+
+
+def _preflight_owner_fit_input_binding(
+    *,
+    scope: Mapping[str, Any],
+    modeling_data: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    embedding_row_digests: Sequence[str],
+    modeling_row_digests: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Bind only the rows that can influence one physical preflight fit."""
+
+    fit_rows = tuple(map(int, scope.get("fit_row_ids") or ()))
+    if (
+        not fit_rows
+        or len(fit_rows) != len(set(fit_rows))
+        or min(fit_rows) < 0
+        or max(fit_rows) >= len(modeling_data)
+        or len(embedding_row_digests) != len(modeling_data)
+    ):
+        raise ValueError(
+            "physical owner fit-input binding has invalid row coverage"
+        )
+    if modeling_row_digests is None:
+        modeling_row_digests = _preflight_modeling_row_digests(
+            modeling_data=modeling_data,
+            config=config,
+        )
+    if len(modeling_row_digests) != len(modeling_data):
+        raise ValueError(
+            "preflight modeling row digest index is incomplete"
+        )
+    modeling_projection = []
+    fit_embedding_rows = []
+    for row_id in fit_rows:
+        digest = str(embedding_row_digests[row_id])
+        modeling_digest = str(modeling_row_digests[row_id])
+        if len(digest) != 64 or len(modeling_digest) != 64:
+            raise ValueError(
+                "preflight row digest index is incomplete"
+            )
+        modeling_projection.append(
+            {
+                "row_id": row_id,
+                "modeling_row_sha256": modeling_digest,
+            }
+        )
+        fit_embedding_rows.append(
+            {"row_id": row_id, "embedding_row_sha256": digest}
+        )
+    return {
+        "schema_version": (
+            "production_stage1_owner_fit_input_binding_v2"
+        ),
+        "ordered_fit_modeling_rows_sha256": _sha256_json(
+            modeling_projection
+        ),
+        "ordered_fit_embedding_rows_sha256": _sha256_json(
+            fit_embedding_rows
+        ),
+        "ordered_fit_row_count": len(fit_rows),
+        "embedding_row_digest_schema_version": (
+            "spent_only_frozen_embedding_row_scientific_digest_v1"
+        ),
+    }
+
+
+def _preflight_modeling_row_digests(
+    *,
+    modeling_data: pd.DataFrame,
+    config: AppliedInferenceConfig,
+) -> tuple[str, ...]:
+    """Hash each text/label row once for all overlapping owner scopes."""
+
+    required = {
+        config.text_column,
+        config.treatment_column,
+        config.outcome_column,
+    }
+    if set(modeling_data.columns) != required:
+        raise ValueError(
+            "preflight row digest source has another modeling projection"
+        )
+    output: list[str] = []
+    for row_id, row in modeling_data.iterrows():
+        treatment = float(row[config.treatment_column])
+        outcome = float(row[config.outcome_column])
+        output.append(
+            _sha256_json(
+                {
+                    "schema_version": (
+                        "production_stage1_preflight_modeling_row_v1"
+                    ),
+                    "row_id": int(row_id),
+                    "text": str(row[config.text_column]),
+                    "treatment_hex": treatment.hex(),
+                    "outcome_hex": outcome.hex(),
+                }
+            )
+        )
+    return tuple(output)
 
 
 def build_embedding_cluster_feasibility_audit(
@@ -9085,6 +9610,17 @@ def build_embedding_cluster_feasibility_audit(
     semantic_witness_scientific_config: SemanticWitnessScientificConfig,
     preflight_workers: int = 1,
     preflight_scope_input_root: Path | None = None,
+    reusable_preflight_store_root: Path | None = None,
+    reusable_cluster_compatibility: Mapping[str, Any] | None = None,
+    reusable_owner_compatibilities: (
+        Mapping[str, Mapping[str, Any]] | None
+    ) = None,
+    reusable_owner_producer_identity: str | None = None,
+    reusable_owner_parquet_compression: str = "zstd",
+    _operational_reusable_owner_handles: (
+        dict[str, Any] | None
+    ) = None,
+    _operational_preflight_telemetry: dict[str, Any] | None = None,
     _operational_scope_input_identity: dict[str, Any] | None = None,
     _operational_canonical_scope_states: dict[str, Any] | None = None,
     _canonical_state_scope_ids: Sequence[str] | None = None,
@@ -9110,6 +9646,27 @@ def build_embedding_cluster_feasibility_audit(
                 ),
                 preflight_workers=preflight_workers,
                 preflight_scope_input_root=preflight_scope_input_root,
+                reusable_preflight_store_root=(
+                    reusable_preflight_store_root
+                ),
+                reusable_cluster_compatibility=(
+                    reusable_cluster_compatibility
+                ),
+                reusable_owner_compatibilities=(
+                    reusable_owner_compatibilities
+                ),
+                reusable_owner_producer_identity=(
+                    reusable_owner_producer_identity
+                ),
+                reusable_owner_parquet_compression=(
+                    reusable_owner_parquet_compression
+                ),
+                _operational_reusable_owner_handles=(
+                    _operational_reusable_owner_handles
+                ),
+                _operational_preflight_telemetry=(
+                    _operational_preflight_telemetry
+                ),
                 _operational_scope_input_identity=(_operational_scope_input_identity),
                 _operational_canonical_scope_states=(
                     _operational_canonical_scope_states
@@ -9168,6 +9725,121 @@ def build_embedding_cluster_feasibility_audit(
             canonical_scopes
         )
         physical_scopes = tuple(owner for owner, _members in physical_groups)
+        reusable_controls = (
+            reusable_preflight_store_root,
+            reusable_cluster_compatibility,
+            reusable_owner_producer_identity,
+        )
+        if any(value is not None for value in reusable_controls) and not all(
+            value is not None for value in reusable_controls
+        ):
+            raise ValueError(
+                "reusable preflight owner execution requires its store, "
+                "cluster compatibility, and producer identity together"
+            )
+        reusable_enabled = all(
+            value is not None for value in reusable_controls
+        )
+        reusable_handles: dict[str, Any] = {}
+        owner_compatibilities: dict[str, Mapping[str, Any]] = {}
+        reused_results: list[dict[str, Any]] = []
+        missing_physical_scopes: list[Mapping[str, Any]] = []
+        if reusable_enabled:
+            from .production_stage1_reusable_preflight import (
+                OWNER_COMPATIBILITY_SCHEMA,
+                owner_compatibility,
+                scientific_key,
+                try_load_reusable_owner_artifact,
+            )
+
+            assert reusable_preflight_store_root is not None
+            assert reusable_cluster_compatibility is not None
+            assert reusable_owner_producer_identity is not None
+            if reusable_owner_compatibilities is None:
+                all_rows = tuple(range(len(modeling_data)))
+                all_texts = tuple(
+                    str(value)
+                    for value in modeling_data[
+                        config.text_column
+                    ].tolist()
+                )
+                embedding_row_digests = (
+                    embedding_cache.bind_spent(
+                        all_rows,
+                        all_texts,
+                    ).exact_row_scientific_digests()
+                )
+                modeling_row_digests = (
+                    _preflight_modeling_row_digests(
+                        modeling_data=modeling_data,
+                        config=config,
+                    )
+                )
+                reusable_owner_compatibilities = {
+                    str(owner["scope_id"]): owner_compatibility(
+                        cluster_compatibility=(
+                            reusable_cluster_compatibility
+                        ),
+                        physical_scope=owner,
+                        fit_input_binding=(
+                            _preflight_owner_fit_input_binding(
+                                scope=owner,
+                                modeling_data=modeling_data,
+                                config=config,
+                                embedding_row_digests=(
+                                    embedding_row_digests
+                                ),
+                                modeling_row_digests=(
+                                    modeling_row_digests
+                                ),
+                            )
+                        ),
+                    )
+                    for owner in physical_scopes
+                }
+            if set(reusable_owner_compatibilities) != {
+                str(owner["scope_id"]) for owner in physical_scopes
+            }:
+                raise ValueError(
+                    "reusable preflight owner compatibility coverage changed"
+                )
+            for owner in physical_scopes:
+                scope_id = str(owner["scope_id"])
+                compatibility = copy.deepcopy(
+                    dict(reusable_owner_compatibilities[scope_id])
+                )
+                owner_compatibilities[scope_id] = compatibility
+                handle = try_load_reusable_owner_artifact(
+                    store_root=reusable_preflight_store_root,
+                    compatibility=compatibility,
+                    producer_identity=(
+                        reusable_owner_producer_identity
+                    ),
+                )
+                if handle is None:
+                    missing_physical_scopes.append(owner)
+                    continue
+                scope_audit = handle.load_scope_audit()
+                reusable_handles[scope_id] = handle
+                reused_results.append(
+                    {
+                        "scope_audit": scope_audit,
+                        "scope_id": scope_id,
+                        "owner_fit_seconds": 0.0,
+                        "owner_seal_seconds": 0.0,
+                        "reusable_owner_scientific_key": (
+                            handle.scientific_key
+                        ),
+                        "reusable_owner_artifact_bytes": sum(
+                            int(row["size_bytes"])
+                            for row in handle.terminal["files"]
+                        ),
+                        "reused_owner": True,
+                        "owner_state_deserialized": False,
+                    }
+                )
+        else:
+            missing_physical_scopes.extend(physical_scopes)
         from .production_stage1_preflight_scope_inputs import (
             publish_preflight_scope_inputs,
         )
@@ -9183,45 +9855,272 @@ def build_embedding_cluster_feasibility_audit(
             if not private_root.is_absolute():
                 raise ValueError("preflight_scope_input_root must be an absolute path")
         try:
-            private_inputs = publish_preflight_scope_inputs(
-                output_root=private_root,
-                modeling_data=modeling_data,
-                config=config,
-                embedding_cache=embedding_cache,
-                embedding_cache_identity=embedding_cache_identity,
-                registry=registry,
-                registry_content_sha256=registry_content_sha256,
-                scopes=physical_scopes,
-                source_dataset_path=Path(str(config.dataset_path)),
-                global_embedding_cache_path=Path(embedding_cache.cache_dir),
-                semantic_witness_scientific_config=(
-                    semantic_witness_scientific_config
-                ),
-            )
-            payloads = tuple(
-                {
-                    **dict(payload),
-                    "initial_training_partitions": initial_partitions,
+            scope_publish_started = time.perf_counter()
+            if missing_physical_scopes:
+                private_inputs = publish_preflight_scope_inputs(
+                    output_root=private_root,
+                    modeling_data=modeling_data,
+                    config=config,
+                    embedding_cache=embedding_cache,
+                    embedding_cache_identity=embedding_cache_identity,
+                    registry=registry,
+                    registry_content_sha256=registry_content_sha256,
+                    scopes=tuple(missing_physical_scopes),
+                    source_dataset_path=Path(str(config.dataset_path)),
+                    global_embedding_cache_path=Path(
+                        embedding_cache.cache_dir
+                    ),
+                    semantic_witness_scientific_config=(
+                        semantic_witness_scientific_config
+                    ),
+                )
+                private_identity = private_inputs.identity()
+                payload_rows: list[dict[str, Any]] = []
+                for payload in private_inputs.worker_payloads():
+                    scope_id = str(payload["scope_id"])
+                    row = {
+                        **dict(payload),
+                        "initial_training_partitions": initial_partitions,
+                    }
+                    if reusable_enabled:
+                        row["schema_version"] = (
+                            "production_stage1_preflight_worker_payload_v5"
+                        )
+                        row["reusable_owner_publication"] = {
+                            "store_root": str(
+                                reusable_preflight_store_root
+                            ),
+                            "compatibility": owner_compatibilities[
+                                scope_id
+                            ],
+                            "producer_identity": str(
+                                reusable_owner_producer_identity
+                            ),
+                            "parquet_compression": str(
+                                reusable_owner_parquet_compression
+                            ),
+                        }
+                    payload_rows.append(row)
+                payloads = tuple(payload_rows)
+                if len(payloads) != len(missing_physical_scopes):
+                    raise RuntimeError(
+                        "preflight publisher returned incomplete physical "
+                        "scope coverage"
+                    )
+            else:
+                private_inputs = None
+                private_identity = {
+                    "schema_version": (
+                        "production_stage1_reused_scope_input_set_v1"
+                    ),
+                    "scope_order": [],
+                    "scope_count": 0,
+                    "all_owner_scope_inputs_skipped_due_to_reuse": True,
+                    "content_sha256": _sha256_json(
+                        {
+                            "schema_version": (
+                                "production_stage1_reused_scope_input_set_v1"
+                            ),
+                            "scope_order": [],
+                            "scope_count": 0,
+                            "all_owner_scope_inputs_skipped_due_to_reuse": (
+                                True
+                            ),
+                        }
+                    ),
                 }
-                for payload in private_inputs.worker_payloads()
+                payloads = ()
+            scope_publish_seconds = (
+                time.perf_counter() - scope_publish_started
             )
             if _operational_scope_input_identity is not None:
                 _operational_scope_input_identity.clear()
-                _operational_scope_input_identity.update(private_inputs.identity())
-            if len(payloads) != len(physical_scopes):
-                raise RuntimeError(
-                    "preflight publisher returned incomplete physical scope "
-                    "coverage"
+                _operational_scope_input_identity.update(
+                    copy.deepcopy(private_identity)
                 )
-            with parallel_config(backend="loky", inner_max_num_threads=1):
-                isolated_results = Parallel(
-                    n_jobs=min(workers, len(physical_scopes)),
-                    batch_size=1,
-                    pre_dispatch="all",
-                )(delayed(_embedding_cluster_preflight_loky_scope)(payload) for payload in payloads)
+            if payloads:
+                effective_concurrency = min(workers, len(payloads))
+                with parallel_config(
+                    backend="loky",
+                    inner_max_num_threads=1,
+                ):
+                    computed_results = Parallel(
+                        n_jobs=effective_concurrency,
+                        batch_size=1,
+                        pre_dispatch=effective_concurrency,
+                    )(
+                        delayed(_embedding_cluster_preflight_loky_scope)(
+                            payload
+                        )
+                        for payload in payloads
+                    )
+            else:
+                effective_concurrency = 0
+                computed_results = []
+            isolated_results = [
+                *reused_results,
+                *computed_results,
+            ]
         finally:
             if cleanup is not None:
                 cleanup.cleanup()
+        if reusable_enabled:
+            from .production_stage1_reusable_preflight import (
+                load_reusable_owner_artifact,
+            )
+
+            for returned in computed_results:
+                scope_id = str(returned["scope_id"])
+                handle = load_reusable_owner_artifact(
+                    store_root=reusable_preflight_store_root,
+                    compatibility=owner_compatibilities[scope_id],
+                    producer_identity=str(
+                        reusable_owner_producer_identity
+                    ),
+                )
+                if (
+                    handle.scientific_key
+                    != returned["reusable_owner_scientific_key"]
+                ):
+                    raise RuntimeError(
+                        "preflight worker sealed another owner artifact"
+                    )
+                reusable_handles[scope_id] = handle
+                returned["scope_audit"] = handle.load_scope_audit()
+                returned["owner_state_deserialized"] = False
+            if set(reusable_handles) != {
+                str(scope["scope_id"]) for scope in physical_scopes
+            }:
+                raise RuntimeError(
+                    "reusable preflight omitted a physical owner artifact"
+                )
+            if _operational_reusable_owner_handles is not None:
+                _operational_reusable_owner_handles.clear()
+                _operational_reusable_owner_handles.update(
+                    reusable_handles
+                )
+        if _operational_preflight_telemetry is not None:
+            reused_count = len(reused_results)
+            actual_concurrency = _actual_interval_concurrency(
+                computed_results
+            )
+            incomplete_count = 0
+            if reusable_enabled:
+                owner_parent = (
+                    Path(str(reusable_preflight_store_root))
+                    / "owner_artifacts"
+                )
+                current_attempt_prefixes = tuple(
+                    (
+                        "."
+                        + scientific_key(
+                            compatibility,
+                            expected_schema=(
+                                OWNER_COMPATIBILITY_SCHEMA
+                            ),
+                        )
+                        + ".attempt-"
+                    )
+                    for compatibility in (
+                        owner_compatibilities.values()
+                    )
+                )
+                if owner_parent.is_dir() and not owner_parent.is_symlink():
+                    incomplete_count = sum(
+                        1
+                        for path in owner_parent.iterdir()
+                        if path.is_dir()
+                        and not path.is_symlink()
+                        and path.name.startswith(
+                            current_attempt_prefixes
+                        )
+                    )
+            _operational_preflight_telemetry.update(
+                {
+                    "owner_total_count": len(physical_scopes),
+                    "owner_reused_count": reused_count,
+                    "owner_recomputed_count": len(computed_results),
+                    "owner_incomplete_count": incomplete_count,
+                    "owner_fast_stat_count": sum(
+                        getattr(
+                            handle,
+                            "authentication_mode",
+                            None,
+                        )
+                        == "prior_proof_stat_continuity"
+                        for handle in reusable_handles.values()
+                    ),
+                    "owner_deep_auth_count": sum(
+                        getattr(
+                            handle,
+                            "authentication_mode",
+                            None,
+                        )
+                        == "full_byte_reauthentication"
+                        for handle in reusable_handles.values()
+                    ),
+                    "owner_fit_seconds": {
+                        str(row["scope_audit"]["scope_id"]): float(
+                            row.get("owner_fit_seconds", 0.0)
+                        )
+                        for row in isolated_results
+                    },
+                    "owner_seal_seconds": {
+                        str(row["scope_audit"]["scope_id"]): float(
+                            row.get("owner_seal_seconds", 0.0)
+                        )
+                        for row in isolated_results
+                    },
+                    "owner_artifact_bytes": {
+                        str(row["scope_audit"]["scope_id"]): int(
+                            row.get(
+                                "reusable_owner_artifact_bytes",
+                                0,
+                            )
+                        )
+                        for row in isolated_results
+                    },
+                    "scope_input_publication_seconds": (
+                        scope_publish_seconds
+                    ),
+                    "scope_input_publication_bytes": int(
+                        private_identity.get("shared_text_bytes", 0)
+                        + private_identity.get(
+                            "shared_embedding_row_store_bytes",
+                            0,
+                        )
+                        + sum(
+                            int(value)
+                            for value in private_identity.get(
+                                "per_scope_label_projection_bytes",
+                                {},
+                            ).values()
+                        )
+                    ),
+                    "configured_worker_concurrency": (
+                        effective_concurrency
+                    ),
+                    "actual_worker_concurrency": actual_concurrency,
+                    "owner_process_io": {
+                        str(row["scope_id"]): copy.deepcopy(
+                            dict(row.get("owner_process_io", {}))
+                        )
+                        for row in computed_results
+                    },
+                    "worker_peak_rss_kib": max(
+                        (
+                            int(
+                                row.get(
+                                    "owner_peak_rss_kib",
+                                    0,
+                                )
+                            )
+                            for row in computed_results
+                        ),
+                        default=0,
+                    ),
+                }
+            )
         by_scope: dict[str, dict[str, Any]] = {}
         states_by_scope: dict[str, dict[str, Any]] = {}
         for returned in isolated_results:
@@ -9236,6 +10135,17 @@ def build_embedding_cluster_feasibility_audit(
                 else:
                     row = dict(returned["scope_audit"])
                     state = dict(returned["scope_state"])
+            elif (
+                reusable_enabled
+                and isinstance(returned, Mapping)
+                and isinstance(returned.get("scope_audit"), Mapping)
+            ):
+                row = (
+                    copy.deepcopy(dict(returned["scope_audit"]))
+                    if _copy_validation_result
+                    else dict(returned["scope_audit"])
+                )
+                state = None
             elif _operational_canonical_scope_states is None:
                 # Retain the narrow historical test seam for audit-only
                 # callers. Production state publication always supplies the
@@ -9264,7 +10174,7 @@ def build_embedding_cluster_feasibility_audit(
                 "loky preflight returned incomplete physical scope coverage"
             )
         scope_states = states_by_scope
-        if states_by_scope:
+        if states_by_scope or reusable_enabled:
             logical_by_scope: dict[str, dict[str, Any]] = {}
             for owner, members in physical_groups:
                 owner_id = str(owner["scope_id"])
@@ -9585,7 +10495,14 @@ def build_embedding_cluster_feasibility_audit(
             "_scope_audits": scope_audits,
             "_scope_states": scope_states,
         }
-    if _operational_canonical_scope_states is not None:
+    if (
+        _operational_canonical_scope_states is not None
+        and not (
+            _scope_subset is None
+            and reusable_preflight_store_root is not None
+            and reusable_owner_producer_identity is not None
+        )
+    ):
         required_state_ids = tuple(
             str(value)
             for value in (
@@ -9619,7 +10536,11 @@ def build_embedding_cluster_feasibility_audit(
     body = {
         "schema_version": STAGE1_EMBEDDING_CLUSTER_FEASIBILITY_AUDIT_SCHEMA,
         "split_registry_content_sha256": str(registry_content_sha256),
-        "embedding_configuration_sha256": _sha256_json(embedding_configuration),
+        "embedding_configuration_sha256": (
+            _embedding_cluster_preflight_scientific_configuration(
+                config
+            )["content_sha256"]
+        ),
         "embedding_cache_identity_sha256": _sha256_json(dict(embedding_cache_identity)),
         "cluster_support_contract_schema_version": EMBEDDING_CLUSTER_SUPPORT_CONTRACT_SCHEMA,
         "required_svd_families": ["treatment", "residualized_interaction"],
@@ -10008,12 +10929,21 @@ class Stage1BundleBuildOptions:
     ) = None
     scope_workers_per_gpu: int = 1
     preflight_workers: int = 1
+    preflight_execution_attestation: Mapping[str, Any] | None = None
     # The portable workflow stores clustered concepts once per physical fit
     # and places only a closed content-addressed reference in the request.
     # ``False`` retains the historical inline-audit seam for generic callers.
     portable_cluster_preflight_v2: bool = False
     cluster_preflight_manifest_path: Path | None = None
     cluster_preflight_state_bundle_manifest_path: Path | None = None
+    # Optional no-refit import source for a previously sealed portable-v2
+    # preflight.  It is authenticated and transcoded into owner-granular
+    # reusable artifacts; it is never used as the active output locator.
+    reusable_preflight_import_manifest_path: Path | None = None
+    reusable_preflight_import_state_bundle_manifest_path: Path | None = None
+    # Operational locator for path-neutral, component-granular preflight
+    # artifacts. Its path and resource topology never enter a scientific key.
+    reusable_preflight_store_root: Path | None = None
     stage1_scope_descriptor_root: Path | None = None
     stage1_scope_attempt_root: Path | None = None
     stage1_scope_progress_path: Path | None = None
@@ -10047,6 +10977,39 @@ class Stage1BundleBuildOptions:
                 self,
                 "embedding_cache_operator_trusted_read_proof",
                 copy.deepcopy(dict(trusted_read_proof)),
+            )
+        preflight_attestation = self.preflight_execution_attestation
+        if preflight_attestation is not None:
+            if not isinstance(preflight_attestation, Mapping):
+                raise TypeError(
+                    "preflight_execution_attestation must be one mapping"
+                )
+            body = {
+                key: copy.deepcopy(value)
+                for key, value in preflight_attestation.items()
+                if key != "content_sha256"
+            }
+            if (
+                preflight_attestation.get("schema_version")
+                != "production_stage1_preflight_execution_attestation_v1"
+                or preflight_attestation.get("content_sha256")
+                != _sha256_json(body)
+                or preflight_attestation.get(
+                    "effective_preflight_owner_lanes_before_scope_cap"
+                )
+                != self.preflight_workers
+                or preflight_attestation.get(
+                    "resource_assignment_in_scientific_identity"
+                )
+                is not False
+            ):
+                raise ValueError(
+                    "preflight execution attestation is invalid"
+                )
+            object.__setattr__(
+                self,
+                "preflight_execution_attestation",
+                copy.deepcopy(dict(preflight_attestation)),
             )
 
 
@@ -10085,6 +11048,7 @@ class _PreparedBuild:
     input_file_identities: Mapping[str, Mapping[str, Any]]
     behavior_identity: Mapping[str, Any]
     hierarchical_discovery_contract_identity: Mapping[str, Any]
+    reusable_preflight_telemetry: Mapping[str, Any]
     request: Mapping[str, Any]
     request_sha256: str
 
@@ -10223,6 +11187,72 @@ class ProductionStage1BundleBuilder:
             cluster_preflight_state_bundle_manifest_path = (
                 supplied_state_bundle_manifest
             )
+        import_values = (
+            options.reusable_preflight_import_manifest_path,
+            options.reusable_preflight_import_state_bundle_manifest_path,
+        )
+        if any(value is not None for value in import_values) and not all(
+            value is not None for value in import_values
+        ):
+            raise ValueError(
+                "reusable preflight import requires both its portable "
+                "preflight and canonical state-bundle manifests"
+            )
+        reusable_import_manifest_path: Path | None = None
+        reusable_import_state_manifest_path: Path | None = None
+        if all(value is not None for value in import_values):
+            if (
+                cluster_preflight_manifest_path is not None
+                or cluster_preflight_state_bundle_manifest_path is not None
+                or not options.portable_cluster_preflight_v2
+            ):
+                raise ValueError(
+                    "reusable preflight import is a no-refit transcode source, "
+                    "not a configured active preflight"
+                )
+            reusable_import_manifest_path = Path(
+                options.reusable_preflight_import_manifest_path
+            )
+            reusable_import_state_manifest_path = Path(
+                options.reusable_preflight_import_state_bundle_manifest_path
+            )
+            if (
+                not reusable_import_manifest_path.is_absolute()
+                or reusable_import_manifest_path.is_symlink()
+                or not reusable_import_manifest_path.is_file()
+                or reusable_import_manifest_path.name
+                != "cluster_preflight_manifest.json"
+                or not reusable_import_state_manifest_path.is_absolute()
+                or reusable_import_state_manifest_path.is_symlink()
+                or not reusable_import_state_manifest_path.is_file()
+                or reusable_import_state_manifest_path.name
+                != "cluster_state_bundle_manifest.json"
+            ):
+                raise ValueError(
+                    "reusable preflight import locators must be absolute "
+                    "canonical manifest files"
+                )
+        reusable_preflight_store_root: Path | None = None
+        if options.reusable_preflight_store_root is not None:
+            supplied_reusable_root = Path(
+                options.reusable_preflight_store_root
+            )
+            if (
+                not supplied_reusable_root.is_absolute()
+                or supplied_reusable_root.is_symlink()
+            ):
+                raise ValueError(
+                    "reusable_preflight_store_root must be one absolute "
+                    "non-symlink operational directory"
+                )
+            supplied_reusable_root.mkdir(parents=True, exist_ok=True)
+            reusable_preflight_store_root = (
+                supplied_reusable_root.resolve(strict=True)
+            )
+            if reusable_preflight_store_root != supplied_reusable_root:
+                raise ValueError(
+                    "reusable_preflight_store_root must be canonical"
+                )
         relocation: AuthenticatedProductionEmbeddingCacheRelocation | None = None
         if options.embedding_cache_relocation is not None:
             if cache_validation_dataset_path is not None:
@@ -10458,13 +11488,293 @@ class ProductionStage1BundleBuilder:
         if any(_ORACLE_COLUMN.search(column) for column in modeling_data.columns):
             raise RuntimeError("oracle column entered the Stage 1 modeling projection")
 
+        global_started = time.perf_counter()
         htr_sha = _directory_tree_sha256(htr_model_path)
-        htr_input_nontruncation_audit = _build_htr_input_nontruncation_audit(
-            texts=tuple(modeling_data[config.text_column].tolist()),
-            config=config,
-            htr_model_path=htr_model_path,
-            htr_model_tree_sha256=htr_sha,
+        htr_exact_inventory: dict[str, Any] = {}
+        reusable_global_audit = None
+        reusable_preflight_telemetry: dict[str, Any] = {
+            "schema_version": (
+                "production_stage1_reusable_preflight_telemetry_v1"
+            ),
+            "global_audit_seconds": 0.0,
+            "global_audit_authentication_seconds": 0.0,
+            "global_audit_authentication_mode": None,
+            "global_audit_payload_bytes_read": 0,
+            "global_audit_reused": False,
+            "owner_total_count": 0,
+            "owner_reused_count": 0,
+            "owner_recomputed_count": 0,
+            "owner_incomplete_count": 0,
+            "owner_fast_stat_count": 0,
+            "owner_deep_auth_count": 0,
+            "owner_fit_seconds": {},
+            "owner_seal_seconds": {},
+            "owner_artifact_bytes": {},
+            "scope_input_publication_seconds": 0.0,
+            "scope_input_publication_bytes": 0,
+            "actual_worker_concurrency": 0,
+            "assembled_authentication_seconds": 0.0,
+            "assembled_authentication_mode": None,
+            "peak_rss_kib": 0,
+            "deployment_execution_attestation": copy.deepcopy(
+                options.preflight_execution_attestation
+            ),
+        }
+        htr_architecture = config.architecture
+        ordered_unit_identity = [
+            {"type": type(value).__name__, "value": repr(value)}
+            for value in data[options.unit_id_column].tolist()
+        ]
+        normalized_text_projection_sha256 = _sha256_json(
+            {
+                "schema_version": (
+                    "production_htr_normalized_text_projection_v1"
+                ),
+                "texts": tuple(
+                    _normalize_text(value)
+                    for value in modeling_data[config.text_column].tolist()
+                ),
+            }
         )
+        htr_tokenizer_identity = _htr_tokenizer_scientific_identity(
+            htr_model_path
+        )
+        global_audit_compatibility = {
+            "schema_version": (
+                "production_stage1_global_nontruncation_compatibility_v1"
+            ),
+            "prepared_row_count": len(modeling_data),
+            "ordered_unit_id_sha256": _sha256_json(
+                ordered_unit_identity
+            ),
+            "normalized_text_projection_sha256": (
+                normalized_text_projection_sha256
+            ),
+            "htr_model_tree_sha256": htr_sha,
+            "htr_tokenizer_identity": copy.deepcopy(
+                dict(htr_tokenizer_identity)
+            ),
+            "htr_tokenizer_identity_sha256": (
+                htr_tokenizer_identity["content_sha256"]
+            ),
+            "htr_model_locator_included": False,
+            "chunking": {
+                "chunk_size_words": int(
+                    htr_architecture.htr_chunk_size_words
+                ),
+                "chunk_overlap_words": int(
+                    htr_architecture.htr_chunk_overlap_words
+                ),
+                "max_chunks": int(htr_architecture.htr_max_chunks),
+                "configured_max_chunk_length": int(
+                    htr_architecture.htr_max_chunk_length
+                ),
+            },
+            "producer_identity": (
+                STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY
+            ),
+            "schema_identity": (
+                STAGE1_HTR_INPUT_NONTRUNCATION_AUDIT_SCHEMA
+            ),
+        }
+        imported_portable_preflight = None
+        imported_projection: Mapping[str, Any] | None = None
+        imported_owner_transcode_compatible = False
+        imported_owner_transcode_rejection_reasons: list[str] = []
+        imported_htr_audit: Mapping[str, Any] | None = None
+        imported_preflight_source: Mapping[str, Any] | None = None
+        if reusable_import_manifest_path is not None:
+            from .production_stage1_cluster_preflight_artifact_v2 import (
+                load_path_only_portable_production_stage1_cluster_preflight_artifact,
+            )
+
+            imported_portable_preflight = (
+                load_path_only_portable_production_stage1_cluster_preflight_artifact(
+                    manifest_path=reusable_import_manifest_path,
+                    expected_stage1_request=None,
+                )
+            )
+            imported_projection = imported_portable_preflight.stage1_request[
+                "stage1_request_scientific_projection"
+            ]
+            candidate_htr = imported_projection.get(
+                "htr_input_nontruncation_audit"
+            )
+            if not isinstance(candidate_htr, Mapping):
+                raise ValueError(
+                    "portable preflight import lacks its exact HTR audit"
+                )
+            imported_htr_audit = validate_htr_input_nontruncation_audit(
+                candidate_htr,
+                config=config,
+                expected_rows=len(modeling_data),
+                expected_htr_model_tree_sha256=htr_sha,
+            )
+            if imported_htr_audit[
+                "normalized_text_projection_sha256"
+            ] != normalized_text_projection_sha256:
+                raise ValueError(
+                    "portable preflight import belongs to another ordered "
+                    "text projection"
+                )
+            imported_identity = (
+                imported_portable_preflight.identity()
+            )
+            imported_manifest = _load_serialized_mapping(
+                reusable_import_manifest_path
+            )
+            imported_preflight_source = {
+                "source_kind": (
+                    "portable_cluster_preflight_artifact_v2"
+                ),
+                "manifest_path": str(
+                    reusable_import_manifest_path.resolve(strict=True)
+                ),
+                "manifest_sha256": imported_identity[
+                    "manifest_sha256"
+                ],
+                "manifest_content_sha256": imported_manifest[
+                    "content_sha256"
+                ],
+                "artifact_scientific_content_sha256": (
+                    imported_identity[
+                        "path_neutral_scientific_content_sha256"
+                    ]
+                ),
+                "payload_bytes_deeply_authenticated": True,
+                "kmeans_or_svd_refit_performed": False,
+                "htr_retokenization_performed": False,
+            }
+            imported_dataset = imported_projection.get("dataset")
+            current_dataset_projection = {
+                "sha256": dataset_sha,
+                "row_count": len(data),
+                "columns_read": projected_columns,
+                "ordered_unit_id_sha256": _sha256_json(
+                    ordered_unit_identity
+                ),
+            }
+            if imported_dataset != current_dataset_projection:
+                imported_owner_transcode_rejection_reasons.append(
+                    "prepared_dataset_or_ordered_labels_changed"
+                )
+        if reusable_preflight_store_root is not None:
+            from .production_stage1_reusable_preflight import (
+                try_load_reusable_global_audit,
+            )
+
+            reusable_global_audit = try_load_reusable_global_audit(
+                store_root=reusable_preflight_store_root,
+                compatibility=global_audit_compatibility,
+                producer_identity=(
+                    STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY
+                ),
+            )
+        if reusable_global_audit is None:
+            if imported_htr_audit is not None:
+                # Portable-v2 authenticated exact ordered coverage hashes, but
+                # did not persist the complete per-row chunk-count and
+                # per-chunk token-length arrays required by the reusable
+                # global-artifact schema.  Re-tokenize once to materialize
+                # those arrays, and require exact equality with the old audit;
+                # never label a hash-only legacy proof as a complete inventory.
+                htr_input_nontruncation_audit = (
+                    _build_htr_input_nontruncation_audit(
+                        texts=tuple(
+                            modeling_data[config.text_column].tolist()
+                        ),
+                        config=config,
+                        htr_model_path=htr_model_path,
+                        htr_model_tree_sha256=htr_sha,
+                        _exact_inventory_sink=htr_exact_inventory,
+                    )
+                )
+                if (
+                    htr_input_nontruncation_audit
+                    != dict(imported_htr_audit)
+                ):
+                    raise ValueError(
+                        "materialized global HTR inventory differs from the "
+                        "authenticated portable-v2 coverage proof"
+                    )
+                reusable_preflight_telemetry[
+                    "global_audit_legacy_hash_proof_retokenized_for_complete_inventory"
+                ] = True
+                reusable_preflight_telemetry[
+                    "global_audit_adopted_without_retokenization"
+                ] = False
+            else:
+                htr_input_nontruncation_audit = (
+                    _build_htr_input_nontruncation_audit(
+                        texts=tuple(
+                            modeling_data[config.text_column].tolist()
+                        ),
+                        config=config,
+                        htr_model_path=htr_model_path,
+                        htr_model_tree_sha256=htr_sha,
+                        _exact_inventory_sink=htr_exact_inventory,
+                    )
+                )
+            if (
+                reusable_preflight_store_root is not None
+                and reusable_global_audit is None
+            ):
+                from .production_stage1_reusable_preflight import (
+                    seal_reusable_global_audit,
+                )
+
+                reusable_global_audit = seal_reusable_global_audit(
+                    store_root=reusable_preflight_store_root,
+                    compatibility=global_audit_compatibility,
+                    audit=htr_input_nontruncation_audit,
+                    row_text_sha256=htr_exact_inventory[
+                        "row_text_sha256"
+                    ],
+                    row_chunk_counts=htr_exact_inventory[
+                        "row_chunk_counts"
+                    ],
+                    token_lengths=htr_exact_inventory[
+                        "chunk_token_lengths"
+                    ],
+                    producer_identity=(
+                        STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY
+                    ),
+                )
+        else:
+            htr_input_nontruncation_audit = (
+                validate_htr_input_nontruncation_audit(
+                    reusable_global_audit.audit,
+                    config=config,
+                    expected_rows=len(modeling_data),
+                    expected_htr_model_tree_sha256=htr_sha,
+                )
+            )
+            if (
+                htr_input_nontruncation_audit[
+                    "normalized_text_projection_sha256"
+                ]
+                != normalized_text_projection_sha256
+            ):
+                raise ValueError(
+                    "reused global HTR audit belongs to another ordered "
+                    "text projection"
+                )
+            reusable_preflight_telemetry[
+                "global_audit_reused"
+            ] = True
+        reusable_preflight_telemetry["global_audit_seconds"] = (
+            time.perf_counter() - global_started
+        )
+        if reusable_global_audit is not None:
+            reusable_preflight_telemetry[
+                "global_audit_authentication_seconds"
+            ] = reusable_global_audit.authentication_seconds
+            reusable_preflight_telemetry[
+                "global_audit_authentication_mode"
+            ] = reusable_global_audit.authentication_mode
+            reusable_preflight_telemetry[
+                "global_audit_payload_bytes_read"
+            ] = reusable_global_audit.payload_bytes_read
 
         fresh_result_identity: Mapping[str, Any] | None = None
         if build_fresh_cache:
@@ -10592,6 +11902,61 @@ class ProductionStage1BundleBuilder:
             raise RuntimeError(
                 "published embedding-cache validation differs from the active provider"
             )
+        if imported_projection is not None:
+            current_cache_projection = (
+                _embedding_cache_cluster_preflight_scientific_selector(
+                    cache_input_identity
+                )
+            )
+            imported_cache = imported_projection.get(
+                "embedding_cache"
+            )
+            try:
+                imported_cache_projection = (
+                    _embedding_cache_cluster_preflight_scientific_selector(
+                        imported_cache
+                    )
+                )
+            except (TypeError, ValueError):
+                imported_cache_projection = None
+            if imported_cache_projection != current_cache_projection:
+                imported_owner_transcode_rejection_reasons.append(
+                    "frozen_embedding_cache_or_configuration_changed"
+                )
+            imported_effective = imported_projection.get(
+                "effective_stage1_config"
+            )
+            try:
+                imported_cluster_projection = (
+                    _embedding_cluster_preflight_scientific_configuration(
+                        imported_effective
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                imported_cluster_projection = None
+            current_cluster_projection = (
+                _embedding_cluster_preflight_scientific_configuration(
+                    config
+                )
+            )
+            if imported_cluster_projection != current_cluster_projection:
+                imported_owner_transcode_rejection_reasons.append(
+                    "cluster_or_effective_scientific_configuration_changed"
+                )
+            current_semantic = (
+                None
+                if semantic_witness_scientific_config is None
+                else semantic_witness_scientific_config.as_dict()
+            )
+            if (
+                imported_projection.get(
+                    "semantic_witness_scientific_config"
+                )
+                != current_semantic
+            ):
+                imported_owner_transcode_rejection_reasons.append(
+                    "semantic_witness_scientific_configuration_changed"
+                )
 
         registry = build_canonical_split_registry(
             data=modeling_data,
@@ -10628,71 +11993,555 @@ class ProductionStage1BundleBuilder:
                 config.architecture.multi_model_forest.candidate_consistency_inner_folds
             ),
         )
+        if imported_projection is not None:
+            if (
+                imported_projection.get(
+                    "split_registry_content_sha256"
+                )
+                != registry_sha
+            ):
+                imported_owner_transcode_rejection_reasons.append(
+                    "split_registry_changed"
+                )
+            # The portable-v2 scientific request intentionally retained only
+            # the broad plan's scientific root, not its full operational plan
+            # body.  Authenticate the cluster-specific plan facts from the
+            # lossless compact audit instead: canonical logical bindings,
+            # exact ordered-row fingerprints and seeds, plus physical-owner
+            # grouping.  This permits a no-refit migration when only the
+            # broad all-ten producer identity or resource assignment changed.
+            imported_audit = imported_portable_preflight.audit
+            imported_logical = imported_audit.get("logical_scopes")
+            imported_physical = imported_audit.get("physical_fits")
+            current_scope_bindings = [
+                _embedding_cluster_scope_binding(scope.as_dict())
+                for scope in stage1_scope_plan.scopes
+            ]
+            imported_scope_bindings = []
+            if isinstance(imported_logical, list):
+                for row in imported_logical:
+                    without_fit = (
+                        row.get("scope_without_fit_identity")
+                        if isinstance(row, Mapping)
+                        else None
+                    )
+                    if not isinstance(without_fit, Mapping):
+                        imported_scope_bindings = []
+                        break
+                    imported_scope_bindings.append(
+                        {
+                            key: copy.deepcopy(
+                                without_fit.get(key)
+                            )
+                            for key in current_scope_bindings[0]
+                        }
+                    )
+            current_physical_groups = [
+                {
+                    "physical_owner_scope_id": owner.scope_id,
+                    "logical_member_scope_ids": [
+                        member.scope_id for member in members
+                    ],
+                }
+                for owner, members
+                in stage1_scope_plan.physical_scope_groups
+            ]
+            imported_physical_groups = (
+                [
+                    {
+                        "physical_owner_scope_id": row.get(
+                            "physical_owner_scope_id"
+                        ),
+                        "logical_member_scope_ids": copy.deepcopy(
+                            row.get("logical_member_scope_ids")
+                        ),
+                    }
+                    for row in imported_physical
+                    if isinstance(row, Mapping)
+                ]
+                if isinstance(imported_physical, list)
+                else []
+            )
+            if (
+                imported_audit.get("scope_order")
+                != [scope.scope_id for scope in stage1_scope_plan.scopes]
+                or imported_audit.get("physical_scope_order")
+                != [
+                    scope.scope_id
+                    for scope in stage1_scope_plan.physical_scopes
+                ]
+                or imported_scope_bindings
+                != current_scope_bindings
+                or imported_physical_groups
+                != current_physical_groups
+            ):
+                imported_owner_transcode_rejection_reasons.append(
+                    "physical_owner_plan_or_seed_changed"
+                )
+            imported_owner_transcode_compatible = (
+                not imported_owner_transcode_rejection_reasons
+            )
+            reusable_preflight_telemetry[
+                "portable_v2_owner_transcode_compatible"
+            ] = imported_owner_transcode_compatible
+            reusable_preflight_telemetry[
+                "portable_v2_owner_transcode_rejection_reasons"
+            ] = list(imported_owner_transcode_rejection_reasons)
         cluster_preflight_artifact = None
         cluster_preflight_state_bundle = None
         cluster_preflight_canonical_scope_states: Mapping[str, Any] | None = None
         cluster_preflight_scope_input_set_identity: Mapping[str, Any] | None = None
-        if cluster_preflight_manifest_path is None:
-            operational_scope_input_identity: dict[str, Any] = {}
-            operational_canonical_scope_states: dict[str, Any] = {}
-            embedding_cluster_feasibility_audit = build_embedding_cluster_feasibility_audit(
+        reusable_owner_handles: dict[str, Any] = {}
+        reusable_cluster_compatibility: Mapping[str, Any] | None = None
+        reusable_owner_compatibilities: (
+            Mapping[str, Mapping[str, Any]] | None
+        ) = None
+        reusable_assembled_compatibility: Mapping[str, Any] | None = None
+        reusable_import_complete = False
+        if (
+            cluster_preflight_manifest_path is None
+            and reusable_preflight_store_root is not None
+            and options.portable_cluster_preflight_v2
+        ):
+            from .production_stage1_reusable_preflight import (
+                assembled_compatibility,
+                owner_compatibility,
+                preflight_scope_plan_projection,
+                scientific_key,
+                try_load_reusable_assembled_preflight,
+            )
+
+            cluster_configuration = (
+                _embedding_cluster_preflight_scientific_configuration(
+                    config
+                )
+            )
+            embedding_encoder_identity = {
+                "schema_version": (
+                    "production_stage1_cluster_embedding_encoder_identity_v1"
+                ),
+                "sentence_model_name": str(
+                    cache_input_identity["sentence_model_name"]
+                ),
+                "local_model_tree_sha256": str(
+                    cache_input_identity["local_model_tree_sha256"]
+                ),
+                "chunk_configuration": copy.deepcopy(
+                    dict(cache_configuration)
+                ),
+            }
+            reusable_cluster_compatibility = {
+                "schema_version": (
+                    "production_stage1_cluster_precomputation_compatibility_v2"
+                ),
+                "embedding_encoder_identity": embedding_encoder_identity,
+                "embedding_encoder_identity_sha256": _sha256_json(
+                    embedding_encoder_identity
+                ),
+                "cluster_local_scientific_configuration": (
+                    copy.deepcopy(dict(cluster_configuration))
+                ),
+                "cluster_local_scientific_configuration_sha256": (
+                    _sha256_json(cluster_configuration)
+                ),
+                "semantic_witness_scientific_configuration": (
+                    semantic_witness_scientific_config.as_dict()
+                ),
+                "semantic_witness_scientific_configuration_sha256": (
+                    semantic_witness_scientific_config.identity_sha256
+                ),
+                "seed_policy": (
+                    "canonical_ordered_fit_rows_group_seed_v1"
+                ),
+                "numerical_runtime_class": {
+                    "numpy": np.__version__,
+                    "sklearn": importlib.metadata.version(
+                        "scikit-learn"
+                    ),
+                },
+                "producer_identity": (
+                    STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY
+                ),
+                "scope_count_or_resource_topology_included": False,
+            }
+            embedding_row_digests = (
+                full_cache_binding.exact_row_scientific_digests()
+            )
+            if len(embedding_row_digests) != len(modeling_data):
+                raise RuntimeError(
+                    "embedding row digest index omitted a cohort row"
+                )
+            modeling_row_digests = _preflight_modeling_row_digests(
                 modeling_data=modeling_data,
                 config=config,
-                embedding_cache=embedding_cache,
-                embedding_cache_identity=cache_identity,
-                registry=registry,
-                registry_content_sha256=registry_sha,
-                initial_training_partitions=options.initial_training_partitions,
-                semantic_witness_scientific_config=(
-                    semantic_witness_scientific_config
+            )
+            reusable_owner_compatibilities: dict[
+                str, Mapping[str, Any]
+            ] = {}
+            owner_keys: dict[str, str] = {}
+            for scope in stage1_scope_plan.physical_scopes:
+                fit_input_binding = _preflight_owner_fit_input_binding(
+                    scope=scope.as_dict(),
+                    modeling_data=modeling_data,
+                    config=config,
+                    embedding_row_digests=embedding_row_digests,
+                    modeling_row_digests=modeling_row_digests,
+                )
+                compatibility = owner_compatibility(
+                    cluster_compatibility=(
+                        reusable_cluster_compatibility
+                    ),
+                    physical_scope=scope.as_dict(),
+                    fit_input_binding=fit_input_binding,
+                )
+                reusable_owner_compatibilities[
+                    scope.scope_id
+                ] = compatibility
+                owner_keys[scope.scope_id] = scientific_key(
+                    compatibility,
+                    expected_schema=(
+                        "production_stage1_cluster_owner_compatibility_v3"
+                    ),
+                )
+            if reusable_global_audit is None:
+                raise RuntimeError(
+                    "reusable clustered preflight requires its global "
+                    "non-truncation artifact"
+                )
+            reusable_assembled_compatibility = (
+                assembled_compatibility(
+                    cluster_compatibility=(
+                        reusable_cluster_compatibility
+                    ),
+                    preflight_plan_content_sha256=(
+                        preflight_scope_plan_projection(
+                            stage1_scope_plan
+                        )["content_sha256"]
+                    ),
+                    physical_owner_keys=owner_keys,
+                    global_audit_scientific_key=(
+                        reusable_global_audit.scientific_key
+                    ),
+                )
+            )
+            reusable_loaded = try_load_reusable_assembled_preflight(
+                store_root=reusable_preflight_store_root,
+                compatibility=reusable_assembled_compatibility,
+                expected_stage1_request=None,
+                global_audit=reusable_global_audit,
+                plan=stage1_scope_plan,
+                producer_identity=(
+                    STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY
                 ),
-                preflight_workers=options.preflight_workers,
-                preflight_scope_input_root=(
-                    scope_descriptor_root.parent / "cluster_preflight_scope_inputs"
-                ).resolve(),
-                _operational_scope_input_identity=(operational_scope_input_identity),
-                _operational_canonical_scope_states=(
-                    operational_canonical_scope_states
+                owner_producer_identity=(
+                    STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY
                 ),
-                _canonical_state_scope_ids=tuple(
-                    scope.scope_id for scope in stage1_scope_plan.physical_scopes
-                ),
-                _copy_validation_result=(
-                    not options.portable_cluster_preflight_v2
+                global_audit_producer_identity=(
+                    STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY
                 ),
             )
-            if operational_scope_input_identity:
-                cluster_preflight_scope_input_set_identity = copy.deepcopy(
-                    operational_scope_input_identity
+            if reusable_loaded is not None:
+                (
+                    cluster_preflight_artifact,
+                    cluster_preflight_state_bundle,
+                ) = reusable_loaded
+                embedding_cluster_feasibility_audit = copy.deepcopy(
+                    dict(cluster_preflight_artifact.audit)
                 )
-            if operational_canonical_scope_states:
-                if set(operational_canonical_scope_states) != {
-                    scope.scope_id for scope in stage1_scope_plan.physical_scopes
-                }:
+                reopened = dict(
+                    cluster_preflight_artifact.authentication
+                )
+                reusable_preflight_telemetry.update(
+                    {
+                        "owner_total_count": len(
+                            stage1_scope_plan.physical_scopes
+                        ),
+                        "owner_reused_count": len(
+                            stage1_scope_plan.physical_scopes
+                        ),
+                        "owner_recomputed_count": 0,
+                        "owner_incomplete_count": 0,
+                        "owner_fast_stat_count": int(
+                            reopened["owner_fast_stat_count"]
+                        ),
+                        "owner_deep_auth_count": int(
+                            reopened["owner_deep_auth_count"]
+                        ),
+                        "assembled_authentication_seconds": float(
+                            reopened["authentication_seconds"]
+                        ),
+                        "assembled_authentication_mode": str(
+                            reopened[
+                                "assembled_authentication_mode"
+                            ]
+                        ),
+                    }
+                )
+            elif (
+                imported_portable_preflight is not None
+                and imported_owner_transcode_compatible
+            ):
+                if (
+                    reusable_import_state_manifest_path is None
+                    or reusable_owner_compatibilities is None
+                    or reusable_global_audit is None
+                ):
                     raise RuntimeError(
-                        "cluster preflight omitted a canonical "
-                        "physical-owner state"
+                        "portable preflight import lacks its authenticated "
+                        "state, owner identities, or global audit"
                     )
-                cluster_preflight_canonical_scope_states = (
-                    dict(operational_canonical_scope_states)
-                    if options.portable_cluster_preflight_v2
-                    else copy.deepcopy(operational_canonical_scope_states)
+                from .production_stage1_reusable_preflight import (
+                    captured_state_from_authenticated_canonical_state,
+                    seal_reusable_owner_artifact,
+                    try_load_reusable_owner_artifact,
                 )
-        else:
-            if options.portable_cluster_preflight_v2:
-                from .production_stage1_cluster_preflight_artifact_v2 import (
-                    load_portable_production_stage1_cluster_preflight_artifact,
+                from .role_neutral_embedding_group_execution import (
+                    load_canonical_clustered_preflight_state_bundle_for_scientific_migration,
                 )
 
-                cluster_preflight_artifact = (
-                    load_portable_production_stage1_cluster_preflight_artifact(
-                        manifest_path=cluster_preflight_manifest_path,
+                imported_state_bundle = (
+                    load_canonical_clustered_preflight_state_bundle_for_scientific_migration(
+                        manifest_path=(
+                            reusable_import_state_manifest_path
+                        ),
+                        preflight=imported_portable_preflight,
+                        current_plan=stage1_scope_plan,
+                        expected_source_plan_scientific_content_sha256=str(
+                            imported_projection[
+                                "stage1_scope_plan"
+                            ]["scientific_content_sha256"]
+                        ),
+                    )
+                )
+                imported_owner_reused = 0
+                imported_owner_transcoded = 0
+                for scope in stage1_scope_plan.physical_scopes:
+                    owner = scope.scope_id
+                    compatibility = (
+                        reusable_owner_compatibilities[owner]
+                    )
+                    handle = try_load_reusable_owner_artifact(
+                        store_root=reusable_preflight_store_root,
+                        compatibility=compatibility,
+                        producer_identity=(
+                            STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY
+                        ),
+                    )
+                    if handle is None:
+                        source_scope = (
+                            imported_portable_preflight.logical_scope_record(
+                                owner,
+                                include_concepts=True,
+                            )
+                        )
+                        source_fit = source_scope.get(
+                            "cluster_fit_identity"
+                        )
+                        if not isinstance(source_fit, Mapping):
+                            raise ValueError(
+                                "portable preflight import owner lacks its "
+                                "fit identity"
+                            )
+                        canonical_state = (
+                            imported_state_bundle.load_state_for_owner(
+                                owner
+                            )
+                        )
+                        captured = (
+                            captured_state_from_authenticated_canonical_state(
+                                state=canonical_state,
+                                owner_scope_id=owner,
+                                expected_fit_identity_content_sha256=str(
+                                    source_fit["content_sha256"]
+                                ),
+                            )
+                        )
+                        handle = seal_reusable_owner_artifact(
+                            store_root=reusable_preflight_store_root,
+                            compatibility=compatibility,
+                            scope_audit=source_scope,
+                            captured_state=captured,
+                            producer_identity=(
+                                STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY
+                            ),
+                            parquet_compression=str(
+                                imported_portable_preflight.identity()[
+                                    "physical_storage"
+                                ]["parquet_compression"]
+                            ),
+                        )
+                        imported_owner_transcoded += 1
+                    else:
+                        imported_owner_reused += 1
+                    reusable_owner_handles[owner] = handle
+                if set(reusable_owner_handles) != {
+                    scope.scope_id
+                    for scope in stage1_scope_plan.physical_scopes
+                }:
+                    raise RuntimeError(
+                        "portable preflight import omitted a physical owner"
+                    )
+                embedding_cluster_feasibility_audit = (
+                    upgrade_embedding_cluster_feasibility_audit_v2(
+                        imported_portable_preflight.audit,
                         config=config,
                         registry=registry,
                         registry_content_sha256=registry_sha,
                         embedding_cache_identity=cache_identity,
+                        initial_training_partitions=(
+                            options.initial_training_partitions
+                        ),
                     )
                 )
+                reusable_import_complete = True
+                reusable_preflight_telemetry.update(
+                    {
+                        "owner_total_count": len(
+                            stage1_scope_plan.physical_scopes
+                        ),
+                        "owner_reused_count": imported_owner_reused,
+                        "owner_recomputed_count": 0,
+                        "owner_imported_without_refit_count": (
+                            imported_owner_transcoded
+                        ),
+                        "portable_v2_import_deeply_authenticated": True,
+                        "htr_retokenization_performed_for_import": False,
+                        "kmeans_or_svd_refit_performed_for_import": False,
+                    }
+                )
+        if cluster_preflight_manifest_path is None:
+            if (
+                cluster_preflight_artifact is None
+                and not reusable_import_complete
+            ):
+                operational_scope_input_identity: dict[str, Any] = {}
+                operational_canonical_scope_states: dict[str, Any] = {}
+                embedding_cluster_feasibility_audit = build_embedding_cluster_feasibility_audit(
+                    modeling_data=modeling_data,
+                    config=config,
+                    embedding_cache=embedding_cache,
+                    embedding_cache_identity=cache_identity,
+                    registry=registry,
+                    registry_content_sha256=registry_sha,
+                    initial_training_partitions=options.initial_training_partitions,
+                    semantic_witness_scientific_config=(
+                        semantic_witness_scientific_config
+                    ),
+                    preflight_workers=options.preflight_workers,
+                    preflight_scope_input_root=(
+                        scope_descriptor_root.parent / "cluster_preflight_scope_inputs"
+                    ).resolve(),
+                    reusable_preflight_store_root=(
+                        reusable_preflight_store_root
+                        if options.portable_cluster_preflight_v2
+                        else None
+                    ),
+                    reusable_cluster_compatibility=(
+                        reusable_cluster_compatibility
+                    ),
+                    reusable_owner_compatibilities=(
+                        reusable_owner_compatibilities
+                    ),
+                    reusable_owner_producer_identity=(
+                        STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY
+                        if reusable_cluster_compatibility is not None
+                        else None
+                    ),
+                    _operational_reusable_owner_handles=(
+                        reusable_owner_handles
+                    ),
+                    _operational_preflight_telemetry=(
+                        reusable_preflight_telemetry
+                    ),
+                    _operational_scope_input_identity=(operational_scope_input_identity),
+                    _operational_canonical_scope_states=(
+                        operational_canonical_scope_states
+                    ),
+                    _canonical_state_scope_ids=tuple(
+                        scope.scope_id for scope in stage1_scope_plan.physical_scopes
+                    ),
+                    _copy_validation_result=(
+                        not options.portable_cluster_preflight_v2
+                    ),
+                )
+                if operational_scope_input_identity:
+                    cluster_preflight_scope_input_set_identity = copy.deepcopy(
+                        operational_scope_input_identity
+                    )
+                if operational_canonical_scope_states:
+                    if set(operational_canonical_scope_states) != {
+                        scope.scope_id for scope in stage1_scope_plan.physical_scopes
+                    }:
+                        raise RuntimeError(
+                            "cluster preflight omitted a canonical "
+                            "physical-owner state"
+                        )
+                    cluster_preflight_canonical_scope_states = (
+                        dict(operational_canonical_scope_states)
+                        if options.portable_cluster_preflight_v2
+                        else copy.deepcopy(operational_canonical_scope_states)
+                    )
+            else:
+                cluster_preflight_scope_input_set_identity = {
+                    "schema_version": (
+                        "production_stage1_reused_scope_inputs_v1"
+                    ),
+                    "scope_count": 0,
+                    "scope_inputs_republished": False,
+                    "all_physical_owners_reused": True,
+                    "portable_v2_no_refit_import_used": (
+                        reusable_import_complete
+                    ),
+                    "content_sha256": _sha256_json(
+                        {
+                            "schema_version": (
+                                "production_stage1_reused_scope_inputs_v1"
+                            ),
+                            "scope_count": 0,
+                            "scope_inputs_republished": False,
+                            "all_physical_owners_reused": True,
+                            "portable_v2_no_refit_import_used": (
+                                reusable_import_complete
+                            ),
+                        }
+                    ),
+                }
+        else:
+            if options.portable_cluster_preflight_v2:
+                from .production_stage1_reusable_preflight import (
+                    is_reusable_preflight_reference,
+                    load_reusable_preflight_reference,
+                )
+
+                if is_reusable_preflight_reference(
+                    cluster_preflight_manifest_path
+                ):
+                    cluster_preflight_artifact = (
+                        load_reusable_preflight_reference(
+                            manifest_path=(
+                                cluster_preflight_manifest_path
+                            ),
+                            expected_stage1_request=None,
+                            plan=stage1_scope_plan,
+                            producer_identity=(
+                                STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY
+                            ),
+                        )
+                    )
+                else:
+                    from .production_stage1_cluster_preflight_artifact_v2 import (
+                        load_portable_production_stage1_cluster_preflight_artifact,
+                    )
+
+                    cluster_preflight_artifact = (
+                        load_portable_production_stage1_cluster_preflight_artifact(
+                            manifest_path=cluster_preflight_manifest_path,
+                            config=config,
+                            registry=registry,
+                            registry_content_sha256=registry_sha,
+                            embedding_cache_identity=cache_identity,
+                        )
+                    )
             else:
                 from .production_stage1_cluster_preflight_artifact import (
                     load_production_stage1_cluster_preflight_artifact,
@@ -10773,6 +12622,34 @@ class ProductionStage1BundleBuilder:
                     "sha256": digest,
                     "stat_identity": list(stat_identity),
                 }
+        deployment_preflight = options.preflight_execution_attestation
+        if deployment_preflight is not None:
+            caps = deployment_preflight.get("derived_caps")
+            actual = int(
+                reusable_preflight_telemetry.get(
+                    "actual_worker_concurrency",
+                    0,
+                )
+            )
+            if (
+                not isinstance(caps, Mapping)
+                or not caps
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 1
+                    for value in caps.values()
+                )
+                or actual
+                > min(int(value) for value in caps.values())
+            ):
+                raise RuntimeError(
+                    "actual Stage 1 preflight concurrency exceeded a "
+                    "compiled deployment resource cap"
+                )
+            reusable_preflight_telemetry[
+                "actual_worker_concurrency_within_every_derived_cap"
+            ] = True
         if relocation is not None:
             relocation_identity = relocation.identity()
             for label, path, expected_sha in (
@@ -10924,6 +12801,96 @@ class ProductionStage1BundleBuilder:
         validate_production_stage1_hierarchy_request_bindings(request_body)
         request_sha = _sha256_json(request_body)
         request = {**request_body, "request_sha256": request_sha}
+        if (
+            cluster_preflight_artifact is None
+            and reusable_preflight_store_root is not None
+            and reusable_assembled_compatibility is not None
+            and reusable_owner_handles
+        ):
+            if reusable_global_audit is None:
+                raise RuntimeError(
+                    "reusable preflight assembly lacks its global audit"
+                )
+            from .production_stage1_reusable_preflight import (
+                seal_reusable_assembled_preflight,
+            )
+
+            assembly_started = time.perf_counter()
+            cluster_preflight_artifact = (
+                seal_reusable_assembled_preflight(
+                    store_root=reusable_preflight_store_root,
+                    compatibility=reusable_assembled_compatibility,
+                    audit=embedding_cluster_feasibility_audit,
+                    stage1_request=request,
+                    owner_handles=reusable_owner_handles,
+                    global_audit=reusable_global_audit,
+                    plan=stage1_scope_plan,
+                    producer_identity=(
+                        STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY
+                    ),
+                    owner_producer_identity=(
+                        STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY
+                    ),
+                    global_audit_producer_identity=(
+                        STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY
+                    ),
+                )
+            )
+            from .production_stage1_reusable_preflight import (
+                ReusableClusterPreflightStateBundle,
+            )
+
+            cluster_preflight_state_bundle = (
+                ReusableClusterPreflightStateBundle(
+                    preflight=cluster_preflight_artifact,
+                    plan=stage1_scope_plan,
+                )
+            )
+            embedding_cluster_feasibility_audit = copy.deepcopy(
+                dict(cluster_preflight_artifact.audit)
+            )
+            cluster_preflight_artifact_identity = (
+                cluster_preflight_artifact.identity()
+            )
+            reusable_preflight_telemetry[
+                "assembled_authentication_seconds"
+            ] = time.perf_counter() - assembly_started
+            reusable_preflight_telemetry[
+                "assembled_authentication_mode"
+            ] = cluster_preflight_artifact.authentication[
+                "assembled_authentication_mode"
+            ]
+            for label, path, expected_sha in (
+                (
+                    "cluster_preflight_manifest",
+                    cluster_preflight_artifact.manifest_path,
+                    cluster_preflight_artifact_identity[
+                        "manifest_sha256"
+                    ],
+                ),
+                (
+                    "cluster_preflight_audit",
+                    cluster_preflight_artifact.audit_path,
+                    cluster_preflight_artifact_identity["audit_sha256"],
+                ),
+                (
+                    "cluster_preflight_stage1_request",
+                    cluster_preflight_artifact.stage1_request_path,
+                    cluster_preflight_artifact_identity[
+                        "stage1_request_file_sha256"
+                    ],
+                ),
+            ):
+                digest, stat_identity = _read_stable_sha256(path)
+                if digest != expected_sha:
+                    raise RuntimeError(
+                        f"{label} differs from reusable artifact"
+                    )
+                input_file_identities[label] = {
+                    "path": str(path),
+                    "sha256": digest,
+                    "stat_identity": list(stat_identity),
+                }
         if cluster_preflight_artifact is not None:
             # The artifact location is an operational capability and is not
             # part of the scientific request. Both exact requests are
@@ -10931,6 +12898,14 @@ class ProductionStage1BundleBuilder:
             # must match while paths, devices, worker counts, and assignments
             # may differ.
             cluster_preflight_artifact.require_stage1_request(request)
+        try:
+            import resource
+
+            reusable_preflight_telemetry["peak_rss_kib"] = int(
+                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            )
+        except (ImportError, OSError):
+            reusable_preflight_telemetry["peak_rss_kib"] = 0
         self._revalidate_input_files(input_file_identities)
         if _source_identity() != behavior_identity:
             raise RuntimeError("Stage 1 behavior dependencies changed during preflight")
@@ -10972,6 +12947,9 @@ class ProductionStage1BundleBuilder:
             input_file_identities=input_file_identities,
             behavior_identity=behavior_identity,
             hierarchical_discovery_contract_identity=(hierarchical_discovery_contract_identity),
+            reusable_preflight_telemetry=copy.deepcopy(
+                reusable_preflight_telemetry
+            ),
             request=request,
             request_sha256=request_sha,
         )

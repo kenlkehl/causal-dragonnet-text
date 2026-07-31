@@ -1353,6 +1353,48 @@ class BoundSpentFrozenChunkEmbeddingProvider:
             "token_bounded_row_ids_sha256": _sha256_json(list(self.token_bounded_row_ids)),
         }
 
+    def exact_row_scientific_digests(self) -> tuple[str, ...]:
+        """Return one content digest per authorized cached row.
+
+        The digest is deliberately row-local: changing an unrelated cache row
+        cannot invalidate a physical owner's preflight state.  It covers every
+        chunk embedding byte, the exact ordered chunk texts, and the
+        token-bounded reconciliation status for that row.  No future or
+        unauthorized row is decoded.
+        """
+
+        token_bounded = set(self.token_bounded_row_ids)
+        output: list[str] = []
+        for row_id in self.row_ids:
+            start = int(self._offsets[row_id])
+            stop = int(self._offsets[row_id + 1])
+            matrix = np.ascontiguousarray(
+                self._embeddings[start:stop],
+            )
+            chunks = self.cached_by_row.get(row_id)
+            if chunks is None:
+                raise RuntimeError(
+                    "authorized embedding row lost its cached text binding"
+                )
+            body = {
+                "schema_version": (
+                    "spent_only_frozen_embedding_row_scientific_digest_v1"
+                ),
+                "row_id": int(row_id),
+                "ordered_chunk_texts_sha256": _sha256_json(
+                    list(chunks)
+                ),
+                "ordered_chunk_count": len(chunks),
+                "embedding_array_sha256": _array_digest(matrix),
+                "embedding_dtype": matrix.dtype.str,
+                "embedding_shape": list(matrix.shape),
+                "token_bounded_reconciliation_used": (
+                    row_id in token_bounded
+                ),
+            }
+            output.append(_sha256_json(body))
+        return tuple(output)
+
     def chunk_matrix(self, row_id: int) -> np.ndarray:
         if isinstance(row_id, (bool, np.bool_)) or not isinstance(row_id, (int, np.integer)):
             raise TypeError("chunk_matrix.row_id must be an integer")

@@ -8,6 +8,7 @@ import copy
 import functools
 import hashlib
 import inspect
+import importlib.metadata
 import json
 import logging
 import math
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +34,7 @@ from .production_authenticated_tree_cache import (
 )
 from .production_stage1_bundle import (
     ProductionStage1BundleBuilder,
+    STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY,
     Stage1BundleBuildOptions,
 )
 from .production_text_preparation import (
@@ -73,6 +76,7 @@ from .portable_workflow_spec import (
     ScientificWorkflowSpec,
     SentenceEmbeddingEncoderSpec,
     Stage1ExecutionProfile,
+    Stage1PreflightExecutionPolicy,
     Stage2PromptProtocolSpec,
     StrictCausalForestOperationalSpec,
     StrictCausalForestRuntimeConfig,
@@ -3510,6 +3514,47 @@ def _path_neutral_identity(value: Any) -> Any:
     return value
 
 
+def _reusable_preflight_cache_selector(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Select only scientific cache fields, excluding publication paths."""
+
+    # A relocated/adopted cache wraps the original cache-build identity in a
+    # path-bearing relocation record.  The completed phase has already
+    # authenticated that wrapper; preflight compatibility is intentionally
+    # keyed by the same nested cache science as a fresh build.
+    nested = value.get("cache_build_identity")
+    selected = (
+        nested
+        if isinstance(nested, Mapping)
+        else value
+    )
+    required = (
+        "schema_version",
+        "dataset_sha256",
+        "ordered_text_sha256",
+        "sentence_model_name",
+        "local_model_tree_sha256",
+        "chunk_configuration_sha256",
+        "cache_configuration_sha256",
+        "row_count",
+        "chunk_count",
+        "hidden_size",
+        "cache_files",
+        "provider_identity",
+    )
+    if any(name not in selected for name in required):
+        raise ValueError(
+            "embedding-cache phase identity lacks reusable-preflight science"
+        )
+    return {
+        name: _path_neutral_identity(
+            copy.deepcopy(selected[name])
+        )
+        for name in required
+    }
+
+
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
     """Durably replace one JSON control file in its existing parent."""
 
@@ -4774,6 +4819,218 @@ def _persist_legacy_preflight_recompute_decision(
     return path.resolve(strict=True), decision
 
 
+def _validate_preflight_candidate_selector(
+    path: Path,
+) -> tuple[Mapping[str, Any], str, Path | None]:
+    """Validate a preflight selector without reading its bulk payloads."""
+
+    candidate = Path(path).resolve(strict=True)
+    value = _read_json_object(
+        candidate,
+        label="selected preflight manifest",
+    )
+    if value.get("schema_version") == (
+        "production_stage1_reusable_preflight_reference_v1"
+    ):
+        body = {
+            key: copy.deepcopy(child)
+            for key, child in value.items()
+            if key != "content_sha256"
+        }
+        assembled_path = Path(
+            str(value.get("assembled_terminal_path", ""))
+        )
+        if (
+            value.get("status") != "complete"
+            or value.get("content_sha256") != _sha(body)
+            or value.get("owner_payloads_copied") is not False
+            or value.get("locator_is_operational_not_scientific")
+            is not True
+            or not assembled_path.is_absolute()
+            or assembled_path.name
+            != "assembled_preflight_terminal.json"
+            or not assembled_path.is_file()
+            or assembled_path.is_symlink()
+        ):
+            raise ValueError(
+                "reusable preflight selector terminal is invalid"
+            )
+        assembled = _read_json_object(
+            assembled_path,
+            label="selected reusable assembled preflight terminal",
+        )
+        assembled_body = {
+            key: copy.deepcopy(child)
+            for key, child in assembled.items()
+            if key != "content_sha256"
+        }
+        if (
+            assembled.get("schema_version")
+            != "production_stage1_reusable_assembled_preflight_artifact_v2"
+            or assembled.get("status") != "complete"
+            or assembled.get("content_sha256")
+            != _sha(assembled_body)
+            or assembled.get("content_sha256")
+            != value.get("assembled_terminal_content_sha256")
+            or assembled.get(
+                "artifact_scientific_content_sha256"
+            )
+            != value.get(
+                "assembled_scientific_content_sha256"
+            )
+        ):
+            raise ValueError(
+                "reusable preflight selector assembled binding changed"
+            )
+        state_manifest = (
+            candidate.parent.parent
+            / "cluster_preflight_states"
+            / "cluster_state_bundle_manifest.json"
+        ).resolve(strict=True)
+        state_value = _read_json_object(
+            state_manifest,
+            label="selected reusable preflight state reference",
+        )
+        state_body = {
+            key: copy.deepcopy(child)
+            for key, child in state_value.items()
+            if key != "content_sha256"
+        }
+        prepared_context_manifest = (
+            candidate.parent.parent
+            / "prepared_stage1_context"
+            / "prepared_stage1_context_manifest.json"
+        ).resolve(strict=True)
+        if (
+            state_value.get("schema_version")
+            != "production_stage1_reusable_cluster_state_bundle_reference_v1"
+            or state_value.get("status") != "complete"
+            or state_value.get("content_sha256") != _sha(state_body)
+            or state_value.get("cluster_refit_performed") is not False
+            or state_value.get("owner_payloads_copied") is not False
+            or state_value.get("assembled_terminal_path")
+            != str(assembled_path)
+            or not prepared_context_manifest.is_file()
+            or prepared_context_manifest.is_symlink()
+        ):
+            raise ValueError(
+                "reusable preflight selector state/context binding changed"
+            )
+        return (
+            {
+                "manifest": copy.deepcopy(value),
+                "payloads": {},
+                "assembled_terminal_path": str(assembled_path),
+                "prepared_context_manifest_path": str(
+                    prepared_context_manifest
+                ),
+            },
+            "reusable_v1",
+            state_manifest,
+        )
+    if value.get("schema_version") != (
+        "production_stage1_cluster_preflight_manifest_v2"
+    ):
+        from .legacy_checkpoint_migration import (
+            validate_legacy_preflight_manifest,
+        )
+
+        return (
+            validate_legacy_preflight_manifest(
+                candidate,
+                authenticate_registered_payload_bytes=False,
+            ),
+            "legacy_v4",
+            None,
+        )
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in value.items()
+        if key != "content_sha256"
+    }
+    files = value.get("files")
+    if (
+        value.get("artifact_version")
+        != "production_stage1_cluster_preflight_artifact_v2"
+        or value.get("status") != "complete"
+        or value.get("content_sha256") != _sha(body)
+        or not isinstance(files, list)
+        or not files
+        or value.get("logical_scope_count") is None
+        or value.get("physical_fit_count") is None
+    ):
+        raise ValueError(
+            "portable-v2 preflight selector terminal is invalid"
+        )
+    payloads: dict[str, dict[str, Any]] = {}
+    for row in files:
+        relative = (
+            row.get("relative_path")
+            if isinstance(row, Mapping)
+            else None
+        )
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or relative.startswith("/")
+            or ".." in Path(relative).parts
+            or relative in payloads
+        ):
+            raise ValueError(
+                "portable-v2 preflight selector inventory is invalid"
+            )
+        payload_path = candidate.parent / relative
+        state = os.lstat(payload_path)
+        if (
+            stat.S_ISLNK(state.st_mode)
+            or not stat.S_ISREG(state.st_mode)
+            or int(state.st_nlink) != 1
+            or int(state.st_size) != int(row.get("size_bytes", -1))
+        ):
+            raise ValueError(
+                "portable-v2 preflight selector payload is absent or linked"
+            )
+        payloads[relative] = {
+            "path": str(payload_path.resolve(strict=True)),
+            "sha256": str(row.get("sha256")),
+            "size_bytes": int(row["size_bytes"]),
+        }
+    state_manifest = (
+        candidate.parent.parent
+        / "cluster_preflight_states"
+        / "cluster_state_bundle_manifest.json"
+    ).resolve(strict=True)
+    state_value = _read_json_object(
+        state_manifest,
+        label="selected portable-v2 preflight state bundle",
+    )
+    state_body = {
+        key: copy.deepcopy(child)
+        for key, child in state_value.items()
+        if key != "content_sha256"
+    }
+    if (
+        state_value.get("schema_version")
+        != "production_canonical_clustered_preflight_state_bundle_v2"
+        or state_value.get("status") != "complete"
+        or state_value.get("cluster_refit_performed") is not False
+        or state_value.get("content_sha256") != _sha(state_body)
+        or state_value.get("physical_owner_scope_order")
+        != value.get("physical_scope_order")
+    ):
+        raise ValueError(
+            "portable-v2 preflight state selector is incompatible"
+        )
+    return (
+        {
+            "manifest": copy.deepcopy(value),
+            "payloads": payloads,
+        },
+        "portable_v2",
+        state_manifest,
+    )
+
+
 def _attempt_tree_artifacts(attempt_dir: Path) -> list[dict[str, Any]]:
     """Return the exact closed regular-file inventory for one phase attempt."""
 
@@ -5079,6 +5336,84 @@ def _phase_payload_stat_inventory(
             int(state.st_ctime_ns),
         )
     return inventory
+
+
+def _phase_payload_proof_store_root(work_root: Path) -> Path:
+    """Return the protected operational proof store for durable phase bytes."""
+
+    return (
+        Path(work_root)
+        / "execution_attestations"
+        / "phase_payload_authentication"
+    )
+
+
+def _phase_payload_proof_key(
+    *,
+    phase: str,
+    request_sha256: str,
+    terminal_content_sha256: str,
+) -> str:
+    return _sha(
+        {
+            "schema_version": (
+                "production_workflow_phase_payload_proof_key_v1"
+            ),
+            "phase": str(phase),
+            "request_sha256": str(request_sha256),
+            "terminal_content_sha256": str(
+                terminal_content_sha256
+            ),
+        }
+    )
+
+
+def _phase_payload_stat_inventory_from_proof(
+    *,
+    proof: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+) -> dict[str, tuple[int, ...]]:
+    """Project one protected proof into the existing stat-only phase guard."""
+
+    rows = proof.get("tree_stat_inventory")
+    if not isinstance(rows, list):
+        raise ValueError("phase payload proof has no stat inventory")
+    files = {
+        str(row.get("relative_path")): row
+        for row in rows
+        if isinstance(row, Mapping)
+        and row.get("kind") == "file"
+    }
+    expected = {
+        str(row["relative_path"])
+        for row in artifacts
+    }
+    if set(files) != expected:
+        raise ValueError(
+            "phase payload proof coverage differs from its manifest"
+        )
+    output: dict[str, tuple[int, ...]] = {}
+    for registration in artifacts:
+        relative = str(registration["relative_path"])
+        row = files[relative]
+        if (
+            int(row.get("size_bytes", -1))
+            != int(registration["size_bytes"])
+            or int(row.get("link_count", -1)) != 1
+        ):
+            raise ValueError(
+                "phase payload proof metadata differs from its manifest"
+            )
+        output[relative] = (
+            int(row["device"]),
+            int(row["inode"]),
+            int(row["mode"]),
+            int(row["link_count"]),
+            int(row["size_bytes"]),
+            int(row["mtime_ns"]),
+            int(row["ctime_ns"]),
+        )
+    return output
 
 
 def _publish_attempt_tree(
@@ -6140,6 +6475,92 @@ def _embedding_builder_tree_sha256(
     return _sha(builder_body)
 
 
+def _stage1_bundle_model_tree_sha256_from_workflow_identity(
+    workflow_tree_identity: Mapping[str, Any],
+) -> str:
+    """Project an already authenticated model tree into the Stage 1 digest.
+
+    ``stage1_upstream_gate_backend._directory_tree_sha256`` hashes rows named
+    ``relative_path``, ``size``, and ``sha256``.  The immutable workflow
+    request has already authenticated the same bytes under the workflow tree
+    schema, whose size field is named ``size_bytes``.  Re-projecting that
+    closed inventory avoids a second read of every model byte during a
+    reusable-preflight reopen.
+    """
+
+    files = workflow_tree_identity.get("files")
+    if (
+        workflow_tree_identity.get("kind") != "directory"
+        or not isinstance(files, list)
+        or not files
+        or int(workflow_tree_identity.get("file_count", -1))
+        != len(files)
+    ):
+        raise ValueError(
+            "workflow HTR model identity is not one closed directory tree"
+        )
+    workflow_rows: list[dict[str, Any]] = []
+    stage1_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in files:
+        if (
+            not isinstance(raw, Mapping)
+            or set(raw)
+            != {"relative_path", "sha256", "size_bytes"}
+        ):
+            raise ValueError(
+                "workflow HTR model inventory row is malformed"
+            )
+        relative = str(raw["relative_path"])
+        relative_path = Path(relative)
+        if (
+            not relative
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative in seen
+        ):
+            raise ValueError(
+                "workflow HTR model inventory path is invalid or duplicated"
+            )
+        seen.add(relative)
+        size = int(raw["size_bytes"])
+        digest = str(raw["sha256"])
+        if (
+            size < 0
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(
+                "workflow HTR model inventory content identity is invalid"
+            )
+        workflow_rows.append(
+            {
+                "relative_path": relative,
+                "sha256": digest,
+                "size_bytes": size,
+            }
+        )
+        stage1_rows.append(
+            {
+                "relative_path": relative,
+                "size": size,
+                "sha256": digest,
+            }
+        )
+    workflow_rows.sort(key=lambda row: row["relative_path"])
+    stage1_rows.sort(key=lambda row: row["relative_path"])
+    if (
+        sum(int(row["size_bytes"]) for row in workflow_rows)
+        != int(workflow_tree_identity.get("total_size_bytes", -1))
+        or _sha(workflow_rows)
+        != workflow_tree_identity.get("tree_sha256")
+    ):
+        raise ValueError(
+            "workflow HTR model inventory does not match its terminal identity"
+        )
+    return _sha(stage1_rows)
+
+
 def _revalidate_request_bound_external_inputs(
     request: Mapping[str, Any],
     *,
@@ -6366,21 +6787,63 @@ def _revalidate_request_bound_external_inputs(
     if legacy_preflight_identity is not None:
         if not isinstance(legacy_preflight_identity, Mapping):
             raise ValueError("immutable legacy preflight identity is invalid")
-        from .legacy_checkpoint_migration import validate_legacy_preflight_manifest
-
         path = Path(str(legacy_preflight_identity.get("manifest_path", ""))).resolve(strict=True)
         observed_sha, observed_size = authenticate_file(path)
-        observed = validate_legacy_preflight_manifest(
+        (
+            observed,
+            observed_kind,
+            observed_state_manifest,
+        ) = _validate_preflight_candidate_selector(
             path,
-            authenticate_registered_payload_bytes=False,
         )
         if (
             observed_sha != legacy_preflight_identity.get("manifest_sha256")
             or observed_size != legacy_preflight_identity.get("manifest_size_bytes")
             or observed["manifest"]["content_sha256"]
             != legacy_preflight_identity.get("manifest_content_sha256")
+            or observed_kind
+            != legacy_preflight_identity.get("candidate_kind")
+            or (
+                None
+                if observed_state_manifest is None
+                else str(observed_state_manifest)
+            )
+            != legacy_preflight_identity.get(
+                "state_bundle_manifest_path"
+            )
+            or (
+                None
+                if observed_state_manifest is None
+                else stable_file_sha256(observed_state_manifest)[0]
+            )
+            != legacy_preflight_identity.get(
+                "state_bundle_manifest_sha256"
+            )
+            or observed.get("prepared_context_manifest_path")
+            != legacy_preflight_identity.get(
+                "prepared_context_manifest_path"
+            )
+            or (
+                None
+                if observed.get("prepared_context_manifest_path")
+                is None
+                else stable_file_sha256(
+                    Path(
+                        str(
+                            observed[
+                                "prepared_context_manifest_path"
+                            ]
+                        )
+                    )
+                )[0]
+            )
+            != legacy_preflight_identity.get(
+                "prepared_context_manifest_sha256"
+            )
         ):
-            raise RuntimeError("legacy preflight candidate changed after workflow initialization")
+            raise RuntimeError(
+                "selected preflight candidate changed after workflow initialization"
+            )
 
     cache_inputs = request.get("embedding_cache_import_inputs")
     expected_model_policy = AUTHENTICATED_DIRECTORY_TREE_POLICY
@@ -7764,6 +8227,7 @@ class ProductionAllEvidenceWorkflowOptions:
     stage1_scope_workers_per_gpu: int = 1
     stage1_execution_profile: Stage1ExecutionProfile | None = None
     stage1_preflight_workers: int = 8
+    stage1_preflight_execution_attestation: Mapping[str, Any] | None = None
     stage1_seed_policy: str | None = None
     num_workers: int = 1
     tfidf_workers: int = 8
@@ -8003,6 +8467,70 @@ class ProductionAllEvidenceWorkflow:
                 "typed portable Stage 1 requires its complete deployment "
                 "execution-selection profile"
             )
+        if o.portable_scientific_spec is not None:
+            profile = o.stage1_execution_profile
+            assert isinstance(profile, Stage1ExecutionProfile)
+            policy = profile.preflight_execution_policy
+            caps = {
+                "cpu_budget": int(o.cpu_budget),
+                "stage1_owner_cap": int(
+                    profile.max_parallel_owners
+                ),
+                "preflight_owner_cap": int(
+                    policy.max_parallel_owners
+                ),
+                "memory_lane_cap": int(policy.memory_lane_cap),
+                "input_io_lane_cap": int(
+                    policy.input_io_lane_cap
+                ),
+                "publication_io_lane_cap": int(
+                    policy.publication_io_lane_cap
+                ),
+                "authentication_io_lane_cap": int(
+                    policy.authentication_io_lane_cap
+                ),
+                "ordinary_read_amplification_lane_cap": math.floor(
+                    o.resource_performance_safety
+                    .maximum_ordinary_read_amplification
+                ),
+            }
+            body = {
+                "schema_version": (
+                    "production_stage1_preflight_execution_attestation_v1"
+                ),
+                "policy": policy.as_dict(),
+                "derived_caps": caps,
+                "effective_preflight_owner_lanes_before_scope_cap": min(
+                    caps.values()
+                ),
+                "physical_owner_count_applied_by_preflight_executor": True,
+                "resource_assignment_in_scientific_identity": False,
+                "completion_order_in_scientific_identity": False,
+            }
+            expected_attestation = {
+                **body,
+                "content_sha256": _sha(body),
+            }
+            if (
+                not isinstance(
+                    o.stage1_preflight_execution_attestation,
+                    Mapping,
+                )
+                or dict(
+                    o.stage1_preflight_execution_attestation
+                )
+                != expected_attestation
+                or int(o.stage1_preflight_workers)
+                != int(
+                    expected_attestation[
+                        "effective_preflight_owner_lanes_before_scope_cap"
+                    ]
+                )
+            ):
+                raise ValueError(
+                    "Stage 1 preflight worker count or execution "
+                    "attestation differs from the compiled deployment policy"
+                )
         if o.stage1_seed_policy != "canonical_group_sha256_v1":
             raise ValueError("stage1_seed_policy must be canonical_group_sha256_v1")
         scientific_scalars = {
@@ -8329,7 +8857,13 @@ class ProductionAllEvidenceWorkflow:
             str, tuple[tuple[int, ...], str, int]
         ] = {}
         legacy: dict[str, tuple[Path, Mapping[str, Any]]] = {}
-        selected_preflight: tuple[Path, Mapping[str, Any], str] | None = None
+        selected_preflight: tuple[
+            Path,
+            Mapping[str, Any],
+            str,
+            str,
+            Path | None,
+        ] | None = None
         for raw_attestation in (
             self.options.run_control
             .trust_prior_adoption_attestations
@@ -8395,14 +8929,19 @@ class ProductionAllEvidenceWorkflow:
                     )
                 if selected_preflight is not None:
                     raise ValueError("legacy preflight candidate was selected more than once")
-                validated_preflight = validate_legacy_preflight_manifest(
+                (
+                    validated_preflight,
+                    candidate_kind,
+                    state_manifest,
+                ) = _validate_preflight_candidate_selector(
                     source,
-                    authenticate_registered_payload_bytes=False,
                 )
                 selected_preflight = (
                     source.resolve(strict=True),
                     validated_preflight,
                     "adopt_checkpoint",
+                    candidate_kind,
+                    state_manifest,
                 )
                 continue
             if source.name == "complete_manifest.json":
@@ -8456,13 +8995,17 @@ class ProductionAllEvidenceWorkflow:
                     "both --adopt-checkpoint and --legacy-preflight-candidate"
                 )
             alias_path = Path(self.options.legacy_preflight_candidate).resolve(strict=True)
+            (
+                validated_preflight,
+                candidate_kind,
+                state_manifest,
+            ) = _validate_preflight_candidate_selector(alias_path)
             selected_preflight = (
                 alias_path,
-                validate_legacy_preflight_manifest(
-                    alias_path,
-                    authenticate_registered_payload_bytes=False,
-                ),
+                validated_preflight,
                 "deprecated_legacy_preflight_candidate_alias",
+                candidate_kind,
+                state_manifest,
             )
 
         portable_kinds = [str(artifact.manifest["artifact_kind"]) for artifact in portable]
@@ -8583,10 +9126,17 @@ class ProductionAllEvidenceWorkflow:
             portable.append(artifact)
         preflight_identity: dict[str, Any] | None = None
         if selected_preflight is not None:
-            manifest_path, validated_preflight, selection_source = selected_preflight
+            (
+                manifest_path,
+                validated_preflight,
+                selection_source,
+                candidate_kind,
+                state_manifest,
+            ) = selected_preflight
             manifest_sha256, manifest_size = stable_file_sha256(manifest_path)
             preflight_identity = {
                 "selection_source": selection_source,
+                "candidate_kind": candidate_kind,
                 "manifest_path": str(manifest_path),
                 "manifest_sha256": manifest_sha256,
                 "manifest_size_bytes": manifest_size,
@@ -8600,7 +9150,41 @@ class ProductionAllEvidenceWorkflow:
                     for name, row in validated_preflight["payloads"].items()
                 },
                 "registered_payload_bytes_authenticated_during_request": False,
-                "direct_reuse_allowed": False,
+                "direct_reuse_allowed": (
+                    candidate_kind
+                    in {"portable_v2", "reusable_v1"}
+                ),
+                "state_bundle_manifest_path": (
+                    None
+                    if state_manifest is None
+                    else str(state_manifest)
+                ),
+                "state_bundle_manifest_sha256": (
+                    None
+                    if state_manifest is None
+                    else stable_file_sha256(state_manifest)[0]
+                ),
+                "prepared_context_manifest_path": (
+                    validated_preflight.get(
+                        "prepared_context_manifest_path"
+                    )
+                ),
+                "prepared_context_manifest_sha256": (
+                    None
+                    if validated_preflight.get(
+                        "prepared_context_manifest_path"
+                    )
+                    is None
+                    else stable_file_sha256(
+                        Path(
+                            str(
+                                validated_preflight[
+                                    "prepared_context_manifest_path"
+                                ]
+                            )
+                        )
+                    )[0]
+                ),
             }
         return portable, migration_records, preflight_identity
 
@@ -8666,6 +9250,9 @@ class ProductionAllEvidenceWorkflow:
                 else self.options.stage1_execution_profile.as_dict()
             ),
             "preflight_workers": self.options.stage1_preflight_workers,
+            "preflight_execution_attestation": copy.deepcopy(
+                self.options.stage1_preflight_execution_attestation
+            ),
             "tfidf_workers": self.options.tfidf_workers,
             "tfidf_parallel_backend": self.options.tfidf_parallel_backend,
             "seed": self.options.seed,
@@ -11280,12 +11867,278 @@ class ProductionAllEvidenceWorkflow:
         path = self._phase_manifest(phase)
         if not path.is_file():
             return None
-        return _validate_phase_manifest_from_paths(
+        process_stats = self._phase_payload_stat_inventories.get(
+            phase
+        )
+        proof_start_probe: int | None = None
+        if process_stats is None:
+            candidate = _read_json_object(
+                path,
+                label=f"{phase} phase manifest",
+            )
+            candidate_body = {
+                key: item
+                for key, item in candidate.items()
+                if key != "content_sha256"
+            }
+            attempt = Path(
+                str(candidate.get("attempt_dir", ""))
+            )
+            expected_phase_root = (
+                self.options.work_root / "phases" / phase
+            ).resolve(strict=True)
+            if (
+                candidate.get("schema_version")
+                == WORKFLOW_PHASE_MANIFEST_SCHEMA
+                and candidate.get("phase") == phase
+                and candidate.get("status") == "complete"
+                and candidate.get("request_sha256")
+                == self.request["request_sha256"]
+                and candidate.get("content_sha256")
+                == _sha(candidate_body)
+                and isinstance(
+                    candidate.get("artifacts"),
+                    list,
+                )
+                and attempt.is_absolute()
+                and not attempt.is_symlink()
+                and attempt.is_dir()
+                and attempt.resolve(strict=True).parent
+                == expected_phase_root
+            ):
+                from .production_stage1_reusable_preflight import (
+                    _authentication_probe_ctime_ns,
+                    _load_fast_proof,
+                )
+
+                proof_store = _phase_payload_proof_store_root(
+                    self.options.work_root
+                )
+                key = _phase_payload_proof_key(
+                    phase=phase,
+                    request_sha256=self.request[
+                        "request_sha256"
+                    ],
+                    terminal_content_sha256=str(
+                        candidate["content_sha256"]
+                    ),
+                )
+                proof = _load_fast_proof(
+                    store_root=proof_store,
+                    artifact_kind=(
+                        f"workflow_phase_payload_{phase}"
+                    ),
+                    scientific_key=key,
+                    artifact_root=attempt.resolve(strict=True),
+                    terminal_content_sha256=str(
+                        candidate["content_sha256"]
+                    ),
+                    producer_identity=(
+                        "production_workflow_phase_publication_v1"
+                    ),
+                    schema_identity=WORKFLOW_PHASE_MANIFEST_SCHEMA,
+                )
+                if proof is not None:
+                    self._phase_payload_stat_inventories[phase] = (
+                        _phase_payload_stat_inventory_from_proof(
+                            proof=proof[0],
+                            artifacts=candidate["artifacts"],
+                        )
+                    )
+                    return self._validated_complete(phase)
+                proof_start_probe = (
+                    _authentication_probe_ctime_ns(
+                        proof_store
+                    )
+                )
+        if process_stats is not None:
+            value = _read_json_object(
+                path,
+                label=f"{phase} phase manifest",
+            )
+            body = {
+                key: item
+                for key, item in value.items()
+                if key != "content_sha256"
+            }
+            artifacts = value.get("artifacts")
+            attempt = Path(str(value.get("attempt_dir", "")))
+            expected_phase_root = (
+                self.options.work_root / "phases" / phase
+            ).resolve(strict=True)
+            if (
+                set(value)
+                != {
+                    "schema_version",
+                    "phase",
+                    "status",
+                    "request_sha256",
+                    "attempt_dir",
+                    "result",
+                    "artifacts",
+                    "content_sha256",
+                }
+                or value.get("schema_version")
+                != WORKFLOW_PHASE_MANIFEST_SCHEMA
+                or value.get("phase") != phase
+                or value.get("status") != "complete"
+                or value.get("request_sha256")
+                != self.request["request_sha256"]
+                or value.get("content_sha256") != _sha(body)
+                or not isinstance(value.get("result"), Mapping)
+                or not isinstance(artifacts, list)
+                or not attempt.is_absolute()
+                or attempt.is_symlink()
+                or not attempt.is_dir()
+                or attempt.resolve(strict=True).parent
+                != expected_phase_root
+            ):
+                raise ValueError(
+                    f"completed phase fast-stat manifest failed: {phase}"
+                )
+            registered_relatives = [
+                str(row.get("relative_path", ""))
+                for row in artifacts
+                if isinstance(row, Mapping)
+            ]
+            observed_relatives = [
+                candidate.relative_to(attempt).as_posix()
+                for candidate in sorted(attempt.rglob("*"))
+                if candidate.is_file()
+            ]
+            if (
+                len(registered_relatives) != len(artifacts)
+                or len(registered_relatives)
+                != len(set(registered_relatives))
+                or registered_relatives != observed_relatives
+                or set(process_stats)
+                != set(registered_relatives)
+            ):
+                raise ValueError(
+                    f"completed phase fast-stat inventory changed: {phase}"
+                )
+            registered_paths: set[str] = set()
+            for row in artifacts:
+                relative = str(row["relative_path"])
+                payload = attempt / relative
+                state = os.lstat(payload)
+                observed_state = (
+                    int(state.st_dev),
+                    int(state.st_ino),
+                    int(state.st_mode),
+                    int(state.st_nlink),
+                    int(state.st_size),
+                    int(state.st_mtime_ns),
+                    int(state.st_ctime_ns),
+                )
+                if (
+                    observed_state
+                    != tuple(process_stats[relative])
+                    or stat.S_ISLNK(state.st_mode)
+                    or not stat.S_ISREG(state.st_mode)
+                    or int(state.st_nlink) != 1
+                    or int(state.st_size)
+                    != int(row.get("size_bytes", -1))
+                    or str(payload.resolve(strict=True))
+                    != str(row.get("path"))
+                ):
+                    raise ValueError(
+                        f"completed phase fast-stat payload changed: "
+                        f"{phase}/{relative}"
+                    )
+                registered_paths.add(str(payload.resolve(strict=True)))
+            terminal_files = value["result"].get(
+                "terminal_files",
+                [],
+            )
+            if (
+                not isinstance(terminal_files, list)
+                or any(
+                    not isinstance(item, str)
+                    or item not in registered_paths
+                    for item in terminal_files
+                )
+                or len(terminal_files) != len(set(terminal_files))
+            ):
+                raise ValueError(
+                    f"completed phase fast-stat terminal changed: {phase}"
+                )
+            return value
+        validated = _validate_phase_manifest_from_paths(
             work_root=self.options.work_root.resolve(strict=True),
             phase=phase,
             request_sha256=self.request["request_sha256"],
             authenticated_adoptions=self._adopted_artifact_handles,
         )
+        # Deep validation has already hashed every ordinary phase payload.
+        # Preserve that process-local authority so subsequent selector/path/
+        # option lookups validate only exact inode/stat continuity instead of
+        # rereading the same (potentially multi-gigabyte) tree.
+        if validated.get("schema_version") == WORKFLOW_PHASE_MANIFEST_SCHEMA:
+            attempt = Path(
+                str(validated["attempt_dir"])
+            ).resolve(strict=True)
+            if proof_start_probe is not None:
+                from .production_stage1_reusable_preflight import (
+                    _publish_optional_full_auth_proof,
+                )
+
+                proof_store = _phase_payload_proof_store_root(
+                    self.options.work_root
+                )
+                key = _phase_payload_proof_key(
+                    phase=phase,
+                    request_sha256=self.request[
+                        "request_sha256"
+                    ],
+                    terminal_content_sha256=str(
+                        validated["content_sha256"]
+                    ),
+                )
+                authenticated = {
+                    str(row["relative_path"]): (
+                        str(row["sha256"]),
+                        int(row["size_bytes"]),
+                    )
+                    for row in validated["artifacts"]
+                }
+                published_proof = _publish_optional_full_auth_proof(
+                    store_root=proof_store,
+                    artifact_kind=(
+                        f"workflow_phase_payload_{phase}"
+                    ),
+                    scientific_key=key,
+                    artifact_root=attempt,
+                    terminal_content_sha256=str(
+                        validated["content_sha256"]
+                    ),
+                    artifact_scientific_content_sha256=str(
+                        validated["content_sha256"]
+                    ),
+                    producer_identity=(
+                        "production_workflow_phase_publication_v1"
+                    ),
+                    schema_identity=(
+                        WORKFLOW_PHASE_MANIFEST_SCHEMA
+                    ),
+                    full_authentication_start_probe_ctime_ns=(
+                        proof_start_probe
+                    ),
+                    authenticated_byte_inventory=authenticated,
+                )
+                if published_proof is not None:
+                    self._phase_payload_stat_inventories[
+                        phase
+                    ] = _phase_payload_stat_inventory_from_proof(
+                        proof=published_proof,
+                        artifacts=validated["artifacts"],
+                    )
+                else:
+                    self._phase_payload_stat_inventories.pop(
+                        phase,
+                        None,
+                    )
+        return validated
 
     def _attempt_dir(self, phase: str) -> Path:
         configured = self.options.scratch_root
@@ -11335,6 +12188,23 @@ class ProductionAllEvidenceWorkflow:
             or len(terminal_files) != len(set(terminal_files))
         ):
             raise ValueError(f"phase {phase} returned an invalid terminal_files list")
+        proof_start_probe: int | None = None
+        try:
+            from .production_stage1_reusable_preflight import (
+                _authentication_probe_ctime_ns,
+            )
+
+            proof_start_probe = _authentication_probe_ctime_ns(
+                _phase_payload_proof_store_root(
+                    self.options.work_root
+                )
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            LOGGER.warning(
+                "could not start phase stat-continuity proof: %s",
+                phase,
+                exc_info=True,
+            )
         artifacts = _attempt_tree_artifacts(attempt_dir)
         registered = {row["path"] for row in artifacts}
         for raw in terminal_files:
@@ -11356,7 +12226,6 @@ class ProductionAllEvidenceWorkflow:
             durable_phase_root=self.options.work_root / "phases" / phase,
             artifacts=artifacts,
         )
-        self._phase_payload_stat_inventories[phase] = process_authenticated_stats
         self.telemetry.count_bytes(**dict(publication_counters))
         result_copy = dict(
             _rewrite_attempt_locators(
@@ -11383,6 +12252,60 @@ class ProductionAllEvidenceWorkflow:
         }
         manifest = {**body, "content_sha256": _sha(body)}
         _atomic_write_json(target, manifest)
+        if proof_start_probe is not None:
+            from .production_stage1_reusable_preflight import (
+                _publish_optional_full_auth_proof,
+            )
+
+            key = _phase_payload_proof_key(
+                phase=phase,
+                request_sha256=self.request["request_sha256"],
+                terminal_content_sha256=manifest[
+                    "content_sha256"
+                ],
+            )
+            published_proof = _publish_optional_full_auth_proof(
+                store_root=_phase_payload_proof_store_root(
+                    self.options.work_root
+                ),
+                artifact_kind=(
+                    f"workflow_phase_payload_{phase}"
+                ),
+                scientific_key=key,
+                artifact_root=published_root,
+                terminal_content_sha256=manifest[
+                    "content_sha256"
+                ],
+                artifact_scientific_content_sha256=manifest[
+                    "content_sha256"
+                ],
+                producer_identity=(
+                    "production_workflow_phase_publication_v1"
+                ),
+                schema_identity=WORKFLOW_PHASE_MANIFEST_SCHEMA,
+                full_authentication_start_probe_ctime_ns=(
+                    proof_start_probe
+                ),
+                authenticated_byte_inventory={
+                    str(row["relative_path"]): (
+                        str(row["sha256"]),
+                        int(row["size_bytes"]),
+                    )
+                    for row in published_artifacts
+                },
+            )
+            if published_proof is not None:
+                self._phase_payload_stat_inventories[
+                    phase
+                ] = _phase_payload_stat_inventory_from_proof(
+                    proof=published_proof,
+                    artifacts=published_artifacts,
+                )
+            else:
+                self._phase_payload_stat_inventories.pop(
+                    phase,
+                    None,
+                )
         return manifest
 
     def _gpu_preflight(self) -> Mapping[str, Any]:
@@ -12641,6 +13564,258 @@ class ProductionAllEvidenceWorkflow:
             )
         return rebound.manifest_path
 
+    def _reusable_preflight_store_root(self) -> Path:
+        configured = self.options.scratch_root
+        if configured is None:
+            configured = (
+                self.options.work_root.parent
+                / ".production_all_evidence_reusable"
+            )
+        return (
+            Path(configured)
+            / "production_all_evidence_workflow"
+            / "stage1_reusable_preflight_store_v2"
+        ).resolve()
+
+    def _reusable_preflight_accepted_input_selector(
+        self,
+    ) -> dict[str, Any]:
+        """Derive a path/resource/Stage2-neutral preflight lookup key."""
+
+        if self.request.get("portable_typed_workflow") is not True:
+            raise RuntimeError(
+                "reusable preflight accepted-input selection requires a "
+                "typed portable workflow"
+            )
+        cache_phase = self._validated_complete("embedding_cache")
+        cache_identity = (
+            cache_phase.get("result", {}).get("cache_identity")
+            if isinstance(cache_phase, Mapping)
+            else None
+        )
+        settings = self.request.get("scientific_settings")
+        architectures = (
+            settings.get("architecture_profiles")
+            if isinstance(settings, Mapping)
+            else None
+        )
+        if (
+            not isinstance(cache_identity, Mapping)
+            or not isinstance(settings, Mapping)
+            or not isinstance(architectures, Mapping)
+        ):
+            raise RuntimeError(
+                "workflow request lacks reusable-preflight scientific inputs"
+            )
+        htr_profile = architectures.get("hierarchical_transformer")
+        cluster_profile = architectures.get(
+            "cluster_local_embeddings"
+        )
+        cluster_producer_configuration = (
+            cluster_profile.get("producer_configuration")
+            if isinstance(cluster_profile, Mapping)
+            else None
+        )
+        if (
+            not isinstance(htr_profile, Mapping)
+            or not isinstance(cluster_profile, Mapping)
+            or not isinstance(
+                cluster_producer_configuration,
+                Mapping,
+            )
+        ):
+            raise RuntimeError(
+                "workflow request lacks HTR/cluster preflight science"
+            )
+        raw_stage1_profile = json.loads(
+            self.options.stage1_profile_path.read_text(
+                encoding="utf-8"
+            )
+        )
+        raw_stage1_config = raw_stage1_profile.get(
+            "config",
+            raw_stage1_profile,
+        )
+        raw_architecture = (
+            raw_stage1_config.get("architecture")
+            if isinstance(raw_stage1_config, Mapping)
+            else None
+        )
+        raw_forest = (
+            raw_architecture.get("multi_model_forest")
+            if isinstance(raw_architecture, Mapping)
+            else None
+        )
+        raw_embedding = (
+            raw_forest.get("embedding_contrast")
+            if isinstance(raw_forest, Mapping)
+            else None
+        )
+        if not all(
+            isinstance(value, Mapping)
+            for value in (
+                raw_architecture,
+                raw_forest,
+                raw_embedding,
+            )
+        ):
+            raise RuntimeError(
+                "Stage 1 profile lacks preflight architecture inputs"
+            )
+        htr_chunking = {
+            name: copy.deepcopy(raw_architecture[name])
+            for name in (
+                "htr_chunk_size_words",
+                "htr_chunk_overlap_words",
+                "htr_max_chunks",
+                "htr_max_chunk_length",
+            )
+        }
+        embedding_for_preflight = copy.deepcopy(
+            dict(raw_embedding)
+        )
+        embedding_for_preflight.update(
+            {
+                **{
+                    name: copy.deepcopy(value)
+                    for name, value in (
+                        self._embedding_chunk_configuration()
+                    ).items()
+                    if name
+                    in {
+                        "chunk_size_words",
+                        "chunk_overlap_words",
+                        "max_chunks",
+                        "chunk_selection",
+                        "normalize_embeddings",
+                        "max_seq_length",
+                    }
+                },
+                "model_name": self.options.embedding_model_name,
+                "cache_dir": "reusable-preflight://frozen-cache",
+                "cluster_local_scientific": copy.deepcopy(
+                    dict(cluster_producer_configuration)
+                ),
+            }
+        )
+        from .production_stage1_bundle import (
+            STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY,
+            STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY,
+            _embedding_cluster_preflight_scientific_configuration,
+            _htr_tokenizer_scientific_identity,
+        )
+        cluster_preflight_configuration = (
+            _embedding_cluster_preflight_scientific_configuration(
+                {
+                    "architecture": {
+                        "multi_model_forest": {
+                            "embedding_contrast": (
+                                embedding_for_preflight
+                            )
+                        }
+                    }
+                }
+            )
+        )
+
+        htr_tokenizer_identity = (
+            _htr_tokenizer_scientific_identity(
+                self.options.htr_local_model_path
+            )
+        )
+        semantic_witness_identity = None
+        if self.options.portable_scientific_spec is not None:
+            from .review_spent_evidence_provider import (
+                semantic_witness_config_from_portable_scientific_spec,
+            )
+
+            semantic_witness_identity = (
+                semantic_witness_config_from_portable_scientific_spec(
+                    self.options.portable_scientific_spec
+                ).as_dict()
+            )
+        body = {
+            "schema_version": (
+                "production_stage1_preflight_accepted_input_selector_v2"
+            ),
+            "prepared_dataset_and_embedding_cache": (
+                _reusable_preflight_cache_selector(cache_identity)
+            ),
+            "source_dataset_content_sha256": self.request[
+                "source_sha256"
+            ],
+            "row_order_identity": copy.deepcopy(
+                self.request[
+                    "expected_checkpoint_compatibility"
+                ]["row_order_identity"]
+            ),
+            "columns": copy.deepcopy(settings["columns"]),
+            "preprocessing": copy.deepcopy(
+                settings["preprocessing"]
+            ),
+            "folds": copy.deepcopy(settings["folds"]),
+            "seed": settings["seed"],
+            "seed_policy": settings["seed_policy"],
+            "split_and_owner_derivation": {
+                "row_order_identity": copy.deepcopy(
+                    self.request[
+                        "expected_checkpoint_compatibility"
+                    ]["row_order_identity"]
+                ),
+                "folds": copy.deepcopy(settings["folds"]),
+                "global_seed": settings["seed"],
+                "seed_policy": settings["seed_policy"],
+                "initial_training_partitions": int(
+                    self.options.initial_training_partitions
+                ),
+                "review_rounds": int(self.options.review_rounds),
+                "deduplication_policy": (
+                    "identical_ordered_fit_rows_and_canonical_seed_"
+                    "earliest_scope_owner_v1"
+                ),
+                "all_ten_physical_fit_identity_included": False,
+            },
+            "htr_nontruncation_configuration": htr_chunking,
+            "cluster_preflight_scientific_configuration": (
+                cluster_preflight_configuration
+            ),
+            "semantic_witness_scientific_configuration": (
+                semantic_witness_identity
+            ),
+            "htr_model": _path_neutral_identity(
+                self.request["htr_model_tree"]
+            ),
+            "htr_tokenizer_identity": htr_tokenizer_identity,
+            "numerical_runtime_class": {
+                "numpy": importlib.metadata.version("numpy"),
+                "sklearn": importlib.metadata.version(
+                    "scikit-learn"
+                ),
+                "runtime_compatibility_class": (
+                    self.options.runtime_compatibility_class
+                ),
+            },
+            "producer_and_schema_identities": {
+                "global_audit": (
+                    STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY
+                ),
+                "cluster_owner": (
+                    STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY
+                ),
+                "assembled": (
+                    STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY
+                ),
+                "store": (
+                    "production_stage1_reusable_preflight_store_v2"
+                ),
+            },
+            "stage2_identity_included": False,
+            "all_ten_physical_fit_identity_included": False,
+            "operational_paths_included": False,
+            "resource_assignment_included": False,
+        }
+        return {**body, "content_sha256": _sha(body)}
+
     def _stage1_build_options(
         self,
         *,
@@ -12651,6 +13826,7 @@ class ProductionAllEvidenceWorkflow:
         dry_run: bool,
         cluster_preflight_manifest_path: Path | None = None,
         cluster_preflight_state_bundle_manifest_path: Path | None = None,
+        reusable_preflight_fast_reopen: bool = False,
     ) -> Stage1BundleBuildOptions:
         from .production_stage1_scope_scheduler import (
             Stage1PhysicalFitIdentity,
@@ -12739,14 +13915,15 @@ class ProductionAllEvidenceWorkflow:
                         migration_identity=legacy_migration_identity,
                     )
                 )
-        cache_relocation = (
-            None
-            if trusted_cache_read_proof is not None
-            else self._embedding_cache_relocation_options(
+        cache_relocation = None
+        if (
+            trusted_cache_read_proof is None
+            and not reusable_preflight_fast_reopen
+        ):
+            cache_relocation = self._embedding_cache_relocation_options(
                 cache=cache,
                 prepared=dataset,
             )
-        )
         values: dict[str, Any] = {
             "dataset_path": dataset,
             "config_path": profile,
@@ -12755,7 +13932,10 @@ class ProductionAllEvidenceWorkflow:
             "embedding_cache_output_dir": None,
             "embedding_cache_relocation_prepublication_root": (
                 None
-                if cache_relocation is None
+                if (
+                    cache_relocation is None
+                    or reusable_preflight_fast_reopen
+                )
                 else self._embedding_cache_relocation_prepublication_root(
                     cache=cache,
                 )
@@ -12764,6 +13944,7 @@ class ProductionAllEvidenceWorkflow:
                 None
                 if trusted_cache_read_proof is not None
                 or cache_relocation is not None
+                or reusable_preflight_fast_reopen
                 else self._embedding_cache_validation_dataset_path(
                     cache=cache,
                     prepared=dataset,
@@ -12826,6 +14007,9 @@ class ProductionAllEvidenceWorkflow:
         optional_bindings = {
             "scope_workers_per_gpu": self.options.stage1_scope_workers_per_gpu,
             "preflight_workers": self.options.stage1_preflight_workers,
+            "preflight_execution_attestation": copy.deepcopy(
+                self.options.stage1_preflight_execution_attestation
+            ),
             "portable_cluster_preflight_v2": (
                 self.options.portable_scientific_spec is not None
             ),
@@ -12834,6 +14018,9 @@ class ProductionAllEvidenceWorkflow:
             "cluster_preflight_state_bundle_manifest_path": (
                 cluster_preflight_state_bundle_manifest_path
             ),
+            "reusable_preflight_store_root": (
+                self._reusable_preflight_store_root()
+            ),
             "stage1_scope_attempt_root": (
                 self.options.work_root / "recovery" / "stage1_scope_attempts"
             ).resolve(),
@@ -12841,6 +14028,31 @@ class ProductionAllEvidenceWorkflow:
                 self.options.work_root / "recovery" / "stage1_scope_progress.json"
             ).resolve(),
         }
+        selected_preflight = self.request.get(
+            "legacy_preflight_candidate_identity"
+        )
+        if (
+            isinstance(selected_preflight, Mapping)
+            and selected_preflight.get("candidate_kind")
+            == "portable_v2"
+            and cluster_preflight_manifest_path is None
+        ):
+            optional_bindings.update(
+                {
+                    "reusable_preflight_import_manifest_path": Path(
+                        str(selected_preflight["manifest_path"])
+                    ).resolve(strict=True),
+                    "reusable_preflight_import_state_bundle_manifest_path": (
+                        Path(
+                            str(
+                                selected_preflight[
+                                    "state_bundle_manifest_path"
+                                ]
+                            )
+                        ).resolve(strict=True)
+                    ),
+                }
+            )
         if (
             self.options.portable_scientific_spec is not None
             and "semantic_witness_scientific_config" in available
@@ -13989,6 +15201,851 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         }
         return _validate_portable_role_neutral_stage1_phase_result(result)
 
+    def _compile_current_stage1_request_from_reused_preflight(
+        self,
+        *,
+        accepted: Any,
+        current_options: Stage1BundleBuildOptions,
+        current_plan: Any,
+    ) -> Mapping[str, Any]:
+        """Compile today's exact Stage 1 request without cohort/cache reads."""
+
+        from .production_stage1_bundle import (
+            STAGE1_BUNDLE_REQUEST_SCHEMA,
+            STAGE1_TFIDF_RESUME_POLICY,
+            ProductionStage1BundleBuilder,
+            _exact_inner_contract_registry_status,
+            _hierarchy_spent_evidence_contract,
+            _read_stable_sha256,
+            _sanitize_secrets,
+            _scientific_query_config_identity,
+            _source_identity,
+            _validate_effective_config,
+            exact_inner_family_adapter_gate,
+            load_applied_stage1_config,
+        )
+        from .production_stage1_config_wire import (
+            production_stage1_effective_config_payload,
+        )
+        from .production_stage1_hierarchy_contract import (
+            current_production_stage1_hierarchy_contract_identity,
+            production_stage1_hierarchy_architecture_bindings,
+            validate_production_stage1_hierarchy_request_bindings,
+        )
+
+        old_request = copy.deepcopy(
+            dict(
+                accepted.prepared_context.execution_locators[
+                    "exact_stage1_request"
+                ]
+            )
+        )
+        registry = accepted.prepared_context.scientific_identity[
+            "split_registry"
+        ]
+        registry_sha = str(
+            accepted.prepared_context.scientific_identity[
+                "split_registry_content_sha256"
+            ]
+        )
+        profile_path = Path(current_options.config_path).resolve(
+            strict=True
+        )
+        dataset_path = Path(current_options.dataset_path).resolve(
+            strict=True
+        )
+        cache_path = Path(
+            current_options.embedding_cache_dir
+        ).resolve(strict=True)
+        config_sha, _config_stat = _read_stable_sha256(
+            profile_path
+        )
+        source_config = load_applied_stage1_config(
+            profile_path,
+            require_explicit_scientific_fields=True,
+        )
+        config, htr_model_path = _validate_effective_config(
+            source_config,
+            dataset_path=dataset_path,
+            embedding_cache_dir=cache_path,
+            config_dir=profile_path.parent,
+            seed=current_options.seed,
+        )
+        if (
+            htr_model_path.resolve(strict=True)
+            != self.options.htr_local_model_path.resolve(strict=True)
+        ):
+            raise ValueError(
+                "current effective profile selected another HTR model"
+            )
+        effective_config = _sanitize_secrets(
+            production_stage1_effective_config_payload(config)
+        )
+        query_config, query_identity = (
+            ProductionStage1BundleBuilder._load_query_config(
+                current_options.query_config_path
+            )
+        )
+        query_request_identity = _scientific_query_config_identity(
+            query_identity
+        )
+        semantic = current_options.semantic_witness_scientific_config
+        if isinstance(semantic, Mapping):
+            from .review_spent_evidence_provider import (
+                SemanticWitnessScientificConfig,
+            )
+
+            semantic = SemanticWitnessScientificConfig.from_mapping(
+                semantic
+            )
+        if semantic is None:
+            raise ValueError(
+                "current Stage 1 request lacks semantic-witness science"
+            )
+        semantic_mapping = semantic.as_dict()
+        hierarchy_identity = (
+            current_production_stage1_hierarchy_contract_identity()
+        )
+        architecture_contract = (
+            production_stage1_hierarchy_architecture_bindings(
+                hierarchy_identity
+            )
+        )
+        if (
+            architecture_contract.get("tfidf_resume_policy")
+            != STAGE1_TFIDF_RESUME_POLICY
+        ):
+            raise RuntimeError(
+                "current hierarchy changed TF-IDF resume policy"
+            )
+        exact_inner = _exact_inner_contract_registry_status(
+            registry
+        )
+        hierarchy_spent = _hierarchy_spent_evidence_contract(
+            registry=registry,
+            config=config,
+            initial_training_partitions=(
+                current_options.initial_training_partitions
+            ),
+            hierarchical_discovery_contract_identity_sha256=(
+                hierarchy_identity["content_sha256"]
+            ),
+        )
+
+        cache_phase = self._validated_complete("embedding_cache")
+        cache_phase_result = (
+            cache_phase.get("result")
+            if isinstance(cache_phase, Mapping)
+            else None
+        )
+        raw_cache_identity = (
+            cache_phase_result.get("cache_identity")
+            if isinstance(cache_phase_result, Mapping)
+            else None
+        )
+        cache_phase_mode = (
+            cache_phase_result.get("mode")
+            if isinstance(cache_phase_result, Mapping)
+            else None
+        )
+        if not isinstance(raw_cache_identity, Mapping):
+            raise RuntimeError(
+                "current embedding-cache phase lacks its identity"
+            )
+        old_cache = old_request.get("embedding_cache")
+        if not isinstance(old_cache, Mapping):
+            raise RuntimeError(
+                "accepted Stage 1 request lacks cache provenance"
+            )
+        trusted_cache_route = (
+            current_options.embedding_cache_operator_trusted_read_proof
+            is not None
+        )
+        if trusted_cache_route:
+            # Match the ordinary builder: the prior byte-authentication proof
+            # is an access capability, not a relocation scientific record.
+            cache_build_identity = copy.deepcopy(
+                dict(
+                    old_cache[
+                        "production_cache_build_identity"
+                    ]
+                )
+            )
+            provider_identity = copy.deepcopy(
+                dict(old_cache["identity"])
+            )
+            authenticated_relocation = None
+        elif cache_phase_mode == "authenticated_relocation":
+            from .production_embedding_cache_relocation import (
+                PRODUCTION_EMBEDDING_CACHE_RELOCATION_RESULT_SCHEMA,
+            )
+
+            relocation_fields = {
+                "schema_version",
+                "relocator_version",
+                "relocator_code_sha256",
+                "authenticated_tree_code_sha256",
+                "root",
+                "cache_dir",
+                "prepared_cohort_path",
+                "attestation_path",
+                "terminal_manifest_path",
+                "row_count",
+                "prepared_projection_sha256",
+                "source_cache_identity_sha256",
+                "cache_build_identity",
+                "attestation_sha256",
+                "terminal_manifest_sha256",
+            }
+            relocation_hash_fields = {
+                "relocator_code_sha256",
+                "authenticated_tree_code_sha256",
+                "prepared_projection_sha256",
+                "source_cache_identity_sha256",
+                "attestation_sha256",
+                "terminal_manifest_sha256",
+            }
+            cache_build = raw_cache_identity.get(
+                "cache_build_identity"
+            )
+            if (
+                set(raw_cache_identity) != relocation_fields
+                or raw_cache_identity.get("schema_version")
+                != PRODUCTION_EMBEDDING_CACHE_RELOCATION_RESULT_SCHEMA
+                or not isinstance(cache_build, Mapping)
+                or any(
+                    not isinstance(raw_cache_identity.get(name), str)
+                    or len(str(raw_cache_identity[name])) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in str(
+                            raw_cache_identity[name]
+                        )
+                    )
+                    for name in relocation_hash_fields
+                )
+                or Path(
+                    str(raw_cache_identity.get("cache_dir", ""))
+                ).resolve(strict=True)
+                != cache_path
+                or Path(
+                    str(
+                        raw_cache_identity.get(
+                            "prepared_cohort_path",
+                            "",
+                        )
+                    )
+                ).resolve(strict=True)
+                != dataset_path
+            ):
+                raise RuntimeError(
+                    "completed embedding-cache phase has an invalid "
+                    "relocation identity"
+                )
+            cache_build_identity = copy.deepcopy(
+                dict(cache_build)
+            )
+            raw_provider = cache_build_identity.get(
+                "provider_identity"
+            )
+            if not isinstance(raw_provider, Mapping):
+                raise RuntimeError(
+                    "relocated cache identity lacks its provider science"
+                )
+            provider_identity = copy.deepcopy(dict(raw_provider))
+            authenticated_relocation = copy.deepcopy(
+                dict(raw_cache_identity)
+            )
+        elif cache_phase_mode == "fresh_build":
+            cache_build_identity = copy.deepcopy(
+                dict(raw_cache_identity)
+            )
+            provider_identity = cache_build_identity.get(
+                "provider_identity"
+            )
+            if not isinstance(provider_identity, Mapping):
+                raise RuntimeError(
+                    "current non-relocated embedding cache lacks its "
+                    "provider identity"
+                )
+            provider_identity = copy.deepcopy(
+                dict(provider_identity)
+            )
+            authenticated_relocation = None
+        else:
+            raise RuntimeError(
+                "completed embedding-cache phase has an unsupported mode"
+            )
+        # The immutable request has already authenticated this complete tree.
+        # Project its closed inventory into the bundle schema instead of
+        # rereading every HTR model byte during the fast reopen.
+        workflow_htr_tree = self.request.get("htr_model_tree")
+        if (
+            not isinstance(workflow_htr_tree, Mapping)
+            or Path(str(workflow_htr_tree.get("path", ""))).resolve(
+                strict=True
+            )
+            != htr_model_path.resolve(strict=True)
+        ):
+            raise ValueError(
+                "immutable workflow request selected another HTR model tree"
+            )
+        htr_tree_sha = (
+            _stage1_bundle_model_tree_sha256_from_workflow_identity(
+                workflow_htr_tree
+            )
+        )
+        accepted_audit = copy.deepcopy(
+            dict(old_request["htr_input_nontruncation_audit"])
+        )
+        if (
+            htr_tree_sha
+            != accepted_audit.get("htr_model_tree_sha256")
+        ):
+            raise ValueError(
+                "reused global audit belongs to another HTR tree"
+            )
+        dataset = copy.deepcopy(dict(old_request["dataset"]))
+        dataset["path"] = str(dataset_path)
+        source_profile = {
+            "path": str(profile_path),
+            "sha256": config_sha,
+        }
+        embedding_cache = {
+            "path": str(cache_path),
+            "identity": copy.deepcopy(dict(provider_identity)),
+            "production_cache_build_identity": (
+                cache_build_identity
+            ),
+            "authenticated_relocation": (
+                authenticated_relocation
+            ),
+            "legacy_terminal_migration_identity": copy.deepcopy(
+                current_options.embedding_cache_legacy_migration_identity
+            ),
+        }
+        runtime = {
+            "device": current_options.device,
+            "gpu_ids": list(current_options.gpu_ids),
+            "num_workers": current_options.num_workers,
+            "tfidf_workers": current_options.tfidf_workers,
+            "tfidf_parallel_backend": (
+                current_options.tfidf_parallel_backend
+            ),
+            "query_devices": list(current_options.query_devices),
+            "query_nuisance_folds": (
+                current_options.query_nuisance_folds
+            ),
+            "scope_workers_per_gpu": (
+                current_options.scope_workers_per_gpu
+            ),
+            "preflight_workers": current_options.preflight_workers,
+            "scope_descriptor_root": str(
+                Path(
+                    current_options.stage1_scope_descriptor_root
+                    or (
+                        Path(current_options.output_dir)
+                        / "stage1_scope_recovery"
+                        / "descriptor"
+                    )
+                ).resolve()
+            ),
+            "scope_attempt_root": str(
+                Path(
+                    current_options.stage1_scope_attempt_root
+                    or (
+                        Path(current_options.output_dir)
+                        / "stage1_scope_recovery"
+                        / "attempts"
+                    )
+                ).resolve()
+            ),
+            "scope_progress_path": str(
+                Path(
+                    current_options.stage1_scope_progress_path
+                    or (
+                        Path(current_options.output_dir)
+                        / "stage1_scope_recovery"
+                        / "progress.json"
+                    )
+                ).resolve()
+            ),
+        }
+        request_body = {
+            "schema_version": STAGE1_BUNDLE_REQUEST_SCHEMA,
+            "dataset": dataset,
+            "source_config": source_profile,
+            "effective_stage1_config": effective_config,
+            "embedding_cache": embedding_cache,
+            "htr_model": {
+                "path": str(htr_model_path),
+                "tree_sha256": str(htr_tree_sha),
+                "sentence_encoder_unfrozen": True,
+            },
+            "htr_input_nontruncation_audit": accepted_audit,
+            "embedding_cluster_feasibility_audit": copy.deepcopy(
+                dict(accepted.preflight.reference)
+            ),
+            "split_registry_content_sha256": registry_sha,
+            "stage1_scope_plan": current_plan.as_dict(),
+            "exact_inner_contract": {
+                **exact_inner,
+                "family_adapter_gate": (
+                    exact_inner_family_adapter_gate()
+                ),
+            },
+            "query_config": {
+                "effective": asdict(query_config),
+                "source": query_request_identity,
+            },
+            "semantic_witness_scientific_config": (
+                semantic_mapping
+            ),
+            "runtime": runtime,
+            "behavior_identity": _source_identity(),
+            "hierarchical_discovery_contract_identity": (
+                hierarchy_identity
+            ),
+            "architecture_contract": architecture_contract,
+            "hierarchy_spent_evidence_contract": hierarchy_spent,
+            "security": {
+                "remote_clients_constructed": False,
+                "remote_calls_allowed": False,
+                "oracle_columns_decoded_or_materialized": False,
+                "whole_parquet_container_authenticated": True,
+                "plaintext_secrets_persisted": False,
+                "manual_digest_approval_required": False,
+                "raw_evidence_sidecars_visible_to_prompts": False,
+                "partial_tfidf_checkpoint_reuse_allowed": False,
+                "htr_source_word_truncation_allowed": False,
+                "htr_tokenizer_truncation_allowed": False,
+            },
+        }
+        validate_production_stage1_hierarchy_request_bindings(
+            request_body
+        )
+        request = {
+            **request_body,
+            "request_sha256": _sha(request_body),
+        }
+        accepted.preflight.require_stage1_request(request)
+        return request
+
+    def _try_fast_reopen_stage1_preflight(
+        self,
+        attempt: Path,
+    ) -> Mapping[str, Any] | None:
+        """Fail closed to ordinary preparation while preserving attempts."""
+
+        try:
+            return self._fast_reopen_stage1_preflight_or_raise(
+                attempt
+            )
+        except (
+            FileNotFoundError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            candidates = tuple(
+                attempt / name
+                for name in (
+                    "effective_stage1_profile.json",
+                    "cluster_preflight",
+                    "cluster_preflight_states",
+                    "prepared_stage1_context",
+                    "stage1_preflight_report.json",
+                )
+            )
+            present = tuple(
+                path
+                for path in candidates
+                if path.exists() or path.is_symlink()
+            )
+            if present:
+                recovery = (
+                    attempt
+                    / "fast_reopen_recovery"
+                    / f"attempt-{time.time_ns()}"
+                )
+                recovery.mkdir(parents=True, exist_ok=False)
+                for path in present:
+                    os.rename(path, recovery / path.name)
+            return None
+
+    def _fast_reopen_stage1_preflight_or_raise(
+        self,
+        attempt: Path,
+    ) -> Mapping[str, Any] | None:
+        """Reopen sealed precomputation before constructing the bulk builder."""
+
+        if self.request.get("portable_typed_workflow") is not True:
+            return None
+        from .production_stage1_bundle import (
+            STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY,
+            STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY,
+        )
+        from .production_stage1_reusable_preflight import (
+            publish_reusable_preflight_references,
+            try_load_reusable_preflight_acceptance,
+        )
+
+        selector = self._reusable_preflight_accepted_input_selector()
+        started = time.perf_counter()
+        try:
+            accepted = try_load_reusable_preflight_acceptance(
+                store_root=self._reusable_preflight_store_root(),
+                selector=selector,
+                producer_identity=(
+                    STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY
+                ),
+                owner_producer_identity=(
+                    STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY
+                ),
+                global_audit_producer_identity=(
+                    STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY
+                ),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            # A changed or incomplete candidate can never use the shortcut.
+            # The ordinary builder will deeply authenticate compatible pieces
+            # and recompute only what is missing or invalid.
+            return None
+        if accepted is None:
+            return None
+
+        cache, prepared = self._embedding_cache_paths()
+        profile = self._effective_stage1_profile(
+            attempt,
+            dataset_path=prepared,
+            embedding_cache_dir=cache,
+        )
+        from .production_stage1_scope_scheduler import (
+            Stage1PhysicalFitIdentity,
+            build_canonical_stage1_scope_plan,
+        )
+
+        registry = accepted.prepared_context.scientific_identity[
+            "split_registry"
+        ]
+        registry_sha = accepted.prepared_context.scientific_identity[
+            "split_registry_content_sha256"
+        ]
+        current_plan = build_canonical_stage1_scope_plan(
+            registry=registry,
+            registry_content_sha256=registry_sha,
+            global_seed=int(self.options.seed),
+            physical_fit_identity=(
+                Stage1PhysicalFitIdentity.from_mapping(
+                    self.request["stage1_physical_fit_identity"]
+                )
+            ),
+            gpu_ids=self.stage1_gpu_ids,
+            review_rounds=int(self.options.review_rounds),
+            initial_training_partitions=int(
+                self.options.initial_training_partitions
+            ),
+            scope_workers_per_gpu=int(
+                self.options.stage1_scope_workers_per_gpu
+            ),
+            expected_outer_fold_count=int(
+                self.options.outer_folds
+            ),
+            expected_inner_fold_count=(
+                int(self.options.initial_training_partitions)
+                + int(self.options.review_rounds)
+            ),
+        )
+        from .production_stage1_reusable_preflight import (
+            preflight_scope_plan_projection,
+        )
+
+        if (
+            preflight_scope_plan_projection(current_plan)
+            != preflight_scope_plan_projection(
+                accepted.state_bundle.plan
+            )
+        ):
+            raise RuntimeError(
+                "fast-reopened preflight differs scientifically from the "
+                "current deployment-neutral scope plan"
+            )
+        from .production_stage1_reusable_preflight import (
+            ReusableClusterPreflightStateBundle,
+        )
+
+        current_state_bundle = ReusableClusterPreflightStateBundle(
+            preflight=accepted.preflight,
+            plan=current_plan,
+        )
+        preflight_root = (attempt / "cluster_preflight").resolve()
+        state_root = (
+            attempt / "cluster_preflight_states"
+        ).resolve()
+        artifact, state_bundle = publish_reusable_preflight_references(
+            preflight_output_root=preflight_root,
+            state_output_root=state_root,
+            artifact=accepted.preflight,
+            state_bundle=current_state_bundle,
+        )
+        preflight_manifest = (
+            preflight_root / "cluster_preflight_manifest.json"
+        ).resolve(strict=True)
+        state_manifest = (
+            state_root / "cluster_state_bundle_manifest.json"
+        ).resolve(strict=True)
+        from .prepared_stage1_context import (
+            seal_prepared_stage1_context_from_authenticated_parts,
+            serialize_stage1_build_options,
+        )
+
+        current_options = self._stage1_build_options(
+            dataset=prepared,
+            profile=profile.resolve(strict=True),
+            cache=cache,
+            output=attempt / "preflight_no_model_output",
+            dry_run=False,
+            cluster_preflight_manifest_path=preflight_manifest,
+            cluster_preflight_state_bundle_manifest_path=state_manifest,
+            reusable_preflight_fast_reopen=True,
+        )
+        current_mapping = serialize_stage1_build_options(
+            current_options
+        )
+        exact_request = (
+            self._compile_current_stage1_request_from_reused_preflight(
+                accepted=accepted,
+                current_options=current_options,
+                current_plan=current_plan,
+            )
+        )
+        integration = self.hooks.role_neutral_stage1
+        if integration is None:
+            raise RuntimeError(
+                "fast preflight reopen requires all-ten integration"
+            )
+        prepared_context = (
+            seal_prepared_stage1_context_from_authenticated_parts(
+                root=(
+                    attempt / "prepared_stage1_context"
+                ).resolve(),
+                stage1_build_options=current_mapping,
+                architecture_profiles=(
+                    integration.producer_factories_builder.architecture_profiles
+                ),
+                runtime_compatibility_class=(
+                    integration.producer_factories_builder.runtime_compatibility_class
+                ),
+                exact_stage1_request=exact_request,
+                registry=registry,
+                registry_content_sha256=registry_sha,
+            )
+        )
+        plan = current_plan
+        artifact_identity = artifact.identity()
+        if (
+            artifact_identity["scope_count"] != len(plan.scopes)
+            or artifact_identity["physical_fit_count"]
+            != len(plan.physical_scopes)
+        ):
+            raise RuntimeError(
+                "fast-reopened preflight changed scope coverage"
+            )
+        counts: dict[str, int] = {}
+        for scope in plan.scopes:
+            counts[scope.scope_kind] = (
+                counts.get(scope.scope_kind, 0) + 1
+            )
+        telemetry = {
+            "schema_version": (
+                "production_stage1_reusable_preflight_telemetry_v1"
+            ),
+            "reopen_route": (
+                "accepted_input_prior_proof_and_stat_continuity"
+                if accepted.authentication_mode
+                == "prior_proof_stat_continuity"
+                else "accepted_input_full_byte_reauthentication"
+            ),
+            "global_audit_seconds": 0.0,
+            "global_audit_authentication_seconds": (
+                accepted.global_audit_authentication_seconds
+            ),
+            "global_audit_authentication_mode": (
+                accepted.global_audit_authentication_mode
+            ),
+            "global_audit_payload_bytes_read": (
+                accepted.global_audit_payload_bytes_read
+            ),
+            "owner_total_count": len(plan.physical_scopes),
+            "owner_reused_count": len(plan.physical_scopes),
+            "owner_recomputed_count": 0,
+            "owner_incomplete_count": 0,
+            "owner_fast_stat_count": int(
+                accepted.preflight.authentication[
+                    "owner_fast_stat_count"
+                ]
+            ),
+            "owner_deep_auth_count": int(
+                accepted.preflight.authentication[
+                    "owner_deep_auth_count"
+                ]
+            ),
+            "actual_worker_concurrency": 0,
+            "scope_input_publication_seconds": 0.0,
+            "scope_input_publication_bytes": 0,
+            "authentication_seconds": (
+                time.perf_counter() - started
+            ),
+            "authentication_payload_bytes_read": int(
+                accepted.payload_bytes_read
+                + accepted.global_audit_payload_bytes_read
+                + accepted.preflight.authentication[
+                    "payload_bytes_read"
+                ]
+            ),
+            "htr_retokenization_performed": False,
+            "kmeans_or_svd_refit_performed": False,
+            "bulk_preflight_payload_read_on_fast_path": (
+                accepted.authentication_mode
+                != "prior_proof_stat_continuity"
+                or accepted.global_audit_authentication_mode
+                != "prior_proof_stat_continuity"
+                or accepted.preflight.authentication[
+                    "assembled_authentication_mode"
+                ]
+                != "prior_proof_stat_continuity"
+                or int(
+                    accepted.preflight.authentication[
+                        "owner_deep_auth_count"
+                    ]
+                )
+                != 0
+            ),
+            "deployment_execution_attestation": copy.deepcopy(
+                self.options.stage1_preflight_execution_attestation
+            ),
+            "actual_worker_concurrency_within_every_derived_cap": True,
+        }
+        scope_input_body = {
+            "schema_version": (
+                "production_stage1_reused_scope_inputs_v1"
+            ),
+            "scope_count": 0,
+            "scope_inputs_republished": False,
+            "all_physical_owners_reused": True,
+            "portable_v2_no_refit_import_used": False,
+        }
+        scope_input_identity = {
+            **scope_input_body,
+            "content_sha256": _sha(scope_input_body),
+        }
+        resource = self._gpu_preflight()
+        payload = {
+            "schema_version": STAGE1_PREFLIGHT_PHASE_SCHEMA,
+            "resource_preflight": resource,
+            "cache_phase_reopened_and_rehashed": False,
+            "effective_profile_path": str(
+                profile.resolve(strict=True)
+            ),
+            "cluster_preflight_manifest_path": str(
+                preflight_manifest
+            ),
+            "cluster_preflight_identity": artifact_identity,
+            "cluster_preflight_state_bundle_manifest_path": str(
+                state_manifest
+            ),
+            "cluster_preflight_state_bundle_content_sha256": (
+                state_bundle.content_sha256
+            ),
+            "cluster_preflight_physical_state_count": len(
+                state_bundle.states
+            ),
+            "cluster_preflight_states_are_canonical_no_refit": True,
+            "prepared_stage1_context_manifest_path": str(
+                prepared_context.manifest_path
+            ),
+            "prepared_stage1_context_scientific_content_root_sha256": (
+                prepared_context.content_root_sha256
+            ),
+            "prepared_stage1_context_sealed_during_preflight": True,
+            "prepared_stage1_context_checkpoint_placement": (
+                "nested_terminal_payload_in_stage1_preflight_portable_dag_v1"
+            ),
+            "cluster_preflight_scope_inputs_identity": (
+                scope_input_identity
+            ),
+            "planned_scope_counts": {
+                "full_outer": counts.get("full_outer", 0),
+                "exact_inner": counts.get("exact_inner", 0),
+                "cumulative_review": counts.get(
+                    "cumulative_spent",
+                    0,
+                ),
+                "total": len(plan.scopes),
+            },
+            "scientific_cluster_preflight": (
+                "accepted_reusable_global_owner_assembled_v1"
+            ),
+            "reusable_preflight_telemetry": telemetry,
+            "preflight_computation_distinguished_from_authentication": True,
+            "global_audit_artifact_reusable": True,
+            "per_physical_owner_cluster_artifacts_reusable": True,
+            "assembled_context_references_owner_payloads": True,
+            "scientific_preflight_recomputed_during_supervised_modeling": False,
+            "supervised_fit_may_begin_before_scientific_preflight_acceptance": False,
+            "stage1_gpu_ids": list(self.stage1_gpu_ids),
+            "stage1_execution_device_count": (
+                self.options.stage1_execution_device_count
+            ),
+            "stage1_execution_profile": (
+                self.options.stage1_execution_profile.as_dict()
+                if isinstance(
+                    self.options.stage1_execution_profile,
+                    Stage1ExecutionProfile,
+                )
+                else None
+            ),
+            "scope_workers_per_gpu": (
+                self.options.stage1_scope_workers_per_gpu
+            ),
+            "preflight_workers": (
+                self.options.stage1_preflight_workers
+            ),
+            "preflight_execution_attestation": copy.deepcopy(
+                self.options.stage1_preflight_execution_attestation
+            ),
+            "seed_policy": self.options.stage1_seed_policy,
+            "accepted_context_fast_reopen_used": True,
+        }
+        report = attempt / "stage1_preflight_report.json"
+        report.write_text(
+            json.dumps(
+                payload,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        return {
+            **payload,
+            "terminal_files": [
+                str(profile.resolve(strict=True)),
+                *[
+                    str(path.resolve(strict=True))
+                    for root in (
+                        preflight_root,
+                        state_root,
+                        prepared_context.root,
+                    )
+                    for path in sorted(root.rglob("*"))
+                    if path.is_file()
+                ],
+                str(report.resolve(strict=True)),
+            ],
+        }
+
     def _run_default(self, phase: str, attempt: Path) -> Mapping[str, Any]:
         o = self.options
         if phase == "input_preparation":
@@ -14017,6 +16074,11 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         if phase == "embedding_cache":
             return self._run_embedding_cache_phase(attempt)
         if phase == "stage1_preflight":
+            reopened = self._try_fast_reopen_stage1_preflight(
+                attempt
+            )
+            if reopened is not None:
+                return reopened
             resource = self._gpu_preflight()
             cache, prepared = self._embedding_cache_paths()
             profile = self._effective_stage1_profile(
@@ -14037,9 +16099,17 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             legacy_migration_decision_path: Path | None = None
             legacy_migration_decision: Mapping[str, Any] | None = None
             legacy_preflight_identity = self.request.get("legacy_preflight_candidate_identity")
-            if legacy_preflight_identity is not None:
-                if not isinstance(legacy_preflight_identity, Mapping):
-                    raise RuntimeError("immutable legacy preflight identity is invalid")
+            if (
+                legacy_preflight_identity is not None
+                and isinstance(
+                    legacy_preflight_identity,
+                    Mapping,
+                )
+                and legacy_preflight_identity.get(
+                    "candidate_kind"
+                )
+                == "legacy_v4"
+            ):
                 from .legacy_checkpoint_migration import (
                     plan_legacy_v4_preflight_migration,
                 )
@@ -14086,7 +16156,21 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                 ) = _persist_legacy_preflight_recompute_decision(
                     attempt=attempt,
                     consumer_request_sha256=self.request["request_sha256"],
-                    source_candidate_identity=legacy_preflight_identity,
+                    source_candidate_identity={
+                        name: copy.deepcopy(
+                            legacy_preflight_identity[name]
+                        )
+                        for name in (
+                            "selection_source",
+                            "manifest_path",
+                            "manifest_sha256",
+                            "manifest_size_bytes",
+                            "manifest_content_sha256",
+                            "registered_payloads",
+                            "registered_payload_bytes_authenticated_during_request",
+                            "direct_reuse_allowed",
+                        )
+                    },
                     migration=migration,
                     expected_logical_scope_count=expected_logical,
                     expected_physical_fit_count=expected_physical,
@@ -14097,7 +16181,51 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     "Stage 1 preflight omitted its recoverable row-restricted "
                     "scope-input identity"
                 )
-            if prepared_build.options.portable_cluster_preflight_v2:
+            from .production_stage1_reusable_preflight import (
+                ReusableProductionStage1ClusterPreflightArtifact,
+                load_reusable_preflight_reference,
+                publish_reusable_preflight_references,
+            )
+
+            reusable_preflight = isinstance(
+                prepared_build.cluster_preflight_artifact_handle,
+                ReusableProductionStage1ClusterPreflightArtifact,
+            )
+            if reusable_preflight:
+                artifact = (
+                    prepared_build.cluster_preflight_artifact_handle
+                )
+                state_bundle = (
+                    prepared_build.cluster_preflight_state_bundle
+                )
+                if state_bundle is None:
+                    raise RuntimeError(
+                        "reusable preflight omitted its state bundle"
+                    )
+                publish_reusable_preflight_references(
+                    preflight_output_root=(
+                        attempt / "cluster_preflight"
+                    ).resolve(),
+                    state_output_root=(
+                        attempt / "cluster_preflight_states"
+                    ).resolve(),
+                    artifact=artifact,
+                    state_bundle=state_bundle,
+                )
+                # The phase-local manifests are the portable capabilities.
+                artifact = load_reusable_preflight_reference(
+                    manifest_path=(
+                        attempt
+                        / "cluster_preflight"
+                        / "cluster_preflight_manifest.json"
+                    ).resolve(),
+                    expected_stage1_request=prepared_build.request,
+                    plan=prepared_build.stage1_scope_plan,
+                    producer_identity=(
+                        STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY
+                    ),
+                )
+            elif prepared_build.options.portable_cluster_preflight_v2:
                 from .production_stage1_cluster_preflight_artifact_v2 import (
                     seal_portable_production_stage1_cluster_preflight_artifact,
                 )
@@ -14136,24 +16264,32 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     registry_content_sha256=prepared_build.registry_content_sha256,
                     embedding_cache_identity=prepared_build.embedding_cache_identity,
                 )
-            captured_states = prepared_build.cluster_preflight_canonical_scope_states
-            if not isinstance(captured_states, Mapping):
-                raise RuntimeError(
-                    "fresh clustered preflight omitted its canonical "
-                    "physical-owner fitted states"
+            if reusable_preflight:
+                state_bundle_manifest = (
+                    attempt
+                    / "cluster_preflight_states"
+                    / "cluster_state_bundle_manifest.json"
+                ).resolve(strict=True)
+            else:
+                captured_states = prepared_build.cluster_preflight_canonical_scope_states
+                if not isinstance(captured_states, Mapping):
+                    raise RuntimeError(
+                        "fresh clustered preflight omitted its canonical "
+                        "physical-owner fitted states"
+                    )
+                from .role_neutral_embedding_group_execution import (
+                    seal_canonical_clustered_preflight_state_bundle,
                 )
-            from .role_neutral_embedding_group_execution import (
-                seal_canonical_clustered_preflight_state_bundle,
-            )
 
-            state_bundle = seal_canonical_clustered_preflight_state_bundle(
-                output_root=(attempt / "cluster_preflight_states").resolve(),
-                preflight=artifact,
-                plan=prepared_build.stage1_scope_plan,
-                captured_scope_states=captured_states,
-            )
-            state_bundle_manifest = state_bundle.root / "cluster_state_bundle_manifest.json"
+                state_bundle = seal_canonical_clustered_preflight_state_bundle(
+                    output_root=(attempt / "cluster_preflight_states").resolve(),
+                    preflight=artifact,
+                    plan=prepared_build.stage1_scope_plan,
+                    captured_scope_states=captured_states,
+                )
+                state_bundle_manifest = state_bundle.root / "cluster_state_bundle_manifest.json"
             prepared_context = None
+            accepted_context = None
             if o.portable_scientific_spec is not None:
                 integration = self.hooks.role_neutral_stage1
                 if integration is None:
@@ -14169,7 +16305,13 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     prepared_build.options,
                     dry_run=False,
                     cluster_preflight_manifest_path=(
-                        artifact.manifest_path
+                        (
+                            attempt
+                            / "cluster_preflight"
+                            / "cluster_preflight_manifest.json"
+                        ).resolve(strict=True)
+                        if reusable_preflight
+                        else artifact.manifest_path
                     ),
                     cluster_preflight_state_bundle_manifest_path=(
                         state_bundle_manifest
@@ -14179,7 +16321,13 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     prepared_build,
                     options=reusable_options,
                     cluster_preflight_manifest_path=(
-                        artifact.manifest_path
+                        (
+                            attempt
+                            / "cluster_preflight"
+                            / "cluster_preflight_manifest.json"
+                        ).resolve(strict=True)
+                        if reusable_preflight
+                        else artifact.manifest_path
                     ),
                     cluster_preflight_artifact_identity=(
                         artifact.identity()
@@ -14196,6 +16344,38 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                         integration.producer_factories_builder
                     ),
                 )
+                if reusable_preflight:
+                    from .production_stage1_bundle import (
+                        STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY,
+                        STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY,
+                    )
+                    from .production_stage1_reusable_preflight import (
+                        publish_reusable_preflight_acceptance,
+                    )
+
+                    accepted_context = (
+                        publish_reusable_preflight_acceptance(
+                            store_root=(
+                                self._reusable_preflight_store_root()
+                            ),
+                            selector=(
+                                self._reusable_preflight_accepted_input_selector()
+                            ),
+                            artifact=artifact,
+                            prepared_context_manifest_path=(
+                                prepared_context.manifest_path
+                            ),
+                            producer_identity=(
+                                STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY
+                            ),
+                            owner_producer_identity=(
+                                STAGE1_REUSABLE_CLUSTER_OWNER_PRODUCER_IDENTITY
+                            ),
+                            global_audit_producer_identity=(
+                                STAGE1_REUSABLE_GLOBAL_AUDIT_PRODUCER_IDENTITY
+                            ),
+                        )
+                    )
             report = attempt / "stage1_preflight_report.json"
             inner_partition_count = int(o.initial_training_partitions) + o.review_rounds
             planned_scope_count = o.outer_folds * (1 + inner_partition_count + o.review_rounds)
@@ -14207,7 +16387,15 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                 "resource_preflight": resource,
                 "cache_phase_reopened_and_rehashed": True,
                 "effective_profile_path": str(profile.resolve(strict=True)),
-                "cluster_preflight_manifest_path": str(artifact.manifest_path),
+                "cluster_preflight_manifest_path": str(
+                    (
+                        attempt
+                        / "cluster_preflight"
+                        / "cluster_preflight_manifest.json"
+                    ).resolve(strict=True)
+                    if reusable_preflight
+                    else artifact.manifest_path
+                ),
                 "cluster_preflight_identity": artifact_identity,
                 "cluster_preflight_state_bundle_manifest_path": str(state_bundle_manifest),
                 "cluster_preflight_state_bundle_content_sha256": (state_bundle.content_sha256),
@@ -14231,6 +16419,19 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     if prepared_context is not None
                     else None
                 ),
+                "reusable_preflight_accepted_context_terminal_path": (
+                    None
+                    if accepted_context is None
+                    else str(
+                        accepted_context.root
+                        / "accepted_context_terminal.json"
+                    )
+                ),
+                "reusable_preflight_accepted_context_authentication_mode": (
+                    None
+                    if accepted_context is None
+                    else accepted_context.authentication_mode
+                ),
                 "cluster_preflight_scope_inputs_identity": copy.deepcopy(
                     dict(scope_input_identity)
                 ),
@@ -14241,10 +16442,21 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     "total": planned_scope_count,
                 },
                 "scientific_cluster_preflight": (
+                    "accepted_reusable_global_owner_assembled_v1"
+                    if reusable_preflight
+                    else (
                     "accepted_portable_compact_lossless_v2"
                     if prepared_build.options.portable_cluster_preflight_v2
                     else "accepted_and_independently_sealed_v1"
+                    )
                 ),
+                "reusable_preflight_telemetry": copy.deepcopy(
+                    dict(prepared_build.reusable_preflight_telemetry)
+                ),
+                "preflight_computation_distinguished_from_authentication": True,
+                "global_audit_artifact_reusable": reusable_preflight,
+                "per_physical_owner_cluster_artifacts_reusable": reusable_preflight,
+                "assembled_context_references_owner_payloads": reusable_preflight,
                 "scientific_preflight_recomputed_during_supervised_modeling": False,
                 "supervised_fit_may_begin_before_scientific_preflight_acceptance": False,
                 "stage1_gpu_ids": list(self.stage1_gpu_ids),
@@ -14257,7 +16469,10 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     else o.stage1_execution_profile.as_dict()
                 ),
                 "scope_workers_per_gpu": o.stage1_scope_workers_per_gpu,
-                "preflight_workers": o.stage1_preflight_workers,
+            "preflight_workers": o.stage1_preflight_workers,
+            "preflight_execution_attestation": copy.deepcopy(
+                o.stage1_preflight_execution_attestation
+            ),
                 "seed_policy": o.stage1_seed_policy,
             }
             if legacy_migration_decision_path is not None and legacy_migration_decision is not None:
@@ -14292,10 +16507,26 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     str(profile),
                     *[
                         str(path)
-                        for path in sorted(artifact.root.rglob("*"))
+                        for path in sorted(
+                            (
+                                attempt / "cluster_preflight"
+                                if reusable_preflight
+                                else artifact.root
+                            ).rglob("*")
+                        )
                         if path.is_file()
                     ],
-                    *[str(path) for path in sorted(state_bundle.root.rglob("*")) if path.is_file()],
+                    *[
+                        str(path)
+                        for path in sorted(
+                            (
+                                attempt / "cluster_preflight_states"
+                                if reusable_preflight
+                                else state_bundle.root
+                            ).rglob("*")
+                        )
+                        if path.is_file()
+                    ],
                     *(
                         [
                             str(path)
@@ -15147,6 +17378,21 @@ def build_parser() -> argparse.ArgumentParser:
             "multi-device learned-query reservations."
         ),
     )
+    parser.add_argument("--stage1-preflight-max-parallel-owners", type=int)
+    parser.add_argument("--stage1-preflight-memory-budget-bytes", type=int)
+    parser.add_argument(
+        "--stage1-preflight-estimated-owner-peak-bytes",
+        type=int,
+    )
+    parser.add_argument("--stage1-preflight-input-io-lane-cap", type=int)
+    parser.add_argument(
+        "--stage1-preflight-publication-io-lane-cap",
+        type=int,
+    )
+    parser.add_argument(
+        "--stage1-preflight-authentication-io-lane-cap",
+        type=int,
+    )
     parser.add_argument(
         "--stage1-neural-query-topology",
         choices=tuple(sorted(SUPPORTED_STAGE1_EXECUTION_TOPOLOGY_MODES)),
@@ -15587,6 +17833,12 @@ _DIRECT_DEPLOYMENT_SHIMS = (
     "stage1_scope_workers_per_device",
     "stage1_persistent_slot_startup_timeout_seconds",
     "stage1_max_parallel_owners",
+    "stage1_preflight_max_parallel_owners",
+    "stage1_preflight_memory_budget_bytes",
+    "stage1_preflight_estimated_owner_peak_bytes",
+    "stage1_preflight_input_io_lane_cap",
+    "stage1_preflight_publication_io_lane_cap",
+    "stage1_preflight_authentication_io_lane_cap",
     "stage1_neural_query_topology",
     "stage1_htr_training_batch_size",
     "stage1_htr_sentence_encoder_batch_size",
@@ -15661,6 +17913,55 @@ def _run_control_from_namespace(values: Mapping[str, Any]) -> RunControl:
     )
 
 
+def _stage1_preflight_execution_attestation(
+    deployment: DeploymentProfile,
+) -> dict[str, Any]:
+    """Compile one deployment-only, science-neutral preflight lane cap."""
+
+    policy = (
+        deployment.stage1_execution.preflight_execution_policy
+    )
+    read_amplification_lane_cap = math.floor(
+        deployment.resource_performance_safety
+        .maximum_ordinary_read_amplification
+    )
+    caps = {
+        "cpu_budget": int(deployment.cpu_budget),
+        "stage1_owner_cap": int(
+            deployment.stage1_execution.max_parallel_owners
+        ),
+        "preflight_owner_cap": int(policy.max_parallel_owners),
+        "memory_lane_cap": int(policy.memory_lane_cap),
+        "input_io_lane_cap": int(policy.input_io_lane_cap),
+        "publication_io_lane_cap": int(
+            policy.publication_io_lane_cap
+        ),
+        "authentication_io_lane_cap": int(
+            policy.authentication_io_lane_cap
+        ),
+        "ordinary_read_amplification_lane_cap": int(
+            read_amplification_lane_cap
+        ),
+    }
+    if any(value < 1 for value in caps.values()):
+        raise ValueError(
+            "Stage 1 preflight deployment policy leaves no executable lane"
+        )
+    effective = min(caps.values())
+    body = {
+        "schema_version": (
+            "production_stage1_preflight_execution_attestation_v1"
+        ),
+        "policy": policy.as_dict(),
+        "derived_caps": caps,
+        "effective_preflight_owner_lanes_before_scope_cap": effective,
+        "physical_owner_count_applied_by_preflight_executor": True,
+        "resource_assignment_in_scientific_identity": False,
+        "completion_order_in_scientific_identity": False,
+    }
+    return {**body, "content_sha256": _sha(body)}
+
+
 def _compile_direct_deployment_profile(
     values: Mapping[str, Any],
 ) -> DeploymentProfile:
@@ -15679,6 +17980,12 @@ def _compile_direct_deployment_profile(
         "stage1_scope_workers_per_device",
         "stage1_persistent_slot_startup_timeout_seconds",
         "stage1_max_parallel_owners",
+        "stage1_preflight_max_parallel_owners",
+        "stage1_preflight_memory_budget_bytes",
+        "stage1_preflight_estimated_owner_peak_bytes",
+        "stage1_preflight_input_io_lane_cap",
+        "stage1_preflight_publication_io_lane_cap",
+        "stage1_preflight_authentication_io_lane_cap",
         "stage1_neural_query_topology",
         "stage1_htr_training_batch_size",
         "stage1_htr_sentence_encoder_batch_size",
@@ -15793,6 +18100,28 @@ def _compile_direct_deployment_profile(
                 values["stage1_scope_workers_per_device"]
             ),
             max_parallel_owners=values["stage1_max_parallel_owners"],
+            preflight_execution_policy=(
+                Stage1PreflightExecutionPolicy(
+                    max_parallel_owners=values[
+                        "stage1_preflight_max_parallel_owners"
+                    ],
+                    memory_budget_bytes=values[
+                        "stage1_preflight_memory_budget_bytes"
+                    ],
+                    estimated_owner_peak_bytes=values[
+                        "stage1_preflight_estimated_owner_peak_bytes"
+                    ],
+                    input_io_lane_cap=values[
+                        "stage1_preflight_input_io_lane_cap"
+                    ],
+                    publication_io_lane_cap=values[
+                        "stage1_preflight_publication_io_lane_cap"
+                    ],
+                    authentication_io_lane_cap=values[
+                        "stage1_preflight_authentication_io_lane_cap"
+                    ],
+                )
+            ),
             executor_mode="persistent_slots",
             persistent_slot_startup_timeout_seconds=values[
                 "stage1_persistent_slot_startup_timeout_seconds"
@@ -16083,7 +18412,14 @@ def _compile_production_options(
             deployment.stage1_execution.scope_workers_per_device
         ),
         stage1_execution_profile=deployment.stage1_execution,
-        stage1_preflight_workers=deployment.cpu_budget,
+        stage1_preflight_workers=int(
+            _stage1_preflight_execution_attestation(deployment)[
+                "effective_preflight_owner_lanes_before_scope_cap"
+            ]
+        ),
+        stage1_preflight_execution_attestation=(
+            _stage1_preflight_execution_attestation(deployment)
+        ),
         stage1_seed_policy=scientific.seed_policy,
         num_workers=deployment.cpu_budget,
         tfidf_workers=deployment.cpu_budget,

@@ -62,6 +62,191 @@ from tests.stage1_test_support import (
 from tests.resource_safety_test_support import resource_safety_policy
 
 
+def _bare_workflow_with_completed_phase(
+    tmp_path: Path,
+    *,
+    phase: str = "embedding_cache",
+) -> tuple[ProductionAllEvidenceWorkflow, Path]:
+    work_root = (tmp_path / "phase-proof-workflow").resolve()
+    attempt = (
+        work_root
+        / "phases"
+        / phase
+        / "attempt_20260730T000000000000Z"
+    )
+    attempt.mkdir(parents=True)
+    payload = attempt / "large_payload.bin"
+    payload.write_bytes(b"authenticated-phase-payload" * 4096)
+    digest, size = workflow_module.stable_file_sha256(payload)
+    request_sha256 = "a" * 64
+    body = {
+        "schema_version": workflow_module.WORKFLOW_PHASE_MANIFEST_SCHEMA,
+        "phase": phase,
+        "status": "complete",
+        "request_sha256": request_sha256,
+        "attempt_dir": str(attempt),
+        "result": {
+            "terminal_files": [str(payload.resolve(strict=True))],
+        },
+        "artifacts": [
+            {
+                "relative_path": payload.name,
+                "path": str(payload.resolve(strict=True)),
+                "sha256": digest,
+                "size_bytes": size,
+            }
+        ],
+    }
+    manifest = {
+        **body,
+        "content_sha256": workflow_module._sha(body),
+    }
+    workflow_module._atomic_write_json(
+        work_root / "phases" / phase / "complete_manifest.json",
+        manifest,
+    )
+    workflow = object.__new__(ProductionAllEvidenceWorkflow)
+    workflow.options = SimpleNamespace(work_root=work_root)
+    workflow.request = {"request_sha256": request_sha256}
+    workflow._phase_payload_stat_inventories = {}
+    workflow._adopted_artifact_handles = {}
+    return workflow, payload
+
+
+def test_completed_phase_cross_process_proof_avoids_payload_reread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow, payload = _bare_workflow_with_completed_phase(
+        tmp_path
+    )
+    first = workflow._validated_complete("embedding_cache")
+    assert first is not None
+
+    reopened = object.__new__(ProductionAllEvidenceWorkflow)
+    reopened.options = workflow.options
+    reopened.request = workflow.request
+    reopened._phase_payload_stat_inventories = {}
+    reopened._adopted_artifact_handles = {}
+
+    original = workflow_module.stable_file_sha256
+    payload_reads: list[Path] = []
+
+    def traced(path: Path) -> tuple[str, int]:
+        resolved = Path(path).resolve(strict=True)
+        if resolved == payload.resolve(strict=True):
+            payload_reads.append(resolved)
+        return original(resolved)
+
+    monkeypatch.setattr(
+        workflow_module,
+        "stable_file_sha256",
+        traced,
+    )
+    second = reopened._validated_complete("embedding_cache")
+
+    assert second == first
+    assert payload_reads == []
+    assert "embedding_cache" in (
+        reopened._phase_payload_stat_inventories
+    )
+
+
+def test_completed_phase_optional_proof_failure_accepts_valid_deep_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import oci.inference.production_stage1_reusable_preflight as reusable
+
+    workflow, _payload = _bare_workflow_with_completed_phase(
+        tmp_path
+    )
+
+    def unavailable(**_kwargs: object) -> dict[str, object]:
+        raise RuntimeError("timestamp barrier unavailable")
+
+    monkeypatch.setattr(
+        reusable,
+        "_publish_full_auth_proof",
+        unavailable,
+    )
+    completed = workflow._validated_complete("embedding_cache")
+
+    assert completed is not None
+    assert workflow._phase_payload_stat_inventories == {}
+
+
+def test_completed_phase_mutation_during_proof_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import oci.inference.production_stage1_reusable_preflight as reusable
+
+    workflow, payload = _bare_workflow_with_completed_phase(
+        tmp_path
+    )
+    mutated = False
+
+    def mutate_before_barrier(
+        *,
+        store_root: Path,
+        after_ctime_ns: int,
+        timeout_seconds: float = 10.0,
+    ) -> int:
+        nonlocal mutated
+        del store_root, timeout_seconds
+        if not mutated:
+            changed = bytearray(payload.read_bytes())
+            changed[-1] ^= 1
+            payload.write_bytes(changed)
+            mutated = True
+        return int(after_ctime_ns) + 1
+
+    monkeypatch.setattr(
+        reusable,
+        "_wait_for_timestamp_barrier",
+        mutate_before_barrier,
+    )
+    with pytest.raises(
+        (RuntimeError, ValueError),
+        match="changed",
+    ):
+        workflow._validated_complete("embedding_cache")
+    assert mutated is True
+
+
+def test_authenticated_htr_inventory_projects_to_bundle_digest_without_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from oci.inference.stage1_upstream_gate_backend import (
+        _directory_tree_sha256,
+    )
+
+    model = (tmp_path / "htr-projection").resolve()
+    model.mkdir()
+    (model / "config.json").write_bytes(b'{"model":"fixture"}')
+    (model / "weights.bin").write_bytes(b"fixture-weights")
+    workflow_identity = workflow_module._stable_path_identity(model)
+    expected = _directory_tree_sha256(model)
+
+    def forbidden_hash(_path: Path) -> tuple[str, int]:
+        raise AssertionError("fast reopen reread an HTR model file")
+
+    monkeypatch.setattr(
+        workflow_module,
+        "stable_file_sha256",
+        forbidden_hash,
+    )
+    assert (
+        workflow_module
+        ._stage1_bundle_model_tree_sha256_from_workflow_identity(
+            workflow_identity
+        )
+        == expected
+    )
+
+
 def _wire_budget() -> HierarchyWireBudgetSpec:
     return HierarchyWireBudgetSpec(
         budget_version="hierarchy_wire_budget_v1",
@@ -449,13 +634,55 @@ def _portable_options(
         causal_forest=specification.causal_estimator,
         operational=_forest_operational(base.cpu_budget),
     )
+    execution_profile = stage1_execution_profile(
+        resource_kind="cpu",
+        device_count=base.stage1_execution_device_count,
+        scope_workers_per_device=base.stage1_scope_workers_per_gpu,
+    )
+    policy = execution_profile.preflight_execution_policy
+    caps = {
+        "cpu_budget": int(base.cpu_budget),
+        "stage1_owner_cap": int(
+            execution_profile.max_parallel_owners
+        ),
+        "preflight_owner_cap": int(policy.max_parallel_owners),
+        "memory_lane_cap": int(policy.memory_lane_cap),
+        "input_io_lane_cap": int(policy.input_io_lane_cap),
+        "publication_io_lane_cap": int(
+            policy.publication_io_lane_cap
+        ),
+        "authentication_io_lane_cap": int(
+            policy.authentication_io_lane_cap
+        ),
+        "ordinary_read_amplification_lane_cap": int(
+            base.resource_performance_safety
+            .maximum_ordinary_read_amplification
+        ),
+    }
+    preflight_body = {
+        "schema_version": (
+            "production_stage1_preflight_execution_attestation_v1"
+        ),
+        "policy": policy.as_dict(),
+        "derived_caps": caps,
+        "effective_preflight_owner_lanes_before_scope_cap": min(
+            caps.values()
+        ),
+        "physical_owner_count_applied_by_preflight_executor": True,
+        "resource_assignment_in_scientific_identity": False,
+        "completion_order_in_scientific_identity": False,
+    }
+    preflight_attestation = {
+        **preflight_body,
+        "content_sha256": workflow_module._sha(preflight_body),
+    }
     return replace(
         base,
         portable_scientific_spec=specification.identity_payload(),
-        stage1_execution_profile=stage1_execution_profile(
-            resource_kind="cpu",
-            device_count=base.stage1_execution_device_count,
-            scope_workers_per_device=base.stage1_scope_workers_per_gpu,
+        stage1_execution_profile=execution_profile,
+        stage1_preflight_workers=min(caps.values()),
+        stage1_preflight_execution_attestation=(
+            preflight_attestation
         ),
         forest_runtime_config=runtime,
         forest_n_estimators=None,
@@ -473,6 +700,332 @@ def _portable_options(
         forest_nuisance_outcome_max_features=None,
         forest_random_seed=None,
     )
+
+
+def test_reusable_fast_option_compilation_skips_cohort_rehydration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _portable_options(tmp_path)
+    workflow = ProductionAllEvidenceWorkflow(options)
+    workflow.request = {
+        "stage1_physical_fit_identity": (
+            PHYSICAL_FIT_IDENTITY.as_dict()
+        )
+    }
+    source_cache = (tmp_path / "source-cache").resolve()
+    source_cache.mkdir()
+    source_prepared = (tmp_path / "source-prepared.parquet").resolve()
+    source_manifest = (tmp_path / "source-preparation.json").resolve()
+    source_prepared.write_bytes(b"source")
+    source_manifest.write_text("{}\n", encoding="utf-8")
+    workflow.options = replace(
+        workflow.options,
+        portable_scientific_spec=None,
+        embedding_cache_import=source_cache,
+        embedding_cache_import_source_prepared_path=source_prepared,
+        embedding_cache_import_source_preparation_manifest_path=(
+            source_manifest
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_validated_complete",
+        lambda phase: (
+            {
+                "result": {
+                    "mode": "authenticated_relocation",
+                    "cache_identity": {},
+                    "legacy_terminal_migration_identity": None,
+                }
+            }
+            if phase == "embedding_cache"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_adopted_record_for_phase",
+        lambda _phase: None,
+    )
+
+    def forbidden(**_kwargs: object) -> None:
+        raise AssertionError(
+            "accepted fast reopen attempted cohort/cache provenance "
+            "rehydration"
+        )
+
+    monkeypatch.setattr(
+        workflow,
+        "_embedding_cache_relocation_options",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_embedding_cache_validation_dataset_path",
+        forbidden,
+    )
+    compiled = workflow._stage1_build_options(
+        dataset=(tmp_path / "durable-prepared.parquet").resolve(),
+        profile=(tmp_path / "effective-profile.json").resolve(),
+        cache=(tmp_path / "durable-cache").resolve(),
+        output=(tmp_path / "preflight-output").resolve(),
+        dry_run=False,
+        reusable_preflight_fast_reopen=True,
+    )
+
+    assert compiled.embedding_cache_relocation is None
+    assert compiled.embedding_cache_validation_dataset_path is None
+    assert (
+        compiled.embedding_cache_relocation_prepublication_root
+        is None
+    )
+
+
+def test_reused_preflight_compiles_relocated_cache_from_authenticated_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import oci.inference.production_stage1_bundle as bundle_module
+    import oci.inference.production_stage1_config_wire as config_wire
+    import oci.inference.production_stage1_hierarchy_contract as hierarchy
+    from oci.inference.production_embedding_cache_relocation import (
+        PRODUCTION_EMBEDDING_CACHE_RELOCATION_RESULT_SCHEMA,
+    )
+
+    dataset = (tmp_path / "relocated-prepared.parquet").resolve()
+    profile = (tmp_path / "effective-profile.json").resolve()
+    query = (tmp_path / "query.json").resolve()
+    htr = (tmp_path / "htr-fast").resolve()
+    cache = (tmp_path / "relocated-cache").resolve()
+    for path in (dataset, profile, query):
+        path.write_bytes(b"fixture")
+    htr.mkdir()
+    cache.mkdir()
+    htr_digest = "1" * 64
+    htr_files = [
+        {
+            "relative_path": "weights.bin",
+            "sha256": htr_digest,
+            "size_bytes": 7,
+        }
+    ]
+    htr_tree = {
+        "kind": "directory",
+        "path": str(htr),
+        "file_count": 1,
+        "total_size_bytes": 7,
+        "tree_sha256": workflow_module._sha(htr_files),
+        "files": htr_files,
+    }
+    bundle_htr_sha = workflow_module._sha(
+        [
+            {
+                "relative_path": "weights.bin",
+                "size": 7,
+                "sha256": htr_digest,
+            }
+        ]
+    )
+    cache_build = {
+        "schema_version": "fixture_cache_build_v1",
+        "provider_identity": {
+            "provider": "fixture-cache",
+            "embeddings_sha256": "2" * 64,
+        },
+    }
+    relocation = {
+        "schema_version": (
+            PRODUCTION_EMBEDDING_CACHE_RELOCATION_RESULT_SCHEMA
+        ),
+        "relocator_version": "fixture-relocator",
+        "relocator_code_sha256": "3" * 64,
+        "authenticated_tree_code_sha256": "4" * 64,
+        "root": str(cache.parent),
+        "cache_dir": str(cache),
+        "prepared_cohort_path": str(dataset),
+        "attestation_path": str(cache.parent / "attestation.json"),
+        "terminal_manifest_path": str(
+            cache.parent / "complete_manifest.json"
+        ),
+        "row_count": 1000,
+        "prepared_projection_sha256": "5" * 64,
+        "source_cache_identity_sha256": "6" * 64,
+        "cache_build_identity": cache_build,
+        "attestation_sha256": "7" * 64,
+        "terminal_manifest_sha256": "8" * 64,
+    }
+    old_request = {
+        "dataset": {
+            "sha256": "9" * 64,
+            "row_count": 1000,
+        },
+        "embedding_cache": {},
+        "htr_input_nontruncation_audit": {
+            "htr_model_tree_sha256": bundle_htr_sha,
+        },
+    }
+    captured: list[dict[str, object]] = []
+    accepted = SimpleNamespace(
+        prepared_context=SimpleNamespace(
+            execution_locators={
+                "exact_stage1_request": old_request,
+            },
+            scientific_identity={
+                "split_registry": {"fixture": True},
+                "split_registry_content_sha256": "a" * 64,
+            },
+        ),
+        preflight=SimpleNamespace(
+            reference={"content_sha256": "b" * 64},
+            require_stage1_request=lambda request: captured.append(
+                request
+            ),
+        ),
+    )
+    workflow = object.__new__(ProductionAllEvidenceWorkflow)
+    workflow.options = SimpleNamespace(htr_local_model_path=htr)
+    workflow.request = {"htr_model_tree": htr_tree}
+    workflow._validated_complete = lambda phase: (
+        {
+            "result": {
+                "mode": "authenticated_relocation",
+                "cache_identity": relocation,
+            }
+        }
+        if phase == "embedding_cache"
+        else None
+    )
+
+    monkeypatch.setattr(
+        bundle_module,
+        "_read_stable_sha256",
+        lambda _path: ("c" * 64, (0, 0, 0)),
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "load_applied_stage1_config",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_validate_effective_config",
+        lambda *_args, **_kwargs: (object(), htr),
+    )
+    monkeypatch.setattr(
+        config_wire,
+        "production_stage1_effective_config_payload",
+        lambda _config: {},
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_sanitize_secrets",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        bundle_module.ProductionStage1BundleBuilder,
+        "_load_query_config",
+        staticmethod(lambda _path: (object(), {})),
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_scientific_query_config_identity",
+        lambda _identity: {},
+    )
+    monkeypatch.setattr(
+        hierarchy,
+        "current_production_stage1_hierarchy_contract_identity",
+        lambda: {"content_sha256": "d" * 64},
+    )
+    monkeypatch.setattr(
+        hierarchy,
+        "production_stage1_hierarchy_architecture_bindings",
+        lambda _identity: {
+            "tfidf_resume_policy": (
+                bundle_module.STAGE1_TFIDF_RESUME_POLICY
+            )
+        },
+    )
+    monkeypatch.setattr(
+        hierarchy,
+        "validate_production_stage1_hierarchy_request_bindings",
+        lambda _request: None,
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_exact_inner_contract_registry_status",
+        lambda _registry: {},
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_hierarchy_spent_evidence_contract",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "exact_inner_family_adapter_gate",
+        lambda: {},
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_source_identity",
+        lambda: {"content_sha256": "e" * 64},
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "asdict",
+        lambda _value: {},
+    )
+
+    class _Semantic:
+        @staticmethod
+        def as_dict() -> dict[str, object]:
+            return {"fixture": True}
+
+    current = SimpleNamespace(
+        config_path=profile,
+        dataset_path=dataset,
+        embedding_cache_dir=cache,
+        seed=42,
+        query_config_path=query,
+        semantic_witness_scientific_config=_Semantic(),
+        initial_training_partitions=3,
+        embedding_cache_operator_trusted_read_proof=None,
+        embedding_cache_legacy_migration_identity=None,
+        device="cpu",
+        gpu_ids=(),
+        num_workers=1,
+        tfidf_workers=1,
+        tfidf_parallel_backend="processes",
+        query_devices=("cpu",),
+        query_nuisance_folds=3,
+        scope_workers_per_gpu=1,
+        preflight_workers=1,
+        stage1_scope_descriptor_root=None,
+        stage1_scope_attempt_root=None,
+        stage1_scope_progress_path=None,
+        output_dir=(tmp_path / "output").resolve(),
+    )
+    plan = SimpleNamespace(as_dict=lambda: {"fixture": True})
+
+    request = (
+        workflow._compile_current_stage1_request_from_reused_preflight(
+            accepted=accepted,
+            current_options=current,
+            current_plan=plan,
+        )
+    )
+
+    assert request["embedding_cache"][
+        "production_cache_build_identity"
+    ] == cache_build
+    assert request["embedding_cache"]["identity"] == (
+        cache_build["provider_identity"]
+    )
+    assert request["embedding_cache"][
+        "authenticated_relocation"
+    ] == relocation
+    assert captured == [request]
 
 
 def _write_scientific_spec(path: Path) -> Path:

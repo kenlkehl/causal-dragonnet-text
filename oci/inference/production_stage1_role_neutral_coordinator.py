@@ -32,13 +32,17 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
 from .production_stage1_legacy_scope_fragments import (
+    ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMAS,
     durably_sync_legacy_stage1_tree,
 )
 from .production_stage1_scope_scheduler import Stage1ScopePlan
 from .role_neutral_all_ten_binding import (
     AuthenticatedRoleNeutralComponentReceipt,
     EXPECTED_COMPONENT_FAMILIES,
+    ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V1,
+    ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V2,
     ROLE_NEUTRAL_COMPONENT_RECEIPT_SCHEMA,
+    authenticated_role_neutral_component_tree_sha256,
     persist_complete_role_neutral_stage1_bindings,
     validate_authenticated_role_neutral_component_receipt,
     validate_complete_role_neutral_stage1_bindings,
@@ -46,7 +50,7 @@ from .role_neutral_all_ten_binding import (
 
 ROLE_NEUTRAL_COORDINATION_GATE_SCHEMA = "production_role_neutral_stage1_coordination_gate_v1"
 ROLE_NEUTRAL_COMPONENT_LOCATOR_ATTESTATION_SCHEMA = (
-    "production_role_neutral_component_locator_attestation_v1"
+    "production_role_neutral_component_locator_attestation_v3"
 )
 ROLE_NEUTRAL_COORDINATION_SCIENTIFIC_IDENTITY_SCHEMA = (
     "production_role_neutral_stage1_coordination_scientific_identity_v1"
@@ -208,40 +212,66 @@ def _stable_private_file_sha256(path: Path) -> tuple[str, int]:
 
 
 def _component_tree_sha256(root: Path) -> str:
-    inventory: list[dict[str, Any]] = []
+    return authenticated_role_neutral_component_tree_sha256(
+        root
+    )
+
+
+def _component_tree_stat_inventory(
+    root: Path,
+) -> list[dict[str, Any]]:
+    """Snapshot every inode after the component's deep tree hash succeeds."""
+
+    rows: list[dict[str, Any]] = []
     seen_inodes: set[tuple[int, int]] = set()
-    for path in sorted(
-        root.rglob("*"),
-        key=lambda value: value.relative_to(root).as_posix(),
-    ):
-        relative = path.relative_to(root).as_posix()
+    paths = (
+        root,
+        *sorted(
+            root.rglob("*"),
+            key=lambda path: path.relative_to(root).as_posix(),
+        ),
+    )
+    for path in paths:
         metadata = os.lstat(path)
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError(f"role-neutral component contains a symlink: {relative}")
+        relative = (
+            "."
+            if path == root
+            else path.relative_to(root).as_posix()
+        )
         if stat.S_ISDIR(metadata.st_mode):
-            continue
-        if not stat.S_ISREG(metadata.st_mode) or int(metadata.st_nlink) != 1:
-            raise ValueError("role-neutral component contains non-private data: " f"{relative}")
+            kind = "directory"
+        elif (
+            stat.S_ISREG(metadata.st_mode)
+            and int(metadata.st_nlink) == 1
+        ):
+            kind = "file"
+        else:
+            raise ValueError(
+                "role-neutral component stat inventory contains a symlink, "
+                "hard link, or non-file entry"
+            )
         inode = (int(metadata.st_dev), int(metadata.st_ino))
         if inode in seen_inodes:
-            raise ValueError("role-neutral component contains a hard-linked alias")
+            raise ValueError(
+                "role-neutral component stat inventory contains an inode alias"
+            )
         seen_inodes.add(inode)
-        digest, size = _stable_private_file_sha256(path)
-        inventory.append(
+        rows.append(
             {
                 "relative_path": relative,
-                "size_bytes": size,
-                "sha256": digest,
+                "kind": kind,
+                "device": int(metadata.st_dev),
+                "inode": int(metadata.st_ino),
+                "mode": int(metadata.st_mode),
+                "link_count": int(metadata.st_nlink),
+                "size_bytes": int(metadata.st_size),
+                "mtime_ns": int(metadata.st_mtime_ns),
+                "ctime_ns": int(metadata.st_ctime_ns),
             }
         )
-    if not inventory:
-        raise ValueError("role-neutral component tree is empty")
-    return _sha256_json(
-        {
-            "schema_version": "production_role_neutral_component_tree_v1",
-            "files": inventory,
-        }
-    )
+    if not rows:
+        raise ValueError("role-neutral component stat inventory is empty")
+    return rows
 
 
 def _directory_tree_registration(root: Path) -> dict[str, Any]:
@@ -357,6 +387,7 @@ def _normalize_component_sources(
             seen_roots.append(root)
             seen_root_inodes.add(root_inode)
             owner_receipts.append(receipt)
+            stat_inventory = _component_tree_stat_inventory(root)
             registrations.append(
                 {
                     "physical_owner_scope_id": owner.scope_id,
@@ -369,6 +400,17 @@ def _normalize_component_sources(
                     ),
                     "source_terminal_content_sha256": (receipt.source_terminal_content_sha256),
                     "source_tree_sha256": receipt.source_tree_sha256,
+                    "source_tree_stat_inventory": stat_inventory,
+                    "source_tree_stat_inventory_content_sha256": (
+                        _sha256_json(stat_inventory)
+                    ),
+                    "source_tree_full_byte_hash_authenticated": True,
+                    "source_tree_exact_stat_snapshot_after_authentication": (
+                        True
+                    ),
+                    "source_tree_payload_reread_required_for_unchanged_inode_tree": (
+                        False
+                    ),
                     "absolute_root_locator": str(root),
                     "registered_heldout_labels_accessed": False,
                     "oracle_fields_accessed": False,
@@ -417,7 +459,11 @@ def _locator_attestation(
         "registration_count": len(registrations),
         "registrations": copy.deepcopy(list(registrations)),
         "component_roots_distinct_and_nonnested": True,
-        "all_registered_bytes_reopened": True,
+        "all_registered_bytes_have_prior_or_current_full_hash_authentication": (
+            True
+        ),
+        "unchanged_component_trees_revalidated_by_exact_stat_identity": True,
+        "redundant_payload_rereads_required": False,
         "locator_metadata_excluded_from_scientific_identity": True,
     }
     return {**body, "content_sha256": _sha256_json(body)}
@@ -558,6 +604,11 @@ def _validate_scientific_receipt_registration(
         "component_authentication_content_sha256",
         "source_terminal_content_sha256",
         "source_tree_sha256",
+        "source_tree_stat_inventory",
+        "source_tree_stat_inventory_content_sha256",
+        "source_tree_full_byte_hash_authenticated",
+        "source_tree_exact_stat_snapshot_after_authentication",
+        "source_tree_payload_reread_required_for_unchanged_inode_tree",
         "absolute_root_locator",
         "registered_heldout_labels_accessed",
         "oracle_fields_accessed",
@@ -610,6 +661,16 @@ def _validate_scientific_receipt_registration(
         or registration.get("oracle_fields_accessed") is not False
         or registration.get("text_truncation_applied") is not False
         or registration.get("lossy_evidence_selection_applied") is not False
+        or registration.get("source_tree_full_byte_hash_authenticated")
+        is not True
+        or registration.get(
+            "source_tree_exact_stat_snapshot_after_authentication"
+        )
+        is not True
+        or registration.get(
+            "source_tree_payload_reread_required_for_unchanged_inode_tree"
+        )
+        is not False
     ):
         raise ValueError(f"{owner_scope_id}/{component} locator registration changed")
     scientific_body = {
@@ -631,7 +692,18 @@ def _validate_scientific_receipt_registration(
                 label=(f"{owner_scope_id}/{component}/{family}/{scope_id} " "logical view"),
             )
     authentication_body = {
-        "schema_version": ("production_role_neutral_component_authenticated_handle_v1"),
+        "schema_version": (
+            ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V2
+            if all(
+                isinstance(expected_family_fit_seals[family], Mapping)
+                and expected_family_fit_seals[family].get(
+                    "schema_version"
+                )
+                in ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMAS
+                for family in expected_families
+            )
+            else ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V1
+        ),
         "component": component,
         "plan_scientific_content_sha256": plan.scientific_content_sha256,
         "physical_owner_scope_id": owner_scope_id,
@@ -659,11 +731,24 @@ def _validate_scientific_receipt_registration(
         registration.get("absolute_root_locator"),
         label=f"{owner_scope_id}/{component} registered component root",
     )
-    if _component_tree_sha256(root) != _require_sha256(
+    _require_sha256(
         registration.get("source_tree_sha256"),
         label=f"{owner_scope_id}/{component} source tree",
+    )
+    stat_inventory = registration.get(
+        "source_tree_stat_inventory"
+    )
+    if (
+        not isinstance(stat_inventory, list)
+        or registration.get(
+            "source_tree_stat_inventory_content_sha256"
+        )
+        != _sha256_json(stat_inventory)
+        or _component_tree_stat_inventory(root) != stat_inventory
     ):
-        raise ValueError(f"{owner_scope_id}/{component} registered component tree changed")
+        raise ValueError(
+            f"{owner_scope_id}/{component} registered component tree changed"
+        )
     terminal = _read_json(
         root / _COMPONENT_TERMINAL_FILE,
         label=f"{owner_scope_id}/{component} execution terminal",
@@ -787,7 +872,9 @@ def validate_role_neutral_stage1_coordination_gate(
         "registration_count",
         "registrations",
         "component_roots_distinct_and_nonnested",
-        "all_registered_bytes_reopened",
+        "all_registered_bytes_have_prior_or_current_full_hash_authentication",
+        "unchanged_component_trees_revalidated_by_exact_stat_identity",
+        "redundant_payload_rereads_required",
         "locator_metadata_excluded_from_scientific_identity",
         "content_sha256",
     }
@@ -811,7 +898,15 @@ def validate_role_neutral_stage1_coordination_gate(
         or not isinstance(registrations, list)
         or len(registrations) != expected_registration_count
         or attestation.get("component_roots_distinct_and_nonnested") is not True
-        or attestation.get("all_registered_bytes_reopened") is not True
+        or attestation.get(
+            "all_registered_bytes_have_prior_or_current_full_hash_authentication"
+        )
+        is not True
+        or attestation.get(
+            "unchanged_component_trees_revalidated_by_exact_stat_identity"
+        )
+        is not True
+        or attestation.get("redundant_payload_rereads_required") is not False
         or attestation.get("locator_metadata_excluded_from_scientific_identity") is not True
         or attestation.get("content_sha256") != _sha256_json(attestation_body)
     ):

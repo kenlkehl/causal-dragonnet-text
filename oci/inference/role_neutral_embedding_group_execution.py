@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import inspect
 import json
 import math
@@ -350,14 +351,93 @@ def _read_registered_array(
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError(f"{label} path escapes its artifact")
     path = root / relative
-    digest, size = _sha256_file(path)
-    if digest != registration["file_sha256"] or size != registration["size_bytes"]:
+    expected_size = registration["size_bytes"]
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 1
+    ):
+        raise ValueError(f"{label} has an invalid bounded file size")
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise FileNotFoundError(f"{label} file is absent") from exc
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or int(before.st_nlink) != 1
+        or int(before.st_size) != expected_size
+    ):
+        raise ValueError(
+            f"{label} file is linked, nonregular, or has another size"
+        )
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        consumed = 0
+        while consumed < expected_size:
+            block = os.read(
+                descriptor,
+                min(1024 * 1024, expected_size - consumed),
+            )
+            if not block:
+                break
+            chunks.append(block)
+            consumed += len(block)
+        if os.read(descriptor, 1):
+            raise RuntimeError(f"{label} exceeded its registered size")
+        closed = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = os.lstat(path)
+    identity_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    expected_stat = tuple(
+        int(getattr(before, name)) for name in identity_fields
+    )
+    if (
+        consumed != expected_size
+        or tuple(
+            int(getattr(opened, name)) for name in identity_fields
+        )
+        != expected_stat
+        or tuple(
+            int(getattr(closed, name)) for name in identity_fields
+        )
+        != expected_stat
+        or tuple(
+            int(getattr(after, name)) for name in identity_fields
+        )
+        != expected_stat
+    ):
+        raise RuntimeError(f"{label} changed during its bounded read")
+    payload = b"".join(chunks)
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != registration["file_sha256"]:
         raise ValueError(f"{label} file registration changed")
     try:
-        value = np.load(path, mmap_mode="r", allow_pickle=False)
+        with io.BytesIO(payload) as stream:
+            loaded = np.load(stream, allow_pickle=False)
     except (OSError, ValueError, EOFError) as exc:
         raise ValueError(f"{label} is not a safe NPY array") from exc
-    if value.dtype.hasobject or _array_identity(value) != {
+    if not isinstance(loaded, np.ndarray) or loaded.dtype.hasobject:
+        raise ValueError(f"{label} is not a safe NPY array")
+    value = np.array(loaded, copy=True)
+    value.setflags(write=False)
+    if _array_identity(value) != {
         "dtype": registration["dtype"],
         "shape": registration["shape"],
         "sha256": registration["sha256"],
@@ -2370,6 +2450,269 @@ def load_canonical_clustered_preflight_state_bundle(
         registrations=registrations,
         preflight=preflight,
     )
+    return AuthenticatedClusteredPreflightStateBundle(
+        root=root,
+        manifest=copy.deepcopy(manifest),
+        states=states,
+    )
+
+
+def load_canonical_clustered_preflight_state_bundle_for_scientific_migration(
+    *,
+    manifest_path: Path | str,
+    preflight: PortableProductionStage1ClusterPreflightArtifact,
+    current_plan: Stage1ScopePlan,
+    expected_source_plan_scientific_content_sha256: str,
+) -> AuthenticatedClusteredPreflightStateBundle:
+    """Deeply authenticate a superseded broad plan before a no-refit transcode.
+
+    Portable-v2 stored the source plan and group request roots, but its compact
+    Stage 1 request deliberately omitted the full source plan.  A later
+    Stage2/authentication-only producer change can therefore change the broad
+    all-ten physical-fit identity even though every cluster fit row, seed,
+    cache input, and fitted array remains identical.  The ordinary loader must
+    continue requiring the current broad plan exactly.  This migration-only
+    reader instead:
+
+    * authenticates the source bundle/child manifests and every array byte;
+    * requires the recorded source plan root to equal the authenticated
+      portable request projection;
+    * treats only the old broad plan/group roots as superseded bindings; and
+    * revalidates exact current owner order, rows, seeds, aliases, fitted-state
+      identities, and preflight bindings before exposing any state.
+    """
+
+    if not isinstance(
+        preflight,
+        PortableProductionStage1ClusterPreflightArtifact,
+    ):
+        raise TypeError(
+            "scientific migration requires an authenticated portable-v2 "
+            "preflight"
+        )
+    if not isinstance(current_plan, Stage1ScopePlan):
+        raise TypeError(
+            "scientific migration requires the current canonical scope plan"
+        )
+    current_plan.as_dict()
+    source_plan_sha = _require_sha256(
+        expected_source_plan_scientific_content_sha256,
+        label="source clustered-preflight plan",
+    )
+    supplied = Path(manifest_path)
+    if (
+        not supplied.is_absolute()
+        or supplied.name != _CLUSTER_STATE_BUNDLE_MANIFEST
+    ):
+        raise ValueError(
+            "cluster state migration manifest path must be absolute and "
+            "canonical"
+        )
+    root = supplied.parent
+    if root.is_symlink() or not root.is_dir() or root.resolve(strict=True) != root:
+        raise ValueError(
+            "cluster state migration root must be one real directory"
+        )
+    manifest = _read_json(
+        supplied,
+        label="cluster state migration bundle manifest",
+    )
+    body = {
+        key: copy.deepcopy(value)
+        for key, value in manifest.items()
+        if key != "content_sha256"
+    }
+    required = {
+        "schema_version",
+        "status",
+        "plan_scientific_content_sha256",
+        "preflight_binding",
+        "physical_owner_count",
+        "physical_owner_scope_order",
+        "logical_scope_count",
+        "deduplicated_logical_scope_count",
+        "states",
+        "all_physical_owners_have_one_state",
+        "logical_alias_state_copies_published",
+        "cluster_refit_performed",
+        "serialization_policy",
+        "content_sha256",
+    }
+    owner_ids = tuple(
+        scope.scope_id for scope in current_plan.physical_scopes
+    )
+    rows = manifest.get("states")
+    physical_rows = preflight.audit.get("physical_fits")
+    expected_groups = [
+        {
+            "physical_owner_scope_id": owner.scope_id,
+            "logical_member_scope_ids": [
+                member.scope_id for member in members
+            ],
+        }
+        for owner, members in current_plan.physical_scope_groups
+    ]
+    observed_groups = (
+        [
+            {
+                "physical_owner_scope_id": row.get(
+                    "physical_owner_scope_id"
+                ),
+                "logical_member_scope_ids": copy.deepcopy(
+                    row.get("logical_member_scope_ids")
+                ),
+            }
+            for row in physical_rows
+            if isinstance(row, Mapping)
+        ]
+        if isinstance(physical_rows, list)
+        else []
+    )
+    if (
+        set(manifest) != required
+        or manifest.get("schema_version")
+        != ROLE_NEUTRAL_EMBEDDING_CLUSTER_STATE_BUNDLE_SCHEMA
+        or manifest.get("status") != "complete"
+        or manifest.get("plan_scientific_content_sha256")
+        != source_plan_sha
+        or manifest.get("preflight_binding")
+        != _cluster_state_bundle_preflight_binding(preflight)
+        or manifest.get("physical_owner_count") != len(owner_ids)
+        or manifest.get("physical_owner_scope_order")
+        != list(owner_ids)
+        or manifest.get("logical_scope_count")
+        != len(current_plan.scopes)
+        or manifest.get("deduplicated_logical_scope_count")
+        != len(current_plan.scopes) - len(owner_ids)
+        or manifest.get("all_physical_owners_have_one_state") is not True
+        or manifest.get("logical_alias_state_copies_published") is not False
+        or manifest.get("cluster_refit_performed") is not False
+        or manifest.get("serialization_policy")
+        != "canonical_json_and_individual_npy_only_v1"
+        or manifest.get("content_sha256") != _sha256_json(body)
+        or not isinstance(rows, list)
+        or len(rows) != len(owner_ids)
+        or observed_groups != expected_groups
+    ):
+        raise ValueError(
+            "cluster state migration bundle is invalid or scientifically "
+            "incompatible"
+        )
+    if {path.name for path in root.iterdir()} != {
+        _CLUSTER_STATE_BUNDLE_MANIFEST,
+        "owners",
+    }:
+        raise ValueError(
+            "cluster state migration bundle contains unregistered entries"
+        )
+    owners_root = root / "owners"
+    expected_directories = {
+        f"{index:03d}" for index in range(len(owner_ids))
+    }
+    if (
+        owners_root.is_symlink()
+        or not owners_root.is_dir()
+        or {path.name for path in owners_root.iterdir()}
+        != expected_directories
+    ):
+        raise ValueError(
+            "cluster state migration owner inventory is incomplete"
+        )
+    row_fields = {
+        "canonical_index",
+        "physical_owner_scope_id",
+        "group_request_content_sha256",
+        "relative_manifest_path",
+        "state_content_sha256",
+        "cluster_fit_identity_content_sha256",
+        "state_origin",
+    }
+    states: dict[str, AuthenticatedClusteredPreflightScopeState] = {}
+    all_inode_keys: set[tuple[int, int]] = set()
+    for index, (owner_id, row) in enumerate(
+        zip(owner_ids, rows, strict=True)
+    ):
+        current_request = RoleNeutralEmbeddingPhysicalGroupRequest.from_plan(
+            plan=current_plan,
+            physical_owner_scope_id=owner_id,
+        )
+        expected_relative = (
+            Path("owners")
+            / f"{index:03d}"
+            / _CLUSTER_STATE_MANIFEST
+        ).as_posix()
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != row_fields
+            or row.get("canonical_index") != index
+            or row.get("physical_owner_scope_id") != owner_id
+            or row.get("relative_manifest_path") != expected_relative
+            or row.get("state_origin")
+            != "canonical_clustered_preflight_no_refit_v1"
+        ):
+            raise ValueError(
+                "cluster state migration owner registration changed"
+            )
+        source_group_sha = _require_sha256(
+            row.get("group_request_content_sha256"),
+            label=f"source clustered-preflight group {owner_id}",
+        )
+        # This capability is confined to the migration reader.  The two
+        # supplied hashes are authenticated source-manifest bindings; every
+        # remaining request field comes from the current plan and is checked
+        # against the lossless portable preflight below.
+        source_request = RoleNeutralEmbeddingPhysicalGroupRequest(
+            plan_scientific_content_sha256=source_plan_sha,
+            physical_owner=current_request.physical_owner,
+            logical_members=current_request.logical_members,
+            content_sha256=source_group_sha,
+        )
+        state = load_canonical_clustered_preflight_scope_state(
+            manifest_path=root / expected_relative,
+            preflight=preflight,
+            request=source_request,
+        )
+        if (
+            row.get("state_content_sha256")
+            != state.manifest.get("content_sha256")
+            or row.get("cluster_fit_identity_content_sha256")
+            != state.manifest["preflight_binding"][
+                "cluster_fit_identity_sha256"
+            ]
+        ):
+            raise ValueError(
+                "cluster state migration substituted fitted arrays"
+            )
+        arrays = state.manifest.get("arrays")
+        if not isinstance(arrays, Mapping):
+            raise ValueError(
+                "cluster state migration array inventory is absent"
+            )
+        owner_inode_keys: set[tuple[int, int]] = set()
+        for registration in arrays.values():
+            if not isinstance(registration, Mapping):
+                raise ValueError(
+                    "cluster state migration array registration is malformed"
+                )
+            array_path = state.root / str(
+                registration.get("relative_path", "")
+            )
+            array_stat = os.lstat(array_path)
+            inode_key = (
+                int(array_stat.st_dev),
+                int(array_stat.st_ino),
+            )
+            if inode_key in owner_inode_keys or inode_key in all_inode_keys:
+                raise ValueError(
+                    "cluster state migration arrays may not be hard-linked"
+                )
+            owner_inode_keys.add(inode_key)
+        all_inode_keys.update(owner_inode_keys)
+        states[owner_id] = state
+    if set(states) != set(owner_ids):
+        raise RuntimeError(
+            "cluster state migration omitted a physical owner"
+        )
     return AuthenticatedClusteredPreflightStateBundle(
         root=root,
         manifest=copy.deepcopy(manifest),

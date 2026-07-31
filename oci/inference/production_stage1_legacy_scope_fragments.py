@@ -60,7 +60,7 @@ LEGACY_STAGE1_ROLE_NEUTRAL_BINDING_SET_SCHEMA = (
     "production_legacy_stage1_role_neutral_binding_set_v2"
 )
 LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_PAYLOAD_SCHEMA = (
-    "production_legacy_stage1_role_neutral_physical_payload_v2"
+    "production_legacy_stage1_role_neutral_physical_payload_v3"
 )
 LEGACY_STAGE1_LOGICAL_VIEW_ARTIFACT_SCHEMA = (
     "production_legacy_stage1_logical_view_artifact_v2"
@@ -73,6 +73,18 @@ LEGACY_STAGE1_FIT_ONLY_FAMILY_SEAL_SCHEMA = (
 )
 LEGACY_STAGE1_FIT_ONLY_HTR_FAMILY_SEAL_SCHEMA = (
     "production_legacy_stage1_fit_only_htr_family_seal_v3"
+)
+ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA = (
+    "production_role_neutral_fit_only_family_seal_reference_v1"
+)
+ROLE_NEUTRAL_FIT_ONLY_FAMILY_PRIOR_AUTH_REFERENCE_SCHEMA = (
+    "production_role_neutral_fit_only_family_prior_auth_reference_v1"
+)
+ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMAS = frozenset(
+    {
+        ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA,
+        ROLE_NEUTRAL_FIT_ONLY_FAMILY_PRIOR_AUTH_REFERENCE_SCHEMA,
+    }
 )
 
 _FRAGMENT_MANIFEST_NAME = "fragment_manifest.json"
@@ -604,6 +616,195 @@ def _validate_role_neutral_fit_only_family_seal(
     if not isinstance(value, Mapping):
         raise TypeError("fit-only family seal must be a mapping")
     seal = copy.deepcopy(dict(value))
+    if (
+        seal.get("schema_version")
+        == ROLE_NEUTRAL_FIT_ONLY_FAMILY_PRIOR_AUTH_REFERENCE_SCHEMA
+    ):
+        expected_fields = {
+            "schema_version",
+            "plan_scientific_content_sha256",
+            "physical_owner_scope_id",
+            "family",
+            "content_sha256",
+            "source_seal_registration",
+            "source_evidence_projection",
+            "prior_component_import_attestation_content_sha256",
+            "source_terminal_content_sha256",
+            "source_tree_sha256",
+            "complete_evidence_payload_retained_by_reference",
+            "evidence_payload_in_receipt",
+            "hierarchical_raw_sidecars_retained",
+            "reference_content_sha256",
+        }
+        body = {
+            key: copy.deepcopy(child)
+            for key, child in seal.items()
+            if key != "reference_content_sha256"
+        }
+        registration = seal.get("source_seal_registration")
+        if (
+            set(seal) != expected_fields
+            or seal.get("plan_scientific_content_sha256")
+            != plan.scientific_content_sha256
+            or seal.get("physical_owner_scope_id") != owner.scope_id
+            or seal.get("family") != family
+            or not isinstance(registration, Mapping)
+            or set(registration)
+            != {
+                "relative_path",
+                "sha256",
+                "size_bytes",
+                "content_sha256",
+            }
+            or PurePosixPath(
+                str(registration.get("relative_path"))
+            ).is_absolute()
+            or not PurePosixPath(
+                str(registration.get("relative_path"))
+            ).parts
+            or any(
+                part in {"", ".", ".."}
+                for part in PurePosixPath(
+                    str(registration.get("relative_path"))
+                ).parts
+            )
+            or isinstance(registration.get("size_bytes"), bool)
+            or not isinstance(registration.get("size_bytes"), int)
+            or int(registration["size_bytes"]) < 1
+            or seal.get("source_evidence_projection")
+            not in {
+                "identity_evidence_payload_v1",
+                "matched_pair_subproducer_normalization_v1",
+            }
+            or seal.get(
+                "complete_evidence_payload_retained_by_reference"
+            )
+            is not True
+            or seal.get("evidence_payload_in_receipt") is not False
+            or seal.get("hierarchical_raw_sidecars_retained") is not True
+            or seal.get("reference_content_sha256")
+            != _sha256_json(body)
+        ):
+            raise ValueError(
+                "prior-authenticated fit-only family seal reference is "
+                f"invalid: {owner.scope_id}/{family}"
+            )
+        for field_name in (
+            "content_sha256",
+            "prior_component_import_attestation_content_sha256",
+            "source_terminal_content_sha256",
+            "source_tree_sha256",
+            "reference_content_sha256",
+        ):
+            _require_sha256(
+                seal.get(field_name),
+                label=(
+                    f"{owner.scope_id}/{family} prior-auth reference "
+                    f"{field_name}"
+                ),
+            )
+        for field_name in ("sha256", "content_sha256"):
+            _require_sha256(
+                registration.get(field_name),
+                label=(
+                    f"{owner.scope_id}/{family} source registration "
+                    f"{field_name}"
+                ),
+            )
+        return seal
+    if (
+        seal.get("schema_version")
+        == ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA
+    ):
+        expected_fields = {
+            "schema_version",
+            "plan_scientific_content_sha256",
+            "physical_owner_scope_id",
+            "family",
+            "content_sha256",
+            "evidence_payload_sha256",
+            "producer_identity_sha256",
+            "configuration_identity_sha256",
+            "fit_state_artifact_sha256",
+            "source_seal_registration",
+            "source_evidence_projection",
+            "complete_evidence_payload_retained_by_reference",
+            "evidence_payload_in_receipt",
+            "hierarchical_raw_sidecars_retained",
+            "reference_content_sha256",
+        }
+        body = {
+            key: copy.deepcopy(child)
+            for key, child in seal.items()
+            if key != "reference_content_sha256"
+        }
+        registration = seal.get("source_seal_registration")
+        if (
+            set(seal) != expected_fields
+            or seal.get("plan_scientific_content_sha256")
+            != plan.scientific_content_sha256
+            or seal.get("physical_owner_scope_id") != owner.scope_id
+            or seal.get("family") != family
+            or not isinstance(registration, Mapping)
+            or set(registration)
+            != {
+                "relative_path",
+                "sha256",
+                "size_bytes",
+                "content_sha256",
+            }
+            or PurePosixPath(
+                str(registration.get("relative_path"))
+            ).is_absolute()
+            or ".."
+            in PurePosixPath(
+                str(registration.get("relative_path"))
+            ).parts
+            or isinstance(registration.get("size_bytes"), bool)
+            or not isinstance(registration.get("size_bytes"), int)
+            or int(registration["size_bytes"]) < 1
+            or seal.get("source_evidence_projection")
+            not in {
+                "identity_evidence_payload_v1",
+                "matched_pair_subproducer_normalization_v1",
+            }
+            or seal.get(
+                "complete_evidence_payload_retained_by_reference"
+            )
+            is not True
+            or seal.get("evidence_payload_in_receipt") is not False
+            or seal.get("hierarchical_raw_sidecars_retained") is not True
+            or seal.get("reference_content_sha256")
+            != _sha256_json(body)
+        ):
+            raise ValueError(
+                "fit-only family seal reference is invalid: "
+                f"{owner.scope_id}/{family}"
+            )
+        for field_name in (
+            "content_sha256",
+            "evidence_payload_sha256",
+            "producer_identity_sha256",
+            "configuration_identity_sha256",
+            "fit_state_artifact_sha256",
+            "reference_content_sha256",
+        ):
+            _require_sha256(
+                seal.get(field_name),
+                label=(
+                    f"{owner.scope_id}/{family} seal reference "
+                    f"{field_name}"
+                ),
+            )
+        for field_name in ("sha256", "content_sha256"):
+            _require_sha256(
+                registration.get(field_name),
+                label=(
+                    f"{owner.scope_id}/{family} source registration "
+                    f"{field_name}"
+                ),
+            )
+        return seal
     expected = build_role_neutral_fit_only_family_seal(
         plan=plan,
         physical_owner_scope_id=owner.scope_id,
@@ -2244,6 +2445,9 @@ __all__ = [
     "LEGACY_STAGE1_ROLE_NEUTRAL_PHYSICAL_FIT_SCHEMA",
     "LEGACY_STAGE1_SCOPE_ACCUMULATOR_SCHEMA",
     "LEGACY_STAGE1_SCOPE_FRAGMENT_SCHEMA",
+    "ROLE_NEUTRAL_FIT_ONLY_FAMILY_PRIOR_AUTH_REFERENCE_SCHEMA",
+    "ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA",
+    "ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMAS",
     "LegacyStage1ScopeFragment",
     "build_role_neutral_fit_only_family_seal",
     "build_role_neutral_logical_evidence_bindings",

@@ -21,7 +21,12 @@ from oci.inference.all_evidence_discovery_interfaces import (
     TFIDF_TOPICS,
 )
 from oci.inference.production_stage1_legacy_scope_fragments import (
+    ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA,
     build_role_neutral_fit_only_family_seal,
+)
+from oci.inference.htr_attention_evidence_schema import (
+    ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
+    ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA,
 )
 from oci.inference.production_stage1_scope_scheduler import (
     build_canonical_stage1_scope_plan,
@@ -31,6 +36,7 @@ from oci.inference.role_neutral_all_ten_binding import (
     AuthenticatedRoleNeutralComponentReceipt,
     EXPECTED_COMPONENT_FAMILIES,
     PORTABLE_TO_NATIVE_FAMILY,
+    ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V2,
     merge_all_ten_components_for_owner,
     persist_complete_role_neutral_stage1_bindings,
     validate_complete_role_neutral_stage1_bindings,
@@ -126,6 +132,20 @@ def _receipt(plan, owner_scope_id: str, component: str, *, tree_tag: str = "a"):
                 }
             ],
         }
+        if family == HTR_NEURAL:
+            payload = {
+                **payload,
+                "schema_version": ROLE_NEUTRAL_HTR_NATIVE_EVIDENCE_SCHEMA,
+                "token_attention_evidence": {
+                    "schema_version": (
+                        ROLE_NEUTRAL_HTR_TOKEN_EVIDENCE_PACKAGE_SCHEMA
+                    ),
+                    "sentence_pooling": "token_attention",
+                    "effective_sentence_pooling": "token_attention",
+                    "all_raw_token_occurrences_authenticated": True,
+                    "top_k_applied_to_raw_inventory": False,
+                },
+            }
         seals[family] = build_role_neutral_fit_only_family_seal(
             plan=plan,
             physical_owner_scope_id=owner_scope_id,
@@ -258,6 +278,76 @@ def test_receipt_rejects_any_truncation_or_lossy_selection():
             **kwargs,
             lossy_evidence_selection_applied=True,
         )
+
+
+def test_receipt_compacts_authenticated_seals_to_lossless_references():
+    plan = _plan()
+    owner = plan.physical_scopes[0]
+    inline = _receipt(plan, owner.scope_id, "embeddings")
+    registrations = {
+        family: {
+            "relative_path": f"fit_only_{index}.json",
+            "sha256": _sha({"family": family, "kind": "file"}),
+            "size_bytes": 10_000_000 + index,
+            "content_sha256": seal["content_sha256"],
+        }
+        for index, (family, seal) in enumerate(
+            inline.family_fit_seals.items()
+        )
+    }
+    compact = AuthenticatedRoleNeutralComponentReceipt.create(
+        plan=plan,
+        physical_owner_scope_id=owner.scope_id,
+        component="embeddings",
+        family_fit_seals=inline.family_fit_seals,
+        family_fit_seal_registrations=registrations,
+        family_logical_view_content_sha256=(
+            inline.family_logical_view_content_sha256
+        ),
+        source_terminal_content_sha256=(
+            inline.source_terminal_content_sha256
+        ),
+        source_tree_sha256=inline.source_tree_sha256,
+    )
+
+    compact._assert_intact()
+    assert all(
+        seal["schema_version"]
+        == ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA
+        and "evidence_payload" not in seal
+        and seal["evidence_payload_in_receipt"] is False
+        and seal[
+            "complete_evidence_payload_retained_by_reference"
+        ]
+        is True
+        for seal in compact.family_fit_seals.values()
+    )
+    authentication_body = {
+        "schema_version": (
+            ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V2
+        ),
+        "component": compact.component,
+        "plan_scientific_content_sha256": (
+            compact.plan_scientific_content_sha256
+        ),
+        "physical_owner_scope_id": compact.physical_owner_scope_id,
+        "logical_scope_ids": list(compact.logical_scope_ids),
+        "family_fit_seals": compact.family_fit_seals,
+        "family_logical_view_content_sha256": (
+            compact.family_logical_view_content_sha256
+        ),
+        "source_terminal_content_sha256": (
+            compact.source_terminal_content_sha256
+        ),
+        "source_tree_sha256": compact.source_tree_sha256,
+        "registered_heldout_labels_accessed": False,
+        "oracle_fields_accessed": False,
+        "text_truncation_applied": False,
+        "lossy_evidence_selection_applied": False,
+    }
+    assert compact.authentication_content_sha256 == _sha(
+        authentication_body
+    )
 
 
 def test_receipt_rejects_wrong_component_partition_and_duplicate_views():

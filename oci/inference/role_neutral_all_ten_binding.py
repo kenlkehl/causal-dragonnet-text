@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -40,6 +41,8 @@ from .all_evidence_discovery_interfaces import (
 )
 from .portable_workflow_spec import EVIDENCE_FAMILIES
 from .production_stage1_legacy_scope_fragments import (
+    ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA,
+    ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMAS,
     build_role_neutral_fit_only_family_seal,
     persist_role_neutral_logical_evidence_bindings,
     validate_persisted_role_neutral_logical_evidence_bindings,
@@ -48,7 +51,16 @@ from .production_stage1_scope_scheduler import Stage1ScopePlan
 
 
 ROLE_NEUTRAL_COMPONENT_RECEIPT_SCHEMA = (
-    "production_role_neutral_component_receipt_v1"
+    "production_role_neutral_component_receipt_v2"
+)
+ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V1 = (
+    "production_role_neutral_component_authenticated_handle_v1"
+)
+ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V2 = (
+    "production_role_neutral_component_authenticated_handle_v2"
+)
+ROLE_NEUTRAL_COMPONENT_RECEIPT_CACHE_SCHEMA = (
+    "production_role_neutral_component_receipt_cache_v1"
 )
 ROLE_NEUTRAL_ALL_TEN_OWNER_SCHEMA = (
     "production_role_neutral_all_ten_physical_owner_v1"
@@ -90,6 +102,12 @@ EXPECTED_COMPONENT_FAMILIES = MappingProxyType(
 _HEX = frozenset("0123456789abcdef")
 _COMPONENT_TERMINAL_FILE = "execution_manifest.json"
 _COMPONENT_FIT_METADATA_FILE = "fit_state/metadata.json"
+_COMPONENT_TREE_HASH_CACHE_LOCK = threading.Lock()
+_COMPONENT_TREE_HASH_CACHE: dict[
+    tuple[int, int],
+    tuple[tuple[tuple[Any, ...], ...], str],
+] = {}
+_COMPONENT_TREE_HASH_CACHE_LIMIT = 512
 
 
 def _validate_static_family_contract() -> None:
@@ -139,6 +157,57 @@ def _require_sha256(value: Any, *, label: str) -> str:
     return text
 
 
+def _component_tree_stat_signature(
+    tree: Path,
+) -> tuple[tuple[Any, ...], ...]:
+    rows: list[tuple[Any, ...]] = []
+    seen_inodes: set[tuple[int, int]] = set()
+    for path in sorted(
+        tree.rglob("*"),
+        key=lambda value: value.relative_to(tree).as_posix(),
+    ):
+        relative = path.relative_to(tree).as_posix()
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(
+                f"component artifact contains a symlink: {relative}"
+            )
+        if stat.S_ISDIR(metadata.st_mode):
+            kind = "directory"
+        elif (
+            stat.S_ISREG(metadata.st_mode)
+            and int(metadata.st_nlink) == 1
+        ):
+            kind = "file"
+        else:
+            raise ValueError(
+                "component artifact file is not private regular data: "
+                f"{relative}"
+            )
+        inode = (int(metadata.st_dev), int(metadata.st_ino))
+        if inode in seen_inodes:
+            raise ValueError(
+                "component artifact contains a hard-linked alias"
+            )
+        seen_inodes.add(inode)
+        rows.append(
+            (
+                relative,
+                kind,
+                int(metadata.st_dev),
+                int(metadata.st_ino),
+                int(metadata.st_mode),
+                int(metadata.st_nlink),
+                int(metadata.st_size),
+                int(metadata.st_mtime_ns),
+                int(metadata.st_ctime_ns),
+            )
+        )
+    if not rows:
+        raise ValueError("component artifact tree is empty")
+    return tuple(rows)
+
+
 def _safe_component_tree_sha256(root: Path | str) -> str:
     """Authenticate an already validated component tree without locators."""
 
@@ -148,6 +217,16 @@ def _safe_component_tree_sha256(root: Path | str) -> str:
     tree = source.resolve(strict=True)
     if tree != source.absolute() or not tree.is_dir():
         raise ValueError("component artifact root must be one canonical directory")
+    root_metadata = os.lstat(tree)
+    cache_key = (
+        int(root_metadata.st_dev),
+        int(root_metadata.st_ino),
+    )
+    stat_signature = _component_tree_stat_signature(tree)
+    with _COMPONENT_TREE_HASH_CACHE_LOCK:
+        cached = _COMPONENT_TREE_HASH_CACHE.get(cache_key)
+    if cached is not None and cached[0] == stat_signature:
+        return cached[1]
     inventory: list[dict[str, Any]] = []
     seen_inodes: set[tuple[int, int]] = set()
     for path in sorted(tree.rglob("*"), key=lambda value: value.relative_to(tree).as_posix()):
@@ -210,12 +289,79 @@ def _safe_component_tree_sha256(root: Path | str) -> str:
         )
     if not inventory:
         raise ValueError("component artifact tree is empty")
-    return _sha256_json(
+    if _component_tree_stat_signature(tree) != stat_signature:
+        raise RuntimeError(
+            "component artifact changed while its tree was hashed"
+        )
+    digest = _sha256_json(
         {
             "schema_version": "production_role_neutral_component_tree_v1",
             "files": inventory,
         }
     )
+    with _COMPONENT_TREE_HASH_CACHE_LOCK:
+        if len(_COMPONENT_TREE_HASH_CACHE) >= (
+            _COMPONENT_TREE_HASH_CACHE_LIMIT
+        ):
+            _COMPONENT_TREE_HASH_CACHE.pop(
+                next(iter(_COMPONENT_TREE_HASH_CACHE))
+            )
+        _COMPONENT_TREE_HASH_CACHE[cache_key] = (
+            stat_signature,
+            digest,
+        )
+    return digest
+
+
+def authenticated_role_neutral_component_tree_sha256(
+    root: Path | str,
+) -> str:
+    """Hash once per unchanged inode tree within one trusted process."""
+
+    return _safe_component_tree_sha256(root)
+
+
+def register_authenticated_role_neutral_component_tree_sha256(
+    root: Path | str,
+    expected_sha256: str,
+) -> None:
+    """Seed the process-local hash cache from an externally closed proof.
+
+    The caller must already have verified a prior full-byte authentication
+    and exact immutable-tree stat continuity.  This function performs only a
+    metadata walk, then lets later trust-boundary checks reuse that proof
+    instead of reading the same multi-gigabyte tree again.
+    """
+
+    source = Path(root)
+    if source.is_symlink():
+        raise ValueError("component artifact root cannot be a symbolic link")
+    tree = source.resolve(strict=True)
+    if tree != source.absolute() or not tree.is_dir():
+        raise ValueError(
+            "component artifact root must be one canonical directory"
+        )
+    root_metadata = os.lstat(tree)
+    cache_key = (
+        int(root_metadata.st_dev),
+        int(root_metadata.st_ino),
+    )
+    stat_signature = _component_tree_stat_signature(tree)
+    digest = _require_sha256(
+        expected_sha256,
+        label="authenticated component tree",
+    )
+    with _COMPONENT_TREE_HASH_CACHE_LOCK:
+        if len(_COMPONENT_TREE_HASH_CACHE) >= (
+            _COMPONENT_TREE_HASH_CACHE_LIMIT
+        ):
+            _COMPONENT_TREE_HASH_CACHE.pop(
+                next(iter(_COMPONENT_TREE_HASH_CACHE))
+            )
+        _COMPONENT_TREE_HASH_CACHE[cache_key] = (
+            stat_signature,
+            digest,
+        )
 
 
 def _read_component_json(
@@ -568,6 +714,20 @@ def _validate_standard_seal(
     if not isinstance(seal, Mapping):
         raise TypeError(f"{family} fit-only seal must be one mapping")
     closed = copy.deepcopy(dict(seal))
+    if closed.get("schema_version") in (
+        ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMAS
+    ):
+        from .production_stage1_legacy_scope_fragments import (
+            _validate_role_neutral_fit_only_family_seal,
+        )
+
+        owner = plan.scope(owner_scope_id)
+        return _validate_role_neutral_fit_only_family_seal(
+            closed,
+            plan=plan,
+            owner=owner,
+            family=family,
+        )
     expected = build_role_neutral_fit_only_family_seal(
         plan=plan,
         physical_owner_scope_id=owner_scope_id,
@@ -585,6 +745,123 @@ def _validate_standard_seal(
             "fit-only family seal"
         )
     return closed
+
+
+def _seal_reference(
+    *,
+    plan: Stage1ScopePlan,
+    owner_scope_id: str,
+    family: str,
+    seal: Mapping[str, Any],
+    source_registration: Mapping[str, Any],
+    source_evidence_projection: str = "identity_evidence_payload_v1",
+) -> dict[str, Any]:
+    """Reduce one fully authenticated seal to a lossless path reference."""
+
+    registration = copy.deepcopy(dict(source_registration))
+    if (
+        set(registration)
+        != {
+            "relative_path",
+            "sha256",
+            "size_bytes",
+            "content_sha256",
+        }
+        or PurePosixPath(
+            str(registration.get("relative_path"))
+        ).is_absolute()
+        or ".."
+        in PurePosixPath(
+            str(registration.get("relative_path"))
+        ).parts
+        or isinstance(registration.get("size_bytes"), bool)
+        or not isinstance(registration.get("size_bytes"), int)
+        or int(registration["size_bytes"]) < 1
+    ):
+        raise ValueError(
+            f"{family} fit-only seal source registration is invalid"
+        )
+    for field_name in ("sha256", "content_sha256"):
+        _require_sha256(
+            registration.get(field_name),
+            label=f"{family} source seal {field_name}",
+        )
+    closed = _validate_standard_seal(
+        plan=plan,
+        owner_scope_id=owner_scope_id,
+        family=family,
+        seal=seal,
+    )
+    projection = str(source_evidence_projection)
+    if projection not in {
+        "identity_evidence_payload_v1",
+        "matched_pair_subproducer_normalization_v1",
+    }:
+        raise ValueError(
+            f"{family} seal reference has an invalid source projection"
+        )
+    body = {
+        "schema_version": (
+            ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA
+        ),
+        "plan_scientific_content_sha256": (
+            plan.scientific_content_sha256
+        ),
+        "physical_owner_scope_id": owner_scope_id,
+        "family": family,
+        "content_sha256": _require_sha256(
+            closed.get("content_sha256"),
+            label=f"{family} fit-only seal content",
+        ),
+        "evidence_payload_sha256": _require_sha256(
+            closed.get("evidence_payload_sha256"),
+            label=f"{family} evidence payload",
+        ),
+        "producer_identity_sha256": _require_sha256(
+            closed.get("producer_identity_sha256"),
+            label=f"{family} producer identity",
+        ),
+        "configuration_identity_sha256": _require_sha256(
+            closed.get("configuration_identity_sha256"),
+            label=f"{family} configuration identity",
+        ),
+        "fit_state_artifact_sha256": _require_sha256(
+            closed.get("fit_state_artifact_sha256"),
+            label=f"{family} fit-state identity",
+        ),
+        "source_seal_registration": registration,
+        "source_evidence_projection": projection,
+        "complete_evidence_payload_retained_by_reference": True,
+        "evidence_payload_in_receipt": False,
+        "hierarchical_raw_sidecars_retained": True,
+    }
+    reference = {
+        **body,
+        "reference_content_sha256": _sha256_json(body),
+    }
+    return _validate_standard_seal(
+        plan=plan,
+        owner_scope_id=owner_scope_id,
+        family=family,
+        seal=reference,
+    )
+
+
+def _authenticated_handle_schema(
+    seals: Mapping[str, Mapping[str, Any]],
+) -> str:
+    reference_flags = {
+        seal.get("schema_version")
+        in ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMAS
+        for seal in seals.values()
+    }
+    if reference_flags == {True}:
+        return ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V2
+    if reference_flags == {False}:
+        return ROLE_NEUTRAL_COMPONENT_AUTHENTICATED_HANDLE_SCHEMA_V1
+    raise ValueError(
+        "component receipt cannot mix inline seals and seal references"
+    )
 
 
 @dataclass(frozen=True)
@@ -606,6 +883,84 @@ class AuthenticatedRoleNeutralComponentReceipt:
     authentication_content_sha256: str
 
     @classmethod
+    def from_cache(
+        cls,
+        *,
+        plan: Stage1ScopePlan,
+        value: Mapping[str, Any],
+    ) -> "AuthenticatedRoleNeutralComponentReceipt":
+        if not isinstance(value, Mapping):
+            raise TypeError("component receipt cache must be one mapping")
+        cached = copy.deepcopy(dict(value))
+        expected_fields = {
+            "schema_version",
+            "component",
+            "plan_scientific_content_sha256",
+            "physical_owner_scope_id",
+            "logical_scope_ids",
+            "family_fit_seals",
+            "family_logical_view_content_sha256",
+            "source_terminal_content_sha256",
+            "source_tree_sha256",
+            "registered_heldout_labels_accessed",
+            "oracle_fields_accessed",
+            "text_truncation_applied",
+            "lossy_evidence_selection_applied",
+            "authentication_content_sha256",
+            "content_sha256",
+        }
+        body = {
+            key: copy.deepcopy(child)
+            for key, child in cached.items()
+            if key != "content_sha256"
+        }
+        if (
+            set(cached) != expected_fields
+            or cached.get("schema_version")
+            != ROLE_NEUTRAL_COMPONENT_RECEIPT_CACHE_SCHEMA
+            or cached.get("plan_scientific_content_sha256")
+            != plan.scientific_content_sha256
+            or cached.get("content_sha256") != _sha256_json(body)
+            or cached.get("registered_heldout_labels_accessed")
+            is not False
+            or cached.get("oracle_fields_accessed") is not False
+            or cached.get("text_truncation_applied") is not False
+            or cached.get("lossy_evidence_selection_applied")
+            is not False
+        ):
+            raise ValueError("component receipt cache is invalid")
+        receipt = cls.create(
+            plan=plan,
+            physical_owner_scope_id=str(
+                cached.get("physical_owner_scope_id")
+            ),
+            component=str(cached.get("component")),
+            family_fit_seals=cached.get("family_fit_seals") or {},
+            family_logical_view_content_sha256=(
+                cached.get(
+                    "family_logical_view_content_sha256"
+                )
+                or {}
+            ),
+            source_terminal_content_sha256=str(
+                cached.get("source_terminal_content_sha256")
+            ),
+            source_tree_sha256=str(
+                cached.get("source_tree_sha256")
+            ),
+        )
+        if (
+            list(receipt.logical_scope_ids)
+            != cached.get("logical_scope_ids")
+            or receipt.authentication_content_sha256
+            != cached.get("authentication_content_sha256")
+        ):
+            raise ValueError(
+                "component receipt cache does not reconstruct its handle"
+            )
+        return receipt
+
+    @classmethod
     def create(
         cls,
         *,
@@ -613,6 +968,12 @@ class AuthenticatedRoleNeutralComponentReceipt:
         physical_owner_scope_id: str,
         component: str,
         family_fit_seals: Mapping[str, Mapping[str, Any]],
+        family_fit_seal_registrations: (
+            Mapping[str, Mapping[str, Any]] | None
+        ) = None,
+        family_fit_seal_source_projections: (
+            Mapping[str, str] | None
+        ) = None,
         family_logical_view_content_sha256: Mapping[
             str, Mapping[str, str]
         ],
@@ -655,6 +1016,57 @@ class AuthenticatedRoleNeutralComponentReceipt:
             for family in ACTIVE_STAGE1_CONCEPT_FAMILIES
             if family in family_fit_seals
         }
+        if (
+            family_fit_seal_source_projections is not None
+            and family_fit_seal_registrations is None
+        ):
+            raise ValueError(
+                "component seal source projections require registrations"
+            )
+        if family_fit_seal_registrations is not None:
+            if (
+                not isinstance(
+                    family_fit_seal_registrations,
+                    Mapping,
+                )
+                or set(family_fit_seal_registrations)
+                != set(normalized_seals)
+            ):
+                raise ValueError(
+                    "component fit-only seal registrations do not cover "
+                    "exactly its family partition"
+                )
+            projections = (
+                {
+                    family: "identity_evidence_payload_v1"
+                    for family in normalized_seals
+                }
+                if family_fit_seal_source_projections is None
+                else {
+                    str(family): str(projection)
+                    for family, projection in (
+                        family_fit_seal_source_projections.items()
+                    )
+                }
+            )
+            if set(projections) != set(normalized_seals):
+                raise ValueError(
+                    "component seal source projections do not cover "
+                    "exactly its family partition"
+                )
+            normalized_seals = {
+                family: _seal_reference(
+                    plan=plan,
+                    owner_scope_id=owner.scope_id,
+                    family=family,
+                    seal=normalized_seals[family],
+                    source_registration=(
+                        family_fit_seal_registrations[family]
+                    ),
+                    source_evidence_projection=projections[family],
+                )
+                for family in normalized_seals
+            }
         normalized_views: dict[str, dict[str, str]] = {}
         for family in normalized_seals:
             raw_views = family_logical_view_content_sha256[family]
@@ -699,8 +1111,8 @@ class AuthenticatedRoleNeutralComponentReceipt:
             label=f"{component_name} authenticated tree identity",
         )
         authentication_body = {
-            "schema_version": (
-                "production_role_neutral_component_authenticated_handle_v1"
+            "schema_version": _authenticated_handle_schema(
+                normalized_seals
             ),
             "component": component_name,
             "plan_scientific_content_sha256": plan.scientific_content_sha256,
@@ -735,8 +1147,8 @@ class AuthenticatedRoleNeutralComponentReceipt:
 
     def _assert_intact(self) -> None:
         authentication_body = {
-            "schema_version": (
-                "production_role_neutral_component_authenticated_handle_v1"
+            "schema_version": _authenticated_handle_schema(
+                self.family_fit_seals
             ),
             "component": self.component,
             "plan_scientific_content_sha256": (
@@ -814,6 +1226,42 @@ class AuthenticatedRoleNeutralComponentReceipt:
                 "content_sha256"
             ],
             "source_tree_sha256": self.source_tree_sha256,
+        }
+        return {**body, "content_sha256": _sha256_json(body)}
+
+    def cache_dict(self) -> dict[str, Any]:
+        """Return a compact, content-addressed resume capability."""
+
+        self._assert_intact()
+        body = {
+            "schema_version": (
+                ROLE_NEUTRAL_COMPONENT_RECEIPT_CACHE_SCHEMA
+            ),
+            "component": self.component,
+            "plan_scientific_content_sha256": (
+                self.plan_scientific_content_sha256
+            ),
+            "physical_owner_scope_id": (
+                self.physical_owner_scope_id
+            ),
+            "logical_scope_ids": list(self.logical_scope_ids),
+            "family_fit_seals": copy.deepcopy(
+                dict(self.family_fit_seals)
+            ),
+            "family_logical_view_content_sha256": copy.deepcopy(
+                dict(self.family_logical_view_content_sha256)
+            ),
+            "source_terminal_content_sha256": (
+                self.source_terminal_content_sha256
+            ),
+            "source_tree_sha256": self.source_tree_sha256,
+            "registered_heldout_labels_accessed": False,
+            "oracle_fields_accessed": False,
+            "text_truncation_applied": False,
+            "lossy_evidence_selection_applied": False,
+            "authentication_content_sha256": (
+                self.authentication_content_sha256
+            ),
         }
         return {**body, "content_sha256": _sha256_json(body)}
 
@@ -1168,6 +1616,7 @@ def _standard_component_receipt(
         physical_owner_scope_id=owner.scope_id,
         component=component,
         family_fit_seals=seals,
+        family_fit_seal_registrations=seal_registrations,
         family_logical_view_content_sha256=_logical_view_identities(
             root=tree,
             terminal=terminal,
@@ -1396,6 +1845,14 @@ def authenticate_role_neutral_matched_pair_component(
         physical_owner_scope_id=physical_owner_scope_id,
         component="matched_pair",
         family_fit_seals={MATCHED_PAIR_UPLIFT: common_seal},
+        family_fit_seal_registrations={
+            MATCHED_PAIR_UPLIFT: registration
+        },
+        family_fit_seal_source_projections={
+            MATCHED_PAIR_UPLIFT: (
+                "matched_pair_subproducer_normalization_v1"
+            )
+        },
         family_logical_view_content_sha256=_logical_view_identities(
             root=tree,
             terminal=terminal,
@@ -1606,6 +2063,8 @@ __all__ = [
     "ROLE_NEUTRAL_ALL_TEN_OWNER_SCHEMA",
     "ROLE_NEUTRAL_COMPONENT_RECEIPT_SCHEMA",
     "ROLE_NEUTRAL_LOGICAL_SOURCE_IDENTITY_SCHEMA",
+    "authenticated_role_neutral_component_tree_sha256",
+    "register_authenticated_role_neutral_component_tree_sha256",
     "merge_all_ten_components_for_owner",
     "persist_complete_role_neutral_stage1_bindings",
     "validate_authenticated_role_neutral_component_receipt",

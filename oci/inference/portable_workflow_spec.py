@@ -14,7 +14,7 @@ import copy
 import json
 import math
 import re
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
@@ -57,6 +57,9 @@ from .post_extraction_scientific_policy import (
 PORTABLE_SPEC_VERSION = "portable_all_evidence_scientific_workflow_v11"
 DEPLOYMENT_PROFILE_VERSION = "portable_all_evidence_deployment_profile_v9"
 STAGE1_EXECUTION_PROFILE_VERSION = "portable_stage1_execution_profile_v8"
+STAGE1_PREFLIGHT_EXECUTION_POLICY_VERSION = (
+    "portable_stage1_preflight_execution_policy_v1"
+)
 RESOURCE_PERFORMANCE_SAFETY_VERSION = "portable_resource_performance_safety_policy_v2"
 RUN_CONTROL_VERSION = "portable_all_evidence_run_control_v2"
 BINARY_PROBABILITY_DIFFERENCE = "binary_treatment_binary_outcome_probability_difference_v1"
@@ -1236,6 +1239,99 @@ class ResourcePerformanceSafetyPolicy:
 
 
 @dataclass(frozen=True)
+class Stage1PreflightExecutionPolicy:
+    """Deployment-only bounds for reusable Stage 1 precomputation.
+
+    These values select operational concurrency only.  They are intentionally
+    absent from every Stage 1 scientific identity.
+    """
+
+    max_parallel_owners: int
+    memory_budget_bytes: int
+    estimated_owner_peak_bytes: int
+    input_io_lane_cap: int
+    publication_io_lane_cap: int
+    authentication_io_lane_cap: int
+    schema_version: str = STAGE1_PREFLIGHT_EXECUTION_POLICY_VERSION
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version
+            != STAGE1_PREFLIGHT_EXECUTION_POLICY_VERSION
+        ):
+            raise ValueError(
+                "unsupported Stage 1 preflight execution policy version"
+            )
+        for name in (
+            "max_parallel_owners",
+            "memory_budget_bytes",
+            "estimated_owner_peak_bytes",
+            "input_io_lane_cap",
+            "publication_io_lane_cap",
+            "authentication_io_lane_cap",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+            ):
+                raise ValueError(
+                    f"Stage 1 preflight {name} must be a positive integer"
+                )
+        if self.estimated_owner_peak_bytes > self.memory_budget_bytes:
+            raise ValueError(
+                "Stage 1 preflight estimated_owner_peak_bytes exceeds "
+                "its deployment memory budget"
+            )
+
+    @property
+    def memory_lane_cap(self) -> int:
+        return max(
+            1,
+            int(self.memory_budget_bytes)
+            // int(self.estimated_owner_peak_bytes),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "Stage1PreflightExecutionPolicy":
+        if not isinstance(value, Mapping):
+            raise TypeError(
+                "stage1_execution.preflight_execution_policy must be "
+                "one mapping"
+            )
+        required = {row.name for row in fields(cls)}
+        if set(value) != required:
+            raise ValueError(
+                "preflight_execution_policy must configure every field "
+                f"exactly; missing={sorted(required - set(value))}, "
+                f"extra={sorted(set(value) - required)}"
+            )
+        return cls(**dict(value))
+
+
+def _backward_compatible_preflight_execution_policy() -> (
+    Stage1PreflightExecutionPolicy
+):
+    """Conservative operational default for pre-policy deployment profiles."""
+
+    return Stage1PreflightExecutionPolicy(
+        max_parallel_owners=1,
+        memory_budget_bytes=1,
+        estimated_owner_peak_bytes=1,
+        input_io_lane_cap=1,
+        publication_io_lane_cap=1,
+        authentication_io_lane_cap=1,
+    )
+
+
+@dataclass(frozen=True)
 class Stage1ExecutionProfile:
     """Complete deployment-only Stage 1 execution selection."""
 
@@ -1260,6 +1356,11 @@ class Stage1ExecutionProfile:
     benchmark_workload_deployment_locator: Path | None
     benchmark_publication_sha256: str | None
     benchmark_publication_locator: Path | None
+    preflight_execution_policy: Stage1PreflightExecutionPolicy = field(
+        default_factory=(
+            _backward_compatible_preflight_execution_policy
+        )
+    )
     schema_version: str = STAGE1_EXECUTION_PROFILE_VERSION
 
     def __post_init__(self) -> None:
@@ -1300,6 +1401,22 @@ class Stage1ExecutionProfile:
             raise ValueError(
                 "Stage 1 max_parallel_owners exceeds the effective "
                 "device-topology capacity"
+            )
+        if not isinstance(
+            self.preflight_execution_policy,
+            Stage1PreflightExecutionPolicy,
+        ):
+            raise TypeError(
+                "Stage 1 execution requires a typed preflight execution "
+                "policy"
+            )
+        if (
+            self.preflight_execution_policy.max_parallel_owners
+            > self.max_parallel_owners
+        ):
+            raise ValueError(
+                "Stage 1 preflight max_parallel_owners exceeds the "
+                "deployment Stage 1 owner cap"
             )
         if not isinstance(
             self.htr_operational_controls,
@@ -1471,13 +1588,36 @@ class Stage1ExecutionProfile:
         if not isinstance(value, Mapping):
             raise TypeError("stage1_execution must be one mapping")
         required = {field.name for field in fields(cls)}
-        if set(value) != required:
+        backward_optional = {"preflight_execution_policy"}
+        if (
+            set(value) - backward_optional
+            != required - backward_optional
+            or set(value) - required
+        ):
             raise ValueError(
                 "stage1_execution must configure every field exactly; "
                 f"missing={sorted(required - set(value))}, "
                 f"extra={sorted(set(value) - required)}"
             )
         normalized = dict(value)
+        preflight_policy = normalized.get(
+            "preflight_execution_policy"
+        )
+        if preflight_policy is None:
+            normalized["preflight_execution_policy"] = (
+                _backward_compatible_preflight_execution_policy()
+            )
+        elif not isinstance(preflight_policy, Mapping):
+            raise ValueError(
+                "stage1_execution must configure "
+                "preflight_execution_policy as one mapping"
+            )
+        else:
+            normalized["preflight_execution_policy"] = (
+                Stage1PreflightExecutionPolicy.from_mapping(
+                    preflight_policy
+                )
+            )
         topology = normalized.get("neural_query_topology")
         if not isinstance(topology, Mapping):
             raise ValueError(
@@ -1608,6 +1748,17 @@ class DeploymentProfile:
             raise ValueError(
                 "Stage 1 max_parallel_owners exceeds the configured global "
                 "host CPU budget"
+            )
+        if (
+            math.floor(
+                self.resource_performance_safety
+                .maximum_ordinary_read_amplification
+            )
+            < 1
+        ):
+            raise ValueError(
+                "maximum_ordinary_read_amplification must permit at least "
+                "one Stage 1 preflight input lane"
             )
         owner_cpu_budget = (
             self.cpu_budget
@@ -1928,6 +2079,8 @@ __all__ = [
     "STRICT_FOREST_IMPLEMENTATION",
     "ScientificWorkflowSpec",
     "STAGE1_EXECUTION_PROFILE_VERSION",
+    "STAGE1_PREFLIGHT_EXECUTION_POLICY_VERSION",
+    "Stage1PreflightExecutionPolicy",
     "Stage1ExecutionProfile",
     "Stage2PromptProtocolSpec",
     "StrictCausalForestDMLSpec",

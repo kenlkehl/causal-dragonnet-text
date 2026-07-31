@@ -11,10 +11,20 @@ from pathlib import Path
 import pytest
 
 import oci.inference.production_stage1_cluster_preflight_artifact_v2 as v2
+import oci.inference.production_stage1_scope_scheduler as scope_scheduler
+import oci.inference.role_neutral_embedding_group_execution as embedding_execution
 from oci.inference.role_neutral_embedding_group_execution import (
     load_canonical_clustered_preflight_state_bundle,
+    load_canonical_clustered_preflight_state_bundle_for_scientific_migration,
     seal_canonical_clustered_preflight_state_bundle,
     seal_canonical_clustered_preflight_scope_state,
+)
+from oci.inference.production_stage1_scope_scheduler import (
+    Stage1PhysicalFitIdentity,
+    Stage1ScopePlan,
+)
+from oci.inference.stage1_exact_inner_evidence import (
+    row_order_fingerprint,
 )
 from tests.test_production_stage1_cluster_preflight_artifact import (
     _fixture_values as _v1_fixture_values,
@@ -488,17 +498,50 @@ def test_role_neutral_state_sealing_consumes_lazy_portable_owner_handle(
     fit_body = {key: child for key, child in fit.items() if key != "content_sha256"}
     fit["content_sha256"] = v2._sha256_json(fit_body)
     owner = embedding_request.physical_owner.scope_id
-    binding_body = {
-        "schema_version": ("production_stage1_cluster_preflight_physical_binding_v2"),
-        "logical_scope_id": owner,
-        "physical_owner_scope_id": owner,
-        "reuses_physical_fit": False,
-    }
-    scope["physical_fit_binding"] = _addressed(binding_body)
+    complete_scopes = []
+    for member in plan.scopes:
+        member_scope = copy.deepcopy(scope)
+        member_scope.update(
+            {
+                "scope_id": member.scope_id,
+                "scope_kind": member.scope_kind,
+                "outer_fold": member.outer_fold,
+                "inner_fold": member.inner_fold,
+                "context_epoch": member.context_epoch,
+                "provider_inner_fold": member.provider_inner_fold,
+                "fit_row_count": member.fit_row_count,
+                "fit_row_order_fingerprint": row_order_fingerprint(
+                    member.fit_row_ids
+                ),
+                "canonical_group_seed": member.scope_seed,
+                "heldout_row_count": len(
+                    member.heldout_row_ids
+                ),
+                "heldout_row_order_fingerprint": row_order_fingerprint(
+                    member.heldout_row_ids
+                ),
+            }
+        )
+        binding_body = {
+            "schema_version": (
+                "production_stage1_cluster_preflight_physical_binding_v2"
+            ),
+            "logical_scope_id": member.scope_id,
+            "physical_owner_scope_id": owner,
+            "reuses_physical_fit": member.scope_id != owner,
+        }
+        member_scope["physical_fit_binding"] = _addressed(
+            binding_body
+        )
+        complete_scopes.append(member_scope)
     source_audit.update(
         {
+            "scope_order": [
+                member.scope_id for member in plan.scopes
+            ],
+            "scopes": complete_scopes,
             "physical_fit_count": 1,
-            "deduplicated_fit_count": 0,
+            "deduplicated_fit_count": len(plan.scopes) - 1,
             "physical_scope_order": [owner],
         }
     )
@@ -507,6 +550,7 @@ def test_role_neutral_state_sealing_consumes_lazy_portable_owner_handle(
     reference = v2.build_portable_cluster_preflight_reference(source_audit)
     _unused, stage1_request = _v1_fixture_values(scope_count=1)
     stage1_request["embedding_cluster_feasibility_audit"] = reference
+    stage1_request["stage1_scope_plan"] = plan.as_dict()
     request_body = {key: child for key, child in stage1_request.items() if key != "request_sha256"}
     stage1_request["request_sha256"] = v2._sha256_json(request_body)
     portable = v2.seal_portable_production_stage1_cluster_preflight_artifact(
@@ -574,6 +618,75 @@ def test_role_neutral_state_sealing_consumes_lazy_portable_owner_handle(
         assert reads == 1
         assert reopened.load_state_for_owner(owner) is loaded
         assert reads == 1
+
+        changed_fit_identity = Stage1PhysicalFitIdentity(
+            architecture_identity="4" * 64,
+            target=plan.physical_fit_identity.target,
+            scientific_configuration_identity="5" * 64,
+            producer_identity="6" * 64,
+            runtime_compatibility_class=(
+                plan.physical_fit_identity.runtime_compatibility_class
+            ),
+        )
+        changed_body = scope_scheduler._stage1_scope_plan_body(
+            registry_content_sha256=plan.registry_content_sha256,
+            global_seed=plan.global_seed,
+            review_rounds=plan.review_rounds,
+            initial_training_partitions=(
+                plan.initial_training_partitions
+            ),
+            physical_fit_identity=changed_fit_identity,
+            gpu_ids=(7,),
+            scope_workers_per_gpu=3,
+            scopes=plan.scopes,
+            assignments=plan.assignments,
+        )
+        changed_plan = Stage1ScopePlan(
+            registry_content_sha256=plan.registry_content_sha256,
+            global_seed=plan.global_seed,
+            review_rounds=plan.review_rounds,
+            initial_training_partitions=(
+                plan.initial_training_partitions
+            ),
+            physical_fit_identity=changed_fit_identity,
+            gpu_ids=(7,),
+            scope_workers_per_gpu=3,
+            scopes=plan.scopes,
+            assignments=plan.assignments,
+            content_sha256=v2._sha256_json(changed_body),
+        )
+        changed_plan.as_dict()
+
+        original_np_load = embedding_execution.np.load
+
+        def no_path_or_mmap_load(source, *args, **kwargs):
+            assert not isinstance(source, (str, os.PathLike))
+            assert "mmap_mode" not in kwargs
+            return original_np_load(source, *args, **kwargs)
+
+        monkeypatch.setattr(
+            embedding_execution.np,
+            "load",
+            no_path_or_mmap_load,
+        )
+        migrated = (
+            load_canonical_clustered_preflight_state_bundle_for_scientific_migration(
+                manifest_path=(
+                    bundle.root
+                    / "cluster_state_bundle_manifest.json"
+                ),
+                preflight=portable,
+                current_plan=changed_plan,
+                expected_source_plan_scientific_content_sha256=(
+                    plan.scientific_content_sha256
+                ),
+            )
+        )
+        assert set(migrated.states) == {owner}
+        assert (
+            migrated.load_state_for_owner(owner).content_sha256
+            == state.content_sha256
+        )
     finally:
         _make_writable(portable.root)
 

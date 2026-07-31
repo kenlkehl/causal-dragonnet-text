@@ -83,6 +83,15 @@ def _scientific() -> dict:
             "content_sha256": "5" * 64,
         },
         "split_registry_content_sha256": "5" * 64,
+        "architecture_profiles": {
+            "fixture": {"closed": True},
+        },
+        "architecture_profiles_content_sha256": (
+            context_module._sha256_json(
+                {"fixture": {"closed": True}}
+            )
+        ),
+        "runtime_compatibility_class": "fixture-runtime",
     }
     return {**body, "content_sha256": context_module._sha256_json(body)}
 
@@ -148,6 +157,33 @@ def test_scientific_root_excludes_locators_and_supports_rebinding(
     )
     _make_writable(first.root)
     _make_writable(rebound.root)
+
+
+def test_architecture_profiles_and_runtime_are_scientifically_bound(
+    tmp_path: Path,
+) -> None:
+    incompatible_locator = context_module._locator_payload(
+        stage1_build_options=_options(tmp_path, "changed-profile"),
+        architecture_profiles={"fixture": {"closed": False}},
+        runtime_compatibility_class="fixture-runtime",
+        scientific_compatibility_sha256=_scientific()[
+            "stage1_request_scientific_compatibility_sha256"
+        ],
+        exact_stage1_request=_request(
+            dataset_path="/changed-profile/cohort",
+            runtime_root="/changed-profile/runtime",
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="execution locators are invalid",
+    ):
+        context_module._publish_prepared_stage1_context_payloads(
+            root=(tmp_path / "changed-profile-context").resolve(),
+            scientific=_scientific(),
+            locator=incompatible_locator,
+        )
 
 
 def test_context_directory_is_byte_relocatable_and_tamper_fails(

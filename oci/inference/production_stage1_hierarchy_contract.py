@@ -26,7 +26,7 @@ from types import ModuleType
 from typing import Any, Mapping
 
 PRODUCTION_STAGE1_HIERARCHY_CONTRACT_SCHEMA_VERSION = (
-    "production_stage1_hierarchical_discovery_contract_v7"
+    "production_stage1_hierarchical_discovery_contract_v8"
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -110,7 +110,7 @@ _REQUIRED_VERSION_ROWS = (
     (
         "orchestrator",
         "HIERARCHICAL_DISCOVERY_PRECOMMIT_VERSION",
-        "hierarchical_discovery_precommit_v11",
+        "hierarchical_discovery_precommit_v12",
     ),
     ("orchestrator", "DISCOVERY_JSON_JOB_VERSION", "hierarchical_discovery_json_job_v7"),
     (
@@ -136,7 +136,7 @@ _REQUIRED_VERSION_ROWS = (
     (
         "orchestrator",
         "HIERARCHICAL_DISCOVERY_IMPLEMENTATION_BUNDLE_VERSION",
-        "hierarchical_discovery_implementation_bundle_v5",
+        "hierarchical_discovery_implementation_bundle_v6",
     ),
     (
         "job_cache",
@@ -231,12 +231,12 @@ _REQUIRED_VERSION_ROWS = (
     (
         "adaptive_hierarchy",
         "ADAPTIVE_PROMPT_CONTRACT_VERSION",
-        "adaptive_hierarchical_stage1_prompt_contract_v7",
+        "adaptive_hierarchical_stage1_prompt_contract_v8",
     ),
     (
         "adaptive_hierarchy",
         "ADAPTIVE_IMPLEMENTATION_BUNDLE_VERSION",
-        "adaptive_hierarchical_implementation_bundle_v8",
+        "adaptive_hierarchical_implementation_bundle_v9",
     ),
     (
         "frozen_review",
@@ -273,7 +273,7 @@ _REQUIRED_VERSION_ROWS = (
         "CUMULATIVE_SPENT_EVIDENCE_BUNDLE_SCHEMA",
         "cumulative_spent_stage1_evidence_bundle_v1",
     ),
-    ("catalog", "ARCHITECTURE_CHUNK_PLAN_SCHEMA_VERSION", "complete_architecture_chunk_plan_v7"),
+    ("catalog", "ARCHITECTURE_CHUNK_PLAN_SCHEMA_VERSION", "complete_architecture_chunk_plan_v8"),
     (
         "production_handoff",
         "STAGE1_HIERARCHY_HANDOFF_SCHEMA",
@@ -429,7 +429,7 @@ def current_production_stage1_hierarchy_contract_identity() -> dict[str, Any]:
         orchestrator.hierarchical_discovery_implementation_bundle(),
         label="base hierarchy implementation bundle",
         hash_key="implementation_bundle_sha256",
-        expected_schema="hierarchical_discovery_implementation_bundle_v5",
+        expected_schema="hierarchical_discovery_implementation_bundle_v6",
         expected_files=_HIERARCHY_BUNDLE_FILES,
         expected_keys=frozenset(
             {
@@ -463,7 +463,7 @@ def current_production_stage1_hierarchy_contract_identity() -> dict[str, Any]:
         adaptive.adaptive_hierarchical_implementation_bundle(),
         label="adaptive hierarchy implementation bundle",
         hash_key="implementation_bundle_sha256",
-        expected_schema="adaptive_hierarchical_implementation_bundle_v8",
+        expected_schema="adaptive_hierarchical_implementation_bundle_v9",
         expected_files=_ADAPTIVE_BUNDLE_FILES,
         expected_keys=frozenset(
             {

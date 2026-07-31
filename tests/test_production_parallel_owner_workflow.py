@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -15,7 +16,10 @@ from oci.inference.neural_query_operational_controls import (
     ROLE_NEUTRAL_NEURAL_QUERY_OPERATIONAL_CONTROLS_SCHEMA,
     RoleNeutralNeuralQueryOperationalControls,
 )
-from oci.inference.portable_workflow_spec import DeploymentProfile
+from oci.inference.portable_workflow_spec import (
+    DeploymentProfile,
+    Stage1PreflightExecutionPolicy,
+)
 from oci.inference.production_role_neutral_persistent_executor import (
     PersistentRoleNeutralExecutionSession,
 )
@@ -36,11 +40,15 @@ from oci.inference.production_stage1_role_neutral_execution import (
     RoleNeutralProducerFactories,
     RoleNeutralStage1ExecutionPolicy,
     _execute_one_owner,
+    _prior_authenticated_component_receipt,
+    _write_new_json,
     execute_and_publish_role_neutral_stage1,
     validate_role_neutral_stage1_execution,
 )
 from oci.inference.role_neutral_all_ten_binding import (
     EXPECTED_COMPONENT_FAMILIES,
+    authenticated_role_neutral_component_tree_sha256,
+    validate_authenticated_role_neutral_component_receipt,
 )
 from oci.inference.stage1_execution_topology_policy import (
     ONE_CONTEXT_SPANNING_ALL_SELECTED_DEVICES,
@@ -182,6 +190,92 @@ def test_deployment_compilation_bounds_generic_owner_capacity(
                 one_device_controls,
                 fold_parallelism=2,
                 fold_parallel_backend="processes",
+            ),
+        )
+
+
+def test_deployment_compiles_independent_preflight_resource_caps(
+    tmp_path: Path,
+) -> None:
+    execution = stage1_execution_profile(
+        resource_kind="accelerator",
+        device_count=4,
+        scope_workers_per_device=1,
+        max_parallel_owners=4,
+    )
+    policy = Stage1PreflightExecutionPolicy(
+        max_parallel_owners=4,
+        memory_budget_bytes=3_000,
+        estimated_owner_peak_bytes=1_000,
+        input_io_lane_cap=3,
+        publication_io_lane_cap=2,
+        authentication_io_lane_cap=4,
+    )
+    deployment = _deployment(
+        tmp_path / "bounded",
+        execution=replace(
+            execution,
+            preflight_execution_policy=policy,
+        ),
+        devices=("cuda:0", "cuda:1", "cuda:2", "cuda:3"),
+        cpu_budget=8,
+    )
+    deployment = DeploymentProfile.from_mapping(
+        asdict(
+            replace(
+                deployment,
+                resource_performance_safety=replace(
+                    deployment.resource_performance_safety,
+                    maximum_ordinary_read_amplification=4.0,
+                ),
+            )
+        )
+    )
+
+    attestation = (
+        workflow_module._stage1_preflight_execution_attestation(
+            deployment
+        )
+    )
+    assert attestation[
+        "effective_preflight_owner_lanes_before_scope_cap"
+    ] == 2
+    assert attestation["derived_caps"] == {
+        "cpu_budget": 8,
+        "stage1_owner_cap": 4,
+        "preflight_owner_cap": 4,
+        "memory_lane_cap": 3,
+        "input_io_lane_cap": 3,
+        "publication_io_lane_cap": 2,
+        "authentication_io_lane_cap": 4,
+        "ordinary_read_amplification_lane_cap": 4,
+    }
+    assert attestation["resource_assignment_in_scientific_identity"] is False
+    assert attestation["completion_order_in_scientific_identity"] is False
+
+    # Profiles written before the preflight policy existed remain valid and
+    # deliberately reopen with one conservative lane.
+    legacy_mapping = asdict(execution)
+    legacy_mapping.pop("preflight_execution_policy")
+    legacy = type(execution).from_mapping(legacy_mapping)
+    assert legacy.preflight_execution_policy.max_parallel_owners == 1
+    assert legacy.preflight_execution_policy.memory_lane_cap == 1
+
+    with pytest.raises(ValueError, match="estimated_owner_peak_bytes"):
+        Stage1PreflightExecutionPolicy(
+            max_parallel_owners=1,
+            memory_budget_bytes=999,
+            estimated_owner_peak_bytes=1_000,
+            input_io_lane_cap=1,
+            publication_io_lane_cap=1,
+            authentication_io_lane_cap=1,
+        )
+    with pytest.raises(ValueError, match="preflight max_parallel_owners"):
+        replace(
+            execution,
+            preflight_execution_policy=replace(
+                policy,
+                max_parallel_owners=5,
             ),
         )
 
@@ -734,6 +828,19 @@ def test_cross_request_component_import_reuses_only_currently_authenticated_work
         tmp_path / "corrected-component-store" / "components"
     ).resolve()
     corrected_execution = (tmp_path / "corrected-execution").resolve()
+
+    class _LaneImportExecutor(_RecordingExecutor):
+        def execute(self, *, tasks, worker, max_workers, cpu_budget):
+            assert not tuple(
+                target_store.rglob(ROLE_NEUTRAL_EXECUTION_MANIFEST)
+            )
+            return super().execute(
+                tasks=tasks,
+                worker=worker,
+                max_workers=max_workers,
+                cpu_budget=cpu_budget,
+            )
+
     manifest = execute_and_publish_role_neutral_stage1(
         root=corrected_execution,
         plan=plan,
@@ -746,7 +853,7 @@ def test_cross_request_component_import_reuses_only_currently_authenticated_work
             neural_query=corrected_factories.neural_query,
         ),
         policy=policy,
-        executor=_RecordingExecutor(),
+        executor=_LaneImportExecutor(),
         component_store_root=target_store,
         component_reuse_roots=(legacy_components,),
     )
@@ -759,17 +866,101 @@ def test_cross_request_component_import_reuses_only_currently_authenticated_work
         if event == "execute"
     ]
     assert execute_events == [(first_owner, "htr")]
-    import_attestations = tuple(
+    operational_attestations = tuple(
         (
             target_store.parent
             / "authenticated_component_imports"
         ).glob("*.json")
+    )
+    import_attestations = tuple(
+        path
+        for path in operational_attestations
+        if json.loads(path.read_text(encoding="utf-8")).get(
+            "schema_version"
+        )
+        == "production_role_neutral_authenticated_component_import_v2"
+    )
+    authentication_caches = tuple(
+        path
+        for path in operational_attestations
+        if json.loads(path.read_text(encoding="utf-8")).get(
+            "schema_version"
+        )
+        == "production_role_neutral_component_authentication_cache_v2"
     )
     assert len(import_attestations) == (
         len(plan.physical_scopes)
         * len(EXPECTED_COMPONENT_FAMILIES)
         - 1
     )
+    expected_component_count = (
+        len(plan.physical_scopes)
+        * len(EXPECTED_COMPONENT_FAMILIES)
+    )
+    assert len(authentication_caches) == expected_component_count
+    assert sum(
+        event == "authenticate"
+        for _owner, _component, event, _resource in corrected.events
+    ) == expected_component_count
+    for path in import_attestations:
+        attestation = json.loads(path.read_text(encoding="utf-8"))
+        assert attestation["schema_version"] == (
+            "production_role_neutral_authenticated_component_import_v2"
+        )
+        assert (
+            attestation[
+                "current_producer_semantic_authentication_count"
+            ]
+            == 1
+        )
+        assert (
+            attestation["copied_tree_integrity_validation_count"]
+            == 1
+        )
+        assert (
+            attestation[
+                "temporary_semantic_reauthentication_count"
+            ]
+            == 0
+        )
+        assert (
+            attestation[
+                "published_target_semantic_reauthentication_count"
+            ]
+            == 0
+        )
+    cached_owner_id = plan.physical_execution_order[1]
+    cached_owner, cached_members = next(
+        (owner, members)
+        for owner, members in plan.physical_scope_groups
+        if owner.scope_id == cached_owner_id
+    )
+    cache_recorder = _ProducerRecorder()
+    cached_result = _execute_one_owner(
+        task=RoleNeutralPhysicalOwnerTask(
+            plan=plan,
+            physical_owner=cached_owner,
+            logical_members=cached_members,
+            component_parent=target_store / cached_owner_id,
+            resource="cpu",
+            resume=True,
+            component_reuse_roots=(legacy_components,),
+            component_import_attestation_root=(
+                target_store.parent
+                / "authenticated_component_imports"
+            ),
+        ),
+        factories=cache_recorder.factories().as_mapping(),
+        resume=True,
+    )
+    assert not [
+        event
+        for event in cache_recorder.events
+        if event[2] == "authenticate"
+    ]
+    assert cached_result.execution_telemetry[
+        "authentication_cache_hit_components"
+    ] == list(EXPECTED_COMPONENT_FAMILIES)
     assert (
         legacy_components
         / first_owner
@@ -782,6 +973,261 @@ def test_cross_request_component_import_reuses_only_currently_authenticated_work
         / "htr"
         / ROLE_NEUTRAL_EXECUTION_MANIFEST
     ).is_file()
+
+
+def test_historical_full_authentication_reopens_by_exact_stat_continuity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(gpu_ids=())
+    owner, members = plan.physical_scope_groups[0]
+    component_parent = (tmp_path / "components" / owner.scope_id).resolve()
+    attestation_root = (
+        tmp_path / "authenticated_component_imports"
+    ).resolve()
+    component_parent.mkdir(parents=True)
+    attestation_root.mkdir()
+
+    def write_closed(path: Path, body: Mapping[str, Any]) -> dict[str, Any]:
+        value = {**body, "content_sha256": _sha(body)}
+        _write_new_json(path, value)
+        payload = path.read_bytes()
+        return {
+            "relative_path": path.relative_to(
+                component_parent / str(body["component"])
+            ).as_posix(),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+            "content_sha256": value["content_sha256"],
+        }
+
+    for component, families in EXPECTED_COMPONENT_FAMILIES.items():
+        root = component_parent / component
+        views_root = root / "logical_views"
+        views_root.mkdir(parents=True)
+        seal_registrations: dict[str, dict[str, Any]] = {}
+        logical_views: list[dict[str, Any]] = []
+        for family_index, family in enumerate(families):
+            seal_path = root / f"fit_only_{family_index}.json"
+            seal_registrations[family] = write_closed(
+                seal_path,
+                {
+                    "schema_version": "test_prior_fit_seal_v1",
+                    "component": component,
+                    "physical_owner_scope_id": owner.scope_id,
+                    "family": family,
+                },
+            )
+            for member_index, member in enumerate(members):
+                view_path = (
+                    views_root
+                    / f"{family_index}_{member_index}.json"
+                )
+                registration = write_closed(
+                    view_path,
+                    {
+                        "schema_version": "test_prior_logical_view_v1",
+                        "component": component,
+                        "physical_owner_scope_id": owner.scope_id,
+                        "logical_scope_id": member.scope_id,
+                        "family": family,
+                    },
+                )
+                logical_views.append(
+                    {
+                        **registration,
+                        "logical_scope_id": member.scope_id,
+                        **(
+                            {}
+                            if len(families) == 1
+                            else {"family": family}
+                        ),
+                    }
+                )
+        group_request_body = {
+            "schema_version": "test_prior_group_request_v1",
+            "plan_scientific_content_sha256": (
+                plan.scientific_content_sha256
+            ),
+            "physical_owner": owner.as_dict(),
+            "logical_members": [
+                member.as_dict() for member in members
+            ],
+            "fit_row_ids": list(owner.fit_row_ids),
+            "canonical_group_seed": int(owner.scope_seed),
+            "heldout_labels_supplied": False,
+        }
+        group_request = {
+            **group_request_body,
+            "content_sha256": _sha(group_request_body),
+        }
+        terminal_body = {
+            "schema_version": "test_prior_component_terminal_v1",
+            "status": "complete",
+            "group_request": group_request,
+            "fit_only_family_seal": (
+                seal_registrations[families[0]]
+                if len(families) == 1
+                else None
+            ),
+            "fit_only_family_seals": (
+                seal_registrations
+                if len(families) > 1
+                else None
+            ),
+            "logical_views": logical_views,
+            "registered_heldout_labels_accessed": False,
+            "oracle_fields_accessed": False,
+            "text_truncation_applied": False,
+        }
+        terminal = {
+            **terminal_body,
+            "content_sha256": _sha(terminal_body),
+        }
+        _write_new_json(
+            root / ROLE_NEUTRAL_EXECUTION_MANIFEST,
+            terminal,
+        )
+        tree_sha256 = (
+            authenticated_role_neutral_component_tree_sha256(root)
+        )
+        attestation_body = {
+            "schema_version": (
+                "production_role_neutral_authenticated_component_import_v1"
+            ),
+            "physical_owner_scope_id": owner.scope_id,
+            "component": component,
+            "plan_scientific_content_sha256": (
+                plan.scientific_content_sha256
+            ),
+            "source_components_root": str(component_parent),
+            "source_terminal_content_sha256": terminal[
+                "content_sha256"
+            ],
+            "source_tree_sha256": tree_sha256,
+            "authentication_content_sha256": _sha(
+                {
+                    "owner": owner.scope_id,
+                    "component": component,
+                    "historical_full_authentication": True,
+                }
+            ),
+            "current_producer_authenticated_source": True,
+            "private_copy_not_link_or_reference": True,
+            "current_producer_reauthenticated_temporary": True,
+            "current_producer_reauthenticated_published_target": True,
+            "source_tree_preserved": True,
+        }
+        _write_new_json(
+            attestation_root
+            / (
+                _sha(
+                    {
+                        "physical_owner_scope_id": owner.scope_id,
+                        "component": component,
+                    }
+                )
+                + ".json"
+            ),
+            {
+                **attestation_body,
+                "content_sha256": _sha(attestation_body),
+            },
+        )
+
+    task = RoleNeutralPhysicalOwnerTask(
+        plan=plan,
+        physical_owner=owner,
+        logical_members=members,
+        component_parent=component_parent,
+        resource="cpu",
+        resume=True,
+        component_import_attestation_root=attestation_root,
+    )
+    recorder = _ProducerRecorder()
+    first = _execute_one_owner(
+        task=task,
+        factories=recorder.factories().as_mapping(),
+        resume=True,
+    )
+    assert not [
+        event for event in recorder.events if event[2] == "authenticate"
+    ]
+    assert first.execution_telemetry[
+        "prior_authentication_continuity_components"
+    ] == list(EXPECTED_COMPONENT_FAMILIES)
+    caches = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in attestation_root.glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8")).get(
+            "schema_version"
+        )
+        == "production_role_neutral_component_authentication_cache_v2"
+    ]
+    assert len(caches) == len(EXPECTED_COMPONENT_FAMILIES)
+    assert all(
+        cache["authentication_basis"]
+        == "prior_authenticated_component_import_v1_stat_continuity_v1"
+        and cache["payload_bytes_reauthenticated"] is False
+        for cache in caches
+    )
+
+    cached_recorder = _ProducerRecorder()
+    cached = _execute_one_owner(
+        task=task,
+        factories=cached_recorder.factories().as_mapping(),
+        resume=True,
+    )
+    assert not [
+        event
+        for event in cached_recorder.events
+        if event[2] == "authenticate"
+    ]
+    assert cached.execution_telemetry[
+        "authentication_cache_hit_components"
+    ] == list(EXPECTED_COMPONENT_FAMILIES)
+
+    import oci.inference.role_neutral_all_ten_binding as binding_module
+
+    real_os_read = binding_module.os.read
+
+    def reject_payload_reread(descriptor, size):
+        opened_path = Path(
+            binding_module.os.readlink(
+                f"/proc/self/fd/{int(descriptor)}"
+            )
+        )
+        if opened_path.name == ROLE_NEUTRAL_EXECUTION_MANIFEST:
+            return real_os_read(descriptor, size)
+        raise AssertionError(
+            "unchanged component payload was redundantly reread"
+        )
+
+    monkeypatch.setattr(binding_module.os, "read", reject_payload_reread)
+    for source in cached.sources:
+        validate_authenticated_role_neutral_component_receipt(
+            root=source.root,
+            plan=plan,
+            physical_owner_scope_id=owner.scope_id,
+            receipt=source.receipt,
+            expected_component=source.receipt.component,
+        )
+
+    terminal_path = (
+        component_parent / "htr" / ROLE_NEUTRAL_EXECUTION_MANIFEST
+    )
+    terminal_path.write_bytes(terminal_path.read_bytes())
+    with pytest.raises(
+        ValueError,
+        match="changed after its historical authentication",
+    ):
+        _prior_authenticated_component_receipt(
+            attestation_root=attestation_root,
+            component_root=component_parent / "htr",
+            plan=plan,
+            physical_owner_scope_id=owner.scope_id,
+            component="htr",
+        )
 
 
 def test_component_store_namespace_excludes_stage2_catalog_identity_and_finds_v1(

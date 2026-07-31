@@ -102,7 +102,7 @@ readonly REMOTE_HOSTNAME_SAFE="$(
 [[ -n "${REMOTE_HOSTNAME_SAFE}" ]] \
     || fail "remote hostname has no safe characters"
 
-readonly RUN_TAG="${FIVE_CONF_RUN_TAG:-r15_token_attention_htr_stage2_complete_semantic_catalog_v4_remote_${REMOTE_HOSTNAME_SAFE}_gpu01}"
+readonly RUN_TAG="${FIVE_CONF_RUN_TAG:-r15_token_attention_htr_stage2_complete_semantic_catalog_fast_stat_auth_reusable_preflight_v8_remote_${REMOTE_HOSTNAME_SAFE}_gpu01}"
 [[ "${RUN_TAG}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
     || fail "FIVE_CONF_RUN_TAG contains unsupported characters"
 
@@ -119,6 +119,7 @@ readonly LAUNCH_LOCK_DIRECTORY="${REPO_ROOT}/artifacts/production_launch_locks"
 readonly LAUNCH_LOCK_PATH="${LAUNCH_LOCK_DIRECTORY}/five_conf_five_mod_1000_${RUN_TAG}.lock"
 readonly ADOPT_INPUT_PREPARATION_CHECKPOINT="${SUPERSEDED_TOKEN_ROOT}/portable_checkpoints/input_preparation"
 readonly ADOPT_EMBEDDING_CACHE_CHECKPOINT="${SUPERSEDED_TOKEN_ROOT}/portable_checkpoints/embedding_cache"
+readonly ADOPT_STAGE1_PREFLIGHT_CHECKPOINT="${SUPERSEDED_TOKEN_ROOT}/portable_checkpoints/stage1_preflight"
 
 [[ "${DURABLE_ROOT}" == "${REPO_ROOT}/artifacts/"* ]] \
     || fail "durable root must remain below ${REPO_ROOT}/artifacts"
@@ -147,6 +148,35 @@ require_file "${ADOPT_INPUT_PREPARATION_CHECKPOINT}/artifact_locator.json"
 require_directory "${ADOPT_EMBEDDING_CACHE_CHECKPOINT}"
 require_file "${ADOPT_EMBEDDING_CACHE_CHECKPOINT}/artifact_manifest.json"
 require_file "${ADOPT_EMBEDDING_CACHE_CHECKPOINT}/artifact_locator.json"
+require_directory "${ADOPT_STAGE1_PREFLIGHT_CHECKPOINT}"
+require_file "${ADOPT_STAGE1_PREFLIGHT_CHECKPOINT}/artifact_manifest.json"
+require_file "${ADOPT_STAGE1_PREFLIGHT_CHECKPOINT}/artifact_locator.json"
+readonly ADOPT_STAGE1_PREFLIGHT_MANIFEST="$(
+    FIVE_CONF_PREFLIGHT_LOCATOR="${ADOPT_STAGE1_PREFLIGHT_CHECKPOINT}/artifact_locator.json" \
+        "${REMOTE_PYTHON}" -P - <<'PY'
+import json
+import os
+from pathlib import Path
+
+locator = json.loads(
+    Path(os.environ["FIVE_CONF_PREFLIGHT_LOCATOR"]).read_text(
+        encoding="utf-8"
+    )
+)
+payload_root = Path(str(locator.get("payload_root", "")))
+candidate = payload_root / "cluster_preflight" / "cluster_preflight_manifest.json"
+if (
+    not payload_root.is_absolute()
+    or candidate.is_symlink()
+    or not candidate.is_file()
+):
+    raise SystemExit(
+        "portable Stage 1 preflight has no canonical source manifest"
+    )
+print(candidate.resolve(strict=True))
+PY
+)"
+require_file "${ADOPT_STAGE1_PREFLIGHT_MANIFEST}"
 readonly OBSOLETE_CONTROL="${SNAPSHOT_ROOT}/scripts/control_obsolete_five_conf_token_catalog_workflow.py"
 require_file "${OBSOLETE_CONTROL}"
 "${REMOTE_PYTHON}" -P "${OBSOLETE_CONTROL}" assert-stopped
@@ -154,6 +184,7 @@ require_file "${OBSOLETE_CONTROL}"
 ADOPTION_ARGUMENTS=(
     --adopt-checkpoint "${ADOPT_INPUT_PREPARATION_CHECKPOINT}"
     --adopt-checkpoint "${ADOPT_EMBEDDING_CACHE_CHECKPOINT}"
+    --adopt-checkpoint "${ADOPT_STAGE1_PREFLIGHT_MANIFEST}"
 )
 readonly -a ADOPTION_ARGUMENTS
 readonly EXPECTED_ADOPTED_PHASES="input_preparation,embedding_cache"
@@ -361,6 +392,15 @@ stage1.update(
 stage1["neural_query_topology"][
     "mode"
 ] = "one_context_per_selected_device"
+stage1["preflight_execution_policy"] = {
+    "schema_version": "portable_stage1_preflight_execution_policy_v1",
+    "max_parallel_owners": 2,
+    "memory_budget_bytes": 34359738368,
+    "estimated_owner_peak_bytes": 8589934592,
+    "input_io_lane_cap": 2,
+    "publication_io_lane_cap": 1,
+    "authentication_io_lane_cap": 1,
+}
 # Each remote A6000 has 48 GiB.  The superseded run proved that two
 # simultaneously resident HTR fold models consume the entire device.  Keep
 # the two owner lanes (one per GPU), but execute one HTR fold at a time within
@@ -410,6 +450,11 @@ if (
         profile.stage1_execution.htr_operational_controls.fold_slots_per_device
         != 1
     )
+    or (
+        profile.stage1_execution.preflight_execution_policy
+        .max_parallel_owners
+        != 2
+    )
 ):
     raise SystemExit(
         "compiled deployment does not provide two disjoint one-fold lanes"
@@ -426,7 +471,7 @@ elif [[ -e "${DURABLE_ROOT}" ]]; then
     RESUME_ARGUMENTS=(--resume)
     note "existing immutable request found; component-granular resume is enabled"
 else
-    note "fresh complete-semantic-catalog request will adopt compatible completed checkpoints"
+    note "fresh fast-auth complete-semantic-catalog request will adopt compatible completed checkpoints"
 fi
 
 WORKFLOW_ARGUMENTS=(
@@ -457,11 +502,14 @@ note "source identity: ${SNAPSHOT_CONTENT_SHA256}"
 note "durable root: ${DURABLE_ROOT}"
 note "scratch root: ${SCRATCH_ROOT}"
 note "superseded request is stopped; compatible sealed Stage 1 components share this scratch store"
-note "Stage 1 preflight will be freshly authenticated for the corrected producer"
+note "portable Stage 1 preflight candidate: ${ADOPT_STAGE1_PREFLIGHT_MANIFEST}"
+note "the first v8 migration authenticates old bytes, reuses KMeans/SVD states, and materializes the complete global token inventory once"
+note "later compatible preflight opens use protected proof/stat continuity and lazy owner-state references"
 note "deployment profile: ${DEPLOYMENT_PROFILE}"
 note "HTR pooling: token_attention; all CLS HTR components are ineligible"
 note "HTR Stage 2 delivery: exhaustive semantic aggregates and complete reverse indexes"
 note "bounded non-mmap .npy replay/authentication: required by this snapshot"
+note "authentication: prior full validation plus exact inode/stat continuity; deep fallback on change"
 
 if (( CHECK_ONLY == 1 )); then
     note "validating the exact request/checkpoint graph without creating run state"
@@ -501,9 +549,19 @@ expected = set(
 )
 if adopted != expected:
     raise SystemExit(f"unexpected adopted phases: {sorted(adopted)}")
+preflight = request.get("legacy_preflight_candidate_identity")
+if (
+    not isinstance(preflight, dict)
+    or preflight.get("candidate_kind") != "portable_v2"
+    or preflight.get("direct_reuse_allowed") is not True
+):
+    raise SystemExit(
+        "portable-v2 Stage 1 preflight was not selected for no-refit migration"
+    )
 print(
     "[five-conf token-attention remote] exact request compatibility "
-    "passed; only non-adopted work will be rebuilt"
+    "passed; input/cache are adopted and compatible preflight states "
+    "will migrate without refitting"
 )
 PY
     note "all checks passed; workflow was not started"

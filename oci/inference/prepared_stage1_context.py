@@ -32,16 +32,16 @@ from typing import Any, Mapping
 
 
 PREPARED_STAGE1_CONTEXT_ARTIFACT_SCHEMA = (
-    "portable_prepared_stage1_context_artifact_v1"
+    "portable_prepared_stage1_context_artifact_v2"
 )
 PREPARED_STAGE1_CONTEXT_MANIFEST_SCHEMA = (
-    "portable_prepared_stage1_context_manifest_v1"
+    "portable_prepared_stage1_context_manifest_v2"
 )
 PREPARED_STAGE1_CONTEXT_SCIENTIFIC_SCHEMA = (
-    "portable_prepared_stage1_context_scientific_identity_v1"
+    "portable_prepared_stage1_context_scientific_identity_v2"
 )
 PREPARED_STAGE1_CONTEXT_LOCATOR_SCHEMA = (
-    "portable_prepared_stage1_context_execution_locators_v1"
+    "portable_prepared_stage1_context_execution_locators_v2"
 )
 PREPARED_STAGE1_CONTEXT_MANIFEST_NAME = "prepared_stage1_context_manifest.json"
 PREPARED_STAGE1_CONTEXT_SCIENTIFIC_NAME = "scientific_identity.json"
@@ -74,6 +74,9 @@ _PATH_OPTION_FIELDS = frozenset(
         "query_config_path",
         "cluster_preflight_manifest_path",
         "cluster_preflight_state_bundle_manifest_path",
+        "reusable_preflight_import_manifest_path",
+        "reusable_preflight_import_state_bundle_manifest_path",
+        "reusable_preflight_store_root",
         "stage1_scope_descriptor_root",
         "stage1_scope_attempt_root",
         "stage1_scope_progress_path",
@@ -413,12 +416,24 @@ def _scientific_payload(
     *,
     registry: Mapping[str, Any],
     registry_content_sha256: str,
+    architecture_profiles: Mapping[str, Mapping[str, Any]],
+    runtime_compatibility_class: str,
 ) -> dict[str, Any]:
     from .production_stage1_cluster_preflight_artifact import (
         stage1_request_scientific_compatibility_projection,
     )
 
     projection = stage1_request_scientific_compatibility_projection(request)
+    profiles = _json_copy(
+        architecture_profiles,
+        label="prepared-context scientific architecture profiles",
+    )
+    runtime = str(runtime_compatibility_class).strip()
+    if not runtime:
+        raise ValueError(
+            "prepared-context scientific runtime compatibility class "
+            "must be nonempty"
+        )
     body = {
         "schema_version": PREPARED_STAGE1_CONTEXT_SCIENTIFIC_SCHEMA,
         "stage1_request_scientific_projection": projection,
@@ -434,6 +449,11 @@ def _scientific_payload(
             registry_content_sha256,
             label="prepared Stage 1 split registry",
         ),
+        "architecture_profiles": profiles,
+        "architecture_profiles_content_sha256": _sha256_json(
+            profiles
+        ),
+        "runtime_compatibility_class": runtime,
     }
     return {**body, "content_sha256": _sha256_json(body)}
 
@@ -578,6 +598,7 @@ class PreparedStage1ContextArtifact:
         )
         from .production_stage1_bundle import (
             ProductionStage1BundleBuilder,
+            STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY,
             SpentOnlyFrozenChunkEmbeddingCache,
             _PreparedBuild,
             _directory_tree_sha256,
@@ -906,20 +927,41 @@ class PreparedStage1ContextArtifact:
             raise ValueError(
                 "prepared-context clustered-preflight locator is missing"
             )
+        reusable_preflight_selected = False
         if options.portable_cluster_preflight_v2:
-            from .production_stage1_cluster_preflight_artifact_v2 import (
-                load_portable_production_stage1_cluster_preflight_artifact,
+            from .production_stage1_reusable_preflight import (
+                is_reusable_preflight_reference,
+                load_reusable_preflight_reference,
             )
 
-            preflight = (
-                load_portable_production_stage1_cluster_preflight_artifact(
-                    manifest_path=options.cluster_preflight_manifest_path,
-                    config=config,
-                    registry=registry,
-                    registry_content_sha256=registry_sha256,
-                    embedding_cache_identity=cache_identity,
+            if is_reusable_preflight_reference(
+                options.cluster_preflight_manifest_path
+            ):
+                reusable_preflight_selected = True
+                preflight = load_reusable_preflight_reference(
+                    manifest_path=(
+                        options.cluster_preflight_manifest_path
+                    ),
+                    expected_stage1_request=exact_request,
+                    plan=plan,
+                    producer_identity=(
+                        STAGE1_REUSABLE_ASSEMBLED_PREFLIGHT_PRODUCER_IDENTITY
+                    ),
                 )
-            )
+            else:
+                from .production_stage1_cluster_preflight_artifact_v2 import (
+                    load_portable_production_stage1_cluster_preflight_artifact,
+                )
+
+                preflight = (
+                    load_portable_production_stage1_cluster_preflight_artifact(
+                        manifest_path=options.cluster_preflight_manifest_path,
+                        config=config,
+                        registry=registry,
+                        registry_content_sha256=registry_sha256,
+                        embedding_cache_identity=cache_identity,
+                    )
+                )
         else:
             from .production_stage1_cluster_preflight_artifact import (
                 load_production_stage1_cluster_preflight_artifact,
@@ -936,13 +978,26 @@ class PreparedStage1ContextArtifact:
             raise ValueError(
                 "prepared-context clustered-state locator is missing"
             )
-        state_bundle = load_canonical_clustered_preflight_state_bundle(
-            manifest_path=(
-                options.cluster_preflight_state_bundle_manifest_path
-            ),
-            preflight=preflight,
-            plan=plan,
-        )
+        if reusable_preflight_selected:
+            from .production_stage1_reusable_preflight import (
+                load_reusable_state_bundle_reference,
+            )
+
+            state_bundle = load_reusable_state_bundle_reference(
+                manifest_path=(
+                    options.cluster_preflight_state_bundle_manifest_path
+                ),
+                preflight=preflight,
+                plan=plan,
+            )
+        else:
+            state_bundle = load_canonical_clustered_preflight_state_bundle(
+                manifest_path=(
+                    options.cluster_preflight_state_bundle_manifest_path
+                ),
+                preflight=preflight,
+                plan=plan,
+            )
         physical_ids = {scope.scope_id for scope in plan.physical_scopes}
         if set(state_bundle.states) != physical_ids:
             raise ValueError(
@@ -1032,6 +1087,13 @@ class PreparedStage1ContextArtifact:
                     "hierarchical_discovery_contract_identity"
                 ]
             ),
+            reusable_preflight_telemetry={
+                "schema_version": (
+                    "production_stage1_prepared_context_reopen_telemetry_v1"
+                ),
+                "prepared_context_reconstruction": True,
+                "cluster_owner_states_loaded": 0,
+            },
             request=exact_request,
             request_sha256=str(exact_request["request_sha256"]),
         )
@@ -1136,6 +1198,9 @@ def load_prepared_stage1_context(
             "stage1_request_scientific_compatibility_sha256",
             "split_registry",
             "split_registry_content_sha256",
+            "architecture_profiles",
+            "architecture_profiles_content_sha256",
+            "runtime_compatibility_class",
             "content_sha256",
         }
         or scientific.get("schema_version")
@@ -1153,6 +1218,13 @@ def load_prepared_stage1_context(
         != (
             scientific.get("stage1_request_scientific_projection") or {}
         ).get("split_registry_content_sha256")
+        or scientific.get("architecture_profiles_content_sha256")
+        != _sha256_json(scientific.get("architecture_profiles"))
+        or not isinstance(
+            scientific.get("runtime_compatibility_class"),
+            str,
+        )
+        or not scientific["runtime_compatibility_class"].strip()
     ):
         raise ValueError("prepared-context scientific identity is invalid")
     if (
@@ -1175,6 +1247,10 @@ def load_prepared_stage1_context(
         != scientific.get(
             "stage1_request_scientific_compatibility_sha256"
         )
+        or locator.get("architecture_profiles")
+        != scientific.get("architecture_profiles")
+        or locator.get("runtime_compatibility_class")
+        != scientific.get("runtime_compatibility_class")
     ):
         raise ValueError("prepared-context execution locators are invalid")
     # Validate the closed locator schema without touching its target inputs.
@@ -1387,6 +1463,12 @@ def seal_prepared_stage1_context(
         prepared.request,
         registry=prepared.registry,
         registry_content_sha256=prepared.registry_content_sha256,
+        architecture_profiles=(
+            producer_factories_builder.architecture_profiles
+        ),
+        runtime_compatibility_class=(
+            producer_factories_builder.runtime_compatibility_class
+        ),
     )
     locator = _locator_payload(
         stage1_build_options=serialize_stage1_build_options(
@@ -1410,6 +1492,47 @@ def seal_prepared_stage1_context(
     )
 
 
+def seal_prepared_stage1_context_from_authenticated_parts(
+    *,
+    root: Path | str,
+    stage1_build_options: Mapping[str, Any],
+    architecture_profiles: Mapping[str, Mapping[str, Any]],
+    runtime_compatibility_class: str,
+    exact_stage1_request: Mapping[str, Any],
+    registry: Mapping[str, Any],
+    registry_content_sha256: str,
+) -> PreparedStage1ContextArtifact:
+    """Seal a current context around already authenticated preflight state.
+
+    This is the no-refit/no-retokenization path used after a reusable
+    preflight hit.  It deliberately accepts only the same closed primitives
+    used by the ordinary seal path; it cannot invent or weaken a scientific
+    projection.
+    """
+
+    scientific = _scientific_payload(
+        exact_stage1_request,
+        registry=registry,
+        registry_content_sha256=registry_content_sha256,
+        architecture_profiles=architecture_profiles,
+        runtime_compatibility_class=runtime_compatibility_class,
+    )
+    locator = _locator_payload(
+        stage1_build_options=stage1_build_options,
+        architecture_profiles=architecture_profiles,
+        runtime_compatibility_class=runtime_compatibility_class,
+        scientific_compatibility_sha256=scientific[
+            "stage1_request_scientific_compatibility_sha256"
+        ],
+        exact_stage1_request=exact_stage1_request,
+    )
+    return _publish_prepared_stage1_context_payloads(
+        root=Path(root),
+        scientific=scientific,
+        locator=locator,
+    )
+
+
 __all__ = [
     "PREPARED_STAGE1_CONTEXT_ARTIFACT_SCHEMA",
     "PREPARED_STAGE1_CONTEXT_LOCATOR_NAME",
@@ -1422,5 +1545,6 @@ __all__ = [
     "load_prepared_stage1_context",
     "rebind_prepared_stage1_context_locators",
     "seal_prepared_stage1_context",
+    "seal_prepared_stage1_context_from_authenticated_parts",
     "serialize_stage1_build_options",
 ]

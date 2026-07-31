@@ -40,8 +40,10 @@ from .all_evidence_fusion import FoldEvidenceProvenance
 from .all_evidence_discovery_interfaces import (
     ACTIVE_STAGE1_CONCEPT_FAMILIES,
     HTR_NEURAL,
+    MATCHED_PAIR_UPLIFT,
 )
 from .lossless_stage1_evidence_catalog import (
+    NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION,
     RoleNeutralEvidenceCatalog,
     assemble_cumulative_spent_role_neutral_catalog,
 )
@@ -74,6 +76,11 @@ from .production_stage1_scope_scheduler import (
     Stage1PhysicalFitIdentity,
     Stage1ScopePlan,
     validate_stage1_scope_plan,
+)
+from .production_stage1_legacy_scope_fragments import (
+    ROLE_NEUTRAL_FIT_ONLY_FAMILY_PRIOR_AUTH_REFERENCE_SCHEMA,
+    ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA,
+    ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMAS,
 )
 from .role_neutral_all_ten_binding import (
     EXPECTED_COMPONENT_FAMILIES,
@@ -2135,12 +2142,195 @@ def _review_partition_assignments(
     return {partition: rows[partition] for partition in expected}
 
 
+def _component_root_index(
+    locator_attestation: Mapping[str, Any],
+) -> dict[tuple[str, str], Path]:
+    registrations = locator_attestation.get("registrations")
+    if not isinstance(registrations, list):
+        raise ValueError(
+            "component locator attestation lacks its registrations"
+        )
+    output: dict[tuple[str, str], Path] = {}
+    for registration in registrations:
+        if not isinstance(registration, Mapping):
+            raise ValueError("component locator registration is malformed")
+        owner_id = str(
+            registration.get("physical_owner_scope_id")
+        )
+        component = str(registration.get("component"))
+        key = (owner_id, component)
+        root = Path(str(registration.get("absolute_root_locator")))
+        if (
+            not owner_id
+            or component not in EXPECTED_COMPONENT_FAMILIES
+            or key in output
+            or not root.is_absolute()
+        ):
+            raise ValueError(
+                "component locator registration index is invalid"
+            )
+        output[key] = root
+    return output
+
+
+def _resolve_fit_seal_reference(
+    *,
+    owner_scope_id: str,
+    family: str,
+    seal_or_reference: Mapping[str, Any],
+    component_roots: Mapping[tuple[str, str], Path],
+) -> dict[str, Any]:
+    """Open one complete seal only when its Stage 2 family is consumed."""
+
+    reference_schema = seal_or_reference.get("schema_version")
+    if reference_schema not in (
+        ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMAS
+    ):
+        return copy.deepcopy(dict(seal_or_reference))
+    components = [
+        component
+        for component, families in EXPECTED_COMPONENT_FAMILIES.items()
+        if family in families
+    ]
+    if len(components) != 1:
+        raise RuntimeError("native family has no unique producer component")
+    component = components[0]
+    root = component_roots.get((owner_scope_id, component))
+    registration = seal_or_reference.get(
+        "source_seal_registration"
+    )
+    if root is None or not isinstance(registration, Mapping):
+        raise ValueError(
+            f"{owner_scope_id}/{family} seal reference lacks its source"
+        )
+    relative = Path(str(registration.get("relative_path")))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(
+            f"{owner_scope_id}/{family} seal reference path is unsafe"
+        )
+    source = _read_registered_json(
+        root / relative,
+        registration,
+        label=f"{owner_scope_id}/{family} complete fit-only seal",
+    )
+    if (
+        source.get("content_sha256")
+        != seal_or_reference.get("content_sha256")
+        or source.get("physical_owner_scope_id") != owner_scope_id
+        or source.get("family") != family
+    ):
+        raise ValueError(
+            f"{owner_scope_id}/{family} seal reference changed its "
+            "authenticated source identity"
+        )
+    if (
+        reference_schema
+        == ROLE_NEUTRAL_FIT_ONLY_FAMILY_SEAL_REFERENCE_SCHEMA
+    ):
+        for field_name in (
+            "producer_identity_sha256",
+            "configuration_identity_sha256",
+            "fit_state_artifact_sha256",
+        ):
+            if source.get(field_name) == seal_or_reference.get(
+                field_name
+            ):
+                continue
+            raise ValueError(
+                f"{owner_scope_id}/{family} seal reference changed "
+                f"{field_name}"
+            )
+    elif (
+        reference_schema
+        != ROLE_NEUTRAL_FIT_ONLY_FAMILY_PRIOR_AUTH_REFERENCE_SCHEMA
+    ):
+        raise ValueError(
+            f"{owner_scope_id}/{family} seal reference schema is invalid"
+        )
+    projection = seal_or_reference.get("source_evidence_projection")
+    if projection == "identity_evidence_payload_v1":
+        payload = source.get("evidence_payload")
+    elif (
+        projection
+        == "matched_pair_subproducer_normalization_v1"
+        and family == MATCHED_PAIR_UPLIFT
+    ):
+        proofs = source.get("subproducer_proofs")
+        if not isinstance(proofs, list) or not proofs:
+            raise ValueError(
+                f"{owner_scope_id}/{family} source proofs are incomplete"
+            )
+        payload = {
+            "schema_version": (
+                NATIVE_FAMILY_CONCEPT_PAYLOAD_SCHEMA_VERSION
+            ),
+            "family": MATCHED_PAIR_UPLIFT,
+            "architecture_evidence": [
+                {
+                    "source_family_seal_content_sha256": source[
+                        "content_sha256"
+                    ],
+                    "subproducer": proof["subproducer"],
+                    "evidence_payload_sha256": proof[
+                        "evidence_payload_sha256"
+                    ],
+                    "evidence_payload": copy.deepcopy(
+                        proof["evidence_payload"]
+                    ),
+                }
+                for proof in proofs
+            ],
+        }
+    else:
+        raise ValueError(
+            f"{owner_scope_id}/{family} source projection is invalid"
+        )
+    if not isinstance(payload, Mapping):
+        raise ValueError(
+            f"{owner_scope_id}/{family} referenced evidence is invalid"
+        )
+    if reference_schema == (
+        ROLE_NEUTRAL_FIT_ONLY_FAMILY_PRIOR_AUTH_REFERENCE_SCHEMA
+    ):
+        if (
+            projection == "identity_evidence_payload_v1"
+            and _sha256_json(payload)
+            != _require_sha256(
+                source.get("evidence_payload_sha256"),
+                label=(
+                    f"{owner_scope_id}/{family} source evidence payload"
+                ),
+            )
+        ):
+            raise ValueError(
+                f"{owner_scope_id}/{family} referenced evidence is "
+                "invalid"
+            )
+    elif _sha256_json(payload) != _require_sha256(
+        seal_or_reference.get("evidence_payload_sha256"),
+        label=f"{owner_scope_id}/{family} evidence payload",
+    ):
+        raise ValueError(
+            f"{owner_scope_id}/{family} referenced evidence is invalid"
+        )
+    resolved = copy.deepcopy(dict(source))
+    # The source seal may bind an earlier aggregate all-ten plan.  The
+    # compact receipt re-expresses that fit under the current plan without
+    # changing its independently authenticated evidence payload.
+    resolved["content_sha256"] = _require_sha256(
+        seal_or_reference.get("content_sha256"),
+        label=f"{owner_scope_id}/{family} current fit seal",
+    )
+    return resolved
+
+
 def _cumulative_catalogs(
     *,
     execution_root: Path,
     plan: Stage1ScopePlan,
     bridge: AuthenticatedRoleNeutralStage2Bridge,
     binding_terminal: Mapping[str, Any],
+    locator_attestation: Mapping[str, Any],
     htr_aggregation_store: AuthenticatedHtrSemanticAggregationStore,
     semantic_member_batch_size: int,
 ) -> dict[tuple[int, int], RoleNeutralEvidenceCatalog]:
@@ -2172,6 +2362,7 @@ def _cumulative_catalogs(
         / ROLE_NEUTRAL_COORDINATION_DIRECTORY
         / ROLE_NEUTRAL_SCIENTIFIC_BINDING_DIRECTORY
     )
+    component_roots = _component_root_index(locator_attestation)
     cached_non_htr: dict[
         str,
         tuple[dict[str, Mapping[str, Any]], dict[str, str], str],
@@ -2211,7 +2402,13 @@ def _cumulative_catalogs(
                 )
                 if family == HTR_NEURAL:
                     continue
-                source_payload = seal.get("evidence_payload")
+                resolved_seal = _resolve_fit_seal_reference(
+                    owner_scope_id=owner.scope_id,
+                    family=family,
+                    seal_or_reference=seal,
+                    component_roots=component_roots,
+                )
+                source_payload = resolved_seal.get("evidence_payload")
                 if not isinstance(source_payload, Mapping):
                     raise ValueError(
                         f"{owner.scope_id}/{family} has no sealed evidence payload"
@@ -2507,6 +2704,7 @@ class AuthenticatedRoleNeutralStage2Provider:
             plan=self._plan,
             bridge=bridge,
             binding_terminal=binding_terminal,
+            locator_attestation=locator_attestation,
             htr_aggregation_store=htr_aggregation_store,
             semantic_member_batch_size=self._semantic_member_batch_size,
         )
