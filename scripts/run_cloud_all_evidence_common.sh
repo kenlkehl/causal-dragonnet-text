@@ -40,25 +40,42 @@ case "${1:-}" in
     *) fail "usage: $0 [--check-only|--prepare-only]" ;;
 esac
 
-cloud_endpoint="${STAGE2_ENDPOINT:-https://generativelanguage.googleapis.com/v1beta/openai/}"
-cloud_endpoint_model="${STAGE2_ENDPOINT_MODEL:-gemini-3.6-flash}"
-cloud_endpoint_auth="${OCI_STAGE2_ENDPOINT_AUTH:-api_key}"
-cloud_endpoint_transport="${OCI_STAGE2_ENDPOINT_TRANSPORT:-openai_compatible}"
-[[ "${cloud_endpoint_auth}" == "api_key" ]] \
-    || fail "OCI_STAGE2_ENDPOINT_AUTH must be api_key for this Gemini launcher"
-[[ "${cloud_endpoint_transport}" == "openai_compatible" ]] \
-    || fail "OCI_STAGE2_ENDPOINT_TRANSPORT must be openai_compatible for this Gemini launcher"
-if [[ -n "${OCI_STAGE2_ENDPOINT_API_KEY:-}" \
-    && -n "${GEMINI_API_KEY:-}" \
-    && "${OCI_STAGE2_ENDPOINT_API_KEY}" != "${GEMINI_API_KEY}" ]]; then
-    fail "OCI_STAGE2_ENDPOINT_API_KEY and GEMINI_API_KEY disagree"
+cloud_vllm_model_id="nvidia/Gemma-4-31B-IT-NVFP4"
+cloud_vllm_model_revision="4135a98a9b728a548947683219633b25682223ac"
+cloud_endpoint_model="${cloud_vllm_model_id}@${cloud_vllm_model_revision}"
+cloud_vllm_proxy_port="${VLLM_PROXY_PORT:-8002}"
+cloud_vllm_upstream_port="${VLLM_UPSTREAM_PORT:-8003}"
+for cloud_port_name in cloud_vllm_proxy_port cloud_vllm_upstream_port; do
+    cloud_port_value="${!cloud_port_name}"
+    [[ "${cloud_port_value}" =~ ^[0-9]+$ ]] \
+        || fail "${cloud_port_name} must be an integer"
+    (( cloud_port_value >= 1024 && cloud_port_value <= 65535 )) \
+        || fail "${cloud_port_name} must be an unprivileged TCP port"
+done
+[[ "${cloud_vllm_proxy_port}" != "${cloud_vllm_upstream_port}" ]] \
+    || fail "VLLM_PROXY_PORT and VLLM_UPSTREAM_PORT must differ"
+cloud_endpoint="http://127.0.0.1:${cloud_vllm_proxy_port}/v1"
+if [[ -n "${STAGE2_ENDPOINT:-}" && "${STAGE2_ENDPOINT}" != "${cloud_endpoint}" ]]; then
+    fail "STAGE2_ENDPOINT cannot replace the launcher-owned local vLLM endpoint"
 fi
-cloud_endpoint_api_key="${OCI_STAGE2_ENDPOINT_API_KEY:-${GEMINI_API_KEY:-}}"
-if (( cloud_prepare_only == 0 )) && [[ -z "${cloud_endpoint_api_key}" ]]; then
-    fail "GEMINI_API_KEY is required for check-only and full workflow execution"
+if [[ -n "${STAGE2_ENDPOINT_MODEL:-}" \
+    && "${STAGE2_ENDPOINT_MODEL}" != "${cloud_endpoint_model}" ]]; then
+    fail "STAGE2_ENDPOINT_MODEL cannot replace the pinned NVIDIA NVFP4 model"
+fi
+cloud_endpoint_auth="${OCI_STAGE2_ENDPOINT_AUTH:-none}"
+cloud_endpoint_transport="${OCI_STAGE2_ENDPOINT_TRANSPORT:-vllm}"
+[[ "${cloud_endpoint_auth}" == "none" ]] \
+    || fail "OCI_STAGE2_ENDPOINT_AUTH must be none for the loopback-only vLLM server"
+[[ "${cloud_endpoint_transport}" == "vllm" ]] \
+    || fail "OCI_STAGE2_ENDPOINT_TRANSPORT must be vllm"
+[[ -z "${OCI_STAGE2_ENDPOINT_API_KEY:-}" ]] \
+    || fail "OCI_STAGE2_ENDPOINT_API_KEY must be unset for local vLLM"
+cloud_stop_after="${STOP_AFTER-}"
+if [[ -n "${cloud_stop_after}" && "${cloud_stop_after}" != "handoff_validation" ]]; then
+    fail "these launchers support STOP_AFTER only when set to handoff_validation"
 fi
 
-for cloud_command in awk flock nproc nvidia-smi realpath uv; do
+for cloud_command in awk flock nproc nvidia-smi ps realpath setsid tail tr uv; do
     command -v "${cloud_command}" >/dev/null 2>&1 \
         || fail "required command is unavailable: ${cloud_command}"
 done
@@ -68,12 +85,15 @@ if [[ "${SKIP_UV_SYNC:-0}" != "1" ]]; then
     note "syncing the locked Python environment"
     UV_CACHE_DIR="${cloud_uv_cache}" uv sync \
         --frozen \
-        --extra extraction \
-        --extra gemini
+        --extra extraction
 fi
 cloud_python="${CLOUD_PYTHON:-${cloud_repo_root}/.venv/bin/python}"
 [[ -x "${cloud_python}" && ! -d "${cloud_python}" ]] \
     || fail "uv environment Python is absent: ${cloud_python}"
+cloud_vllm_command="${VLLM_COMMAND:-$(dirname -- "${cloud_python}")/vllm}"
+[[ -x "${cloud_vllm_command}" && -f "${cloud_vllm_command}" \
+    && ! -L "${cloud_vllm_command}" ]] \
+    || fail "the locked environment does not expose a real vLLM executable: ${cloud_vllm_command}"
 
 "${cloud_python}" -P - <<'PY'
 import sys
@@ -102,6 +122,7 @@ cloud_model_root="${CLOUD_MODEL_ROOT:-${cloud_repo_root}/artifacts/local_models/
 cloud_embedding_model="${EMBEDDING_MODEL_DIR:-${cloud_model_root}/qwen3_embedding_8b}"
 cloud_htr_model="${HTR_MODEL_DIR:-${cloud_model_root}/bert_tiny}"
 cloud_stage2_tokenizer="${STAGE2_TOKENIZER_DIR:-${cloud_model_root}/stage2_tokenizer}"
+cloud_stage2_vllm_model="${STAGE2_VLLM_MODEL_DIR:-${cloud_model_root}/gemma4_31b_it_nvfp4}"
 mkdir -p "${cloud_model_root}"
 
 materialize_model() {
@@ -135,18 +156,20 @@ else
         "${HTR_MODEL_REVISION:-6f75de8b60a9f8a2fdf7b69cbd86d9e64bcb3837}" \
         "${cloud_htr_model}"
 fi
-if [[ -n "${STAGE2_TOKENIZER_DIR:-}" ]]; then
-    require_directory "${cloud_stage2_tokenizer}"
-else
-    materialize_model \
-        tokenizer \
-        "${STAGE2_TOKENIZER_MODEL_ID:-RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic}" \
-        "${STAGE2_TOKENIZER_REVISION:-30dd81263d7400b11032161ea3d8a6765557a4a1}" \
-        "${cloud_stage2_tokenizer}"
-fi
+materialize_model \
+    tokenizer \
+    "${cloud_vllm_model_id}" \
+    "${cloud_vllm_model_revision}" \
+    "${cloud_stage2_tokenizer}"
+materialize_model \
+    stage2_vllm \
+    "${cloud_vllm_model_id}" \
+    "${cloud_vllm_model_revision}" \
+    "${cloud_stage2_vllm_model}"
 require_directory "${cloud_embedding_model}"
 require_directory "${cloud_htr_model}"
 require_directory "${cloud_stage2_tokenizer}"
+require_directory "${cloud_stage2_vllm_model}"
 
 cloud_gpu_count="${CLOUD_GPU_COUNT:-8}"
 [[ "${cloud_gpu_count}" =~ ^[1-9][0-9]*$ ]] \
@@ -167,9 +190,15 @@ if torch.cuda.device_count() != 8:
     raise SystemExit(f"expected 8 visible CUDA devices, found {torch.cuda.device_count()}")
 for index in range(8):
     properties = torch.cuda.get_device_properties(index)
+    capability = torch.cuda.get_device_capability(index)
+    if capability[0] < 10:
+        raise SystemExit(
+            f"cuda:{index} is not NVIDIA Blackwell-class: capability={capability}"
+        )
     print(
         f"[cloud gpu] cuda:{index}: {properties.name}; "
-        f"memory={properties.total_memory / (1024 ** 3):.1f} GiB"
+        f"memory={properties.total_memory / (1024 ** 3):.1f} GiB; "
+        f"capability={capability[0]}.{capability[1]}"
     )
 PY
 
@@ -276,10 +305,17 @@ cloud_scratch_root="${cloud_scratch_base}/${CLOUD_RUN_KEY}"
 cloud_profile_directory="${cloud_repo_root}/artifacts/runtime_profiles/current"
 cloud_deployment="${cloud_profile_directory}/${CLOUD_RUN_KEY}.json"
 cloud_embedding_batch_size="${EMBEDDING_BATCH_SIZE:-8}"
+cloud_vllm_runtime_root="${cloud_scratch_base}/vllm_${CLOUD_RUN_KEY}"
+cloud_vllm_log="${cloud_vllm_runtime_root}/vllm.log"
+cloud_vllm_status="${cloud_vllm_runtime_root}/status.json"
+cloud_vllm_proxy_log="${cloud_vllm_runtime_root}/proxy.log"
+cloud_vllm_gpu_memory_utilization="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+cloud_vllm_startup_timeout="${VLLM_STARTUP_TIMEOUT_SECONDS:-600}"
 mkdir -p \
     "${cloud_run_base}" \
     "${cloud_scratch_base}" \
-    "${cloud_profile_directory}"
+    "${cloud_profile_directory}" \
+    "${cloud_vllm_runtime_root}"
 
 PYTHONPATH="${cloud_snapshot}" \
     "${cloud_python}" -P \
@@ -321,7 +357,6 @@ else
     note "starting a new request with no adopted checkpoints or cache imports"
 fi
 
-cloud_stop_after="${STOP_AFTER-}"
 cloud_stop_arguments=()
 [[ -n "${cloud_stop_after}" ]] \
     && cloud_stop_arguments=(--stop-after "${cloud_stop_after}")
@@ -345,7 +380,9 @@ note "deployment profile: ${cloud_deployment}"
 note "source snapshot: ${cloud_snapshot} (${cloud_snapshot_identity})"
 note "HTR pooling: token_attention; HTR folds per owner/GPU: 1"
 note "Stage 2 endpoint: ${cloud_endpoint}"
-note "Stage 2 model: ${cloud_endpoint_model} (Gemini OpenAI-compatible transport)"
+note "Stage 2 model: ${cloud_endpoint_model}"
+note "Stage 2 vLLM: ModelOpt NVFP4, tensor parallel 8, 256K context"
+note "Stage 2 scheduling: vLLM starts lazily only after the first post-Stage-1 request"
 note "stop-after: ${cloud_stop_after:-none}"
 
 if (( cloud_prepare_only == 1 )); then
@@ -368,9 +405,29 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="${cloud_snapshot}"
 export OCI_STAGE2_ENDPOINT_AUTH="${cloud_endpoint_auth}"
 export OCI_STAGE2_ENDPOINT_TRANSPORT="${cloud_endpoint_transport}"
-export OCI_STAGE2_ENDPOINT_API_KEY="${cloud_endpoint_api_key}"
+unset OCI_STAGE2_ENDPOINT_API_KEY
+
+cloud_vllm_proxy_arguments=(
+    --listen-port "${cloud_vllm_proxy_port}"
+    --upstream-port "${cloud_vllm_upstream_port}"
+    --vllm-command "${cloud_vllm_command}"
+    --model-dir "${cloud_stage2_vllm_model}"
+    --served-model-name "${cloud_endpoint_model}"
+    --tensor-parallel-size 8
+    --max-model-len 262144
+    --gpu-memory-utilization "${cloud_vllm_gpu_memory_utilization}"
+    --max-num-seqs 8
+    --startup-timeout-seconds "${cloud_vllm_startup_timeout}"
+    --request-timeout-seconds 900
+    --log-path "${cloud_vllm_log}"
+    --status-path "${cloud_vllm_status}"
+)
 
 if (( cloud_check_only == 1 )); then
+    "${cloud_python}" -P \
+        "${cloud_snapshot}/scripts/run_local_vllm_stage2_proxy.py" \
+        "${cloud_vllm_proxy_arguments[@]}" \
+        --check-only >/dev/null
     "${cloud_python}" -P - "${cloud_workflow_arguments[@]}" <<'PY'
 import sys
 
@@ -392,17 +449,141 @@ if request["requested_checkpoint_adoptions"]:
     raise SystemExit("cold cloud request unexpectedly adopted checkpoints")
 if workflow.query_devices != tuple(f"cuda:{index}" for index in range(8)):
     raise SystemExit("cloud request did not compile eight devices")
-if request.get("stage2_endpoint_authentication", {}).get("mode") != "api_key":
-    raise SystemExit("cloud request did not compile secret-free API-key auth")
-if request.get("stage2_endpoint_transport", {}).get("mode") != "openai_compatible":
-    raise SystemExit("cloud request did not compile OpenAI-compatible transport")
+if "stage2_endpoint_authentication" in request:
+    raise SystemExit("local vLLM request unexpectedly configured endpoint auth")
+if "stage2_endpoint_transport" in request:
+    raise SystemExit("local vLLM request unexpectedly changed the default vLLM transport")
+if options.stage2_prompt_protocol.model_context_window_tokens != 262_144:
+    raise SystemExit("cloud request did not compile the complete 256K Stage 2 context")
+if options.stage2_prompt_protocol.max_rendered_discovery_prompt_bytes != 440_000:
+    raise SystemExit("cloud request did not compile the expanded prompt batching ceiling")
 print("[cloud check] exact cold-start request compiled successfully")
 PY
     note "all checks passed; workflow was not started"
     exit 0
 fi
 
+cloud_proxy_pid=""
+cloud_proxy_pgid=""
+cloud_workflow_pid=""
+cloud_workflow_pgid=""
+
+stop_owned_proxy() {
+    if [[ -z "${cloud_proxy_pid}" ]] || ! kill -0 "${cloud_proxy_pid}" 2>/dev/null; then
+        return 0
+    fi
+    local observed_pgid
+    observed_pgid="$(ps -o pgid= -p "${cloud_proxy_pid}" | tr -d '[:space:]')"
+    if [[ "${observed_pgid}" != "${cloud_proxy_pgid}" \
+        || "${cloud_proxy_pgid}" != "${cloud_proxy_pid}" ]]; then
+        note "refusing to signal Stage 2 proxy because its process-group identity changed"
+        return 0
+    fi
+    note "sending SIGTERM to the workflow-owned Stage 2 proxy/vLLM supervisor"
+    kill -TERM -- "-${cloud_proxy_pgid}" 2>/dev/null || true
+    local poll
+    for ((poll = 0; poll < 60; poll++)); do
+        kill -0 "${cloud_proxy_pid}" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "${cloud_proxy_pid}" 2>/dev/null; then
+        note "Stage 2 supervisor is still shutting down; no SIGKILL was sent"
+    else
+        wait "${cloud_proxy_pid}" 2>/dev/null || true
+    fi
+}
+
+terminate_owned_workflow() {
+    if [[ -z "${cloud_workflow_pid}" ]] \
+        || ! kill -0 "${cloud_workflow_pid}" 2>/dev/null; then
+        return 0
+    fi
+    local observed_pgid
+    observed_pgid="$(ps -o pgid= -p "${cloud_workflow_pid}" | tr -d '[:space:]')"
+    if [[ "${observed_pgid}" == "${cloud_workflow_pgid}" \
+        && "${cloud_workflow_pgid}" == "${cloud_workflow_pid}" ]]; then
+        note "forwarding SIGTERM to the workflow-owned production process group"
+        kill -TERM -- "-${cloud_workflow_pgid}" 2>/dev/null || true
+    else
+        note "refusing to signal production because its process-group identity changed"
+    fi
+}
+
+handle_launcher_signal() {
+    local status="$1"
+    terminate_owned_workflow
+    stop_owned_proxy
+    exit "${status}"
+}
+
+trap stop_owned_proxy EXIT
+trap 'handle_launcher_signal 130' INT
+trap 'handle_launcher_signal 143' TERM
+
+if [[ -z "${cloud_stop_after}" ]]; then
+    note "starting the CPU-only lazy Stage 2 proxy; it will not touch CUDA during Stage 1"
+    setsid "${cloud_python}" -P -u \
+        "${cloud_snapshot}/scripts/run_local_vllm_stage2_proxy.py" \
+        "${cloud_vllm_proxy_arguments[@]}" \
+        >"${cloud_vllm_proxy_log}" 2>&1 &
+    cloud_proxy_pid="$!"
+    cloud_proxy_pgid="$(ps -o pgid= -p "${cloud_proxy_pid}" | tr -d '[:space:]')"
+    [[ "${cloud_proxy_pgid}" == "${cloud_proxy_pid}" ]] \
+        || fail "Stage 2 proxy did not acquire a disjoint owned process group"
+    CLOUD_PROXY_PID="${cloud_proxy_pid}" \
+    CLOUD_PROXY_PORT="${cloud_vllm_proxy_port}" \
+        "${cloud_python}" -P - <<'PY'
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+
+pid = int(os.environ["CLOUD_PROXY_PID"])
+url = f"http://127.0.0.1:{os.environ['CLOUD_PROXY_PORT']}/proxy-health"
+deadline = time.monotonic() + 30.0
+while time.monotonic() < deadline:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError as exc:
+        raise SystemExit("lazy Stage 2 proxy exited during startup") from exc
+    try:
+        with urllib.request.urlopen(url, timeout=1.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if response.status == 200 and payload.get("vllm_started") is False:
+            break
+    except (OSError, UnicodeError, json.JSONDecodeError, urllib.error.URLError):
+        pass
+    time.sleep(0.25)
+else:
+    raise SystemExit("lazy Stage 2 proxy did not become ready")
+PY
+    note "lazy Stage 2 proxy is ready; vLLM has not started and GPUs remain free"
+fi
+
 note "starting production workflow"
-exec "${cloud_python}" -P -u \
+setsid "${cloud_python}" -P -u \
     "${cloud_snapshot}/scripts/run_production_all_evidence_workflow.py" \
-    "${cloud_workflow_arguments[@]}"
+    "${cloud_workflow_arguments[@]}" &
+cloud_workflow_pid="$!"
+cloud_workflow_pgid="$(ps -o pgid= -p "${cloud_workflow_pid}" | tr -d '[:space:]')"
+[[ "${cloud_workflow_pgid}" == "${cloud_workflow_pid}" ]] \
+    || fail "production workflow did not acquire a disjoint owned process group"
+set +e
+wait "${cloud_workflow_pid}"
+cloud_workflow_status="$?"
+set -e
+cloud_workflow_pid=""
+cloud_workflow_pgid=""
+if (( cloud_workflow_status != 0 )); then
+    if [[ -f "${cloud_vllm_proxy_log}" ]]; then
+        note "recent Stage 2 proxy log follows"
+        tail -n 80 -- "${cloud_vllm_proxy_log}" >&2 || true
+    fi
+    if [[ -f "${cloud_vllm_log}" ]]; then
+        note "recent vLLM log follows"
+        tail -n 120 -- "${cloud_vllm_log}" >&2 || true
+    fi
+    exit "${cloud_workflow_status}"
+fi
+note "production workflow completed successfully"

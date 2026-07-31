@@ -34,6 +34,19 @@ REQUIRED_FILES = {
     ),
     "htr": ("config.json", "pytorch_model.bin", "vocab.txt"),
     "tokenizer": ("config.json", "tokenizer.json", "tokenizer_config.json"),
+    "stage2_vllm": (
+        "chat_template.jinja",
+        "config.json",
+        "generation_config.json",
+        "hf_quant_config.json",
+        "model-00001-of-00004.safetensors",
+        "model-00002-of-00004.safetensors",
+        "model-00003-of-00004.safetensors",
+        "model-00004-of-00004.safetensors",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ),
 }
 
 
@@ -93,6 +106,30 @@ def _validate_tree(
     missing = [name for name in REQUIRED_FILES[kind] if not (target / name).is_file()]
     if missing:
         raise ValueError(f"materialized {kind} model is missing files: {missing}")
+    if kind == "stage2_vllm":
+        try:
+            config = json.loads((target / "config.json").read_text(encoding="utf-8"))
+            legacy_quant = json.loads(
+                (target / "hf_quant_config.json").read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Stage 2 vLLM model metadata is unreadable") from exc
+        quantization = config.get("quantization_config")
+        text_config = config.get("text_config")
+        if (
+            config.get("architectures") != ["Gemma4ForConditionalGeneration"]
+            or config.get("model_type") != "gemma4"
+            or not isinstance(text_config, dict)
+            or text_config.get("max_position_embeddings") != 262_144
+            or not isinstance(quantization, dict)
+            or quantization.get("quant_method") != "modelopt"
+            or quantization.get("quant_algo") != "NVFP4"
+            or legacy_quant.get("producer", {}).get("name") != "modelopt"
+            or legacy_quant.get("quantization", {}).get("quant_algo") != "NVFP4"
+        ):
+            raise ValueError(
+                "Stage 2 model is not the expected 256K Gemma 4 ModelOpt NVFP4 checkpoint"
+            )
 
 
 def _copy_snapshot(source: Path, target: Path) -> None:

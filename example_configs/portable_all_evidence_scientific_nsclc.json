@@ -2758,8 +2758,8 @@
       "max_reason_chars": 128,
       "max_response_transport_bytes": 20000
     },
-    "max_rendered_discovery_prompt_bytes": 220000,
-    "model_context_window_tokens": 131072,
+    "max_rendered_discovery_prompt_bytes": 440000,
+    "model_context_window_tokens": 262144,
     "post_extraction_review_max_operations": 4,
     "post_extraction_review_max_quality_retries": 8,
     "post_extraction_review_min_partition_rows": 8,

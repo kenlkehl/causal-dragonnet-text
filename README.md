@@ -38,12 +38,18 @@ python oracle_experiment_scripts/run_oracle_experiments.py \
 
 ### Hierarchical all-evidence pipeline
 
-The production architecture-at-a-time feature-discovery benchmark has separate
-operator documentation:
+The current integrated production workflow has a self-service operator guide:
+
+- [Production all-evidence quickstart](docs/production_all_evidence_quickstart.md):
+  host requirements, locked installation, eight-GPU cloud launch, Stage 1 and
+  local-vLLM Stage 2, monitoring, interruption/resume, outputs, and the boundary
+  for arbitrary clinical cohorts.
+
+Detailed scientific contracts and historical recovery guidance are available
+separately:
 
 - [Operations runbook](docs/hierarchical_all_evidence_operations_runbook.md):
-  prerequisites, dry run, immutable preparation, approval, execution, completion,
-  and interruption handling.
+  retained low-level and exact-replay guidance.
 - [Reproducibility and recovery runbook](docs/hierarchical_all_evidence_reproducibility_runbook.md):
   artifact preservation, exact cache replay, relocation limits, verification, and
   recovery after conversation compaction.

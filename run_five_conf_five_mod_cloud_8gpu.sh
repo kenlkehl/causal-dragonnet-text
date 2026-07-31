@@ -10,36 +10,43 @@
 # Repository preparation on the cloud VM:
 #
 #   cd /path/to/causal-dragonnet-text
-#   uv sync --frozen --extra extraction --extra gemini
+#   uv sync --frozen --extra extraction
 #
-# Configure Gemini, validate, and launch:
+# Download/prepare the pinned models, validate, and launch:
 #
-#   export GEMINI_API_KEY='your-key'
+#   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh --prepare-only
 #   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh --check-only
 #   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh
 #
-# The default is the complete workflow: Stage 1, handoff validation, Gemini
-# 3.6 Flash Stage 2, complete-note extraction, five strict outer-fold causal
-# forests, frozen held-out predictions, and post-freeze oracle evaluation. To
-# intentionally stop at the validated Stage 1 handoff instead, launch with:
+# The default is the complete workflow: Stage 1, handoff validation, local
+# vLLM Stage 2, complete-note extraction, five strict outer-fold causal
+# forests, frozen held-out predictions, and post-freeze oracle evaluation.
+# Stage 2 uses NVIDIA's pinned nvidia/Gemma-4-31B-IT-NVFP4 checkpoint with
+# ModelOpt NVFP4, tensor parallelism across GPUs 0-7, and the complete 256K
+# context window. The model-facing prompt ceiling creates additional lossless
+# deterministic batches; it never truncates or samples evidence.
+#
+# A CPU-only loopback proxy starts before production. It does not touch CUDA
+# during Stage 1. The first Stage 2 request starts the eight-GPU vLLM server,
+# waits for health and exact served-model identity, then forwards the request.
+# This prevents Stage 1 and vLLM from competing for the same GPUs. The launcher
+# sends SIGTERM to its verified proxy/server group on exit and never SIGKILL.
+#
+# To intentionally stop at the validated Stage 1 handoff (without ever loading
+# vLLM), launch with:
 #
 #   STOP_AFTER=handoff_validation SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh
 #
-# Gemini defaults to model gemini-3.6-flash at Google's OpenAI-compatible API.
-# STAGE2_ENDPOINT and STAGE2_ENDPOINT_MODEL may override those values before
-# the first invocation; later changes define a different immutable request.
-#
 # The launcher requires exactly eight visible GPUs (physical devices 0-7),
-# Python 3.12 or 3.13, and the locked uv environment. It downloads and
-# materializes the pinned models when explicit local model directories are not
-# supplied. Run this committed source revision on the VM; uncommitted local
-# changes are not transferred by git.
+# NVIDIA Blackwell capability, Python 3.12 or 3.13, and the locked uv
+# environment. Its first preparation downloads about 32.7 GB for the pinned
+# Stage 2 checkpoint in addition to the Stage 1 models. Run this committed
+# source revision on the VM; uncommitted local changes are not transferred by
+# git.
 #
-# The abandoned local/remote production attempts, scratch data, dated source
-# snapshots, launch controls, logs, and old five-conf remote launcher were
-# removed. Unrelated historical research fixtures and local models were
-# intentionally preserved. User-facing run/profile/snapshot names are
-# unversioned; internal schema versions remain authentication contracts.
+# No pre-existing artifacts are required. The ignored artifacts/ directory is
+# recreated on the VM for pinned local models, the immutable source snapshot,
+# durable results, scratch data, profiles, locks, and vLLM logs/status.
 #
 # Verification at publication: focused tests, py_compile, shell syntax,
 # uv lock --check, locked uv sync --dry-run, and git diff --check passed.

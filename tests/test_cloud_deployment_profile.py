@@ -41,8 +41,11 @@ def test_cloud_profile_compiles_eight_disjoint_lanes_deterministically(
         preflight_owner_peak=8 * 1024**3,
         preflight_lanes=8,
         embedding_batch_size=8,
-        endpoint="https://generativelanguage.googleapis.com/v1beta/openai/",
-        endpoint_model="gemini-3.6-flash",
+        endpoint="http://127.0.0.1:8002/v1",
+        endpoint_model=(
+            "nvidia/Gemma-4-31B-IT-NVFP4@"
+            "4135a98a9b728a548947683219633b25682223ac"
+        ),
     )
 
     first = module.build_profile(args)
@@ -53,8 +56,11 @@ def test_cloud_profile_compiles_eight_disjoint_lanes_deterministically(
     assert args.target.read_bytes() == first_bytes
     assert first.devices == tuple(f"cuda:{index}" for index in range(8))
     assert first.embedding_batch_size == 8
-    assert first.endpoint == "https://generativelanguage.googleapis.com/v1beta/openai/"
-    assert first.endpoint_model == "gemini-3.6-flash"
+    assert first.endpoint == "http://127.0.0.1:8002/v1"
+    assert first.endpoint_model == (
+        "nvidia/Gemma-4-31B-IT-NVFP4@"
+        "4135a98a9b728a548947683219633b25682223ac"
+    )
     assert first.stage1_execution.max_parallel_owners == 8
     assert first.stage1_execution.scope_workers_per_device == 1
     assert first.stage1_execution.htr_operational_controls.fold_parallelism == 1
