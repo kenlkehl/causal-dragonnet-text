@@ -102,7 +102,7 @@ readonly REMOTE_HOSTNAME_SAFE="$(
 [[ -n "${REMOTE_HOSTNAME_SAFE}" ]] \
     || fail "remote hostname has no safe characters"
 
-readonly RUN_TAG="${FIVE_CONF_RUN_TAG:-r15_token_attention_htr_stage2_complete_semantic_catalog_fast_stat_auth_reusable_preflight_v8_remote_${REMOTE_HOSTNAME_SAFE}_gpu01}"
+readonly RUN_TAG="${FIVE_CONF_RUN_TAG:-r15_token_attention_htr_stage2_complete_semantic_catalog_fast_stat_auth_reusable_preflight_v11_remote_${REMOTE_HOSTNAME_SAFE}_gpu01}"
 [[ "${RUN_TAG}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
     || fail "FIVE_CONF_RUN_TAG contains unsupported characters"
 
@@ -117,8 +117,6 @@ readonly ENDPOINT_MODEL="${FIVE_CONF_ENDPOINT_MODEL:-gemma4-26B}"
 readonly MPL_CONFIG_DIRECTORY="/tmp/causal_dragonnet_mpl_${RUN_TAG}"
 readonly LAUNCH_LOCK_DIRECTORY="${REPO_ROOT}/artifacts/production_launch_locks"
 readonly LAUNCH_LOCK_PATH="${LAUNCH_LOCK_DIRECTORY}/five_conf_five_mod_1000_${RUN_TAG}.lock"
-readonly ADOPT_INPUT_PREPARATION_CHECKPOINT="${SUPERSEDED_TOKEN_ROOT}/portable_checkpoints/input_preparation"
-readonly ADOPT_EMBEDDING_CACHE_CHECKPOINT="${SUPERSEDED_TOKEN_ROOT}/portable_checkpoints/embedding_cache"
 readonly ADOPT_STAGE1_PREFLIGHT_CHECKPOINT="${SUPERSEDED_TOKEN_ROOT}/portable_checkpoints/stage1_preflight"
 
 [[ "${DURABLE_ROOT}" == "${REPO_ROOT}/artifacts/"* ]] \
@@ -142,12 +140,6 @@ require_directory "${EMBEDDING_CACHE}"
 require_file "${EMBEDDING_CACHE}/metadata.json"
 require_file "${CACHE_SOURCE_PREPARED_DURABLE}"
 require_file "${CACHE_SOURCE_PREPARATION_MANIFEST}"
-require_directory "${ADOPT_INPUT_PREPARATION_CHECKPOINT}"
-require_file "${ADOPT_INPUT_PREPARATION_CHECKPOINT}/artifact_manifest.json"
-require_file "${ADOPT_INPUT_PREPARATION_CHECKPOINT}/artifact_locator.json"
-require_directory "${ADOPT_EMBEDDING_CACHE_CHECKPOINT}"
-require_file "${ADOPT_EMBEDDING_CACHE_CHECKPOINT}/artifact_manifest.json"
-require_file "${ADOPT_EMBEDDING_CACHE_CHECKPOINT}/artifact_locator.json"
 require_directory "${ADOPT_STAGE1_PREFLIGHT_CHECKPOINT}"
 require_file "${ADOPT_STAGE1_PREFLIGHT_CHECKPOINT}/artifact_manifest.json"
 require_file "${ADOPT_STAGE1_PREFLIGHT_CHECKPOINT}/artifact_locator.json"
@@ -182,12 +174,9 @@ require_file "${OBSOLETE_CONTROL}"
 "${REMOTE_PYTHON}" -P "${OBSOLETE_CONTROL}" assert-stopped
 
 ADOPTION_ARGUMENTS=(
-    --adopt-checkpoint "${ADOPT_INPUT_PREPARATION_CHECKPOINT}"
-    --adopt-checkpoint "${ADOPT_EMBEDDING_CACHE_CHECKPOINT}"
     --adopt-checkpoint "${ADOPT_STAGE1_PREFLIGHT_MANIFEST}"
 )
 readonly -a ADOPTION_ARGUMENTS
-readonly EXPECTED_ADOPTED_PHASES="input_preparation,embedding_cache"
 
 readonly SNAPSHOT_CONTENT_SHA256="$(
     SNAPSHOT_TO_VALIDATE="${SNAPSHOT_ROOT}" \
@@ -471,7 +460,7 @@ elif [[ -e "${DURABLE_ROOT}" ]]; then
     RESUME_ARGUMENTS=(--resume)
     note "existing immutable request found; component-granular resume is enabled"
 else
-    note "fresh fast-auth complete-semantic-catalog request will adopt compatible completed checkpoints"
+    note "fresh fast-auth complete-semantic-catalog request will rebuild cheap phase wrappers around reusable scientific payloads"
 fi
 
 WORKFLOW_ARGUMENTS=(
@@ -503,7 +492,8 @@ note "durable root: ${DURABLE_ROOT}"
 note "scratch root: ${SCRATCH_ROOT}"
 note "superseded request is stopped; compatible sealed Stage 1 components share this scratch store"
 note "portable Stage 1 preflight candidate: ${ADOPT_STAGE1_PREFLIGHT_MANIFEST}"
-note "the first v8 migration authenticates old bytes, reuses KMeans/SVD states, and materializes the complete global token inventory once"
+note "input preparation will rerun; the completed R14 embedding payload will be imported without recomputing embeddings"
+note "the first v11 migration authenticates old bytes, reuses KMeans/SVD states, and materializes the complete global token inventory once"
 note "later compatible preflight opens use protected proof/stat continuity and lazy owner-state references"
 note "deployment profile: ${DEPLOYMENT_PROFILE}"
 note "HTR pooling: token_attention; all CLS HTR components are ineligible"
@@ -521,9 +511,7 @@ if (( CHECK_ONLY == 1 )); then
     PYTHONNOUSERSITE=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH="${SNAPSHOT_ROOT}" \
-    FIVE_CONF_EXPECTED_ADOPTED_PHASES="${EXPECTED_ADOPTED_PHASES}" \
         "${REMOTE_PYTHON}" -P - "${WORKFLOW_ARGUMENTS[@]}" <<'PY'
-import os
 import sys
 
 from oci.inference.production_all_evidence_workflow import (
@@ -544,10 +532,7 @@ adopted = {
     record["substituted_phase"]
     for record in request["requested_checkpoint_adoptions"]
 }
-expected = set(
-    os.environ["FIVE_CONF_EXPECTED_ADOPTED_PHASES"].split(",")
-)
-if adopted != expected:
+if adopted:
     raise SystemExit(f"unexpected adopted phases: {sorted(adopted)}")
 preflight = request.get("legacy_preflight_candidate_identity")
 if (
@@ -560,8 +545,9 @@ if (
     )
 print(
     "[five-conf token-attention remote] exact request compatibility "
-    "passed; input/cache are adopted and compatible preflight states "
-    "will migrate without refitting"
+    "passed; input/cache phase wrappers will be rebuilt, the completed "
+    "embedding payload will be imported without recomputation, and "
+    "compatible preflight states will migrate without refitting"
 )
 PY
     note "all checks passed; workflow was not started"

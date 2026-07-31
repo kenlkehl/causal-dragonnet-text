@@ -7,7 +7,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly REPO_ROOT="/data1/ken/pcori_dev/causal-dragonnet-text"
-readonly SNAPSHOT_ROOT="${REPO_ROOT}/artifacts/production_source_snapshot_20260730_token_attention_htr_stage2_complete_semantic_catalog_fast_stat_auth_reusable_preflight_v8"
+readonly SNAPSHOT_ROOT="${REPO_ROOT}/artifacts/production_source_snapshot_20260731_token_attention_htr_stage2_complete_semantic_catalog_fast_stat_auth_reusable_preflight_v11"
 readonly SNAPSHOT_LAUNCHER="${SNAPSHOT_ROOT}/scripts/run_five_conf_five_mod_remote_gpu01.sh"
 
 if [[ ! -f "${SNAPSHOT_LAUNCHER}" || -L "${SNAPSHOT_LAUNCHER}" ]]; then

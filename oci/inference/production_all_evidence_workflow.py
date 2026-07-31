@@ -11946,11 +11946,32 @@ class ProductionAllEvidenceWorkflow:
                         )
                     )
                     return self._validated_complete(phase)
-                proof_start_probe = (
-                    _authentication_probe_ctime_ns(
-                        proof_store
+                try:
+                    proof_start_probe = (
+                        _authentication_probe_ctime_ns(
+                            proof_store
+                        )
                     )
-                )
+                except (
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    # Stat-continuity proof creation is an optimization, not
+                    # an authentication prerequisite.  A shared filesystem
+                    # may be unable to establish the private timestamp probe
+                    # required by the fast path.  In that case retain no
+                    # stat authority and continue into the ordinary full-byte
+                    # validator below.
+                    LOGGER.warning(
+                        "phase stat-continuity probe unavailable; "
+                        "falling back to full-byte authentication: %s "
+                        "(%s: %s)",
+                        phase,
+                        type(exc).__name__,
+                        exc,
+                    )
         if process_stats is not None:
             value = _read_json_object(
                 path,
@@ -12199,11 +12220,18 @@ class ProductionAllEvidenceWorkflow:
                     self.options.work_root
                 )
             )
-        except (OSError, RuntimeError, TypeError, ValueError):
+        except (
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             LOGGER.warning(
-                "could not start phase stat-continuity proof: %s",
+                "could not start phase stat-continuity proof: %s "
+                "(%s: %s)",
                 phase,
-                exc_info=True,
+                type(exc).__name__,
+                exc,
             )
         artifacts = _attempt_tree_artifacts(attempt_dir)
         registered = {row["path"] for row in artifacts}
@@ -12252,6 +12280,13 @@ class ProductionAllEvidenceWorkflow:
         }
         manifest = {**body, "content_sha256": _sha(body)}
         _atomic_write_json(target, manifest)
+        # Publication either atomically moved an already authenticated tree
+        # or hashed every copied byte before committing it.  Preserve the
+        # returned inode/stat inventory as process-local authority even when
+        # this filesystem cannot support the optional cross-process proof.
+        self._phase_payload_stat_inventories[phase] = dict(
+            process_authenticated_stats
+        )
         if proof_start_probe is not None:
             from .production_stage1_reusable_preflight import (
                 _publish_optional_full_auth_proof,
@@ -12300,11 +12335,6 @@ class ProductionAllEvidenceWorkflow:
                 ] = _phase_payload_stat_inventory_from_proof(
                     proof=published_proof,
                     artifacts=published_artifacts,
-                )
-            else:
-                self._phase_payload_stat_inventories.pop(
-                    phase,
-                    None,
                 )
         return manifest
 

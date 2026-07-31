@@ -176,6 +176,110 @@ def test_completed_phase_optional_proof_failure_accepts_valid_deep_bytes(
     assert workflow._phase_payload_stat_inventories == {}
 
 
+def test_completed_phase_timestamp_probe_failure_uses_deep_authentication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import oci.inference.production_stage1_reusable_preflight as reusable
+
+    workflow, payload = _bare_workflow_with_completed_phase(
+        tmp_path
+    )
+    original = workflow_module.stable_file_sha256
+    payload_reads: list[Path] = []
+
+    def unavailable(_store_root: Path) -> int:
+        raise ValueError(
+            "reusable preflight timestamp-probe root is not protected"
+        )
+
+    def traced(path: Path) -> tuple[str, int]:
+        resolved = Path(path).resolve(strict=True)
+        if resolved == payload.resolve(strict=True):
+            payload_reads.append(resolved)
+        return original(resolved)
+
+    monkeypatch.setattr(
+        reusable,
+        "_authentication_probe_ctime_ns",
+        unavailable,
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "stable_file_sha256",
+        traced,
+    )
+    with caplog.at_level(logging.WARNING):
+        completed = workflow._validated_complete(
+            "embedding_cache"
+        )
+
+    assert completed is not None
+    assert payload_reads == [payload.resolve(strict=True)]
+    assert workflow._phase_payload_stat_inventories == {}
+    assert "falling back to full-byte authentication" in caplog.text
+
+
+def test_phase_publication_retains_process_stats_when_probe_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import oci.inference.production_stage1_reusable_preflight as reusable
+
+    work_root = (tmp_path / "publication-workflow").resolve()
+    attempt = (tmp_path / "publication-attempt").resolve()
+    attempt.mkdir()
+    payload = attempt / "embedding-cache.bin"
+    payload.write_bytes(b"authenticated-cache" * 4096)
+
+    workflow = object.__new__(ProductionAllEvidenceWorkflow)
+    workflow.options = SimpleNamespace(work_root=work_root)
+    workflow.request = {"request_sha256": "b" * 64}
+    workflow._phase_payload_stat_inventories = {}
+    workflow._adopted_artifact_handles = {}
+    workflow.telemetry = SimpleNamespace(
+        count_bytes=lambda **_kwargs: None,
+    )
+
+    def unavailable(_store_root: Path) -> int:
+        raise ValueError(
+            "reusable preflight timestamp-probe root is not protected"
+        )
+
+    monkeypatch.setattr(
+        reusable,
+        "_authentication_probe_ctime_ns",
+        unavailable,
+    )
+    completed = workflow._complete(
+        "embedding_cache",
+        {
+            "terminal_files": [str(payload)],
+        },
+        attempt_dir=attempt,
+    )
+    published_payload = Path(completed["attempt_dir"]) / payload.name
+    original_hash = workflow_module.stable_file_sha256
+
+    def forbidden_hash(path: Path) -> tuple[str, int]:
+        if Path(path).resolve(strict=True) == published_payload:
+            raise AssertionError(
+                "same-process validation reread a published payload"
+            )
+        return original_hash(path)
+
+    assert "embedding_cache" in (
+        workflow._phase_payload_stat_inventories
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "stable_file_sha256",
+        forbidden_hash,
+    )
+    assert workflow._validated_complete("embedding_cache") == completed
+
+
 def test_completed_phase_mutation_during_proof_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
