@@ -21,6 +21,17 @@
 #   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh --check-only
 #   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh
 #
+# To guarantee a completely new run that cannot resume or import any prior
+# scientific artifact, select unused roots and enable the fresh-start guard:
+#
+#   unset CLOUD_ADOPT_RUN_ROOT CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT STOP_AFTER
+#   export CLOUD_FRESH_START=1
+#   export CLOUD_RUN_ROOT_BASE="$PWD/artifacts/cloud_runs_fresh"
+#   export CLOUD_SCRATCH_ROOT_BASE="$PWD/artifacts/cloud_scratch_fresh"
+#   export CLOUD_RUNTIME_PROFILE_ROOT="$PWD/artifacts/runtime_profiles/fresh"
+#   export CLOUD_SOURCE_SNAPSHOT_ROOT="$PWD/artifacts/production_source_snapshot_fresh"
+#   SKIP_UV_SYNC=1 ./run_five_conf_five_mod_cloud_8gpu.sh
+#
 # To recover the completed embedding cache from a preserved failed run after a
 # source correction, keep the old trees intact and use fresh active roots:
 #

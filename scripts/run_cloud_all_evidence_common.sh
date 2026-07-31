@@ -33,6 +33,9 @@ require_directory() {
 
 cloud_check_only=0
 cloud_prepare_only=0
+cloud_fresh_start="${CLOUD_FRESH_START:-0}"
+[[ "${cloud_fresh_start}" == "0" || "${cloud_fresh_start}" == "1" ]] \
+    || fail "CLOUD_FRESH_START must be 0 or 1"
 case "${1:-}" in
     "") ;;
     --check-only) cloud_check_only=1 ;;
@@ -311,6 +314,16 @@ cloud_vllm_status="${cloud_vllm_runtime_root}/status.json"
 cloud_vllm_proxy_log="${cloud_vllm_runtime_root}/proxy.log"
 cloud_vllm_gpu_memory_utilization="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
 cloud_vllm_startup_timeout="${VLLM_STARTUP_TIMEOUT_SECONDS:-600}"
+if [[ "${cloud_fresh_start}" == "1" ]]; then
+    [[ -z "${CLOUD_ADOPT_RUN_ROOT:-}" ]] \
+        || fail "CLOUD_FRESH_START forbids checkpoint adoption"
+    [[ -z "${CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT:-}" ]] \
+        || fail "CLOUD_FRESH_START forbids embedding-cache import"
+    [[ ! -e "${cloud_durable_root}" && ! -L "${cloud_durable_root}" ]] \
+        || fail "CLOUD_FRESH_START requires an unused durable run root: ${cloud_durable_root}"
+    [[ ! -e "${cloud_scratch_root}" && ! -L "${cloud_scratch_root}" ]] \
+        || fail "CLOUD_FRESH_START requires an unused scratch root: ${cloud_scratch_root}"
+fi
 mkdir -p \
     "${cloud_run_base}" \
     "${cloud_scratch_base}" \
@@ -345,7 +358,9 @@ exec 9>"${cloud_lock_path}"
 flock -n 9 || fail "another launcher owns ${CLOUD_RUN_KEY}"
 
 cloud_resume_arguments=()
-if [[ -L "${cloud_durable_root}" ]]; then
+if [[ "${cloud_fresh_start}" == "1" ]]; then
+    note "fresh-start guard accepted unused durable and scratch roots; no checkpoints or cache imports are eligible"
+elif [[ -L "${cloud_durable_root}" ]]; then
     fail "durable run root is a symlink"
 elif [[ -d "${cloud_durable_root}" ]]; then
     require_file "${cloud_durable_root}/immutable_run_request.json"

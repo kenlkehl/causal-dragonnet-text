@@ -297,31 +297,28 @@ every subsequent resume of the corrected request.
 ## Starting a genuinely fresh run
 
 The default run keys are stable so an ordinary rerun resumes. To create a new
-attempt without deleting or overwriting the old one, first preserve the
-generated deployment profile for the old request. For the one-confounder run:
+attempt without deleting or overwriting the old one, unset every recovery
+input, enable the fail-closed fresh-start guard, and select unused run, scratch,
+profile, and source-snapshot roots:
 
 ```bash
-mkdir -p /absolute/path/to/preserved_profiles
-mv artifacts/runtime_profiles/current/one_conf_one_mod.json \
-  /absolute/path/to/preserved_profiles/one_conf_one_mod.previous.json
-```
+unset CLOUD_ADOPT_RUN_ROOT CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT STOP_AFTER
+export CLOUD_FRESH_START=1
+export CLOUD_RUN_ROOT_BASE="$PWD/artifacts/cloud_runs_fresh"
+export CLOUD_SCRATCH_ROOT_BASE="$PWD/artifacts/cloud_scratch_fresh"
+export CLOUD_RUNTIME_PROFILE_ROOT="$PWD/artifacts/runtime_profiles/fresh"
+export CLOUD_SOURCE_SNAPSHOT_ROOT="$PWD/artifacts/production_source_snapshot_fresh"
 
-Use `five_conf_five_mod.json` for the other benchmark. Then choose fresh run,
-scratch, and source-snapshot paths:
-
-```bash
-export CLOUD_RUN_ROOT_BASE=/absolute/path/to/new_cloud_runs
-export CLOUD_SCRATCH_ROOT_BASE=/absolute/path/to/new_cloud_scratch
-export CLOUD_SOURCE_SNAPSHOT_ROOT=/absolute/path/to/new_source_snapshot
-
-SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh --check-only
 SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh
 ```
 
-These paths must not identify an incompatible prior request. A compatible
-`CLOUD_MODEL_ROOT` may be shared read-only or reused to avoid downloading model
-bytes again, but the two active workflows must have distinct run and scratch
-roots.
+The guard refuses to launch if the selected durable or scratch run root already
+exists, or if any checkpoint/cache import is configured. Input preparation,
+embedding construction, preflight, and Stage 1 therefore run from scratch. A
+compatible `CLOUD_MODEL_ROOT` remains reusable because model materialization is
+not a scientific run artifact. After a failed fresh launch, unset
+`CLOUD_FRESH_START` to resume that same immutable request rather than asking the
+guard to create it again.
 
 If source code changed after `production_source_snapshot_current` was created,
 the launcher rejects the stale snapshot. Preserve it for the old run and select
@@ -382,6 +379,7 @@ The launchers expose a small number of deployment-only controls. Set them before
 | `CLOUD_SCRATCH_ROOT_BASE` | scratch base | `artifacts/cloud_scratch` |
 | `CLOUD_RUNTIME_PROFILE_ROOT` | generated deployment-profile directory | `artifacts/runtime_profiles/current` |
 | `CLOUD_SOURCE_SNAPSHOT_ROOT` | immutable source snapshot | `artifacts/production_source_snapshot_current` |
+| `CLOUD_FRESH_START` | require unused run/scratch roots and forbid all checkpoint/cache reuse | `0` |
 | `CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT` | optional preserved run supplying a cache through authenticated relocation | unset |
 
 `CLOUD_GPU_COUNT` and `CLOUD_VISIBLE_DEVICES` are validated rather than

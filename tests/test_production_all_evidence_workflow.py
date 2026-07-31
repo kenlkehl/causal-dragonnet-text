@@ -4670,6 +4670,80 @@ def test_cache_import_can_discover_its_authenticated_source_preparation(tmp_path
     )
 
 
+def test_cold_reusable_preflight_selector_reads_typed_request_science(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import oci.inference.production_stage1_bundle as bundle_module
+    import oci.inference.review_spent_evidence_provider as witness_module
+
+    options = _portable_options(tmp_path)
+    options.stage1_profile_path.write_text(
+        json.dumps(
+            {
+                "config": {
+                    "architecture": {
+                        "htr_chunk_size_words": 64,
+                        "htr_chunk_overlap_words": 8,
+                        "htr_max_chunks": 128,
+                        "htr_max_chunk_length": 96,
+                        "multi_model_forest": {
+                            "embedding_contrast": {},
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    workflow = ProductionAllEvidenceWorkflow(options)
+    workflow.request = workflow._request_body()
+    assert "scientific_settings" not in workflow.request
+    assert isinstance(
+        workflow.request.get("portable_scientific_spec"),
+        dict,
+    )
+    workflow._validated_complete = lambda phase: (
+        {"result": {"cache_identity": {"fixture": True}}}
+        if phase == "embedding_cache"
+        else None
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "_reusable_preflight_cache_selector",
+        lambda _identity: {"fixture_cache_science": True},
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_embedding_cluster_preflight_scientific_configuration",
+        lambda _config: {"fixture_cluster_science": True},
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_htr_tokenizer_scientific_identity",
+        lambda _path: {"fixture_tokenizer_science": True},
+    )
+    monkeypatch.setattr(
+        witness_module,
+        "semantic_witness_config_from_portable_scientific_spec",
+        lambda _spec: SimpleNamespace(
+            as_dict=lambda: {"fixture_witness_science": True}
+        ),
+    )
+
+    selector = workflow._reusable_preflight_accepted_input_selector()
+
+    assert selector["schema_version"] == (
+        "production_stage1_preflight_accepted_input_selector_v2"
+    )
+    assert selector["columns"] == options.portable_scientific_spec[
+        "columns"
+    ]
+    assert selector["prepared_dataset_and_embedding_cache"] == {
+        "fixture_cache_science": True
+    }
+
+
 def test_parallel_cache_preflight_and_modeling_hooks_receive_immutable_context(
     tmp_path,
 ):

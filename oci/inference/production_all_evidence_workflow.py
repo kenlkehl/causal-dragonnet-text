@@ -13623,7 +13623,11 @@ class ProductionAllEvidenceWorkflow:
             if isinstance(cache_phase, Mapping)
             else None
         )
-        settings = self.request.get("scientific_settings")
+        # The immutable request stores the typed path-neutral scientific
+        # payload under the same public field carried by the compiled
+        # options.  ``scientific_settings`` is only an internal input to the
+        # workflow-science identity and is not a top-level request field.
+        settings = self.request.get("portable_scientific_spec")
         architectures = (
             settings.get("architecture_profiles")
             if isinstance(settings, Mapping)
