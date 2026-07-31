@@ -1,6 +1,0 @@
-variable,hit,n_hits,best_feature,best_direction,best_coefficient,best_abs_rank_within_direction,all_hit_features
-age,True,65,age 71,negative,-0.5609974010167207,4,age 71; age 75; age 77; age 86; age 78; age 84; miller age; age 85; age 73; age 70; 71 year; age 81; age 80; 78 year; age 82; 84 year; age 72; 77 year; 10 years; 86 year; age 76; age 74; stated age; 75 year; age and
-sex,True,7,female,positive,0.1990081613769284,156,male; 78 sex; 71 sex; female; 53 sex; 55 sex; redacted sex
-ecog_performance_status,True,5,ambulation,negative,-0.2804049148615279,106,ambulation; fatigued; ecog limited; mildly fatigued; ecog fully
-creatinine_clearance,True,24,kidney,negative,-0.498230604595503,12,kidney; kidney disease; chronic kidney; crcl; renal panel; bun 22; bun 18; renal function; creatinine mg; renal impairment; bun 15; renal; bun 16; min bun; high bun; and renal; borderline renal; bun; function crcl; creatinine 78; bun 12; creatinine 80; creatinine 85; renal and
-prior_platinum_therapy,True,2,cisplatin pemetrexed,positive,0.3161082067373147,42,cisplatin pemetrexed; platinum doublet
