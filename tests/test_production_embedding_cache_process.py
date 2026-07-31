@@ -158,7 +158,7 @@ def test_public_spawn_builder_freshly_validates_in_parent_and_stat_guards(
             sentence_model_name="fixture/model",
             chunk_configuration={"fixture": True},
             target_dir=target,
-            device="cpu",
+            devices=("cuda:0", "cuda:1"),
             batch_size=2,
             cpu_budget=2,
         )
@@ -166,6 +166,11 @@ def test_public_spawn_builder_freshly_validates_in_parent_and_stat_guards(
 
     assert result.identity()["cache_path"] == str(target)
     assert result.execution_attestation["worker_exit_confirmed"] is True
+    assert result.execution_attestation["selected_devices"] == [
+        "cuda:0",
+        "cuda:1",
+    ]
+    assert result.execution_attestation["parallel_device_lanes"] == 2
     assert (
         result.execution_attestation[
             "model_materialized_in_parent_process"
@@ -194,7 +199,7 @@ def test_workflow_fresh_cache_phase_uses_spawned_builder(
 
     class Result:
         execution_attestation = {
-            "schema_version": "production_embedding_cache_spawn_execution_v1",
+            "schema_version": "production_embedding_cache_spawn_execution_v2",
             "worker_exit_confirmed": True,
         }
 
@@ -221,6 +226,8 @@ def test_workflow_fresh_cache_phase_uses_spawned_builder(
         embedding_local_model_path=model,
         embedding_model_name="configured/model",
         stage1_device="cpu",
+        query_device=None,
+        query_devices=("cpu",),
         embedding_batch_size=7,
         cpu_budget=3,
     )
@@ -240,6 +247,7 @@ def test_workflow_fresh_cache_phase_uses_spawned_builder(
     assert len(calls) == 1
     assert calls[0]["cpu_budget"] == 3
     assert calls[0]["batch_size"] == 7
+    assert calls[0]["devices"] == ("cpu",)
     assert result["cache_identity"] == {"authenticated": "parent"}
     assert result["embedding_model_materialized_in_workflow_process"] is False
     assert result["embedding_model_materialized_in_short_lived_worker"] is True

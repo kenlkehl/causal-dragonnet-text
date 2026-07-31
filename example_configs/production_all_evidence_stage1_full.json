@@ -251,7 +251,7 @@
       "htr_sentence_encoder_backend": "auto",
       "htr_sentence_encoder_batch_size": 16,
       "htr_sentence_model": "CONFIGURED_BY_PRODUCTION_WORKFLOW",
-      "htr_sentence_pooling": "auto",
+      "htr_sentence_pooling": "token_attention",
       "htr_trainable_sentence_encoder_layers": 0,
       "htr_transformer_activation": "gelu_exact",
       "htr_transformer_attention_bias": true,

@@ -7,7 +7,7 @@ name = "onc-causal-inference"
 version = "0.1.0"
 description = "Causal inference from clinical text using frozen LLM feature extraction"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 license = {text = "MIT"}
 authors = [
     {name = "Ken Kehl", email = "kenneth_kehl@dfci.harvard.edu"}
@@ -32,6 +32,7 @@ dependencies = [
     "joblib>=1.2.0",
     "accelerate>=0.20.0",
     "sentence-transformers>=3.0.0",
+    "huggingface-hub>=1.0.0",
     "sentencepiece>=0.2.0",
     "tiktoken>=0.5.0",
     "jsonschema==4.26.0",

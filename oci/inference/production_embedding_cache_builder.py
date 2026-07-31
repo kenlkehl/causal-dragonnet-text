@@ -37,15 +37,15 @@ from oci.models.concept_embedding_utils import chunk_text_words
 from .review_spent_evidence_provider import SpentOnlyFrozenChunkEmbeddingCache
 
 PRODUCTION_EMBEDDING_CACHE_BUILDER_VERSION = (
-    "production_arbitrary_cohort_embedding_cache_builder_v3"
+    "production_arbitrary_cohort_embedding_cache_builder_v4"
 )
 PRODUCTION_EMBEDDING_CACHE_METADATA_SCHEMA = (
-    "production_arbitrary_cohort_embedding_cache_metadata_v3"
+    "production_arbitrary_cohort_embedding_cache_metadata_v4"
 )
 PRODUCTION_EMBEDDING_CACHE_PROVENANCE_SCHEMA = (
-    "production_arbitrary_cohort_embedding_cache_provenance_v3"
+    "production_arbitrary_cohort_embedding_cache_provenance_v4"
 )
-PRODUCTION_EMBEDDING_CACHE_RESULT_SCHEMA = "production_arbitrary_cohort_embedding_cache_result_v3"
+PRODUCTION_EMBEDDING_CACHE_RESULT_SCHEMA = "production_arbitrary_cohort_embedding_cache_result_v4"
 
 _CACHE_FILES = frozenset(
     {
@@ -170,8 +170,9 @@ _MODEL_PROVENANCE_FIELDS = frozenset(
 )
 _ENCODER_EXECUTION_FIELDS = frozenset(
     {
-        "device",
         "batch_size",
+        "batch_partition_policy",
+        "resource_assignment_in_scientific_identity",
         "local_files_only",
         "trust_remote_code",
         "offline_environment",
@@ -519,8 +520,14 @@ def _validated_chunk_configuration(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("convert_to_numpy must be true and convert_to_tensor must be false")
     if raw["truncate_dim"] is not None:
         raise ValueError("truncate_dim must be null; embedding truncation is forbidden")
-    if raw["pooling_output_policy"] != "single_process_sentence_embedding_v1":
-        raise ValueError("pooling_output_policy must be 'single_process_sentence_embedding_v1'")
+    if (
+        raw["pooling_output_policy"]
+        != "canonical_batch_multi_device_sentence_embedding_v1"
+    ):
+        raise ValueError(
+            "pooling_output_policy must be "
+            "'canonical_batch_multi_device_sentence_embedding_v1'"
+        )
     if raw["model_dtype"] not in {"float32", "float16", "bfloat16"}:
         raise ValueError("model_dtype must be float32, float16, or bfloat16")
     if raw["stored_array_dtype"] != "float32":
@@ -841,6 +848,46 @@ def _write_chunk_registry(path: Path, sample_chunks: Sequence[Sequence[str]]) ->
         os.fsync(handle.fileno())
 
 
+def _validated_encoder_devices(
+    *,
+    device: str | None,
+    devices: Sequence[str] | None,
+) -> tuple[str | None, ...]:
+    """Resolve one deployment lease without making it cache science.
+
+    Canonical batches are the scientific/numerical unit.  A deployment may
+    schedule those complete batches on one or several devices, but it cannot
+    change their boundaries or their canonical output positions.
+    """
+
+    if devices is not None and device is not None:
+        raise ValueError("device and devices cannot both be configured")
+    if devices is None:
+        candidates: tuple[str | None, ...] = (device,)
+    else:
+        if isinstance(devices, (str, bytes)):
+            raise TypeError("devices must be a sequence of explicit device names")
+        candidates = tuple(devices)
+        if not candidates:
+            raise ValueError("devices must contain at least one execution device")
+    for value in candidates:
+        if value is not None and (
+            not isinstance(value, str)
+            or re.fullmatch(r"cpu|cuda(?::[0-9]+)?", value) is None
+        ):
+            raise ValueError(
+                "each encoder device must be null, cpu, cuda, or one explicit CUDA index"
+            )
+    non_null = tuple(value for value in candidates if value is not None)
+    if len(candidates) > 1 and len(non_null) != len(candidates):
+        raise ValueError("multi-device embedding execution requires explicit devices")
+    if len(non_null) != len(set(non_null)):
+        raise ValueError("encoder devices must be unique")
+    if len(candidates) > 1 and any(value == "cpu" for value in candidates):
+        raise ValueError("CPU execution supports one embedding lane")
+    return candidates
+
+
 def _encode_chunks(
     *,
     encoder: Any,
@@ -850,6 +897,7 @@ def _encode_chunks(
     configuration: Mapping[str, Any],
     prompt_name: str | None,
     prompt: str | None,
+    devices: Sequence[str | None] = (None,),
 ) -> tuple[int, int, int]:
     total = len(flat_chunks)
     if total < 1:
@@ -859,14 +907,33 @@ def _encode_chunks(
     cursor = 0
     zero_vector_count = 0
     stored_dtype = np.dtype(str(configuration["stored_array_dtype"]))
+    execution_devices = tuple(devices)
+    if not execution_devices:
+        raise ValueError("embedding encoding requires at least one device lane")
+    parallel = len(execution_devices) > 1
+    pool: Mapping[str, Any] | None = None
     try:
+        if parallel:
+            if any(value is None for value in execution_devices):
+                raise ValueError("parallel embedding lanes require explicit devices")
+            pool = encoder.start_multi_process_pool(
+                target_devices=[str(value) for value in execution_devices]
+            )
+            processes = pool.get("processes") if isinstance(pool, Mapping) else None
+            if not isinstance(processes, list) or len(processes) != len(
+                execution_devices
+            ):
+                raise RuntimeError(
+                    "sentence encoder did not establish one process per device lease"
+                )
+        wave_size = batch_size * len(execution_devices)
         while cursor < total:
-            stop = min(cursor + batch_size, total)
+            stop = min(cursor + wave_size, total)
             encoded = encoder.encode(
                 list(flat_chunks[cursor:stop]),
                 prompt_name=prompt_name,
                 prompt=prompt,
-                batch_size=stop - cursor,
+                batch_size=(batch_size if parallel else stop - cursor),
                 output_value=configuration["output_value"],
                 precision=configuration["precision"],
                 convert_to_numpy=configuration["convert_to_numpy"],
@@ -874,8 +941,8 @@ def _encode_chunks(
                 normalize_embeddings=configuration["normalize_embeddings"],
                 truncate_dim=configuration["truncate_dim"],
                 show_progress_bar=False,
-                pool=None,
-                chunk_size=None,
+                pool=pool,
+                chunk_size=(batch_size if parallel else None),
             )
             values = np.asarray(encoded)
             if values.ndim == 1:
@@ -916,6 +983,8 @@ def _encode_chunks(
         assert matrix is not None and hidden_size is not None
         matrix.flush()
     finally:
+        if pool is not None:
+            encoder.stop_multi_process_pool(pool)
         if matrix is not None:
             del matrix
     return total, int(hidden_size or 0), zero_vector_count
@@ -991,17 +1060,14 @@ def _validate_closed_provenance_shapes(provenance: Mapping[str, Any]) -> None:
         ("local_model.tree_sha256", model.get("tree_sha256")),
     ):
         _require_sha256(source, field_name=field_name)
-    device = execution.get("device")
     if (
-        (
-            device is not None
-            and (
-                not isinstance(device, str) or re.fullmatch(r"cpu|cuda(?::[0-9]+)?", device) is None
-            )
-        )
-        or not isinstance(execution.get("batch_size"), int)
+        not isinstance(execution.get("batch_size"), int)
         or isinstance(execution.get("batch_size"), bool)
         or execution["batch_size"] < 1
+        or execution.get("batch_partition_policy")
+        != "canonical_contiguous_batches_input_order_v1"
+        or execution.get("resource_assignment_in_scientific_identity")
+        is not False
         or execution.get("local_files_only") is not True
         or execution.get("trust_remote_code") is not False
         or execution.get("offline_environment") != _OFFLINE_ENVIRONMENT
@@ -1482,6 +1548,7 @@ def _build_production_embedding_cache(
     chunk_configuration: Mapping[str, Any],
     target_dir: Path | str,
     device: str | None = None,
+    devices: Sequence[str] | None = None,
     batch_size: int = 32,
 ) -> ProductionEmbeddingCacheBuildResult:
     """Build and atomically publish one authenticated arbitrary-cohort cache."""
@@ -1491,10 +1558,10 @@ def _build_production_embedding_cache(
     logical_model_name = _validated_sentence_model_name(sentence_model_name)
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
-    if device is not None and (
-        not isinstance(device, str) or re.fullmatch(r"cpu|cuda(?::[0-9]+)?", device) is None
-    ):
-        raise ValueError("device must be null, cpu, cuda, or one explicit cuda index")
+    execution_devices = _validated_encoder_devices(
+        device=device,
+        devices=devices,
+    )
     supplied_chunk_configuration = chunk_configuration
     configuration = _validated_chunk_configuration(supplied_chunk_configuration)
 
@@ -1560,9 +1627,15 @@ def _build_production_embedding_cache(
             for chunk_index, _chunk in enumerate(chunks)
         )
 
+        # Multi-device SentenceTransformer inference shares one CPU model with
+        # one spawned process per leased GPU.  Avoid materializing the model on
+        # the first GPU before all lanes have been established.
+        load_device = (
+            "cpu" if len(execution_devices) > 1 else execution_devices[0]
+        )
         encoder = _load_local_sentence_encoder(
             model_path=model,
-            device=device,
+            device=load_device,
             max_seq_length=configuration["max_seq_length"],
             model_dtype=configuration["model_dtype"],
         )
@@ -1589,6 +1662,7 @@ def _build_production_embedding_cache(
             configuration=configuration,
             prompt_name=prompt_name,
             prompt=prompt,
+            devices=execution_devices,
         )
 
         companion_registrations = {
@@ -1614,8 +1688,11 @@ def _build_production_embedding_cache(
         }
         model_provenance = {"path": str(model), **model_before}
         encoder_execution = {
-            "device": device,
             "batch_size": batch_size,
+            "batch_partition_policy": (
+                "canonical_contiguous_batches_input_order_v1"
+            ),
+            "resource_assignment_in_scientific_identity": False,
             "local_files_only": True,
             "trust_remote_code": False,
             "offline_environment": copy.deepcopy(_OFFLINE_ENVIRONMENT),
@@ -1770,6 +1847,7 @@ def build_production_embedding_cache(
     chunk_configuration: Mapping[str, Any],
     target_dir: Path | str,
     device: str | None = None,
+    devices: Sequence[str] | None = None,
     batch_size: int = 32,
 ) -> ProductionEmbeddingCacheBuildResult:
     """Build under process-wide offline guards and atomically publish."""
@@ -1783,6 +1861,7 @@ def build_production_embedding_cache(
             chunk_configuration=chunk_configuration,
             target_dir=target_dir,
             device=device,
+            devices=devices,
             batch_size=batch_size,
         )
 

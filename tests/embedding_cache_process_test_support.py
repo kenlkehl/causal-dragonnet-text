@@ -44,7 +44,7 @@ def fake_production_target(
         },
     }
     return {
-        "schema_version": "production_embedding_cache_spawn_build_v1",
+        "schema_version": "production_embedding_cache_spawn_build_v2",
         "cache_path": str(target.resolve(strict=True)),
         "build_identity": identity,
         "model_materialized_in_worker_process": True,

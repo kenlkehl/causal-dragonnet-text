@@ -14170,7 +14170,7 @@ class ProductionAllEvidenceWorkflow:
                 sentence_model_name=o.embedding_model_name,
                 chunk_configuration=self._embedding_chunk_configuration(),
                 target_dir=cache_path,
-                device=o.stage1_device,
+                devices=self.query_devices,
                 batch_size=int(o.embedding_batch_size),
                 cpu_budget=int(o.cpu_budget),
             )

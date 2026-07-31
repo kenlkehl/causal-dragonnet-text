@@ -26,6 +26,14 @@ _STAGE2_ENDPOINT_TRANSPORT_MODES = {
     "openai_compatible",
     "google_vertex",
 }
+_GEMINI_36_MODEL_NAMES = {
+    "gemini-3.6-flash",
+    "google/gemini-3.6-flash",
+}
+
+
+def _uses_gemini_36(model_name: Any) -> bool:
+    return str(model_name or "").strip().lower() in _GEMINI_36_MODEL_NAMES
 
 
 @dataclass(frozen=True)
@@ -197,7 +205,40 @@ def project_stage2_chat_completion_request(
     # Completions fields. Portable endpoints receive the closest standard
     # representation (including reasoning_effort) without leaking those
     # implementation-specific fields onto the wire.
-    projected.pop("extra_body", None)
+    extra_body = projected.pop("extra_body", None)
+
+    # Gemini 3.6 owns its sampling defaults and rejects the legacy custom
+    # sampling controls retained in the endpoint-neutral scientific policy.
+    # Preserve that authenticated policy in the immutable request, but project
+    # it onto the provider's supported OpenAI-compatible surface at transport
+    # time. Gemini 3 cannot disable thinking completely, so ``minimal`` is the
+    # closest supported representation for extraction jobs whose local-vLLM
+    # policy disables thinking.
+    if _uses_gemini_36(projected.get("model")):
+        for field in (
+            "temperature",
+            "top_p",
+            "seed",
+            "frequency_penalty",
+            "presence_penalty",
+            "n",
+        ):
+            projected.pop(field, None)
+        chat_template = (
+            extra_body.get("chat_template_kwargs")
+            if isinstance(extra_body, Mapping)
+            else None
+        )
+        thinking_enabled = (
+            chat_template.get("enable_thinking")
+            if isinstance(chat_template, Mapping)
+            else None
+        )
+        if projected.get("reasoning_effort") is None:
+            if thinking_enabled is True:
+                projected["reasoning_effort"] = "medium"
+            elif thinking_enabled is False:
+                projected["reasoning_effort"] = "minimal"
 
     # Avoid transmitting inactive optional controls. Some otherwise compatible
     # endpoints reject them instead of treating their empty values as no-ops.
@@ -341,9 +382,15 @@ def uses_google_agent_platform(
     if uses_google_adc_api_key(api_key):
         return True
     url = str(server_url or "").lower()
-    if "aiplatform.googleapis.com" in url:
+    if (
+        "aiplatform.googleapis.com" in url
+        or "generativelanguage.googleapis.com" in url
+    ):
         return True
-    return str(model_name or "").lower().startswith("google/")
+    normalized_model = str(model_name or "").strip().lower()
+    return normalized_model.startswith("google/") or normalized_model.startswith(
+        "gemini-"
+    )
 
 
 def google_json_response_format_kwargs(

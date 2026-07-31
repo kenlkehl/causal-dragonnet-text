@@ -326,10 +326,13 @@ class SentenceEmbeddingEncoderSpec:
             )
         if self.truncate_dim is not None:
             raise ValueError("embedding_encoder.truncate_dim must be null; truncation is forbidden")
-        if self.pooling_output_policy != "single_process_sentence_embedding_v1":
+        if (
+            self.pooling_output_policy
+            != "canonical_batch_multi_device_sentence_embedding_v1"
+        ):
             raise ValueError(
                 "embedding_encoder.pooling_output_policy must be "
-                "'single_process_sentence_embedding_v1'"
+                "'canonical_batch_multi_device_sentence_embedding_v1'"
             )
         if self.model_dtype not in {"float32", "float16", "bfloat16"}:
             raise ValueError("embedding_encoder.model_dtype must be float32, float16, or bfloat16")

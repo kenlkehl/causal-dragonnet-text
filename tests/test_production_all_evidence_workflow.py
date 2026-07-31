@@ -579,7 +579,9 @@ def _options(tmp_path: Path, *, endpoint="https://different.example/v1", model="
             convert_to_numpy=True,
             convert_to_tensor=False,
             truncate_dim=None,
-            pooling_output_policy="single_process_sentence_embedding_v1",
+            pooling_output_policy=(
+                "canonical_batch_multi_device_sentence_embedding_v1"
+            ),
             model_dtype="float32",
             stored_array_dtype="float32",
             zero_vector_policy="reject",

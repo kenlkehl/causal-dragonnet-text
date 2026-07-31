@@ -2,8 +2,9 @@
 
 Loading the sentence encoder in the long-lived workflow process can retain
 Python, Torch, and CUDA allocations after the cache has been published.  This
-module keeps model construction inside one ``spawn`` child.  The parent
-receives only closed JSON, waits for the worker process to exit, and then
+module keeps model construction inside one ``spawn`` coordinator, which may
+establish one bounded encoding lane per deployment-selected GPU.  The parent
+receives only closed JSON, waits for the whole worker group to exit, and then
 freshly validates the published cache bytes without loading the model.
 
 Multiprocessing transport is ephemeral only.  No pickle is persisted as a
@@ -31,7 +32,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .production_stage1_scope_scheduler import (
     _establish_worker_process_group,
@@ -40,10 +41,10 @@ from .production_stage1_scope_scheduler import (
 
 
 SPAWNED_EMBEDDING_CACHE_BUILD_SCHEMA = (
-    "production_embedding_cache_spawn_build_v1"
+    "production_embedding_cache_spawn_build_v2"
 )
 SPAWNED_EMBEDDING_CACHE_EXECUTION_SCHEMA = (
-    "production_embedding_cache_spawn_execution_v1"
+    "production_embedding_cache_spawn_execution_v2"
 )
 PRODUCTION_EMBEDDING_CACHE_WORKER_TARGET = (
     "oci.inference.production_embedding_cache_process:"
@@ -250,7 +251,7 @@ def _production_embedding_cache_build_target(
         "sentence_model_name",
         "chunk_configuration",
         "target_dir",
-        "device",
+        "devices",
         "batch_size",
     }
     if not isinstance(parameters, Mapping) or set(parameters) != required:
@@ -270,7 +271,7 @@ def _production_embedding_cache_build_target(
             dict(parameters["chunk_configuration"])
         ),
         target_dir=Path(str(parameters["target_dir"])),
-        device=parameters["device"],
+        devices=tuple(parameters["devices"]),
         batch_size=_positive_integer(
             parameters["batch_size"],
             label="embedding-cache encode batch size",
@@ -321,7 +322,12 @@ def _worker_entry(
         )
         usage_after = resource.getrusage(resource.RUSAGE_SELF)
         io_after = _process_io_counters()
-        device = worker_parameters.get("device")
+        devices = worker_parameters.get("devices")
+        device = (
+            devices[0]
+            if isinstance(devices, list) and devices
+            else None
+        )
         telemetry = {
             "worker_pid": int(os.getpid()),
             "wall_seconds": max(0.0, time.monotonic() - started_wall),
@@ -336,6 +342,10 @@ def _worker_entry(
             ),
             "process_io_deltas": _process_io_delta(io_before, io_after),
             "peak_resident_kib": max(0, int(usage_after.ru_maxrss)),
+            "selected_devices": copy.deepcopy(devices),
+            "parallel_device_lanes": (
+                len(devices) if isinstance(devices, list) else 1
+            ),
             **_gpu_peak(device),
         }
         connection.send(
@@ -595,7 +605,8 @@ def build_production_embedding_cache_in_spawned_worker(
     sentence_model_name: str,
     chunk_configuration: Mapping[str, Any],
     target_dir: Path | str,
-    device: str | None,
+    device: str | None = None,
+    devices: Sequence[str] | None = None,
     batch_size: int,
     cpu_budget: int,
 ) -> SpawnedProductionEmbeddingCacheBuildResult:
@@ -605,6 +616,32 @@ def build_production_embedding_cache_in_spawned_worker(
     if not target.is_absolute():
         raise ValueError(
             "spawned embedding-cache target must be an absolute path"
+        )
+    if devices is not None and device is not None:
+        raise ValueError("device and devices cannot both be configured")
+    if devices is None:
+        resolved_devices: tuple[str | None, ...] = (device,)
+    else:
+        if isinstance(devices, (str, bytes)):
+            raise TypeError("devices must be a sequence of explicit device names")
+        resolved_devices = tuple(devices)
+        if not resolved_devices:
+            raise ValueError("devices must contain at least one execution device")
+    if any(
+        value is not None
+        and (
+            not isinstance(value, str)
+            or re.fullmatch(r"cpu|cuda(?::[0-9]+)?", value) is None
+        )
+        for value in resolved_devices
+    ):
+        raise ValueError("embedding-cache devices contain an invalid device name")
+    if len(resolved_devices) > 1 and (
+        any(value is None or value == "cpu" for value in resolved_devices)
+        or len(set(resolved_devices)) != len(resolved_devices)
+    ):
+        raise ValueError(
+            "parallel embedding-cache devices must be unique explicit accelerators"
         )
     parameters = {
         "dataset_path": str(Path(dataset_path)),
@@ -616,7 +653,7 @@ def build_production_embedding_cache_in_spawned_worker(
             label="embedding-cache chunk configuration",
         ),
         "target_dir": str(target),
-        "device": device,
+        "devices": list(resolved_devices),
         "batch_size": _positive_integer(
             batch_size,
             label="embedding-cache encode batch size",
@@ -683,6 +720,9 @@ def build_production_embedding_cache_in_spawned_worker(
         "model_materialized_in_worker_process": True,
         "model_materialized_in_parent_process": False,
         "parent_fresh_byte_validation": True,
+        "selected_devices": list(resolved_devices),
+        "parallel_device_lanes": len(resolved_devices),
+        "canonical_batch_merge_order": True,
         "cpu_budget": _positive_integer(
             cpu_budget,
             label="embedding-cache CPU budget",

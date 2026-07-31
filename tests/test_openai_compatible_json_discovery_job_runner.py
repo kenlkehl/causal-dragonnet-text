@@ -447,6 +447,63 @@ def test_stage2_transport_projects_portable_requests_and_keeps_response_identity
         )
 
 
+def test_gemini_36_projection_uses_supported_sampling_and_thinking_controls():
+    common = {
+        "model": "gemini-3.6-flash",
+        "messages": [{"role": "user", "content": "Return JSON"}],
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "seed": 42,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "n": 1,
+        "max_tokens": 100,
+        "reasoning_effort": None,
+    }
+    selector = llm_routing.project_stage2_chat_completion_request(
+        {
+            **common,
+            "extra_body": {
+                "top_k": -1,
+                "min_p": 0.0,
+                "chat_template_kwargs": {"enable_thinking": True},
+                "thinking_token_budget": 5000,
+            },
+        },
+        transport_mode="openai_compatible",
+    )
+    extraction = llm_routing.project_stage2_chat_completion_request(
+        {
+            **common,
+            "extra_body": {
+                "chat_template_kwargs": {"enable_thinking": False},
+                "thinking_token_budget": 0,
+            },
+        },
+        transport_mode="openai_compatible",
+    )
+
+    for projected in (selector, extraction):
+        assert not {
+            "temperature",
+            "top_p",
+            "seed",
+            "frequency_penalty",
+            "presence_penalty",
+            "n",
+            "extra_body",
+        }.intersection(projected)
+    assert selector["reasoning_effort"] == "medium"
+    assert extraction["reasoning_effort"] == "minimal"
+    assert llm_routing.uses_google_agent_platform(
+        server_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        model_name="gemini-3.6-flash",
+    )
+    assert llm_routing.google_json_response_format_kwargs(
+        model_name="gemini-3.6-flash"
+    ) == {"response_format": {"type": "json_object"}}
+
+
 def test_identity_recomputes_implementation_hash(monkeypatch):
     factory = _ClientFactory([])
     runner = _runner(factory)

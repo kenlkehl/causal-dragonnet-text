@@ -66,6 +66,22 @@ class _FakeEncoder:
         self.encoded_chunks: list[str] = []
         self.expected_prompt_name = expected_prompt_name
         self.expected_prompt = expected_prompt
+        self.started_device_pools: list[tuple[str, ...]] = []
+        self.stopped_device_pool_count = 0
+        self._active_pool = None
+
+    def start_multi_process_pool(self, target_devices):
+        devices = tuple(target_devices)
+        self.started_device_pools.append(devices)
+        self._active_pool = {
+            "processes": [object() for _device in devices],
+        }
+        return self._active_pool
+
+    def stop_multi_process_pool(self, pool):
+        assert pool is self._active_pool
+        self.stopped_device_pool_count += 1
+        self._active_pool = None
 
     def encode(
         self,
@@ -86,15 +102,19 @@ class _FakeEncoder:
     ):
         assert prompt_name == self.expected_prompt_name
         assert prompt == self.expected_prompt
-        assert batch_size == len(chunks)
+        if pool is None:
+            assert batch_size == len(chunks)
+            assert chunk_size is None
+        else:
+            assert pool is self._active_pool
+            assert 0 < batch_size <= len(chunks)
+            assert chunk_size == batch_size
         assert output_value == "sentence_embedding"
         assert precision == "float32"
         assert convert_to_numpy is True
         assert convert_to_tensor is False
         assert truncate_dim is None
         assert show_progress_bar is False
-        assert pool is None
-        assert chunk_size is None
         output = []
         for chunk in chunks:
             self.encoded_chunks.append(chunk)
@@ -145,7 +165,9 @@ def _chunk_configuration() -> dict[str, object]:
         "convert_to_numpy": True,
         "convert_to_tensor": False,
         "truncate_dim": None,
-        "pooling_output_policy": "single_process_sentence_embedding_v1",
+        "pooling_output_policy": (
+            "canonical_batch_multi_device_sentence_embedding_v1"
+        ),
         "model_dtype": "float32",
         "stored_array_dtype": "float32",
         "zero_vector_policy": "reject",
@@ -318,6 +340,54 @@ def test_builds_exact_offline_atomic_cache_and_returns_closed_identity(
         )
     )
     _validate_cache_configuration(cache, wrapper_config)
+
+
+def test_multi_device_encoding_uses_every_lease_and_merges_canonically(
+    tmp_path: Path,
+    monkeypatch,
+):
+    dataset, model, _texts = _write_inputs(tmp_path)
+    parallel_encoder = _FakeEncoder()
+    _parallel, observed = _install_fake_encoder(
+        monkeypatch,
+        encoder=parallel_encoder,
+    )
+    parallel_target = tmp_path / "parallel-cache"
+    build_production_embedding_cache(
+        dataset_path=dataset,
+        text_column="clinical_text",
+        local_model_path=model,
+        sentence_model_name=_SENTENCE_MODEL_NAME,
+        chunk_configuration=_chunk_configuration(),
+        target_dir=parallel_target,
+        devices=("cuda:0", "cuda:1", "cuda:2"),
+        batch_size=2,
+    )
+
+    assert observed["device"] == "cpu"
+    assert parallel_encoder.started_device_pools == [
+        ("cuda:0", "cuda:1", "cuda:2")
+    ]
+    assert parallel_encoder.stopped_device_pool_count == 1
+    assert parallel_encoder.encoded_chunks == [
+        "zero one two",
+        "two three four",
+        "four five",
+        "alpha beta gamma",
+        "gamma delta epsilon",
+        "epsilon zeta",
+        "short clinical row",
+        "row",
+    ]
+    metadata = json.loads(
+        (parallel_target / "metadata.json").read_text(encoding="utf-8")
+    )
+    execution = metadata["production_provenance"]["encoder_execution"]
+    assert execution["batch_partition_policy"] == (
+        "canonical_contiguous_batches_input_order_v1"
+    )
+    assert execution["resource_assignment_in_scientific_identity"] is False
+    assert "device" not in execution
 
 
 def test_disabled_prompt_policy_overrides_hidden_model_default_prompt(
