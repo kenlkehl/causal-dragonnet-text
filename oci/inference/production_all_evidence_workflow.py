@@ -45,7 +45,10 @@ from .production_text_preparation import (
 from .portable_artifacts import (
     ArtifactCompatibility,
     COMPLETE_PAYLOAD_TREE,
+    FRESH_FULL_BYTE_ADOPTION_POLICY,
     MANIFEST_NAME,
+    MANIFEST_LOCAL_ADOPTION_POLICY,
+    PRIOR_PROOF_STAT_CONTINUITY_ADOPTION_POLICY,
     REGISTERED_PAYLOAD_PATHS_ONLY,
     ValidatedPortableArtifact,
     adopt_checkpoint,
@@ -71,6 +74,7 @@ from .portable_workflow_spec import (
     DeploymentProfile,
     EVIDENCE_FAMILIES,
     PostExtractionCausalReviewSpec,
+    RESUME_TRUST_POLICIES,
     ResourcePerformanceSafetyPolicy,
     RunControl,
     ScientificWorkflowSpec,
@@ -103,7 +107,7 @@ from .neural_query_operational_controls import (
 
 LOGGER = logging.getLogger(__name__)
 
-WORKFLOW_SCHEMA = "production_all_evidence_workflow_v5"
+WORKFLOW_SCHEMA = "production_all_evidence_workflow_v6"
 PHASES = (
     "input_preparation",
     "embedding_cache",
@@ -134,7 +138,7 @@ LEGACY_STAGE1_COMPONENT_STORE_SCHEMAS = frozenset(
     {"production_stage1_scientific_component_store_v1"}
 )
 STAGE1_COMPONENT_STORE_MANIFEST = "component_store_manifest.json"
-WORKFLOW_PROGRESS_SCHEMA = "production_all_evidence_workflow_progress_v1"
+WORKFLOW_PROGRESS_SCHEMA = "production_all_evidence_workflow_progress_v2"
 WORKFLOW_PHASE_MANIFEST_SCHEMA = "production_workflow_phase_manifest_v2"
 WORKFLOW_ADOPTED_PHASE_MANIFEST_SCHEMA = "production_workflow_adopted_phase_manifest_v1"
 WORKFLOW_CHECKPOINT_PUBLICATION_ATTESTATION_SCHEMA = (
@@ -187,7 +191,10 @@ WORKFLOW_LEGACY_PREFLIGHT_DECISION_SCHEMA = (
 )
 WORKFLOW_TERMINAL_VALIDATION_SCHEMA = "production_all_evidence_fresh_terminal_validation_v1"
 WORKFLOW_RUN_CONTROL_SELECTION_SCHEMA = (
-    "production_all_evidence_run_control_selection_v1"
+    "production_all_evidence_run_control_selection_v2"
+)
+WORKFLOW_EXECUTION_EPOCH_SCHEMA = (
+    "production_all_evidence_execution_epoch_v1"
 )
 WORKFLOW_VALIDATION_ACHIEVEMENT_SCHEMA = (
     "production_all_evidence_validation_achievement_v1"
@@ -196,9 +203,86 @@ WORKFLOW_VALIDATION_POLICY_SCHEMA = (
     "production_all_evidence_validation_minimum_policy_v1"
 )
 WORKFLOW_STRUCTURED_LOG_EVENT_SCHEMA = (
-    "production_all_evidence_structured_log_event_v1"
+    "production_all_evidence_structured_log_event_v2"
 )
 SOURCE_SNAPSHOT_EXECUTION_ENV = "OCI_PRODUCTION_SOURCE_SNAPSHOT_SHA256"
+PHASE_SCIENTIFIC_PRODUCER_IDENTITY_SCHEMA = (
+    "production_phase_declared_scientific_producer_identity_v1"
+)
+
+# These versions, rather than whole-module byte hashes, are the compatibility
+# authority for phase checkpoints.  Full implementation hashes remain sealed
+# as provenance.  Any code change that can alter scientific contents MUST bump
+# the affected phase version; an operational/authentication-only correction
+# deliberately retains it.
+PHASE_SCIENTIFIC_PRODUCER_VERSIONS: Mapping[str, str] = {
+    "input_preparation": "prepared_cohort_semantics_v1",
+    "embedding_cache": "multi_gpu_embedding_cache_semantics_v2",
+    "stage1_preflight": "token_attention_reusable_preflight_semantics_v2",
+    "stage1_modeling": "token_attention_all_ten_component_semantics_v3",
+    "stage2_canary": "semantic_catalog_stage2_canary_semantics_v2",
+    "stage2_inference": "semantic_catalog_strict_forest_semantics_v2",
+    "oracle_evaluation": "post_frozen_prediction_oracle_semantics_v1",
+}
+
+# These request fields describe where and how one execution epoch runs.  They
+# are deliberately absent from scientific/component compatibility.  A resume
+# may change only these top-level fields while retaining the original immutable
+# request and all of its sealed phase/component identities.  Future request
+# fields fail closed unless they are explicitly classified here.
+OPERATIONAL_EXECUTION_EPOCH_REQUEST_FIELDS = frozenset(
+    {
+        "cluster_preflight_parquet_compression",
+        "cpu_budget",
+        "dataset_path",
+        "deployment_profile_path",
+        "deployment_profile_source_sha256",
+        "device_policy",
+        "embedding_batch_size",
+        "embedding_local_model_path",
+        "embedding_model_builder_tree_sha256",
+        "embedding_model_tree",
+        "endpoint",
+        "forest_runtime_config",
+        "gpu_id",
+        "htr_local_model_path",
+        "htr_model_tree",
+        "implementation_files",
+        "integration_hooks",
+        "num_workers",
+        "query_device",
+        "query_devices",
+        "query_profile_path",
+        "phase_implementation_code_identities",
+        "phase_transitive_producer_code",
+        "resolved_query_devices",
+        "resolved_stage1_gpu_ids",
+        "resource_performance_safety",
+        "response_concurrency",
+        "review_device",
+        "scientific_spec_path",
+        "scratch_root",
+        "source_snapshot",
+        "source_snapshot_root",
+        "stage1_profile_path",
+        "stage1_device",
+        "stage1_execution_device_count",
+        "stage1_execution_profile",
+        "stage1_gpu_ids",
+        "stage1_preflight_execution_attestation",
+        "stage1_preflight_workers",
+        "stage1_resource_contract",
+        "stage1_scope_workers_per_gpu",
+        "stage2_endpoint_authentication",
+        "stage2_endpoint_transport",
+        "stage2_tokenizer_locator",
+        "stage2_tokenizer_tree",
+        "storage_backend",
+        "tfidf_parallel_backend",
+        "tfidf_workers",
+        "workflow_implementation_code_identity",
+    }
+)
 
 # Stage 1 component artifacts already seal their own implementation,
 # configuration, model, row, and seed identities.  Keep the scope-plan
@@ -1460,6 +1544,94 @@ def _canonical(value: Any) -> str:
 
 def _sha(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
+
+
+def _request_body_without_operational_execution_fields(
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the fail-closed scientific/producer portion of one request.
+
+    The immutable request remains the authority for sealed artifacts.  This
+    projection is used only to decide whether a new process may execute that
+    same request with a different resource deployment.
+    """
+
+    return {
+        str(key): copy.deepcopy(value)
+        for key, value in request.items()
+        if key != "request_sha256"
+        and key not in OPERATIONAL_EXECUTION_EPOCH_REQUEST_FIELDS
+    }
+
+
+def _operational_execution_epoch_values(
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key in sorted(OPERATIONAL_EXECUTION_EPOCH_REQUEST_FIELDS):
+        if key not in request:
+            continue
+        value = request.get(key)
+        if key == "phase_transitive_producer_code" and isinstance(
+            value, Mapping
+        ):
+            output[key] = {
+                str(phase): record.get("content_sha256")
+                for phase, record in sorted(value.items())
+                if isinstance(record, Mapping)
+            }
+        elif key == "implementation_files" and isinstance(
+            value, Mapping
+        ):
+            output[key] = {
+                "file_count": len(value),
+                "inventory_content_sha256": _sha(value),
+            }
+        elif key == "source_snapshot" and isinstance(value, Mapping):
+            output[key] = {
+                "root": value.get("root"),
+                "content_sha256": value.get("content_sha256"),
+            }
+        else:
+            output[key] = copy.deepcopy(value)
+    return output
+
+
+def _requests_are_execution_epoch_compatible(
+    *,
+    immutable_request: Mapping[str, Any],
+    candidate_request: Mapping[str, Any],
+) -> bool:
+    """Accept only resource/path changes under an unchanged scientific run."""
+
+    immutable_science = immutable_request.get("scientific_identity")
+    candidate_science = candidate_request.get("scientific_identity")
+    immutable_components = immutable_request.get(
+        "expected_checkpoint_compatibilities_by_phase"
+    )
+    candidate_components = candidate_request.get(
+        "expected_checkpoint_compatibilities_by_phase"
+    )
+    immutable_producers = immutable_request.get(
+        "phase_producer_code_identities"
+    )
+    candidate_producers = candidate_request.get(
+        "phase_producer_code_identities"
+    )
+    if (
+        not isinstance(immutable_science, Mapping)
+        or immutable_science != candidate_science
+        or not isinstance(immutable_components, Mapping)
+        or immutable_components != candidate_components
+        or not isinstance(immutable_producers, Mapping)
+        or immutable_producers != candidate_producers
+    ):
+        return False
+    return _request_body_without_operational_execution_fields(
+        immutable_request
+    ) == _request_body_without_operational_execution_fields(
+        candidate_request
+    )
 
 
 _VALIDATION_DEPTH_RANK: Mapping[str, int] = {
@@ -3416,12 +3588,36 @@ def _phase_transitive_producer_code_records(
     return output
 
 
+def _declared_phase_scientific_producer_identities() -> dict[str, str]:
+    if set(PHASE_SCIENTIFIC_PRODUCER_VERSIONS) != set(
+        PORTABLE_CHECKPOINT_PHASE_SPECS
+    ):
+        raise RuntimeError(
+            "declared phase scientific producer versions do not cover the "
+            "portable checkpoint phases"
+        )
+    return {
+        phase: identity_sha256(
+            {
+                "schema_version": (
+                    PHASE_SCIENTIFIC_PRODUCER_IDENTITY_SCHEMA
+                ),
+                "phase": phase,
+                "scientific_producer_version": version,
+            }
+        )
+        for phase, version in sorted(
+            PHASE_SCIENTIFIC_PRODUCER_VERSIONS.items()
+        )
+    }
+
+
 def _bind_workflow_scientific_identity(
     *,
     scientific_configuration_body: Mapping[str, Any],
     phase_code_records: Mapping[str, Mapping[str, Any]],
 ) -> Mapping[str, Any]:
-    """Bind global identity to all code while retaining phase-local reuse."""
+    """Bind declared science separately from full code provenance."""
 
     if set(phase_code_records) != set(
         PORTABLE_CHECKPOINT_PHASE_SPECS
@@ -3429,7 +3625,7 @@ def _bind_workflow_scientific_identity(
         raise ValueError(
             "phase producer identities do not cover every checkpoint phase"
         )
-    phase_ids: dict[str, str] = {}
+    implementation_phase_ids: dict[str, str] = {}
     for phase, record in phase_code_records.items():
         body = {
             key: copy.deepcopy(value)
@@ -3443,21 +3639,34 @@ def _bind_workflow_scientific_identity(
             raise ValueError(
                 f"{phase} producer-code record is invalid"
             )
-        phase_ids[phase] = str(record["content_sha256"])
+        implementation_phase_ids[phase] = str(
+            record["content_sha256"]
+        )
+    phase_ids = _declared_phase_scientific_producer_identities()
     scientific_configuration_sha256 = identity_sha256(
         scientific_configuration_body
     )
     workflow_producer_code_identity = identity_sha256(
         {
             "schema_version": (
-                "workflow_phase_producer_code_aggregate_v1"
+                "workflow_declared_scientific_producer_aggregate_v1"
             ),
             "phase_producer_code_identities": phase_ids,
         }
     )
+    workflow_implementation_code_identity = identity_sha256(
+        {
+            "schema_version": (
+                "workflow_phase_implementation_code_aggregate_v1"
+            ),
+            "phase_implementation_code_identities": (
+                implementation_phase_ids
+            ),
+        }
+    )
     scientific_body = {
         "schema_version": (
-            "portable_all_evidence_scientific_identity_v3"
+            "portable_all_evidence_scientific_identity_v4"
         ),
         "scientific_configuration_sha256": (
             scientific_configuration_sha256
@@ -3466,6 +3675,9 @@ def _bind_workflow_scientific_identity(
             workflow_producer_code_identity
         ),
         "phase_producer_code_identities": phase_ids,
+        "declared_scientific_producer_versions": dict(
+            PHASE_SCIENTIFIC_PRODUCER_VERSIONS
+        ),
     }
     return {
         "scientific_configuration_identity": {
@@ -3475,8 +3687,14 @@ def _bind_workflow_scientific_identity(
             ),
         },
         "phase_producer_code_identities": phase_ids,
+        "phase_implementation_code_identities": (
+            implementation_phase_ids
+        ),
         "workflow_producer_code_identity": (
             workflow_producer_code_identity
+        ),
+        "workflow_implementation_code_identity": (
+            workflow_implementation_code_identity
         ),
         "scientific_identity": {
             **scientific_body,
@@ -5338,6 +5556,71 @@ def _phase_payload_stat_inventory(
     return inventory
 
 
+def _manifest_local_phase_stat_inventory(
+    root: Path,
+    artifacts: Sequence[Mapping[str, Any]],
+) -> dict[str, tuple[int, ...]]:
+    """Accept a sealed local phase without rereading its payload bytes.
+
+    This is the intentionally higher-risk ``manifest_local`` policy.  It
+    still closes the file tree, rejects links and non-private payloads, and
+    binds exact stat identities for the rest of the process.  The registered
+    SHA-256 values are trusted until ordinary handoff/terminal validation.
+    """
+
+    resolved_root = root.resolve(strict=True)
+    root_state = os.lstat(resolved_root)
+    if (
+        stat.S_ISLNK(root_state.st_mode)
+        or not stat.S_ISDIR(root_state.st_mode)
+        or int(root_state.st_uid) != int(os.getuid())
+        or stat.S_IMODE(root_state.st_mode) & 0o022
+    ):
+        raise ValueError(
+            "manifest-local phase root is linked, foreign-owned, or writable "
+            "by another user"
+        )
+    registered = [str(row.get("relative_path", "")) for row in artifacts]
+    observed = [
+        candidate.relative_to(resolved_root).as_posix()
+        for candidate in sorted(resolved_root.rglob("*"))
+        if candidate.is_file()
+    ]
+    if (
+        len(registered) != len(artifacts)
+        or len(registered) != len(set(registered))
+        or registered != observed
+    ):
+        raise ValueError("manifest-local phase file inventory changed")
+    inventory: dict[str, tuple[int, ...]] = {}
+    for row in artifacts:
+        relative = str(row["relative_path"])
+        payload = resolved_root / relative
+        state = os.lstat(payload)
+        if (
+            stat.S_ISLNK(state.st_mode)
+            or not stat.S_ISREG(state.st_mode)
+            or int(state.st_uid) != int(os.getuid())
+            or int(state.st_nlink) != 1
+            or stat.S_IMODE(state.st_mode) & 0o022
+            or int(state.st_size) != int(row.get("size_bytes", -1))
+            or str(payload.resolve(strict=True)) != str(row.get("path"))
+        ):
+            raise ValueError(
+                f"manifest-local phase payload metadata changed: {relative}"
+            )
+        inventory[relative] = (
+            int(state.st_dev),
+            int(state.st_ino),
+            int(state.st_mode),
+            int(state.st_nlink),
+            int(state.st_size),
+            int(state.st_mtime_ns),
+            int(state.st_ctime_ns),
+        )
+    return inventory
+
+
 def _phase_payload_proof_store_root(work_root: Path) -> Path:
     """Return the protected operational proof store for durable phase bytes."""
 
@@ -5552,6 +5835,20 @@ def _operator_trusted_adoption_selected(
             "operator-trusted checkpoint adoption has an invalid byte-audit claim"
         )
     return True
+
+
+def _portable_adoption_attestation_policy_for_record(
+    record: Mapping[str, Any],
+) -> str:
+    mode = str(
+        record.get("resume_authentication_mode")
+        or "full_byte_reauthentication"
+    )
+    if mode == "prior_proof_stat_continuity":
+        return PRIOR_PROOF_STAT_CONTINUITY_ADOPTION_POLICY
+    if mode == "manifest_local_stat_inventory":
+        return MANIFEST_LOCAL_ADOPTION_POLICY
+    return FRESH_FULL_BYTE_ADOPTION_POLICY
 
 
 def _operator_trusted_legacy_migration_expectation(
@@ -6036,11 +6333,18 @@ def _validate_adoption_attestation_for_record(
                 for value in record.get("upstream_artifact_ids") or ()
             ),
         )
-    return validate_checkpoint_adoption(
+    attestation = validate_checkpoint_adoption(
         attestation_path=attestation_path,
         artifact=artifact,
         consumer_request_sha256=consumer_request_sha256,
     )
+    if attestation.get("validation_policy") != (
+        _portable_adoption_attestation_policy_for_record(record)
+    ):
+        raise ValueError(
+            "checkpoint adoption attestation trust policy changed"
+        )
+    return attestation
 
 
 def _validate_adopted_phase_manifest_from_paths(
@@ -6164,6 +6468,10 @@ def _validate_adopted_phase_manifest_from_paths(
         artifact,
         expected_phase=phase,
     )
+    fresh_validation = (
+        authenticated_adoptions is None
+        and not _operator_trusted_adoption_selected(expected)
+    )
     return {
         "schema_version": WORKFLOW_ADOPTED_PHASE_MANIFEST_SCHEMA,
         "phase": phase,
@@ -6180,14 +6488,17 @@ def _validate_adopted_phase_manifest_from_paths(
             "upstream_artifact_ids": list(artifact.manifest["upstream_artifact_ids"]),
             "adoption_attestation_path": str(expected_attestation),
             "fresh_full_byte_validation": (
-                authenticated_adoptions is None
-                and not _operator_trusted_adoption_selected(expected)
+                fresh_validation
             ),
             "operator_trusted_prior_full_byte_attestation": (
                 _operator_trusted_adoption_selected(expected)
             ),
             "payload_bytes_reauthenticated": (
-                not _operator_trusted_adoption_selected(expected)
+                fresh_validation
+                or expected.get("payload_bytes_reauthenticated") is True
+            ),
+            "initial_resume_authentication_mode": expected.get(
+                "resume_authentication_mode"
             ),
         },
     }
@@ -6913,6 +7224,9 @@ def _revalidate_request_bound_external_inputs(
         "phase_transitive_producer_code"
     )
     phase_code_ids = request.get("phase_producer_code_identities")
+    implementation_phase_ids = request.get(
+        "phase_implementation_code_identities"
+    )
     if (
         not isinstance(phase_code_records, Mapping)
         or set(phase_code_records) != set(
@@ -6920,6 +7234,10 @@ def _revalidate_request_bound_external_inputs(
         )
         or not isinstance(phase_code_ids, Mapping)
         or set(phase_code_ids) != set(
+            PORTABLE_CHECKPOINT_PHASE_SPECS
+        )
+        or not isinstance(implementation_phase_ids, Mapping)
+        or set(implementation_phase_ids) != set(
             PORTABLE_CHECKPOINT_PHASE_SPECS
         )
     ):
@@ -6944,7 +7262,7 @@ def _revalidate_request_bound_external_inputs(
             raw_record.get("phase") != phase
             or raw_record.get("content_sha256")
             != _sha(record_body)
-            or phase_code_ids.get(phase)
+            or implementation_phase_ids.get(phase)
             != raw_record.get("content_sha256")
             or not isinstance(constant_identity, Mapping)
         ):
@@ -6993,10 +7311,17 @@ def _revalidate_request_bound_external_inputs(
                     raise ValueError(
                         f"immutable {phase} producer inventory is unbound"
                     )
+    declared_phase_ids = (
+        _declared_phase_scientific_producer_identities()
+    )
+    if dict(phase_code_ids) != declared_phase_ids:
+        raise ValueError(
+            "immutable declared phase producer identities are invalid"
+        )
     aggregate_identity = identity_sha256(
         {
             "schema_version": (
-                "workflow_phase_producer_code_aggregate_v1"
+                "workflow_declared_scientific_producer_aggregate_v1"
             ),
             "phase_producer_code_identities": dict(phase_code_ids),
         }
@@ -7004,6 +7329,22 @@ def _revalidate_request_bound_external_inputs(
     if request.get("workflow_producer_code_identity") != aggregate_identity:
         raise ValueError(
             "immutable aggregate workflow producer identity is invalid"
+        )
+    implementation_aggregate_identity = identity_sha256(
+        {
+            "schema_version": (
+                "workflow_phase_implementation_code_aggregate_v1"
+            ),
+            "phase_implementation_code_identities": dict(
+                implementation_phase_ids
+            ),
+        }
+    )
+    if request.get("workflow_implementation_code_identity") != (
+        implementation_aggregate_identity
+    ):
+        raise ValueError(
+            "immutable aggregate workflow implementation identity is invalid"
         )
     scientific_configuration = request.get(
         "scientific_configuration_identity"
@@ -7047,6 +7388,10 @@ def _revalidate_request_bound_external_inputs(
             "phase_producer_code_identities"
         )
         != phase_code_ids
+        or scientific_identity.get(
+            "declared_scientific_producer_versions"
+        )
+        != dict(PHASE_SCIENTIFIC_PRODUCER_VERSIONS)
     ):
         raise ValueError(
             "immutable workflow scientific identity binding is invalid"
@@ -8350,6 +8695,13 @@ class ProductionAllEvidenceWorkflow:
             str, Mapping[str, Any]
         ] = {}
         self._phase_payload_stat_inventories: dict[str, Mapping[str, tuple[int, ...]]] = {}
+        self._phase_resume_authentication_modes: dict[str, str] = {}
+        self._checkpoint_adoption_authentication_modes: dict[
+            str, str
+        ] = {}
+        self._execution_epoch_attestation: Mapping[str, Any] | None = None
+        self._execution_epoch_attestation_path: Path | None = None
+        self._active_execution_source_snapshot: Mapping[str, Any] | None = None
         self._validate_options()
         self._validation_policy = _resolve_validation_depth_policy(
             self.options.run_control.validation_depth
@@ -8373,6 +8725,49 @@ class ProductionAllEvidenceWorkflow:
 
     def _phase_sequence(self) -> tuple[str, ...]:
         return STAGE1_ONLY_PHASES if self.options.stage1_only else PHASES
+
+    def _fresh_validation_source_snapshot(self) -> Mapping[str, Any] | None:
+        """Return the authenticated code tree selected for this execution.
+
+        Sealed artifacts remain bound to the source snapshot in the original
+        immutable request.  A compatible operational epoch may, however, run
+        from a corrected implementation snapshot.  Fresh validators must use
+        that active tree or they would silently execute archived code while
+        reporting on the corrected epoch.
+        """
+
+        active = getattr(
+            self,
+            "_active_execution_source_snapshot",
+            None,
+        )
+        if isinstance(active, Mapping):
+            return active
+        requested = self.request.get("source_snapshot")
+        return requested if isinstance(requested, Mapping) else None
+
+    def _bind_fresh_validation_environment(
+        self,
+        environment: MutableMapping[str, str],
+    ) -> Mapping[str, Any] | None:
+        source_snapshot = self._fresh_validation_source_snapshot()
+        if source_snapshot is None:
+            return None
+        snapshot_root = Path(
+            str(source_snapshot.get("root", ""))
+        ).resolve(strict=True)
+        snapshot_sha = str(
+            source_snapshot.get("content_sha256") or ""
+        )
+        if len(snapshot_sha) != 64:
+            raise RuntimeError(
+                "active execution source snapshot identity is invalid"
+            )
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment["PYTHONPATH"] = str(snapshot_root)
+        environment[SOURCE_SNAPSHOT_EXECUTION_ENV] = snapshot_sha
+        environment["PYTHONHASHSEED"] = str(int(self.options.seed))
+        return source_snapshot
 
     def _resolved_cache_import_sources(self) -> tuple[Path, Path] | None:
         o = self.options
@@ -8817,6 +9212,157 @@ class ProductionAllEvidenceWorkflow:
         work_root = Path(self.options.work_root)
         return work_root.parent / f".{work_root.name}.legacy_checkpoint_sources" / phase
 
+    def _seed_trusted_local_adoption_authentication_cache(
+        self,
+        *,
+        source: Path,
+        payload_authentication_cache: MutableMapping[
+            str, tuple[tuple[int, ...], str, int]
+        ],
+    ) -> None:
+        """Reuse a source run's protected phase proof for portable adoption.
+
+        The portable validator still authenticates its control manifest,
+        compatibility, exact tree, and every payload stat.  Only payload byte
+        rereads are skipped, and only when the source phase's prior full-byte
+        proof remains stat-continuous.  Any ambiguity silently returns to the
+        ordinary deep validator.
+        """
+
+        policy = self.options.run_control.resume_trust_policy
+        if policy == "strict_portable":
+            return
+        selected = Path(source)
+        control_root = (
+            selected.parent
+            if selected.name == MANIFEST_NAME
+            else selected
+        )
+        try:
+            control_root = control_root.resolve(strict=True)
+        except OSError:
+            return
+        if control_root.parent.name != "portable_checkpoints":
+            return
+        source_work_root = control_root.parent.parent
+        phase = control_root.name
+        if phase not in PORTABLE_CHECKPOINT_PHASE_SPECS:
+            return
+        request_path = source_work_root / "immutable_run_request.json"
+        phase_manifest_path = (
+            source_work_root
+            / "phases"
+            / phase
+            / "complete_manifest.json"
+        )
+        try:
+            request = _read_json_object(
+                request_path,
+                label="trusted-local adoption source request",
+            )
+            request_body = {
+                key: value
+                for key, value in request.items()
+                if key != "request_sha256"
+            }
+            phase_manifest = _read_json_object(
+                phase_manifest_path,
+                label="trusted-local adoption source phase",
+            )
+            phase_body = {
+                key: value
+                for key, value in phase_manifest.items()
+                if key != "content_sha256"
+            }
+            artifacts = phase_manifest.get("artifacts")
+            attempt = Path(str(phase_manifest.get("attempt_dir", "")))
+            if (
+                request.get("request_sha256") != _sha(request_body)
+                or phase_manifest.get("schema_version")
+                != WORKFLOW_PHASE_MANIFEST_SCHEMA
+                or phase_manifest.get("phase") != phase
+                or phase_manifest.get("status") != "complete"
+                or phase_manifest.get("request_sha256")
+                != request.get("request_sha256")
+                or phase_manifest.get("content_sha256") != _sha(phase_body)
+                or not isinstance(artifacts, list)
+                or not attempt.is_absolute()
+                or attempt.resolve(strict=True).parent
+                != (source_work_root / "phases" / phase).resolve(
+                    strict=True
+                )
+            ):
+                return
+            stats: Mapping[str, tuple[int, ...]] | None = None
+            from .production_stage1_reusable_preflight import (
+                _load_fast_proof,
+            )
+
+            key = _phase_payload_proof_key(
+                phase=phase,
+                request_sha256=str(request["request_sha256"]),
+                terminal_content_sha256=str(
+                    phase_manifest["content_sha256"]
+                ),
+            )
+            proof = _load_fast_proof(
+                store_root=_phase_payload_proof_store_root(
+                    source_work_root
+                ),
+                artifact_kind=(
+                    f"workflow_phase_payload_{phase}"
+                ),
+                scientific_key=key,
+                artifact_root=attempt.resolve(strict=True),
+                terminal_content_sha256=str(
+                    phase_manifest["content_sha256"]
+                ),
+                producer_identity=(
+                    "production_workflow_phase_publication_v1"
+                ),
+                schema_identity=WORKFLOW_PHASE_MANIFEST_SCHEMA,
+            )
+            if proof is not None:
+                stats = _phase_payload_stat_inventory_from_proof(
+                    proof=proof[0],
+                    artifacts=artifacts,
+                )
+                mode = "prior_proof_stat_continuity"
+            elif policy == "manifest_local":
+                stats = _manifest_local_phase_stat_inventory(
+                    attempt.resolve(strict=True),
+                    artifacts,
+                )
+                mode = "manifest_local_stat_inventory"
+            if stats is None:
+                return
+            for row in artifacts:
+                relative = str(row["relative_path"])
+                payload_authentication_cache[
+                    str((attempt / relative).resolve(strict=True))
+                ] = (
+                    tuple(int(value) for value in stats[relative]),
+                    str(row["sha256"]),
+                    int(row["size_bytes"]),
+                )
+            self._checkpoint_adoption_authentication_modes[
+                str(control_root)
+            ] = mode
+        except (
+            FileNotFoundError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            LOGGER.warning(
+                "trusted-local checkpoint proof unavailable; falling back "
+                "to full-byte adoption authentication: %s (%s: %s)",
+                control_root,
+                type(exc).__name__,
+                exc,
+            )
+
     def _resolve_requested_checkpoint_sources(
         self,
         *,
@@ -8916,6 +9462,11 @@ class ProductionAllEvidenceWorkflow:
             self._operator_trusted_checkpoint_handles[
                 artifact.artifact_id
             ] = trusted
+            self._checkpoint_adoption_authentication_modes[
+                str(artifact.root)
+            ] = (
+                "operator_trusted_prior_attestation_stat_continuity"
+            )
             portable.append(artifact)
         for raw_source in self.options.run_control.adopt_checkpoints:
             source = Path(raw_source)
@@ -8974,11 +9525,20 @@ class ProductionAllEvidenceWorkflow:
                     "checkpoint adoption files must be artifact_manifest.json "
                     "or a supported legacy complete_manifest.json"
                 )
-            portable.append(
-                validate_portable_artifact(
-                    source,
-                    payload_authentication_cache=payload_authentication_cache,
-                )
+            self._seed_trusted_local_adoption_authentication_cache(
+                source=source,
+                payload_authentication_cache=(
+                    payload_authentication_cache
+                ),
+            )
+            artifact = validate_portable_artifact(
+                source,
+                payload_authentication_cache=payload_authentication_cache,
+            )
+            portable.append(artifact)
+            self._checkpoint_adoption_authentication_modes.setdefault(
+                str(artifact.root),
+                "full_byte_reauthentication",
             )
 
         artifact_ids = [artifact.artifact_id for artifact in portable]
@@ -9191,6 +9751,7 @@ class ProductionAllEvidenceWorkflow:
     def _request_body(self) -> dict[str, Any]:
         self._adopted_artifact_handles.clear()
         self._operator_trusted_checkpoint_handles.clear()
+        self._checkpoint_adoption_authentication_modes.clear()
         identity_memo = self._scientific_identity_memo
         values = json.loads(json.dumps(asdict(self.options), default=str))
         values.pop("run_control")
@@ -9364,7 +9925,7 @@ class ProductionAllEvidenceWorkflow:
             identity_memo=identity_memo,
         )
         values["phase_transitive_producer_code"] = phase_code_records
-        values["phase_producer_code_identities"] = {
+        values["phase_implementation_code_identities"] = {
             phase: record["content_sha256"]
             for phase, record in phase_code_records.items()
         }
@@ -9698,6 +10259,12 @@ class ProductionAllEvidenceWorkflow:
                     artifact.artifact_id
                 )
             )
+            automatic_authentication_mode = (
+                self._checkpoint_adoption_authentication_modes.get(
+                    str(artifact.root),
+                    "full_byte_reauthentication",
+                )
+            )
             compatibility_record = {
                 "adoption_validation_policy": (
                     None
@@ -9713,6 +10280,11 @@ class ProductionAllEvidenceWorkflow:
                 ),
                 "payload_bytes_reauthenticated": (
                     trusted_checkpoint is None
+                    and automatic_authentication_mode
+                    == "full_byte_reauthentication"
+                ),
+                "resume_authentication_mode": (
+                    automatic_authentication_mode
                 ),
                 "legacy_phase_compatibility_projection_proof": (
                     trusted_legacy_projection_proofs.get(
@@ -9769,6 +10341,12 @@ class ProductionAllEvidenceWorkflow:
                     artifact.artifact_id
                 )
             )
+            automatic_authentication_mode = (
+                self._checkpoint_adoption_authentication_modes.get(
+                    str(artifact.root),
+                    "full_byte_reauthentication",
+                )
+            )
             if substituted_phase == "stage1_preflight":
                 self._require_adopted_preflight_storage_compatibility(
                     artifact
@@ -9802,6 +10380,11 @@ class ProductionAllEvidenceWorkflow:
                     ),
                     "payload_bytes_reauthenticated": (
                         trusted_checkpoint is None
+                        and automatic_authentication_mode
+                        == "full_byte_reauthentication"
+                    ),
+                    "resume_authentication_mode": (
+                        automatic_authentication_mode
                     ),
                     "legacy_phase_compatibility_projection_proof": (
                         trusted_legacy_projection_proofs.get(
@@ -9833,6 +10416,74 @@ class ProductionAllEvidenceWorkflow:
             )
         return normalized
 
+    def _write_execution_epoch_attestation(
+        self,
+        *,
+        candidate_request: Mapping[str, Any],
+        immutable_request: Mapping[str, Any],
+        request_match_mode: str,
+    ) -> Mapping[str, Any]:
+        """Append one immutable operational execution epoch."""
+
+        if request_match_mode not in {
+            "fresh_request",
+            "exact_request",
+            "operational_epoch",
+        }:
+            raise ValueError("execution epoch request-match mode is invalid")
+        epoch_root = (
+            self.options.work_root
+            / "execution_attestations"
+            / "execution_epochs"
+        )
+        epoch_root.mkdir(parents=True, exist_ok=True)
+        prior = sorted(epoch_root.glob("epoch_*.json"))
+        ordinal = len(prior) + 1
+        body = {
+            "schema_version": WORKFLOW_EXECUTION_EPOCH_SCHEMA,
+            "epoch_ordinal": ordinal,
+            "recorded_at": _utc_now(),
+            "immutable_request_sha256": immutable_request.get(
+                "request_sha256"
+            ),
+            "candidate_request_sha256": candidate_request.get(
+                "request_sha256"
+            ),
+            "scientific_sha256": (
+                immutable_request.get("scientific_identity") or {}
+            ).get("scientific_sha256"),
+            "request_match_mode": request_match_mode,
+            "resume_requested": self.options.run_control.resume,
+            "resume_trust_policy": (
+                self.options.run_control.resume_trust_policy
+            ),
+            "operational_request_fields": sorted(
+                OPERATIONAL_EXECUTION_EPOCH_REQUEST_FIELDS
+            ),
+            "immutable_operational_values": (
+                _operational_execution_epoch_values(
+                    immutable_request
+                )
+            ),
+            "selected_operational_values": (
+                _operational_execution_epoch_values(candidate_request)
+            ),
+            "scientific_request_identity_affected": False,
+            "sealed_artifact_identity_affected": False,
+        }
+        record = {**body, "content_sha256": _sha(body)}
+        target = epoch_root / f"epoch_{ordinal:06d}.json"
+        _write_immutable_json(target, record)
+        reopened = _read_json_object(
+            target,
+            label="execution epoch attestation",
+        )
+        if reopened != record:
+            raise RuntimeError("execution epoch attestation changed")
+        self._execution_epoch_attestation = record
+        self._execution_epoch_attestation_path = target
+        return record
+
     def _run_control_attestation_root(self) -> Path:
         parent = self.options.work_root / "execution_attestations"
         target = parent / "run_control"
@@ -9860,6 +10511,9 @@ class ProductionAllEvidenceWorkflow:
                 self.options.run_control.schema_version
             ),
             "resume_requested": self.options.run_control.resume,
+            "resume_trust_policy": (
+                self.options.run_control.resume_trust_policy
+            ),
             "stop_after": self.options.run_control.stop_after,
             "log_level": self.options.run_control.log_level,
             "validation_policy": copy.deepcopy(
@@ -9870,6 +10524,13 @@ class ProductionAllEvidenceWorkflow:
             ),
             "scientific_request_identity_affected": False,
             "portable_artifact_identity_affected": False,
+            "execution_epoch_content_sha256": (
+                None
+                if self._execution_epoch_attestation is None
+                else self._execution_epoch_attestation[
+                    "content_sha256"
+                ]
+            ),
             "achievement_requires_separate_fresh_validation_attestation": (
                 True
             ),
@@ -10164,13 +10825,49 @@ class ProductionAllEvidenceWorkflow:
             # the not-yet-visible immutable run root.
             root.parent.mkdir(parents=True, exist_ok=True)
         body = self._request_body()
-        request = {**body, "request_sha256": _sha(body)}
+        candidate_request = {**body, "request_sha256": _sha(body)}
+        candidate_source_snapshot = candidate_request.get(
+            "source_snapshot"
+        )
+        self._active_execution_source_snapshot = (
+            copy.deepcopy(dict(candidate_source_snapshot))
+            if isinstance(candidate_source_snapshot, Mapping)
+            else None
+        )
+        request = candidate_request
+        request_match_mode = "fresh_request"
         if root.exists():
             if not self.options.run_control.resume or not request_path.is_file():
                 raise ValueError("work root must be fresh unless --resume validates its request")
             existing = _read_json_object(request_path, label="immutable workflow request")
-            if existing != request:
-                raise ValueError("--resume request differs from the immutable run request")
+            existing_body = {
+                key: value
+                for key, value in existing.items()
+                if key != "request_sha256"
+            }
+            if existing.get("request_sha256") != _sha(existing_body):
+                raise ValueError("immutable workflow request failed authentication")
+            if existing == candidate_request:
+                request = existing
+                request_match_mode = "exact_request"
+            elif (
+                self.options.run_control.resume_trust_policy
+                in {"trusted_local", "manifest_local"}
+                and _requests_are_execution_epoch_compatible(
+                    immutable_request=existing,
+                    candidate_request=candidate_request,
+                )
+            ):
+                # Sealed phase/component manifests continue to name the
+                # original immutable request.  Runtime resource selection is
+                # taken from ``self.options`` and attested as a new epoch.
+                request = existing
+                request_match_mode = "operational_epoch"
+            else:
+                raise ValueError(
+                    "--resume request differs scientifically or by producer "
+                    "identity from the immutable run request"
+                )
         else:
             initialization_attempt = Path(
                 tempfile.mkdtemp(
@@ -10183,13 +10880,13 @@ class ProductionAllEvidenceWorkflow:
             # keeping the requested work root absent and therefore reusable.
             # The root becomes visible only after the immutable request has
             # been durably written and reopened byte-for-byte.
-            _atomic_write_json(staged_request, request)
+            _atomic_write_json(staged_request, candidate_request)
             if (
                 _read_json_object(
                     staged_request,
                     label="staged immutable workflow request",
                 )
-                != request
+                != candidate_request
             ):
                 raise RuntimeError("staged immutable workflow request changed")
             attempt_fd = os.open(
@@ -10212,6 +10909,11 @@ class ProductionAllEvidenceWorkflow:
             finally:
                 os.close(parent_fd)
         self.request = request
+        self._write_execution_epoch_attestation(
+            candidate_request=candidate_request,
+            immutable_request=request,
+            request_match_mode=request_match_mode,
+        )
         self._write_run_control_selection_attestation()
         self._publish_checkpoint_adoptions()
         self._write_progress(status="initialized", completed=(), current_phase=None)
@@ -10268,6 +10970,11 @@ class ProductionAllEvidenceWorkflow:
                     expected_compatibility_key=str(expected["compatibility_key"]),
                     expected_upstream_artifact_ids=tuple(expected["upstream_artifact_ids"]),
                     validated_artifact=handle,
+                    validation_policy=(
+                        _portable_adoption_attestation_policy_for_record(
+                            expected
+                        )
+                    ),
                 )
             if attestation.get("producer_artifact_id") != expected["artifact_id"]:
                 raise RuntimeError("checkpoint adoption attestation bound the wrong artifact")
@@ -11796,6 +12503,16 @@ class ProductionAllEvidenceWorkflow:
             "stage1_scope_workers_per_gpu": self.options.stage1_scope_workers_per_gpu,
             "stage1_preflight_workers": self.options.stage1_preflight_workers,
             "tfidf_workers": self.options.tfidf_workers,
+            "resume_trust_policy": (
+                self.options.run_control.resume_trust_policy
+            ),
+            "execution_epoch_content_sha256": (
+                None
+                if self._execution_epoch_attestation is None
+                else self._execution_epoch_attestation[
+                    "content_sha256"
+                ]
+            ),
             "updated_at": _utc_now(),
             "error": error,
         }
@@ -11814,6 +12531,16 @@ class ProductionAllEvidenceWorkflow:
             "error": error,
             "configured_log_level": (
                 self.options.run_control.log_level
+            ),
+            "resume_trust_policy": (
+                self.options.run_control.resume_trust_policy
+            ),
+            "execution_epoch_content_sha256": (
+                None
+                if self._execution_epoch_attestation is None
+                else self._execution_epoch_attestation[
+                    "content_sha256"
+                ]
             ),
             "run_control_selection_content_sha256": (
                 None
@@ -11867,6 +12594,9 @@ class ProductionAllEvidenceWorkflow:
         path = self._phase_manifest(phase)
         if not path.is_file():
             return None
+        resume_trust_policy = (
+            self.options.run_control.resume_trust_policy
+        )
         process_stats = self._phase_payload_stat_inventories.get(
             phase
         )
@@ -11923,20 +12653,24 @@ class ProductionAllEvidenceWorkflow:
                         candidate["content_sha256"]
                     ),
                 )
-                proof = _load_fast_proof(
-                    store_root=proof_store,
-                    artifact_kind=(
-                        f"workflow_phase_payload_{phase}"
-                    ),
-                    scientific_key=key,
-                    artifact_root=attempt.resolve(strict=True),
-                    terminal_content_sha256=str(
-                        candidate["content_sha256"]
-                    ),
-                    producer_identity=(
-                        "production_workflow_phase_publication_v1"
-                    ),
-                    schema_identity=WORKFLOW_PHASE_MANIFEST_SCHEMA,
+                proof = (
+                    None
+                    if resume_trust_policy == "strict_portable"
+                    else _load_fast_proof(
+                        store_root=proof_store,
+                        artifact_kind=(
+                            f"workflow_phase_payload_{phase}"
+                        ),
+                        scientific_key=key,
+                        artifact_root=attempt.resolve(strict=True),
+                        terminal_content_sha256=str(
+                            candidate["content_sha256"]
+                        ),
+                        producer_identity=(
+                            "production_workflow_phase_publication_v1"
+                        ),
+                        schema_identity=WORKFLOW_PHASE_MANIFEST_SCHEMA,
+                    )
                 )
                 if proof is not None:
                     self._phase_payload_stat_inventories[phase] = (
@@ -11945,7 +12679,37 @@ class ProductionAllEvidenceWorkflow:
                             artifacts=candidate["artifacts"],
                         )
                     )
+                    self._phase_resume_authentication_modes[phase] = (
+                        "prior_proof_stat_continuity"
+                    )
                     return self._validated_complete(phase)
+                if resume_trust_policy == "manifest_local":
+                    try:
+                        self._phase_payload_stat_inventories[phase] = (
+                            _manifest_local_phase_stat_inventory(
+                                attempt.resolve(strict=True),
+                                candidate["artifacts"],
+                            )
+                        )
+                    except (
+                        OSError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        LOGGER.warning(
+                            "manifest-local authentication rejected; "
+                            "falling back to full-byte authentication: %s "
+                            "(%s: %s)",
+                            phase,
+                            type(exc).__name__,
+                            exc,
+                        )
+                    else:
+                        self._phase_resume_authentication_modes[phase] = (
+                            "manifest_local_stat_inventory"
+                        )
+                        return self._validated_complete(phase)
                 try:
                     proof_start_probe = (
                         _authentication_probe_ctime_ns(
@@ -12090,6 +12854,9 @@ class ProductionAllEvidenceWorkflow:
             phase=phase,
             request_sha256=self.request["request_sha256"],
             authenticated_adoptions=self._adopted_artifact_handles,
+        )
+        self._phase_resume_authentication_modes[phase] = (
+            "full_byte_reauthentication"
         )
         # Deep validation has already hashed every ordinary phase payload.
         # Preserve that process-local authority so subsequent selector/path/
@@ -12286,6 +13053,9 @@ class ProductionAllEvidenceWorkflow:
         # this filesystem cannot support the optional cross-process proof.
         self._phase_payload_stat_inventories[phase] = dict(
             process_authenticated_stats
+        )
+        self._phase_resume_authentication_modes[phase] = (
+            "publication_full_byte_authentication"
         )
         if proof_start_probe is not None:
             from .production_stage1_reusable_preflight import (
@@ -14336,8 +15106,11 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
 """
         environment = os.environ.copy()
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        source_snapshot = self._bind_fresh_validation_environment(
+            environment
+        )
         interpreter = [sys.executable]
-        if self.request.get("source_snapshot") is not None:
+        if source_snapshot is not None:
             interpreter.append("-P")
         subprocess.run(
             [
@@ -14376,7 +15149,6 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             )
         ):
             raise RuntimeError("fresh Stage 1 handoff validation report is invalid")
-        source_snapshot = self.request.get("source_snapshot")
         if source_snapshot is not None:
             loaded = Path(str(value.get("loader_module_path", ""))).resolve(strict=True)
             snapshot_root = Path(str(source_snapshot["root"])).resolve(strict=True)
@@ -14442,9 +15214,12 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
 """
         environment = os.environ.copy()
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        source_snapshot = self._bind_fresh_validation_environment(
+            environment
+        )
         prior_phases = list(self._phase_sequence()[:-1])
         interpreter = [sys.executable]
-        if self.request.get("source_snapshot") is not None:
+        if source_snapshot is not None:
             interpreter.append("-P")
         subprocess.run(
             [
@@ -14522,7 +15297,6 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             or checkpoint_validation.get("oracle_evaluation_after_frozen_prediction") is not True
         ):
             raise RuntimeError("fresh terminal validation report is invalid")
-        source_snapshot = self.request.get("source_snapshot")
         if source_snapshot is not None:
             loaded = Path(str(value.get("validator_module_path", ""))).resolve(strict=True)
             snapshot_root = Path(str(source_snapshot["root"])).resolve(strict=True)
@@ -17014,6 +17788,39 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         if not self.options.work_root.is_dir():
             return
         payload = dict(self.telemetry.as_dict())
+        payload["resume_authentication"] = {
+            "schema_version": (
+                "production_resume_authentication_telemetry_v1"
+            ),
+            "policy": self.options.run_control.resume_trust_policy,
+            "phase_modes": dict(
+                sorted(self._phase_resume_authentication_modes.items())
+            ),
+            "checkpoint_adoption_modes": dict(
+                sorted(
+                    self._checkpoint_adoption_authentication_modes.items()
+                )
+            ),
+            "prior_proof_stat_continuity_count": sum(
+                mode == "prior_proof_stat_continuity"
+                for mode in self._phase_resume_authentication_modes.values()
+            ),
+            "manifest_local_count": sum(
+                mode == "manifest_local_stat_inventory"
+                for mode in self._phase_resume_authentication_modes.values()
+            ),
+            "full_byte_count": sum(
+                "full_byte" in mode
+                for mode in self._phase_resume_authentication_modes.values()
+            ),
+            "execution_epoch_content_sha256": (
+                None
+                if self._execution_epoch_attestation is None
+                else self._execution_epoch_attestation[
+                    "content_sha256"
+                ]
+            ),
+        }
         safety = self.options.resource_performance_safety
         payload["resource_performance_safety"] = safety.as_dict()
         payload["resource_performance_safety_sha256"] = safety.content_sha256
@@ -17055,18 +17862,20 @@ print(json.dumps({
     "python_no_user_site": os.environ.get("PYTHONNOUSERSITE"),
 }, sort_keys=True, allow_nan=False))
 """
-        source_snapshot = self.request.get("source_snapshot")
+        environment = os.environ.copy()
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        source_snapshot = self._bind_fresh_validation_environment(
+            environment
+        )
         if not isinstance(source_snapshot, Mapping):
             raise RuntimeError("canary preparation fresh validation requires a source snapshot")
         snapshot_root = Path(str(source_snapshot.get("root", ""))).resolve(strict=True)
         snapshot_sha = str(source_snapshot.get("content_sha256") or "")
         expected_hash_seed = str(int(self.options.seed))
-        environment = os.environ.copy()
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        environment["PYTHONNOUSERSITE"] = "1"
-        environment["PYTHONPATH"] = str(snapshot_root)
-        environment[SOURCE_SNAPSHOT_EXECUTION_ENV] = snapshot_sha
-        environment["PYTHONHASHSEED"] = expected_hash_seed
+        if environment.get("PYTHONHASHSEED") != expected_hash_seed:
+            raise RuntimeError(
+                "fresh validation environment has the wrong hash seed"
+            )
         completed = subprocess.run(
             [
                 sys.executable,
@@ -17261,13 +18070,20 @@ print(json.dumps({
                 current_phase=None,
             )
             return {
-                "schema_version": "production_all_evidence_operational_pause_v1",
+                "schema_version": "production_all_evidence_operational_pause_v2",
                 "status": "paused",
                 "stop_after": execution_sequence[-1],
                 "completed_phases": list(completed),
                 "request_sha256": self.request["request_sha256"],
                 "scientific_sha256": self.request["scientific_identity"]["scientific_sha256"],
-                "resume_requires_identical_immutable_request": True,
+                "resume_requires_identical_science_and_producer_identity": True,
+                "resume_accepts_recorded_operational_execution_epoch": (
+                    self.options.run_control.resume_trust_policy
+                    != "strict_portable"
+                ),
+                "resume_trust_policy": (
+                    self.options.run_control.resume_trust_policy
+                ),
             }
         terminal_result = completed["terminal_validation"].get("result")
         if not isinstance(terminal_result, Mapping):
@@ -17724,6 +18540,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--oracle-ite-column")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--resume-trust",
+        dest="resume_trust_policy",
+        type=lambda value: str(value).strip().lower().replace("-", "_"),
+        choices=tuple(sorted(RESUME_TRUST_POLICIES)),
+        help=(
+            "Resume authentication policy: trusted-local uses protected "
+            "prior byte proofs plus exact stat continuity and falls back to "
+            "deep authentication; strict-portable always deep-authenticates "
+            "after a process restart; manifest-local explicitly trusts a "
+            "private sealed manifest/stat inventory until final handoff and "
+            "terminal validation."
+        ),
+    )
+    parser.add_argument(
         "--stop-after",
         choices=PHASES,
         help="Operational pause boundary; excluded from scientific identity.",
@@ -17938,6 +18768,10 @@ def _run_control_from_namespace(values: Mapping[str, Any]) -> RunControl:
         trust_prior_adoption_attestations=tuple(
             values.get("trust_prior_adoption_attestation", ())
         ),
+        resume_trust_policy=values.get(
+            "resume_trust_policy",
+        )
+        or defaults.resume_trust_policy,
         log_level=values.get("log_level", defaults.log_level),
         validation_depth=values.get(
             "validation_depth",

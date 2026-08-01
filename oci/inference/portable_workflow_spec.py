@@ -61,7 +61,15 @@ STAGE1_PREFLIGHT_EXECUTION_POLICY_VERSION = (
     "portable_stage1_preflight_execution_policy_v1"
 )
 RESOURCE_PERFORMANCE_SAFETY_VERSION = "portable_resource_performance_safety_policy_v2"
-RUN_CONTROL_VERSION = "portable_all_evidence_run_control_v2"
+RUN_CONTROL_VERSION = "portable_all_evidence_run_control_v3"
+
+RESUME_TRUST_POLICIES = frozenset(
+    {
+        "strict_portable",
+        "trusted_local",
+        "manifest_local",
+    }
+)
 BINARY_PROBABILITY_DIFFERENCE = "binary_treatment_binary_outcome_probability_difference_v1"
 
 EVIDENCE_FAMILIES = (
@@ -1924,6 +1932,7 @@ class RunControl:
     stop_after: str | None = None
     adopt_checkpoints: tuple[Path, ...] = ()
     trust_prior_adoption_attestations: tuple[Path, ...] = ()
+    resume_trust_policy: str = "trusted_local"
     log_level: str = "INFO"
     validation_depth: str = "full"
     schema_version: str = RUN_CONTROL_VERSION
@@ -1941,6 +1950,17 @@ class RunControl:
             object.__setattr__(self, "stop_after", stop_after)
         if self.validation_depth not in {"standard", "full", "fresh_terminal_audit"}:
             raise ValueError("unsupported validation depth")
+        resume_trust_policy = _require_nonempty(
+            self.resume_trust_policy,
+            label="run-control resume_trust_policy",
+        ).lower().replace("-", "_")
+        if resume_trust_policy not in RESUME_TRUST_POLICIES:
+            raise ValueError("unsupported resume trust policy")
+        object.__setattr__(
+            self,
+            "resume_trust_policy",
+            resume_trust_policy,
+        )
         log_level = _require_nonempty(
             self.log_level,
             label="run-control log_level",
@@ -2014,6 +2034,7 @@ class RunControl:
                 str(value)
                 for value in self.trust_prior_adoption_attestations
             ],
+            "resume_trust_policy": self.resume_trust_policy,
             "log_level": self.log_level,
             "validation_depth": self.validation_depth,
             "schema_version": self.schema_version,
@@ -2051,6 +2072,7 @@ class RunControl:
             trust_prior_adoption_attestations=tuple(
                 trusted_attestations
             ),
+            resume_trust_policy=value.get("resume_trust_policy"),
             log_level=value.get("log_level"),
             validation_depth=value.get("validation_depth"),
             schema_version=value.get("schema_version"),
@@ -2077,6 +2099,7 @@ __all__ = [
     "ResourcePerformanceSafetyPolicy",
     "RoleNeutralNeuralQueryOperationalControls",
     "RUN_CONTROL_VERSION",
+    "RESUME_TRUST_POLICIES",
     "RunControl",
     "SentenceEmbeddingEncoderSpec",
     "STRICT_FOREST_IMPLEMENTATION",

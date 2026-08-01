@@ -257,8 +257,42 @@ SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh
 ```
 
 If its durable root already contains an immutable request, the launcher adds
-`--resume` automatically. Compatible sealed phases and components are reused;
+`--resume --resume-trust trusted-local` automatically. Compatible sealed
+phases and components are reopened from protected prior byte proofs plus exact
+file-stat continuity; unchanged multi-gigabyte payloads are not reread.
+Missing or discontinuous proofs fall back to full-byte authentication, and
 incomplete work is recomputed at the supported boundary.
+
+An unchanged scientific request may use a different GPU allocation, CPU/I/O
+budget, concurrency, scratch root, or endpoint address. The original immutable
+request remains the artifact authority and the selected resource configuration
+is appended under `execution_attestations/execution_epochs/`. Such an
+operational epoch does not rerun a sealed embedding phase. Model, tokenizer,
+dataset, row-order, split, seed, scientific profile, schema, and producer-code
+changes are still rejected as in-place resumes.
+
+The public authentication policies are:
+
+- `trusted-local` (the launcher default): protected prior full-byte proof and
+  exact stat continuity, with automatic deep fallback;
+- `strict-portable`: force a new full-byte read after every process restart;
+- `manifest-local`: explicitly trust a private, closed manifest/stat inventory
+  when no prior proof exists. This is faster but can miss corruption that
+  preserves the checked metadata. Fresh handoff and terminal validators remain
+  mandatory.
+
+Portable checkpoint adoption also consumes a compatible source phase's
+protected proof automatically under `trusted-local`; the request records
+whether adoption used prior-proof continuity or fresh byte authentication.
+
+Phase compatibility uses explicit declared scientific producer versions.
+Complete source-closure hashes are still retained in the immutable request and
+each execution epoch for provenance, but an authentication, scheduling, or
+other scientifically equivalent implementation correction may retain the
+phase version. Any change capable of altering scientific contents, schemas, or
+coverage must bump the affected entry in
+`PHASE_SCIENTIFIC_PRODUCER_VERSIONS`; forgetting that bump is the intentional
+additional risk of this faster policy.
 
 Do not edit terminal manifests, generated deployment JSON, model files, or
 sealed payloads. Do not point both hosts or both benchmark launchers at the same
@@ -267,10 +301,28 @@ active scratch or durable root.
 ### Recovering completed preparation after a source correction
 
 If a run completed `input_preparation` and `embedding_cache` but then exposed a
-code defect, preserve its durable and scratch roots. Corrected source cannot
-resume the old immutable request in place. Instead, select distinct corrected
-run, scratch, profile, and source-snapshot roots and ask the launcher to import
-the prior cache through the authenticated relocation path:
+code defect, preserve its durable and scratch roots. If the correction is
+scientifically equivalent and therefore retains every affected declared phase
+producer version, select a fresh source-snapshot path but retain the durable
+and scratch roots. The launcher resumes it as an implementation-changed
+execution epoch without relocating or rebuilding the embedding cache:
+
+```bash
+unset CLOUD_FRESH_START CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT
+export CLOUD_SOURCE_SNAPSHOT_ROOT="$PWD/artifacts/production_source_snapshot_corrected"
+SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh --check-only
+SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh
+```
+
+The old snapshot and its source hashes remain available for provenance. The
+new epoch records the corrected implementation closure. Component-specific
+producer identities still reject and recompute affected incomplete or sealed
+components when the correction changes that component implementation.
+
+If the correction changes scientific contents and bumps a declared producer
+version, select distinct corrected run, scratch, profile, and source-snapshot
+roots and import only compatible prior checkpoints through the authenticated
+path:
 
 ```bash
 unset CLOUD_ADOPT_RUN_ROOT
@@ -414,15 +466,19 @@ as a completed pinned model.
 
 ### The source snapshot is stale
 
-Code changed after the snapshot was sealed. Resume an existing run with its
-original code and snapshot, or start a new run with fresh run, scratch, and
-snapshot paths. Never overwrite the old snapshot.
+Code changed after the snapshot was sealed. Never overwrite the old snapshot.
+For a declared scientifically equivalent correction, choose a fresh snapshot
+path and retain the run/scratch roots; trusted-local resume records a new
+implementation epoch. If an affected scientific producer version changed,
+start a new run or use compatible checkpoint adoption.
 
 ### The deployment profile differs from an existing file
 
 The requested dataset, paths, endpoint identity, or resource settings changed.
-Use the original values to resume, or choose fresh run/scratch/profile roots for
-a new request.
+Keep separate immutable generated profile files. A resource-only profile change
+may resume the same durable root as a recorded `trusted-local` execution epoch.
+A scientific or producer-code change still requires a new request or compatible
+checkpoint adoption.
 
 ### GPUs are quiet
 

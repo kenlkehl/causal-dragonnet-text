@@ -503,10 +503,12 @@ def test_run_control_strict_round_trip_and_scientific_exclusion(
             tmp_path / "prepared-adoption.json",
             tmp_path / "embedding-adoption.json",
         ),
+        resume_trust_policy="manifest-local",
         log_level="warning",
         validation_depth="fresh_terminal_audit",
     )
     assert control.log_level == "WARNING"
+    assert control.resume_trust_policy == "manifest_local"
     assert RunControl.from_mapping(control.as_dict()) == control
     path = tmp_path / "run-control.json"
     path.write_text(
@@ -536,6 +538,7 @@ def test_run_control_strict_round_trip_and_scientific_exclusion(
             },
             "duplicated",
         ),
+        ({"resume_trust_policy": "unsafe"}, "resume trust policy"),
         ({"log_level": "verbose"}, "log level"),
         ({"validation_depth": "shallow"}, "validation depth"),
     ),

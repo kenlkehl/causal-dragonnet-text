@@ -12,6 +12,7 @@ import pytest
 
 import oci.inference.production_authenticated_tree_cache as tree_module
 import oci.inference.production_all_evidence_workflow as workflow_module
+import oci.inference.portable_artifacts as portable_artifact_module
 from oci.inference.portable_artifacts import (
     ArtifactCompatibility,
     publish_portable_artifact,
@@ -106,9 +107,13 @@ def _bare_workflow_with_completed_phase(
         manifest,
     )
     workflow = object.__new__(ProductionAllEvidenceWorkflow)
-    workflow.options = SimpleNamespace(work_root=work_root)
+    workflow.options = SimpleNamespace(
+        work_root=work_root,
+        run_control=RunControl(),
+    )
     workflow.request = {"request_sha256": request_sha256}
     workflow._phase_payload_stat_inventories = {}
+    workflow._phase_resume_authentication_modes = {}
     workflow._adopted_artifact_handles = {}
     return workflow, payload
 
@@ -127,6 +132,7 @@ def test_completed_phase_cross_process_proof_avoids_payload_reread(
     reopened.options = workflow.options
     reopened.request = workflow.request
     reopened._phase_payload_stat_inventories = {}
+    reopened._phase_resume_authentication_modes = {}
     reopened._adopted_artifact_handles = {}
 
     original = workflow_module.stable_file_sha256
@@ -150,6 +156,65 @@ def test_completed_phase_cross_process_proof_avoids_payload_reread(
     assert "embedding_cache" in (
         reopened._phase_payload_stat_inventories
     )
+    assert reopened._phase_resume_authentication_modes == {
+        "embedding_cache": "prior_proof_stat_continuity",
+    }
+
+
+def test_strict_portable_resume_rehashes_phase_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow, payload = _bare_workflow_with_completed_phase(tmp_path)
+    workflow.options = SimpleNamespace(
+        work_root=workflow.options.work_root,
+        run_control=RunControl(
+            resume=True,
+            resume_trust_policy="strict_portable",
+        ),
+    )
+    original = workflow_module.stable_file_sha256
+    payload_reads: list[Path] = []
+
+    def traced(path: Path) -> tuple[str, int]:
+        resolved = Path(path).resolve(strict=True)
+        if resolved == payload.resolve(strict=True):
+            payload_reads.append(resolved)
+        return original(resolved)
+
+    monkeypatch.setattr(workflow_module, "stable_file_sha256", traced)
+    assert workflow._validated_complete("embedding_cache") is not None
+    assert payload_reads == [payload.resolve(strict=True)]
+    assert workflow._phase_resume_authentication_modes == {
+        "embedding_cache": "full_byte_reauthentication",
+    }
+
+
+def test_manifest_local_resume_uses_closed_private_inventory_without_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow, payload = _bare_workflow_with_completed_phase(tmp_path)
+    workflow.options = SimpleNamespace(
+        work_root=workflow.options.work_root,
+        run_control=RunControl(
+            resume=True,
+            resume_trust_policy="manifest_local",
+        ),
+    )
+
+    original = workflow_module.stable_file_sha256
+
+    def guarded(path: Path) -> tuple[str, int]:
+        if Path(path).resolve(strict=True) == payload.resolve(strict=True):
+            raise AssertionError("manifest-local resume reread payload bytes")
+        return original(path)
+
+    monkeypatch.setattr(workflow_module, "stable_file_sha256", guarded)
+    assert workflow._validated_complete("embedding_cache") is not None
+    assert workflow._phase_resume_authentication_modes == {
+        "embedding_cache": "manifest_local_stat_inventory",
+    }
 
 
 def test_completed_phase_optional_proof_failure_accepts_valid_deep_bytes(
@@ -234,9 +299,13 @@ def test_phase_publication_retains_process_stats_when_probe_is_unavailable(
     payload.write_bytes(b"authenticated-cache" * 4096)
 
     workflow = object.__new__(ProductionAllEvidenceWorkflow)
-    workflow.options = SimpleNamespace(work_root=work_root)
+    workflow.options = SimpleNamespace(
+        work_root=work_root,
+        run_control=RunControl(),
+    )
     workflow.request = {"request_sha256": "b" * 64}
     workflow._phase_payload_stat_inventories = {}
+    workflow._phase_resume_authentication_modes = {}
     workflow._adopted_artifact_handles = {}
     workflow.telemetry = SimpleNamespace(
         count_bytes=lambda **_kwargs: None,
@@ -1475,6 +1544,275 @@ def test_run_control_is_excluded_from_immutable_scientific_request(
     assert observed == baseline
     assert "run_control" not in observed
     assert observed["scientific_identity"] == baseline["scientific_identity"]
+
+
+def test_cli_run_control_defaults_to_trusted_local_resume() -> None:
+    control = workflow_module._run_control_from_namespace(
+        {"resume_trust_policy": None}
+    )
+
+    assert control.resume_trust_policy == "trusted_local"
+
+
+def test_trusted_local_resume_records_resource_epoch_without_new_request(
+    tmp_path: Path,
+) -> None:
+    options = _options(tmp_path)
+    first = ProductionAllEvidenceWorkflow(options)
+    first._initialize()
+    immutable_bytes = (
+        options.work_root / "immutable_run_request.json"
+    ).read_bytes()
+
+    resumed_options = replace(
+        options,
+        embedding_batch_size=options.embedding_batch_size + 4,
+        scratch_root=tmp_path / "new-operational-scratch",
+        run_control=replace(
+            options.run_control,
+            resume=True,
+            resume_trust_policy="trusted_local",
+        ),
+    )
+    resumed = ProductionAllEvidenceWorkflow(resumed_options)
+    resumed._initialize()
+
+    assert resumed.request == first.request
+    assert (
+        options.work_root / "immutable_run_request.json"
+    ).read_bytes() == immutable_bytes
+    epochs = sorted(
+        (
+            options.work_root
+            / "execution_attestations"
+            / "execution_epochs"
+        ).glob("epoch_*.json")
+    )
+    assert len(epochs) == 2
+    second_epoch = json.loads(epochs[-1].read_text(encoding="utf-8"))
+    assert second_epoch["request_match_mode"] == "operational_epoch"
+    assert second_epoch["resume_trust_policy"] == "trusted_local"
+    assert second_epoch["scientific_request_identity_affected"] is False
+    assert (
+        second_epoch["selected_operational_values"]["embedding_batch_size"]
+        == options.embedding_batch_size + 4
+    )
+
+
+def test_declared_phase_version_separates_science_from_implementation_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def records(marker: str) -> dict[str, dict[str, object]]:
+        output: dict[str, dict[str, object]] = {}
+        for phase in workflow_module.PORTABLE_CHECKPOINT_PHASE_SPECS:
+            body = {"phase": phase, "implementation_marker": marker}
+            output[phase] = {
+                **body,
+                "content_sha256": workflow_module._sha(body),
+            }
+        return output
+
+    scientific = {"fixture_science": "unchanged"}
+    first = workflow_module._bind_workflow_scientific_identity(
+        scientific_configuration_body=scientific,
+        phase_code_records=records("implementation-a"),
+    )
+    implementation_only = (
+        workflow_module._bind_workflow_scientific_identity(
+            scientific_configuration_body=scientific,
+            phase_code_records=records("implementation-b"),
+        )
+    )
+    assert first["scientific_identity"] == (
+        implementation_only["scientific_identity"]
+    )
+    assert first["phase_implementation_code_identities"] != (
+        implementation_only["phase_implementation_code_identities"]
+    )
+
+    monkeypatch.setitem(
+        workflow_module.PHASE_SCIENTIFIC_PRODUCER_VERSIONS,
+        "stage1_modeling",
+        "token_attention_all_ten_component_semantics_v4",
+    )
+    scientific_change = (
+        workflow_module._bind_workflow_scientific_identity(
+            scientific_configuration_body=scientific,
+            phase_code_records=records("implementation-b"),
+        )
+    )
+    assert scientific_change["scientific_identity"] != (
+        first["scientific_identity"]
+    )
+
+
+def test_resource_epoch_resume_skips_sealed_embedding_phase(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def producer(phase: str):
+        def run(attempt: Path) -> dict[str, object]:
+            calls.append(phase)
+            payload = attempt / f"{phase}.bin"
+            payload.write_bytes(phase.encode("utf-8") * 128)
+            return {"terminal_files": [str(payload)]}
+
+        return run
+
+    overrides = {
+        "input_preparation": producer("input_preparation"),
+        "embedding_cache": producer("embedding_cache"),
+    }
+    options = _with_run_control(
+        _options(tmp_path),
+        stop_after="embedding_cache",
+    )
+    first = ProductionAllEvidenceWorkflow(
+        options,
+        phase_overrides=overrides,
+    ).run()
+    assert first["status"] == "paused"
+    assert calls == ["input_preparation", "embedding_cache"]
+
+    calls.clear()
+    resumed_options = replace(
+        options,
+        embedding_batch_size=options.embedding_batch_size + 2,
+        run_control=replace(
+            options.run_control,
+            resume=True,
+            resume_trust_policy="trusted_local",
+        ),
+    )
+    resumed = ProductionAllEvidenceWorkflow(
+        resumed_options,
+        phase_overrides=overrides,
+    ).run()
+
+    assert resumed["status"] == "paused"
+    assert calls == []
+    assert resumed["completed_phases"] == [
+        "input_preparation",
+        "embedding_cache",
+    ]
+    assert resumed[
+        "resume_accepts_recorded_operational_execution_epoch"
+    ] is True
+
+
+def test_strict_or_scientifically_changed_resume_rejects_execution_epoch(
+    tmp_path: Path,
+) -> None:
+    options = _options(tmp_path)
+    ProductionAllEvidenceWorkflow(options)._initialize()
+
+    operational_change = replace(
+        options,
+        embedding_batch_size=options.embedding_batch_size + 1,
+        run_control=replace(
+            options.run_control,
+            resume=True,
+            resume_trust_policy="strict_portable",
+        ),
+    )
+    with pytest.raises(ValueError, match="differs scientifically"):
+        ProductionAllEvidenceWorkflow(operational_change)._initialize()
+
+    scientific_change = replace(
+        options,
+        model_name="different/scientific-stage2-model",
+        run_control=replace(
+            options.run_control,
+            resume=True,
+            resume_trust_policy="trusted_local",
+        ),
+    )
+    with pytest.raises(ValueError, match="differs scientifically"):
+        ProductionAllEvidenceWorkflow(scientific_change)._initialize()
+
+
+def test_trusted_local_checkpoint_adoption_reuses_source_phase_byte_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    producer_root = tmp_path / "producer"
+    consumer_root = tmp_path / "consumer"
+    producer_root.mkdir()
+    consumer_root.mkdir()
+    producer_options = _options(producer_root)
+    producer = ProductionAllEvidenceWorkflow(producer_options)
+    producer._initialize()
+    attempt = producer._attempt_dir("input_preparation")
+    payload = attempt / "prepared.bin"
+    payload.write_bytes(b"large prepared payload" * 16_384)
+    phase_manifest = producer._complete(
+        "input_preparation",
+        {"terminal_files": [str(payload)]},
+        attempt_dir=attempt,
+    )
+    artifact = producer._publish_completed_phase_checkpoint(
+        "input_preparation",
+        phase_manifest,
+    )
+    published_payload = Path(phase_manifest["attempt_dir"]) / payload.name
+
+    consumer_base = _options(consumer_root)
+    consumer_options = replace(
+        consumer_base,
+        dataset_path=producer_options.dataset_path,
+        stage1_profile_path=producer_options.stage1_profile_path,
+        query_profile_path=producer_options.query_profile_path,
+        embedding_local_model_path=(
+            producer_options.embedding_local_model_path
+        ),
+        htr_local_model_path=producer_options.htr_local_model_path,
+        stage2_tokenizer_locator=(
+            producer_options.stage2_tokenizer_locator
+        ),
+        run_control=RunControl(
+            adopt_checkpoints=(artifact.root,),
+            resume_trust_policy="trusted_local",
+        ),
+    )
+    original_hash = portable_artifact_module._safe_file_hash_with_identity
+    payload_reads: list[Path] = []
+
+    def traced(path: Path, *, label: str):
+        resolved = Path(path).resolve(strict=True)
+        if resolved == published_payload.resolve(strict=True):
+            payload_reads.append(resolved)
+        return original_hash(path, label=label)
+
+    monkeypatch.setattr(
+        portable_artifact_module,
+        "_safe_file_hash_with_identity",
+        traced,
+    )
+    consumer = ProductionAllEvidenceWorkflow(consumer_options)
+    consumer._initialize()
+    request = consumer.request
+
+    assert payload_reads == []
+    assert consumer._checkpoint_adoption_authentication_modes[
+        str(artifact.root)
+    ] == "prior_proof_stat_continuity"
+    assert request["requested_checkpoint_adoptions"][0][
+        "payload_bytes_reauthenticated"
+    ] is False
+    assert request["requested_checkpoint_adoptions"][0][
+        "resume_authentication_mode"
+    ] == "prior_proof_stat_continuity"
+    attestation = json.loads(
+        (
+            consumer_options.work_root
+            / "checkpoint_adoptions"
+            / f"{artifact.artifact_id}.adoption.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert attestation["validation_policy"] == (
+        portable_artifact_module.PRIOR_PROOF_STAT_CONTINUITY_ADOPTION_POLICY
+    )
 
 
 @pytest.mark.parametrize(
@@ -5961,9 +6299,13 @@ def test_fresh_canary_validator_sets_and_verifies_snapshot_environment(
     workflow = ProductionAllEvidenceWorkflow(options)
     workflow.request = {
         "source_snapshot": {
-            "root": str(snapshot_root),
-            "content_sha256": snapshot_sha,
+            "root": str(tmp_path / "archived-snapshot"),
+            "content_sha256": "a" * 64,
         }
+    }
+    workflow._active_execution_source_snapshot = {
+        "root": str(snapshot_root),
+        "content_sha256": snapshot_sha,
     }
     options.work_root.mkdir()
     expected_result = {"status": "complete"}

@@ -12,11 +12,11 @@
 # to its verified workflow process group, waits for it to exit, and starts a
 # new production request on physical GPUs 2,3. It never sends SIGKILL.
 #
-# The two requests have distinct durable roots and one shared scratch store.
-# The post-deadline request deliberately rebuilds embeddings on GPUs 2,3; it
-# does not adopt or import a prior cache. Compatible sealed preflight and Stage
-# 1 components remain eligible through their path/resource-neutral scientific
-# identities. Incomplete attempts are preserved.
+# Both resource schedules are execution epochs of one durable scientific run
+# and share one scratch store. The post-deadline epoch reopens the already
+# sealed input, embedding, preflight, and Stage 1 work through protected
+# proof/stat continuity; it does not rebuild embeddings merely because the GPU
+# allocation changed. Incomplete attempts are preserved.
 #
 # This is a Stage 1-only path through ordinary handoff_validation. It does not
 # contact an LLM endpoint or open the oracle. Re-running the script resumes the
@@ -128,10 +128,11 @@ require_directory "${local_htr_model}"
 local_run_base="${LOCAL_FIVE_CONF_RUN_ROOT_BASE:-${local_repo_root}/artifacts/local_runs/five_conf_five_mod_scheduled}"
 local_scratch_root="${LOCAL_FIVE_CONF_SCRATCH_ROOT:-${local_repo_root}/artifacts/local_scratch/five_conf_five_mod_scheduled}"
 local_profile_root="${LOCAL_FIVE_CONF_PROFILE_ROOT:-${local_repo_root}/artifacts/runtime_profiles/local_five_conf_five_mod_scheduled}"
-local_snapshot="${LOCAL_FIVE_CONF_SOURCE_SNAPSHOT_ROOT:-${local_repo_root}/artifacts/production_source_snapshot_local_five_conf_five_mod_scheduled_vram90_admission}"
-local_admission_namespace="at_least_90pct_vram_free"
-local_before_root="${local_run_base}/${local_admission_namespace}/gpu0123"
-local_after_root="${local_run_base}/${local_admission_namespace}/gpu23"
+local_snapshot="${LOCAL_FIVE_CONF_SOURCE_SNAPSHOT_ROOT:-${local_repo_root}/artifacts/production_source_snapshot_local_five_conf_five_mod_current}"
+local_admission_namespace="at_least_90pct_vram_free_trusted_resume"
+local_active_root="${local_run_base}/${local_admission_namespace}/active"
+local_before_root="${local_active_root}"
+local_after_root="${local_active_root}"
 local_before_profile="${local_profile_root}/${local_admission_namespace}/gpu0123.json"
 local_after_profile="${local_profile_root}/${local_admission_namespace}/gpu23.json"
 local_log_root="${local_repo_root}/artifacts/operator_logs"
@@ -397,6 +398,7 @@ start_workflow() {
         --scientific-spec "${local_scientific}" \
         --deployment-profile "${profile}" \
         --source-snapshot-root "${local_snapshot}" \
+        --resume-trust trusted-local \
         --validation-depth fresh_terminal_audit \
         --log-level INFO \
         --stage1-only \

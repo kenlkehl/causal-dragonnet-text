@@ -411,6 +411,7 @@ cloud_workflow_arguments=(
     --scientific-spec "${cloud_scientific}"
     --deployment-profile "${cloud_deployment}"
     --source-snapshot-root "${cloud_snapshot}"
+    --resume-trust trusted-local
     --validation-depth fresh_terminal_audit
     --log-level INFO
     "${cloud_stop_arguments[@]}"

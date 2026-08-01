@@ -9,6 +9,10 @@
 # CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT may name a preserved prior durable root.
 # Input preparation then runs freshly and the old cache passes the workflow's
 # authenticated relocation path; embeddings are not recomputed.
+# Ordinary restarts use trusted-local resume: protected prior byte proofs plus
+# exact stat continuity avoid rereading sealed payloads, while any proof/stat
+# discontinuity falls back to deep authentication. Resource-only deployment
+# changes are recorded as execution epochs under the same scientific request.
 #
 # Repository preparation on the cloud VM:
 #

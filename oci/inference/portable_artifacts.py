@@ -21,6 +21,22 @@ from .portable_identity import canonical_json, identity_sha256
 PORTABLE_ARTIFACT_MANIFEST = "portable_scientific_artifact_manifest_v1"
 PORTABLE_ARTIFACT_LOCATOR = "portable_scientific_artifact_locator_v2"
 PORTABLE_ADOPTION_ATTESTATION = "portable_checkpoint_adoption_attestation_v3"
+FRESH_FULL_BYTE_ADOPTION_POLICY = (
+    "fresh_full_byte_and_exact_control_inventory_no_force_v3"
+)
+PRIOR_PROOF_STAT_CONTINUITY_ADOPTION_POLICY = (
+    "prior_full_byte_proof_stat_continuity_exact_control_inventory_no_force_v1"
+)
+MANIFEST_LOCAL_ADOPTION_POLICY = (
+    "manifest_local_stat_inventory_exact_control_inventory_no_force_v1"
+)
+ADOPTION_VALIDATION_POLICIES = frozenset(
+    {
+        FRESH_FULL_BYTE_ADOPTION_POLICY,
+        PRIOR_PROOF_STAT_CONTINUITY_ADOPTION_POLICY,
+        MANIFEST_LOCAL_ADOPTION_POLICY,
+    }
+)
 PORTABLE_PHASE_BINDING = "portable_workflow_phase_binding_v1"
 PORTABLE_SCIENTIFIC_CONTENT_DESCRIPTOR = (
     "portable_scientific_content_descriptor_v2"
@@ -1660,6 +1676,7 @@ def adopt_checkpoint(
     expected_compatibility_key: str | None = None,
     expected_upstream_artifact_ids: Sequence[str] | None = None,
     validated_artifact: ValidatedPortableArtifact | None = None,
+    validation_policy: str = FRESH_FULL_BYTE_ADOPTION_POLICY,
 ) -> Mapping[str, Any]:
     """Authenticate and adopt one complete checkpoint into a fresh request.
 
@@ -1669,6 +1686,8 @@ def adopt_checkpoint(
 
     if _SHA256.fullmatch(str(consumer_request_sha256)) is None:
         raise ValueError("consumer request identity must be one lowercase SHA-256")
+    if validation_policy not in ADOPTION_VALIDATION_POLICIES:
+        raise ValueError("checkpoint adoption validation policy is unsupported")
     if validated_artifact is None:
         artifact = validate_portable_artifact(
             source,
@@ -1719,9 +1738,7 @@ def adopt_checkpoint(
         "validated_upstream_artifact_ids": list(
             artifact.manifest["upstream_artifact_ids"]
         ),
-        "validation_policy": (
-            "fresh_full_byte_and_exact_control_inventory_no_force_v3"
-        ),
+        "validation_policy": validation_policy,
     }
     target_root = Path(attestation_root)
     if target_root.exists() and (target_root.is_symlink() or not target_root.is_dir()):
@@ -1825,7 +1842,7 @@ def validate_checkpoint_adoption(
         or value.get("validated_upstream_artifact_ids")
         != list(artifact.manifest["upstream_artifact_ids"])
         or value.get("validation_policy")
-        != "fresh_full_byte_and_exact_control_inventory_no_force_v3"
+        not in ADOPTION_VALIDATION_POLICIES
         or value.get("content_sha256") != identity_sha256(body)
         or not isinstance(value.get("recorded_at"), str)
         or not str(value["recorded_at"]).strip()
@@ -1951,17 +1968,21 @@ def write_table_parquet_new(path: Path, table: Any) -> PayloadRegistration:
 
 __all__ = [
     "ArtifactCompatibility",
+    "ADOPTION_VALIDATION_POLICIES",
     "CHECKPOINT_ARTIFACT_KINDS",
     "COMPLETE_PAYLOAD_TREE",
     "LOCATOR_NAME",
     "MANIFEST_NAME",
+    "MANIFEST_LOCAL_ADOPTION_POLICY",
     "PORTABLE_ADOPTION_ATTESTATION",
     "PORTABLE_ARTIFACT_LOCATOR",
     "PORTABLE_ARTIFACT_MANIFEST",
     "PORTABLE_PHASE_BINDING",
+    "PRIOR_PROOF_STAT_CONTINUITY_ADOPTION_POLICY",
     "REGISTERED_PAYLOAD_PATHS_ONLY",
     "PayloadRegistration",
     "SCIENTIFIC_COMPATIBILITY_VERSION",
+    "FRESH_FULL_BYTE_ADOPTION_POLICY",
     "ValidatedPortableArtifact",
     "adopt_checkpoint",
     "assert_validated_artifact_unchanged",
