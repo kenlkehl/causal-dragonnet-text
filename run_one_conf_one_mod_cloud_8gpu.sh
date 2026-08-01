@@ -32,6 +32,22 @@
 #   export CLOUD_SOURCE_SNAPSHOT_ROOT="$PWD/artifacts/production_source_snapshot_fresh"
 #   SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh
 #
+# To recover the long cold-start run after the TF-IDF NMF C-order correction,
+# preserve its durable root and reuse its existing scratch/component store.
+# Use a new immutable request and source snapshot, importing only the already
+# authenticated embedding phase. Ordinary component authentication reuses
+# sealed non-TF-IDF Stage 1 work and recomputes TF-IDF components whose
+# producer identity changed:
+#
+#   unset CLOUD_FRESH_START CLOUD_ADOPT_RUN_ROOT STOP_AFTER
+#   export CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT="$PWD/artifacts/cloud_runs_fresh/one_conf_one_mod"
+#   export CLOUD_RUN_ROOT_BASE="$PWD/artifacts/cloud_runs_nmf_c_order"
+#   export CLOUD_SCRATCH_ROOT_BASE="$PWD/artifacts/cloud_scratch_fresh"
+#   export CLOUD_RUNTIME_PROFILE_ROOT="$PWD/artifacts/runtime_profiles/nmf_c_order"
+#   export CLOUD_SOURCE_SNAPSHOT_ROOT="$PWD/artifacts/production_source_snapshot_nmf_c_order"
+#   SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh --check-only
+#   SKIP_UV_SYNC=1 ./run_one_conf_one_mod_cloud_8gpu.sh
+#
 # To recover the completed embedding cache from a preserved failed run after a
 # source correction, keep the old trees intact and use fresh active roots:
 #

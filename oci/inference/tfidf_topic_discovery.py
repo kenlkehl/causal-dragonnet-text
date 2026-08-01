@@ -57,6 +57,7 @@ from .multi_model_agentic_forest import (
     _make_bow_regressor,
     _make_bow_vectorizer,
 )
+from .sklearn_nmf_compat import fit_transform_nmf_with_c_order_initial_w
 from .tfidf_topic_score_selection import (
     TOPIC_SCORE_TEST_SCHEMA_VERSION,
     score_topic_banks,
@@ -1760,7 +1761,7 @@ class ConsensusNMFTopicBank:
                 verbose=0,
                 shuffle=bool(config.nmf_scientific.shuffle),
             )
-            w = model.fit_transform(weighted)
+            w = fit_transform_nmf_with_c_order_initial_w(model, weighted)
             h = np.asarray(model.components_, dtype=float)
             component_norm = np.linalg.norm(h, axis=1)
             component_norm = np.where(component_norm > 0.0, component_norm, 1.0)
