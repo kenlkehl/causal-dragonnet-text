@@ -22,6 +22,11 @@
 # contact an LLM endpoint or open the oracle. Re-running the script resumes the
 # applicable immutable request. The pinned embedding and HTR model trees are
 # materialized once under artifacts/local_models/current and then reused.
+#
+# GPU admission is based on aggregate VRAM, not process exclusivity. A selected
+# GPU may have other compute processes so long as at least 90% of its VRAM is
+# free when production performs its resource checks. The observed processes
+# and memory state remain recorded in the production resource attestations.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -123,14 +128,15 @@ require_directory "${local_htr_model}"
 local_run_base="${LOCAL_FIVE_CONF_RUN_ROOT_BASE:-${local_repo_root}/artifacts/local_runs/five_conf_five_mod_scheduled}"
 local_scratch_root="${LOCAL_FIVE_CONF_SCRATCH_ROOT:-${local_repo_root}/artifacts/local_scratch/five_conf_five_mod_scheduled}"
 local_profile_root="${LOCAL_FIVE_CONF_PROFILE_ROOT:-${local_repo_root}/artifacts/runtime_profiles/local_five_conf_five_mod_scheduled}"
-local_snapshot="${LOCAL_FIVE_CONF_SOURCE_SNAPSHOT_ROOT:-${local_repo_root}/artifacts/production_source_snapshot_local_five_conf_five_mod_scheduled}"
-local_before_root="${local_run_base}/gpu0123"
-local_after_root="${local_run_base}/gpu23"
-local_before_profile="${local_profile_root}/gpu0123.json"
-local_after_profile="${local_profile_root}/gpu23.json"
+local_snapshot="${LOCAL_FIVE_CONF_SOURCE_SNAPSHOT_ROOT:-${local_repo_root}/artifacts/production_source_snapshot_local_five_conf_five_mod_scheduled_vram90_admission}"
+local_admission_namespace="at_least_90pct_vram_free"
+local_before_root="${local_run_base}/${local_admission_namespace}/gpu0123"
+local_after_root="${local_run_base}/${local_admission_namespace}/gpu23"
+local_before_profile="${local_profile_root}/${local_admission_namespace}/gpu0123.json"
+local_after_profile="${local_profile_root}/${local_admission_namespace}/gpu23.json"
 local_log_root="${local_repo_root}/artifacts/operator_logs"
-local_before_log="${local_log_root}/five_conf_five_mod_gpu0123.log"
-local_after_log="${local_log_root}/five_conf_five_mod_gpu23.log"
+local_before_log="${local_log_root}/five_conf_five_mod_vram90_gpu0123.log"
+local_after_log="${local_log_root}/five_conf_five_mod_vram90_gpu23.log"
 local_lock_root="${local_repo_root}/artifacts/production_launch_locks"
 mkdir -p \
     "${local_run_base}" \
@@ -201,6 +207,7 @@ local_total_memory_bytes="$(( $(awk '/^MemTotal:/ {print $2; exit}' /proc/meminf
 local_preflight_memory_budget="${PREFLIGHT_MEMORY_BUDGET_BYTES:-$(( local_total_memory_bytes * 3 / 4 ))}"
 local_preflight_owner_peak="${PREFLIGHT_ESTIMATED_OWNER_PEAK_BYTES:-8589934592}"
 local_embedding_batch_size="${EMBEDDING_BATCH_SIZE:-8}"
+local_gpu_minimum_free_fraction="0.90"
 for local_positive in \
     "${local_preflight_memory_budget}" \
     "${local_preflight_owner_peak}" \
@@ -248,6 +255,7 @@ build_profile() {
         --preflight-owner-peak "${local_preflight_owner_peak}" \
         --preflight-lanes "${lane_count}" \
         --embedding-batch-size "${local_embedding_batch_size}" \
+        --gpu-minimum-free-fraction "${local_gpu_minimum_free_fraction}" \
         "${device_arguments[@]}"
 }
 

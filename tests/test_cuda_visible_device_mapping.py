@@ -99,7 +99,10 @@ def test_numeric_cuda_visibility_maps_nvml_to_logical_devices(
         0: [{"pid": 222, "used_memory_mib": "9"}],
     }
 
-    safety.gpu_max_allocation_fraction = 0.2
+    safety.gpu_max_allocation_fraction = 0.25
+    workflow.ProductionAllEvidenceWorkflow._gpu_preflight(subject)
+
+    safety.gpu_max_allocation_fraction = 0.249
     with pytest.raises(RuntimeError) as unsafe:
         workflow.ProductionAllEvidenceWorkflow._gpu_preflight(subject)
     assert '"0":{"allocation_fraction":0.25' in str(unsafe.value)

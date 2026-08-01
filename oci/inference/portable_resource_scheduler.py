@@ -315,7 +315,7 @@ def plan_resources(
                     reasons.append("less_than_required_headroom")
                 if (
                     gpu.used_memory_bytes / gpu.total_memory_bytes
-                    >= resource_performance_safety.gpu_max_allocation_fraction
+                    > resource_performance_safety.gpu_max_allocation_fraction
                 ):
                     reasons.append("existing_allocation_exceeds_fraction")
                 if reasons:
@@ -422,7 +422,7 @@ def select_fastest_safe_candidate(
             and value.deterministic
             and value.scientifically_equal
             and float(value.peak_allocation_fraction)
-            < resource_performance_safety.gpu_max_allocation_fraction
+            <= resource_performance_safety.gpu_max_allocation_fraction
             and int(value.minimum_headroom_bytes)
             >= resource_performance_safety.gpu_minimum_headroom_bytes
             and (

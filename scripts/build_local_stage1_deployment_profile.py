@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable
 
@@ -20,6 +21,23 @@ def _positive(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
+
+
+def _free_fraction(value: str) -> Decimal:
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(
+            "expected a decimal GPU free-memory fraction"
+        ) from exc
+    if (
+        not parsed.is_finite()
+        or not Decimal("0") < parsed < Decimal("1")
+    ):
+        raise argparse.ArgumentTypeError(
+            "GPU free-memory fraction must be in (0, 1)"
+        )
     return parsed
 
 
@@ -79,7 +97,13 @@ def build_profile(args: argparse.Namespace) -> DeploymentProfile:
         args.cpu_budget
     )
     safety = profile["resource_performance_safety"]
-    safety["fail_on_external_gpu_occupants"] = True
+    # Existing process presence is not itself unsafe. Admission is based on
+    # aggregate VRAM occupancy, irrespective of which processes own it.
+    safety["fail_on_external_gpu_occupants"] = False
+    safety["gpu_max_allocation_fraction"] = float(
+        Decimal("1") - args.gpu_minimum_free_fraction
+    )
+    safety["gpu_minimum_headroom_bytes"] = 0
     safety["maximum_ordinary_read_amplification"] = float(
         args.preflight_lanes
     )
@@ -158,6 +182,10 @@ def build_profile(args: argparse.Namespace) -> DeploymentProfile:
         or execution.htr_operational_controls.fold_slots_per_device != 1
         or execution.neural_query_topology.mode
         != "one_context_per_selected_device"
+        or compiled.resource_performance_safety.fail_on_external_gpu_occupants
+        or compiled.resource_performance_safety.gpu_max_allocation_fraction
+        != float(Decimal("1") - args.gpu_minimum_free_fraction)
+        or compiled.resource_performance_safety.gpu_minimum_headroom_bytes != 0
         or compiled.endpoint is not None
         or compiled.oracle_source is not None
     ):
@@ -205,6 +233,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--embedding-batch-size",
         type=_positive,
         required=True,
+    )
+    parser.add_argument(
+        "--gpu-minimum-free-fraction",
+        type=_free_fraction,
+        required=True,
+        help=(
+            "Admit selected GPUs when this fraction of aggregate VRAM is "
+            "free; external process presence alone is permitted."
+        ),
     )
     return parser
 

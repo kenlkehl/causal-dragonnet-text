@@ -6,6 +6,12 @@ from pathlib import Path
 
 import pytest
 
+from oci.inference.portable_resource_scheduler import (
+    GPUResource,
+    ResourceInventory,
+    plan_resources,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -65,6 +71,8 @@ def _args(
         str(len(devices)),
         "--embedding-batch-size",
         "8",
+        "--gpu-minimum-free-fraction",
+        "0.90",
     ]
     for device in devices:
         values.extend(("--device", device))
@@ -107,6 +115,12 @@ def test_local_profiles_compile_four_then_two_disjoint_lanes(
     assert before.durable_artifact_root != after.durable_artifact_root
     assert before.endpoint is None and after.endpoint is None
     assert before.oracle_source is None and after.oracle_source is None
+    assert (
+        before.resource_performance_safety.fail_on_external_gpu_occupants
+        is False
+    )
+    assert before.resource_performance_safety.gpu_max_allocation_fraction == 0.1
+    assert before.resource_performance_safety.gpu_minimum_headroom_bytes == 0
 
 
 def test_local_profile_rejects_owner_cap_above_resource_capacity(
@@ -123,3 +137,70 @@ def test_local_profile_rejects_owner_cap_above_resource_capacity(
 
     with pytest.raises(ValueError, match="device or CPU capacity"):
         module.build_profile(args)
+
+
+def test_local_policy_allows_occupant_at_ninety_percent_free(
+    tmp_path: Path,
+) -> None:
+    profile = _builder().build_profile(
+        _args(
+            tmp_path=tmp_path,
+            target=tmp_path / "profile.json",
+            durable=tmp_path / "run",
+            devices=("cuda:0",),
+        )
+    )
+    accepted_inventory = ResourceInventory(
+        cpu_count=8,
+        gpus=(
+            GPUResource(
+                device="cuda:0",
+                uuid="gpu-0",
+                total_memory_bytes=1_000,
+                free_memory_bytes=900,
+                utilization_percent=4.0,
+                external_processes=(
+                    {"pid": 123, "used_memory_bytes": 100},
+                ),
+            ),
+        ),
+    )
+
+    accepted = plan_resources(
+        policy=("cuda:0",),
+        cpu_budget=8,
+        requested_device_count=1,
+        inventory=accepted_inventory,
+        cpu_supported=False,
+        resource_performance_safety=(
+            profile.resource_performance_safety
+        ),
+    )
+    assert accepted.devices == ("cuda:0",)
+
+    rejected_inventory = ResourceInventory(
+        cpu_count=8,
+        gpus=(
+            GPUResource(
+                device="cuda:0",
+                uuid="gpu-0",
+                total_memory_bytes=1_000,
+                free_memory_bytes=899,
+                utilization_percent=4.0,
+                external_processes=(
+                    {"pid": 123, "used_memory_bytes": 101},
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="occupied or unsafe"):
+        plan_resources(
+            policy=("cuda:0",),
+            cpu_budget=8,
+            requested_device_count=1,
+            inventory=rejected_inventory,
+            cpu_supported=False,
+            resource_performance_safety=(
+                profile.resource_performance_safety
+            ),
+        )

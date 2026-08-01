@@ -12419,7 +12419,7 @@ class ProductionAllEvidenceWorkflow:
             free_bytes = max(0, total - used) * 1024**2
             allocation_fraction = used / total if total > 0 else math.inf
             reasons: list[str] = []
-            if allocation_fraction >= safety.gpu_max_allocation_fraction:
+            if allocation_fraction > safety.gpu_max_allocation_fraction:
                 reasons.append("existing_allocation_exceeds_configured_fraction")
             if free_bytes < safety.gpu_minimum_headroom_bytes:
                 reasons.append("less_than_configured_headroom")
