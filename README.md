@@ -40,10 +40,13 @@ python oracle_experiment_scripts/run_oracle_experiments.py \
 
 The current integrated production workflow has a self-service operator guide:
 
+- [Production all-evidence end-to-end guide](docs/production_all_evidence_end_to_end.md):
+  canonical fresh-cohort workflow, Stage 1 and Stage 2 science, complete
+  artifact map, endpoint setup, monitoring, authentication, interruption,
+  resume, checkpoint reuse, and final outputs.
 - [Production all-evidence quickstart](docs/production_all_evidence_quickstart.md):
-  host requirements, locked installation, eight-GPU cloud launch, Stage 1 and
-  local-vLLM Stage 2, monitoring, interruption/resume, outputs, and the boundary
-  for arbitrary clinical cohorts.
+  host requirements and concrete eight-GPU cloud launchers for the supplied
+  synthetic benchmarks.
 
 Detailed scientific contracts and historical recovery guidance are available
 separately:

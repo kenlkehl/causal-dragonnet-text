@@ -1469,7 +1469,7 @@ def test_historical_full_authentication_reopens_by_exact_stat_continuity(
         )
 
 
-def test_component_store_namespace_excludes_stage2_catalog_identity_and_finds_v1(
+def test_component_store_namespace_is_science_narrow_and_finds_legacy_stores(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1539,7 +1539,89 @@ def test_component_store_namespace_excludes_stage2_catalog_identity_and_finds_v1
     )
     assert first == second
 
+    source_variant_projection = {
+        **projection,
+        "source_config": {"field": "byte-different-equivalent-profile"},
+    }
+    source_variant = workflow._stage1_component_store_root(
+        prepared_context=SimpleNamespace(
+            scientific_identity={
+                "stage1_request_scientific_projection": (
+                    source_variant_projection
+                ),
+            }
+        ),
+        plan=plan,
+        integration=SimpleNamespace(stage2_identity="c" * 64),
+    )
+    assert source_variant == first
+
+    effective_variant_projection = {
+        **projection,
+        "effective_stage1_config": {"field": "changed-science"},
+    }
+    effective_variant = workflow._stage1_component_store_root(
+        prepared_context=SimpleNamespace(
+            scientific_identity={
+                "stage1_request_scientific_projection": (
+                    effective_variant_projection
+                ),
+            }
+        ),
+        plan=plan,
+        integration=SimpleNamespace(stage2_identity="d" * 64),
+    )
+    assert effective_variant != first
+
     namespace = first.parent.parent
+    v2_store = namespace / ("e" * 64)
+    v2_components = v2_store / "components"
+    v2_components.mkdir(parents=True)
+    v2_projection = {
+        **projection,
+        "source_config": {"field": "old-profile-byte-identity"},
+    }
+    v2_compatibility = {
+        "schema_version": (
+            "production_stage1_component_store_compatibility_v2"
+        ),
+        "prepared_stage1_component_input_projection": v2_projection,
+        "prepared_stage1_component_input_projection_sha256": (
+            _sha(v2_projection)
+        ),
+        "stage1_scope_plan_scientific_content_sha256": (
+            plan.scientific_content_sha256
+        ),
+        "component_plan_namespace_identity": "v2",
+        "component_producer_scientific_identity": (
+            producer_scientific_identity
+        ),
+    }
+    v2_body = {
+        "schema_version": (
+            "production_stage1_scientific_component_store_v2"
+        ),
+        "component_store_key": v2_store.name,
+        "compatibility": v2_compatibility,
+        "components_relative_path": "components",
+        "successful_component_marker": "execution_manifest.json",
+        "incomplete_attempts_preserved_for_recovery": True,
+    }
+    (
+        v2_store
+        / workflow_module.STAGE1_COMPONENT_STORE_MANIFEST
+    ).write_text(
+        json.dumps(
+            {
+                **v2_body,
+                "content_sha256": _sha(v2_body),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     legacy_store = namespace / ("f" * 64)
     legacy_components = legacy_store / "components"
     legacy_components.mkdir(parents=True)
@@ -1586,4 +1668,7 @@ def test_component_store_namespace_excludes_stage2_catalog_identity_and_finds_v1
     assert workflow._stage1_component_reuse_roots(
         component_store_root=first,
         plan=plan,
-    ) == (legacy_components.resolve(strict=True),)
+    ) == (
+        v2_components.resolve(strict=True),
+        legacy_components.resolve(strict=True),
+    )

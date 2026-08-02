@@ -138,12 +138,27 @@ PORTABLE_ROLE_NEUTRAL_STAGE1_HANDOFF_BINDING_SCHEMA = (
     "production_portable_role_neutral_stage1_handoff_binding_v2"
 )
 STAGE1_COMPONENT_STORE_SCHEMA = (
-    "production_stage1_scientific_component_store_v2"
+    "production_stage1_scientific_component_store_v3"
 )
 LEGACY_STAGE1_COMPONENT_STORE_SCHEMAS = frozenset(
-    {"production_stage1_scientific_component_store_v1"}
+    {
+        "production_stage1_scientific_component_store_v1",
+        "production_stage1_scientific_component_store_v2",
+    }
 )
 STAGE1_COMPONENT_STORE_MANIFEST = "component_store_manifest.json"
+STAGE1_COMPONENT_STORE_INPUT_FIELDS = (
+    "dataset",
+    "effective_stage1_config",
+    "embedding_cache",
+    "exact_inner_contract",
+    "htr_input_nontruncation_audit",
+    "htr_model",
+    "query_config",
+    "semantic_witness_scientific_config",
+    "split_registry_content_sha256",
+    "stage1_scope_plan",
+)
 WORKFLOW_PROGRESS_SCHEMA = "production_all_evidence_workflow_progress_v3"
 WORKFLOW_PHASE_MANIFEST_SCHEMA = "production_workflow_phase_manifest_v2"
 WORKFLOW_ADOPTED_PHASE_MANIFEST_SCHEMA = "production_workflow_adopted_phase_manifest_v1"
@@ -15421,19 +15436,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             "scientific_content_sha256",
             None,
         )
-        component_input_fields = (
-            "dataset",
-            "effective_stage1_config",
-            "embedding_cache",
-            "exact_inner_contract",
-            "htr_input_nontruncation_audit",
-            "htr_model",
-            "query_config",
-            "semantic_witness_scientific_config",
-            "source_config",
-            "split_registry_content_sha256",
-            "stage1_scope_plan",
-        )
+        component_input_fields = STAGE1_COMPONENT_STORE_INPUT_FIELDS
         if (
             not isinstance(producer_compatibility, Mapping)
             or not isinstance(prepared_projection, Mapping)
@@ -15455,7 +15458,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         }
         compatibility = {
             "schema_version": (
-                "production_stage1_component_store_compatibility_v2"
+                "production_stage1_component_store_compatibility_v3"
             ),
             "prepared_stage1_component_input_projection": (
                 component_input_projection
@@ -15476,6 +15479,8 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             "component_authentication_is_final_reuse_authority": True,
             "stage2_handoff_publisher_identity_included": False,
             "stage2_catalog_identity_included": False,
+            "raw_source_config_file_identity_included": False,
+            "compiled_effective_stage1_config_included": True,
             "repository_source_closure_included": False,
             "resource_assignment_included": False,
             "cpu_budget_included": False,
@@ -15572,6 +15577,7 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             if isinstance(current_compatibility, Mapping)
             else None
         )
+        component_input_fields = STAGE1_COMPONENT_STORE_INPUT_FIELDS
         plan_sha256 = getattr(
             plan,
             "scientific_content_sha256",
@@ -15658,15 +15664,52 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                 != plan_sha256
             ):
                 continue
-            if (
-                manifest.get("schema_version")
-                == STAGE1_COMPONENT_STORE_SCHEMA
-                and compatibility.get(
+            candidate_schema = manifest.get("schema_version")
+            if candidate_schema in {
+                STAGE1_COMPONENT_STORE_SCHEMA,
+                "production_stage1_scientific_component_store_v2",
+            }:
+                expected_compatibility_schema = (
+                    "production_stage1_component_store_compatibility_v3"
+                    if candidate_schema == STAGE1_COMPONENT_STORE_SCHEMA
+                    else "production_stage1_component_store_compatibility_v2"
+                )
+                candidate_projection = compatibility.get(
+                    "prepared_stage1_component_input_projection"
+                )
+                candidate_projection_sha256 = compatibility.get(
                     "prepared_stage1_component_input_projection_sha256"
                 )
-                != current_input_sha256
-            ):
-                continue
+                if (
+                    compatibility.get("schema_version")
+                    != expected_compatibility_schema
+                    or not isinstance(candidate_projection, Mapping)
+                    or not isinstance(candidate_projection_sha256, str)
+                    or len(candidate_projection_sha256) != 64
+                    or _sha(candidate_projection)
+                    != candidate_projection_sha256
+                    or any(
+                        field not in candidate_projection
+                        for field in component_input_fields
+                    )
+                ):
+                    raise ValueError(
+                        "prior Stage 1 component store compatibility is "
+                        "incomplete"
+                    )
+                # v2 included the raw source-profile file hash in this broad
+                # namespace even though the compiled effective configuration
+                # and every component-specific scientific identity were
+                # already authenticated separately.  Normalize both v2 and
+                # v3 stores to the narrowly scoped component inputs, then let
+                # the producer-specific authenticator remain the final reuse
+                # authority for every candidate component.
+                candidate_component_projection = {
+                    field: copy.deepcopy(candidate_projection[field])
+                    for field in component_input_fields
+                }
+                if _sha(candidate_component_projection) != current_input_sha256:
+                    continue
             candidate_components_path = candidate_store / "components"
             if (
                 candidate_components_path.is_symlink()

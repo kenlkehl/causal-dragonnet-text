@@ -6,6 +6,12 @@ without an interactive coding agent. The real entrypoint is
 synthetic benchmarks, use the repository-root launchers documented below; they
 construct and invoke that entrypoint rather than running an alternate workflow.
 
+For the complete scientific flow, fresh-cohort setup, durable and scratch
+artifact maps, authentication model, and resume decision tree, use the
+[Production all-evidence end-to-end guide](production_all_evidence_end_to_end.md).
+This quickstart remains the shorter runbook for the supplied benchmark
+launchers.
+
 The supplied launchers are deliberately specific to one deployment shape:
 
 - one Linux VM;
