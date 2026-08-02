@@ -67,4 +67,5 @@ exec uv run python scripts/run_all_evidence.py \
     --workers 32 \
     --htr-model prajjwal1/bert-tiny \
     --embedding-model Qwen/Qwen3-Embedding-8B \
+    --set science.stage1.architecture.multi_model_forest.embedding_contrast.max_chunks=128 \
     --stage1-only
