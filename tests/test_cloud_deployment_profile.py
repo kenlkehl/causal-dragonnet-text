@@ -41,6 +41,12 @@ def test_cloud_profile_compiles_eight_disjoint_lanes_deterministically(
         preflight_owner_peak=8 * 1024**3,
         preflight_lanes=8,
         embedding_batch_size=8,
+        max_workers_per_device=4,
+        estimated_device_memory_per_owner=8 * 1024**3,
+        device_memory_reserve=6 * 1024**3,
+        estimated_host_memory_per_owner=8 * 1024**3,
+        host_memory_budget_fraction=0.75,
+        minimum_cpu_threads_per_owner=1,
         endpoint="http://127.0.0.1:8002/v1",
         endpoint_model=(
             "nvidia/Gemma-4-31B-IT-NVFP4@"
@@ -61,8 +67,12 @@ def test_cloud_profile_compiles_eight_disjoint_lanes_deterministically(
         "nvidia/Gemma-4-31B-IT-NVFP4@"
         "4135a98a9b728a548947683219633b25682223ac"
     )
-    assert first.stage1_execution.max_parallel_owners == 8
-    assert first.stage1_execution.scope_workers_per_device == 1
+    assert first.stage1_execution.max_parallel_owners == 32
+    assert first.stage1_execution.scope_workers_per_device == 4
+    assert (
+        first.stage1_execution.owner_capacity_policy.mode
+        == "resource_autodetect"
+    )
     assert first.stage1_execution.htr_operational_controls.fold_parallelism == 1
     assert first.stage1_execution.htr_operational_controls.fold_slots_per_device == 1
     assert (

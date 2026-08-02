@@ -67,6 +67,7 @@ from .operator_trusted_checkpoint_adoption import (
 )
 from .performance_telemetry import TelemetryLedger
 from .portable_resource_scheduler import (
+    STAGE1_OWNER_CAPACITY_ATTESTATION_SCHEMA,
     _logical_to_physical_cuda_indices,
 )
 from .portable_workflow_spec import (
@@ -80,6 +81,7 @@ from .portable_workflow_spec import (
     ScientificWorkflowSpec,
     SentenceEmbeddingEncoderSpec,
     Stage1ExecutionProfile,
+    Stage1OwnerCapacityPolicy,
     Stage1PreflightExecutionPolicy,
     Stage2PromptProtocolSpec,
     StrictCausalForestOperationalSpec,
@@ -107,6 +109,10 @@ from .neural_query_operational_controls import (
 
 LOGGER = logging.getLogger(__name__)
 
+# Owner-capacity selection is an execution-epoch concern, so it extends the
+# existing request's explicitly operational fields without changing the
+# immutable scientific workflow schema.  This is what permits a sealed run to
+# resume under a newly detected resource allocation.
 WORKFLOW_SCHEMA = "production_all_evidence_workflow_v6"
 PHASES = (
     "input_preparation",
@@ -138,7 +144,7 @@ LEGACY_STAGE1_COMPONENT_STORE_SCHEMAS = frozenset(
     {"production_stage1_scientific_component_store_v1"}
 )
 STAGE1_COMPONENT_STORE_MANIFEST = "component_store_manifest.json"
-WORKFLOW_PROGRESS_SCHEMA = "production_all_evidence_workflow_progress_v2"
+WORKFLOW_PROGRESS_SCHEMA = "production_all_evidence_workflow_progress_v3"
 WORKFLOW_PHASE_MANIFEST_SCHEMA = "production_workflow_phase_manifest_v2"
 WORKFLOW_ADOPTED_PHASE_MANIFEST_SCHEMA = "production_workflow_adopted_phase_manifest_v1"
 WORKFLOW_CHECKPOINT_PUBLICATION_ATTESTATION_SCHEMA = (
@@ -269,6 +275,7 @@ OPERATIONAL_EXECUTION_EPOCH_REQUEST_FIELDS = frozenset(
         "stage1_execution_device_count",
         "stage1_execution_profile",
         "stage1_gpu_ids",
+        "stage1_owner_capacity_attestation",
         "stage1_preflight_execution_attestation",
         "stage1_preflight_workers",
         "stage1_resource_contract",
@@ -8573,6 +8580,7 @@ class ProductionAllEvidenceWorkflowOptions:
     stage1_execution_profile: Stage1ExecutionProfile | None = None
     stage1_preflight_workers: int = 8
     stage1_preflight_execution_attestation: Mapping[str, Any] | None = None
+    stage1_owner_capacity_attestation: Mapping[str, Any] | None = None
     stage1_seed_policy: str | None = None
     num_workers: int = 1
     tfidf_workers: int = 8
@@ -8925,6 +8933,51 @@ class ProductionAllEvidenceWorkflow:
                 raise ValueError(
                     "Stage 1 preflight worker count or execution "
                     "attestation differs from the compiled deployment policy"
+                )
+            capacity_attestation = (
+                o.stage1_owner_capacity_attestation
+            )
+            capacity_body = (
+                {
+                    key: copy.deepcopy(value)
+                    for key, value in capacity_attestation.items()
+                    if key != "content_sha256"
+                }
+                if isinstance(capacity_attestation, Mapping)
+                else None
+            )
+            if (
+                not isinstance(capacity_attestation, Mapping)
+                or capacity_attestation.get("schema_version")
+                != STAGE1_OWNER_CAPACITY_ATTESTATION_SCHEMA
+                or capacity_attestation.get("content_sha256")
+                != identity_sha256(capacity_body)
+                or int(
+                    capacity_attestation.get(
+                        "effective_scope_workers_per_device",
+                        -1,
+                    )
+                )
+                != int(profile.scope_workers_per_device)
+                or int(
+                    capacity_attestation.get(
+                        "effective_max_parallel_owners",
+                        -1,
+                    )
+                )
+                != int(profile.max_parallel_owners)
+                or capacity_attestation.get(
+                    "configured_values_are_hard_ceilings"
+                )
+                is not True
+                or capacity_attestation.get(
+                    "resource_assignment_in_scientific_identity"
+                )
+                is not False
+            ):
+                raise ValueError(
+                    "Stage 1 owner capacity differs from its runtime "
+                    "resource attestation"
                 )
         if o.stage1_seed_policy != "canonical_group_sha256_v1":
             raise ValueError("stage1_seed_policy must be canonical_group_sha256_v1")
@@ -9813,6 +9866,9 @@ class ProductionAllEvidenceWorkflow:
             "preflight_workers": self.options.stage1_preflight_workers,
             "preflight_execution_attestation": copy.deepcopy(
                 self.options.stage1_preflight_execution_attestation
+            ),
+            "owner_capacity_attestation": copy.deepcopy(
+                self.options.stage1_owner_capacity_attestation
             ),
             "tfidf_workers": self.options.tfidf_workers,
             "tfidf_parallel_backend": self.options.tfidf_parallel_backend,
@@ -12502,6 +12558,9 @@ class ProductionAllEvidenceWorkflow:
             ),
             "stage1_scope_workers_per_gpu": self.options.stage1_scope_workers_per_gpu,
             "stage1_preflight_workers": self.options.stage1_preflight_workers,
+            "stage1_owner_capacity_attestation": copy.deepcopy(
+                self.options.stage1_owner_capacity_attestation
+            ),
             "tfidf_workers": self.options.tfidf_workers,
             "resume_trust_policy": (
                 self.options.run_control.resume_trust_policy
@@ -18228,6 +18287,34 @@ def build_parser() -> argparse.ArgumentParser:
             "multi-device learned-query reservations."
         ),
     )
+    parser.add_argument(
+        "--stage1-owner-capacity-mode",
+        choices=("resource_autodetect", "fixed"),
+        help=(
+            "Resolve owner lanes from selected-device free VRAM, host RAM, "
+            "and CPU capacity, or retain the configured hard ceilings."
+        ),
+    )
+    parser.add_argument(
+        "--stage1-estimated-device-memory-bytes-per-owner",
+        type=int,
+    )
+    parser.add_argument(
+        "--stage1-device-memory-reserve-bytes",
+        type=int,
+    )
+    parser.add_argument(
+        "--stage1-estimated-host-memory-bytes-per-owner",
+        type=int,
+    )
+    parser.add_argument(
+        "--stage1-host-memory-budget-fraction",
+        type=float,
+    )
+    parser.add_argument(
+        "--stage1-minimum-cpu-threads-per-owner",
+        type=int,
+    )
     parser.add_argument("--stage1-preflight-max-parallel-owners", type=int)
     parser.add_argument("--stage1-preflight-memory-budget-bytes", type=int)
     parser.add_argument(
@@ -18697,6 +18784,12 @@ _DIRECT_DEPLOYMENT_SHIMS = (
     "stage1_scope_workers_per_device",
     "stage1_persistent_slot_startup_timeout_seconds",
     "stage1_max_parallel_owners",
+    "stage1_owner_capacity_mode",
+    "stage1_estimated_device_memory_bytes_per_owner",
+    "stage1_device_memory_reserve_bytes",
+    "stage1_estimated_host_memory_bytes_per_owner",
+    "stage1_host_memory_budget_fraction",
+    "stage1_minimum_cpu_threads_per_owner",
     "stage1_preflight_max_parallel_owners",
     "stage1_preflight_memory_budget_bytes",
     "stage1_preflight_estimated_owner_peak_bytes",
@@ -18848,6 +18941,12 @@ def _compile_direct_deployment_profile(
         "stage1_scope_workers_per_device",
         "stage1_persistent_slot_startup_timeout_seconds",
         "stage1_max_parallel_owners",
+        "stage1_owner_capacity_mode",
+        "stage1_estimated_device_memory_bytes_per_owner",
+        "stage1_device_memory_reserve_bytes",
+        "stage1_estimated_host_memory_bytes_per_owner",
+        "stage1_host_memory_budget_fraction",
+        "stage1_minimum_cpu_threads_per_owner",
         "stage1_preflight_max_parallel_owners",
         "stage1_preflight_memory_budget_bytes",
         "stage1_preflight_estimated_owner_peak_bytes",
@@ -18968,6 +19067,24 @@ def _compile_direct_deployment_profile(
                 values["stage1_scope_workers_per_device"]
             ),
             max_parallel_owners=values["stage1_max_parallel_owners"],
+            owner_capacity_policy=Stage1OwnerCapacityPolicy(
+                mode=values["stage1_owner_capacity_mode"],
+                estimated_device_memory_bytes_per_owner=values[
+                    "stage1_estimated_device_memory_bytes_per_owner"
+                ],
+                device_memory_reserve_bytes=values[
+                    "stage1_device_memory_reserve_bytes"
+                ],
+                estimated_host_memory_bytes_per_owner=values[
+                    "stage1_estimated_host_memory_bytes_per_owner"
+                ],
+                host_memory_budget_fraction=values[
+                    "stage1_host_memory_budget_fraction"
+                ],
+                minimum_cpu_threads_per_owner=values[
+                    "stage1_minimum_cpu_threads_per_owner"
+                ],
+            ),
             preflight_execution_policy=(
                 Stage1PreflightExecutionPolicy(
                     max_parallel_owners=values[
@@ -19131,7 +19248,10 @@ def _compile_production_options(
             candidate = deployment_path.parent / candidate
         return candidate.resolve()
 
-    from .portable_resource_scheduler import plan_resources
+    from .portable_resource_scheduler import (
+        plan_resources,
+        resolve_stage1_owner_capacity,
+    )
 
     policy = normalize_device_policy(deployment.devices)
     resource_plan = plan_resources(
@@ -19140,6 +19260,17 @@ def _compile_production_options(
         requested_device_count=deployment.stage1_execution.device_count,
         cpu_supported=(deployment.stage1_execution.resource_kind == "cpu"),
         resource_performance_safety=(deployment.resource_performance_safety),
+    )
+    (
+        effective_stage1_execution,
+        owner_capacity_attestation,
+    ) = resolve_stage1_owner_capacity(
+        profile=deployment.stage1_execution,
+        resource_plan=resource_plan,
+    )
+    deployment = replace(
+        deployment,
+        stage1_execution=effective_stage1_execution,
     )
     selected_devices = tuple(resource_plan.devices)
     if (
@@ -19287,6 +19418,9 @@ def _compile_production_options(
         ),
         stage1_preflight_execution_attestation=(
             _stage1_preflight_execution_attestation(deployment)
+        ),
+        stage1_owner_capacity_attestation=(
+            owner_capacity_attestation
         ),
         stage1_seed_policy=scientific.seed_policy,
         num_workers=deployment.cpu_budget,

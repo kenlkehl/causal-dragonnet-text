@@ -421,6 +421,12 @@ The launchers expose a small number of deployment-only controls. Set them before
 | `PREFLIGHT_MEMORY_BUDGET_BYTES` | Total bounded preflight memory budget | 75% of host RAM |
 | `PREFLIGHT_ESTIMATED_OWNER_PEAK_BYTES` | Per-owner preflight planning estimate | 8 GiB |
 | `EMBEDDING_BATCH_SIZE` | Canonical per-worker embedding batch size | 8 |
+| `STAGE1_MAX_WORKERS_PER_DEVICE` | Hard owner-lane ceiling per selected GPU | 4 |
+| `STAGE1_ESTIMATED_DEVICE_MEMORY_BYTES_PER_OWNER` | VRAM capacity estimate per active owner | 8 GiB |
+| `STAGE1_DEVICE_MEMORY_RESERVE_BYTES` | VRAM kept free on every selected GPU | 6 GiB |
+| `STAGE1_ESTIMATED_HOST_MEMORY_BYTES_PER_OWNER` | Host-memory capacity estimate per active owner | 8 GiB |
+| `STAGE1_HOST_MEMORY_BUDGET_FRACTION` | Fraction of currently available host RAM eligible for owner lanes | 0.75 |
+| `STAGE1_MINIMUM_CPU_THREADS_PER_OWNER` | CPU capacity estimate per active owner | 1 |
 | `VLLM_GPU_MEMORY_UTILIZATION` | vLLM GPU memory target | 0.90 |
 | `VLLM_STARTUP_TIMEOUT_SECONDS` | Time allowed for vLLM startup | 600 seconds |
 | `VLLM_PROXY_PORT` | CPU-only proxy listen port | 8002 |
@@ -436,6 +442,17 @@ The launchers expose a small number of deployment-only controls. Set them before
 
 `CLOUD_GPU_COUNT` and `CLOUD_VISIBLE_DEVICES` are validated rather than
 generalized by these wrappers: they must remain `8` and `0,1,2,3,4,5,6,7`.
+
+Owner-capacity resolution itself is part of the production entrypoint, not the
+cloud wrapper. Every current typed deployment carries a versioned
+`stage1_execution.owner_capacity_policy`. In `resource_autodetect` mode the
+configured per-device and global owner counts are ceilings; production lowers
+them, when necessary, using the smallest selected GPU's free VRAM after the
+reserve, currently available host RAM, and the CPU budget. It records the
+inputs and effective counts in `workflow_progress.json` under
+`stage1_owner_capacity_attestation`. Set the policy mode to `fixed` only for an
+intentional manual override. Legacy profiles without the policy retain their
+previous fixed behavior during resume.
 
 Advanced operators may supply already materialized, compatible model directories
 through `EMBEDDING_MODEL_DIR`, `HTR_MODEL_DIR`, `STAGE2_TOKENIZER_DIR`, and

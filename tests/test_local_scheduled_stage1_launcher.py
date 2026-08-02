@@ -28,6 +28,25 @@ def _builder():
     return module
 
 
+def test_local_parallel_launcher_enables_production_capacity_autodetection(
+) -> None:
+    launcher = (
+        ROOT / "run_five_conf_five_mod_local_parallel.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'scope_workers_per_device="${SCOPE_WORKERS_PER_DEVICE:-4}"' in launcher
+    assert "--owner-capacity-mode resource_autodetect" in launcher
+    for option in (
+        "--estimated-device-memory-per-owner",
+        "--device-memory-reserve",
+        "--estimated-host-memory-per-owner",
+        "--host-memory-budget-fraction",
+        "--minimum-cpu-threads-per-owner",
+    ):
+        assert option in launcher
+    assert "stage1_owner_capacity_attestation" in launcher
+
+
 def _args(
     *,
     tmp_path: Path,
@@ -108,6 +127,10 @@ def test_local_profiles_compile_four_then_two_disjoint_lanes(
         "cuda:3",
     )
     assert before.stage1_execution.max_parallel_owners == 4
+    assert (
+        before.stage1_execution.owner_capacity_policy.mode
+        == "resource_autodetect"
+    )
     assert tuple(after.devices) == ("cuda:0", "cuda:1")
     assert after.stage1_execution.max_parallel_owners == 2
     assert before.scratch_root == shared

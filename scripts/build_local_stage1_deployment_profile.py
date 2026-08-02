@@ -119,6 +119,25 @@ def build_profile(args: argparse.Namespace) -> DeploymentProfile:
             "max_parallel_owners": owner_cap,
         }
     )
+    stage1["owner_capacity_policy"] = {
+        "schema_version": "portable_stage1_owner_capacity_policy_v1",
+        "mode": args.owner_capacity_mode,
+        "estimated_device_memory_bytes_per_owner": int(
+            args.estimated_device_memory_per_owner
+        ),
+        "device_memory_reserve_bytes": int(
+            args.device_memory_reserve
+        ),
+        "estimated_host_memory_bytes_per_owner": int(
+            args.estimated_host_memory_per_owner
+        ),
+        "host_memory_budget_fraction": float(
+            args.host_memory_budget_fraction
+        ),
+        "minimum_cpu_threads_per_owner": int(
+            args.minimum_cpu_threads_per_owner
+        ),
+    }
     stage1["neural_query_topology"]["mode"] = (
         "one_context_per_selected_device"
     )
@@ -178,6 +197,8 @@ def build_profile(args: argparse.Namespace) -> DeploymentProfile:
         or execution.scope_workers_per_device
         != int(args.scope_workers_per_device)
         or execution.max_parallel_owners != owner_cap
+        or execution.owner_capacity_policy.mode
+        != args.owner_capacity_mode
         or execution.htr_operational_controls.fold_parallelism != 1
         or execution.htr_operational_controls.fold_slots_per_device != 1
         or execution.neural_query_topology.mode
@@ -243,11 +264,43 @@ def build_parser() -> argparse.ArgumentParser:
             "free; external process presence alone is permitted."
         ),
     )
+    parser.add_argument(
+        "--owner-capacity-mode",
+        choices=("resource_autodetect", "fixed"),
+        default="resource_autodetect",
+    )
+    parser.add_argument(
+        "--estimated-device-memory-per-owner",
+        type=_positive,
+        default=8 * 1024**3,
+    )
+    parser.add_argument(
+        "--device-memory-reserve",
+        type=int,
+        default=6 * 1024**3,
+    )
+    parser.add_argument(
+        "--estimated-host-memory-per-owner",
+        type=_positive,
+        default=8 * 1024**3,
+    )
+    parser.add_argument(
+        "--host-memory-budget-fraction",
+        type=_free_fraction,
+        default=Decimal("0.75"),
+    )
+    parser.add_argument(
+        "--minimum-cpu-threads-per-owner",
+        type=_positive,
+        default=1,
+    )
     return parser
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.device_memory_reserve < 0:
+        raise ValueError("device memory reserve cannot be negative")
     build_profile(args)
     return 0
 

@@ -10,13 +10,20 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from .portable_workflow_spec import (
     ResourcePerformanceSafetyPolicy,
+    Stage1ExecutionProfile,
     identity_sha256,
     normalize_device_policy,
+)
+from .stage1_execution_topology_policy import (
+    ONE_CONTEXT_PER_SELECTED_DEVICE,
 )
 
 RESOURCE_INVENTORY_SCHEMA = "portable_single_node_resource_inventory_v1"
 RESOURCE_PLAN_SCHEMA = "portable_single_node_resource_plan_v1"
 EXECUTION_ATTESTATION_SCHEMA = "portable_execution_attestation_v1"
+STAGE1_OWNER_CAPACITY_ATTESTATION_SCHEMA = (
+    "production_stage1_owner_capacity_autodetection_v1"
+)
 GIB = 1024**3
 
 
@@ -210,6 +217,36 @@ def discover_resources() -> ResourceInventory:
     return ResourceInventory(cpu_count=cpu_count, gpus=gpus)
 
 
+def discover_host_available_memory_bytes() -> int:
+    """Return currently available host memory without a platform constant."""
+
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as stream:
+            rows = {
+                fields[0].rstrip(":"): int(fields[1]) * 1024
+                for line in stream
+                if len(fields := line.split()) >= 2
+                and fields[1].isdigit()
+            }
+        available = rows.get("MemAvailable")
+        if isinstance(available, int) and available > 0:
+            return available
+    except OSError:
+        pass
+    try:
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        available = pages * page_size
+    except (OSError, TypeError, ValueError):
+        available = 0
+    if available < 1:
+        raise RuntimeError(
+            "Stage 1 capacity autodetection cannot determine available "
+            "host memory"
+        )
+    return available
+
+
 @dataclass(frozen=True)
 class ResourcePlan:
     devices: tuple[str, ...]
@@ -366,6 +403,244 @@ def plan_resources(
     )
 
 
+def resolve_stage1_owner_capacity(
+    *,
+    profile: Stage1ExecutionProfile,
+    resource_plan: ResourcePlan,
+    host_available_memory_bytes: int | None = None,
+) -> tuple[Stage1ExecutionProfile, Mapping[str, Any]]:
+    """Resolve uniform persistent owner lanes from live resource capacity.
+
+    The configured profile always remains the upper bound.  Uniform lanes are
+    intentional: the persistent executor currently provisions one equal lane
+    count on every selected device, so selecting the minimum safe GPU capacity
+    prevents a smaller device from being overcommitted.
+    """
+
+    if not isinstance(profile, Stage1ExecutionProfile):
+        raise TypeError(
+            "Stage 1 owner-capacity resolution requires a typed profile"
+        )
+    if not isinstance(resource_plan, ResourcePlan):
+        raise TypeError(
+            "Stage 1 owner-capacity resolution requires a resource plan"
+        )
+    selected = tuple(resource_plan.devices)
+    if len(selected) != int(profile.device_count):
+        raise ValueError(
+            "Stage 1 owner-capacity inventory differs from the configured "
+            "device count"
+        )
+    capacity_policy = profile.owner_capacity_policy
+    configured = {
+        "scope_workers_per_device_ceiling": int(
+            profile.scope_workers_per_device
+        ),
+        "max_parallel_owners_ceiling": int(
+            profile.max_parallel_owners
+        ),
+    }
+    if capacity_policy.mode == "fixed":
+        effective = profile
+        body = {
+            "schema_version": (
+                STAGE1_OWNER_CAPACITY_ATTESTATION_SCHEMA
+            ),
+            "mode": "fixed",
+            "selected_devices": list(selected),
+            "configured_capacity": configured,
+            "owner_capacity_policy": capacity_policy.as_dict(),
+            "host_available_memory_bytes": None,
+            "host_owner_lane_cap": None,
+            "cpu_owner_lane_cap": int(resource_plan.cpu_budget),
+            "per_device_capacity": [],
+            "effective_scope_workers_per_device": int(
+                effective.scope_workers_per_device
+            ),
+            "effective_max_parallel_owners": int(
+                effective.max_parallel_owners
+            ),
+            "configured_values_are_hard_ceilings": True,
+            "resource_assignment_in_scientific_identity": False,
+            "completion_order_in_scientific_identity": False,
+        }
+        return effective, {
+            **body,
+            "content_sha256": identity_sha256(body),
+        }
+
+    available_host = (
+        discover_host_available_memory_bytes()
+        if host_available_memory_bytes is None
+        else int(host_available_memory_bytes)
+    )
+    if available_host < 1:
+        raise ValueError(
+            "Stage 1 owner-capacity host memory must be positive"
+        )
+    host_budget = int(
+        available_host
+        * capacity_policy.host_memory_budget_fraction
+    )
+    host_owner_cap = (
+        host_budget
+        // capacity_policy.estimated_host_memory_bytes_per_owner
+    )
+    cpu_owner_cap = (
+        int(resource_plan.cpu_budget)
+        // capacity_policy.minimum_cpu_threads_per_owner
+    )
+    if host_owner_cap < 1 or cpu_owner_cap < 1:
+        raise RuntimeError(
+            "Stage 1 capacity autodetection leaves no host-memory or CPU "
+            "owner lane"
+        )
+
+    per_device_rows: list[dict[str, Any]] = []
+    if profile.resource_kind == "accelerator":
+        inventory_by_device = {
+            gpu.device: gpu for gpu in resource_plan.inventory.gpus
+        }
+        for device in selected:
+            gpu = inventory_by_device.get(device)
+            if gpu is None:
+                raise RuntimeError(
+                    "Stage 1 capacity autodetection lacks a selected GPU "
+                    f"inventory row: {device}"
+                )
+            free_after_reserve = max(
+                0,
+                int(gpu.free_memory_bytes)
+                - capacity_policy.device_memory_reserve_bytes,
+            )
+            # Resource admission already applied the deployment's existing
+            # allocation threshold.  Lane sizing is based on the memory that
+            # is actually free after the separately configured reserve; using
+            # the admission fraction again would incorrectly turn a
+            # "GPU must be 90% free" rule into a 10%-of-VRAM workflow cap.
+            allocatable = free_after_reserve
+            detected_lanes = (
+                allocatable
+                // capacity_policy
+                .estimated_device_memory_bytes_per_owner
+            )
+            per_device_rows.append(
+                {
+                    "device": device,
+                    "uuid": gpu.uuid,
+                    "total_memory_bytes": int(
+                        gpu.total_memory_bytes
+                    ),
+                    "free_memory_bytes": int(gpu.free_memory_bytes),
+                    "used_memory_bytes": int(gpu.used_memory_bytes),
+                    "free_after_reserve_bytes": free_after_reserve,
+                    "allocatable_owner_memory_bytes": allocatable,
+                    "detected_owner_lane_cap": int(detected_lanes),
+                }
+            )
+        device_lane_cap = min(
+            int(row["detected_owner_lane_cap"])
+            for row in per_device_rows
+        )
+    elif selected == ("cpu",):
+        device_lane_cap = int(profile.scope_workers_per_device)
+    else:
+        raise ValueError(
+            "Stage 1 capacity autodetection resource kind conflicts with "
+            "the selected devices"
+        )
+    if device_lane_cap < 1:
+        raise RuntimeError(
+            "Stage 1 capacity autodetection found no safe per-device owner "
+            "lane"
+        )
+
+    if (
+        profile.neural_query_topology.mode
+        == ONE_CONTEXT_PER_SELECTED_DEVICE
+    ):
+        device_count = len(selected)
+        uniform_workers = min(
+            int(profile.scope_workers_per_device),
+            int(device_lane_cap),
+            int(host_owner_cap) // device_count,
+            int(cpu_owner_cap) // device_count,
+            int(profile.max_parallel_owners) // device_count,
+        )
+        if uniform_workers < 1:
+            raise RuntimeError(
+                "Stage 1 capacity autodetection cannot provision one "
+                "uniform lane on every selected device; select fewer "
+                "devices or increase the host budget"
+            )
+        topology_owner_cap = device_count * uniform_workers
+    else:
+        uniform_workers = min(
+            int(profile.scope_workers_per_device),
+            int(device_lane_cap),
+            int(host_owner_cap),
+            int(cpu_owner_cap),
+            int(profile.max_parallel_owners),
+        )
+        topology_owner_cap = uniform_workers
+    effective_owner_cap = min(
+        int(profile.max_parallel_owners),
+        int(host_owner_cap),
+        int(cpu_owner_cap),
+        int(topology_owner_cap),
+    )
+    if effective_owner_cap < 1:
+        raise RuntimeError(
+            "Stage 1 capacity autodetection leaves no executable owner"
+        )
+    effective_preflight = replace(
+        profile.preflight_execution_policy,
+        max_parallel_owners=min(
+            int(
+                profile.preflight_execution_policy
+                .max_parallel_owners
+            ),
+            effective_owner_cap,
+        ),
+    )
+    effective = replace(
+        profile,
+        scope_workers_per_device=uniform_workers,
+        max_parallel_owners=effective_owner_cap,
+        preflight_execution_policy=effective_preflight,
+    )
+    body = {
+        "schema_version": STAGE1_OWNER_CAPACITY_ATTESTATION_SCHEMA,
+        "mode": "resource_autodetect",
+        "selected_devices": list(selected),
+        "configured_capacity": configured,
+        "owner_capacity_policy": capacity_policy.as_dict(),
+        "host_available_memory_bytes": available_host,
+        "host_memory_budget_bytes": host_budget,
+        "host_owner_lane_cap": int(host_owner_cap),
+        "cpu_owner_lane_cap": int(cpu_owner_cap),
+        "per_device_capacity": per_device_rows,
+        "minimum_uniform_device_lane_cap": int(device_lane_cap),
+        "topology_owner_lane_cap": int(topology_owner_cap),
+        "effective_scope_workers_per_device": int(
+            effective.scope_workers_per_device
+        ),
+        "effective_max_parallel_owners": int(
+            effective.max_parallel_owners
+        ),
+        "effective_preflight_max_parallel_owners": int(
+            effective.preflight_execution_policy.max_parallel_owners
+        ),
+        "configured_values_are_hard_ceilings": True,
+        "resource_assignment_in_scientific_identity": False,
+        "completion_order_in_scientific_identity": False,
+    }
+    return effective, {
+        **body,
+        "content_sha256": identity_sha256(body),
+    }
+
+
 def assign_physical_fits(
     physical_fit_keys: Sequence[str],
     plan: ResourcePlan,
@@ -454,10 +729,13 @@ __all__ = [
     "GPUResource",
     "RESOURCE_INVENTORY_SCHEMA",
     "RESOURCE_PLAN_SCHEMA",
+    "STAGE1_OWNER_CAPACITY_ATTESTATION_SCHEMA",
     "ResourceInventory",
     "ResourcePlan",
     "assign_physical_fits",
     "discover_resources",
+    "discover_host_available_memory_bytes",
     "plan_resources",
+    "resolve_stage1_owner_capacity",
     "select_fastest_safe_candidate",
 ]

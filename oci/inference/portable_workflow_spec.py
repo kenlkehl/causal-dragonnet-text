@@ -55,8 +55,17 @@ from .post_extraction_scientific_policy import (
 )
 
 PORTABLE_SPEC_VERSION = "portable_all_evidence_scientific_workflow_v11"
-DEPLOYMENT_PROFILE_VERSION = "portable_all_evidence_deployment_profile_v9"
-STAGE1_EXECUTION_PROFILE_VERSION = "portable_stage1_execution_profile_v8"
+DEPLOYMENT_PROFILE_VERSION = "portable_all_evidence_deployment_profile_v10"
+LEGACY_DEPLOYMENT_PROFILE_VERSIONS = frozenset(
+    {"portable_all_evidence_deployment_profile_v9"}
+)
+STAGE1_EXECUTION_PROFILE_VERSION = "portable_stage1_execution_profile_v9"
+LEGACY_STAGE1_EXECUTION_PROFILE_VERSIONS = frozenset(
+    {"portable_stage1_execution_profile_v8"}
+)
+STAGE1_OWNER_CAPACITY_POLICY_VERSION = (
+    "portable_stage1_owner_capacity_policy_v1"
+)
 STAGE1_PREFLIGHT_EXECUTION_POLICY_VERSION = (
     "portable_stage1_preflight_execution_policy_v1"
 )
@@ -1343,6 +1352,119 @@ def _backward_compatible_preflight_execution_policy() -> (
 
 
 @dataclass(frozen=True)
+class Stage1OwnerCapacityPolicy:
+    """Operational inputs for deterministic runtime capacity discovery.
+
+    ``scope_workers_per_device`` and ``max_parallel_owners`` on the enclosing
+    execution profile remain hard ceilings.  In autodetect mode these
+    estimates only reduce those ceilings; they can never authorize more work
+    than the deployment profile permits.
+    """
+
+    mode: str
+    estimated_device_memory_bytes_per_owner: int
+    device_memory_reserve_bytes: int
+    estimated_host_memory_bytes_per_owner: int
+    host_memory_budget_fraction: float
+    minimum_cpu_threads_per_owner: int
+    schema_version: str = STAGE1_OWNER_CAPACITY_POLICY_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != STAGE1_OWNER_CAPACITY_POLICY_VERSION:
+            raise ValueError(
+                "unsupported Stage 1 owner-capacity policy version"
+            )
+        mode = str(self.mode).strip().lower().replace("-", "_")
+        if mode not in {"fixed", "resource_autodetect"}:
+            raise ValueError(
+                "Stage 1 owner-capacity mode must be fixed or "
+                "resource_autodetect"
+            )
+        object.__setattr__(self, "mode", mode)
+        for name in (
+            "estimated_device_memory_bytes_per_owner",
+            "estimated_host_memory_bytes_per_owner",
+            "minimum_cpu_threads_per_owner",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+            ):
+                raise ValueError(
+                    f"Stage 1 owner-capacity {name} must be positive"
+                )
+        reserve = self.device_memory_reserve_bytes
+        if (
+            isinstance(reserve, bool)
+            or not isinstance(reserve, int)
+            or reserve < 0
+        ):
+            raise ValueError(
+                "Stage 1 owner-capacity device reserve must be nonnegative"
+            )
+        fraction = float(self.host_memory_budget_fraction)
+        if not math.isfinite(fraction) or not 0 < fraction <= 1:
+            raise ValueError(
+                "Stage 1 owner-capacity host memory fraction must be in "
+                "(0, 1]"
+            )
+        object.__setattr__(
+            self,
+            "host_memory_budget_fraction",
+            fraction,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "Stage1OwnerCapacityPolicy":
+        if not isinstance(value, Mapping):
+            raise TypeError(
+                "stage1_execution.owner_capacity_policy must be one mapping"
+            )
+        required = {row.name for row in fields(cls)}
+        if set(value) != required:
+            raise ValueError(
+                "owner_capacity_policy must configure every field exactly; "
+                f"missing={sorted(required - set(value))}, "
+                f"extra={sorted(set(value) - required)}"
+            )
+        return cls(**dict(value))
+
+
+def _legacy_fixed_owner_capacity_policy() -> (
+    Stage1OwnerCapacityPolicy
+):
+    return Stage1OwnerCapacityPolicy(
+        mode="fixed",
+        estimated_device_memory_bytes_per_owner=1,
+        device_memory_reserve_bytes=0,
+        estimated_host_memory_bytes_per_owner=1,
+        host_memory_budget_fraction=1.0,
+        minimum_cpu_threads_per_owner=1,
+    )
+
+
+def _default_owner_capacity_policy() -> Stage1OwnerCapacityPolicy:
+    """Safe generic defaults for newly compiled production deployments."""
+
+    return Stage1OwnerCapacityPolicy(
+        mode="resource_autodetect",
+        estimated_device_memory_bytes_per_owner=8 * 1024**3,
+        device_memory_reserve_bytes=6 * 1024**3,
+        estimated_host_memory_bytes_per_owner=8 * 1024**3,
+        host_memory_budget_fraction=0.75,
+        minimum_cpu_threads_per_owner=1,
+    )
+
+
+@dataclass(frozen=True)
 class Stage1ExecutionProfile:
     """Complete deployment-only Stage 1 execution selection."""
 
@@ -1371,6 +1493,9 @@ class Stage1ExecutionProfile:
         default_factory=(
             _backward_compatible_preflight_execution_policy
         )
+    )
+    owner_capacity_policy: Stage1OwnerCapacityPolicy = field(
+        default_factory=_default_owner_capacity_policy
     )
     schema_version: str = STAGE1_EXECUTION_PROFILE_VERSION
 
@@ -1420,6 +1545,13 @@ class Stage1ExecutionProfile:
             raise TypeError(
                 "Stage 1 execution requires a typed preflight execution "
                 "policy"
+            )
+        if not isinstance(
+            self.owner_capacity_policy,
+            Stage1OwnerCapacityPolicy,
+        ):
+            raise TypeError(
+                "Stage 1 execution requires a typed owner-capacity policy"
             )
         if (
             self.preflight_execution_policy.max_parallel_owners
@@ -1599,7 +1731,10 @@ class Stage1ExecutionProfile:
         if not isinstance(value, Mapping):
             raise TypeError("stage1_execution must be one mapping")
         required = {field.name for field in fields(cls)}
-        backward_optional = {"preflight_execution_policy"}
+        backward_optional = {
+            "preflight_execution_policy",
+            "owner_capacity_policy",
+        }
         if (
             set(value) - backward_optional
             != required - backward_optional
@@ -1611,6 +1746,14 @@ class Stage1ExecutionProfile:
                 f"extra={sorted(set(value) - required)}"
             )
         normalized = dict(value)
+        source_schema_version = normalized.get("schema_version")
+        legacy_profile = source_schema_version in (
+            LEGACY_STAGE1_EXECUTION_PROFILE_VERSIONS
+        )
+        if legacy_profile:
+            normalized["schema_version"] = (
+                STAGE1_EXECUTION_PROFILE_VERSION
+            )
         preflight_policy = normalized.get(
             "preflight_execution_policy"
         )
@@ -1628,6 +1771,25 @@ class Stage1ExecutionProfile:
                 Stage1PreflightExecutionPolicy.from_mapping(
                     preflight_policy
                 )
+            )
+        owner_capacity = normalized.get("owner_capacity_policy")
+        if owner_capacity is None:
+            if not legacy_profile:
+                raise ValueError(
+                    "current stage1_execution profiles must explicitly "
+                    "configure owner_capacity_policy"
+                )
+            normalized["owner_capacity_policy"] = (
+                _legacy_fixed_owner_capacity_policy()
+            )
+        elif not isinstance(owner_capacity, Mapping):
+            raise ValueError(
+                "stage1_execution must configure owner_capacity_policy "
+                "as one mapping"
+            )
+        else:
+            normalized["owner_capacity_policy"] = (
+                Stage1OwnerCapacityPolicy.from_mapping(owner_capacity)
             )
         topology = normalized.get("neural_query_topology")
         if not isinstance(topology, Mapping):
@@ -1842,6 +2004,10 @@ class DeploymentProfile:
             "oracle_dataset_path": "oracle_source",
         }
         normalized = dict(value)
+        if normalized.get("schema_version") in (
+            LEGACY_DEPLOYMENT_PROFILE_VERSIONS
+        ):
+            normalized["schema_version"] = DEPLOYMENT_PROFILE_VERSION
         for source, target in aliases.items():
             if source in normalized and target not in normalized:
                 normalized[target] = normalized.pop(source)
@@ -2105,7 +2271,9 @@ __all__ = [
     "STRICT_FOREST_IMPLEMENTATION",
     "ScientificWorkflowSpec",
     "STAGE1_EXECUTION_PROFILE_VERSION",
+    "STAGE1_OWNER_CAPACITY_POLICY_VERSION",
     "STAGE1_PREFLIGHT_EXECUTION_POLICY_VERSION",
+    "Stage1OwnerCapacityPolicy",
     "Stage1PreflightExecutionPolicy",
     "Stage1ExecutionProfile",
     "Stage2PromptProtocolSpec",

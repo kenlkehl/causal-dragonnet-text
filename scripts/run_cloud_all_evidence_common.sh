@@ -218,10 +218,26 @@ cloud_total_memory_bytes="$(( $(awk '/^MemTotal:/ {print $2; exit}' /proc/meminf
 (( cloud_total_memory_bytes > 0 )) || fail "could not determine host memory"
 cloud_preflight_memory_budget="${PREFLIGHT_MEMORY_BUDGET_BYTES:-$(( cloud_total_memory_bytes * 3 / 4 ))}"
 cloud_preflight_owner_peak="${PREFLIGHT_ESTIMATED_OWNER_PEAK_BYTES:-8589934592}"
+cloud_stage1_max_workers_per_device="${STAGE1_MAX_WORKERS_PER_DEVICE:-4}"
+cloud_stage1_estimated_device_owner_bytes="${STAGE1_ESTIMATED_DEVICE_MEMORY_BYTES_PER_OWNER:-8589934592}"
+cloud_stage1_device_reserve_bytes="${STAGE1_DEVICE_MEMORY_RESERVE_BYTES:-6442450944}"
+cloud_stage1_estimated_host_owner_bytes="${STAGE1_ESTIMATED_HOST_MEMORY_BYTES_PER_OWNER:-8589934592}"
+cloud_stage1_host_memory_fraction="${STAGE1_HOST_MEMORY_BUDGET_FRACTION:-0.75}"
+cloud_stage1_minimum_cpu_threads="${STAGE1_MINIMUM_CPU_THREADS_PER_OWNER:-1}"
 [[ "${cloud_preflight_memory_budget}" =~ ^[1-9][0-9]*$ ]] \
     || fail "PREFLIGHT_MEMORY_BUDGET_BYTES must be positive"
 [[ "${cloud_preflight_owner_peak}" =~ ^[1-9][0-9]*$ ]] \
     || fail "PREFLIGHT_ESTIMATED_OWNER_PEAK_BYTES must be positive"
+for cloud_capacity_value in \
+    "${cloud_stage1_max_workers_per_device}" \
+    "${cloud_stage1_estimated_device_owner_bytes}" \
+    "${cloud_stage1_estimated_host_owner_bytes}" \
+    "${cloud_stage1_minimum_cpu_threads}"; do
+    [[ "${cloud_capacity_value}" =~ ^[1-9][0-9]*$ ]] \
+        || fail "Stage 1 capacity estimates and ceilings must be positive integers"
+done
+[[ "${cloud_stage1_device_reserve_bytes}" =~ ^[0-9]+$ ]] \
+    || fail "STAGE1_DEVICE_MEMORY_RESERVE_BYTES must be a nonnegative integer"
 cloud_memory_lanes="$(( cloud_preflight_memory_budget / cloud_preflight_owner_peak ))"
 (( cloud_memory_lanes >= 1 )) || cloud_memory_lanes=1
 cloud_preflight_lanes=8
@@ -348,6 +364,12 @@ PYTHONPATH="${cloud_snapshot}" \
     --preflight-owner-peak "${cloud_preflight_owner_peak}" \
     --preflight-lanes "${cloud_preflight_lanes}" \
     --embedding-batch-size "${cloud_embedding_batch_size}" \
+    --max-workers-per-device "${cloud_stage1_max_workers_per_device}" \
+    --estimated-device-memory-per-owner "${cloud_stage1_estimated_device_owner_bytes}" \
+    --device-memory-reserve "${cloud_stage1_device_reserve_bytes}" \
+    --estimated-host-memory-per-owner "${cloud_stage1_estimated_host_owner_bytes}" \
+    --host-memory-budget-fraction "${cloud_stage1_host_memory_fraction}" \
+    --minimum-cpu-threads-per-owner "${cloud_stage1_minimum_cpu_threads}" \
     --endpoint "${cloud_endpoint}" \
     --endpoint-model "${cloud_endpoint_model}"
 
@@ -420,7 +442,8 @@ cloud_workflow_arguments=(
 )
 
 note "dataset: ${cloud_dataset}"
-note "GPUs: cuda:0 through cuda:7; eight owner lanes"
+note "GPUs: cuda:0 through cuda:7; runtime owner-capacity autodetection enabled"
+note "Stage 1 ceiling: ${cloud_stage1_max_workers_per_device} owners/GPU; effective lanes derive from live VRAM, host RAM, and CPU"
 note "embedding: eight model workers, canonical batch size ${cloud_embedding_batch_size}"
 note "CPU budget: ${cloud_cpu_budget}; preflight lanes: ${cloud_preflight_lanes}"
 note "durable root: ${cloud_durable_root}"

@@ -43,7 +43,7 @@
   },
   "response_concurrency": 8,
   "runtime_compatibility_class": "portable_python_posix_v1",
-  "schema_version": "portable_all_evidence_deployment_profile_v9",
+  "schema_version": "portable_all_evidence_deployment_profile_v10",
   "scratch_root": "/tmp/causal_dragonnet_portable_scratch",
   "stage1_execution": {
     "benchmark_evidence_kind": "none",
@@ -76,13 +76,22 @@
       "schema_version": "production_role_neutral_neural_query_operational_controls_v1",
       "worker_cpu_threads": 1
     },
+    "owner_capacity_policy": {
+      "device_memory_reserve_bytes": 6442450944,
+      "estimated_device_memory_bytes_per_owner": 8589934592,
+      "estimated_host_memory_bytes_per_owner": 8589934592,
+      "host_memory_budget_fraction": 0.75,
+      "minimum_cpu_threads_per_owner": 1,
+      "mode": "resource_autodetect",
+      "schema_version": "portable_stage1_owner_capacity_policy_v1"
+    },
     "max_parallel_owners": 1,
     "neural_query_topology": {
       "mode": "one_context_per_selected_device",
       "schema_version": "portable_stage1_execution_topology_policy_v1"
     },
     "resource_kind": "accelerator",
-    "schema_version": "portable_stage1_execution_profile_v8",
+    "schema_version": "portable_stage1_execution_profile_v9",
     "selected_candidate": null,
     "selection_method": "operator_configured",
     "scope_workers_per_device": 1,

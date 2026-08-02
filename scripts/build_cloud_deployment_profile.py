@@ -46,14 +46,41 @@ def build_profile(args: argparse.Namespace) -> DeploymentProfile:
         args.preflight_lanes
     )
     stage1 = profile["stage1_execution"]
+    owner_ceiling = min(
+        int(args.cpu_budget),
+        GPU_COUNT * int(args.max_workers_per_device),
+    )
     stage1.update(
         {
             "resource_kind": "accelerator",
             "device_count": GPU_COUNT,
-            "scope_workers_per_device": 1,
-            "max_parallel_owners": GPU_COUNT,
+            "scope_workers_per_device": int(
+                args.max_workers_per_device
+            ),
+            "max_parallel_owners": owner_ceiling,
         }
     )
+    stage1["owner_capacity_policy"] = {
+        "schema_version": (
+            "portable_stage1_owner_capacity_policy_v1"
+        ),
+        "mode": "resource_autodetect",
+        "estimated_device_memory_bytes_per_owner": int(
+            args.estimated_device_memory_per_owner
+        ),
+        "device_memory_reserve_bytes": int(
+            args.device_memory_reserve
+        ),
+        "estimated_host_memory_bytes_per_owner": int(
+            args.estimated_host_memory_per_owner
+        ),
+        "host_memory_budget_fraction": float(
+            args.host_memory_budget_fraction
+        ),
+        "minimum_cpu_threads_per_owner": int(
+            args.minimum_cpu_threads_per_owner
+        ),
+    }
     stage1["neural_query_topology"]["mode"] = (
         "one_context_per_selected_device"
     )
@@ -103,8 +130,11 @@ def build_profile(args: argparse.Namespace) -> DeploymentProfile:
         tuple(compiled.devices)
         != tuple(f"cuda:{index}" for index in range(GPU_COUNT))
         or execution.device_count != GPU_COUNT
-        or execution.scope_workers_per_device != 1
-        or execution.max_parallel_owners != GPU_COUNT
+        or execution.scope_workers_per_device
+        != int(args.max_workers_per_device)
+        or execution.max_parallel_owners != owner_ceiling
+        or execution.owner_capacity_policy.mode
+        != "resource_autodetect"
         or execution.htr_operational_controls.fold_parallelism != 1
         or execution.htr_operational_controls.fold_slots_per_device != 1
         or execution.htr_operational_controls.sentence_encoder_batch_size != 16
@@ -121,6 +151,15 @@ def _positive(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
+
+
+def _fraction(value: str) -> float:
+    parsed = float(value)
+    if not 0 < parsed <= 1:
+        raise argparse.ArgumentTypeError(
+            "expected a fraction in (0, 1]"
+        )
     return parsed
 
 
@@ -144,6 +183,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preflight-owner-peak", type=_positive, required=True)
     parser.add_argument("--preflight-lanes", type=_positive, required=True)
     parser.add_argument("--embedding-batch-size", type=_positive, required=True)
+    parser.add_argument(
+        "--max-workers-per-device",
+        type=_positive,
+        required=True,
+    )
+    parser.add_argument(
+        "--estimated-device-memory-per-owner",
+        type=_positive,
+        required=True,
+    )
+    parser.add_argument(
+        "--device-memory-reserve",
+        type=int,
+        required=True,
+    )
+    parser.add_argument(
+        "--estimated-host-memory-per-owner",
+        type=_positive,
+        required=True,
+    )
+    parser.add_argument(
+        "--host-memory-budget-fraction",
+        type=_fraction,
+        required=True,
+    )
+    parser.add_argument(
+        "--minimum-cpu-threads-per-owner",
+        type=_positive,
+        required=True,
+    )
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--endpoint-model", required=True)
     return parser
@@ -151,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.device_memory_reserve < 0:
+        raise ValueError("device memory reserve cannot be negative")
     if args.preflight_lanes > GPU_COUNT:
         raise ValueError("preflight lanes cannot exceed the eight-GPU owner cap")
     build_profile(args)

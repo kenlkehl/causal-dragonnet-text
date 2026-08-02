@@ -18,7 +18,15 @@ from oci.inference.neural_query_operational_controls import (
 )
 from oci.inference.portable_workflow_spec import (
     DeploymentProfile,
+    Stage1ExecutionProfile,
+    Stage1OwnerCapacityPolicy,
     Stage1PreflightExecutionPolicy,
+)
+from oci.inference.portable_resource_scheduler import (
+    GPUResource,
+    ResourceInventory,
+    ResourcePlan,
+    resolve_stage1_owner_capacity,
 )
 from oci.inference.production_role_neutral_persistent_executor import (
     PersistentRoleNeutralExecutionSession,
@@ -192,6 +200,194 @@ def test_deployment_compilation_bounds_generic_owner_capacity(
                 fold_parallel_backend="processes",
             ),
         )
+
+
+def test_new_profiles_default_to_autodetect_but_legacy_profiles_stay_fixed(
+) -> None:
+    current = stage1_execution_profile(
+        resource_kind="cpu",
+        device_count=1,
+        scope_workers_per_device=1,
+    )
+    assert current.owner_capacity_policy.mode == "resource_autodetect"
+
+    current_mapping = asdict(current)
+    current_mapping.pop("owner_capacity_policy")
+    with pytest.raises(
+        ValueError,
+        match="must explicitly configure owner_capacity_policy",
+    ):
+        Stage1ExecutionProfile.from_mapping(current_mapping)
+
+    legacy_mapping = dict(current_mapping)
+    legacy_mapping["schema_version"] = (
+        "portable_stage1_execution_profile_v8"
+    )
+    migrated = Stage1ExecutionProfile.from_mapping(legacy_mapping)
+    assert migrated.owner_capacity_policy.mode == "fixed"
+
+
+def test_runtime_owner_capacity_autodetects_vram_host_and_cpu_caps() -> None:
+    gib = 1024**3
+    configured = replace(
+        stage1_execution_profile(
+            resource_kind="accelerator",
+            device_count=8,
+            scope_workers_per_device=4,
+            max_parallel_owners=32,
+        ),
+        owner_capacity_policy=Stage1OwnerCapacityPolicy(
+            mode="resource_autodetect",
+            estimated_device_memory_bytes_per_owner=8 * gib,
+            device_memory_reserve_bytes=6 * gib,
+            estimated_host_memory_bytes_per_owner=8 * gib,
+            host_memory_budget_fraction=0.75,
+            minimum_cpu_threads_per_owner=1,
+        ),
+        preflight_execution_policy=Stage1PreflightExecutionPolicy(
+            max_parallel_owners=8,
+            memory_budget_bytes=64 * gib,
+            estimated_owner_peak_bytes=8 * gib,
+            input_io_lane_cap=8,
+            publication_io_lane_cap=8,
+            authentication_io_lane_cap=8,
+        ),
+    )
+    resources = ResourceInventory(
+        cpu_count=64,
+        gpus=tuple(
+            GPUResource(
+                device=f"cuda:{index}",
+                uuid=f"gpu-{index}",
+                total_memory_bytes=96 * gib,
+                free_memory_bytes=96 * gib,
+                utilization_percent=0.0,
+            )
+            for index in range(8)
+        ),
+    )
+    plan = ResourcePlan(
+        devices=tuple(f"cuda:{index}" for index in range(8)),
+        cpu_budget=64,
+        inventory=resources,
+        policy=("auto",),
+        resource_performance_safety=_resource_safety(
+            maximum_allocation_fraction=0.85,
+        ),
+    )
+
+    effective, attestation = resolve_stage1_owner_capacity(
+        profile=configured,
+        resource_plan=plan,
+        host_available_memory_bytes=512 * gib,
+    )
+
+    assert effective.scope_workers_per_device == 4
+    assert effective.max_parallel_owners == 32
+    assert attestation["mode"] == "resource_autodetect"
+    assert attestation["minimum_uniform_device_lane_cap"] == 11
+    assert attestation["effective_scope_workers_per_device"] == 4
+    assert attestation["effective_max_parallel_owners"] == 32
+    assert len(attestation["per_device_capacity"]) == 8
+
+    host_limited, host_attestation = resolve_stage1_owner_capacity(
+        profile=configured,
+        resource_plan=plan,
+        host_available_memory_bytes=128 * gib,
+    )
+    assert host_limited.scope_workers_per_device == 1
+    assert host_limited.max_parallel_owners == 8
+    assert host_attestation["host_owner_lane_cap"] == 12
+    assert (
+        host_limited.preflight_execution_policy.max_parallel_owners
+        == 8
+    )
+
+
+def test_runtime_owner_capacity_uses_smallest_selected_gpu_and_fixed_fallback() -> None:
+    gib = 1024**3
+    configured = replace(
+        stage1_execution_profile(
+            resource_kind="accelerator",
+            device_count=2,
+            scope_workers_per_device=4,
+            max_parallel_owners=8,
+        ),
+        owner_capacity_policy=Stage1OwnerCapacityPolicy(
+            mode="resource_autodetect",
+            estimated_device_memory_bytes_per_owner=8 * gib,
+            device_memory_reserve_bytes=6 * gib,
+            estimated_host_memory_bytes_per_owner=4 * gib,
+            host_memory_budget_fraction=0.75,
+            minimum_cpu_threads_per_owner=1,
+        ),
+        preflight_execution_policy=Stage1PreflightExecutionPolicy(
+            max_parallel_owners=4,
+            memory_budget_bytes=32 * gib,
+            estimated_owner_peak_bytes=8 * gib,
+            input_io_lane_cap=4,
+            publication_io_lane_cap=4,
+            authentication_io_lane_cap=4,
+        ),
+    )
+    inventory = ResourceInventory(
+        cpu_count=32,
+        gpus=(
+            GPUResource(
+                device="cuda:0",
+                uuid="large",
+                total_memory_bytes=96 * gib,
+                free_memory_bytes=96 * gib,
+                utilization_percent=0.0,
+            ),
+            GPUResource(
+                device="cuda:1",
+                uuid="small",
+                total_memory_bytes=24 * gib,
+                free_memory_bytes=20 * gib,
+                utilization_percent=0.0,
+            ),
+        ),
+    )
+    plan = ResourcePlan(
+        devices=("cuda:0", "cuda:1"),
+        cpu_budget=16,
+        inventory=inventory,
+        policy=("cuda:0", "cuda:1"),
+        resource_performance_safety=_resource_safety(
+            maximum_allocation_fraction=0.85,
+        ),
+    )
+
+    effective, attestation = resolve_stage1_owner_capacity(
+        profile=configured,
+        resource_plan=plan,
+        host_available_memory_bytes=256 * gib,
+    )
+    assert effective.scope_workers_per_device == 1
+    assert effective.max_parallel_owners == 2
+    assert attestation["minimum_uniform_device_lane_cap"] == 1
+
+    fixed = replace(
+        configured,
+        owner_capacity_policy=Stage1OwnerCapacityPolicy(
+            mode="fixed",
+            estimated_device_memory_bytes_per_owner=1,
+            device_memory_reserve_bytes=0,
+            estimated_host_memory_bytes_per_owner=1,
+            host_memory_budget_fraction=1.0,
+            minimum_cpu_threads_per_owner=1,
+        ),
+    )
+    fixed_effective, fixed_attestation = (
+        resolve_stage1_owner_capacity(
+            profile=fixed,
+            resource_plan=plan,
+            host_available_memory_bytes=1,
+        )
+    )
+    assert fixed_effective == fixed
+    assert fixed_attestation["mode"] == "fixed"
 
 
 def test_deployment_compiles_independent_preflight_resource_caps(

@@ -27,6 +27,7 @@ from oci.inference.portable_workflow_spec import (
     RunControl,
     SentenceEmbeddingEncoderSpec,
     Stage1ExecutionProfile,
+    Stage1OwnerCapacityPolicy,
     Stage2PromptProtocolSpec,
 )
 from oci.inference.production_all_evidence_workflow import (
@@ -61,6 +62,12 @@ from tests.stage1_test_support import (
     stage1_execution_profile,
 )
 from tests.resource_safety_test_support import resource_safety_policy
+from oci.inference.portable_resource_scheduler import (
+    GPUResource,
+    ResourceInventory,
+    ResourcePlan,
+    resolve_stage1_owner_capacity,
+)
 
 
 def _bare_workflow_with_completed_phase(
@@ -809,10 +816,37 @@ def _portable_options(
         causal_forest=specification.causal_estimator,
         operational=_forest_operational(base.cpu_budget),
     )
-    execution_profile = stage1_execution_profile(
-        resource_kind="cpu",
-        device_count=base.stage1_execution_device_count,
-        scope_workers_per_device=base.stage1_scope_workers_per_gpu,
+    execution_profile = replace(
+        stage1_execution_profile(
+            resource_kind="cpu",
+            device_count=base.stage1_execution_device_count,
+            scope_workers_per_device=base.stage1_scope_workers_per_gpu,
+        ),
+        owner_capacity_policy=Stage1OwnerCapacityPolicy(
+            mode="fixed",
+            estimated_device_memory_bytes_per_owner=1,
+            device_memory_reserve_bytes=0,
+            estimated_host_memory_bytes_per_owner=1,
+            host_memory_budget_fraction=1.0,
+            minimum_cpu_threads_per_owner=1,
+        ),
+    )
+    execution_profile, owner_capacity_attestation = (
+        resolve_stage1_owner_capacity(
+            profile=execution_profile,
+            resource_plan=ResourcePlan(
+                devices=("cpu",),
+                cpu_budget=base.cpu_budget,
+                inventory=ResourceInventory(
+                    cpu_count=base.cpu_budget,
+                    gpus=(),
+                ),
+                policy=("cpu",),
+                resource_performance_safety=(
+                    base.resource_performance_safety
+                ),
+            ),
+        )
     )
     policy = execution_profile.preflight_execution_policy
     caps = {
@@ -858,6 +892,9 @@ def _portable_options(
         stage1_preflight_workers=min(caps.values()),
         stage1_preflight_execution_attestation=(
             preflight_attestation
+        ),
+        stage1_owner_capacity_attestation=(
+            owner_capacity_attestation
         ),
         forest_runtime_config=runtime,
         forest_n_estimators=None,
@@ -1270,6 +1307,30 @@ def _direct_deployment_args(
         "45.5",
         "--stage1-max-parallel-owners",
         "1",
+        "--stage1-owner-capacity-mode",
+        "fixed",
+        "--stage1-estimated-device-memory-bytes-per-owner",
+        "1",
+        "--stage1-device-memory-reserve-bytes",
+        "0",
+        "--stage1-estimated-host-memory-bytes-per-owner",
+        "1",
+        "--stage1-host-memory-budget-fraction",
+        "1.0",
+        "--stage1-minimum-cpu-threads-per-owner",
+        "1",
+        "--stage1-preflight-max-parallel-owners",
+        "1",
+        "--stage1-preflight-memory-budget-bytes",
+        str(8 * 1024**3),
+        "--stage1-preflight-estimated-owner-peak-bytes",
+        str(4 * 1024**3),
+        "--stage1-preflight-input-io-lane-cap",
+        "1",
+        "--stage1-preflight-publication-io-lane-cap",
+        "1",
+        "--stage1-preflight-authentication-io-lane-cap",
+        "1",
         "--stage1-neural-query-topology",
         "one_context_per_selected_device",
         "--stage1-htr-training-batch-size",
@@ -1597,6 +1658,25 @@ def test_trusted_local_resume_records_resource_epoch_without_new_request(
         second_epoch["selected_operational_values"]["embedding_batch_size"]
         == options.embedding_batch_size + 4
     )
+
+
+def test_capacity_autodetection_is_compatible_with_a_prior_resource_epoch(
+    tmp_path: Path,
+) -> None:
+    current = ProductionAllEvidenceWorkflow(
+        _portable_options(tmp_path)
+    )._request_body()
+    prior = deepcopy(current)
+    prior.pop("stage1_owner_capacity_attestation")
+    prior["stage1_resource_contract"].pop(
+        "owner_capacity_attestation"
+    )
+
+    assert workflow_module._requests_are_execution_epoch_compatible(
+        immutable_request=prior,
+        candidate_request=current,
+    )
+    assert prior["scientific_identity"] == current["scientific_identity"]
 
 
 def test_declared_phase_version_separates_science_from_implementation_hash(
@@ -4113,9 +4193,115 @@ def test_scientific_spec_and_complete_direct_deployment_compile_typed_options(
         validation_depth="full",
     )
     assert (
-        workflow_module._default_portable_role_neutral_hooks(parsed).role_neutral_stage1 is not None
+        workflow_module._default_portable_role_neutral_hooks(parsed)
+        .role_neutral_stage1
+        is not None
     )
     assert not configured.work_root.exists()
+
+
+def test_typed_production_compiler_autodetects_owner_lanes_and_reports_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1024**3
+    configured = _options(tmp_path)
+    scientific_path = _write_scientific_spec(tmp_path / "scientific.json")
+    execution = replace(
+        stage1_execution_profile(
+            resource_kind="accelerator",
+            device_count=2,
+            scope_workers_per_device=4,
+            max_parallel_owners=8,
+        ),
+        owner_capacity_policy=Stage1OwnerCapacityPolicy(
+            mode="resource_autodetect",
+            estimated_device_memory_bytes_per_owner=8 * gib,
+            device_memory_reserve_bytes=6 * gib,
+            estimated_host_memory_bytes_per_owner=8 * gib,
+            host_memory_budget_fraction=0.75,
+            minimum_cpu_threads_per_owner=1,
+        ),
+    )
+    profile = DeploymentProfile(
+        dataset_path=configured.dataset_path,
+        durable_artifact_root=configured.work_root,
+        scratch_root=tmp_path / "typed-scratch",
+        embedding_model_locator=configured.embedding_local_model_path,
+        htr_model_locator=configured.htr_local_model_path,
+        stage1_profile_locator=configured.stage1_profile_path,
+        query_profile_locator=configured.query_profile_path,
+        embedding_batch_size=configured.embedding_batch_size,
+        cluster_preflight_parquet_compression="zstd",
+        resource_performance_safety=configured.resource_performance_safety,
+        forest_operational=_forest_operational(16),
+        stage1_execution=execution,
+        embedding_model_name=configured.embedding_model_name,
+        devices=("cuda:0", "cuda:1"),
+        cpu_budget=16,
+        response_concurrency=8,
+        storage_backend="posix",
+        runtime_compatibility_class="portable-test-runtime-v1",
+    )
+    deployment_path = tmp_path / "deployment.json"
+    deployment_path.write_text(
+        json.dumps(asdict(profile), default=str, sort_keys=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "oci.inference.portable_resource_scheduler.discover_resources",
+        lambda: ResourceInventory(
+            cpu_count=32,
+            gpus=tuple(
+                GPUResource(
+                    device=f"cuda:{index}",
+                    uuid=f"gpu-{index}",
+                    total_memory_bytes=96 * gib,
+                    free_memory_bytes=96 * gib,
+                    utilization_percent=0.0,
+                )
+                for index in range(2)
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "oci.inference.portable_resource_scheduler."
+        "discover_host_available_memory_bytes",
+        lambda: 64 * gib,
+    )
+
+    parsed = options_from_args(
+        build_parser().parse_args(
+            [
+                "--scientific-spec",
+                str(scientific_path),
+                "--deployment-profile",
+                str(deployment_path),
+                "--stage1-only",
+            ]
+        )
+    )
+
+    assert parsed.stage1_scope_workers_per_gpu == 3
+    assert parsed.stage1_execution_profile is not None
+    assert parsed.stage1_execution_profile.max_parallel_owners == 6
+    attestation = parsed.stage1_owner_capacity_attestation
+    assert attestation is not None
+    assert attestation["host_owner_lane_cap"] == 6
+    assert attestation["effective_scope_workers_per_device"] == 3
+    workflow = ProductionAllEvidenceWorkflow(parsed)
+    workflow._write_progress(
+        status="initialized",
+        completed=(),
+        current_phase=None,
+    )
+    progress = json.loads(
+        (configured.work_root / "workflow_progress.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert progress["stage1_owner_capacity_attestation"] == attestation
+    assert progress["stage1_scope_workers_per_gpu"] == 3
 
 
 @pytest.mark.parametrize(
@@ -5560,13 +5746,74 @@ def test_typed_portable_scope_concurrency_is_deployment_selected(
 ) -> None:
     portable_root = tmp_path / "portable"
     portable_root.mkdir()
+    baseline = _portable_options(portable_root)
+    execution_profile = replace(
+        baseline.stage1_execution_profile,
+        scope_workers_per_device=2,
+        max_parallel_owners=2,
+    )
+    execution_profile, capacity_attestation = (
+        resolve_stage1_owner_capacity(
+            profile=execution_profile,
+            resource_plan=ResourcePlan(
+                devices=("cpu",),
+                cpu_budget=baseline.cpu_budget,
+                inventory=ResourceInventory(
+                    cpu_count=baseline.cpu_budget,
+                    gpus=(),
+                ),
+                policy=("cpu",),
+                resource_performance_safety=(
+                    baseline.resource_performance_safety
+                ),
+            ),
+        )
+    )
+    policy = execution_profile.preflight_execution_policy
+    preflight_caps = {
+        "cpu_budget": int(baseline.cpu_budget),
+        "stage1_owner_cap": int(
+            execution_profile.max_parallel_owners
+        ),
+        "preflight_owner_cap": int(policy.max_parallel_owners),
+        "memory_lane_cap": int(policy.memory_lane_cap),
+        "input_io_lane_cap": int(policy.input_io_lane_cap),
+        "publication_io_lane_cap": int(
+            policy.publication_io_lane_cap
+        ),
+        "authentication_io_lane_cap": int(
+            policy.authentication_io_lane_cap
+        ),
+        "ordinary_read_amplification_lane_cap": int(
+            baseline.resource_performance_safety
+            .maximum_ordinary_read_amplification
+        ),
+    }
+    preflight_body = {
+        "schema_version": (
+            "production_stage1_preflight_execution_attestation_v1"
+        ),
+        "policy": policy.as_dict(),
+        "derived_caps": preflight_caps,
+        "effective_preflight_owner_lanes_before_scope_cap": min(
+            preflight_caps.values()
+        ),
+        "physical_owner_count_applied_by_preflight_executor": True,
+        "resource_assignment_in_scientific_identity": False,
+        "completion_order_in_scientific_identity": False,
+    }
+    preflight_attestation = {
+        **preflight_body,
+        "content_sha256": workflow_module._sha(preflight_body),
+    }
     portable = replace(
-        _portable_options(portable_root),
+        baseline,
         stage1_scope_workers_per_gpu=2,
-        stage1_execution_profile=stage1_execution_profile(
-            resource_kind="cpu",
-            device_count=1,
-            scope_workers_per_device=2,
+        stage1_execution_profile=execution_profile,
+        stage1_owner_capacity_attestation=capacity_attestation,
+        stage1_preflight_workers=min(preflight_caps.values()),
+        stage1_preflight_execution_attestation=(
+            preflight_attestation
         ),
     )
     workflow = ProductionAllEvidenceWorkflow(portable)

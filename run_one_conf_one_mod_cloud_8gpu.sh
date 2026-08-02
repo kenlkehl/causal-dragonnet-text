@@ -4,8 +4,9 @@
 #
 # This launcher defaults to a cold one-confounder/one-modifier workflow. Fresh
 # embedding construction uses all eight selected GPUs concurrently with
-# canonical output ordering. Stage 1 then uses eight disjoint owner lanes, one
-# per GPU. For code-correction recovery,
+# canonical output ordering. Stage 1 production then detects a safe uniform
+# number of disjoint owner lanes per GPU from live free VRAM, host RAM, and
+# CPU capacity, up to the deployment's hard ceilings. For code-correction recovery,
 # CLOUD_IMPORT_EMBEDDING_FROM_RUN_ROOT may name a preserved prior durable root.
 # Input preparation then runs freshly and the old cache passes the workflow's
 # authenticated relocation path; embeddings are not recomputed.
