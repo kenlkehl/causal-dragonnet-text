@@ -23,8 +23,20 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! ldconfig -p 2>/dev/null | grep -E 'libavutil\.so\.(56|57|58|59|60)' >/dev/null; then
+    if ! command -v apt-get >/dev/null 2>&1 || ! command -v sudo >/dev/null 2>&1; then
+        echo "Shared FFmpeg libraries are required; install FFmpeg and rerun." >&2
+        exit 1
+    fi
+    echo "Installing the shared FFmpeg libraries required by TorchCodec..."
+    sudo apt-get update
+    sudo apt-get install -y ffmpeg
+fi
+
 echo "Installing the locked environment..."
 uv sync --frozen
+
+uv run python -c 'from sentence_transformers import SentenceTransformer'
 
 gpu_count="$(uv run python -c 'import torch; print(torch.cuda.device_count())')"
 if [[ "${gpu_count}" != "8" ]]; then
