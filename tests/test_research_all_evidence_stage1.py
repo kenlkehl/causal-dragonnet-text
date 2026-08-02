@@ -87,6 +87,30 @@ def test_compile_config_keeps_run_and_science_in_one_file(tmp_path):
     assert config.stage1_overrides["training"]["epochs"] == 3
 
 
+def test_resolved_context_syncs_legacy_embedding_config_alias(tmp_path):
+    raw, _config = _inputs(tmp_path, components=())
+    raw["science"]["stage1"]["architecture"] = {
+        "multi_model_forest": {
+            "embedding_contrast": {"max_chunks": 128},
+        }
+    }
+    config = compile_config(raw, config_dir=tmp_path)
+
+    context = ResearchAllEvidenceStage1(config)._resolved_context()
+    architecture = context.applied_config.architecture
+
+    assert architecture.model_type == "multi_model_forest"
+    assert architecture.multi_model_forest.embedding_contrast.max_chunks == 128
+    assert architecture.multi_model_agentic_forest.embedding_contrast.max_chunks == 128
+    assert architecture.multi_model_agentic_forest.embedding_contrast.cache_dir == str(
+        config.output_dir / "components" / "embedding_cache" / "cache"
+    )
+    assert (
+        architecture.multi_model_agentic_forest.embedding_contrast.model_name
+        == "test-embedding-model"
+    )
+
+
 def test_completed_components_are_skipped_without_revalidation(tmp_path):
     _raw, config = _inputs(tmp_path)
     calls: list[str] = []

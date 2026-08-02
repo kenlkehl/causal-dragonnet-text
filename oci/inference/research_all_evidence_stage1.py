@@ -1013,6 +1013,24 @@ class ResearchAllEvidenceStage1:
                 "applied_inference": applied_mapping,
             }
         )
+        # The reusable embedding evidence implementation predates the
+        # integrated multi-model forest and still reads its settings through
+        # the legacy multi_model_agentic_forest slot. Keep that compatibility
+        # alias synchronized with the researcher-facing model config. The
+        # model_type remains multi_model_forest, so this does not enable an
+        # agentic workflow.
+        experiment.applied_inference.architecture.multi_model_agentic_forest = copy.deepcopy(
+            experiment.applied_inference.architecture.multi_model_forest
+        )
+        embedding_config = (
+            experiment.applied_inference.architecture.multi_model_forest.embedding_contrast
+        )
+        LOGGER.info(
+            "resolved embedding cache model=%s max_chunks=%s cache_dir=%s",
+            embedding_config.model_name,
+            embedding_config.max_chunks,
+            embedding_config.cache_dir,
+        )
         from .neural_query_agentic_forest import NeuralQueryAgenticForestConfig
 
         neural_config = NeuralQueryAgenticForestConfig(**neural_mapping)
