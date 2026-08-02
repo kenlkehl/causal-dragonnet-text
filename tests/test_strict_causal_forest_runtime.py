@@ -9,9 +9,6 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import StratifiedKFold
 
 import oci.models.causal_forest_head as head_module
-from oci.inference.final_context_fit_causal_forest_adapter import (
-    FixedCausalForestHeadBackend,
-)
 from oci.models.causal_forest_head import CausalForestHead
 from oci.models.strict_causal_forest_runtime import (
     CAUSAL_FOREST_IMPLEMENTATION,
@@ -461,45 +458,6 @@ def test_explicit_crossfit_preserves_implicit_cv2_predictions_and_n_jobs():
     )
     assert strict_two.fit_audit()["operational_attestation"]["requested_host_cpu_budget"] == 2
     assert strict_two.fit_audit()["operational_attestation"]["effective_estimator_n_jobs"] == 1
-
-
-def test_backend_identity_distinguishes_portable_and_legacy_modes():
-    portable_one = FixedCausalForestHeadBackend(runtime_config=_runtime(n_jobs=1))
-    portable_two = FixedCausalForestHeadBackend(runtime_config=_runtime(n_jobs=2))
-    legacy = FixedCausalForestHeadBackend()
-
-    assert portable_one.identity() == portable_two.identity()
-    assert portable_one.identity()["configuration_mode"] == ("portable_strict_runtime_config_v1")
-    assert legacy.identity()["configuration_mode"] == ("legacy_compatibility_shim_v1")
-    assert portable_one.identity() != legacy.identity()
-    with pytest.raises(ValueError, match="cannot be combined"):
-        FixedCausalForestHeadBackend(
-            n_estimators=8,
-            runtime_config=_runtime(),
-        )
-
-
-def test_portable_backend_runs_only_the_authenticated_strict_path():
-    effect, control, treatment, outcome = _data()
-    config = _runtime(n_jobs=3)
-    backend = FixedCausalForestHeadBackend(runtime_config=config)
-    tau = backend.fit_predict(
-        effect_train=effect,
-        control_train=control,
-        treatment=treatment,
-        outcome=outcome,
-        effect_heldout=effect[:9],
-        control_heldout=control[:9],
-    )
-    assert tau.shape == (9,)
-    assert np.isfinite(tau).all()
-    audit = backend.fit_audit()
-    assert audit["configuration_mode"] == ("portable_strict_runtime_config_v1")
-    assert audit["scientific_identity_sha256"] == (config.scientific_identity_sha256())
-    assert audit["operational_parameters"]["requested_host_cpu_budget"] == 3
-    assert audit["operational_parameters"]["effective_estimator_n_jobs"] == 1
-    assert audit["outer_train_labels_only"] is True
-    assert audit["outer_heldout_labels_accepted"] is False
 
 
 def test_scientific_mutations_change_identity_but_operations_do_not():

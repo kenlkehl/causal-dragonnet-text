@@ -15,9 +15,8 @@ import copy
 import hashlib
 import json
 import logging
-import time
 from dataclasses import asdict, is_dataclass
-from typing import Any, Callable, Mapping, NamedTuple, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
@@ -34,13 +33,6 @@ from .neural_cohort_witness import (
     standardized_direct_target_contrasts,
 )
 from .neural_query_agentic_forest import NeuralQueryAgenticForestConfig
-from .neural_query_operational_controls import (
-    RoleNeutralNeuralQueryTaskResourcePlan,
-)
-from .neural_query_task_execution import (
-    NeuralQueryAuthenticatedCacheReference,
-    execute_bounded_neural_query_tasks,
-)
 from .tfidf_topic_discovery import (
     _strata,
     fit_joint_cross_fitted_nuisance_stacks,
@@ -52,18 +44,6 @@ NEURAL_QUERY_DISCOVERY_RUNTIME_ID = "neural_query_in_memory_discovery_runtime_v2
 NEURAL_QUERY_DISCOVERY_SUBFOLD_SCHEMA = "neural_query_in_memory_subfold_v2"
 
 BANKS = ("treatment", "outcome", "effect")
-
-
-class _NeuralQueryInnerFoldTask(NamedTuple):
-    """Spawn-pickleable arguments for one complete inner-fold fit."""
-
-    arguments: Mapping[str, Any]
-
-
-class _NeuralQueryFinalBankTask(NamedTuple):
-    """Spawn-pickleable arguments for one consensus/final-refit bank."""
-
-    arguments: Mapping[str, Any]
 
 
 def _json_default(value: Any) -> Any:
@@ -140,33 +120,13 @@ def _resolve_task_chunks(
     *,
     row_ids: Sequence[int],
     texts: Sequence[str],
-    chunks: Sequence[np.ndarray] | None,
-    embedding_task_reference: (
-        NeuralQueryAuthenticatedCacheReference | None
-    ),
+    chunks: Sequence[np.ndarray],
 ) -> tuple[np.ndarray, ...]:
-    """Resolve exact owner chunks locally, reopening mmap state in processes."""
+    """Validate materialized chunk matrices for one discovery context."""
 
     rows = tuple(map(int, row_ids))
     exact_texts = tuple(texts)
-    if embedding_task_reference is not None:
-        if chunks is not None:
-            raise ValueError(
-                "neural-query task cannot receive both cache-backed and "
-                "materialized chunks"
-            )
-        bound = embedding_task_reference.open_bound(
-            row_ids=rows,
-            texts=exact_texts,
-        )
-        resolved = tuple(bound.chunk_matrices(rows))
-    else:
-        if chunks is None:
-            raise ValueError(
-                "neural-query task requires chunks or an authenticated "
-                "mmap cache reference"
-            )
-        resolved = tuple(chunks)
+    resolved = tuple(chunks)
     if (
         len(resolved) != len(rows)
         or len(exact_texts) != len(rows)
@@ -191,10 +151,7 @@ def _fit_subfold(
     train_indices: np.ndarray,
     validation_indices: np.ndarray,
     row_ids: Sequence[int],
-    chunks: Sequence[np.ndarray] | None,
-    embedding_task_reference: (
-        NeuralQueryAuthenticatedCacheReference | None
-    ) = None,
+    chunks: Sequence[np.ndarray],
     texts: Sequence[str],
     treatment: np.ndarray,
     outcome: np.ndarray,
@@ -218,7 +175,6 @@ def _fit_subfold(
         row_ids=row_ids,
         texts=texts,
         chunks=chunks,
-        embedding_task_reference=embedding_task_reference,
     )
     identity_payload = {
         "schema": NEURAL_QUERY_DISCOVERY_SUBFOLD_SCHEMA,
@@ -399,30 +355,13 @@ def _run_device_tasks(
     return [_fit_subfold(device=device, **dict(task)) for task in tasks]
 
 
-def _run_inner_fold_task(
-    task: _NeuralQueryInnerFoldTask,
-    device: str,
-) -> dict[str, Any]:
-    if not isinstance(task, _NeuralQueryInnerFoldTask):
-        raise TypeError(
-            "neural-query inner-fold worker received another task type"
-        )
-    return _fit_subfold(
-        device=str(device),
-        **dict(task.arguments),
-    )
-
-
 def _fit_final_bank(
     *,
     bank: str,
     bank_index: int,
     candidates: Sequence[Mapping[str, Any]],
     row_ids: Sequence[int],
-    chunks: Sequence[np.ndarray] | None,
-    embedding_task_reference: (
-        NeuralQueryAuthenticatedCacheReference | None
-    ),
+    chunks: Sequence[np.ndarray],
     texts: Sequence[str],
     treatment: np.ndarray,
     outcome: np.ndarray,
@@ -446,7 +385,6 @@ def _fit_final_bank(
         row_ids=row_ids,
         texts=texts,
         chunks=chunks,
-        embedding_task_reference=embedding_task_reference,
     )
     treatment_values = np.asarray(treatment, dtype=float)
     outcome_values = np.asarray(outcome, dtype=float)
@@ -586,24 +524,10 @@ def _fit_final_bank(
     }
 
 
-def _run_final_bank_task(
-    task: _NeuralQueryFinalBankTask,
-    device: str,
-) -> dict[str, Any]:
-    if not isinstance(task, _NeuralQueryFinalBankTask):
-        raise TypeError(
-            "neural-query final-bank worker received another task type"
-        )
-    return _fit_final_bank(
-        device=str(device),
-        **dict(task.arguments),
-    )
-
-
 def fit_in_memory_query_discovery(
     *,
     fit_ids: Sequence[int],
-    fit_chunks: Sequence[np.ndarray] | None,
+    fit_chunks: Sequence[np.ndarray],
     fit_texts: Sequence[str],
     treatment: np.ndarray,
     outcome: np.ndarray,
@@ -616,15 +540,6 @@ def fit_in_memory_query_discovery(
     nuisance_folds: int,
     devices: Sequence[str],
     seed: int,
-    task_resource_plan: (
-        RoleNeutralNeuralQueryTaskResourcePlan | None
-    ) = None,
-    embedding_task_reference: (
-        NeuralQueryAuthenticatedCacheReference | None
-    ) = None,
-    execution_attestation_sink: (
-        Callable[[Mapping[str, Any]], None] | None
-    ) = None,
 ) -> dict[str, Any]:
     """Fit all three nested query banks without executable checkpoint I/O."""
 
@@ -638,7 +553,7 @@ def fit_in_memory_query_discovery(
     )
     row_ids = tuple(int(row_id) for row_id in fit_ids)
     texts = tuple(fit_texts)
-    chunks = None if fit_chunks is None else tuple(fit_chunks)
+    chunks = tuple(fit_chunks)
     treatment_values = np.asarray(treatment, dtype=float)
     outcome_values = np.asarray(outcome, dtype=float)
     fit_e_values = np.asarray(fit_e, dtype=float)
@@ -651,7 +566,7 @@ def fit_in_memory_query_discovery(
         == len(fit_e_values)
         == len(fit_m_values)
         == row_count
-    ) or (chunks is not None and len(chunks) != row_count):
+    ) or len(chunks) != row_count:
         raise ValueError("neural-query discovery inputs must have identical row counts")
     if (
         len(row_ids) != len(set(row_ids))
@@ -670,58 +585,9 @@ def fit_in_memory_query_discovery(
             "neural-query discovery requires unique rows, exact texts, and "
             "finite aligned vectors"
         )
-    if task_resource_plan is None:
-        if chunks is None:
-            raise ValueError(
-                "legacy neural-query execution requires materialized chunks"
-            )
-        if embedding_task_reference is not None:
-            raise ValueError(
-                "an authenticated task cache reference requires a bounded "
-                "resource plan"
-            )
-        if execution_attestation_sink is not None:
-            raise ValueError(
-                "neural-query execution attestation requires bounded task "
-                "controls"
-            )
-    else:
-        if not isinstance(
-            task_resource_plan,
-            RoleNeutralNeuralQueryTaskResourcePlan,
-        ):
-            raise TypeError(
-                "neural-query execution requires a typed task resource plan"
-            )
-        if tuple(task_resource_plan.devices) != device_names:
-            raise ValueError(
-                "neural-query task resources differ from selected devices"
-            )
-        if (
-            task_resource_plan.fold_parallel_backend == "processes"
-            and embedding_task_reference is None
-        ):
-            raise ValueError(
-                "process neural-query tasks require an authenticated mmap "
-                "cache reference"
-            )
-        if embedding_task_reference is not None and (
-            tuple(embedding_task_reference.allowed_row_ids) != row_ids
-        ):
-            raise ValueError(
-                "neural-query task cache authority changed owner row order"
-            )
-        if (
-            execution_attestation_sink is not None
-            and not callable(execution_attestation_sink)
-        ):
-            raise TypeError(
-                "neural-query execution attestation sink must be callable"
-            )
-
     parent_binding = _stable_hash(
         {
-            "scope": "production_in_memory_no_executable_checkpoint_io",
+            "scope": "in_memory_query_discovery",
             "runtime": NEURAL_QUERY_DISCOVERY_RUNTIME_ID,
             "row_ids": list(row_ids),
             "texts_sha256": _stable_hash(list(texts)),
@@ -763,14 +629,7 @@ def fit_in_memory_query_discovery(
                 "train_indices": train,
                 "validation_indices": validation,
                 "row_ids": row_ids,
-                "chunks": (
-                    None
-                    if embedding_task_reference is not None
-                    else chunks
-                ),
-                "embedding_task_reference": (
-                    embedding_task_reference
-                ),
+                "chunks": chunks,
                 "texts": texts,
                 "treatment": treatment_values,
                 "outcome": outcome_values,
@@ -784,51 +643,30 @@ def fit_in_memory_query_discovery(
             }
         )
 
-    inner_attestation: Mapping[str, Any] | None = None
-    if task_resource_plan is None:
-        tasks_by_device: dict[str, list[dict[str, Any]]] = {
-            device: [] for device in device_names
-        }
-        for index, task in enumerate(canonical_tasks):
-            device = device_names[index % len(device_names)]
-            tasks_by_device[device].append(task)
-        unordered_subfolds: list[dict[str, Any]] = []
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(
-                len(device_names),
-                int(config.query_inner_folds),
-            )
-        ) as executor:
-            futures = [
-                executor.submit(_run_device_tasks, device, tasks)
-                for device, tasks in tasks_by_device.items()
-                if tasks
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                unordered_subfolds.extend(future.result())
-        subfolds = sorted(
-            unordered_subfolds,
-            key=lambda row: int(row["fold"]),
+    tasks_by_device: dict[str, list[dict[str, Any]]] = {
+        device: [] for device in device_names
+    }
+    for index, task in enumerate(canonical_tasks):
+        device = device_names[index % len(device_names)]
+        tasks_by_device[device].append(task)
+    unordered_subfolds: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(
+            len(device_names),
+            int(config.query_inner_folds),
         )
-    else:
-        values, inner_attestation = execute_bounded_neural_query_tasks(
-            tuple(
-                _NeuralQueryInnerFoldTask(arguments=task)
-                for task in canonical_tasks
-            ),
-            task_names=tuple(
-                f"inner_fold_{fold:03d}"
-                for fold in range(
-                    1,
-                    len(canonical_tasks) + 1,
-                )
-            ),
-            resource_plan=task_resource_plan,
-            worker=_run_inner_fold_task,
-            parallelism=task_resource_plan.inner_fold_parallelism,
-            phase="inner_folds",
-        )
-        subfolds = list(values)
+    ) as executor:
+        futures = [
+            executor.submit(_run_device_tasks, device, tasks)
+            for device, tasks in tasks_by_device.items()
+            if tasks
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            unordered_subfolds.extend(future.result())
+    subfolds = sorted(
+        unordered_subfolds,
+        key=lambda row: int(row["fold"]),
+    )
 
     if len(subfolds) != len(canonical_tasks):
         raise RuntimeError(
@@ -854,10 +692,7 @@ def fit_in_memory_query_discovery(
                 "identity, or banks"
             )
 
-    # No final bank task is even constructed until every inner-fold result
-    # has returned and its canonical rows/seeds/banks have been verified.
-    inner_fold_barrier_ns = time.monotonic_ns()
-    final_tasks: list[_NeuralQueryFinalBankTask] = []
+    final_tasks: list[dict[str, Any]] = []
     for bank_index, bank in enumerate(BANKS):
         candidates = [
             candidate
@@ -865,20 +700,12 @@ def fit_in_memory_query_discovery(
             for candidate in subfold["banks"][bank]["candidates"]
         ]
         final_tasks.append(
-            _NeuralQueryFinalBankTask(
-                arguments={
+                {
                     "bank": bank,
                     "bank_index": bank_index,
                     "candidates": candidates,
                     "row_ids": row_ids,
-                    "chunks": (
-                        None
-                        if embedding_task_reference is not None
-                        else chunks
-                    ),
-                    "embedding_task_reference": (
-                        embedding_task_reference
-                    ),
+                    "chunks": chunks,
                     "texts": texts,
                     "treatment": treatment_values,
                     "outcome": outcome_values,
@@ -888,29 +715,15 @@ def fit_in_memory_query_discovery(
                     "config": config,
                     "seed": int(seed),
                 }
-            )
         )
 
-    bank_attestation: Mapping[str, Any] | None = None
-    if task_resource_plan is None:
-        final_rows = tuple(
-            _run_final_bank_task(
-                task,
-                device_names[index % len(device_names)],
-            )
-            for index, task in enumerate(final_tasks)
+    final_rows = tuple(
+        _fit_final_bank(
+            device=device_names[index % len(device_names)],
+            **task,
         )
-    else:
-        final_rows, bank_attestation = execute_bounded_neural_query_tasks(
-            tuple(final_tasks),
-            task_names=tuple(
-                f"final_{bank}_bank" for bank in BANKS
-            ),
-            resource_plan=task_resource_plan,
-            worker=_run_final_bank_task,
-            parallelism=task_resource_plan.bank_parallelism,
-            phase="consensus_and_final_refit_banks",
-        )
+        for index, task in enumerate(final_tasks)
+    )
     final_banks: dict[str, dict[str, Any]] = {}
     for bank_index, (bank, row) in enumerate(
         zip(BANKS, final_rows, strict=True)
@@ -929,51 +742,6 @@ def fit_in_memory_query_discovery(
                 "or seed formulas"
             )
         final_banks[bank] = dict(row["result"])
-
-    if task_resource_plan is not None:
-        if inner_attestation is None or bank_attestation is None:
-            raise RuntimeError(
-                "neural-query bounded execution omitted phase telemetry"
-            )
-        inner_finishes = [
-            int(row["finished_monotonic_ns"])
-            for row in inner_attestation["task_intervals"]
-        ]
-        bank_starts = [
-            int(row["started_monotonic_ns"])
-            for row in bank_attestation["task_intervals"]
-        ]
-        if (
-            not inner_finishes
-            or not bank_starts
-            or max(inner_finishes) >= inner_fold_barrier_ns
-            or min(bank_starts) <= inner_fold_barrier_ns
-        ):
-            raise RuntimeError(
-                "neural-query final refits crossed the inner-fold barrier"
-            )
-        attestation_body = {
-            "schema_version": (
-                "production_neural_query_discovery_execution_attestation_v1"
-            ),
-            "resource_plan": task_resource_plan.as_dict(),
-            "inner_fold_phase": copy.deepcopy(dict(inner_attestation)),
-            "inner_fold_barrier_monotonic_ns": inner_fold_barrier_ns,
-            "inner_fold_barrier_enforced": True,
-            "all_inner_results_verified_before_final_task_construction": True,
-            "final_bank_phase": copy.deepcopy(dict(bank_attestation)),
-            "canonical_fold_order": list(
-                range(1, len(subfolds) + 1)
-            ),
-            "canonical_bank_order": list(BANKS),
-            "scientific_payload_contains_device_metadata": False,
-        }
-        attestation = {
-            **attestation_body,
-            "content_sha256": _stable_hash(attestation_body),
-        }
-        if execution_attestation_sink is not None:
-            execution_attestation_sink(attestation)
 
     return {
         "runtime": NEURAL_QUERY_DISCOVERY_RUNTIME_ID,
@@ -1005,8 +773,58 @@ def fit_in_memory_query_discovery(
     }
 
 
+def fit_context_query_discovery(
+    *,
+    row_ids: tuple[int, ...],
+    chunks: Sequence[np.ndarray],
+    texts: tuple[str, ...],
+    treatment: np.ndarray,
+    outcome: np.ndarray,
+    outcome_binary: bool,
+    nuisance_views: Sequence[Any],
+    nuisance_stack_config: TfidfNuisanceStackScientificConfig,
+    query_config: NeuralQueryAgenticForestConfig,
+    nuisance_folds: int,
+    devices: tuple[str, ...],
+    seed: int,
+) -> Mapping[str, Any]:
+    """Fit nuisance models and all neural-query banks for one context."""
+
+    nuisance = fit_joint_cross_fitted_nuisance_stacks(
+        texts=list(texts),
+        treatment=np.asarray(treatment, dtype=float),
+        outcome=np.asarray(outcome, dtype=float),
+        outcome_binary=bool(outcome_binary),
+        strata=_strata(treatment, outcome, outcome_binary=bool(outcome_binary)),
+        views=list(nuisance_views),
+        folds=int(nuisance_folds),
+        random_state=int(seed + 10_000),
+        nuisance_stack_config=nuisance_stack_config,
+    )
+    fit_e = np.asarray(nuisance["treatment"]["stacked_oof"], dtype=float)
+    fit_m = np.asarray(nuisance["outcome"]["stacked_oof"], dtype=float)
+    del nuisance
+    return fit_in_memory_query_discovery(
+        fit_ids=row_ids,
+        fit_chunks=chunks,
+        fit_texts=texts,
+        treatment=np.asarray(treatment, dtype=float),
+        outcome=np.asarray(outcome, dtype=float),
+        outcome_binary=bool(outcome_binary),
+        fit_e=fit_e,
+        fit_m=fit_m,
+        nuisance_views=list(nuisance_views),
+        nuisance_stack_config=nuisance_stack_config,
+        config=query_config,
+        nuisance_folds=int(nuisance_folds),
+        devices=devices,
+        seed=int(seed),
+    )
+
+
 __all__ = [
     "BANKS",
     "NEURAL_QUERY_DISCOVERY_RUNTIME_ID",
+    "fit_context_query_discovery",
     "fit_in_memory_query_discovery",
 ]

@@ -957,12 +957,10 @@ class AgenticFeatureSearchConfig:
 class ClusterLocalEmbeddingScientificConfig:
     """Closed scientific controls for native cluster-local embedding evidence.
 
-    This type intentionally has no defaults.  In portable production it must
-    be constructed from an exact mapping so an omitted sklearn, pooling, SVD,
-    rank, or replay setting can never inherit a library or source-code
-    default.  The KMeans ``random_state`` is the authenticated physical
-    group's ordered-row seed; it is consequently represented by a seed policy
-    rather than by a free-standing integer hyperparameter.
+    This type intentionally has no defaults so an omitted sklearn, pooling,
+    SVD, rank, or replay setting cannot silently inherit a library default. The
+    KMeans ``random_state`` is derived from the context's ordered rows and is
+    therefore represented by a seed policy rather than a free-standing integer.
     """
 
     requested_cluster_count: int
@@ -1116,7 +1114,7 @@ class ClusterLocalEmbeddingScientificConfig:
             )
         if (
             self.patient_pooling_policy
-            != "arithmetic_mean_all_authenticated_chunks_v1"
+            != "arithmetic_mean_all_chunks_v1"
         ):
             raise ValueError("cluster-local patient pooling policy is unsupported")
         if self.computation_dtype not in {"float32", "float64"}:
@@ -3492,15 +3490,13 @@ class ModelArchitectureConfig:
     htr_sentence_pooling: str = "auto"
     htr_normalize_sentence_embeddings: bool = True
     htr_trainable_sentence_encoder_layers: int = 0
-    # Historical all-evidence Stage-1 sets this runtime-only safety policy to
-    # True after loading its immutable source config.  Generic hash-backed HTR
-    # tests leave it False because they intentionally have no live encoder.
-    htr_require_live_unfrozen_encoder_attestation: bool = False
+    # Require a real trainable encoder whenever the sentence encoder is
+    # configured as unfrozen. Lightweight hash-backed tests leave this false.
+    htr_require_live_unfrozen_encoder: bool = False
     htr_role_attention: bool = False
     htr_w_attention_heads: int = 1
     htr_x_attention_heads: int = 1
-    # Closed role-neutral HTR transformer/output topology. Production Stage 1
-    # requires every leaf explicitly in its source profile.
+    # Explicit HTR transformer/output topology used by Stage 1.
     htr_transformer_feedforward_dim: int = 1024
     htr_transformer_activation: str = "gelu_exact"
     htr_transformer_norm_style: str = "post_norm"
@@ -4090,15 +4086,3 @@ def create_default_config(output_path: str) -> None:
 
     config.to_json(output_path)
     print(f"Default configuration saved to: {output_path}")
-
-
-# Portable production configuration is kept in a small dependency-free module
-# so importing the general experiment configuration does not pull production
-# runners or remote clients into Stage 1-only processes.
-from .inference.portable_workflow_spec import (  # noqa: E402
-    DeploymentProfile,
-    LosslessTextWindowSpec,
-    RunControl,
-    ScientificWorkflowSpec,
-    Stage1ExecutionProfile,
-)

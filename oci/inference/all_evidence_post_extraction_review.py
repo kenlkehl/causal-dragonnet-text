@@ -19,7 +19,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from itertools import combinations
 from typing import Any, Hashable, Mapping, Sequence
 
@@ -39,7 +39,6 @@ from .all_evidence_fusion import (
     source_text_temporal_policy_audit,
 )
 from .fold_honest_r_stack import FitRowProvenance
-from .frozen_extraction_cache_overlay import expected_extraction_columns
 from .post_extraction_scientific_policy import (
     ExtractionQualityPolicy,
     ExtractionRedundancyPolicy,
@@ -98,6 +97,21 @@ RAW_UNCALIBRATED_FEATURE_SOURCE_KINDS = frozenset(
 _VALID_ACTIONS = frozenset({"drop", "merge", "re_role", "replace", "revise", "stop"})
 _VALID_ROLES = frozenset({"confounder", "effect_modifier"})
 _SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def expected_extraction_columns(
+    spec: Mapping[str, Any] | Any,
+) -> tuple[str, str]:
+    """Return the ordinary value and missingness columns for one feature."""
+
+    if is_dataclass(spec) and not isinstance(spec, type):
+        spec = asdict(spec)
+    if not isinstance(spec, Mapping):
+        raise TypeError("an extraction contract must be a mapping or dataclass")
+    name = str(spec.get("name") or "").strip()
+    if not name:
+        raise ValueError("extraction contract name must be non-empty")
+    return f"explicit_feat_{name}", f"explicit_feat_{name}_missing"
 _OPAQUE_DIAGNOSTIC_ID = re.compile(r"^diagnostic_[0-9]{4}$")
 _OPAQUE_EVIDENCE_ID = re.compile(r"^evidence_(?:[0-9]+|[0-9a-f]{64})$")
 

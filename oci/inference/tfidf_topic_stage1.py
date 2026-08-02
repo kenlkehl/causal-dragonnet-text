@@ -1044,9 +1044,9 @@ def _fit_tfidf_topic_stage1_spec(
     limit_native_threads: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Pickle-safe joblib worker for one fold-isolated Stage 1 context."""
-    from .production_stage1_scope_scheduler import (
-        _enforce_stage1_torch_determinism,
-        seed_stage1_scope_rngs,
+    from .discovery_randomness import (
+        enable_deterministic_torch,
+        seed_discovery_rngs,
     )
 
     expected_seed = _tfidf_context_scope_seed(
@@ -1055,8 +1055,8 @@ def _fit_tfidf_topic_stage1_spec(
     )
     if int(spec.get("worker_scope_seed", -1)) != expected_seed:
         raise ValueError("TF-IDF context worker seed binding changed")
-    _enforce_stage1_torch_determinism()
-    seed_stage1_scope_rngs(expected_seed, gpu_id=None)
+    enable_deterministic_torch()
+    seed_discovery_rngs(expected_seed, gpu_id=None)
     thread_limit = threadpool_limits(limits=1) if limit_native_threads else nullcontext()
     with thread_limit:
         return _fit_tfidf_topic_stage1_spec_impl(

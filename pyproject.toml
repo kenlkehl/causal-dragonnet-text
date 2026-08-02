@@ -31,7 +31,11 @@ dependencies = [
     "pyarrow",
     "joblib>=1.2.0",
     "accelerate>=0.20.0",
-    "sentence-transformers>=3.0.0",
+    # 5.4+ probes the optional TorchCodec backend at import time. vLLM installs
+    # TorchCodec, whose native libraries require system FFmpeg even for our
+    # text-only embedding use case. 5.3 supports Transformers v5 without that
+    # multimodal import path.
+    "sentence-transformers>=5.3.0,<5.4.0",
     "huggingface-hub>=1.0.0",
     "sentencepiece>=0.2.0",
     "tiktoken>=0.5.0",

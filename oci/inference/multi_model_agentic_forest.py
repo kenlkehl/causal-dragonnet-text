@@ -71,7 +71,7 @@ from .embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
     redact_embedding_contrast_evidence,
 )
-from .production_stage1_scope_scheduler import derive_stage1_group_seed
+from .discovery_randomness import derive_discovery_seed
 from .agentic_attention_variable_forest import (
     AgenticAttentionVariableForestRunner,
     _attention_evidence_snippet,
@@ -2161,9 +2161,9 @@ class MultiModelAgenticForestRunner:
             ordered_fit_rows = tuple(
                 discovery_df["_oci_row_id"].astype(int).tolist()
             )
-            generator.bind_cluster_physical_fit_authority(
+            generator.bind_cluster_fit_context(
                 ordered_fit_row_ids=ordered_fit_rows,
-                canonical_group_seed=derive_stage1_group_seed(
+                canonical_group_seed=derive_discovery_seed(
                     _required_applied_seed(self.config),
                     ordered_fit_rows,
                 ),

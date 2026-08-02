@@ -1343,10 +1343,10 @@ class AgenticAttentionVariableForestRunner:
             "htr",
             "frozen_llm_pooler",
         }
-        production_attestation_required = bool(
+        live_encoder_required = bool(
             getattr(
                 self.config.architecture,
-                "htr_require_live_unfrozen_encoder_attestation",
+                "htr_require_live_unfrozen_encoder",
                 False,
             )
         )
@@ -1356,11 +1356,11 @@ class AgenticAttentionVariableForestRunner:
                 "htr_requested": False,
             }
         if type(extractor) is not HierarchicalTransformerExtractor:
-            if not production_attestation_required:
+            if not live_encoder_required:
                 return {
                     "schema_version": HTR_SENTENCE_ENCODER_TRAINING_AUDIT_SCHEMA,
                     "htr_requested": True,
-                    "test_double_without_production_attestation": True,
+                    "test_double_without_live_encoder": True,
                 }
             raise TypeError("HTR training requires the exact HierarchicalTransformerExtractor")
         audit = extractor.sentence_encoder_training_audit()
@@ -1378,9 +1378,9 @@ class AgenticAttentionVariableForestRunner:
                 # Deterministic hash extractors are retained for lightweight
                 # tests; the historical production backend authenticates a
                 # concrete private transformer model tree instead.
-                if production_attestation_required:
+                if live_encoder_required:
                     raise RuntimeError(
-                        "production HTR requires a live trainable transformer "
+                        "HTR requires a live trainable transformer "
                         "sentence encoder; hash fallback is forbidden"
                     )
                 return audit
@@ -1409,7 +1409,7 @@ class AgenticAttentionVariableForestRunner:
         if (
             audit.get("htr_requested") is False
             or audit.get("hash_backend_without_sentence_encoder") is True
-            or audit.get("test_double_without_production_attestation") is True
+            or audit.get("test_double_without_live_encoder") is True
         ):
             return
         if audit.get("requested_freeze_sentence_encoder") is not False:

@@ -38,10 +38,10 @@ LOGGER = logging.getLogger(__name__)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STAGE1_TEMPLATE = (
-    REPOSITORY_ROOT / "example_configs" / "production_all_evidence_stage1_full.json"
+    REPOSITORY_ROOT / "example_configs" / "all_evidence_stage1_model.json"
 )
 DEFAULT_NEURAL_QUERY_TEMPLATE = (
-    REPOSITORY_ROOT / "example_configs" / "production_all_evidence_neural_query_full.json"
+    REPOSITORY_ROOT / "example_configs" / "all_evidence_neural_query_model.json"
 )
 
 STAGE1_COMPONENT_ORDER = (
@@ -824,7 +824,7 @@ def _run_one_neural_query_context(
     """Fit and immediately publish one independently resumable context."""
 
     from .neural_query_agentic_forest import build_query_evidence
-    from .neural_query_context_backend import _fit_context_query_discovery
+    from .neural_query_discovery_runtime import fit_context_query_discovery
 
     outer_fold = int(spec["outer_fold"])
     inner_fold = spec.get("inner_fold")
@@ -847,7 +847,7 @@ def _run_one_neural_query_context(
         all_chunk_texts[row_id] = chunk_texts
 
     mm_config = applied_config.architecture.multi_model_forest
-    discovery = _fit_context_query_discovery(
+    discovery = fit_context_query_discovery(
         row_ids=fit_rows,
         chunks=chunks,
         texts=texts,
@@ -1075,15 +1075,6 @@ class ResearchAllEvidenceStage1:
                 "gpu_ids": _cuda_ids(self.config.devices) or None,
                 "applied_inference": applied_mapping,
             }
-        )
-        # The reusable embedding evidence implementation predates the
-        # integrated multi-model forest and still reads its settings through
-        # the legacy multi_model_agentic_forest slot. Keep that compatibility
-        # alias synchronized with the researcher-facing model config. The
-        # model_type remains multi_model_forest, so this does not enable an
-        # agentic workflow.
-        experiment.applied_inference.architecture.multi_model_agentic_forest = copy.deepcopy(
-            experiment.applied_inference.architecture.multi_model_forest
         )
         embedding_config = (
             experiment.applied_inference.architecture.multi_model_forest.embedding_contrast

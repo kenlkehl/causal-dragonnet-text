@@ -8,6 +8,9 @@ import pandas as pd
 import pytest
 import oci.inference.research_all_evidence_stage1 as stage1_workflow
 
+from oci.inference.embedding_contrast_discovery import (
+    EmbeddingContrastEvidenceGenerator,
+)
 from oci.inference.research_all_evidence_stage1 import (
     COMPONENT_ORDER,
     ResearchAllEvidenceStage1,
@@ -87,7 +90,7 @@ def test_compile_config_keeps_run_and_science_in_one_file(tmp_path):
     assert config.stage1_overrides["training"]["epochs"] == 3
 
 
-def test_resolved_context_syncs_legacy_embedding_config_alias(tmp_path):
+def test_resolved_context_uses_multi_model_forest_embedding_config(tmp_path):
     raw, _config = _inputs(tmp_path, components=())
     raw["science"]["stage1"]["architecture"] = {
         "multi_model_forest": {
@@ -98,17 +101,18 @@ def test_resolved_context_syncs_legacy_embedding_config_alias(tmp_path):
 
     context = ResearchAllEvidenceStage1(config)._resolved_context()
     architecture = context.applied_config.architecture
+    generator = EmbeddingContrastEvidenceGenerator(
+        config=context.applied_config,
+        output_dir=tmp_path / "embedding",
+    )
 
     assert architecture.model_type == "multi_model_forest"
     assert architecture.multi_model_forest.embedding_contrast.max_chunks == 128
-    assert architecture.multi_model_agentic_forest.embedding_contrast.max_chunks == 128
-    assert architecture.multi_model_agentic_forest.embedding_contrast.cache_dir == str(
+    assert generator.embedding_config is architecture.multi_model_forest.embedding_contrast
+    assert generator.embedding_config.cache_dir == str(
         config.output_dir / "components" / "embedding_cache" / "cache"
     )
-    assert (
-        architecture.multi_model_agentic_forest.embedding_contrast.model_name
-        == "test-embedding-model"
-    )
+    assert generator.embedding_config.model_name == "test-embedding-model"
 
 
 def test_completed_components_are_skipped_without_revalidation(tmp_path):

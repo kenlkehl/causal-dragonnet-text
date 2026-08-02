@@ -673,9 +673,9 @@ new output directory because the simplified runner deliberately does not compare
 or invalidate prior settings.
 
 The complete operational reference is
-[`docs/production_all_evidence_end_to_end.md`](docs/production_all_evidence_end_to_end.md),
+[`docs/all_evidence_workflow.md`](docs/all_evidence_workflow.md),
 and the abbreviated command reference is
-[`docs/production_all_evidence_quickstart.md`](docs/production_all_evidence_quickstart.md).
+[`docs/all_evidence_quickstart.md`](docs/all_evidence_quickstart.md).
 
 ## Standalone treatment-effect models
 
@@ -861,19 +861,15 @@ coherent, and supported in both treatment groups.
 The simplified workflow should be the starting point for new research runs. The
 following documents provide additional detail:
 
-- [`docs/production_all_evidence_end_to_end.md`](docs/production_all_evidence_end_to_end.md)
+- [`docs/all_evidence_workflow.md`](docs/all_evidence_workflow.md)
   describes configuration, stage-specific execution, output paths, and resume
   behavior.
-- [`docs/production_all_evidence_quickstart.md`](docs/production_all_evidence_quickstart.md)
+- [`docs/all_evidence_quickstart.md`](docs/all_evidence_quickstart.md)
   provides a short command reference.
-- [`docs/all_evidence_discovery_interfaces.md`](docs/all_evidence_discovery_interfaces.md)
-  records the historical authenticated Stage 2 interface. It is retained to
-  explain older artifacts and is not used by `scripts/run_all_evidence.py`.
 
-The historical production control-plane and reproducibility runbooks remain in
-`docs/` for runs created with the older authenticated workflow. New runs do not
-require its immutable requests, source snapshots, artifact hashes, or checkpoint
-adoption procedures.
+The former authenticated production control plane has been removed. New and
+resumed runs use `scripts/run_all_evidence.py` and the ordinary files described
+above.
 
 ## Dependencies
 

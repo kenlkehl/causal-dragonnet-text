@@ -131,8 +131,12 @@ class EmbeddingContrastEvidenceGenerator:
         precompute_devices: Optional[Sequence[Any]] = None,
     ) -> None:
         self.config = config
+        if str(config.architecture.model_type) == "multi_model_forest":
+            model_config = config.architecture.multi_model_forest
+        else:
+            model_config = config.architecture.multi_model_agentic_forest
         self.embedding_config: EmbeddingContrastDiscoveryConfig = (
-            config.architecture.multi_model_agentic_forest.embedding_contrast
+            model_config.embedding_contrast
         )
         self.output_dir = Path(output_dir)
         self.embedding_provider = embedding_provider
@@ -187,13 +191,13 @@ class EmbeddingContrastEvidenceGenerator:
         self._external_corpora = self._load_external_corpora()
         self._prepared = True
 
-    def bind_cluster_physical_fit_authority(
+    def bind_cluster_fit_context(
         self,
         *,
         ordered_fit_row_ids: Sequence[int],
         canonical_group_seed: int,
     ) -> None:
-        """Bind KMeans to one authenticated ordered physical-fit authority."""
+        """Bind KMeans to the ordered rows and seed of one discovery context."""
 
         rows = tuple(map(int, ordered_fit_row_ids))
         seed = int(canonical_group_seed)
@@ -204,39 +208,22 @@ class EmbeddingContrastEvidenceGenerator:
             or isinstance(canonical_group_seed, bool)
             or not 0 <= seed < 2**31
         ):
-            raise ValueError("cluster physical-fit authority is invalid")
+            raise ValueError("cluster fit context is invalid")
         if self._cluster_fit_row_ids is not None and (
             self._cluster_fit_row_ids != rows or self._cluster_group_seed != seed
         ):
-            raise RuntimeError("cluster physical-fit authority was rebound")
+            raise RuntimeError("cluster fit context was rebound")
         self._cluster_fit_row_ids = rows
         self._cluster_group_seed = seed
 
-    def _cluster_physical_fit_authority(
+    def _cluster_fit_context(
         self,
         positions: Sequence[int],
     ) -> tuple[tuple[int, ...], int]:
         rows = tuple(int(self._row_ids[int(position)]) for position in positions)
-        observer = getattr(self, "_native_embedding_proof_observer", None)
-        observer_rows = getattr(observer, "fit_row_ids", None)
-        observer_seed = getattr(observer, "seed", None)
-        if observer_rows is not None or observer_seed is not None:
-            observed = tuple(map(int, observer_rows or ()))
-            if (
-                observed != rows
-                or isinstance(observer_seed, bool)
-                or not isinstance(observer_seed, int)
-            ):
-                raise ValueError(
-                    "native cluster observer differs from the ordered fit authority"
-                )
-            self.bind_cluster_physical_fit_authority(
-                ordered_fit_row_ids=observed,
-                canonical_group_seed=int(observer_seed),
-            )
         if self._cluster_fit_row_ids != rows or self._cluster_group_seed is None:
             raise ValueError(
-                "cluster-local embedding fit lacks its canonical ordered-row group seed"
+                "cluster-local embedding fit lacks its ordered rows and seed"
             )
         return rows, int(self._cluster_group_seed)
 
@@ -263,7 +250,7 @@ class EmbeddingContrastEvidenceGenerator:
         positions = self._positions_for_frame(discovery_df)
         if len(positions) != len(discovery_df):
             raise ValueError("cluster-only evidence lost an ordered discovery row")
-        self._cluster_physical_fit_authority(positions)
+        self._cluster_fit_context(positions)
         patient_embeddings = self._patient_embeddings(positions)
         patient_embeddings = _residualize_embeddings(
             patient_embeddings,
@@ -297,14 +284,6 @@ class EmbeddingContrastEvidenceGenerator:
             "contrasts": contrasts,
             "cluster_contrast_vectors": summary,
         }
-        observer = getattr(self, "_native_embedding_proof_observer", None)
-        if observer is not None:
-            record = getattr(observer, "record_cluster_only_build", None)
-            if not callable(record):
-                raise TypeError(
-                    "cluster preflight observer has no cluster-only build method"
-                )
-            record(evidence=evidence)
         return evidence
 
     def build_evidence(
@@ -329,7 +308,7 @@ class EmbeddingContrastEvidenceGenerator:
             return {"enabled": True, "skipped": "no_rows"}
         cluster_config = self.embedding_config.cluster_local_scientific
         if bool(self.embedding_config.include_cluster_contrast_vectors):
-            self._cluster_physical_fit_authority(positions)
+            self._cluster_fit_context(positions)
 
         patient_embeddings = self._patient_embeddings(positions)
         patient_embeddings = _residualize_embeddings(
@@ -443,22 +422,6 @@ class EmbeddingContrastEvidenceGenerator:
             evidence["cluster_contrast_vectors"] = cluster_contrast_summary
         if self._concept_probe_skip_reason:
             evidence["concept_probe_skipped"] = self._concept_probe_skip_reason
-        native_observer = getattr(self, "_native_embedding_proof_observer", None)
-        if native_observer is not None:
-            record_build = getattr(native_observer, "record_build", None)
-            if not callable(record_build):
-                raise TypeError("native embedding proof observer has no record_build method")
-            record_build(
-                generator=self,
-                discovery_df=discovery_df,
-                y=y,
-                t=t,
-                pseudo_target=pseudo_target,
-                t_resid=t_resid,
-                pseudo_target_names=pseudo_target_names,
-                importance=importance,
-                evidence=evidence,
-            )
         return evidence
 
     def _prepare_from_provider(self) -> None:
@@ -1090,7 +1053,7 @@ class EmbeddingContrastEvidenceGenerator:
             )
 
         _ordered_rows, canonical_group_seed = (
-            self._cluster_physical_fit_authority(positions)
+            self._cluster_fit_context(positions)
         )
         kmeans_parameters = _embedding_cluster_kmeans_parameters(
             self.embedding_config,
@@ -1108,29 +1071,6 @@ class EmbeddingContrastEvidenceGenerator:
         summary["actual_kmeans_parameters"] = copy.deepcopy(kmeans_parameters)
         summary["actual_canonical_group_seed"] = canonical_group_seed
         summary["actual_batch_size"] = int(kmeans_parameters["batch_size"])
-        native_observer = getattr(self, "_native_embedding_proof_observer", None)
-        if native_observer is not None:
-            record_kmeans = getattr(native_observer, "record_cluster_kmeans", None)
-            if not callable(record_kmeans):
-                raise TypeError(
-                    "native embedding proof observer has no record_cluster_kmeans method"
-                )
-            record_kmeans(
-                fit_row_ids=[self._row_ids[int(position)] for position in positions],
-                usable_mask=usable,
-                cluster_labels=cluster_labels,
-                cluster_centers=np.asarray(kmeans.cluster_centers_, dtype=float),
-                cluster_counts=cluster_counts,
-                n_iter=int(kmeans.n_iter_),
-                inertia=float(kmeans.inertia_),
-                parameters=kmeans_parameters,
-                scientific_configuration=config.as_dict(),
-                canonical_group_seed=canonical_group_seed,
-                ordered_fit_row_seed_policy=(
-                    config.kmeans_seed_derivation_policy
-                ),
-            )
-
         records: List[Dict[str, Any]] = []
         treatment_items = self._cluster_treatment_local_contrasts(
             patient_embeddings=patient_embeddings,
@@ -1381,40 +1321,6 @@ class EmbeddingContrastEvidenceGenerator:
         if numerical_rank < int(config.minimum_numerical_rank_per_family):
             raise ValueError(
                 f"cluster-local {family_key} SVD lacks configured numerical rank"
-            )
-        native_observer = getattr(self, "_native_embedding_proof_observer", None)
-        if native_observer is not None:
-            record_svd = getattr(native_observer, "record_cluster_svd", None)
-            if not callable(record_svd):
-                raise TypeError("native embedding proof observer has no record_cluster_svd method")
-            record_svd(
-                family_key=family_key,
-                item_cluster_ids=[int(item["cluster_id"]) for item in items],
-                weighted_matrix=matrix,
-                singular_values=singular_values,
-                components=components,
-                parameters={
-                    "full_matrices": bool(config.svd_full_matrices),
-                    "compute_uv": bool(config.svd_compute_uv),
-                    "hermitian": bool(config.svd_hermitian),
-                },
-                sign_canonicalization_policy=(
-                    config.svd_sign_canonicalization_policy
-                ),
-                rank_tolerance_policy=config.svd_rank_tolerance_policy,
-                rank_tolerance_dtype=config.svd_rank_tolerance_dtype,
-                rank_tolerance_multiplier=float(
-                    config.svd_rank_tolerance_multiplier
-                ),
-                rank_tolerance=float(rank_tolerance),
-                numerical_rank=numerical_rank,
-                replay_comparison_policy=config.replay_comparison_policy,
-                replay_relative_tolerance=float(
-                    config.replay_relative_tolerance
-                ),
-                replay_absolute_tolerance=float(
-                    config.replay_absolute_tolerance
-                ),
             )
         max_components = min(
             int(config.maximum_components_per_family),

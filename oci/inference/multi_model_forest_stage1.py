@@ -62,7 +62,7 @@ from .embedding_contrast_discovery import (
     _residualize_vector_from_basis,
     _tail_labels,
 )
-from .production_stage1_scope_scheduler import derive_stage1_group_seed
+from .discovery_randomness import derive_discovery_seed
 from .multi_model_agentic_forest import (
     MultiModelHTREvidenceProvider,
     _agent_visible_metrics,
@@ -856,9 +856,6 @@ class MultiModelForestStage1Runner:
             "agentic_feature_search",
             AgenticFeatureSearchConfig(),
         )
-        # Existing embedding and agentic code reads this config slot.
-        # Mirror the new config there so shared components use the same settings.
-        config.architecture.multi_model_agentic_forest = self.nn_config
         self._sync_htr_fold_parallelism()
         self.cf_config: ExplicitFeatureForestConfig = getattr(
             config.architecture,
@@ -2508,32 +2505,13 @@ class MultiModelForestStage1Runner:
         ordered_fit_rows = tuple(
             discovery_df["_oci_row_id"].astype(int).tolist()
         )
-        generator.bind_cluster_physical_fit_authority(
+        generator.bind_cluster_fit_context(
             ordered_fit_row_ids=ordered_fit_rows,
-            canonical_group_seed=derive_stage1_group_seed(
+            canonical_group_seed=derive_discovery_seed(
                 int(self.config.seed),
                 ordered_fit_rows,
             ),
         )
-        native_observer = getattr(generator, "_native_embedding_proof_observer", None)
-        if native_observer is not None:
-            register_fit_outputs = getattr(
-                native_observer,
-                "record_registered_fit_outputs",
-                None,
-            )
-            if not callable(register_fit_outputs):
-                raise TypeError(
-                    "native embedding proof observer has no registered-fit-output method"
-                )
-            register_fit_outputs(
-                fit_row_ids=discovery_df["_oci_row_id"].astype(int).tolist(),
-                treatment=t,
-                outcome=y,
-                pseudo_target=[pseudo_target],
-                t_resid=[t_resid],
-                pseudo_target_names=["stage1_ensemble_mean_nuisance"],
-            )
         return generator.build_evidence(
             discovery_df=discovery_df,
             y=y,
@@ -3245,7 +3223,7 @@ class MultiModelForestStage1Runner:
                     finite=finite,
                     metadata=metadata,
                     outer_fold=outer_fold,
-                    canonical_group_seed=derive_stage1_group_seed(
+                    canonical_group_seed=derive_discovery_seed(
                         int(self.config.seed),
                         ordered_fit_rows,
                     ),
