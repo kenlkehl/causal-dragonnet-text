@@ -148,8 +148,10 @@ flowchart TB
     H --> M["4. Matched-patient uplift"]
     E --> E1["5. Whole-cohort contrasts"]
     E --> E2["6. Cluster-local contrasts"]
-    E --> E3["7. Semantic-retrieval vocabulary"]
+    E1 --> E3["7. Lexical views of embedding contrasts"]
+    E2 --> E3
     E --> E4["10. Learned neural queries"]
+    L3 -->|"exclude effect-topic terms"| L4
     L1 --> Z["Triangulated Stage 1 evidence"]
     L2 --> Z
     L3 --> Z
@@ -166,6 +168,15 @@ Families 1 through 7 write their context-level evidence under
 `components/text_models/`. Families 8 and 9 write under `components/tfidf/`,
 and family 10 writes under `components/neural_queries/`. These locations remain
 available after the combined handoff has been assembled.
+
+The three families with `tfidf` in their names do not form one modeling branch.
+Family 7 belongs to the embedding component: it provides a lexical view of both
+the whole-cohort contrasts in family 5 and the cluster-local contrasts in family
+6. Families 8 and 9 instead belong to an independent fold-local TF-IDF topic
+pipeline that does not consume embeddings. Family 9 uses the effect-associated
+n-gram inventory from that pipeline after removing terms already represented in
+family 8's effect-topic bank. Thus family 7 depends on families 5 and 6, whereas
+family 9 depends on the effect-topic term inventory from family 8.
 
 ### 1. Sparse treatment and outcome associations (`bow_nuisance`)
 
@@ -253,11 +264,13 @@ cluster membership itself as a clinical label.
 
 ### 7. TF-IDF vocabulary from semantic retrieval (`tfidf_semantic_retrieval_contrasts`)
 
-Embedding contrasts return sets of records or chunks from opposing sides of a
-semantic direction. This architecture fits a lexical summary to those retrieved
-sets and reports the terms that distinguish them. It therefore acts as a bridge
-between continuous embedding geometry and vocabulary that a researcher can
-inspect directly.
+Both whole-cohort and cluster-local embedding contrasts return records or chunks
+from opposing sides of a semantic direction. This architecture fits lexical
+summaries to those contrasts and reports the terms that distinguish their sides.
+Each result retains the identity of its parent contrast, so evidence derived from
+a whole-cohort direction remains distinguishable from evidence derived from a
+cluster-local direction. Family 7 is therefore a readable projection of families
+5 and 6 rather than a third independent embedding model.
 
 The terms can clarify whether an embedding direction concerns, for example,
 disease burden, functional status, toxicity, or a documentation artifact. When
@@ -266,11 +279,12 @@ ambiguity rather than force a clinical label.
 
 ### 8. Consensus TF-IDF topics (`tfidf_topics`)
 
-The topic architecture uses non-negative matrix factorization across configured
-random seeds to identify groups of terms that recur together. Topic scores are
-evaluated in relation to treatment, outcome, and residual-effect signals within
-the training context. Consensus across fits reduces dependence on a single topic
-decomposition.
+This architecture begins independently from the fold's clinical text; it does
+not use the embedding contrasts or their retrieved chunks. A fold-local TF-IDF
+representation is screened separately for treatment, outcome, and
+residual-effect signal. Non-negative matrix factorization is then fit across
+configured random seeds to identify groups of terms that recur together.
+Consensus across fits reduces dependence on a single topic decomposition.
 
 A topic is a co-occurrence pattern, not necessarily one variable. A topic that
 contains terms for frailty, oxygen use, and hospitalization may represent a
@@ -279,10 +293,12 @@ remain separate. Stage 2 reviews every topic member before naming a feature.
 
 ### 9. Residual or orphan TF-IDF n-grams (`tfidf_orphan_ngrams`)
 
-Topic models summarize common structure but can hide specific terms that carry
-signal without loading strongly on a retained topic. The orphan n-gram
-architecture preserves such residual words and short phrases after topic-based
-representation and score testing.
+This architecture is also independent of the embedding branch. It begins with
+the effect-associated n-grams produced by the same fold-local TF-IDF screening
+used for family 8 and removes every term already represented in the fitted topic
+inventory for the residual-effect bank. The remaining words and short phrases
+are the “orphans.” They can carry residual-effect signal even though they were
+not represented by a retained topic.
 
 This family is intentionally conservative about aggregation. A rare but precise
 measurement may be scientifically important even when it does not belong to a
