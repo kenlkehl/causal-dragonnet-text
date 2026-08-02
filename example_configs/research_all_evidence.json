@@ -1,0 +1,40 @@
+{
+  "dataset": "../synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet",
+  "output_dir": "../artifacts/research_all_evidence",
+  "columns": {
+    "unit_id": "patient_id",
+    "text": "clinical_text",
+    "treatment": "treatment_indicator",
+    "outcome": "outcome_indicator"
+  },
+  "science": {
+    "clinical_question": "Identify text-derived confounders and treatment-effect modifiers.",
+    "outcome_type": "binary",
+    "outer_folds": 5,
+    "inner_folds": 5,
+    "seed": 42,
+    "stage1": {},
+    "neural_queries": {}
+  },
+  "models": {
+    "htr": "prajjwal1/bert-tiny",
+    "embeddings": "Qwen/Qwen3-Embedding-8B"
+  },
+  "stage2": {
+    "command": []
+  },
+  "run": {
+    "devices": [
+      "cuda:0"
+    ],
+    "workers": 8,
+    "components": [
+      "embedding_cache",
+      "tfidf",
+      "text_models",
+      "neural_queries",
+      "handoff"
+    ],
+    "log_level": "INFO"
+  }
+}

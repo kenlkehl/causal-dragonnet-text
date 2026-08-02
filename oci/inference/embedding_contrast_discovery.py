@@ -572,6 +572,45 @@ class EmbeddingContrastEvidenceGenerator:
         end = int(self._offsets[position + 1])
         return np.asarray(self._flat_embeddings[start:end], dtype=np.float32)
 
+    def chunk_matrices(
+        self,
+        row_ids: Optional[Sequence[Any]] = None,
+    ) -> List[np.ndarray]:
+        """Return prepared chunk embeddings in the requested dataset-row order.
+
+        This small public accessor lets the researcher Stage 1 runner reuse the
+        ordinary embedding cache for neural-query discovery without depending
+        on a sealed-cache adapter.
+        """
+
+        if not self._prepared:
+            raise RuntimeError("prepare() must be called before reading chunk embeddings")
+        requested = self._row_ids if row_ids is None else list(row_ids)
+        positions: List[int] = []
+        for row_id in requested:
+            position = self._row_id_to_position.get(_row_key(row_id))
+            if position is None:
+                raise KeyError(f"embedding cache has no dataset row {row_id!r}")
+            positions.append(int(position))
+        return [self._chunk_matrix(position) for position in positions]
+
+    def chunk_texts(
+        self,
+        row_ids: Optional[Sequence[Any]] = None,
+    ) -> List[List[str]]:
+        """Return prepared chunk text in the requested dataset-row order."""
+
+        if not self._prepared:
+            raise RuntimeError("prepare() must be called before reading chunk text")
+        requested = self._row_ids if row_ids is None else list(row_ids)
+        output: List[List[str]] = []
+        for row_id in requested:
+            position = self._row_id_to_position.get(_row_key(row_id))
+            if position is None:
+                raise KeyError(f"embedding cache has no dataset row {row_id!r}")
+            output.append(list(self._chunks_by_position[int(position)]))
+        return output
+
     def _patient_embeddings(self, positions: Sequence[int]) -> np.ndarray:
         config = self.embedding_config.cluster_local_scientific
         if config is not None:

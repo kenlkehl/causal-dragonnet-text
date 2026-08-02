@@ -36,20 +36,38 @@ python oracle_experiment_scripts/run_oracle_experiments.py \
     --n-folds 5
 ```
 
-### Hierarchical all-evidence pipeline
+### All-evidence workflow
 
-The current integrated production workflow has a self-service operator guide:
+The researcher-facing workflow is a single automatically resumable command:
 
-- [Production all-evidence end-to-end guide](docs/production_all_evidence_end_to_end.md):
-  canonical fresh-cohort workflow, Stage 1 and Stage 2 science, complete
-  artifact map, endpoint setup, monitoring, authentication, interruption,
-  resume, checkpoint reuse, and final outputs.
-- [Production all-evidence quickstart](docs/production_all_evidence_quickstart.md):
-  host requirements and concrete eight-GPU cloud launchers for the supplied
-  synthetic benchmarks.
+```bash
+uv run python scripts/run_all_evidence.py \
+  --config example_configs/research_all_evidence.json
+```
 
-Detailed scientific contracts and historical recovery guidance are available
-separately:
+With no Stage 2 command configured, this runs Stage 1 only. A configured
+`stage2.command` makes the default a full Stage 1 + Stage 2 run. The same entry
+point can select either side of the plain handoff explicitly:
+
+```bash
+# Build/resume evidence and stop after handoff/evidence.jsonl.
+uv run python scripts/run_all_evidence.py --config run.json --stage1-only
+
+# Reuse the handoff and build/resume only stage2/.
+uv run python scripts/run_all_evidence.py --config run.json --stage2-only
+```
+
+Its guides are:
+
+- [All-evidence workflow guide](docs/production_all_evidence_end_to_end.md):
+  one config or direct arguments, scientific/run settings, plain output layout,
+  automatic component resume, and the Stage 2 handoff.
+- [All-evidence quickstart](docs/production_all_evidence_quickstart.md):
+  the shortest path from a cohort to `handoff/evidence.jsonl`, plus phase-only
+  execution.
+
+The older production control-plane documentation below is retained only for
+historical runs that were created with that machinery:
 
 - [Operations runbook](docs/hierarchical_all_evidence_operations_runbook.md):
   retained low-level and exact-replay guidance.
@@ -59,6 +77,30 @@ separately:
 - [Model-facing interface specification](docs/all_evidence_discovery_interfaces.md):
   architecture-local interpretation, dossiers, bounded raw-evidence lookback, and
   adaptive hierarchical review.
+
+#### The ten Stage 1 evidence architectures
+
+There are ten evidence families, although they are stored in three modeling
+components. Every family is fit on the same outer/full and exact-inner row
+contexts. The embedding cache is shared infrastructure, and `handoff` only
+gathers results; neither is an additional evidence family.
+
+| Evidence family | What it models | Saved under |
+|---|---|---|
+| Word treatment/outcome associations | Bag-of-words signals associated with treatment assignment or observed outcome | `components/text_models/<context>/` |
+| Residual word effects | Terms associated with residualized treatment-effect signal after nuisance adjustment | `components/text_models/<context>/` |
+| Hierarchical transformer (HTR) | Learned short-chunk representations, token attention, and document-level chunk aggregation | `components/text_models/<context>/worker_artifacts/` |
+| Matched-patient uplift | Text contrasts between treatment-arm patients matched on learned nuisance structure | `components/text_models/<context>/` |
+| Whole-cohort embeddings | Global frozen-embedding directions associated with treatment, outcome, or effect variation | `components/text_models/<context>/` |
+| Cluster-local embeddings | The same embedding contrasts estimated within locally coherent patient clusters | `components/text_models/<context>/` |
+| Lexical-retrieval contrasts | Human-readable phrases retrieved to explain embedding-defined contrasts | `components/text_models/<context>/` |
+| TF-IDF topics | Fold-local latent text topics and their treatment/outcome associations | `components/tfidf/stage1_tfidf_topics/contexts/` |
+| Residual TF-IDF n-grams | N-grams associated with residualized effect signal beyond the topic representation | `components/tfidf/stage1_tfidf_topics/contexts/` |
+| Learned neural queries | Trainable embedding-space queries for treatment, outcome, and effect banks, plus retrieved text evidence | `components/neural_queries/<context>/` |
+
+Each context publishes `evidence.json` or an equivalent model artifact before
+its local `complete.json`. Component-level `evidence.jsonl` files aggregate the
+finished contexts for the final plain handoff.
 
 ## Architecture
 
