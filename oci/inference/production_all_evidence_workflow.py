@@ -15550,8 +15550,14 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         *,
         component_store_root: Path,
         plan: Any,
+        require_same_producer_identity: bool = False,
     ) -> tuple[Path, ...]:
         """Discover prior stores; per-component producers remain authoritative."""
+
+        if not isinstance(require_same_producer_identity, bool):
+            raise TypeError(
+                "component-store producer-identity filter must be boolean"
+            )
 
         current = Path(component_store_root).resolve(strict=True)
         namespace = current.parent.parent
@@ -15573,6 +15579,13 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
         current_input_sha256 = (
             current_compatibility.get(
                 "prepared_stage1_component_input_projection_sha256"
+            )
+            if isinstance(current_compatibility, Mapping)
+            else None
+        )
+        current_producer_identity = (
+            current_compatibility.get(
+                "component_producer_scientific_identity"
             )
             if isinstance(current_compatibility, Mapping)
             else None
@@ -15662,6 +15675,14 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
                     "stage1_scope_plan_scientific_content_sha256"
                 )
                 != plan_sha256
+            ):
+                continue
+            if (
+                require_same_producer_identity
+                and compatibility.get(
+                    "component_producer_scientific_identity"
+                )
+                != current_producer_identity
             ):
                 continue
             candidate_schema = manifest.get("schema_version")
@@ -15922,6 +15943,13 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             component_store_root=component_store_root,
             plan=plan,
         )
+        component_stat_continuity_reuse_roots = (
+            self._stage1_component_reuse_roots(
+                component_store_root=component_store_root,
+                plan=plan,
+                require_same_producer_identity=True,
+            )
+        )
 
         execution_root = (attempt / "role_neutral_stage1_execution").resolve()
         execution_manifest = execute_and_publish_role_neutral_stage1(
@@ -15933,6 +15961,9 @@ report.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
             resume=self.options.run_control.resume,
             component_store_root=component_store_root,
             component_reuse_roots=component_reuse_roots,
+            component_stat_continuity_reuse_roots=(
+                component_stat_continuity_reuse_roots
+            ),
         )
         if (
             int(execution_manifest.get("physical_fit_count", -1)) != len(plan.physical_scopes)

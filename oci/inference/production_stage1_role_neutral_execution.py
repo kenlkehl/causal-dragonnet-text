@@ -162,6 +162,9 @@ _ROLE_NEUTRAL_COMPONENT_EXECUTION_REPORT_SEMANTICS = (
     "direct_monotonic_architecture_phase_envelopes_not_kernel_occupancy_v1"
 )
 ROLE_NEUTRAL_COMPONENT_IMPORT_ATTESTATION_SCHEMA = (
+    "production_role_neutral_authenticated_component_import_v3"
+)
+ROLE_NEUTRAL_COMPONENT_IMPORT_ATTESTATION_SCHEMA_V2 = (
     "production_role_neutral_authenticated_component_import_v2"
 )
 ROLE_NEUTRAL_COMPONENT_IMPORT_ATTESTATION_SCHEMA_V1 = (
@@ -178,6 +181,9 @@ ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_BASIS_CURRENT_PRODUCER = (
 )
 ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_BASIS_PRIOR_IMPORT = (
     "prior_authenticated_component_import_v1_stat_continuity_v1"
+)
+ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_BASIS_SOURCE_CACHE = (
+    "source_component_authentication_cache_stat_continuity_copy_v1"
 )
 
 
@@ -524,12 +530,26 @@ def _validate_prior_import_attestation_registration(
         "stat_identity",
     }
     path = Path(str(registration.get("absolute_path")))
+    registration_schema = registration.get("schema_version")
+    if registration_schema == (
+        "production_role_neutral_prior_import_attestation_registration_v1"
+    ):
+        expected_proof_schema = (
+            ROLE_NEUTRAL_COMPONENT_IMPORT_ATTESTATION_SCHEMA_V1
+        )
+    elif registration_schema == (
+        "production_role_neutral_source_authentication_cache_registration_v1"
+    ):
+        expected_proof_schema = (
+            ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_CACHE_SCHEMA
+        )
+    else:
+        raise ValueError(
+            "component authentication cache prior proof has an unknown "
+            "registration schema"
+        )
     if (
         set(registration) != expected_fields
-        or registration.get("schema_version")
-        != (
-            "production_role_neutral_prior_import_attestation_registration_v1"
-        )
         or not path.is_absolute()
         or not isinstance(registration.get("stat_identity"), Mapping)
         or dict(registration["stat_identity"])
@@ -554,12 +574,49 @@ def _validate_prior_import_attestation_registration(
         or attestation.get("content_sha256")
         != registration.get("content_sha256")
         or attestation.get("content_sha256") != _sha256_json(body)
-        or attestation.get("schema_version")
-        != ROLE_NEUTRAL_COMPONENT_IMPORT_ATTESTATION_SCHEMA_V1
+        or attestation.get("schema_version") != expected_proof_schema
     ):
         raise ValueError(
             "component authentication cache prior proof is invalid"
         )
+
+
+def _source_authentication_cache_registration(
+    path: Path,
+) -> dict[str, Any]:
+    """Bind one protected source cache for a stat-continuous private copy."""
+
+    file_identity = _private_file_stat_identity(path)
+    digest, size_bytes = _private_file_identity(path)
+    value = _read_json(
+        path,
+        label="source component authentication cache",
+    )
+    body = {
+        key: copy.deepcopy(child)
+        for key, child in value.items()
+        if key != "content_sha256"
+    }
+    if (
+        value.get("schema_version")
+        != ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_CACHE_SCHEMA
+        or value.get("content_sha256") != _sha256_json(body)
+        or size_bytes != file_identity["size_bytes"]
+        or _private_file_stat_identity(path) != file_identity
+    ):
+        raise ValueError(
+            "source component authentication cache proof is invalid"
+        )
+    return {
+        "schema_version": (
+            "production_role_neutral_source_authentication_cache_registration_v1"
+        ),
+        "absolute_path": str(path),
+        "sha256": digest,
+        "size_bytes": size_bytes,
+        "content_sha256": value["content_sha256"],
+        "stat_identity": file_identity,
+    }
 
 
 def _registered_component_file_from_inventory(
@@ -972,6 +1029,8 @@ def _read_component_authentication_cache(
                         continue
                 elif basis == (
                     ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_BASIS_PRIOR_IMPORT
+                ) or basis == (
+                    ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_BASIS_SOURCE_CACHE
                 ):
                     if (
                         value.get("payload_bytes_reauthenticated")
@@ -1379,6 +1438,7 @@ class RoleNeutralPhysicalOwnerTask:
     owner_cpu_budget: int | None = None
     resume: bool = False
     component_reuse_roots: tuple[Path, ...] = ()
+    component_stat_continuity_reuse_roots: tuple[Path, ...] = ()
     component_import_attestation_root: Path | None = None
 
     def __post_init__(self) -> None:
@@ -1463,6 +1523,22 @@ class RoleNeutralPhysicalOwnerTask:
         if len(reuse_roots) != len(set(reuse_roots)):
             raise ValueError(
                 "physical-owner component reuse roots contain a duplicate"
+            )
+        stat_continuity_roots = tuple(
+            self.component_stat_continuity_reuse_roots
+        )
+        if (
+            any(
+                not isinstance(root, Path) or not root.is_absolute()
+                for root in stat_continuity_roots
+            )
+            or len(stat_continuity_roots)
+            != len(set(stat_continuity_roots))
+            or not set(stat_continuity_roots).issubset(set(reuse_roots))
+        ):
+            raise ValueError(
+                "physical-owner stat-continuity reuse roots must be a "
+                "unique subset of component reuse roots"
             )
         if reuse_roots and self.component_import_attestation_root is None:
             raise ValueError(
@@ -1976,6 +2052,8 @@ def _execute_one_owner(
             closed_prior_attestation = None
         elif authentication_basis == (
             ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_BASIS_PRIOR_IMPORT
+        ) or authentication_basis == (
+            ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_BASIS_SOURCE_CACHE
         ):
             _validate_prior_import_attestation_registration(
                 prior_authentication_attestation
@@ -2063,29 +2141,68 @@ def _execute_one_owner(
                 or not source_terminal.is_file()
             ):
                 continue
-            source_bound = factories[component](
-                component_invocation(
-                    component=component,
-                    output_root=source,
+            source_cache_registration: dict[str, Any] | None = None
+            source_receipt: (
+                AuthenticatedRoleNeutralComponentReceipt | None
+            ) = None
+            if reuse_root in task.component_stat_continuity_reuse_roots:
+                source_attestation_root = (
+                    reuse_root.parent
+                    / "authenticated_component_imports"
                 )
-            )
-            if not isinstance(
-                source_bound,
-                BoundRoleNeutralComponentProducer,
-            ):
-                raise TypeError(
-                    "component import factory returned an untyped producer"
+                source_cache_path = (
+                    _component_operational_attestation_path(
+                        root=source_attestation_root,
+                        physical_owner_scope_id=(
+                            task.physical_owner.scope_id
+                        ),
+                        component=component,
+                        kind="authentication_cache_v2",
+                    )
                 )
-            try:
-                # This is the sole producer-specific semantic authentication
-                # for the imported component.  It already returns a receipt
-                # bound to the source tree hash, terminal, plan, owner, and
-                # component-local scientific identities.
-                source_receipt = source_bound.authenticate()
-            except Exception:
-                # A scientifically incompatible or incomplete candidate is
-                # not an execution failure; later roots may still be valid.
-                continue
+                if source_cache_path.is_file():
+                    source_receipt = _read_component_authentication_cache(
+                        attestation_root=source_attestation_root,
+                        component_root=source,
+                        plan=task.plan,
+                        physical_owner_scope_id=(
+                            task.physical_owner.scope_id
+                        ),
+                        component=component,
+                    )
+                    if source_receipt is not None:
+                        try:
+                            source_cache_registration = (
+                                _source_authentication_cache_registration(
+                                    source_cache_path
+                                )
+                            )
+                        except Exception:
+                            source_receipt = None
+                            source_cache_registration = None
+            if source_receipt is None:
+                source_bound = factories[component](
+                    component_invocation(
+                        component=component,
+                        output_root=source,
+                    )
+                )
+                if not isinstance(
+                    source_bound,
+                    BoundRoleNeutralComponentProducer,
+                ):
+                    raise TypeError(
+                        "component import factory returned an untyped producer"
+                    )
+                try:
+                    # This is the sole producer-specific semantic
+                    # authentication when no protected stat-continuity proof
+                    # remains valid for the source component.
+                    source_receipt = source_bound.authenticate()
+                except Exception:
+                    # A scientifically incompatible or incomplete candidate
+                    # is not an execution failure; later roots may be valid.
+                    continue
             temporary = task.component_parent / (
                 f".{component}.attempt-import-{os.getpid()}-"
                 f"{threading.get_ident()}-{time.time_ns()}"
@@ -2139,7 +2256,20 @@ def _execute_one_owner(
                 "authentication_content_sha256": (
                     source_receipt.authentication_content_sha256
                 ),
-                "current_producer_semantic_authentication_count": 1,
+                "source_authentication_mode": (
+                    "protected_cache_exact_stat_continuity_v1"
+                    if source_cache_registration is not None
+                    else "current_producer_deep_authentication_v1"
+                ),
+                "source_authentication_cache_registration": (
+                    copy.deepcopy(source_cache_registration)
+                ),
+                "current_producer_semantic_authentication_count": (
+                    0 if source_cache_registration is not None else 1
+                ),
+                "source_payload_bytes_reauthenticated": (
+                    source_cache_registration is None
+                ),
                 "private_copy_not_link_or_reference": True,
                 "copied_tree_integrity_validation_count": 1,
                 "temporary_semantic_reauthentication_count": 0,
@@ -2147,7 +2277,8 @@ def _execute_one_owner(
                 "atomic_same_parent_directory_rename": True,
                 "source_tree_preserved": True,
                 "operational_import_policy": (
-                    "one_deep_source_auth_one_copied_tree_hash_v1"
+                    "protected_source_stat_continuity_or_deep_fallback_plus_"
+                    "one_copied_tree_hash_v2"
                 ),
             }
             attestation = {
@@ -2171,6 +2302,14 @@ def _execute_one_owner(
                 component=component,
                 component_root=component_root,
                 receipt=copied_receipt,
+                authentication_basis=(
+                    ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_BASIS_SOURCE_CACHE
+                    if source_cache_registration is not None
+                    else ROLE_NEUTRAL_COMPONENT_AUTHENTICATION_BASIS_CURRENT_PRODUCER
+                ),
+                prior_authentication_attestation=(
+                    source_cache_registration
+                ),
             )
             return copied_receipt
         return None
@@ -3891,6 +4030,7 @@ def execute_and_publish_role_neutral_stage1(
     resume: bool = False,
     component_store_root: Path | str | None = None,
     component_reuse_roots: Sequence[Path | str] = (),
+    component_stat_continuity_reuse_roots: Sequence[Path | str] = (),
 ) -> dict[str, Any]:
     """Execute canonical owners and publish the authenticated all-ten gate."""
 
@@ -3913,6 +4053,20 @@ def execute_and_publish_role_neutral_stage1(
             "Stage 1 component reuse roots must be one ordered sequence"
         )
     requested_component_reuse_roots = tuple(component_reuse_roots)
+    requested_stat_continuity_roots = tuple(
+        component_stat_continuity_reuse_roots
+    )
+    if isinstance(
+        component_stat_continuity_reuse_roots,
+        (str, bytes, Mapping),
+    ) or not isinstance(
+        component_stat_continuity_reuse_roots,
+        Sequence,
+    ):
+        raise TypeError(
+            "Stage 1 stat-continuity reuse roots must be one ordered "
+            "sequence"
+        )
     if requested_component_reuse_roots and component_store_root is None:
         raise ValueError(
             "Stage 1 component reuse roots require a distinct stable "
@@ -4032,6 +4186,24 @@ def execute_and_publish_role_neutral_stage1(
                 "Stage 1 component reuse roots contain a duplicate"
             )
         normalized_component_reuse_roots.append(resolved)
+    normalized_stat_continuity_roots: list[Path] = []
+    for requested_root in requested_stat_continuity_roots:
+        candidate = Path(requested_root)
+        if not candidate.is_absolute():
+            raise ValueError(
+                "Stage 1 stat-continuity reuse root must be absolute"
+            )
+        resolved = candidate.resolve(strict=True)
+        if resolved not in normalized_component_reuse_roots:
+            raise ValueError(
+                "Stage 1 stat-continuity reuse roots must be a subset of "
+                "component reuse roots"
+            )
+        if resolved in normalized_stat_continuity_roots:
+            raise ValueError(
+                "Stage 1 stat-continuity reuse roots contain a duplicate"
+            )
+        normalized_stat_continuity_roots.append(resolved)
     component_resume_enabled = bool(
         resume or component_store_root is not None
     )
@@ -4078,6 +4250,9 @@ def execute_and_publish_role_neutral_stage1(
             owner_cpu_budget=owner_cpu_budget,
             resume=component_resume_enabled,
             component_reuse_roots=tuple(component_import_sources),
+            component_stat_continuity_reuse_roots=tuple(
+                normalized_stat_continuity_roots
+            ),
             component_import_attestation_root=(
                 import_attestation_root
             ),

@@ -1117,7 +1117,7 @@ def test_cross_request_component_import_reuses_only_currently_authenticated_work
         if json.loads(path.read_text(encoding="utf-8")).get(
             "schema_version"
         )
-        == "production_role_neutral_authenticated_component_import_v2"
+        == "production_role_neutral_authenticated_component_import_v3"
     )
     authentication_caches = tuple(
         path
@@ -1144,8 +1144,15 @@ def test_cross_request_component_import_reuses_only_currently_authenticated_work
     for path in import_attestations:
         attestation = json.loads(path.read_text(encoding="utf-8"))
         assert attestation["schema_version"] == (
-            "production_role_neutral_authenticated_component_import_v2"
+            "production_role_neutral_authenticated_component_import_v3"
         )
+        assert attestation["source_authentication_mode"] == (
+            "current_producer_deep_authentication_v1"
+        )
+        assert attestation[
+            "source_authentication_cache_registration"
+        ] is None
+        assert attestation["source_payload_bytes_reauthenticated"] is True
         assert (
             attestation[
                 "current_producer_semantic_authentication_count"
@@ -1212,6 +1219,76 @@ def test_cross_request_component_import_reuses_only_currently_authenticated_work
         / "htr"
         / ROLE_NEUTRAL_EXECUTION_MANIFEST
     ).is_file()
+
+
+def test_cross_store_import_uses_protected_source_cache_without_replay(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(gpu_ids=())
+    policy = RoleNeutralStage1ExecutionPolicy(
+        resource_plan=_resource_plan(
+            devices=("cpu",),
+            cpu_budget=4,
+        ),
+        max_parallel_owners=1,
+    )
+    source_store = (tmp_path / "source-store" / "components").resolve()
+    execute_and_publish_role_neutral_stage1(
+        root=(tmp_path / "source-execution").resolve(),
+        plan=plan,
+        producer_factories=_ProducerRecorder().factories(),
+        policy=policy,
+        executor=_RecordingExecutor(),
+        component_store_root=source_store,
+    )
+
+    target_store = (tmp_path / "target-store" / "components").resolve()
+    target_recorder = _ProducerRecorder()
+    result = execute_and_publish_role_neutral_stage1(
+        root=(tmp_path / "target-execution").resolve(),
+        plan=plan,
+        producer_factories=target_recorder.factories(),
+        policy=policy,
+        executor=_RecordingExecutor(),
+        component_store_root=target_store,
+        component_reuse_roots=(source_store,),
+        component_stat_continuity_reuse_roots=(source_store,),
+    )
+
+    assert result["status"] == "complete"
+    assert not [
+        event
+        for event in target_recorder.events
+        if event[2] in {"execute", "authenticate"}
+    ]
+    records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (
+            target_store.parent / "authenticated_component_imports"
+        ).glob("*.json")
+    ]
+    imports = [
+        record
+        for record in records
+        if record.get("schema_version")
+        == "production_role_neutral_authenticated_component_import_v3"
+    ]
+    assert len(imports) == (
+        len(plan.physical_scopes) * len(EXPECTED_COMPONENT_FAMILIES)
+    )
+    assert all(
+        record["source_authentication_mode"]
+        == "protected_cache_exact_stat_continuity_v1"
+        and record["current_producer_semantic_authentication_count"] == 0
+        and record["source_payload_bytes_reauthenticated"] is False
+        and record["source_authentication_cache_registration"][
+            "schema_version"
+        ]
+        == (
+            "production_role_neutral_source_authentication_cache_registration_v1"
+        )
+        for record in imports
+    )
 
 
 def test_historical_full_authentication_reopens_by_exact_stat_continuity(
@@ -1672,3 +1749,8 @@ def test_component_store_namespace_is_science_narrow_and_finds_legacy_stores(
         v2_components.resolve(strict=True),
         legacy_components.resolve(strict=True),
     )
+    assert workflow._stage1_component_reuse_roots(
+        component_store_root=first,
+        plan=plan,
+        require_same_producer_identity=True,
+    ) == (v2_components.resolve(strict=True),)
