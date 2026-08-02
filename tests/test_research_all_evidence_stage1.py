@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from oci.inference.research_all_evidence_stage1 import (
     COMPONENT_ORDER,
     ResearchAllEvidenceStage1,
     Stage1RunContext,
+    _context_execution_lanes,
     _stage1_context_specs,
     build_parser,
     compile_config,
@@ -294,6 +294,67 @@ def test_text_model_contexts_are_independently_resumable(tmp_path, monkeypatch):
     assert calls == ["outer_001_inner_001"]
 
 
+def test_gpu_context_lanes_use_every_gpu_without_device_overlap():
+    pending = [{"scope_id": f"context_{index:02d}"} for index in range(30)]
+
+    lanes = _context_execution_lanes(
+        pending,
+        devices=(
+            "cuda:0",
+            "cuda:1",
+            "cuda:2",
+            "cuda:3",
+            "cuda:4",
+            "cuda:5",
+            "cuda:6",
+            "cuda:7",
+        ),
+        workers=32,
+    )
+
+    assert [device for device, _specs in lanes] == [f"cuda:{index}" for index in range(8)]
+    assert [len(specs) for _device, specs in lanes] == [4, 4, 4, 4, 4, 4, 3, 3]
+    scheduled = [
+        spec["scope_id"]
+        for _device, specs in lanes
+        for spec in specs
+    ]
+    assert sorted(scheduled) == sorted(spec["scope_id"] for spec in pending)
+
+
+def test_cpu_context_lanes_are_bounded_by_workers():
+    pending = [{"scope_id": f"context_{index:02d}"} for index in range(7)]
+
+    lanes = _context_execution_lanes(
+        pending,
+        devices=("cpu",),
+        workers=3,
+    )
+
+    assert [device for device, _specs in lanes] == ["cpu", "cpu", "cpu"]
+    assert [len(specs) for _device, specs in lanes] == [3, 2, 2]
+
+
+def test_context_lanes_spread_larger_full_contexts_across_devices():
+    pending = [
+        {"scope_id": "outer_1", "train_idx": list(range(100))},
+        {"scope_id": "inner_1", "train_idx": list(range(60))},
+        {"scope_id": "outer_2", "train_idx": list(range(100))},
+        {"scope_id": "inner_2", "train_idx": list(range(60))},
+    ]
+
+    lanes = _context_execution_lanes(
+        pending,
+        devices=("cuda:0", "cuda:1"),
+        workers=1,
+    )
+
+    assert [
+        [spec["scope_id"] for spec in specs]
+        for _device, specs in lanes
+    ] == [["outer_1", "inner_1"], ["outer_2", "inner_2"]]
+
+
 def test_phase_flags_are_mutually_exclusive():
     parser = build_parser()
 
@@ -301,18 +362,12 @@ def test_phase_flags_are_mutually_exclusive():
         parser.parse_args(["--stage1-only", "--stage2-only"])
 
 
-def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path):
+def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path, monkeypatch):
     raw, _config = _inputs(tmp_path, components=())
     raw["run"]["mode"] = "stage2"
     raw["stage2"] = {
-        "command": [
-            sys.executable,
-            "-c",
-            (
-                "import os; from pathlib import Path; "
-                "Path(os.environ['OCI_STAGE2_OUTPUT'], 'result.txt').write_text('done')"
-            ),
-        ]
+        "endpoint": "http://stage2.test/v1",
+        "model": "test-model",
     }
     config = compile_config(raw, config_dir=tmp_path)
     handoff = config.output_dir / "handoff" / "evidence.jsonl"
@@ -321,6 +376,16 @@ def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path):
     (handoff.parent / "complete.json").write_text("{}", encoding="utf-8")
     workflow = ResearchAllEvidenceStage1(config)
 
+    calls = []
+
+    def run_stage2(*, output_dir, **kwargs):
+        calls.append(kwargs)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "result.txt").write_text("done", encoding="utf-8")
+        return {"artifacts": [str(output_dir / "result.txt")]}
+
+    monkeypatch.setattr(stage1_workflow, "run_plain_handoff_stage2", run_stage2)
+
     first = workflow.run()
     assert first["mode"] == "stage2"
     assert (config.output_dir / "stage2" / "result.txt").read_text() == "done"
@@ -328,13 +393,27 @@ def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path):
 
     second = workflow.run()
     assert second["components"]["stage2"]["status"] == "skipped"
+    assert len(calls) == 1
 
 
-def test_stage2_command_makes_full_run_the_default(tmp_path):
+def test_stage2_endpoint_makes_full_run_the_default(tmp_path):
     raw, _config = _inputs(tmp_path)
-    raw["stage2"] = {"command": ["stage2-program", "--handoff", "{handoff}"]}
+    raw["stage2"] = {
+        "endpoint": "http://stage2.test/v1",
+        "model": "test-model",
+    }
 
     config = compile_config(raw, config_dir=tmp_path)
 
     assert config.mode == "full"
     assert config.components == (*COMPONENT_ORDER, "stage2")
+    assert config.stage2 is not None
+    assert config.stage2.endpoint == "http://stage2.test/v1"
+
+
+def test_old_stage2_command_is_rejected_instead_of_silently_ignored(tmp_path):
+    raw, _config = _inputs(tmp_path)
+    raw["stage2"] = {"command": ["old-bundle-stage2"]}
+
+    with pytest.raises(ValueError, match="stage2.command is not used"):
+        compile_config(raw, config_dir=tmp_path)

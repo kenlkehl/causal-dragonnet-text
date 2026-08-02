@@ -26,8 +26,8 @@
 5. If the process stops, run step 3 again. Completed components are skipped.
 
 Use `--stage1-only` to stop at the handoff or `--stage2-only` to consume an
-existing handoff. A nonempty `stage2.command` in the config makes an unflagged
-invocation run both phases.
+existing handoff. Setting both `stage2.endpoint` and `stage2.model` in the
+config makes an unflagged invocation run both phases.
 
 The Stage 2 input is always:
 
@@ -36,5 +36,5 @@ The Stage 2 input is always:
 ```
 
 See the [complete workflow guide](production_all_evidence_end_to_end.md) for
-the config schema, Stage 2 command contract, output layout, direct CLI
+the config schema, Stage 2 endpoint contract, output layout, direct CLI
 arguments, and component reruns.

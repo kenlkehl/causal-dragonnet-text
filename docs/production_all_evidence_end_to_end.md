@@ -8,9 +8,9 @@ uv run python scripts/run_all_evidence.py \
 ```
 
 It reads one cohort and writes everything to one output directory. With no
-Stage 2 command configured it runs Stage 1 through the plain handoff. With a
-Stage 2 command it runs both phases. Interruption and resume are automatic:
-run the same command again.
+Stage 2 endpoint configured it runs Stage 1 through the plain handoff. With an
+endpoint and model it also interprets that handoff into fold-scoped feature
+definitions. Interruption and resume are automatic: run the same command again.
 
 The older `run_production_all_evidence_workflow.py` control plane is retained
 for old runs, but it is not required by this workflow. This orchestration has
@@ -47,7 +47,8 @@ and edit it. It keeps the settings a researcher normally changes in one place:
     "embeddings": "/models/qwen3-embedding-8b"
   },
   "stage2": {
-    "command": []
+    "endpoint": "",
+    "model": ""
   },
   "run": {
     "devices": ["cuda:0", "cuda:1"],
@@ -76,33 +77,26 @@ environment.
 
 ## Full, Stage-1-only, and Stage-2-only runs
 
-`stage2.command` is a list of arguments for the study's Stage 2 entry point.
-It is executed directly, without a shell. The following placeholders are
-expanded in any argument:
-
-- `{dataset}`: configured input dataset;
-- `{output_dir}`: the whole workflow output;
-- `{handoff}`: `handoff/evidence.jsonl`;
-- `{handoff_dir}`: directory containing the combined and per-family handoffs;
-- `{stage2_output}`: the visible `stage2/` output directory.
-
-For example:
+Stage 2 reads `handoff/evidence.jsonl`, interprets architecture-specific
+evidence through one OpenAI-compatible endpoint, and consolidates candidate
+concepts separately within each outer fold. It is enabled by specifying both
+`stage2.endpoint` and `stage2.model`. For example:
 
 ```json
 {
   "stage2": {
-    "command": [
-      "uv", "run", "python", "/study/run_stage2.py",
-      "--dataset", "{dataset}",
-      "--handoff", "{handoff}",
-      "--output-dir", "{stage2_output}"
-    ],
-    "working_dir": "/study"
+    "endpoint": "http://127.0.0.1:8000/v1",
+    "model": "Qwen/Qwen3-32B",
+    "workers": 8,
+    "max_tokens": 4096
   }
 }
 ```
 
-A nonempty command makes the default mode `full`. The modes can always be made
+The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
+operational controls include `request_timeout`, `max_prompt_chars`,
+`max_candidates_per_fold`, `temperature`, and `enable_thinking`. A configured
+endpoint and model make the default mode `full`. The modes can always be made
 explicit:
 
 ```bash
@@ -118,9 +112,8 @@ uv run python scripts/run_all_evidence.py \
 ```
 
 The same choice can be stored as `run.mode: "full"`, `"stage1"`, or
-`"stage2"`. `--stage1-only` and `--stage2-only` override it. Stage 2 also
-receives the five paths above as `OCI_DATASET`, `OCI_RUN_OUTPUT`,
-`OCI_STAGE1_HANDOFF`, `OCI_STAGE1_HANDOFF_DIR`, and `OCI_STAGE2_OUTPUT`.
+`"stage2"`. `--stage1-only` and `--stage2-only` override it. Endpoint and model
+values can also be supplied as `--stage2-endpoint` and `--stage2-model`.
 
 ## Arguments instead of a config
 
@@ -154,6 +147,35 @@ uv run python scripts/run_all_evidence.py \
 ```
 
 Command-line values override the config file.
+
+## Parallel execution
+
+Top-level components run in order. The embedding cache must exist before its
+consumers run, and TF-IDF writes the shared outer and inner split definitions
+used by the other evidence families. Within those boundaries, the runner uses
+the available CPUs and GPUs as follows.
+
+| Component | Unit of parallel work | Concurrency control |
+|---|---|---|
+| `embedding_cache` | A contiguous shard of the complete chunk corpus | One encoder worker per entry in `run.devices` when multiple CUDA devices are configured |
+| `tfidf` | An outer/full or exact-inner context | CPU context workers, bounded by `run.workers` and the number of contexts |
+| `text_models` | An outer/full or exact-inner context | One fixed process lane per configured CUDA device; CPU-only runs use at most `run.workers` lanes |
+| `neural_queries` | An outer/full or exact-inner context | One fixed process lane per configured CUDA device; CPU-only runs use at most `run.workers` lanes |
+| `handoff` | None | The completed JSONL files are combined serially |
+| `stage2` | Interpretation batches within the current outer fold | Concurrent endpoint requests bounded by `stage2.workers`; outer folds and within-fold consolidation remain ordered |
+
+A fixed CUDA lane processes its assigned contexts serially on one GPU. This
+provides device affinity and prevents a process queue from placing two
+simultaneous contexts on the same GPU. For the standard five outer folds and
+five inner folds, the 30 contexts are distributed across eight GPUs as
+`4, 4, 4, 4, 4, 4, 3, 3`. Each neural-query context performs its inner-fold
+fits, final query-bank fits, and evidence retrieval on its assigned device.
+Thus the principal neural-query parallelism is across independent contexts.
+
+The context directories remain the unit of recovery. Each lane writes the
+context's `complete.json` immediately after its artifacts are durable and
+before proceeding to its next context. Rerunning the command redistributes only
+the unfinished contexts among the available lanes.
 
 ## Output and resume
 
@@ -198,8 +220,15 @@ my_stage1_run/
     index.json
     complete.json
   stage2/
-    run.json
-    ...study Stage 2 outputs...
+    config.json
+    outer_001/
+      input_packets.jsonl
+      interpretations/...
+      interpreted_candidates.json
+      feature_definitions.json
+      complete.json
+    features_by_outer_fold.jsonl
+    summary.json
     complete.json
 ```
 
@@ -225,9 +254,9 @@ Completion has one intentionally simple rule:
   directories.
 
 An interrupted component's partial files are left in place. There is no
-`--resume` flag. Rerun the same command. Stage 2 is reinvoked in the same
-`stage2/` directory, so its command should use that directory for its own
-granular checkpoints; the workflow adds only the final top-level marker.
+`--resume` flag. Rerun the same command. Stage 2 skips completed outer-fold and
+interpretation-batch directories and writes the final top-level marker only
+after every fold has completed.
 
 To intentionally rerun one component, use:
 
@@ -263,8 +292,8 @@ affected component.
 - `neural_queries` fits and saves each outer/full or exact-inner context
   independently.
 - `handoff` gathers the completed evidence into the stable Stage 2 input path.
-- `stage2` invokes the configured Stage 2 command against that handoff and
-  marks it complete only after a zero exit status.
+- `stage2` interprets the plain handoff through the configured endpoint and
+  writes fold-scoped candidate and feature definitions.
 
 The scientific model implementations are reused; this change removes their
 production orchestration layer rather than substituting new estimators.

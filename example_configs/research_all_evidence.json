@@ -21,7 +21,10 @@
     "embeddings": "Qwen/Qwen3-Embedding-8B"
   },
   "stage2": {
-    "command": []
+    "endpoint": "",
+    "model": "",
+    "api_key": "EMPTY",
+    "workers": 4
   },
   "run": {
     "devices": [

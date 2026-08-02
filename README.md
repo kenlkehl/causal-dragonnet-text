@@ -61,8 +61,10 @@ clinical concepts, assigns causal roles from the types of evidence that support
 each concept, defines how each variable will be measured in a complete patient
 record, extracts those values, and fits the study's final causal estimator.
 Stage 2 may be human-led, language-model-assisted, or a combination of the two.
-Because those decisions depend on the study question and governance setting,
-the simplified runner treats Stage 2 as a configured study-specific command.
+The simplified runner includes a plain-handoff interpreter that sends
+fold-scoped evidence to one configured OpenAI-compatible endpoint and saves the
+resulting feature definitions as ordinary JSON. Investigators remain
+responsible for review, extraction policy, and final causal estimation.
 
 ```mermaid
 flowchart LR
@@ -400,7 +402,8 @@ the following form:
     "embeddings": "Qwen/Qwen3-Embedding-8B"
   },
   "stage2": {
-    "command": []
+    "endpoint": "",
+    "model": ""
   },
   "run": {
     "mode": "stage1",
@@ -467,37 +470,61 @@ An optional argument selects another output directory:
 ./run_one_conf_one_mod_cloud_8gpu.sh /persistent/results/nsclc_example
 ```
 
+### Parallel execution
+
+The workflow runs its top-level components in order because later components
+reuse artifacts or split definitions produced by earlier ones. Parallelism is
+applied within the computationally expensive components. The embedding cache
+divides the ordered chunk corpus among the configured GPUs. TF-IDF discovery
+uses CPU workers across fold contexts. The text-model and neural-query
+components treat each outer/full or exact-inner discovery context as an
+independent job.
+
+For CUDA runs, the runner creates one fixed process lane per configured GPU and
+assigns whole contexts to those lanes. A lane remains attached to the same GPU,
+which prevents two contexts from being scheduled onto one device merely because
+another device finished early. With five outer folds and five inner folds there
+are 30 contexts. The eight-GPU launcher therefore runs as many as eight contexts
+at once, assigning four contexts to each of six GPUs and three contexts to each
+of the remaining two GPUs. A neural-query context uses its assigned GPU for its
+inner-fold fits, final query banks, and evidence retrieval; parallelism occurs
+across contexts rather than by oversubscribing the device within a context.
+
+The `run.devices` setting determines GPU concurrency. `run.workers` bounds
+CPU-only context concurrency and supplies the CPU budget used by the TF-IDF
+component; it does not create additional jobs on a CUDA device. Stage 2 uses
+its own `stage2.workers` setting for concurrent interpretation requests. Every
+Stage 1 context writes its own `complete.json` before its lane advances, so the
+same scheduling remains resumable after interruption.
+
 ### Stage-specific execution
 
-An empty `stage2.command` means that the workflow stops after Stage 1. This is
-the default because the repository cannot infer a study's extraction policy,
-causal estimator, or review procedure.
+Empty Stage 2 endpoint and model settings mean that the workflow stops after
+Stage 1. This remains the default because feature definitions require review in
+the context of the study before extraction and causal estimation.
 
 ```bash
 uv run python scripts/run_all_evidence.py --config run.json --stage1-only
 ```
 
-When a Stage 2 program has been configured, the same entry point can run only
-that program against an existing handoff:
+When a Stage 2 endpoint and model have been configured, the same entry point can
+run only the plain-handoff interpreter against an existing handoff:
 
 ```bash
 uv run python scripts/run_all_evidence.py --config run.json --stage2-only
 ```
 
-A `stage2.command` is an argument list rather than a shell expression. It can
-use `{dataset}`, `{output_dir}`, `{handoff}`, `{handoff_dir}`, and
-`{stage2_output}` placeholders. For example:
+A configured endpoint makes the unflagged default a full Stage 1 and Stage 2
+run. The API key may be stored in `stage2.api_key` or supplied through
+`OCI_STAGE2_API_KEY`. For example:
 
 ```json
 {
   "stage2": {
-    "command": [
-      "uv", "run", "python", "/study/run_stage2.py",
-      "--dataset", "{dataset}",
-      "--handoff", "{handoff}",
-      "--output-dir", "{stage2_output}"
-    ],
-    "working_dir": "/study"
+    "endpoint": "http://127.0.0.1:8000/v1",
+    "model": "Qwen/Qwen3-32B",
+    "workers": 8,
+    "max_tokens": 4096
   },
   "run": {
     "mode": "full"
@@ -505,9 +532,9 @@ use `{dataset}`, `{output_dir}`, `{handoff}`, `{handoff_dir}`, and
 }
 ```
 
-The command also receives the same paths through the `OCI_DATASET`,
-`OCI_RUN_OUTPUT`, `OCI_STAGE1_HANDOFF`, `OCI_STAGE1_HANDOFF_DIR`, and
-`OCI_STAGE2_OUTPUT` environment variables.
+The interpreter preserves evidence-family and outer-fold boundaries, performs
+concurrent architecture-level interpretation requests, consolidates candidates
+within each outer fold, and writes resumable outputs under `stage2/`.
 
 ### Output and interruption recovery
 
@@ -550,7 +577,10 @@ nsclc_all_evidence/
     index.json
     complete.json
   stage2/
-    run.json
+    config.json
+    outer_001/...
+    features_by_outer_fold.jsonl
+    summary.json
     complete.json
 ```
 

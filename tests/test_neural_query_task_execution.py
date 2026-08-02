@@ -286,10 +286,16 @@ def _write_embedding_cache(
     metadata = {
         "num_samples": len(texts),
         "hidden_size": embeddings.shape[1],
+        "chunk_counts": [1] * len(texts),
         "chunk_size_words": 100,
         "chunk_overlap_words": 0,
         "max_chunks": 10,
         "chunk_selection": "last",
+        "normalize_embeddings": False,
+        "max_seq_length": None,
+        "chunk_cap_nonbinding": True,
+        "semantic_truncation_allowed": False,
+        "tokenizer_truncation_allowed": False,
     }
     (root / "metadata.json").write_text(
         json.dumps(metadata, sort_keys=True) + "\n",
@@ -304,7 +310,7 @@ def _write_embedding_cache(
     )
 
 
-def test_authenticated_mmap_reference_reopens_rows_and_refuses_peer_access(
+def test_authenticated_cache_reference_reopens_only_authorized_rows(
     tmp_path: Path,
 ) -> None:
     texts = (
@@ -327,7 +333,9 @@ def test_authenticated_mmap_reference_reopens_rows_and_refuses_peer_access(
         row_ids=(1, 0),
         texts=(texts[1], texts[0]),
     )
-    assert isinstance(reopened._embeddings, np.memmap)
+    assert isinstance(reopened._embeddings, np.ndarray)
+    assert not isinstance(reopened._embeddings, np.memmap)
+    assert reopened._embeddings.shape == (2, 2)
     np.testing.assert_array_equal(
         reopened.chunk_matrix(1),
         np.asarray([[0.0, 1.0]], dtype=np.float32),

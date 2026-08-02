@@ -17,9 +17,7 @@ import copy
 import json
 import logging
 import os
-import shlex
 import shutil
-import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -30,6 +28,11 @@ import numpy as np
 import pandas as pd
 
 from ..config import ExperimentConfig
+from .plain_handoff_stage2 import (
+    PlainHandoffStage2Config,
+    plain_stage2_config_from_mapping,
+    run_plain_handoff_stage2,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -207,8 +210,7 @@ class ResearchStage1Config:
     workers: int
     components: tuple[str, ...]
     mode: str
-    stage2_command: tuple[str, ...]
-    stage2_working_dir: Path | None
+    stage2: PlainHandoffStage2Config | None
     stage1_template: Path
     neural_query_template: Path
     htr_model: str
@@ -248,20 +250,15 @@ def compile_config(
     if unknown_components:
         raise ValueError(f"unknown Stage 1 components: {unknown_components}")
 
-    stage2 = dict(raw.get("stage2") or {})
-    raw_stage2_command = stage2.get("command") or ()
-    if isinstance(raw_stage2_command, str):
-        raw_stage2_command = shlex.split(raw_stage2_command)
-    elif isinstance(raw_stage2_command, (bytes, Mapping)) or not isinstance(
-        raw_stage2_command, Sequence
-    ):
-        raise ValueError("stage2.command must be a string or a list of arguments")
-    stage2_command = tuple(str(value) for value in raw_stage2_command)
-    mode = str(run.get("mode") or ("full" if stage2_command else "stage1")).lower()
+    stage2 = plain_stage2_config_from_mapping(
+        dict(raw.get("stage2") or {}),
+        default_workers=max(1, int(run.get("workers", 1))),
+    )
+    mode = str(run.get("mode") or ("full" if stage2 is not None else "stage1")).lower()
     if mode not in {"full", "stage1", "stage2"}:
         raise ValueError("run.mode must be 'full', 'stage1', or 'stage2'")
-    if mode in {"full", "stage2"} and not stage2_command:
-        raise ValueError(f"run.mode={mode!r} requires stage2.command")
+    if mode in {"full", "stage2"} and stage2 is None:
+        raise ValueError(f"run.mode={mode!r} requires stage2.endpoint and stage2.model")
     selected_components = tuple(str(value) for value in raw_components)
     if mode == "full":
         if "handoff" not in selected_components:
@@ -269,13 +266,6 @@ def compile_config(
         selected_components = (*selected_components, "stage2")
     elif mode == "stage2":
         selected_components = ("stage2",)
-
-    raw_stage2_working_dir = stage2.get("working_dir")
-    stage2_working_dir = (
-        None
-        if raw_stage2_working_dir in (None, "")
-        else Path(_resolve_relative_path(raw_stage2_working_dir, base=config_dir))
-    )
 
     stage1_template = raw.get("stage1_template", DEFAULT_STAGE1_TEMPLATE)
     neural_template = raw.get("neural_query_template", DEFAULT_NEURAL_QUERY_TEMPLATE)
@@ -300,8 +290,7 @@ def compile_config(
         workers=max(1, int(run.get("workers", 1))),
         components=selected_components,
         mode=mode,
-        stage2_command=stage2_command,
-        stage2_working_dir=stage2_working_dir,
+        stage2=stage2,
         stage1_template=Path(_resolve_relative_path(stage1_template, base=config_dir)),
         neural_query_template=Path(_resolve_relative_path(neural_template, base=config_dir)),
         htr_model=_resolve_model_locator(
@@ -389,6 +378,66 @@ def _cuda_ids(devices: Sequence[str]) -> list[int]:
     return output
 
 
+def _context_execution_lanes(
+    pending: Sequence[Mapping[str, Any]],
+    *,
+    devices: Sequence[str],
+    workers: int,
+) -> list[tuple[str, list[Mapping[str, Any]]]]:
+    """Assign whole discovery contexts to fixed device lanes.
+
+    A CUDA lane owns one GPU for the duration of its job.  This avoids two
+    process-pool workers landing on the same GPU when contexts take different
+    amounts of time.  CPU-only runs use ``workers`` identical CPU lanes.
+    """
+
+    if not pending:
+        return []
+    normalized = tuple(dict.fromkeys(str(device).strip() for device in devices))
+    if not normalized or any(not device for device in normalized):
+        raise ValueError("context execution requires at least one named device")
+    cuda_devices = tuple(device for device in normalized if device.startswith("cuda:"))
+    execution_devices = cuda_devices or normalized
+    if cuda_devices:
+        parallelism = min(len(cuda_devices), len(pending))
+    else:
+        parallelism = min(max(1, int(workers)), len(pending))
+
+    lanes: list[tuple[str, list[Mapping[str, Any]]]] = [
+        (execution_devices[index % len(execution_devices)], [])
+        for index in range(parallelism)
+    ]
+
+    def context_weight(spec: Mapping[str, Any]) -> int:
+        rows = spec.get("train_idx")
+        try:
+            return max(1, len(rows))
+        except TypeError:
+            return 1
+
+    weighted_specs = sorted(
+        enumerate(pending),
+        key=lambda item: (
+            -context_weight(item[1]),
+            item[0],
+        ),
+    )
+    lane_loads = [0] * parallelism
+    for _original_index, spec in weighted_specs:
+        weight = context_weight(spec)
+        lane_index = min(
+            range(parallelism),
+            key=lambda index: (
+                lane_loads[index],
+                len(lanes[index][1]),
+                index,
+            ),
+        )
+        lanes[lane_index][1].append(spec)
+        lane_loads[lane_index] += weight
+    return lanes
+
+
 def _embedding_cache_component(
     context: Stage1RunContext,
     component_dir: Path,
@@ -424,35 +473,34 @@ def _text_models_component(
         else:
             pending.append(spec)
 
-    devices = tuple(context.config.devices)
-    if any(device.startswith("cuda:") for device in devices):
-        parallelism = min(len(devices), len(pending))
-    else:
-        parallelism = min(context.config.workers, len(pending))
-    parallelism = max(1, parallelism)
+    lanes = _context_execution_lanes(
+        pending,
+        devices=context.config.devices,
+        workers=context.config.workers,
+    )
     if pending:
         LOGGER.info(
-            "run text_models contexts=%s parallelism=%s devices=%s",
+            "run text_models contexts=%s parallelism=%s lanes=%s",
             len(pending),
-            parallelism,
-            devices,
+            len(lanes),
+            [(device, len(specs)) for device, specs in lanes],
         )
-        fitted = Parallel(
-            n_jobs=parallelism,
-            backend="loky" if parallelism > 1 else "sequential",
+        fitted_lanes = Parallel(
+            n_jobs=len(lanes),
+            backend="loky" if len(lanes) > 1 else "sequential",
             batch_size=1,
             pre_dispatch="all",
         )(
-            delayed(_run_one_text_model_context)(
+            delayed(_run_text_model_context_lane)(
                 dataset=context.dataset,
                 applied_config=context.applied_config,
-                spec=spec,
-                context_dir=component_dir / str(spec["scope_id"]),
-                device=devices[index % len(devices)],
+                specs=specs,
+                component_dir=component_dir,
+                device=device,
             )
-            for index, spec in enumerate(pending)
+            for device, specs in lanes
         )
-        completed.extend(fitted)
+        completed.extend(row for lane in fitted_lanes for row in lane)
 
     rows = completed
     rows.sort(
@@ -467,6 +515,32 @@ def _text_models_component(
         "artifacts": [str(evidence_path)],
         "contexts": len(rows),
     }
+
+
+def _run_text_model_context_lane(
+    *,
+    dataset: pd.DataFrame,
+    applied_config: Any,
+    specs: Sequence[Mapping[str, Any]],
+    component_dir: Path,
+    device: str,
+) -> list[dict[str, Any]]:
+    """Run a serial lane of contexts on one fixed device."""
+
+    if device.startswith("cuda:"):
+        import torch
+
+        torch.cuda.set_device(torch.device(device))
+    return [
+        _run_one_text_model_context(
+            dataset=dataset,
+            applied_config=applied_config,
+            spec=spec,
+            context_dir=component_dir / str(spec["scope_id"]),
+            device=device,
+        )
+        for spec in specs
+    ]
 
 
 def _run_one_text_model_context(
@@ -642,116 +716,199 @@ def _neural_queries_component(
     context: Stage1RunContext,
     component_dir: Path,
 ) -> Mapping[str, Any]:
+    from joblib import Parallel, delayed
+
+    completed: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for spec in _stage1_context_specs(context):
+        fold_dir = component_dir / str(spec["scope_id"])
+        evidence_path = fold_dir / "evidence.json"
+        if (fold_dir / "complete.json").is_file():
+            LOGGER.info("skip neural_queries context=%s", spec["scope_id"])
+            completed.append(json.loads(evidence_path.read_text(encoding="utf-8")))
+        else:
+            pending.append(spec)
+
+    lanes = _context_execution_lanes(
+        pending,
+        devices=context.config.devices,
+        workers=context.config.workers,
+    )
+    if pending:
+        LOGGER.info(
+            "run neural_queries contexts=%s parallelism=%s lanes=%s",
+            len(pending),
+            len(lanes),
+            [(device, len(specs)) for device, specs in lanes],
+        )
+        fitted_lanes = Parallel(
+            n_jobs=len(lanes),
+            backend="loky" if len(lanes) > 1 else "sequential",
+            batch_size=1,
+            pre_dispatch="all",
+        )(
+            delayed(_run_neural_query_context_lane)(
+                dataset=context.dataset,
+                config=context.config,
+                applied_config=context.applied_config,
+                neural_query_config=context.neural_query_config,
+                specs=specs,
+                component_dir=component_dir,
+                device=device,
+            )
+            for device, specs in lanes
+        )
+        completed.extend(row for lane in fitted_lanes for row in lane)
+
+    aggregate_path = component_dir / "evidence.jsonl"
+    completed.sort(
+        key=lambda row: (
+            int(row["outer_fold"]),
+            int(row.get("inner_fold") or 0),
+        )
+    )
+    _write_jsonl(aggregate_path, completed)
+    return {"artifacts": [str(aggregate_path)], "contexts": len(completed)}
+
+
+def _run_neural_query_context_lane(
+    *,
+    dataset: pd.DataFrame,
+    config: ResearchStage1Config,
+    applied_config: Any,
+    neural_query_config: Any,
+    specs: Sequence[Mapping[str, Any]],
+    component_dir: Path,
+    device: str,
+) -> list[dict[str, Any]]:
+    """Open the shared embedding cache once and run one fixed-device lane."""
+
     from .embedding_contrast_discovery import EmbeddingContrastEvidenceGenerator
+
+    if device.startswith("cuda:"):
+        import torch
+
+        torch.cuda.set_device(torch.device(device))
+    generator = EmbeddingContrastEvidenceGenerator(
+        config=applied_config,
+        output_dir=config.output_dir / "components" / "embedding_cache",
+        precompute_devices=(device,),
+    )
+    generator.prepare(dataset)
+    return [
+        _run_one_neural_query_context(
+            dataset=dataset,
+            config=config,
+            applied_config=applied_config,
+            neural_query_config=neural_query_config,
+            generator=generator,
+            spec=spec,
+            fold_dir=component_dir / str(spec["scope_id"]),
+            device=device,
+        )
+        for spec in specs
+    ]
+
+
+def _run_one_neural_query_context(
+    *,
+    dataset: pd.DataFrame,
+    config: ResearchStage1Config,
+    applied_config: Any,
+    neural_query_config: Any,
+    generator: Any,
+    spec: Mapping[str, Any],
+    fold_dir: Path,
+    device: str,
+) -> dict[str, Any]:
+    """Fit and immediately publish one independently resumable context."""
+
     from .neural_query_agentic_forest import build_query_evidence
     from .neural_query_context_backend import _fit_context_query_discovery
 
-    generator = EmbeddingContrastEvidenceGenerator(
-        config=context.applied_config,
-        output_dir=context.component_dir("embedding_cache"),
-        precompute_devices=context.config.devices,
+    outer_fold = int(spec["outer_fold"])
+    inner_fold = spec.get("inner_fold")
+    fit_rows = tuple(int(value) for value in spec["train_idx"])
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    fit_frame = dataset.iloc[list(fit_rows)]
+    texts = tuple(
+        str(value or "")
+        for value in fit_frame[config.text_column].fillna("").tolist()
     )
-    generator.prepare(context.dataset)
-    all_chunk_texts = generator.chunk_texts()
-    mm_config = context.applied_config.architecture.multi_model_forest
-    nuisance_config = mm_config.tfidf_topic.nuisance_stack_scientific
-    nuisance_folds = int(mm_config.nuisance_folds)
-    aggregate_rows: list[dict[str, Any]] = []
+    treatment = fit_frame[config.treatment_column].to_numpy(dtype=float)
+    outcome = fit_frame[config.outcome_column].to_numpy(dtype=float)
+    chunks = generator.chunk_matrices(fit_rows)
+    fit_chunk_texts = generator.chunk_texts(fit_rows)
+    # build_query_evidence indexes text by the original dataset row number.
+    # Populate only the fit rows instead of copying the entire text cache for
+    # every context in every worker process.
+    all_chunk_texts: list[Sequence[str]] = [()] * len(dataset)
+    for row_id, chunk_texts in zip(fit_rows, fit_chunk_texts):
+        all_chunk_texts[row_id] = chunk_texts
 
-    for spec in _stage1_context_specs(context):
-        outer_fold = int(spec["outer_fold"])
-        inner_fold = spec.get("inner_fold")
-        fit_rows = tuple(int(value) for value in spec["train_idx"])
-        fold_dir = component_dir / str(spec["scope_id"])
-        fold_complete = fold_dir / "complete.json"
-        evidence_path = fold_dir / "evidence.json"
-        if fold_complete.is_file():
-            LOGGER.info("skip neural_queries context=%s", spec["scope_id"])
-            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-            aggregate_rows.append(evidence)
-            continue
-
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        fit_frame = context.dataset.iloc[list(fit_rows)]
-        texts = tuple(
-            str(value or "") for value in fit_frame[context.config.text_column].fillna("").tolist()
-        )
-        treatment = fit_frame[context.config.treatment_column].to_numpy(dtype=float)
-        outcome = fit_frame[context.config.outcome_column].to_numpy(dtype=float)
-        chunks = generator.chunk_matrices(fit_rows)
-        discovery = _fit_context_query_discovery(
-            row_ids=fit_rows,
-            chunks=chunks,
-            texts=texts,
-            treatment=treatment,
-            outcome=outcome,
-            outcome_binary=context.config.outcome_type == "binary",
-            nuisance_views=mm_config.bow_views,
-            nuisance_stack_config=nuisance_config,
-            query_config=context.neural_query_config,
-            nuisance_folds=nuisance_folds,
-            devices=context.config.devices,
-            seed=context.config.seed + 10_000 * int(spec["fold_key"]),
-        )
-
-        evidence_rows: list[dict[str, Any]] = []
-        arrays: dict[str, np.ndarray] = {"fit_row_ids": np.asarray(fit_rows, dtype=np.int64)}
-        query_records: dict[str, Any] = {}
-        for bank, bank_result in discovery["banks"].items():
-            queries = np.asarray(bank_result["queries"], dtype=np.float32)
-            arrays[f"{bank}_queries"] = queries
-            arrays[f"{bank}_train_activations"] = np.asarray(
-                bank_result["train_activations"],
-                dtype=np.float32,
-            )
-            query_records[bank] = copy.deepcopy(bank_result["records"])
-            evidence_rows.extend(
-                build_query_evidence(
-                    bank=bank,
-                    queries=queries,
-                    query_records=bank_result["records"],
-                    row_ids=fit_rows,
-                    chunk_matrices=chunks,
-                    all_chunk_texts=all_chunk_texts,
-                    config=context.neural_query_config,
-                    device=context.config.devices[0],
-                    seed=context.config.seed + 20_000 * int(spec["fold_key"]),
-                )
-            )
-
-        np.savez_compressed(fold_dir / "queries.npz", **arrays)
-        _write_json(fold_dir / "query_records.json", query_records)
-        evidence = {
-            "outer_fold": outer_fold,
-            "inner_fold": inner_fold,
-            "scope": str(spec["scope"]),
-            "fit_row_ids": list(fit_rows),
-            "heldout_row_ids": [int(value) for value in spec["heldout_idx"]],
-            "evidence": evidence_rows,
-        }
-        _write_json(evidence_path, evidence)
-        _write_json(
-            fold_complete,
-            {
-                "status": "complete",
-                "completed_at": _now(),
-                "artifacts": ["evidence.json", "query_records.json", "queries.npz"],
-            },
-        )
-        aggregate_rows.append(evidence)
-
-    aggregate_path = component_dir / "evidence.jsonl"
-    _write_jsonl(
-        aggregate_path,
-        sorted(
-            aggregate_rows,
-            key=lambda row: (
-                int(row["outer_fold"]),
-                int(row.get("inner_fold") or 0),
-            ),
-        ),
+    mm_config = applied_config.architecture.multi_model_forest
+    discovery = _fit_context_query_discovery(
+        row_ids=fit_rows,
+        chunks=chunks,
+        texts=texts,
+        treatment=treatment,
+        outcome=outcome,
+        outcome_binary=config.outcome_type == "binary",
+        nuisance_views=mm_config.bow_views,
+        nuisance_stack_config=mm_config.tfidf_topic.nuisance_stack_scientific,
+        query_config=neural_query_config,
+        nuisance_folds=int(mm_config.nuisance_folds),
+        devices=(device,),
+        seed=config.seed + 10_000 * int(spec["fold_key"]),
     )
-    return {"artifacts": [str(aggregate_path)], "contexts": len(aggregate_rows)}
+
+    evidence_rows: list[dict[str, Any]] = []
+    arrays: dict[str, np.ndarray] = {
+        "fit_row_ids": np.asarray(fit_rows, dtype=np.int64)
+    }
+    query_records: dict[str, Any] = {}
+    for bank, bank_result in discovery["banks"].items():
+        queries = np.asarray(bank_result["queries"], dtype=np.float32)
+        arrays[f"{bank}_queries"] = queries
+        arrays[f"{bank}_train_activations"] = np.asarray(
+            bank_result["train_activations"],
+            dtype=np.float32,
+        )
+        query_records[bank] = copy.deepcopy(bank_result["records"])
+        evidence_rows.extend(
+            build_query_evidence(
+                bank=bank,
+                queries=queries,
+                query_records=bank_result["records"],
+                row_ids=fit_rows,
+                chunk_matrices=chunks,
+                all_chunk_texts=all_chunk_texts,
+                config=neural_query_config,
+                device=device,
+                seed=config.seed + 20_000 * int(spec["fold_key"]),
+            )
+        )
+
+    np.savez_compressed(fold_dir / "queries.npz", **arrays)
+    _write_json(fold_dir / "query_records.json", query_records)
+    evidence = {
+        "outer_fold": outer_fold,
+        "inner_fold": inner_fold,
+        "scope": str(spec["scope"]),
+        "fit_row_ids": list(fit_rows),
+        "heldout_row_ids": [int(value) for value in spec["heldout_idx"]],
+        "evidence": evidence_rows,
+    }
+    _write_json(fold_dir / "evidence.json", evidence)
+    _write_json(
+        fold_dir / "complete.json",
+        {
+            "status": "complete",
+            "completed_at": _now(),
+            "artifacts": ["evidence.json", "query_records.json", "queries.npz"],
+        },
+    )
+    return evidence
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -822,128 +979,24 @@ def _handoff_component(
     }
 
 
-def _expand_stage2_command(
-    command: Sequence[str],
-    *,
-    config: ResearchStage1Config,
-    component_dir: Path,
-) -> list[str]:
-    replacements = {
-        "{dataset}": str(config.dataset),
-        "{output_dir}": str(config.output_dir),
-        "{handoff}": str(config.output_dir / "handoff" / "evidence.jsonl"),
-        "{handoff_dir}": str(config.output_dir / "handoff"),
-        "{stage2_output}": str(component_dir),
-    }
-    expanded: list[str] = []
-    for raw_token in command:
-        token = str(raw_token)
-        for placeholder, value in replacements.items():
-            token = token.replace(placeholder, value)
-        expanded.append(token)
-    return expanded
-
-
 def _stage2_component(
     context: Stage1RunContext,
     component_dir: Path,
 ) -> Mapping[str, Any]:
-    """Run the configured plain-handoff Stage 2 command in place.
-
-    Stage 2 remains scientifically independent of this small orchestrator. The
-    command receives ordinary paths, writes under ``stage2/``, and controls its
-    own granular resume behavior. This runner adds only the top completion
-    marker after a successful exit.
-    """
+    """Interpret the plain Stage 1 handoff and define fold-scoped features."""
 
     handoff_path = context.output_dir / "handoff" / "evidence.jsonl"
     handoff_complete = handoff_path.parent / "complete.json"
     if not handoff_path.is_file() or not handoff_complete.is_file():
         raise FileNotFoundError(f"Stage 2 requires the completed Stage 1 handoff: {handoff_path}")
-    if not context.config.stage2_command:
-        raise ValueError("Stage 2 requires stage2.command in the config or --stage2-command")
-    component_dir.mkdir(parents=True, exist_ok=True)
-    command = _expand_stage2_command(
-        context.config.stage2_command,
-        config=context.config,
-        component_dir=component_dir,
+    if context.config.stage2 is None:
+        raise ValueError("Stage 2 requires stage2.endpoint and stage2.model")
+    return run_plain_handoff_stage2(
+        handoff_path=handoff_path,
+        output_dir=component_dir,
+        clinical_question=context.config.clinical_question,
+        config=context.config.stage2,
     )
-    _write_json(
-        component_dir / "run.json",
-        {
-            "status": "running",
-            "started_at": _now(),
-            "command": _redact_command(command),
-            "working_dir": (
-                None
-                if context.config.stage2_working_dir is None
-                else str(context.config.stage2_working_dir)
-            ),
-        },
-    )
-    environment = dict(os.environ)
-    environment.update(
-        {
-            "OCI_DATASET": str(context.config.dataset),
-            "OCI_RUN_OUTPUT": str(context.output_dir),
-            "OCI_STAGE1_HANDOFF": str(handoff_path),
-            "OCI_STAGE1_HANDOFF_DIR": str(handoff_path.parent),
-            "OCI_STAGE2_OUTPUT": str(component_dir),
-        }
-    )
-    LOGGER.info("run Stage 2 command: %s", shlex.join(_redact_command(command)))
-    completed = subprocess.run(
-        command,
-        cwd=context.config.stage2_working_dir,
-        env=environment,
-        check=False,
-    )
-    if completed.returncode != 0:
-        _write_json(
-            component_dir / "run.json",
-            {
-                "status": "failed",
-                "finished_at": _now(),
-                "returncode": int(completed.returncode),
-                "command": _redact_command(command),
-            },
-        )
-        raise RuntimeError(f"Stage 2 command exited with status {completed.returncode}")
-    _write_json(
-        component_dir / "run.json",
-        {
-            "status": "complete",
-            "finished_at": _now(),
-            "returncode": 0,
-            "command": _redact_command(command),
-        },
-    )
-    return {"artifacts": [str(component_dir)], "returncode": 0}
-
-
-def _redact_command(command: Sequence[str]) -> list[str]:
-    """Redact values following common command-line secret flags."""
-
-    output: list[str] = []
-    redact_next = False
-    for raw_token in command:
-        token = str(raw_token)
-        if redact_next:
-            output.append("<redacted>")
-            redact_next = False
-            continue
-        lowered = token.lower()
-        if lowered in {"--api-key", "--token", "--access-token"}:
-            output.append(token)
-            redact_next = True
-        elif any(
-            lowered.startswith(f"{prefix}=")
-            for prefix in ("--api-key", "--token", "--access-token")
-        ):
-            output.append(token.split("=", 1)[0] + "=<redacted>")
-        else:
-            output.append(token)
-    return output
 
 
 DEFAULT_COMPONENT_RUNNERS: Mapping[str, ComponentRunner] = {
@@ -993,7 +1046,6 @@ class ResearchAllEvidenceStage1:
         applied_mapping = _load_stage1_template(self.config)
         neural_mapping = _load_neural_query_template(self.config)
         run_config = _redact_credentials(self.config.as_dict())
-        run_config["stage2_command"] = _redact_command(self.config.stage2_command)
         _write_json(self.config.output_dir / "run_config.json", run_config)
         _write_json(
             self.config.output_dir / "resolved_stage1_model_config.json",
@@ -1198,14 +1250,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip Stage 1 and run/resume Stage 2 from the saved handoff",
     )
-    parser.add_argument(
-        "--stage2-command",
-        help=(
-            "Stage 2 command; supports {dataset}, {output_dir}, {handoff}, "
-            "{handoff_dir}, and {stage2_output} placeholders"
-        ),
-    )
-    parser.add_argument("--stage2-working-dir", type=Path)
+    parser.add_argument("--stage2-endpoint", help="OpenAI-compatible Stage 2 base URL")
+    parser.add_argument("--stage2-model", help="model served by the Stage 2 endpoint")
+    parser.add_argument("--stage2-api-key", help="endpoint key; defaults to OCI_STAGE2_API_KEY")
     parser.add_argument(
         "--set",
         action="append",
@@ -1273,10 +1320,10 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
     elif args.stage2_only:
         run["mode"] = "stage2"
     stage2 = raw.setdefault("stage2", {})
-    if args.stage2_command is not None:
-        stage2["command"] = shlex.split(args.stage2_command)
-    if args.stage2_working_dir is not None:
-        stage2["working_dir"] = str(args.stage2_working_dir.expanduser().resolve())
+    for key in ("endpoint", "model", "api_key"):
+        value = getattr(args, f"stage2_{key}")
+        if value is not None:
+            stage2[key] = value
     models = raw.setdefault("models", {})
     if args.htr_model is not None:
         models["htr"] = args.htr_model
@@ -1326,7 +1373,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if component_dir.is_dir():
             markers = (
                 [component_dir / "complete.json"]
-                if name in {"handoff", "stage2"}
+                if name == "handoff"
                 else list(component_dir.rglob("complete.json"))
             )
             for marker in markers:

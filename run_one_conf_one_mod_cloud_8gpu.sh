@@ -48,6 +48,7 @@ echo "Dataset: ${dataset}"
 echo "Output:  ${output_dir}"
 echo "Progress: ${output_dir}/progress.json"
 echo "Log:      ${output_dir}/logs/workflow.log"
+echo "Parallel: one discovery-context lane per GPU (8 concurrent contexts)"
 
 export PYTHONUNBUFFERED=1
 
