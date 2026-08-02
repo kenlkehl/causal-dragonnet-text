@@ -1,6 +1,15 @@
-# All-evidence feature-discovery interfaces
+# Historical all-evidence feature-discovery interfaces
 
-Status: offline specification for the post-v24 discovery path.
+> **Historical reference.** This document describes the authenticated
+> production interface used by older runs. It is not the contract implemented
+> by `scripts/run_all_evidence.py`. New researcher runs use the ordinary JSONL
+> handoff, readable fold directories, training-fold extraction and review, and
+> cross-fitted estimation documented in
+> [`production_all_evidence_end_to_end.md`](production_all_evidence_end_to_end.md).
+> No bundle, digest, immutable cache, or authenticated envelope described below
+> is required by the plain workflow.
+
+Status: retained specification for the historical post-v24 production path.
 
 This document defines the scientific decisions shown to a language model. Split
 identities, hashes, cache keys, producer identities, row lineage, and transport

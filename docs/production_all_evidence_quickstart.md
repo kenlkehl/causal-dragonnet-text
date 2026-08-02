@@ -29,10 +29,40 @@ Use `--stage1-only` to stop at the handoff or `--stage2-only` to consume an
 existing handoff. Setting both `stage2.endpoint` and `stage2.model` in the
 config makes an unflagged invocation run both phases.
 
+Stage 2 does not stop at variable definitions. For each outer fold it extracts
+the proposed variables on training records, reviews their empirical behavior by
+inner validation, freezes the retained definitions, extracts the held-out
+records, and computes held-out nuisance predictions, AIPW scores, and treatment
+effect estimates. The common controls are:
+
+```json
+{
+  "stage2": {
+    "endpoint": "http://127.0.0.1:8000/v1",
+    "model": "Qwen/Qwen3-32B",
+    "workers": 8,
+    "extraction_batch_size": 12,
+    "max_review_rounds": 2,
+    "estimation_trees": 200
+  }
+}
+```
+
+Interpretation and extraction requests are concurrent up to `stage2.workers`.
+Each completed request is saved beneath the relevant outer-fold directory, so
+the same command resumes after interruption without repeating it.
+
 The Stage 2 input is always:
 
 ```text
 /path/to/output/handoff/evidence.jsonl
+```
+
+The final estimate and row-level cross-fitted results are:
+
+```text
+/path/to/output/stage2/causal_estimate.json
+/path/to/output/stage2/cross_fitted_predictions.csv
 ```
 
 See the [complete workflow guide](production_all_evidence_end_to_end.md) for

@@ -1,4 +1,4 @@
-"""A small, researcher-facing runner for all-evidence Stage 1.
+"""A small, researcher-facing runner for the all-evidence workflow.
 
 The production workflow in this repository grew a large control plane around
 the modeling code.  This module deliberately does not reproduce it.  A run is
@@ -983,7 +983,7 @@ def _stage2_component(
     context: Stage1RunContext,
     component_dir: Path,
 ) -> Mapping[str, Any]:
-    """Interpret the plain Stage 1 handoff and define fold-scoped features."""
+    """Extract, review, and estimate from the plain fold-scoped handoff."""
 
     handoff_path = context.output_dir / "handoff" / "evidence.jsonl"
     handoff_complete = handoff_path.parent / "complete.json"
@@ -996,6 +996,17 @@ def _stage2_component(
         output_dir=component_dir,
         clinical_question=context.config.clinical_question,
         config=context.config.stage2,
+        dataset=context.dataset,
+        split_provenance_path=(
+            context.output_dir / "components" / "tfidf" / "split_provenance.jsonl"
+        ),
+        unit_id_column=context.config.unit_id_column,
+        text_column=context.config.text_column,
+        treatment_column=context.config.treatment_column,
+        outcome_column=context.config.outcome_column,
+        outcome_type=context.config.outcome_type,
+        inner_folds=context.config.inner_folds,
+        seed=context.config.seed,
     )
 
 
@@ -1114,9 +1125,24 @@ class ResearchAllEvidenceStage1:
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         (self.config.output_dir / "logs").mkdir(exist_ok=True)
+        if self.config.dataset.suffix.lower() in {".parquet", ".pq"}:
+            dataset = pd.read_parquet(self.config.dataset)
+        elif self.config.dataset.suffix.lower() == ".csv":
+            dataset = pd.read_csv(self.config.dataset)
+        else:
+            raise ValueError("dataset must be Parquet or CSV")
+        required = {
+            self.config.unit_id_column,
+            self.config.text_column,
+            self.config.treatment_column,
+            self.config.outcome_column,
+        }
+        missing = sorted(required - set(dataset.columns))
+        if missing:
+            raise ValueError(f"dataset is missing configured columns: {missing}")
         return Stage1RunContext(
             config=self.config,
-            dataset=pd.DataFrame(),
+            dataset=dataset.reset_index(drop=True),
             applied_config=None,
             neural_query_config=None,
         )
@@ -1150,7 +1176,25 @@ class ResearchAllEvidenceStage1:
             for name in self.config.components:
                 component_dir = self._component_dir(name)
                 complete_path = component_dir / "complete.json"
-                if complete_path.is_file():
+                stage2_is_final = True
+                if name == "stage2" and complete_path.is_file():
+                    try:
+                        stage2_completion = json.loads(
+                            complete_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, json.JSONDecodeError):
+                        stage2_completion = {}
+                    stage2_is_final = (
+                        stage2_completion.get("phase") == "causal_estimation"
+                        and (component_dir / "causal_estimate.json").is_file()
+                        and (component_dir / "cross_fitted_predictions.csv").is_file()
+                    )
+                    if not stage2_is_final:
+                        LOGGER.info(
+                            "continue earlier definition-only Stage 2 output: %s",
+                            component_dir,
+                        )
+                if complete_path.is_file() and stage2_is_final:
                     LOGGER.info("skip completed component: %s", name)
                     progress["components"][name] = {
                         "status": "skipped",
@@ -1254,6 +1298,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage2-model", help="model served by the Stage 2 endpoint")
     parser.add_argument("--stage2-api-key", help="endpoint key; defaults to OCI_STAGE2_API_KEY")
     parser.add_argument(
+        "--stage2-review-rounds",
+        type=int,
+        help="maximum training-fold extraction and empirical-review rounds",
+    )
+    parser.add_argument(
+        "--stage2-extraction-batch-size",
+        type=int,
+        help="patient records sent in each Stage 2 extraction request",
+    )
+    parser.add_argument(
+        "--stage2-estimation-trees",
+        type=int,
+        help="trees in the final effect-modification model",
+    )
+    parser.add_argument(
         "--set",
         action="append",
         default=[],
@@ -1322,6 +1381,14 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
     stage2 = raw.setdefault("stage2", {})
     for key in ("endpoint", "model", "api_key"):
         value = getattr(args, f"stage2_{key}")
+        if value is not None:
+            stage2[key] = value
+    stage2_numeric_overrides = {
+        "max_review_rounds": args.stage2_review_rounds,
+        "extraction_batch_size": args.stage2_extraction_batch_size,
+        "estimation_trees": args.stage2_estimation_trees,
+    }
+    for key, value in stage2_numeric_overrides.items():
         if value is not None:
             stage2[key] = value
     models = raw.setdefault("models", {})

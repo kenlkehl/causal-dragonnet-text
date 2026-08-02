@@ -1,9 +1,10 @@
-"""Plain, resumable interpretation of the researcher Stage 1 handoff.
+"""Plain, resumable Stage 2 analysis of the researcher Stage 1 handoff.
 
 This module intentionally treats a directory as the checkpoint.  It reads the
-ordinary JSONL handoff, sends scientific evidence to one OpenAI-compatible
-model, and writes ordinary JSON results.  It has no bundle format, artifact
-authentication, immutable request, content hashes, or checkpoint adoption.
+ordinary JSONL handoff, defines and extracts patient-level variables, reviews
+them using training-fold performance, and produces cross-fitted causal
+estimates.  It has no bundle format, artifact authentication, immutable
+request, content hashes, or checkpoint adoption.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import math
 import os
 import re
 from collections import Counter, defaultdict
@@ -19,6 +21,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
+
+import numpy as np
+import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
 
@@ -67,6 +72,12 @@ class PlainHandoffStage2Config:
     max_prompt_chars: int = 100_000
     max_candidates_per_fold: int = 50
     workers: int = 4
+    extraction_batch_size: int = 12
+    max_review_rounds: int = 2
+    estimation_trees: int = 200
+    propensity_clip: float = 0.02
+    min_nonmissing_fraction: float = 0.05
+    max_dominant_fraction: float = 0.98
     temperature: float = 0.0
     enable_thinking: bool = False
 
@@ -86,6 +97,18 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.max_candidates_per_fold must be positive")
         if self.workers < 1:
             raise ValueError("stage2.workers must be positive")
+        if self.extraction_batch_size < 1:
+            raise ValueError("stage2.extraction_batch_size must be positive")
+        if self.max_review_rounds < 1:
+            raise ValueError("stage2.max_review_rounds must be positive")
+        if self.estimation_trees < 10:
+            raise ValueError("stage2.estimation_trees must be at least 10")
+        if not 0.0 < self.propensity_clip < 0.5:
+            raise ValueError("stage2.propensity_clip must be between 0 and 0.5")
+        if not 0.0 <= self.min_nonmissing_fraction <= 1.0:
+            raise ValueError("stage2.min_nonmissing_fraction must be between 0 and 1")
+        if not 0.0 <= self.max_dominant_fraction <= 1.0:
+            raise ValueError("stage2.max_dominant_fraction must be between 0 and 1")
         if not 0.0 <= self.temperature <= 2.0:
             raise ValueError("stage2.temperature must be between 0 and 2")
 
@@ -121,6 +144,12 @@ def plain_stage2_config_from_mapping(
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
         max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
         workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
+        extraction_batch_size=int(raw.get("extraction_batch_size", 12)),
+        max_review_rounds=int(raw.get("max_review_rounds", 2)),
+        estimation_trees=int(raw.get("estimation_trees", 200)),
+        propensity_clip=float(raw.get("propensity_clip", 0.02)),
+        min_nonmissing_fraction=float(raw.get("min_nonmissing_fraction", 0.05)),
+        max_dominant_fraction=float(raw.get("max_dominant_fraction", 0.98)),
         temperature=float(raw.get("temperature", 0.0)),
         enable_thinking=bool(raw.get("enable_thinking", False)),
     )
@@ -746,21 +775,32 @@ def _validate_consolidation(
             for packet_id in packets
             for axis in packet_axes.get(packet_id, set())
         }
-        clean_features.append(
-            {
-                key: (
-                    [str(item) for item in feature[key]]
-                    if key in {
-                        "categories_or_unit",
-                        "roles",
-                        "supporting_packet_ids",
-                        "supporting_architectures",
-                    }
-                    else str(feature[key])
-                )
-                for key in required
-            }
-        )
+        clean_feature = {
+            key: (
+                [str(item) for item in feature[key]]
+                if key in {
+                    "categories_or_unit",
+                    "roles",
+                    "supporting_packet_ids",
+                    "supporting_architectures",
+                }
+                else str(feature[key])
+            )
+            for key in required
+        }
+        categories = clean_feature["categories_or_unit"]
+        if value_type in {"binary", "categorical", "ordinal"} and len(categories) == 1:
+            # Models sometimes serialize an enumerated category list as one
+            # comma-separated string.  Store the actual categories so later
+            # extraction has an unambiguous closed vocabulary.
+            separated = [
+                part.strip()
+                for part in re.split(r"\s*[,;|]\s*", categories[0])
+                if part.strip()
+            ]
+            if len(separated) > 1:
+                clean_feature["categories_or_unit"] = separated
+        clean_features.append(clean_feature)
     clean_dispositions: dict[str, dict[str, str]] = {}
     for candidate_id in sorted(candidate_ids):
         raw_disposition = dispositions[candidate_id]
@@ -820,6 +860,96 @@ def _validate_consolidation(
     return {"features": routed_features, "candidate_dispositions": clean_dispositions}
 
 
+def _load_stage2_splits(
+    *,
+    provenance_path: Path | None,
+    dataset_rows: int,
+    outer_fold_ids: Sequence[int],
+    inner_folds: int,
+    seed: int,
+) -> dict[int, dict[str, Any]]:
+    """Read the ordinary Stage 1 split file, with a deterministic fallback."""
+
+    rows: list[dict[str, Any]] = []
+    if provenance_path is not None and Path(provenance_path).is_file():
+        rows = [
+            json.loads(line)
+            for line in Path(provenance_path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    if not rows:
+        from sklearn.model_selection import KFold
+
+        fold_ids = sorted(set(map(int, outer_fold_ids)))
+        if len(fold_ids) < 2:
+            raise FileNotFoundError(
+                "full Stage 2 needs components/tfidf/split_provenance.jsonl when "
+                "the handoff contains fewer than two outer folds"
+            )
+        splitter = KFold(n_splits=len(fold_ids), shuffle=True, random_state=int(seed))
+        all_rows = np.arange(dataset_rows, dtype=int)
+        for outer_fold, (fit, heldout) in zip(fold_ids, splitter.split(all_rows)):
+            fit_ids = all_rows[fit]
+            inner_count = min(max(2, int(inner_folds)), len(fit_ids))
+            inner_rows: list[dict[str, Any]] = []
+            if inner_count >= 2:
+                inner_splitter = KFold(
+                    n_splits=inner_count,
+                    shuffle=True,
+                    random_state=int(seed) + 51_000 + int(outer_fold),
+                )
+                for inner_fold, (inner_fit, inner_heldout) in enumerate(
+                    inner_splitter.split(fit_ids), start=1
+                ):
+                    inner_rows.append(
+                        {
+                            "inner_fold": inner_fold,
+                            "fit_row_ids": fit_ids[inner_fit].tolist(),
+                            "heldout_row_ids": fit_ids[inner_heldout].tolist(),
+                        }
+                    )
+            rows.append(
+                {
+                    "outer_fold": int(outer_fold),
+                    "fit_row_ids": fit_ids.tolist(),
+                    "heldout_row_ids": all_rows[heldout].tolist(),
+                    "inner_splits": inner_rows,
+                }
+            )
+    by_fold: dict[int, dict[str, Any]] = {}
+    for raw in rows:
+        outer_fold = int(raw["outer_fold"])
+        fit_ids = [int(value) for value in raw["fit_row_ids"]]
+        heldout_ids = [int(value) for value in raw["heldout_row_ids"]]
+        if outer_fold in by_fold:
+            raise ValueError(f"duplicate split provenance for outer fold {outer_fold}")
+        if not fit_ids or not heldout_ids:
+            raise ValueError(f"outer fold {outer_fold} requires nonempty fit and heldout rows")
+        if set(fit_ids).intersection(heldout_ids):
+            raise ValueError(f"outer fold {outer_fold} has overlapping fit and heldout rows")
+        if any(value < 0 or value >= dataset_rows for value in [*fit_ids, *heldout_ids]):
+            raise ValueError(f"outer fold {outer_fold} contains an out-of-range row id")
+        inner_splits = []
+        for inner_index, inner in enumerate(raw.get("inner_splits") or [], start=1):
+            inner_splits.append(
+                {
+                    "inner_fold": int(inner.get("inner_fold", inner_index)),
+                    "fit_row_ids": [int(value) for value in inner["fit_row_ids"]],
+                    "heldout_row_ids": [int(value) for value in inner["heldout_row_ids"]],
+                }
+            )
+        by_fold[outer_fold] = {
+            "outer_fold": outer_fold,
+            "fit_row_ids": fit_ids,
+            "heldout_row_ids": heldout_ids,
+            "inner_splits": inner_splits,
+        }
+    missing = sorted(set(map(int, outer_fold_ids)) - set(by_fold))
+    if missing:
+        raise ValueError(f"split provenance is missing Stage 2 outer folds: {missing}")
+    return by_fold
+
+
 class PlainHandoffStage2:
     def __init__(
         self,
@@ -868,129 +998,242 @@ class PlainHandoffStage2:
         outer_fold: int,
         packets: Sequence[Mapping[str, Any]],
         output_dir: Path,
+        dataset: pd.DataFrame | None = None,
+        split: Mapping[str, Any] | None = None,
+        unit_id_column: str = "patient_id",
+        text_column: str = "clinical_text",
+        treatment_column: str = "treatment_indicator",
+        outcome_column: str = "outcome_indicator",
+        outcome_type: str = "binary",
+        inner_folds: int = 5,
+        seed: int = 42,
     ) -> Mapping[str, Any]:
         complete_path = output_dir / "complete.json"
         features_path = output_dir / "feature_definitions.json"
-        if complete_path.is_file():
+        final_features_path = output_dir / "final_definitions.json"
+        completion = (
+            json.loads(complete_path.read_text(encoding="utf-8"))
+            if complete_path.is_file()
+            else {}
+        )
+        if (
+            completion.get("phase") == "causal_estimation"
+            and final_features_path.is_file()
+            and (output_dir / "estimation" / "complete.json").is_file()
+        ):
             LOGGER.info("skip completed Stage 2 outer fold=%s", outer_fold)
-            return json.loads(features_path.read_text(encoding="utf-8"))
+            final = json.loads(final_features_path.read_text(encoding="utf-8"))
+            return {
+                "outer_fold": outer_fold,
+                "features": list(final.get("features") or []),
+                "candidate_dispositions": (
+                    json.loads(features_path.read_text(encoding="utf-8")).get(
+                        "candidate_dispositions", {}
+                    )
+                    if features_path.is_file()
+                    else {}
+                ),
+                "review_rounds": int(final.get("review_rounds") or 0),
+                "estimation": json.loads(
+                    (output_dir / "estimation" / "diagnostics.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+            }
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_jsonl(output_dir / "input_packets.jsonl", packets)
 
         by_architecture: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
         for packet in packets:
             by_architecture[str(packet["architecture"])].append(packet)
-        jobs: list[tuple[str, int, list[Mapping[str, Any]], Path]] = []
-        interpretation_budget = max(2_000, self.config.max_prompt_chars - 12_000)
-        for architecture_index, architecture in enumerate(sorted(by_architecture), start=1):
-            batches = _partition_packets(
-                by_architecture[architecture],
-                max_chars=interpretation_budget,
-            )
-            for batch_index, batch in enumerate(batches, start=1):
-                jobs.append(
-                    (
-                        architecture,
-                        batch_index,
-                        batch,
-                        output_dir
-                        / "interpretations"
-                        / f"architecture_{architecture_index:02d}"
-                        / f"batch_{batch_index:03d}",
-                    )
-                )
-        LOGGER.info(
-            "Stage 2 outer_fold=%s architectures=%s interpretation_batches=%s workers=%s",
-            outer_fold,
-            len(by_architecture),
-            len(jobs),
-            min(self.config.workers, len(jobs)),
-        )
-        results: list[tuple[str, Mapping[str, Any]]] = []
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, min(self.config.workers, len(jobs)))
-        ) as executor:
-            futures = {
-                executor.submit(
-                    self._interpret_batch,
-                    architecture=architecture,
-                    packets=batch,
-                    output_dir=job_dir,
-                ): architecture
-                for architecture, _batch_index, batch, job_dir in jobs
-            }
-            for future in concurrent.futures.as_completed(futures):
-                results.append((futures[future], future.result()))
-
-        packet_by_id = {str(packet["packet_id"]): packet for packet in packets}
-        candidates: list[dict[str, Any]] = []
-        for architecture, result in sorted(results, key=lambda item: item[0]):
-            for concept in result["concepts"]:
-                supporting_packet_ids = [
-                    str(packet_id) for packet_id in concept["supporting_packet_ids"]
-                ]
-                evidence_axes = sorted(
-                    {
-                        str(axis)
-                        for packet_id in supporting_packet_ids
-                        for axis in packet_by_id[packet_id]["observable_axes"]
-                    }
-                )
-                candidates.append(
-                    {
-                        "candidate_id": f"candidate_{len(candidates) + 1:04d}",
-                        "architecture": architecture,
-                        **concept,
-                        "supporting_packet_ids": supporting_packet_ids,
-                        "evidence_axes": evidence_axes,
-                    }
-                )
-        _write_json(output_dir / "interpreted_candidates.json", candidates)
-        if not candidates:
-            final = {"outer_fold": outer_fold, "features": [], "candidate_dispositions": {}}
+        if features_path.is_file():
+            final = json.loads(features_path.read_text(encoding="utf-8"))
         else:
-            consolidated = _request_json(
-                messages=_consolidation_prompt(
-                    clinical_question=self.clinical_question,
-                    outer_fold=outer_fold,
-                    candidates=candidates,
-                    max_candidates=self.config.max_candidates_per_fold,
-                ),
+            jobs: list[tuple[str, int, list[Mapping[str, Any]], Path]] = []
+            interpretation_budget = max(2_000, self.config.max_prompt_chars - 12_000)
+            for architecture_index, architecture in enumerate(sorted(by_architecture), start=1):
+                batches = _partition_packets(
+                    by_architecture[architecture],
+                    max_chars=interpretation_budget,
+                )
+                for batch_index, batch in enumerate(batches, start=1):
+                    jobs.append(
+                        (
+                            architecture,
+                            batch_index,
+                            batch,
+                            output_dir
+                            / "interpretations"
+                            / f"architecture_{architecture_index:02d}"
+                            / f"batch_{batch_index:03d}",
+                        )
+                    )
+            LOGGER.info(
+                "Stage 2 outer_fold=%s architectures=%s interpretation_batches=%s workers=%s",
+                outer_fold,
+                len(by_architecture),
+                len(jobs),
+                min(self.config.workers, len(jobs)),
+            )
+            results: list[tuple[str, Mapping[str, Any]]] = []
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, min(self.config.workers, len(jobs)))
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._interpret_batch,
+                        architecture=architecture,
+                        packets=batch,
+                        output_dir=job_dir,
+                    ): architecture
+                    for architecture, _batch_index, batch, job_dir in jobs
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    results.append((futures[future], future.result()))
+
+            packet_by_id = {str(packet["packet_id"]): packet for packet in packets}
+            candidates: list[dict[str, Any]] = []
+            for architecture, result in sorted(results, key=lambda item: item[0]):
+                for concept in result["concepts"]:
+                    supporting_packet_ids = [
+                        str(packet_id) for packet_id in concept["supporting_packet_ids"]
+                    ]
+                    evidence_axes = sorted(
+                        {
+                            str(axis)
+                            for packet_id in supporting_packet_ids
+                            for axis in packet_by_id[packet_id]["observable_axes"]
+                        }
+                    )
+                    candidates.append(
+                        {
+                            "candidate_id": f"candidate_{len(candidates) + 1:04d}",
+                            "architecture": architecture,
+                            **concept,
+                            "supporting_packet_ids": supporting_packet_ids,
+                            "evidence_axes": evidence_axes,
+                        }
+                    )
+            _write_json(output_dir / "interpreted_candidates.json", candidates)
+            if not candidates:
+                final = {
+                    "outer_fold": outer_fold,
+                    "features": [],
+                    "candidate_dispositions": {},
+                }
+            else:
+                consolidated = _request_json(
+                    messages=_consolidation_prompt(
+                        clinical_question=self.clinical_question,
+                        outer_fold=outer_fold,
+                        candidates=candidates,
+                        max_candidates=self.config.max_candidates_per_fold,
+                    ),
+                    config=self.config,
+                    completion=self.completion,
+                    validate=lambda value: _validate_consolidation(
+                        value,
+                        candidates=candidates,
+                        max_candidates=self.config.max_candidates_per_fold,
+                    ),
+                )
+                features = []
+                for index, feature in enumerate(consolidated["features"], start=1):
+                    features.append(
+                        {
+                            "feature_id": f"outer_{outer_fold:03d}_feature_{index:03d}",
+                            **feature,
+                        }
+                    )
+                final = {
+                    "outer_fold": outer_fold,
+                    "features": features,
+                    "candidate_dispositions": consolidated["candidate_dispositions"],
+                }
+            _write_json(features_path, final)
+            _write_json(
+                output_dir / "definitions_complete.json",
+                {
+                    "status": "complete",
+                    "completed_at": _now(),
+                    "architectures": len(by_architecture),
+                    "packets": len(packets),
+                    "features": len(final["features"]),
+                },
+            )
+
+        if dataset is None:
+            _write_json(
+                complete_path,
+                {
+                    "status": "complete",
+                    "phase": "feature_definitions",
+                    "completed_at": _now(),
+                    "features": len(final["features"]),
+                },
+            )
+            return final
+        if split is None:
+            raise ValueError(f"Stage 2 outer fold {outer_fold} has no row split")
+
+        from .plain_handoff_stage2_analysis import run_fold_analysis
+
+        analysis = run_fold_analysis(
+            dataset=dataset,
+            definitions=final["features"],
+            split=split,
+            clinical_question=self.clinical_question,
+            unit_id_column=unit_id_column,
+            text_column=text_column,
+            treatment_column=treatment_column,
+            outcome_column=outcome_column,
+            outcome_type=outcome_type,
+            inner_folds=inner_folds,
+            seed=seed + 100_000 * outer_fold,
+            output_dir=output_dir,
+            request_json=lambda messages, validate: _request_json(
+                messages=messages,
                 config=self.config,
                 completion=self.completion,
-                validate=lambda value: _validate_consolidation(
-                    value,
-                    candidates=candidates,
-                    max_candidates=self.config.max_candidates_per_fold,
-                ),
-            )
-            features = []
-            for index, feature in enumerate(consolidated["features"], start=1):
-                features.append(
-                    {
-                        "feature_id": f"outer_{outer_fold:03d}_feature_{index:03d}",
-                        **feature,
-                    }
-                )
-            final = {
-                "outer_fold": outer_fold,
-                "features": features,
-                "candidate_dispositions": consolidated["candidate_dispositions"],
-            }
-        _write_json(features_path, final)
+                validate=validate,
+            ),
+            config=self.config,
+        )
+        completed = {
+            "outer_fold": outer_fold,
+            "features": analysis["features"],
+            "candidate_dispositions": final.get("candidate_dispositions", {}),
+            "review_rounds": analysis["review_rounds"],
+            "estimation": analysis["estimation"],
+        }
         _write_json(
             complete_path,
             {
                 "status": "complete",
+                "phase": "causal_estimation",
                 "completed_at": _now(),
-                "architectures": len(by_architecture),
-                "packets": len(packets),
-                "features": len(final["features"]),
+                "features": len(completed["features"]),
+                "review_rounds": completed["review_rounds"],
+                "estimation": completed["estimation"],
             },
         )
-        return final
+        return completed
 
-    def run(self, *, handoff_path: Path, output_dir: Path) -> Mapping[str, Any]:
+    def run(
+        self,
+        *,
+        handoff_path: Path,
+        output_dir: Path,
+        dataset: pd.DataFrame | None = None,
+        split_provenance_path: Path | None = None,
+        unit_id_column: str = "patient_id",
+        text_column: str = "clinical_text",
+        treatment_column: str = "treatment_indicator",
+        outcome_column: str = "outcome_indicator",
+        outcome_type: str = "binary",
+        inner_folds: int = 5,
+        seed: int = 42,
+    ) -> Mapping[str, Any]:
         rows = [
             json.loads(line)
             for line in Path(handoff_path).read_text(encoding="utf-8").splitlines()
@@ -1007,11 +1250,50 @@ class PlainHandoffStage2:
         packets_by_outer: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
         for packet in packets:
             packets_by_outer[int(packet["outer_fold"])].append(packet)
+        splits: dict[int, dict[str, Any]] = {}
+        if dataset is not None:
+            dataset = dataset.reset_index(drop=True)
+            required_columns = {
+                unit_id_column,
+                text_column,
+                treatment_column,
+                outcome_column,
+            }
+            missing = sorted(required_columns - set(dataset.columns))
+            if missing:
+                raise ValueError(f"Stage 2 dataset is missing configured columns: {missing}")
+            treatment_numeric = pd.to_numeric(dataset[treatment_column], errors="coerce")
+            treatment_values = set(treatment_numeric.dropna().unique())
+            if treatment_numeric.isna().any() or not treatment_values <= {0.0, 1.0}:
+                raise ValueError("Stage 2 treatment must be a complete binary 0/1 column")
+            if outcome_type not in {"binary", "continuous"}:
+                raise ValueError("Stage 2 outcome_type must be binary or continuous")
+            outcome_numeric = pd.to_numeric(dataset[outcome_column], errors="coerce")
+            if outcome_numeric.isna().any():
+                raise ValueError("Stage 2 outcome column must be complete and numeric")
+            if outcome_type == "binary" and not set(outcome_numeric.unique()) <= {0.0, 1.0}:
+                raise ValueError("binary Stage 2 outcome must contain only 0 and 1")
+            splits = _load_stage2_splits(
+                provenance_path=split_provenance_path,
+                dataset_rows=len(dataset),
+                outer_fold_ids=sorted(packets_by_outer),
+                inner_folds=inner_folds,
+                seed=seed,
+            )
         fold_results = [
             self._run_outer_fold(
                 outer_fold=outer_fold,
                 packets=packets_by_outer[outer_fold],
                 output_dir=output_dir / f"outer_{outer_fold:03d}",
+                dataset=dataset,
+                split=splits.get(outer_fold),
+                unit_id_column=unit_id_column,
+                text_column=text_column,
+                treatment_column=treatment_column,
+                outcome_column=outcome_column,
+                outcome_type=outcome_type,
+                inner_folds=inner_folds,
+                seed=seed,
             )
             for outer_fold in sorted(packets_by_outer)
         ]
@@ -1033,12 +1315,76 @@ class PlainHandoffStage2:
             "feature_name_fold_counts": dict(sorted(name_counts.items())),
             "features_path": str(output_dir / "features_by_outer_fold.jsonl"),
         }
+        artifacts = [
+            str(output_dir / "features_by_outer_fold.jsonl"),
+            str(output_dir / "summary.json"),
+        ]
+        if dataset is not None:
+            prediction_frames = []
+            for result in fold_results:
+                outer_fold = int(result["outer_fold"])
+                frame = pd.read_csv(
+                    output_dir
+                    / f"outer_{outer_fold:03d}"
+                    / "estimation"
+                    / "predictions.csv"
+                )
+                frame.insert(1, "outer_fold", outer_fold)
+                prediction_frames.append(frame)
+            predictions = pd.concat(prediction_frames, ignore_index=True)
+            row_ids = predictions["_oci_row_id"].astype(int).tolist()
+            if len(row_ids) != len(dataset) or set(row_ids) != set(range(len(dataset))):
+                raise ValueError(
+                    "outer heldout predictions must cover every dataset row exactly once"
+                )
+            if len(set(row_ids)) != len(row_ids):
+                raise ValueError("a dataset row appears in more than one outer heldout fold")
+            predictions = predictions.sort_values("_oci_row_id").reset_index(drop=True)
+            predictions_path = output_dir / "cross_fitted_predictions.csv"
+            temporary = predictions_path.with_name(
+                f".{predictions_path.name}.{os.getpid()}.tmp"
+            )
+            predictions.to_csv(temporary, index=False)
+            os.replace(temporary, predictions_path)
+            scores = predictions["aipw_score"].to_numpy(dtype=float)
+            scores = scores[np.isfinite(scores)]
+            if not len(scores):
+                raise ValueError("cross-fitted Stage 2 estimation produced no finite AIPW scores")
+            ate = float(np.mean(scores))
+            standard_error = (
+                float(np.std(scores, ddof=1) / math.sqrt(len(scores)))
+                if len(scores) > 1
+                else None
+            )
+            causal_estimate = {
+                "estimator": "cross-fitted_aipw_with_fold_trained_nuisance_models",
+                "estimand": "average_treatment_effect",
+                "rows": len(predictions),
+                "ate": ate,
+                "standard_error": standard_error,
+                "confidence_interval_95": (
+                    [ate - 1.96 * standard_error, ate + 1.96 * standard_error]
+                    if standard_error is not None
+                    else None
+                ),
+                "mean_estimated_cate": float(predictions["estimated_cate"].mean()),
+                "predictions_path": str(predictions_path),
+            }
+            causal_path = output_dir / "causal_estimate.json"
+            _write_json(causal_path, causal_estimate)
+            summary.update(
+                {
+                    "phase": "causal_estimation",
+                    "causal_estimate": causal_estimate,
+                    "cross_fitted_predictions_path": str(predictions_path),
+                }
+            )
+            artifacts.extend([str(predictions_path), str(causal_path)])
+        else:
+            summary["phase"] = "feature_definitions"
         _write_json(output_dir / "summary.json", summary)
         return {
-            "artifacts": [
-                str(output_dir / "features_by_outer_fold.jsonl"),
-                str(output_dir / "summary.json"),
-            ],
+            "artifacts": artifacts,
             **summary,
         }
 
@@ -1050,12 +1396,33 @@ def run_plain_handoff_stage2(
     clinical_question: str,
     config: PlainHandoffStage2Config,
     completion: CompletionFunction | None = None,
+    dataset: pd.DataFrame | None = None,
+    split_provenance_path: Path | None = None,
+    unit_id_column: str = "patient_id",
+    text_column: str = "clinical_text",
+    treatment_column: str = "treatment_indicator",
+    outcome_column: str = "outcome_indicator",
+    outcome_type: str = "binary",
+    inner_folds: int = 5,
+    seed: int = 42,
 ) -> Mapping[str, Any]:
     return PlainHandoffStage2(
         config=config,
         clinical_question=clinical_question,
         completion=completion,
-    ).run(handoff_path=handoff_path, output_dir=output_dir)
+    ).run(
+        handoff_path=handoff_path,
+        output_dir=output_dir,
+        dataset=dataset,
+        split_provenance_path=split_provenance_path,
+        unit_id_column=unit_id_column,
+        text_column=text_column,
+        treatment_column=treatment_column,
+        outcome_column=outcome_column,
+        outcome_type=outcome_type,
+        inner_folds=inner_folds,
+        seed=seed,
+    )
 
 
 __all__ = [

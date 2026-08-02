@@ -1,19 +1,46 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+
+import pandas as pd
 
 from oci.inference.plain_handoff_stage2 import (
     PlainHandoffStage2Config,
     packetize_handoff,
     run_plain_handoff_stage2,
 )
+from oci.inference.plain_handoff_stage2_analysis import run_fold_analysis
 
 
 def _fake_completion(calls):
     def complete(messages, _config):
         body = json.loads(messages[1]["content"])
         calls.append(body["job"])
+        if body["job"] == "extract_stage2_patient_variables":
+            rows = []
+            for patient in body["patients"]:
+                match = re.search(r"ECOG\s*([0-4])", patient["text"])
+                values = {}
+                for feature in body["features"]:
+                    values[feature["name"]] = match.group(1) if match is not None else None
+                rows.append({"row_id": patient["row_id"], "values": values})
+            return json.dumps({"rows": rows})
+        if body["job"] == "review_stage2_variables_against_training_fold_performance":
+            return json.dumps(
+                {
+                    "feature_decisions": [
+                        {
+                            "feature_id": feature["feature_id"],
+                            "action": "keep",
+                            "reason": "The training-fold extraction is usable.",
+                        }
+                        for feature in body["features"]
+                    ],
+                    "overall_assessment": "Keep the operational definitions.",
+                }
+            )
         if body["job"] == "interpret_one_stage1_architecture":
             packet_ids = [row["packet_id"] for row in body["packets"]]
             return json.dumps(
@@ -228,3 +255,228 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
 
     assert second["features_by_fold"] == {"1": 1}
     assert len(calls) == 3
+
+
+def test_plain_stage2_finishes_extraction_review_and_causal_estimation(tmp_path: Path):
+    handoff = tmp_path / "handoff.jsonl"
+    evidence_rows = []
+    for outer_fold in (1, 2):
+        for objective in ("treatment", "outcome"):
+            evidence_rows.append(
+                {
+                    "source": "text_models",
+                    "outer_fold": outer_fold,
+                    "inner_fold": None,
+                    "scope": "full_outer_train",
+                    "evidence": {
+                        "architecture": f"model_{objective}",
+                        "objective": objective,
+                        "witnesses": ["ECOG performance status"],
+                    },
+                }
+            )
+    handoff.write_text(
+        "".join(json.dumps(row) + "\n" for row in evidence_rows),
+        encoding="utf-8",
+    )
+    dataset = pd.DataFrame(
+        {
+            "patient_id": [f"p{index:03d}" for index in range(40)],
+            "clinical_text": [f"Pretreatment ECOG {index % 2}." for index in range(40)],
+            "treatment_indicator": [int(index % 4 in {1, 3}) for index in range(40)],
+            "outcome_indicator": [int(index % 5 in {0, 1}) for index in range(40)],
+        }
+    )
+    split_path = tmp_path / "split_provenance.jsonl"
+    split_rows = []
+    for outer_fold, heldout in ((1, list(range(0, 20))), (2, list(range(20, 40)))):
+        fit = sorted(set(range(40)) - set(heldout))
+        split_rows.append(
+            {
+                "outer_fold": outer_fold,
+                "fit_row_ids": fit,
+                "heldout_row_ids": heldout,
+                "inner_splits": [
+                    {
+                        "inner_fold": 1,
+                        "fit_row_ids": fit[:10],
+                        "heldout_row_ids": fit[10:],
+                    },
+                    {
+                        "inner_fold": 2,
+                        "fit_row_ids": fit[10:],
+                        "heldout_row_ids": fit[:10],
+                    },
+                ],
+            }
+        )
+    split_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in split_rows),
+        encoding="utf-8",
+    )
+    calls = []
+    output = tmp_path / "stage2"
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        max_prompt_chars=12_000,
+        workers=4,
+        extraction_batch_size=5,
+        max_review_rounds=1,
+        estimation_trees=10,
+    )
+
+    first = run_plain_handoff_stage2(
+        handoff_path=handoff,
+        output_dir=output,
+        clinical_question="Estimate the treatment effect.",
+        config=config,
+        completion=_fake_completion(calls),
+        dataset=dataset,
+        split_provenance_path=split_path,
+        inner_folds=2,
+        seed=7,
+    )
+
+    assert first["phase"] == "causal_estimation"
+    assert first["causal_estimate"]["rows"] == 40
+    assert (output / "cross_fitted_predictions.csv").is_file()
+    assert (output / "causal_estimate.json").is_file()
+    assert (output / "outer_001" / "review" / "round_001" / "performance.json").is_file()
+    performance = json.loads(
+        (output / "outer_001" / "review" / "round_001" / "performance.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert performance["leave_one_feature_out"][0]["name"] == "performance_status"
+    assert (output / "outer_001" / "extraction" / "extracted_features.csv").is_file()
+    assert (output / "outer_001" / "estimation" / "predictions.csv").is_file()
+    calls_after_first = len(calls)
+
+    second = run_plain_handoff_stage2(
+        handoff_path=handoff,
+        output_dir=output,
+        clinical_question="Estimate the treatment effect.",
+        config=config,
+        completion=_fake_completion(calls),
+        dataset=dataset,
+        split_provenance_path=split_path,
+        inner_folds=2,
+        seed=7,
+    )
+
+    assert second["causal_estimate"]["rows"] == 40
+    assert len(calls) == calls_after_first
+
+
+def test_training_fold_review_can_revise_then_retest_a_definition(tmp_path: Path):
+    dataset = pd.DataFrame(
+        {
+            "patient_id": [f"p{index:02d}" for index in range(12)],
+            "clinical_text": [f"Pretreatment ECOG {index % 3}." for index in range(12)],
+            "treatment_indicator": [0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0],
+            "outcome_indicator": [0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0],
+        }
+    )
+    definitions = [
+        {
+            "feature_id": "outer_001_feature_001",
+            "name": "performance_status",
+            "description": "Baseline ECOG performance status.",
+            "value_type": "ordinal",
+            "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
+            "roles": ["confounder"],
+            "measurement_definition": "Extract the pretreatment ECOG score.",
+            "missing_value_rule": "Use null when undocumented.",
+            "supporting_packet_ids": ["packet_1"],
+            "supporting_architectures": ["test"],
+            "stability_summary": "training evidence",
+            "caveats": "none",
+        }
+    ]
+    split = {
+        "outer_fold": 1,
+        "fit_row_ids": list(range(6)),
+        "heldout_row_ids": list(range(6, 12)),
+        "inner_splits": [
+            {"inner_fold": 1, "fit_row_ids": [0, 1, 2], "heldout_row_ids": [3, 4, 5]},
+            {"inner_fold": 2, "fit_row_ids": [3, 4, 5], "heldout_row_ids": [0, 1, 2]},
+        ],
+    }
+    jobs = []
+
+    def request_json(messages, validate):
+        body = json.loads(messages[1]["content"])
+        jobs.append(body["job"])
+        if body["job"] == "extract_stage2_patient_variables":
+            response = {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "values": {
+                            "performance_status": re.search(
+                                r"ECOG\s*([0-2])", patient["text"]
+                            ).group(1)
+                        },
+                    }
+                    for patient in body["patients"]
+                ]
+            }
+        elif body["allow_measurement_revision"]:
+            response = {
+                "feature_decisions": [
+                    {
+                        "feature_id": "outer_001_feature_001",
+                        "action": "revise",
+                        "reason": "Clarify the scale before another training-fold evaluation.",
+                        "value_type": "ordinal",
+                        "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
+                        "measurement_definition": (
+                            "Extract the last explicitly documented pretreatment ECOG score."
+                        ),
+                        "missing_value_rule": "Use null when no explicit score is documented.",
+                    }
+                ],
+                "overall_assessment": "Retest the clarified definition.",
+            }
+        else:
+            response = {
+                "feature_decisions": [
+                    {
+                        "feature_id": "outer_001_feature_001",
+                        "action": "keep",
+                        "reason": "The revised definition was evaluated successfully.",
+                    }
+                ],
+                "overall_assessment": "Freeze the definition.",
+            }
+        return validate(response)
+
+    result = run_fold_analysis(
+        dataset=dataset,
+        definitions=definitions,
+        split=split,
+        clinical_question="Estimate treatment effect.",
+        unit_id_column="patient_id",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        inner_folds=2,
+        seed=11,
+        output_dir=tmp_path / "outer_001",
+        request_json=request_json,
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_batch_size=6,
+            max_review_rounds=2,
+            estimation_trees=10,
+        ),
+    )
+
+    assert result["review_rounds"] == 2
+    assert result["features"][0]["measurement_definition"].startswith("Extract the last")
+    assert jobs.count("review_stage2_variables_against_training_fold_performance") == 2
+    assert jobs.count("extract_stage2_patient_variables") == 3
+    assert (tmp_path / "outer_001" / "review" / "round_002" / "performance.json").is_file()

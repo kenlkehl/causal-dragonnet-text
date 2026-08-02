@@ -61,10 +61,13 @@ clinical concepts, assigns causal roles from the types of evidence that support
 each concept, defines how each variable will be measured in a complete patient
 record, extracts those values, and fits the study's final causal estimator.
 Stage 2 may be human-led, language-model-assisted, or a combination of the two.
-The simplified runner includes a plain-handoff interpreter that sends
-fold-scoped evidence to one configured OpenAI-compatible endpoint and saves the
-resulting feature definitions as ordinary JSON. Investigators remain
-responsible for review, extraction policy, and final causal estimation.
+The simplified runner supplies the language-model-assisted path. It sends
+fold-scoped evidence to one configured OpenAI-compatible endpoint, saves the
+resulting feature definitions as ordinary JSON, extracts the variables, reviews
+their training-fold empirical performance, and completes cross-fitted causal
+estimation. Investigators remain responsible for judging the identification
+assumptions, clinical validity, overlap, and sensitivity of the resulting
+estimate; the automated review is not a substitute for scientific review.
 
 ```mermaid
 flowchart LR
@@ -119,10 +122,17 @@ A complete Stage 2 analysis ordinarily performs the following sequence:
 4. It routes grounded concepts to adjustment, prognostic, or treatment-effect
    heterogeneity roles according to their treatment, outcome, residual-effect,
    and matched-pair evidence.
-5. It freezes a patient-level extraction definition, including the measurement,
-   unit or categories, aliases, and handling of missing or ambiguous text.
-6. It extracts values from complete records, evaluates their empirical adequacy,
-   and fits the final fold-honest causal model.
+5. It extracts the proposed variables on outer-training records and measures
+   missingness, variation, nuisance-model performance, residual-effect loss,
+   and leave-one-variable-out contributions by inner validation.
+6. It permits a bounded clarification of the extraction definition and repeats
+   training-fold evaluation when a definition changes. The final review round
+   may retain or drop a variable but cannot introduce an unevaluated definition.
+7. It freezes the retained definitions, applies them to the outer-held-out
+   records, and fits the fold-honest nuisance and effect-modification models.
+8. It combines held-out AIPW scores across outer folds to estimate the average
+   treatment effect and writes row-level conditional effect estimates and
+   overlap diagnostics.
 
 This ordering is deliberate. Stage 1 discovers language patterns; Stage 2 turns
 those patterns into scientific variables. Neither stage, by itself, establishes
@@ -493,22 +503,24 @@ across contexts rather than by oversubscribing the device within a context.
 The `run.devices` setting determines GPU concurrency. `run.workers` bounds
 CPU-only context concurrency and supplies the CPU budget used by the TF-IDF
 component; it does not create additional jobs on a CUDA device. Stage 2 uses
-its own `stage2.workers` setting for concurrent interpretation requests. Every
-Stage 1 context writes its own `complete.json` before its lane advances, so the
-same scheduling remains resumable after interruption.
+its own `stage2.workers` setting for concurrent interpretation requests and
+patient-extraction batches. Review rounds and outer folds remain ordered so
+that a single endpoint is never multiplied by two independent concurrency
+limits. Every Stage 1 context and every expensive Stage 2 batch writes its own
+`complete.json`, so the same scheduling remains resumable after interruption.
 
 ### Stage-specific execution
 
 Empty Stage 2 endpoint and model settings mean that the workflow stops after
-Stage 1. This remains the default because feature definitions require review in
-the context of the study before extraction and causal estimation.
+Stage 1. This is useful when a researcher wishes to inspect the discovery
+evidence before permitting any variables to enter the causal analysis.
 
 ```bash
 uv run python scripts/run_all_evidence.py --config run.json --stage1-only
 ```
 
 When a Stage 2 endpoint and model have been configured, the same entry point can
-run only the plain-handoff interpreter against an existing handoff:
+run the complete second stage against an existing handoff:
 
 ```bash
 uv run python scripts/run_all_evidence.py --config run.json --stage2-only
@@ -524,7 +536,10 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "endpoint": "http://127.0.0.1:8000/v1",
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
-    "max_tokens": 4096
+    "max_tokens": 4096,
+    "extraction_batch_size": 12,
+    "max_review_rounds": 2,
+    "estimation_trees": 200
   },
   "run": {
     "mode": "full"
@@ -532,9 +547,35 @@ run. The API key may be stored in `stage2.api_key` or supplied through
 }
 ```
 
-The interpreter preserves evidence-family and outer-fold boundaries, performs
-concurrent architecture-level interpretation requests, consolidates candidates
-within each outer fold, and writes resumable outputs under `stage2/`.
+Stage 2 preserves the outer-fold boundary throughout variable construction and
+estimation. It first interprets each evidence architecture and consolidates the
+result into operational patient-level definitions. It then extracts the
+variables on the outer training rows and measures missingness, variation,
+treatment prediction, outcome prediction, and residual-effect performance by
+inner validation. Leave-one-feature-out measurements show whether each variable
+improves or degrades those metrics relative to the complete extracted feature
+set. The language model may revise an extraction definition and repeat this
+training-fold evaluation for at most `max_review_rounds`. In the last round it
+may retain or drop a variable but may not introduce an unevaluated measurement
+definition.
+
+Only after this review has ended is the final definition applied to the outer
+held-out records. Nuisance models for treatment and potential outcomes are fit
+without using those held-out outcomes. The fold result contains held-out
+propensities, potential-outcome predictions, AIPW scores, and conditional effect
+estimates. Combining the held-out rows across outer folds produces the final
+average treatment effect and its confidence interval.
+
+```mermaid
+flowchart LR
+    A["Stage 1 evidence<br/>for one outer fold"] --> B["Operational variable definitions"]
+    B --> C["Extract outer-training records"]
+    C --> D["Inner-fold predictive and R-loss review"]
+    D -->|"revise, if another round remains"| B
+    D -->|"freeze"| E["Extract outer-held-out records"]
+    E --> F["Held-out nuisance predictions and AIPW score"]
+    F --> G["Aggregate all outer folds"]
+```
 
 ### Output and interruption recovery
 
@@ -578,17 +619,40 @@ nsclc_all_evidence/
     complete.json
   stage2/
     config.json
-    outer_001/...
+    outer_001/
+      interpretations/...
+      feature_definitions.json
+      review/
+        round_001/
+          extraction/extracted.csv
+          extraction_summary.json
+          performance.json
+          review.json
+          complete.json
+      final_definitions.json
+      extraction/
+        heldout/extracted.csv
+        extracted_features.csv
+      estimation/
+        predictions.csv
+        diagnostics.json
+        complete.json
+      complete.json
     features_by_outer_fold.jsonl
+    cross_fitted_predictions.csv
+    causal_estimate.json
     summary.json
     complete.json
 ```
 
 `progress.json` provides the current component and status. The workflow log is
 written to `logs/workflow.log`, and model-specific intermediate results are kept
-under `components/<name>/`. A component or fold context is complete when its
-`complete.json` exists. If a process is interrupted, rerunning the same command
-skips completed work and re-enters the incomplete directory.
+under `components/<name>/`. Stage 2's intermediate scientific results are under
+the current `stage2/outer_NNN/` directory: this is the direct place to inspect
+the variables, extraction summaries, performance measurements, and fold-level
+estimates. If a process is interrupted, rerunning the same command skips each
+completed interpretation batch, extraction batch, review round, and fold
+estimate, then re-enters the first incomplete directory.
 
 The stable boundary between the stages is `handoff/evidence.jsonl`.
 `handoff/index.json` identifies the contributing files, and the uncombined
@@ -803,8 +867,8 @@ following documents provide additional detail:
 - [`docs/production_all_evidence_quickstart.md`](docs/production_all_evidence_quickstart.md)
   provides a short command reference.
 - [`docs/all_evidence_discovery_interfaces.md`](docs/all_evidence_discovery_interfaces.md)
-  specifies the evidence-interpretation and role-routing semantics used by the
-  established all-evidence Stage 2 implementation.
+  records the historical authenticated Stage 2 interface. It is retained to
+  explain older artifacts and is not used by `scripts/run_all_evidence.py`.
 
 The historical production control-plane and reproducibility runbooks remain in
 `docs/` for runs created with the older authenticated workflow. New runs do not

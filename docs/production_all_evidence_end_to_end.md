@@ -9,8 +9,10 @@ uv run python scripts/run_all_evidence.py \
 
 It reads one cohort and writes everything to one output directory. With no
 Stage 2 endpoint configured it runs Stage 1 through the plain handoff. With an
-endpoint and model it also interprets that handoff into fold-scoped feature
-definitions. Interruption and resume are automatic: run the same command again.
+endpoint and model it continues through fold-scoped feature definitions,
+patient-level extraction, training-fold empirical review, and cross-fitted
+causal estimation. Interruption and resume are automatic: run the same command
+again.
 
 The older `run_production_all_evidence_workflow.py` control plane is retained
 for old runs, but it is not required by this workflow. This orchestration has
@@ -77,10 +79,16 @@ environment.
 
 ## Full, Stage-1-only, and Stage-2-only runs
 
-Stage 2 reads `handoff/evidence.jsonl`, interprets architecture-specific
-evidence through one OpenAI-compatible endpoint, and consolidates candidate
-concepts separately within each outer fold. It is enabled by specifying both
-`stage2.endpoint` and `stage2.model`. For example:
+Stage 2 reads `handoff/evidence.jsonl` and completes the remainder of the
+analysis. Within each outer fold, it interprets architecture-specific evidence,
+defines patient-level variables, extracts those variables from the clinical
+text, and evaluates their usefulness on the outer training rows. A bounded
+model-assisted review may clarify a measurement definition and repeat the
+training-row extraction. The definition is then frozen before it is applied to
+the outer held-out rows. Finally, Stage 2 fits nuisance and effect-modification
+models on the training rows and writes held-out AIPW scores and conditional
+effect estimates. It is enabled by specifying both `stage2.endpoint` and
+`stage2.model`. For example:
 
 ```json
 {
@@ -88,14 +96,19 @@ concepts separately within each outer fold. It is enabled by specifying both
     "endpoint": "http://127.0.0.1:8000/v1",
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
-    "max_tokens": 4096
+    "max_tokens": 4096,
+    "extraction_batch_size": 12,
+    "max_review_rounds": 2,
+    "estimation_trees": 200
   }
 }
 ```
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `max_prompt_chars`,
-`max_candidates_per_fold`, `temperature`, and `enable_thinking`. A configured
+`max_candidates_per_fold`, `extraction_batch_size`, `max_review_rounds`,
+`estimation_trees`, `propensity_clip`, `min_nonmissing_fraction`,
+`max_dominant_fraction`, `temperature`, and `enable_thinking`. A configured
 endpoint and model make the default mode `full`. The modes can always be made
 explicit:
 
@@ -134,7 +147,12 @@ uv run python scripts/run_all_evidence.py \
   --devices cuda:0,cuda:1 \
   --workers 16 \
   --htr-model /models/bert-tiny \
-  --embedding-model /models/qwen3-embedding-8b
+  --embedding-model /models/qwen3-embedding-8b \
+  --stage2-endpoint http://127.0.0.1:8000/v1 \
+  --stage2-model Qwen/Qwen3-32B \
+  --stage2-review-rounds 2 \
+  --stage2-extraction-batch-size 12 \
+  --stage2-estimation-trees 200
 ```
 
 Any less-common nested value can be set without adding another CLI flag:
@@ -162,7 +180,7 @@ the available CPUs and GPUs as follows.
 | `text_models` | An outer/full or exact-inner context | One fixed process lane per configured CUDA device; CPU-only runs use at most `run.workers` lanes |
 | `neural_queries` | An outer/full or exact-inner context | One fixed process lane per configured CUDA device; CPU-only runs use at most `run.workers` lanes |
 | `handoff` | None | The completed JSONL files are combined serially |
-| `stage2` | Interpretation batches within the current outer fold | Concurrent endpoint requests bounded by `stage2.workers`; outer folds and within-fold consolidation remain ordered |
+| `stage2` | Interpretation batches and patient-extraction batches within the current outer fold | Concurrent endpoint requests bounded by `stage2.workers`; review rounds, outer folds, and fold-level estimation remain ordered |
 
 A fixed CUDA lane processes its assigned contexts serially on one GPU. This
 provides device affinity and prevents a process queue from placing two
@@ -226,8 +244,33 @@ my_stage1_run/
       interpretations/...
       interpreted_candidates.json
       feature_definitions.json
+      definitions_complete.json
+      review/
+        round_001/
+          definitions.json
+          extraction/
+            batches/...
+            extracted.csv
+            complete.json
+          extraction_summary.json
+          performance.json
+          review.json
+          complete.json
+      final_definitions.json
+      extraction/
+        heldout/
+          batches/...
+          extracted.csv
+          complete.json
+        extracted_features.csv
+      estimation/
+        predictions.csv
+        diagnostics.json
+        complete.json
       complete.json
     features_by_outer_fold.jsonl
+    cross_fitted_predictions.csv
+    causal_estimate.json
     summary.json
     complete.json
 ```
@@ -248,15 +291,38 @@ for evidence_context in iter_stage1_handoff("/results/my_stage1_run"):
 Completion has one intentionally simple rule:
 
 - if `components/<name>/complete.json` exists, that component is skipped
-  (`handoff/complete.json` and `stage2/complete.json` for those components);
+  (`handoff/complete.json` and a causal-estimation `stage2/complete.json` serve
+  the same purpose for those components);
 - if it does not exist, the component runs in the existing directory;
 - text-model and neural-query contexts use the same rule inside their context
   directories.
 
 An interrupted component's partial files are left in place. There is no
-`--resume` flag. Rerun the same command. Stage 2 skips completed outer-fold and
-interpretation-batch directories and writes the final top-level marker only
-after every fold has completed.
+`--resume` flag. Rerun the same command. Stage 2 skips completed interpretation
+and extraction batches, completed review rounds, and completed fold estimates.
+It writes an outer-fold completion marker only after held-out estimation, and
+writes the final top-level marker only after the cross-fitted estimates have
+been assembled.
+
+A `stage2/complete.json` written by the earlier definition-only implementation
+does not suppress the new phases. The runner recognizes that it lacks the
+`causal_estimation` phase and continues from the saved fold definitions. Thus a
+completed pre-refactor handoff and any already completed interpretation batches
+remain usable; the original evidence does not need to be regenerated.
+
+The review boundary is deliberately fold-honest. Extraction summaries and
+performance metrics in `review/round_NNN/` contain outer-training rows only.
+Outer-held-out outcomes are not made available to definition revision or
+feature retention. The performance file includes baseline, complete-feature,
+and leave-one-feature-out measurements so that retention decisions can be tied
+to an individual extracted variable rather than to the feature set in the
+aggregate. The held-out extraction begins only after
+`final_definitions.json` has been written. The reported average treatment effect
+is the mean of the held-out AIPW scores across outer folds; its standard error
+is the empirical standard error of those scores. `estimated_cate` in the
+prediction file comes from a random-forest effect model trained on cross-fitted
+training-fold pseudo-outcomes and the variables assigned an effect-modifier
+role.
 
 To intentionally rerun one component, use:
 
@@ -292,8 +358,13 @@ affected component.
 - `neural_queries` fits and saves each outer/full or exact-inner context
   independently.
 - `handoff` gathers the completed evidence into the stable Stage 2 input path.
-- `stage2` interprets the plain handoff through the configured endpoint and
-  writes fold-scoped candidate and feature definitions.
+- `stage2` interprets the plain handoff, extracts and empirically reviews
+  fold-scoped variables, freezes the retained definitions, and writes held-out
+  AIPW and conditional-effect estimates before aggregating the outer folds.
 
-The scientific model implementations are reused; this change removes their
-production orchestration layer rather than substituting new estimators.
+The Stage 1 scientific model implementations are reused. The plain Stage 2 path
+replaces the former production control plane with readable directories and a
+small dependency-light estimator: logistic or ridge nuisance models, a
+random-forest effect-modification model, and cross-fitted AIPW scores. These
+choices are recorded in the fold diagnostics and final estimate rather than
+hidden in an authenticated deployment specification.
