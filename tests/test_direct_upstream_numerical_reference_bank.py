@@ -139,19 +139,27 @@ def test_authentication_cache_does_not_retain_one_fd_per_payload(
     np.testing.assert_array_equal(array, np.asarray([[63.0]]))
 
 
-def _view_registration(root: Path, relative_path: str, body: dict) -> dict:
+def _view_registration(
+    root: Path,
+    relative_path: str,
+    body: dict,
+    *,
+    include_family: bool = True,
+) -> dict:
     view = _closed(body)
     path = root / relative_path
     _write_json(path, view)
-    return {
+    registration = {
         "logical_scope_id": body["logical_scope_id"],
-        "family": body["family"],
         **_file_registration(
             path,
             root=root,
             content_sha256=view["content_sha256"],
         ),
     }
+    if include_family:
+        registration["family"] = body["family"]
+    return registration
 
 
 def _registry() -> dict:
@@ -231,6 +239,7 @@ def _write_simple_dense_component(
     scope,
     families_and_columns: tuple[tuple[str, tuple[str, ...]], ...],
     base: float,
+    omit_registration_family: bool = False,
 ) -> None:
     logical_views = []
     for family_index, (family, columns) in enumerate(families_and_columns):
@@ -255,6 +264,7 @@ def _write_simple_dense_component(
                     family,
                     prediction_artifact=artifact,
                 ),
+                include_family=not omit_registration_family,
             )
         )
     terminal = _closed(
@@ -274,6 +284,7 @@ def _write_matched_component(
     scope,
     *,
     base: float,
+    omit_registration_family: bool = False,
 ) -> None:
     artifacts = {}
     for offset, subproducer in enumerate(("bow", "htr")):
@@ -301,6 +312,7 @@ def _write_matched_component(
             MATCHED_PAIR_UPLIFT,
             prediction_artifacts=artifacts,
         ),
+        include_family=not omit_registration_family,
     )
     _write_json(
         component_root / "execution_manifest.json",
@@ -486,6 +498,7 @@ def _write_neural_query_component(
     scope,
     *,
     base: float,
+    omit_registration_family: bool = False,
 ) -> None:
     names = (
         "neural_query_treatment_signed_mean",
@@ -536,6 +549,7 @@ def _write_neural_query_component(
             NEURAL_QUERY_MOMENTS,
             prediction_artifact=artifact,
         ),
+        include_family=not omit_registration_family,
     )
     _write_json(
         component_root / "execution_manifest.json",
@@ -556,6 +570,7 @@ def _write_execution(
     *,
     missing_family: str | None = None,
     reordered_bow_rows: bool = False,
+    single_family_registrations_omit_family: bool = False,
 ) -> tuple[Path, Stage1ScopePlan, dict]:
     plan = _plan()
     execution_root = (tmp_path / "execution").resolve()
@@ -598,11 +613,17 @@ def _write_execution(
                 ),
             ),
             base=base + 1,
+            omit_registration_family=(
+                single_family_registrations_omit_family
+            ),
         )
         _write_matched_component(
             owner_root / "matched_pair",
             scope,
             base=base + 2,
+            omit_registration_family=(
+                single_family_registrations_omit_family
+            ),
         )
         _write_embedding_component(
             owner_root / "embeddings",
@@ -636,6 +657,9 @@ def _write_execution(
             owner_root / "neural_query",
             scope,
             base=base + 5,
+            omit_registration_family=(
+                single_family_registrations_omit_family
+            ),
         )
 
     if missing_family is not None:
@@ -1022,6 +1046,131 @@ def test_reference_bank_is_all_ten_oof_full_outer_and_no_copy(
         for path in execution_root.rglob("*.npy")
     }
     assert after_stats == source_stats
+
+
+def test_single_family_registrations_may_omit_redundant_family(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    execution_root, plan, execution_manifest = _write_execution(
+        tmp_path,
+        single_family_registrations_omit_family=True,
+    )
+    _trust_test_execution(monkeypatch, execution_manifest)
+
+    for owner in plan.physical_scopes:
+        for component in ("htr", "matched_pair", "neural_query"):
+            terminal = json.loads(
+                (
+                    execution_root
+                    / "components"
+                    / owner.scope_id
+                    / component
+                    / "execution_manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            assert terminal["logical_views"]
+            assert all(
+                "family" not in registration
+                for registration in terminal["logical_views"]
+            )
+
+    bank = reference_module.publish_role_neutral_direct_numerical_reference_bank(
+        root=(tmp_path / "reference_bank").resolve(),
+        execution_root=execution_root,
+        plan=plan,
+        execution_manifest=execution_manifest,
+    )
+
+    assert {
+        row["source_family"] for row in bank.manifest["family_coverage"]
+    } == set(ACTIVE_STAGE1_CONCEPT_FAMILIES)
+
+
+def test_multifamily_registration_without_family_still_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    execution_root, plan, execution_manifest = _write_execution(tmp_path)
+    owner = plan.physical_scopes[0]
+    terminal_path = (
+        execution_root
+        / "components"
+        / owner.scope_id
+        / "bow"
+        / "execution_manifest.json"
+    )
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    registration = next(
+        row
+        for row in terminal["logical_views"]
+        if row.get("family") == BOW_NUISANCE
+    )
+    registration.pop("family")
+    _write_json(
+        terminal_path,
+        _closed(
+            {
+                key: value
+                for key, value in terminal.items()
+                if key != "content_sha256"
+            }
+        ),
+    )
+    _trust_test_execution(monkeypatch, execution_manifest)
+
+    with pytest.raises(
+        ValueError,
+        match="bow_nuisance has no unique logical view",
+    ):
+        reference_module.publish_role_neutral_direct_numerical_reference_bank(
+            root=(tmp_path / "reference_bank").resolve(),
+            execution_root=execution_root,
+            plan=plan,
+            execution_manifest=execution_manifest,
+        )
+
+
+def test_duplicate_inferred_single_family_registration_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    execution_root, plan, execution_manifest = _write_execution(
+        tmp_path,
+        single_family_registrations_omit_family=True,
+    )
+    owner = plan.physical_scopes[0]
+    terminal_path = (
+        execution_root
+        / "components"
+        / owner.scope_id
+        / "htr"
+        / "execution_manifest.json"
+    )
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    terminal["logical_views"].append(dict(terminal["logical_views"][0]))
+    _write_json(
+        terminal_path,
+        _closed(
+            {
+                key: value
+                for key, value in terminal.items()
+                if key != "content_sha256"
+            }
+        ),
+    )
+    _trust_test_execution(monkeypatch, execution_manifest)
+
+    with pytest.raises(
+        ValueError,
+        match="htr_neural has no unique logical view",
+    ):
+        reference_module.publish_role_neutral_direct_numerical_reference_bank(
+            root=(tmp_path / "reference_bank").resolve(),
+            execution_root=execution_root,
+            plan=plan,
+            execution_manifest=execution_manifest,
+        )
 
 
 def test_gate_only_view_uses_cumulative_primary_and_rejects_context_oof(

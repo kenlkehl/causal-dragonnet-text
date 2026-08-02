@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from argparse import Namespace
 from pathlib import Path
 
@@ -16,12 +17,9 @@ def _module():
     return module
 
 
-def test_cloud_profile_compiles_eight_disjoint_lanes_deterministically(
-    tmp_path: Path,
-) -> None:
-    module = _module()
+def _args(tmp_path: Path) -> Namespace:
     root = Path.cwd().resolve()
-    args = Namespace(
+    return Namespace(
         base=root
         / "example_configs/portable_all_evidence_deployment_nsclc.stage1-only.example.json",
         target=tmp_path / "deployment.json",
@@ -54,6 +52,13 @@ def test_cloud_profile_compiles_eight_disjoint_lanes_deterministically(
         ),
     )
 
+
+def test_cloud_profile_compiles_eight_disjoint_lanes_deterministically(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    args = _args(tmp_path)
+
     first = module.build_profile(args)
     first_bytes = args.target.read_bytes()
     second = module.build_profile(args)
@@ -82,4 +87,58 @@ def test_cloud_profile_compiles_eight_disjoint_lanes_deterministically(
 
     changed = Namespace(**{**vars(args), "cpu_budget": 63})
     with pytest.raises(ValueError, match="existing current deployment profile differs"):
+        module.build_profile(changed)
+
+
+def test_cloud_profile_reuses_matching_legacy_profile_for_resume(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    args = _args(tmp_path)
+    module.build_profile(args)
+    legacy = json.loads(args.target.read_text(encoding="utf-8"))
+    legacy["schema_version"] = (
+        "portable_all_evidence_deployment_profile_v9"
+    )
+    legacy_stage1 = legacy["stage1_execution"]
+    legacy_stage1["schema_version"] = (
+        "portable_stage1_execution_profile_v8"
+    )
+    legacy_stage1.pop("owner_capacity_policy")
+    legacy_bytes = (
+        json.dumps(legacy, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    args.target.write_bytes(legacy_bytes)
+
+    resumed = module.build_profile(args)
+
+    assert args.target.read_bytes() == legacy_bytes
+    assert resumed.stage1_execution.owner_capacity_policy.mode == "fixed"
+
+
+def test_cloud_profile_rejects_changed_inputs_against_legacy_profile(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    args = _args(tmp_path)
+    module.build_profile(args)
+    legacy = json.loads(args.target.read_text(encoding="utf-8"))
+    legacy["schema_version"] = (
+        "portable_all_evidence_deployment_profile_v9"
+    )
+    legacy_stage1 = legacy["stage1_execution"]
+    legacy_stage1["schema_version"] = (
+        "portable_stage1_execution_profile_v8"
+    )
+    legacy_stage1.pop("owner_capacity_policy")
+    args.target.write_text(
+        json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    changed = Namespace(**{**vars(args), "embedding_batch_size": 7})
+    with pytest.raises(
+        ValueError,
+        match="existing current deployment profile differs",
+    ):
         module.build_profile(changed)

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 
-# Fresh five-confounder/five-modifier Stage 1 production launcher.
+# Resumable five-confounder/five-modifier Stage 1 production launcher.
 #
-# This launcher starts from scratch in unique durable and scratch roots. It
-# does not inspect, stop, adopt, delete, or overwrite any prior run. Stop an
-# older launcher first, then run, for example:
+# With no RUN_TAG this launcher starts from scratch under a unique name. An
+# explicit RUN_TAG reopens an interrupted run at its sealed boundaries when
+# its immutable request exists; otherwise it safely retries an interrupted
+# pre-initialization launch. It never adopts, deletes, or overwrites another
+# run. Stop an older launcher first, then run, for example:
 #
 #   GPU_LIST=0,1,2,3 \
 #   ./run_five_conf_five_mod_local_parallel.sh
@@ -22,7 +24,7 @@
 #
 # Useful overrides:
 #
-#   RUN_TAG                         unique filesystem-safe run name
+#   RUN_TAG                         filesystem-safe new or existing run name
 #   GPU_LIST                       comma-separated physical GPU indices
 #   SCOPE_WORKERS_PER_DEVICE       hard owner-lane ceiling per GPU (default 4)
 #   MAX_PARALLEL_OWNERS            hard global owner ceiling (default GPUs * ceiling)
@@ -106,7 +108,13 @@ device_memory_reserve_bytes="${STAGE1_DEVICE_MEMORY_RESERVE_BYTES:-6442450944}"
 estimated_host_owner_bytes="${STAGE1_ESTIMATED_HOST_MEMORY_BYTES_PER_OWNER:-8589934592}"
 host_memory_budget_fraction="${STAGE1_HOST_MEMORY_BUDGET_FRACTION:-0.75}"
 minimum_cpu_threads_per_owner="${STAGE1_MINIMUM_CPU_THREADS_PER_OWNER:-1}"
-run_tag="${RUN_TAG:-five_conf_five_mod_parallel_$(date +%Y%m%dT%H%M%S)}"
+if [[ -n "${RUN_TAG:-}" ]]; then
+    run_tag_was_supplied=1
+    run_tag="${RUN_TAG}"
+else
+    run_tag_was_supplied=0
+    run_tag="five_conf_five_mod_parallel_$(date +%Y%m%dT%H%M%S)"
+fi
 
 [[ "${run_tag}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
     || fail "RUN_TAG must contain only letters, digits, dot, underscore, and dash"
@@ -189,15 +197,44 @@ deployment_profile="${profile_root}/${run_tag}.json"
 log_path="${log_root}/${run_tag}.log"
 mpl_root="${scratch_root}/matplotlib"
 
-for fresh_path in \
-    "${durable_root}" \
-    "${scratch_root}" \
-    "${snapshot_root}" \
-    "${deployment_profile}" \
-    "${log_path}"; do
-    [[ ! -e "${fresh_path}" && ! -L "${fresh_path}" ]] \
-        || fail "fresh run path already exists: ${fresh_path}"
+run_paths=(
+    "${durable_root}"
+    "${scratch_root}"
+    "${snapshot_root}"
+    "${deployment_profile}"
+    "${log_path}"
+)
+if (( ! run_tag_was_supplied )); then
+    for fresh_path in "${run_paths[@]}"; do
+        [[ ! -e "${fresh_path}" && ! -L "${fresh_path}" ]] \
+            || fail "fresh run path already exists: ${fresh_path}"
+    done
+fi
+
+for existing_directory in "${scratch_root}" "${snapshot_root}"; do
+    if [[ -e "${existing_directory}" || -L "${existing_directory}" ]]; then
+        [[ -d "${existing_directory}" && ! -L "${existing_directory}" ]] \
+            || fail "run directory is not one real directory: ${existing_directory}"
+    fi
 done
+for existing_file in "${deployment_profile}" "${log_path}"; do
+    if [[ -e "${existing_file}" || -L "${existing_file}" ]]; then
+        [[ -f "${existing_file}" && ! -L "${existing_file}" ]] \
+            || fail "run file is not one real regular file: ${existing_file}"
+    fi
+done
+
+resume_arguments=()
+if [[ -e "${durable_root}" || -L "${durable_root}" ]]; then
+    (( run_tag_was_supplied )) \
+        || fail "fresh durable run root already exists: ${durable_root}"
+    [[ -d "${durable_root}" && ! -L "${durable_root}" ]] \
+        || fail "durable run root is not one real directory: ${durable_root}"
+    require_file "${durable_root}/immutable_run_request.json"
+    require_directory "${snapshot_root}"
+    require_file "${deployment_profile}"
+    resume_arguments=(--resume)
+fi
 
 mkdir -p \
     "${run_root_base}" \
@@ -220,12 +257,17 @@ from pathlib import Path
 
 from oci.inference.production_source_snapshot import (
     create_production_source_snapshot,
+    validate_production_source_snapshot,
 )
 
-snapshot = create_production_source_snapshot(
-    repository_root=Path(os.environ["REPOSITORY"]),
-    target_dir=Path(os.environ["SNAPSHOT"]),
-)
+target = Path(os.environ["SNAPSHOT"])
+if target.exists() or target.is_symlink():
+    snapshot = validate_production_source_snapshot(target)
+else:
+    snapshot = create_production_source_snapshot(
+        repository_root=Path(os.environ["REPOSITORY"]),
+        target_dir=target,
+    )
 print(snapshot.content_sha256)
 PY
 } | tail -n 1)"
@@ -293,6 +335,11 @@ note "scratch root: ${scratch_root}"
 note "source snapshot: ${snapshot_root} (${snapshot_identity})"
 note "deployment profile: ${deployment_profile}"
 note "log: ${log_path}"
+if (( ${#resume_arguments[@]} )); then
+    note "resume: authenticated durable request will reopen at sealed boundaries"
+else
+    note "resume: starting a new durable request"
+fi
 
 note "checking selected GPUs and logical remapping"
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -370,6 +417,7 @@ setsid nice -n "${LOCAL_NICE_LEVEL:-5}" env \
     --validation-depth fresh_terminal_audit \
     --log-level INFO \
     --stage1-only \
+    "${resume_arguments[@]}" \
     > >(tee -a "${log_path}") 2>&1 &
 active_pid="$!"
 

@@ -45,6 +45,9 @@ def test_local_parallel_launcher_enables_production_capacity_autodetection(
     ):
         assert option in launcher
     assert "stage1_owner_capacity_attestation" in launcher
+    assert "validate_production_source_snapshot" in launcher
+    assert "resume_arguments=(--resume)" in launcher
+    assert '"${resume_arguments[@]}"' in launcher
 
 
 def _args(
@@ -53,6 +56,7 @@ def _args(
     target: Path,
     durable: Path,
     devices: tuple[str, ...],
+    host_memory_budget_fraction: str | None = None,
 ) -> argparse.Namespace:
     parser = _builder().build_parser()
     values = [
@@ -93,6 +97,13 @@ def _args(
         "--gpu-minimum-free-fraction",
         "0.90",
     ]
+    if host_memory_budget_fraction is not None:
+        values.extend(
+            (
+                "--host-memory-budget-fraction",
+                host_memory_budget_fraction,
+            )
+        )
     for device in devices:
         values.extend(("--device", device))
     return parser.parse_args(values)
@@ -160,6 +171,26 @@ def test_local_profile_rejects_owner_cap_above_resource_capacity(
 
     with pytest.raises(ValueError, match="device or CPU capacity"):
         module.build_profile(args)
+
+
+def test_local_profile_accepts_full_host_memory_budget_fraction(
+    tmp_path: Path,
+) -> None:
+    profile = _builder().build_profile(
+        _args(
+            tmp_path=tmp_path,
+            target=tmp_path / "profile.json",
+            durable=tmp_path / "run",
+            devices=("cuda:0",),
+            host_memory_budget_fraction="1.0",
+        )
+    )
+
+    assert (
+        profile.stage1_execution.owner_capacity_policy
+        .host_memory_budget_fraction
+        == 1.0
+    )
 
 
 def test_local_policy_allows_occupant_at_ninety_percent_free(

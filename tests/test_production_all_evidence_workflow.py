@@ -4282,13 +4282,13 @@ def test_typed_production_compiler_autodetects_owner_lanes_and_reports_them(
         )
     )
 
-    assert parsed.stage1_scope_workers_per_gpu == 3
+    assert parsed.stage1_scope_workers_per_gpu == 4
     assert parsed.stage1_execution_profile is not None
     assert parsed.stage1_execution_profile.max_parallel_owners == 6
     attestation = parsed.stage1_owner_capacity_attestation
     assert attestation is not None
     assert attestation["host_owner_lane_cap"] == 6
-    assert attestation["effective_scope_workers_per_device"] == 3
+    assert attestation["effective_scope_workers_per_device"] == 4
     workflow = ProductionAllEvidenceWorkflow(parsed)
     workflow._write_progress(
         status="initialized",
@@ -4301,7 +4301,7 @@ def test_typed_production_compiler_autodetects_owner_lanes_and_reports_them(
         )
     )
     assert progress["stage1_owner_capacity_attestation"] == attestation
-    assert progress["stage1_scope_workers_per_gpu"] == 3
+    assert progress["stage1_scope_workers_per_gpu"] == 4
 
 
 @pytest.mark.parametrize(

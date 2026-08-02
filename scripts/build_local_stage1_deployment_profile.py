@@ -41,6 +41,23 @@ def _free_fraction(value: str) -> Decimal:
     return parsed
 
 
+def _budget_fraction(value: str) -> Decimal:
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(
+            "expected a decimal host-memory budget fraction"
+        ) from exc
+    if (
+        not parsed.is_finite()
+        or not Decimal("0") < parsed <= Decimal("1")
+    ):
+        raise argparse.ArgumentTypeError(
+            "host-memory budget fraction must be in (0, 1]"
+        )
+    return parsed
+
+
 def _devices(values: Iterable[str]) -> tuple[str, ...]:
     devices = tuple(str(value) for value in values)
     if (
@@ -286,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--host-memory-budget-fraction",
-        type=_free_fraction,
+        type=_budget_fraction,
         default=Decimal("0.75"),
     )
     parser.add_argument(

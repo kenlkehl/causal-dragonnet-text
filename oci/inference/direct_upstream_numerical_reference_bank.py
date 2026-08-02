@@ -878,6 +878,11 @@ def _logical_view(
     registrations = terminal.get("logical_views")
     if not isinstance(registrations, list):
         raise ValueError("component terminal lacks logical-view registrations")
+    component = _FAMILY_COMPONENT.get(family)
+    single_family_registration = (
+        component is not None
+        and _COMPONENT_FAMILIES.get(component) == (family,)
+    )
     matches = [
         row
         for row in registrations
@@ -886,7 +891,7 @@ def _logical_view(
         and (
             row.get("family") == family
             or (
-                family == NEURAL_QUERY_MOMENTS
+                single_family_registration
                 and row.get("family") is None
             )
         )

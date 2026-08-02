@@ -295,13 +295,56 @@ def test_runtime_owner_capacity_autodetects_vram_host_and_cpu_caps() -> None:
         resource_plan=plan,
         host_available_memory_bytes=128 * gib,
     )
-    assert host_limited.scope_workers_per_device == 1
-    assert host_limited.max_parallel_owners == 8
+    assert host_limited.scope_workers_per_device == 4
+    assert host_limited.max_parallel_owners == 12
     assert host_attestation["host_owner_lane_cap"] == 12
     assert (
         host_limited.preflight_execution_policy.max_parallel_owners
         == 8
     )
+
+
+def test_runtime_owner_capacity_allows_global_cap_below_device_count() -> None:
+    gib = 1024**3
+    configured = stage1_execution_profile(
+        resource_kind="accelerator",
+        device_count=4,
+        scope_workers_per_device=4,
+        max_parallel_owners=2,
+    )
+    inventory = ResourceInventory(
+        cpu_count=16,
+        gpus=tuple(
+            GPUResource(
+                device=f"cuda:{index}",
+                uuid=f"gpu-{index}",
+                total_memory_bytes=96 * gib,
+                free_memory_bytes=96 * gib,
+                utilization_percent=0.0,
+            )
+            for index in range(4)
+        ),
+    )
+    plan = ResourcePlan(
+        devices=tuple(f"cuda:{index}" for index in range(4)),
+        cpu_budget=16,
+        inventory=inventory,
+        policy=("auto",),
+        resource_performance_safety=_resource_safety(
+            maximum_allocation_fraction=0.85,
+        ),
+    )
+
+    effective, attestation = resolve_stage1_owner_capacity(
+        profile=configured,
+        resource_plan=plan,
+        host_available_memory_bytes=512 * gib,
+    )
+
+    assert effective.scope_workers_per_device == 4
+    assert effective.max_parallel_owners == 2
+    assert attestation["topology_owner_lane_cap"] == 16
+    assert attestation["effective_max_parallel_owners"] == 2
 
 
 def test_runtime_owner_capacity_uses_smallest_selected_gpu_and_fixed_fallback() -> None:

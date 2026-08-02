@@ -14,6 +14,49 @@ from oci.inference.portable_workflow_spec import DeploymentProfile
 GPU_COUNT = 8
 
 
+def _matches_legacy_profile_without_owner_capacity(
+    *,
+    existing: object,
+    candidate: dict[str, object],
+) -> bool:
+    """Compare the last pre-capacity schema with its current equivalent."""
+
+    if not isinstance(existing, dict):
+        return False
+    existing_stage1 = existing.get("stage1_execution")
+    candidate_stage1 = candidate.get("stage1_execution")
+    if (
+        existing.get("schema_version")
+        != "portable_all_evidence_deployment_profile_v9"
+        or not isinstance(existing_stage1, dict)
+        or existing_stage1.get("schema_version")
+        != "portable_stage1_execution_profile_v8"
+        or "owner_capacity_policy" in existing_stage1
+        or not isinstance(candidate_stage1, dict)
+    ):
+        return False
+
+    normalized_existing = dict(existing)
+    normalized_existing_stage1 = dict(existing_stage1)
+    normalized_existing["schema_version"] = candidate.get(
+        "schema_version"
+    )
+    normalized_existing_stage1["schema_version"] = (
+        candidate_stage1.get("schema_version")
+    )
+    normalized_existing["stage1_execution"] = (
+        normalized_existing_stage1
+    )
+
+    normalized_candidate = dict(candidate)
+    normalized_candidate_stage1 = dict(candidate_stage1)
+    normalized_candidate_stage1.pop("owner_capacity_policy", None)
+    normalized_candidate["stage1_execution"] = (
+        normalized_candidate_stage1
+    )
+    return normalized_existing == normalized_candidate
+
+
 def build_profile(args: argparse.Namespace) -> DeploymentProfile:
     profile = json.loads(args.base.read_text(encoding="utf-8"))
     profile.update(
@@ -106,6 +149,7 @@ def build_profile(args: argparse.Namespace) -> DeploymentProfile:
         json.dumps(profile, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     ).encode("utf-8")
     args.target.parent.mkdir(parents=True, exist_ok=True)
+    reused_legacy_profile = False
     try:
         descriptor = os.open(
             args.target,
@@ -113,18 +157,43 @@ def build_profile(args: argparse.Namespace) -> DeploymentProfile:
             0o600,
         )
     except FileExistsError:
-        if args.target.read_bytes() != encoded:
-            raise ValueError(
-                "existing current deployment profile differs; choose fresh "
-                "run and scratch roots"
-            )
+        existing_bytes = args.target.read_bytes()
+        if existing_bytes == encoded:
+            pass
+        else:
+            compiled_existing = DeploymentProfile.from_json(args.target)
+            try:
+                existing_mapping = json.loads(
+                    existing_bytes.decode("utf-8")
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "existing current deployment profile is invalid"
+                ) from exc
+            if not _matches_legacy_profile_without_owner_capacity(
+                existing=existing_mapping,
+                candidate=profile,
+            ):
+                raise ValueError(
+                    "existing current deployment profile differs; choose "
+                    "fresh run and scratch roots"
+                )
+            # Keep the authenticated v9 bytes in place. Loading them applies
+            # the supported fixed-capacity migration without rewriting the
+            # deployment profile named by an interrupted run.
+            reused_legacy_profile = True
+            compiled = compiled_existing
     else:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
 
-    compiled = DeploymentProfile.from_json(args.target)
+    if not reused_legacy_profile:
+        compiled = DeploymentProfile.from_json(args.target)
+    expected_capacity_mode = (
+        "fixed" if reused_legacy_profile else "resource_autodetect"
+    )
     execution = compiled.stage1_execution
     if (
         tuple(compiled.devices)
@@ -134,7 +203,7 @@ def build_profile(args: argparse.Namespace) -> DeploymentProfile:
         != int(args.max_workers_per_device)
         or execution.max_parallel_owners != owner_ceiling
         or execution.owner_capacity_policy.mode
-        != "resource_autodetect"
+        != expected_capacity_mode
         or execution.htr_operational_controls.fold_parallelism != 1
         or execution.htr_operational_controls.fold_slots_per_device != 1
         or execution.htr_operational_controls.sentence_encoder_batch_size != 16

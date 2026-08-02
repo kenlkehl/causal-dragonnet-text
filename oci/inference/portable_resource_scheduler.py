@@ -560,19 +560,14 @@ def resolve_stage1_owner_capacity(
         == ONE_CONTEXT_PER_SELECTED_DEVICE
     ):
         device_count = len(selected)
+        # This topology provisions an equal persistent context capacity on
+        # every selected device. Global host/CPU/configured owner caps limit
+        # how many of those owners may be active; they do not require at least
+        # one concurrently active owner on every device.
         uniform_workers = min(
             int(profile.scope_workers_per_device),
             int(device_lane_cap),
-            int(host_owner_cap) // device_count,
-            int(cpu_owner_cap) // device_count,
-            int(profile.max_parallel_owners) // device_count,
         )
-        if uniform_workers < 1:
-            raise RuntimeError(
-                "Stage 1 capacity autodetection cannot provision one "
-                "uniform lane on every selected device; select fewer "
-                "devices or increase the host budget"
-            )
         topology_owner_cap = device_count * uniform_workers
     else:
         uniform_workers = min(
