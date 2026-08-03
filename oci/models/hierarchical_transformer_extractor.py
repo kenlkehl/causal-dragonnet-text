@@ -103,6 +103,190 @@ def split_text_into_word_chunks(
     return chunks
 
 
+def split_text_to_token_bounded_chunks(
+    text: str,
+    tokenizer: Any,
+    max_chunk_length: int,
+) -> List[str]:
+    """Losslessly subdivide one word chunk to fit the encoder token limit.
+
+    Word counts are only a heuristic for subword-token counts.  In particular,
+    a long run of a non-whitespace character is one word but can be tens of
+    thousands of tokenizer tokens.  This secondary planner partitions the
+    original string without dropping any characters and verifies every
+    resulting chunk with the same non-truncating tokenizer call used by HTR.
+
+    Fast tokenizers provide offsets that let us make near-capacity partitions.
+    Slow tokenizers fall back to exact character bisection.  Bisection may make
+    more chunks, but it retains the source text exactly and always terminates
+    unless the configured limit cannot encode even a single character.
+    """
+    if tokenizer is None:
+        raise ValueError("tokenizer is required for token-bounded HTR chunking")
+    if max_chunk_length <= 0:
+        raise ValueError("max_chunk_length must be positive")
+
+    source = str(text or "")
+    if _htr_tokenized_length(tokenizer, source) <= int(max_chunk_length):
+        return [source]
+
+    offset_chunks = _htr_chunks_from_fast_tokenizer_offsets(
+        source,
+        tokenizer,
+        int(max_chunk_length),
+    )
+    candidates = offset_chunks if offset_chunks is not None else [source]
+    bounded: List[str] = []
+    for candidate in candidates:
+        bounded.extend(
+            _bisect_htr_chunk_to_token_limit(
+                candidate,
+                tokenizer,
+                int(max_chunk_length),
+            )
+        )
+    if "".join(bounded) != source:
+        raise RuntimeError("HTR token-bounded chunk planner changed source text")
+    return bounded or [""]
+
+
+def _htr_tokenized_length(tokenizer: Any, text: str) -> int:
+    encoded = tokenizer(
+        str(text or ""),
+        padding=False,
+        truncation=False,
+    )
+    input_ids = encoded.get("input_ids")
+    if input_ids is None:
+        raise ValueError("HTR tokenizer response omitted input_ids")
+    if input_ids and isinstance(input_ids[0], (list, tuple)):
+        if len(input_ids) != 1:
+            raise ValueError("HTR tokenizer changed one chunk into multiple rows")
+        input_ids = input_ids[0]
+    return len(input_ids)
+
+
+def _htr_num_special_tokens(tokenizer: Any) -> int:
+    counter = getattr(tokenizer, "num_special_tokens_to_add", None)
+    if callable(counter):
+        try:
+            return max(0, int(counter(pair=False)))
+        except TypeError:
+            return max(0, int(counter(False)))
+    return _htr_tokenized_length(tokenizer, "")
+
+
+def _htr_chunks_from_fast_tokenizer_offsets(
+    text: str,
+    tokenizer: Any,
+    max_chunk_length: int,
+) -> Optional[List[str]]:
+    content_limit = int(max_chunk_length) - _htr_num_special_tokens(tokenizer)
+    if content_limit < 1:
+        return None
+    try:
+        encoded = tokenizer(
+            text,
+            add_special_tokens=False,
+            padding=False,
+            truncation=False,
+            return_offsets_mapping=True,
+        )
+    except (NotImplementedError, TypeError, ValueError):
+        return None
+    input_ids = encoded.get("input_ids")
+    offsets = encoded.get("offset_mapping")
+    if input_ids is None or offsets is None:
+        return None
+    if input_ids and isinstance(input_ids[0], (list, tuple)):
+        if len(input_ids) != 1 or len(offsets) != 1:
+            return None
+        input_ids = input_ids[0]
+        offsets = offsets[0]
+    if len(input_ids) <= content_limit or len(offsets) != len(input_ids):
+        return None
+
+    chunks: List[str] = []
+    cursor = 0
+    for token_start in range(content_limit, len(input_ids), content_limit):
+        try:
+            boundary = int(offsets[token_start][0])
+        except (IndexError, TypeError, ValueError):
+            return None
+        if boundary <= cursor or boundary >= len(text):
+            return None
+        chunks.append(text[cursor:boundary])
+        cursor = boundary
+    chunks.append(text[cursor:])
+    if any(chunk == "" for chunk in chunks) or "".join(chunks) != text:
+        return None
+    return chunks
+
+
+def _bisect_htr_chunk_to_token_limit(
+    text: str,
+    tokenizer: Any,
+    max_chunk_length: int,
+) -> List[str]:
+    pending = [str(text or "")]
+    bounded: List[str] = []
+    while pending:
+        candidate = pending.pop()
+        token_count = _htr_tokenized_length(tokenizer, candidate)
+        if token_count <= int(max_chunk_length):
+            bounded.append(candidate)
+            continue
+        if len(candidate) <= 1:
+            raise SemanticTruncationError(
+                "HTR max_chunk_length cannot encode one source character; "
+                "lossless chunking is impossible and semantic truncation is forbidden "
+                f"({token_count} > {int(max_chunk_length)})"
+            )
+        boundary = len(candidate) // 2
+        left = candidate[:boundary]
+        right = candidate[boundary:]
+        # Stack order preserves the source order in the result.
+        pending.append(right)
+        pending.append(left)
+    return bounded
+
+
+def _htr_chunks_for_text(
+    text: str,
+    *,
+    chunk_size_words: int,
+    chunk_overlap_words: int,
+    max_chunks: int,
+    tokenizer: Optional[Any],
+    max_chunk_length: int,
+) -> List[str]:
+    word_chunks = split_text_into_word_chunks(
+        text,
+        chunk_size_words,
+        chunk_overlap_words,
+        max_chunks,
+    )
+    if tokenizer is None:
+        return word_chunks
+    chunks = [
+        bounded
+        for word_chunk in word_chunks
+        for bounded in split_text_to_token_bounded_chunks(
+            word_chunk,
+            tokenizer,
+            max_chunk_length,
+        )
+    ]
+    if len(chunks) > max_chunks:
+        raise SemanticTruncationError(
+            "HierarchicalTransformer token-bounded note requires "
+            f"{len(chunks)} chunks but configured max_chunks={max_chunks}; "
+            "semantic truncation is forbidden. Increase max_chunks so the "
+            "capacity is nonbinding."
+        )
+    return chunks or [""]
+
+
 class HierarchicalTransformerBatchPreprocessor:
     """CPU-only chunking/tokenization helper for DataLoader collators."""
 
@@ -149,11 +333,15 @@ class HierarchicalTransformerBatchPreprocessor:
             key = str(text or "")
             chunks = self._chunk_cache.get(key)
             if chunks is None:
-                chunks = split_text_into_word_chunks(
+                chunks = _htr_chunks_for_text(
                     key,
-                    self._chunk_size_words,
-                    self._chunk_overlap_words,
-                    self._max_chunks,
+                    chunk_size_words=self._chunk_size_words,
+                    chunk_overlap_words=self._chunk_overlap_words,
+                    max_chunks=self._max_chunks,
+                    tokenizer=(
+                        self._tokenizer if self._tokenize_for_transformers else None
+                    ),
+                    max_chunk_length=self._max_chunk_length,
                 )
                 if len(self._chunk_cache) < self._chunk_cache_max_entries:
                     self._chunk_cache[key] = chunks
@@ -1690,11 +1878,17 @@ class HierarchicalTransformerExtractor(nn.Module):
             key = str(text or "")
             chunks = self._chunk_cache.get(key)
             if chunks is None:
-                chunks = split_text_into_word_chunks(
+                chunks = _htr_chunks_for_text(
                     key,
-                    self._chunk_size_words,
-                    self._chunk_overlap_words,
-                    self._max_chunks,
+                    chunk_size_words=self._chunk_size_words,
+                    chunk_overlap_words=self._chunk_overlap_words,
+                    max_chunks=self._max_chunks,
+                    tokenizer=(
+                        self._tokenizer
+                        if self._effective_sentence_encoder_backend() == "transformers"
+                        else None
+                    ),
+                    max_chunk_length=self._max_chunk_length,
                 )
                 if len(self._chunk_cache) < self._chunk_cache_max_entries:
                     self._chunk_cache[key] = chunks
@@ -1867,6 +2061,11 @@ class HierarchicalTransformerExtractor(nn.Module):
             if isinstance(texts, str):
                 texts = [texts]
             texts = list(texts)
+            if (
+                not self._hash_backend
+                and self._effective_sentence_encoder_backend() == "transformers"
+            ):
+                self._ensure_encoder_initialized()
             batch_chunks = self._chunks_for_texts(texts)
         if not texts:
             features = torch.zeros(0, self._projection_dim, device=self._device)
@@ -2001,8 +2200,8 @@ class HierarchicalTransformerExtractor(nn.Module):
         return output
 
     def fit_tokenizer(self, texts: List[str]) -> None:
-        self._populate_chunk_cache(texts)
         self._ensure_encoder_initialized()
+        self._populate_chunk_cache(texts)
         logger.info(
             "HierarchicalTransformerExtractor ready: backend=%s pooling=%s "
             "role_attention=%s W_heads=%s X_heads=%s device=%s "

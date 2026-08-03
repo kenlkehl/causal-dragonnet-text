@@ -389,10 +389,29 @@ def _split_value(value: Any, *, max_chars: int, path: str) -> list[tuple[str, An
             output.append((f"{path}[{batch_start}:{len(value)}]", batch))
         return output
     text = str(value)
-    return [
-        (f"{path}.text_segment_{index + 1:03d}", text[start : start + max_chars])
-        for index, start in enumerate(range(0, len(text), max_chars))
-    ]
+    segments: list[tuple[str, Any]] = []
+    cursor = 0
+    while cursor < len(text):
+        low, high = cursor + 1, len(text)
+        best = cursor
+        while low <= high:
+            end = (low + high) // 2
+            if _json_chars(text[cursor:end]) <= max_chars:
+                best = end
+                low = end + 1
+            else:
+                high = end - 1
+        if best == cursor:
+            raise ValueError(
+                "max_packet_chars cannot encode one source character as JSON"
+            )
+        segments.append(
+            (f"{path}.text_segment_{len(segments) + 1:03d}", text[cursor:best])
+        )
+        cursor = best
+    if "".join(str(segment) for _path, segment in segments) != text:
+        raise RuntimeError("Stage 2 scalar packetization changed source text")
+    return segments
 
 
 def packetize_handoff(
@@ -410,14 +429,40 @@ def packetize_handoff(
             _row_sections(row), start=1
         ):
             section = _scientific_projection(raw_section)
+            prototype = {
+                "packet_id": (
+                    f"outer_{outer_fold:03d}_row_{row_index:04d}_"
+                    f"section_{section_index:02d}_part_000000"
+                ),
+                "source": str(row.get("source") or "unknown"),
+                "architecture": str(architecture),
+                "outer_fold": outer_fold,
+                "inner_fold": row.get("inner_fold"),
+                "scope": str(row.get("scope") or "unspecified"),
+                "json_path": f"{section_path}.text_segment_000000",
+                "observable_axes": [
+                    "matched_pair",
+                    "outcome",
+                    "residual_effect",
+                    "semantic",
+                    "treatment",
+                    "unclear",
+                ],
+                "content": "",
+            }
+            wrapper_chars = _json_chars(prototype) - _json_chars("")
+            content_budget = int(max_packet_chars) - wrapper_chars
+            if content_budget < 1:
+                raise ValueError(
+                    "max_packet_chars is too small for the Stage 2 packet envelope"
+                )
             fragments = _split_value(
                 section,
-                max_chars=max_packet_chars,
+                max_chars=content_budget,
                 path=section_path,
             )
             for fragment_index, (json_path, content) in enumerate(fragments, start=1):
-                packets.append(
-                    {
+                packet = {
                         "packet_id": (
                             f"outer_{outer_fold:03d}_row_{row_index:04d}_"
                             f"section_{section_index:02d}_part_{fragment_index:03d}"
@@ -437,7 +482,11 @@ def packetize_handoff(
                         ),
                         "content": content,
                     }
-                )
+                if _json_chars(packet) > int(max_packet_chars):
+                    raise RuntimeError(
+                        "Stage 2 packet planner emitted an oversized packet"
+                    )
+                packets.append(packet)
     if not packets:
         raise ValueError("the Stage 1 handoff contains no evidence packets")
     return packets
@@ -486,11 +535,18 @@ def _openai_completion(
     kwargs["extra_body"] = {
         "chat_template_kwargs": {"enable_thinking": config.enable_thinking}
     }
+    prompt_chars = sum(len(str(message.get("content") or "")) for message in messages)
+    if prompt_chars > int(config.max_prompt_chars):
+        raise ValueError(
+            "Stage 2 rendered prompt exceeds max_prompt_chars; the caller must "
+            f"partition it losslessly before transport ({prompt_chars} > "
+            f"{config.max_prompt_chars})"
+        )
     LOGGER.info(
         "Stage 2 request endpoint=%s model=%s prompt_chars=%s",
         config.endpoint,
         config.model,
-        sum(len(message.get("content", "")) for message in messages),
+        prompt_chars,
     )
     response = client.chat.completions.create(**kwargs)
     content = response.choices[0].message.content
@@ -519,6 +575,14 @@ def _request_json(
     conversation = [dict(message) for message in messages]
     first_error: Exception | None = None
     for attempt in range(2):
+        prompt_chars = sum(
+            len(str(message.get("content") or "")) for message in conversation
+        )
+        if prompt_chars > int(config.max_prompt_chars):
+            raise ValueError(
+                "Stage 2 rendered prompt exceeds max_prompt_chars before transport "
+                f"({prompt_chars} > {config.max_prompt_chars})"
+            )
         try:
             return validate(_parse_json_object(completion(conversation, config)))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:

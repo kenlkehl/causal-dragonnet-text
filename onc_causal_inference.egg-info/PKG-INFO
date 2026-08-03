@@ -550,6 +550,13 @@ simultaneous context processes is the smaller of the unfinished context count
 and `run.workers`. The text-model and neural-query components also treat each
 outer/full or exact-inner discovery context as an independent job.
 
+Thread pools are retained where they have different semantics: concurrent
+endpoint requests, work assigned to distinct GPU devices, and nested
+scikit-learn fits inside an already isolated text-model process. These tasks
+either wait on I/O, execute outside the Python interpreter, or avoid the memory
+cost and instability of nested process pools. Python-heavy TF-IDF context work
+does not use the thread backend by default.
+
 For CUDA runs, the runner creates one fixed process lane per configured GPU and
 assigns whole contexts to those lanes. A lane remains attached to the same GPU,
 which prevents two contexts from being scheduled onto one device merely because

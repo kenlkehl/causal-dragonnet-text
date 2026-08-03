@@ -11,7 +11,7 @@ from oci.inference.plain_handoff_stage2 import (
     packetize_handoff,
     run_plain_handoff_stage2,
 )
-from oci.inference.plain_handoff_stage2_analysis import run_fold_analysis
+from oci.inference.plain_handoff_stage2_analysis import extract_rows, run_fold_analysis
 
 
 def _fake_completion(calls):
@@ -189,6 +189,99 @@ def test_mixed_tfidf_and_neural_banks_become_separate_axis_packets():
     assert axes_by_path["discovery.topic_banks.outcome"] == ["outcome", "semantic"]
     assert axes_by_path["evidence.treatment"] == ["semantic", "treatment"]
     assert axes_by_path["evidence.effect"] == ["residual_effect", "semantic"]
+
+
+def test_packetizer_losslessly_splits_json_expanding_unicode():
+    text = "漢" * 5_000
+    packets = packetize_handoff(
+        [
+            {
+                "source": "custom",
+                "outer_fold": 1,
+                "scope": "full_outer_train",
+                "evidence": {
+                    "architecture": "unicode_witnesses",
+                    "payload": text,
+                },
+            }
+        ],
+        max_packet_chars=2_000,
+    )
+
+    payload_packets = [packet for packet in packets if "payload" in packet["json_path"]]
+    assert "".join(str(packet["content"]) for packet in payload_packets) == text
+    assert all(
+        len(json.dumps(packet, separators=(",", ":"), sort_keys=True)) <= 2_000
+        for packet in packets
+    )
+
+
+def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Path):
+    note = "start " + ("漢" * 1_800) + " pretreatment ECOG 2 end"
+    dataset = pd.DataFrame({"clinical_text": [note]})
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "performance_status",
+        "description": "Baseline ECOG performance status.",
+        "value_type": "ordinal",
+        "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
+        "roles": ["confounder"],
+        "measurement_definition": "Extract the last pretreatment ECOG score.",
+        "missing_value_rule": "Return null when undocumented.",
+    }
+    page_bodies = []
+    prompt_sizes = []
+
+    def request_json(messages, validate):
+        prompt_sizes.append(sum(len(message["content"]) for message in messages))
+        body = json.loads(messages[1]["content"])
+        if body["job"] == "extract_stage2_patient_variables":
+            page_bodies.extend(body["patients"])
+            response = {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "values": {
+                            "performance_status": (
+                                "ECOG 2" if "ECOG 2" in patient["text"] else None
+                            )
+                        },
+                    }
+                    for patient in body["patients"]
+                ]
+            }
+        else:
+            assert body["job"] == "reconcile_stage2_patient_variable_pages"
+            assert [row["page_index"] for row in body["page_results"]] == list(
+                range(1, len(body["page_results"]) + 1)
+            )
+            response = {
+                "rows": [
+                    {
+                        "row_id": body["row_id"],
+                        "values": {"performance_status": "ECOG 2"},
+                    }
+                ]
+            }
+        return validate(response)
+
+    frame = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        clinical_question="Estimate treatment effect.",
+        output_dir=tmp_path / "extraction",
+        request_json=request_json,
+        workers=3,
+        batch_size=12,
+        max_prompt_chars=5_000,
+    )
+
+    ordered_pages = sorted(page_bodies, key=lambda row: row["page"]["page_index"])
+    assert "".join(row["text"] for row in ordered_pages) == note
+    assert all(size <= 5_000 for size in prompt_sizes)
+    assert frame.loc[0, "performance_status"] == "ECOG 2"
 
 
 def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):

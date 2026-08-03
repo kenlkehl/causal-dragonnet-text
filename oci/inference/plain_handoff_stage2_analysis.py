@@ -137,6 +137,54 @@ def _extraction_prompt(
     ]
 
 
+def _prompt_chars(messages: Sequence[Mapping[str, str]]) -> int:
+    """Return the exact rendered content characters sent to the endpoint."""
+
+    return sum(len(str(message.get("content") or "")) for message in messages)
+
+
+def _page_reconciliation_prompt(
+    *,
+    clinical_question: str,
+    definitions: Sequence[Mapping[str, Any]],
+    row_id: int,
+    page_results: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    body = {
+        "job": "reconcile_stage2_patient_variable_pages",
+        "clinical_question": clinical_question,
+        "rules": [
+            "Every supplied page was extracted from a lossless contiguous span of one note.",
+            "Review every page result and apply each feature's measurement and missing-value rules.",
+            "A null page does not override a supported value on another page.",
+            "Resolve multiple supported values using document order and the specified temporal or aggregation rule.",
+            "Do not invent evidence that is absent from all page results.",
+            "Return every feature exactly once for the original row_id.",
+        ],
+        "features": list(definitions),
+        "row_id": int(row_id),
+        "page_results": list(page_results),
+        "response": {
+            "rows": [
+                {
+                    "row_id": int(row_id),
+                    "values": {"every supplied feature name": "scalar value or null"},
+                }
+            ]
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You reconcile complete-note page extractions without dropping any page. "
+                "Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+    ]
+
+
 def _validate_extraction(
     value: Mapping[str, Any],
     *,
@@ -206,6 +254,112 @@ def _partition_rows(
     return output
 
 
+def _partition_rows_for_prompt(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    batch_size: int,
+    max_prompt_chars: int,
+    clinical_question: str,
+    definitions: Sequence[Mapping[str, Any]],
+) -> tuple[list[list[Mapping[str, Any]]], list[Mapping[str, Any]]]:
+    """Pack rows by their exact rendered prompt size.
+
+    Rows that cannot fit even by themselves are returned separately for
+    lossless page planning.  This avoids the old oversized-singleton hole in
+    the approximate JSON-size partitioner.
+    """
+
+    batches: list[list[Mapping[str, Any]]] = []
+    oversized: list[Mapping[str, Any]] = []
+    current: list[Mapping[str, Any]] = []
+    for row in rows:
+        singleton = _extraction_prompt(
+            clinical_question=clinical_question,
+            definitions=definitions,
+            rows=[row],
+        )
+        if _prompt_chars(singleton) > int(max_prompt_chars):
+            if current:
+                batches.append(current)
+                current = []
+            oversized.append(row)
+            continue
+        candidate = [*current, row]
+        candidate_prompt = _extraction_prompt(
+            clinical_question=clinical_question,
+            definitions=definitions,
+            rows=candidate,
+        )
+        if current and (
+            len(candidate) > max(1, int(batch_size))
+            or _prompt_chars(candidate_prompt) > int(max_prompt_chars)
+        ):
+            batches.append(current)
+            current = [row]
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches, oversized
+
+
+def _lossless_extraction_pages(
+    row: Mapping[str, Any],
+    *,
+    clinical_question: str,
+    definitions: Sequence[Mapping[str, Any]],
+    max_prompt_chars: int,
+) -> list[dict[str, Any]]:
+    """Split one note into the largest exact prompt-sized contiguous pages."""
+
+    source = str(row.get("text") or "")
+    row_id = int(row["row_id"])
+    if not source:
+        raise ValueError(
+            "an empty Stage 2 row exceeded the prompt budget before note text was added; "
+            "increase max_prompt_chars or shorten the feature definitions"
+        )
+    pages: list[dict[str, Any]] = []
+    cursor = 0
+    while cursor < len(source):
+        low = cursor + 1
+        high = len(source)
+        best: dict[str, Any] | None = None
+        while low <= high:
+            end = (low + high) // 2
+            candidate = {
+                "row_id": row_id,
+                "text": source[cursor:end],
+                "page": {
+                    "page_index": len(pages) + 1,
+                    "char_start": cursor,
+                    "char_end": end,
+                    "document_chars": len(source),
+                },
+            }
+            prompt = _extraction_prompt(
+                clinical_question=clinical_question,
+                definitions=definitions,
+                rows=[candidate],
+            )
+            if _prompt_chars(prompt) <= int(max_prompt_chars):
+                best = candidate
+                low = end + 1
+            else:
+                high = end - 1
+        if best is None:
+            raise ValueError(
+                "Stage 2 feature definitions and prompt envelope leave no room for even "
+                "one source character; increase max_prompt_chars or reduce the number of "
+                "features per analysis"
+            )
+        pages.append(best)
+        cursor = int(best["page"]["char_end"])
+    if "".join(str(page["text"]) for page in pages) != source:
+        raise RuntimeError("Stage 2 lossless page planner changed patient text")
+    return pages
+
+
 def extract_rows(
     *,
     dataset: pd.DataFrame,
@@ -240,13 +394,24 @@ def extract_rows(
         }
         for row_id in row_ids
     ]
-    definition_chars = len(json.dumps(list(definitions), sort_keys=True))
-    row_budget = max(2_000, int(max_prompt_chars) - definition_chars - 8_000)
-    batches = _partition_rows(
+    batches, oversized_rows = _partition_rows_for_prompt(
         request_rows,
         batch_size=max(1, int(batch_size)),
-        max_chars=row_budget,
+        max_prompt_chars=int(max_prompt_chars),
+        clinical_question=clinical_question,
+        definitions=definitions,
     )
+
+    page_requests: list[dict[str, Any]] = []
+    for row in oversized_rows:
+        page_requests.extend(
+            _lossless_extraction_pages(
+                row,
+                clinical_question=clinical_question,
+                definitions=definitions,
+                max_prompt_chars=int(max_prompt_chars),
+            )
+        )
 
     def run_batch(index: int, batch: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         batch_dir = output_dir / "batches" / f"batch_{index:05d}"
@@ -257,17 +422,19 @@ def extract_rows(
         batch_dir.mkdir(parents=True, exist_ok=True)
         _write_json(batch_dir / "row_ids.json", [int(row["row_id"]) for row in batch])
         result = request_json(
-            _extraction_prompt(
+            (messages := _extraction_prompt(
                 clinical_question=clinical_question,
                 definitions=definitions,
                 rows=batch,
-            ),
+            )),
             lambda value: _validate_extraction(
                 value,
                 row_ids=[int(row["row_id"]) for row in batch],
                 definitions=definitions,
             ),
         )
+        if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+            raise RuntimeError("Stage 2 extraction planner emitted an oversized batch")
         _write_json(result_path, result)
         _write_json(
             complete_path,
@@ -275,21 +442,113 @@ def extract_rows(
         )
         return list(result["rows"])
 
+    def run_page(page: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        page_meta = dict(page["page"])
+        row_id = int(page["row_id"])
+        page_index = int(page_meta["page_index"])
+        page_dir = output_dir / "pages" / f"row_{row_id:08d}" / f"page_{page_index:05d}"
+        result_path = page_dir / "result.json"
+        complete_path = page_dir / "complete.json"
+        if complete_path.is_file() and result_path.is_file():
+            stored = json.loads(result_path.read_text(encoding="utf-8"))
+            return page_meta, dict(stored["rows"][0])
+        page_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(page_dir / "page.json", page_meta)
+        messages = _extraction_prompt(
+            clinical_question=clinical_question,
+            definitions=definitions,
+            rows=[page],
+        )
+        if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+            raise RuntimeError("Stage 2 extraction planner emitted an oversized page")
+        result = request_json(
+            messages,
+            lambda value: _validate_extraction(
+                value,
+                row_ids=[row_id],
+                definitions=definitions,
+            ),
+        )
+        _write_json(result_path, result)
+        _write_json(
+            complete_path,
+            {"status": "complete", "completed_at": _now(), **page_meta},
+        )
+        return page_meta, dict(result["rows"][0])
+
     completed: list[tuple[int, list[dict[str, Any]]]] = []
+    completed_pages: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    task_count = len(batches) + len(page_requests)
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=max(1, min(int(workers), len(batches)))
+        max_workers=max(1, min(int(workers), max(1, task_count)))
     ) as executor:
-        futures = {
+        batch_futures = {
             executor.submit(run_batch, index, batch): index
             for index, batch in enumerate(batches, start=1)
         }
-        for future in concurrent.futures.as_completed(futures):
-            completed.append((futures[future], future.result()))
+        page_futures = {
+            executor.submit(run_page, page): int(page["row_id"])
+            for page in page_requests
+        }
+        for future in concurrent.futures.as_completed([*batch_futures, *page_futures]):
+            if future in batch_futures:
+                completed.append((batch_futures[future], future.result()))
+            else:
+                row_id = page_futures[future]
+                completed_pages.setdefault(row_id, []).append(future.result())
     values_by_row = {
         int(row["row_id"]): dict(row["values"])
         for _index, rows in sorted(completed)
         for row in rows
     }
+
+    def reconcile_row(
+        row_id: int,
+        page_values: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
+    ) -> dict[str, Any]:
+        reconciliation_dir = output_dir / "pages" / f"row_{row_id:08d}" / "reconciliation"
+        result_path = reconciliation_dir / "result.json"
+        complete_path = reconciliation_dir / "complete.json"
+        if complete_path.is_file() and result_path.is_file():
+            return dict(json.loads(result_path.read_text(encoding="utf-8"))["rows"][0]["values"])
+        ordered = sorted(page_values, key=lambda item: int(item[0]["page_index"]))
+        page_results = [
+            {**dict(meta), "values": dict(result["values"])} for meta, result in ordered
+        ]
+        messages = _page_reconciliation_prompt(
+            clinical_question=clinical_question,
+            definitions=definitions,
+            row_id=row_id,
+            page_results=page_results,
+        )
+        if _prompt_chars(messages) > int(max_prompt_chars):
+            raise ValueError(
+                "Stage 2 complete-note page reconciliation exceeds max_prompt_chars; "
+                "increase the prompt budget or reduce the feature set"
+            )
+        result = request_json(
+            messages,
+            lambda value: _validate_extraction(
+                value,
+                row_ids=[row_id],
+                definitions=definitions,
+            ),
+        )
+        reconciliation_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(reconciliation_dir / "page_manifest.json", page_results)
+        _write_json(result_path, result)
+        _write_json(
+            complete_path,
+            {
+                "status": "complete",
+                "completed_at": _now(),
+                "pages": len(page_results),
+            },
+        )
+        return dict(result["rows"][0]["values"])
+
+    for row_id, page_values in completed_pages.items():
+        values_by_row[row_id] = reconcile_row(row_id, page_values)
     records = []
     for row_id in row_ids:
         record: dict[str, Any] = {"_oci_row_id": int(row_id)}
@@ -305,6 +564,8 @@ def extract_rows(
             "rows": len(frame),
             "features": len(feature_names),
             "batches": len(batches),
+            "paged_rows": len(oversized_rows),
+            "pages": len(page_requests),
         },
     )
     return frame

@@ -235,6 +235,47 @@ class TestHierarchicalGRU:
 
 
 class TestHierarchicalTransformer:
+    class _CharacterTokenizer:
+        pad_token_id = 0
+        eos_token_id = 0
+        padding_side = "right"
+
+        def __init__(self, *, offsets: bool):
+            self.offsets = offsets
+            self.truncation_values = []
+
+        def num_special_tokens_to_add(self, pair=False):
+            assert pair is False
+            return 2
+
+        def __call__(
+            self,
+            text,
+            *,
+            add_special_tokens=True,
+            padding=False,
+            truncation=None,
+            return_offsets_mapping=False,
+            **_kwargs,
+        ):
+            assert padding is False
+            self.truncation_values.append(truncation)
+            if return_offsets_mapping and not self.offsets:
+                raise NotImplementedError("slow tokenizer has no offsets")
+            value = str(text or "")
+            input_ids = [1000 + index for index in range(len(value))]
+            offsets = [(index, index + 1) for index in range(len(value))]
+            if add_special_tokens:
+                input_ids = [101, *input_ids, 102]
+                offsets = [(0, 0), *offsets, (0, 0)]
+            result = {
+                "input_ids": input_ids,
+                "attention_mask": [1] * len(input_ids),
+            }
+            if return_offsets_mapping:
+                result["offset_mapping"] = offsets
+            return result
+
     def test_forward_shape_with_hash_backend(self):
         from oci.models.hierarchical_transformer_extractor import (
             HierarchicalTransformerExtractor,
@@ -346,6 +387,53 @@ class TestHierarchicalTransformer:
                 chunk_overlap_words=1,
                 max_chunks=3,
             )
+
+    @pytest.mark.parametrize("offsets", [True, False])
+    def test_token_bounded_chunks_preserve_pathological_unbroken_text(self, offsets):
+        from oci.models.hierarchical_transformer_extractor import (
+            split_text_to_token_bounded_chunks,
+        )
+
+        tokenizer = self._CharacterTokenizer(offsets=offsets)
+        text = "\u00ad" * 40
+        chunks = split_text_to_token_bounded_chunks(
+            text,
+            tokenizer,
+            max_chunk_length=10,
+        )
+
+        assert len(chunks) > 1
+        assert "".join(chunks) == text
+        assert all(
+            len(tokenizer(chunk, truncation=False)["input_ids"]) <= 10
+            for chunk in chunks
+        )
+        assert all(value is False for value in tokenizer.truncation_values)
+
+    def test_batch_preprocessor_token_windows_long_non_whitespace_run(self):
+        from oci.models.hierarchical_transformer_extractor import (
+            HierarchicalTransformerBatchPreprocessor,
+        )
+
+        tokenizer = self._CharacterTokenizer(offsets=False)
+        text = "\u00ad" * 40
+        preprocessor = HierarchicalTransformerBatchPreprocessor(
+            tokenizer=tokenizer,
+            chunk_size_words=96,
+            chunk_overlap_words=24,
+            max_chunks=32,
+            max_chunk_length=10,
+            tokenize_for_transformers=True,
+            chunk_cache_max_entries=8,
+            tokenization_cache_max_entries=32,
+        )
+
+        batch = preprocessor([text])
+
+        assert "".join(batch["chunks"][0]) == text
+        assert len(batch["chunks"][0]) > 1
+        assert batch["chunk_input_ids"].shape[1] <= 10
+        assert batch["chunk_input_ids"].shape[0] == len(batch["chunks"][0])
 
     def test_sentence_encoder_backend_and_pooling_defaults(self):
         from oci.models.hierarchical_transformer_extractor import (
@@ -603,11 +691,18 @@ class TestHierarchicalTransformer:
             "one two three four five six",
         ]
         first = ext(texts)
+        first_forward_calls = list(calls)
         second = ext(texts)
 
         assert first.shape == (2, 4)
         assert second.shape == (2, 4)
-        assert calls == ["one two three", "four five six"]
+        assert first_forward_calls == [
+            "one two three",
+            "four five six",
+            "one two three",
+            "four five six",
+        ]
+        assert calls == first_forward_calls
         assert len(ext._chunk_cache) == 1
         assert len(ext._tokenization_cache) == 2
 
@@ -645,12 +740,12 @@ class TestHierarchicalTransformer:
 
         with pytest.raises(ValueError, match="semantic truncation is forbidden"):
             ext(["one two three"])
-        assert calls == [
-            (
-                "one two three",
-                {"padding": False, "truncation": False},
-            )
-        ]
+        assert calls[0] == (
+            "one two three",
+            {"padding": False, "truncation": False},
+        )
+        assert all(kwargs.get("truncation") is False for _, kwargs in calls)
+        assert all("max_length" not in kwargs for _, kwargs in calls)
 
     def test_transformer_attention_evidence_never_enables_tokenizer_truncation(self):
         import re
@@ -1091,6 +1186,39 @@ class TestNeuralCausalForest:
         assert isinstance(model.encoder, HTRGradientAttentionEncoder)
         assert out["propensity_logit"].shape == (2,)
         assert out["outcome_raw"].shape == (2,)
+
+    def test_ncf_htr_prepared_chunks_are_secondarily_token_bounded(self):
+        from types import SimpleNamespace
+
+        import torch.nn as nn
+
+        from oci.models.neural_causal_forest_extractor import (
+            HTRGradientAttentionEncoder,
+        )
+
+        class CharacterTokenizer:
+            def __call__(self, text, **_kwargs):
+                return {
+                    "input_ids": [101, *range(len(text)), 102],
+                    "attention_mask": [1] * (len(text) + 2),
+                }
+
+        encoder = object.__new__(HTRGradientAttentionEncoder)
+        nn.Module.__init__(encoder)
+        encoder.config = SimpleNamespace(
+            chunk_size_words=96,
+            chunk_overlap_words=24,
+            max_chunks=32,
+            max_length=8,
+            encoder_backend="transformers",
+        )
+        encoder.htr = SimpleNamespace(_tokenizer=CharacterTokenizer())
+        note = "x" * 31
+
+        chunks = encoder.split_texts([note])[0]
+
+        assert "".join(chunk.text for chunk in chunks) == note
+        assert max(len(CharacterTokenizer()(chunk.text)["input_ids"]) for chunk in chunks) <= 8
 
     def test_ncf_nuisance_defaults_are_calibration_oriented(self):
         from oci.models.neural_causal_forest_extractor import NeuralCausalForestConfig

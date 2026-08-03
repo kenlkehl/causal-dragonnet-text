@@ -59,6 +59,14 @@ from .contract_lexical_context import (
     CONTRACT_LEXICAL_CONTEXT_VERSION,
     compact_contract_lexical_context,
 )
+from .complete_paged import (
+    COMPLETE_PAGED_RESPONSE_SCHEMA,
+    CompleteFeatureContract,
+    CompleteNotePage,
+    CompletePageResponse,
+    CompletePagingGeometry,
+    build_complete_page_prompt,
+)
 from .llm_routing import (
     OpenAIClientPool,
     google_json_response_format_kwargs,
@@ -862,6 +870,195 @@ class VLLMFeatureExtractor:
         if best_result is not None:
             return best_result
         return self._missing_result()
+
+    def _complete_page_completion(
+        self,
+        *,
+        prompt: str,
+        repair_instruction: str,
+        validator: Any,
+    ) -> Any:
+        """Execute one closed-schema complete-page request plus one repair.
+
+        Complete-note paging uses a response contract distinct from the
+        grouped explicit-feature schema.  Keeping this transport on the normal
+        extractor means the lossless path works with the same configured
+        OpenAI-compatible endpoint pool, without the deleted production/auth
+        wrapper.
+        """
+
+        if self.mode == "python_api":
+            raise ValueError(
+                "complete_paged_v1 currently requires server or start_server mode"
+            )
+        self._ensure_initialized()
+        messages: List[Dict[str, str]] = [{"role": "user", "content": prompt}]
+        start_index = (
+            self._client_pool.reserve_start_index() if self._client_pool is not None else 0
+        )
+        first_error: Optional[Exception] = None
+        for attempt in range(2):
+            if self._client_pool is not None:
+                server_url, client = self._client_pool.client_for_attempt(start_index, attempt)
+            else:
+                server_url, client = self.server_url, self._client
+            model_name = self.model_names_by_url.get(server_url, self.model_name)
+            request: Dict[str, Any] = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+            }
+            if self.vllm_enable_thinking is not None:
+                request["extra_body"] = {
+                    "chat_template_kwargs": {
+                        "enable_thinking": bool(self.vllm_enable_thinking)
+                    }
+                }
+            request.update(
+                google_json_response_format_kwargs(
+                    api_key=self.api_key,
+                    server_url=server_url,
+                    model_name=model_name,
+                )
+            )
+            response = client.chat.completions.create(**request)
+            choice = response.choices[0]
+            content = strip_reasoning_trace(str(choice.message.content or ""))
+            if not content:
+                raise ValueError("complete-page extraction returned an empty response")
+            try:
+                return validator(_extract_json_object_text(content))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                if attempt:
+                    raise ValueError(
+                        "complete-page response remained invalid after one schema repair"
+                    ) from exc
+                first_error = exc
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": repair_instruction},
+                    ]
+                )
+        raise RuntimeError(f"unreachable complete-page response state: {first_error}")
+
+    def extract_complete_page(
+        self,
+        *,
+        text: str,
+        page: CompleteNotePage,
+        feature: CompleteFeatureContract,
+        geometry: CompletePagingGeometry,
+    ) -> CompletePageResponse:
+        prompt = build_complete_page_prompt(
+            text,
+            page=page,
+            feature=feature,
+            geometry=geometry,
+        )
+        return self._complete_page_completion(
+            prompt=prompt,
+            repair_instruction=(
+                "SCHEMA REPAIR ONLY. Return exactly the closed JSON object specified "
+                "above. Preserve exact absolute citations and add no prose or keys."
+            ),
+            validator=lambda content: CompletePageResponse.validate(
+                json.loads(content),
+                text=text,
+                page=page,
+            ),
+        )
+
+    def reconcile_complete_pages(
+        self,
+        *,
+        text: str,
+        feature: CompleteFeatureContract,
+        children: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        child_ids = [str(child["node_id"]) for child in children]
+        child_payloads = [
+            {
+                "child_id": child["node_id"],
+                "response": {
+                    **dict(child["response"]),
+                    "citations": [
+                        {
+                            "start": citation["start"],
+                            "end": citation["end"],
+                            "text": citation["text"],
+                        }
+                        for citation in child["response"].get("citations", ())
+                    ],
+                },
+            }
+            for child in children
+        ]
+        contract = {
+            "name": feature.name,
+            "value_type": feature.value_type,
+            "description": feature.description,
+            "categories": list(feature.categories),
+            "temporal_rule": feature.temporal_rule,
+            "aggregation_rule": feature.aggregation_rule,
+        }
+        prompt = (
+            "Reconcile every child result exactly once under the declared temporal "
+            "and aggregation rules. Use only citations already present in children. "
+            '{"child_ids":["every required child ID in order"],"schema_version":'
+            f'"{COMPLETE_PAGED_RESPONSE_SCHEMA}","status":'
+            '"positive|negative|missing|ambiguous","normalized_value":null,'
+            '"reason":null,"citations":[{"start":0,"end":1,'
+            '"text":"exact prepared-text substring"}]}. Return that closed JSON '
+            "object only; citation objects contain start, end, and text only.\n"
+            f"feature_contract={json.dumps(contract, sort_keys=True)}\n"
+            f"required_child_ids={json.dumps(child_ids)}\n"
+            f"children={json.dumps(child_payloads, sort_keys=True)}"
+        )
+        allowed_citations = {
+            (int(citation["start"]), int(citation["end"]), str(citation["text"]))
+            for child in children
+            for citation in child["response"].get("citations", ())
+        }
+
+        def validate(content: str) -> Mapping[str, Any]:
+            parsed = json.loads(content)
+            expected = {
+                "child_ids",
+                "schema_version",
+                "status",
+                "normalized_value",
+                "reason",
+                "citations",
+            }
+            if not isinstance(parsed, Mapping) or set(parsed) != expected:
+                raise ValueError("complete-page reconciliation schema is not closed")
+            if list(map(str, parsed["child_ids"])) != child_ids:
+                raise ValueError(
+                    "complete-page reconciliation omitted, reordered, or duplicated children"
+                )
+            response = CompletePageResponse.validate(
+                {key: parsed[key] for key in expected if key != "child_ids"},
+                text=text,
+                page=None,
+            )
+            observed = {
+                (int(citation["start"]), int(citation["end"]), str(citation["text"]))
+                for citation in response.citations
+            }
+            if not observed <= allowed_citations:
+                raise ValueError("complete-page reconciliation invented a citation")
+            return {"child_ids": child_ids, **response.as_dict()}
+
+        return self._complete_page_completion(
+            prompt=prompt,
+            repair_instruction=(
+                "SCHEMA REPAIR ONLY. Return required child_ids in their exact order "
+                "and only the closed JSON object. Citations contain start, end, text."
+            ),
+            validator=validate,
+        )
 
     def _missing_result(self) -> Dict[str, ExplicitFeatureValue]:
         """Return a missing-value result for every requested feature."""

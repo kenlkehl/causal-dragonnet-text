@@ -1,5 +1,8 @@
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from oci.config import ExperimentConfig, ExplicitFeatureSpec
@@ -20,6 +23,144 @@ from oci.models.explicit_feature_featurizer import (
     filter_specs_by_role,
     get_raw_explicit_features,
 )
+
+
+def test_clinical_text_examples_keep_selected_long_note_complete():
+    from oci.inference.agentic_explicit_feature_forest import (
+        _clinical_text_examples,
+    )
+
+    note = "complete clinical note " + ("x" * 5_000)
+    examples = _clinical_text_examples(
+        pd.DataFrame({"clinical_text": [note]}),
+        "clinical_text",
+        n_examples=1,
+        max_chars=1_600,
+    )
+
+    assert examples == [note]
+
+
+def test_evidence_digest_keeps_complete_clinical_examples():
+    from oci.inference.multi_model_agentic_forest import (
+        _build_evidence_digest_agent_context,
+    )
+
+    note = "complete note " + ("z" * 8_000)
+    context = _build_evidence_digest_agent_context(
+        outer_fold=1,
+        feature_discovery_methods=["bow"],
+        max_proposals=4,
+        clinical_question="Identify baseline variables.",
+        treatment_column="treatment",
+        outcome_column="outcome",
+        outcome_type="binary",
+        current_features=[],
+        metrics={},
+        importance={},
+        clinical_text_examples=[note],
+    )
+
+    assert context["clinical_text_examples"] == [note]
+
+
+def test_complete_paged_provider_processes_and_reconciles_every_page(tmp_path: Path):
+    from oci.extraction import CompletePageResponse
+    from oci.inference.agentic_explicit_feature_forest import (
+        VLLMExplicitFeatureExtractionProvider,
+    )
+
+    note = ("baseline text " * 12) + "ECOG 2" + (" later text" * 12)
+    spec = ExplicitFeatureSpec(
+        name="performance_status",
+        type="categorical",
+        categories=["ECOG 0", "ECOG 1", "ECOG 2"],
+        description="Baseline ECOG score",
+        roles=["confounder"],
+    )
+    provider = object.__new__(VLLMExplicitFeatureExtractionProvider)
+    provider.output_dir = tmp_path
+    provider.config = SimpleNamespace(text_column="clinical_text")
+    provider.feature_config = SimpleNamespace(
+        complete_page_core_chars=80,
+        complete_page_context_chars=10,
+        complete_page_max_chars=100,
+        complete_reconciliation_fan_in=3,
+        extraction_batch_size=4,
+    )
+
+    class FakeExtractor:
+        def __init__(self):
+            self.pages = []
+
+        def extract_complete_page(self, *, text, page, feature, geometry):
+            self.pages.append(page)
+            marker_start = text.find("ECOG 2", page.context_start, page.context_end)
+            if marker_start >= 0:
+                return CompletePageResponse.validate(
+                    {
+                        "schema_version": "complete_paged_response_v1",
+                        "status": "positive",
+                        "normalized_value": "ECOG 2",
+                        "reason": None,
+                        "citations": [
+                            {
+                                "start": marker_start,
+                                "end": marker_start + len("ECOG 2"),
+                                "text": "ECOG 2",
+                            }
+                        ],
+                    },
+                    text=text,
+                    page=page,
+                )
+            return CompletePageResponse.validate(
+                {
+                    "schema_version": "complete_paged_response_v1",
+                    "status": "negative",
+                    "normalized_value": None,
+                    "reason": None,
+                    "citations": [],
+                },
+                text=text,
+                page=page,
+            )
+
+        def reconcile_complete_pages(self, *, text, feature, children):
+            positive = next(
+                (
+                    child["response"]
+                    for child in children
+                    if child["response"]["status"] == "positive"
+                ),
+                None,
+            )
+            response = positive or {
+                "schema_version": "complete_paged_response_v1",
+                "status": "negative",
+                "normalized_value": None,
+                "reason": None,
+                "citations": [],
+            }
+            return {
+                "child_ids": [child["node_id"] for child in children],
+                **response,
+            }
+
+    extractor = FakeExtractor()
+    frame = provider._extract_complete_paged_spec(
+        dataset=pd.DataFrame({"clinical_text": [note]}),
+        specs=[spec],
+        extractor=extractor,
+    )
+
+    cores = sorted(extractor.pages, key=lambda page: page.core_start)
+    assert [(page.core_start, page.core_end) for page in cores] == [
+        (start, min(len(note), start + 80)) for start in range(0, len(note), 80)
+    ]
+    assert frame.loc[0, "explicit_feat_performance_status"] == "ECOG 2"
+    assert not bool(frame.loc[0, "explicit_feat_performance_status_missing"])
+    assert list((tmp_path / "complete_paged_ledgers").glob("*.json"))
 
 
 def test_explicit_feature_roles_are_valid_and_deduped():

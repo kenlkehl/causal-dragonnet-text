@@ -8,6 +8,7 @@ all feature-set decisions are made with inner CV on each outer-training split.
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -17,7 +18,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -33,10 +34,17 @@ from ..config import (
     ExplicitFeatureSpec,
 )
 from ..extraction import (
+    COMPLETE_PAGED_VERSION,
     CONTRACT_LEXICAL_CONTEXT_VERSION,
     EXTRACTION_GROUPING_VERSION,
+    CompleteFeatureContract,
+    CompletePageResponse,
+    CompletePagingGeometry,
     ExtractionCache,
     VLLMFeatureExtractor,
+    build_complete_paged_coverage_ledger,
+    plan_complete_paged_requests,
+    reconcile_complete_page_responses,
     resolve_vllm_reasoning_parser,
     strip_reasoning_trace,
 )
@@ -2394,6 +2402,11 @@ class VLLMExplicitFeatureExtractionProvider:
         specs: List[ExplicitFeatureSpec],
     ) -> List[List[ExplicitFeatureSpec]]:
         """Group related contracts while enforcing the hard ten-variable cap."""
+        if self.feature_config.extraction_context_strategy == COMPLETE_PAGED_VERSION:
+            # Complete-page responses carry one closed feature contract so that
+            # every page can later be reconciled without companion-variable
+            # prompt effects.
+            return [[spec] for spec in specs]
         maximum = int(getattr(self.feature_config, "max_variables_per_extraction_request", 10))
         if not 1 <= maximum <= 10:
             raise ValueError("max_variables_per_extraction_request must be in [1, 10]")
@@ -2701,12 +2714,172 @@ class VLLMExplicitFeatureExtractionProvider:
             ),
         )
         try:
+            if self.feature_config.extraction_context_strategy == COMPLETE_PAGED_VERSION:
+                return self._extract_complete_paged_spec(
+                    dataset=dataset,
+                    specs=specs,
+                    extractor=extractor,
+                )
             return extractor.extract_to_dataframe(
                 dataset[self.config.text_column].tolist(),
                 batch_size=self.feature_config.extraction_batch_size,
             )
         finally:
             extractor.cleanup()
+
+    def _extract_complete_paged_spec(
+        self,
+        *,
+        dataset: pd.DataFrame,
+        specs: List[ExplicitFeatureSpec],
+        extractor: VLLMFeatureExtractor,
+    ) -> pd.DataFrame:
+        """Extract one feature from every character of every nonempty note."""
+
+        if len(specs) != 1:
+            raise ValueError("complete_paged_v1 requires one feature contract per request")
+        spec = specs[0]
+        feature = CompleteFeatureContract(
+            name=spec.name,
+            value_type=spec.type,
+            description=spec.description or spec.name,
+            categories=tuple(spec.categories or ()),
+            temporal_rule=spec.temporal_rule,
+            aggregation_rule=spec.aggregation_rule,
+        )
+        geometry = CompletePagingGeometry(
+            core_chars=int(self.feature_config.complete_page_core_chars),
+            context_chars=int(self.feature_config.complete_page_context_chars),
+            max_page_chars=int(self.feature_config.complete_page_max_chars),
+        )
+        texts = [
+            "" if pd.isna(value) else str(value)
+            for value in dataset[self.config.text_column].tolist()
+        ]
+        notes = {str(index): text for index, text in enumerate(texts) if text}
+        value_column = f"explicit_feat_{spec.name}"
+        missing_column = f"{value_column}_missing"
+        rows: List[Dict[str, Any]] = [
+            {value_column: None, missing_column: True} for _ in texts
+        ]
+        if not notes:
+            return pd.DataFrame(rows)
+
+        request_plan = plan_complete_paged_requests(
+            notes,
+            (feature,),
+            geometry=geometry,
+        )
+        page_results: Dict[str, CompletePageResponse] = {}
+
+        def run_page(request: Any) -> Tuple[str, CompletePageResponse]:
+            response = extractor.extract_complete_page(
+                text=notes[request.patient_id],
+                page=request.page,
+                feature=feature,
+                geometry=geometry,
+            )
+            return request.request_id, response
+
+        workers = max(
+            1,
+            min(
+                len(request_plan.requests),
+                int(self.feature_config.extraction_batch_size),
+            ),
+        )
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(run_page, request): request.request_id
+                for request in request_plan.requests
+            }
+            for future in as_completed(futures):
+                request_id, response = future.result()
+                if request_id in page_results:
+                    raise RuntimeError("complete-page extraction duplicated a response")
+                page_results[request_id] = response
+        if set(page_results) != {request.request_id for request in request_plan.requests}:
+            raise RuntimeError("complete-page extraction omitted a planned response")
+
+        reconciliation_ledgers: Dict[str, Mapping[str, Any]] = {}
+        final_responses: Dict[str, Mapping[str, Any]] = {}
+        for patient_id, text in notes.items():
+            requests = [
+                request
+                for request in request_plan.requests
+                if request.patient_id == patient_id
+            ]
+
+            def reducer(children: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+                return extractor.reconcile_complete_pages(
+                    text=text,
+                    feature=feature,
+                    children=children,
+                )
+
+            final, ledger = reconcile_complete_page_responses(
+                [(request.request_id, page_results[request.request_id]) for request in requests],
+                reducer=reducer,
+                fan_in=int(self.feature_config.complete_reconciliation_fan_in),
+            )
+            value = final.normalized_value
+            if final.status == "positive":
+                if spec.type == "categorical":
+                    value = str(value)
+                    if value not in set(spec.categories or ()):
+                        raise ValueError(
+                            "complete-page extraction returned an undeclared category"
+                        )
+                elif (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                ):
+                    raise ValueError(
+                        "complete-page extraction returned an invalid continuous value"
+                    )
+                rows[int(patient_id)] = {
+                    value_column: value,
+                    missing_column: False,
+                }
+            reconciliation_ledgers[patient_id] = ledger
+            final_responses[patient_id] = final.as_dict()
+
+        normalized_pages = {
+            request_id: response.as_dict()
+            for request_id, response in page_results.items()
+        }
+        ledger_dir = self.output_dir / "complete_paged_ledgers"
+        ledger_dir.mkdir(parents=True, exist_ok=True)
+        ledger_name = hashlib.sha256(
+            json.dumps(
+                {
+                    "feature": feature.contract_sha256,
+                    "notes": [request.note_sha256 for request in request_plan.requests],
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        ledger_path = ledger_dir / f"{ledger_name}.json"
+        ledger_path.write_text(
+            json.dumps(
+                {
+                    "request_plan": request_plan.as_dict(),
+                    "coverage": build_complete_paged_coverage_ledger(
+                        request_plan,
+                        normalized_pages,
+                    ),
+                    "page_responses": normalized_pages,
+                    "reconciliations": reconciliation_ledgers,
+                    "final_responses": final_responses,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return pd.DataFrame(rows)
 
     def _extract_spec_group_resumable(
         self,
@@ -6467,6 +6640,13 @@ def _clinical_text_examples(
     n_examples: int | None,
     max_chars: int | None,
 ) -> List[str]:
+    """Return complete sampled notes for agent context.
+
+    ``max_chars`` remains in the signature so older configuration files still
+    load, but it is intentionally nonbinding.  Prompt construction must not
+    truncate or reject a selected clinical note based on its character count.
+    """
+    del max_chars
     if text_column not in dataset.columns or len(dataset) == 0:
         return []
     nonempty = [
@@ -6482,14 +6662,6 @@ def _clinical_text_examples(
             random_state=17,
         )
         nonempty = [str(text) for text in sample[text_column].fillna("").tolist()]
-    if max_chars is not None:
-        oversized = [len(text) for text in nonempty if len(text) > int(max_chars)]
-        if oversized:
-            raise ValueError(
-                f"clinical-text prompt input contains a {max(oversized)}-character "
-                f"note, exceeding configured clinical_text_example_chars="
-                f"{int(max_chars)}; refusing silent note truncation"
-            )
     return nonempty
 
 

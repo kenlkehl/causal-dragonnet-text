@@ -850,10 +850,9 @@ class AgenticFeatureSearchConfig:
     # Prompt/context controls. Clinical text examples are sent to the proposal
     # agent to ground variable suggestions, but are not written to artifacts by
     # default because they may contain sensitive patient text.
-    # ``None`` preserves every non-empty training note and every character.
-    # A finite example count is an explicit scientific sampling choice.  A
-    # finite character count is only a fail-closed guard and never authorizes
-    # string slicing.
+    # A finite example count is an explicit scientific sampling choice. The
+    # legacy character-count field is accepted for configuration compatibility
+    # but is nonbinding: every selected note is passed in full.
     clinical_text_examples_per_prompt: Optional[int] = None
     clinical_text_example_chars: Optional[int] = None
     save_agent_context: bool = False

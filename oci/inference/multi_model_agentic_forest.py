@@ -9519,7 +9519,6 @@ def _build_evidence_digest_agent_context(
     handoff_provenance: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the compact role-grouped handoff used by default for agents."""
-    del clinical_text_examples
     context: Dict[str, Any] = {
         "prompt_version": _EVIDENCE_DIGEST_PROMPT_VERSION,
         "prompt_mode": "evidence_digest",
@@ -9541,6 +9540,11 @@ def _build_evidence_digest_agent_context(
             "A role-specific prompt will be created from each evidence_digest role section.",
         ],
         "current_features": list(current_features),
+        # These are deliberately complete selected notes.  The selector limits
+        # the number of examples, not their contents; dropping this field in
+        # the simplified evidence-digest path left the proposal agent with no
+        # way to ground a readable evidence blurb back in clinical language.
+        "clinical_text_examples": [str(text) for text in clinical_text_examples],
         "model_diagnostics": _agent_visible_metrics(metrics),
         "evidence_digest": _build_role_grouped_evidence_digest(
             importance=importance,
