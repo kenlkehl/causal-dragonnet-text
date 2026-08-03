@@ -177,18 +177,29 @@ the available CPUs and GPUs as follows.
 |---|---|---|
 | `embedding_cache` | A contiguous shard of the complete chunk corpus | One encoder worker per entry in `run.devices` when multiple CUDA devices are configured |
 | `tfidf` | An outer/full or exact-inner context | CPU context workers, bounded by `run.workers` and the number of contexts |
-| `text_models` | An outer/full or exact-inner context | One fixed process lane per configured CUDA device; CPU-only runs use at most `run.workers` lanes |
+| `text_models` | An outer/full or exact-inner context, with independent BoW folds inside it | One fixed process lane per configured CUDA device; `run.workers` is divided among active lanes and bounds their combined BoW fold threads |
 | `neural_queries` | An outer/full or exact-inner context | One fixed process lane per configured CUDA device; CPU-only runs use at most `run.workers` lanes |
 | `handoff` | None | The completed JSONL files are combined serially |
 | `stage2` | Interpretation batches and patient-extraction batches within the current outer fold | Concurrent endpoint requests bounded by `stage2.workers`; review rounds, outer folds, and fold-level estimation remain ordered |
 
 A fixed CUDA lane processes its assigned contexts serially on one GPU. This
 provides device affinity and prevents a process queue from placing two
-simultaneous contexts on the same GPU. For the standard five outer folds and
-five inner folds, the 30 contexts are distributed across eight GPUs as
-`4, 4, 4, 4, 4, 4, 3, 3`. Each neural-query context performs its inner-fold
-fits, final query-bank fits, and evidence retrieval on its assigned device.
-Thus the principal neural-query parallelism is across independent contexts.
+simultaneous contexts on the same GPU. The runner creates at most one lane per
+configured CUDA device, bounded by the number of unfinished contexts, and
+assigns the largest remaining context to the least-loaded lane. Each
+neural-query context performs its inner-fold fits, final query-bank fits, and
+evidence retrieval on its assigned device. Thus the principal neural-query
+parallelism is across independent contexts.
+
+The CPU budget is shared rather than repeated across the text-model lanes. For
+`W` requested CPU workers and `L` active lanes, each lane receives at least
+`floor(W / L)` workers, and the remainder is assigned one worker at a time.
+BoW nuisance and effect cross-fitting use that lane allocation to execute
+independent folds concurrently. They use threads so the enclosing process lane
+does not create a nested process pool or copy the context dataset. The three
+full-context feature-importance fits are also concurrent. Native linear-algebra
+and estimator thread pools remain limited to one thread per fit. If `W < L`, one
+controller worker per active lane is the unavoidable minimum.
 
 The context directories remain the unit of recovery. Each lane writes the
 context's `complete.json` immediately after its artifacts are durable and

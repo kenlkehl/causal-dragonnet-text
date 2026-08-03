@@ -361,7 +361,7 @@ pip install -e ".[extraction]"  # This adds optional API-based extraction client
 
 TorchCodec requires shared FFmpeg libraries. On Debian or Ubuntu, a missing
 `libavutil` error can be resolved with `sudo apt-get install ffmpeg`. The
-committed eight-GPU example launcher performs this check before it starts.
+committed cloud example launcher performs this check before it starts.
 
 ### Dataset requirements
 
@@ -468,7 +468,7 @@ uv run python scripts/run_all_evidence.py \
 ```
 
 The bundled one-confounder, one-effect-modifier NSCLC example has a dedicated
-foreground launcher for a machine with eight visible GPUs:
+foreground cloud launcher:
 
 ```bash
 ./run_one_conf_one_mod_cloud_8gpu.sh
@@ -493,20 +493,28 @@ independent job.
 For CUDA runs, the runner creates one fixed process lane per configured GPU and
 assigns whole contexts to those lanes. A lane remains attached to the same GPU,
 which prevents two contexts from being scheduled onto one device merely because
-another device finished early. With five outer folds and five inner folds there
-are 30 contexts. The eight-GPU launcher therefore runs as many as eight contexts
-at once, assigning four contexts to each of six GPUs and three contexts to each
-of the remaining two GPUs. A neural-query context uses its assigned GPU for its
-inner-fold fits, final query banks, and evidence retrieval; parallelism occurs
-across contexts rather than by oversubscribing the device within a context.
+another device finished early. The number of active lanes is the smaller of the
+number of configured CUDA devices and the number of unfinished contexts. The
+runner assigns the largest contexts first to the currently least-loaded lane.
 
-The `run.devices` setting determines GPU concurrency. `run.workers` bounds
-CPU-only context concurrency and supplies the CPU budget used by the TF-IDF
-component; it does not create additional jobs on a CUDA device. Stage 2 uses
-its own `stage2.workers` setting for concurrent interpretation requests and
-patient-extraction batches. Review rounds and outer folds remain ordered so
-that a single endpoint is never multiplied by two independent concurrency
-limits. Every Stage 1 context and every expensive Stage 2 batch writes its own
+During `text_models`, the total CPU budget is divided as evenly as possible
+among the active lanes. If the division has a remainder, the first lanes receive
+one additional worker. Within a lane, independent BoW cross-fitting folds and
+the treatment, outcome, and effect-importance fits use up to that lane's worker
+allocation as threads. The native numerical libraries remain single-threaded
+within each fit, which prevents nested work from exceeding the stated CPU
+budget. A neural-query context uses its assigned GPU for its inner-fold fits,
+final query banks, and evidence retrieval; its parallelism occurs across
+contexts rather than by oversubscribing the device within a context.
+
+The `run.devices` setting determines GPU-lane concurrency. `run.workers` is the
+overall CPU budget used by TF-IDF and divided among the concurrently active
+text-model lanes. If fewer workers than CUDA devices are requested, each active
+device still requires one controller worker. Stage 2 uses its own
+`stage2.workers` setting for concurrent interpretation requests and
+patient-extraction batches. Review rounds and outer folds remain ordered so that
+a single endpoint is never multiplied by two independent concurrency limits.
+Every Stage 1 context and every expensive Stage 2 batch writes its own
 `complete.json`, so the same scheduling remains resumable after interruption.
 
 ### Stage-specific execution

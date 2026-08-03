@@ -607,13 +607,16 @@ def _run_handoff_contexts(
         return []
     n_workers = max(1, min(int(plan.context_workers), len(contexts)))
     slots = _handoff_worker_slots(plan, n_workers, base_device)
+    cpu_workers = _handoff_cpu_worker_budgets(plan.cpus_total, n_workers)
     shards = [[] for _ in range(n_workers)]
     for index, context in enumerate(contexts):
         shards[index % n_workers].append(context)
     logger.info(
-        "Precomputing multi-model forest handoff contexts=%s loky_workers=%s slots=%s",
+        "Precomputing multi-model forest handoff contexts=%s loky_workers=%s "
+        "cpu_workers_per_lane=%s slots=%s",
         len(contexts),
         n_workers,
+        cpu_workers,
         slots,
     )
     if n_workers <= 1:
@@ -625,6 +628,7 @@ def _run_handoff_contexts(
             shard_index=0,
             device=str(slots[0][0]),
             gpu_ids=slots[0][1],
+            num_workers=cpu_workers[0],
         )
     shard_rows = Parallel(
         n_jobs=n_workers,
@@ -640,11 +644,23 @@ def _run_handoff_contexts(
             shard_index=shard_index,
             device=str(slots[shard_index][0]),
             gpu_ids=slots[shard_index][1],
+            num_workers=cpu_workers[shard_index],
         )
         for shard_index, shard in enumerate(shards)
         if shard
     )
     return [row for rows in shard_rows for row in rows]
+
+
+def _handoff_cpu_worker_budgets(cpus_total: int, lane_count: int) -> List[int]:
+    """Divide an overall CPU budget among concurrent handoff lanes."""
+
+    lane_count = int(lane_count)
+    if lane_count < 1:
+        raise ValueError("lane_count must be positive")
+    total = max(lane_count, int(cpus_total), 1)
+    per_lane, remainder = divmod(total, lane_count)
+    return [per_lane + (1 if lane_index < remainder else 0) for lane_index in range(lane_count)]
 
 
 def _handoff_worker_slots(
@@ -673,6 +689,7 @@ def _run_handoff_context_shard(
     shard_index: int,
     device: str,
     gpu_ids: Optional[List[int]],
+    num_workers: int,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     with _serial_torch_worker_environment():
@@ -690,7 +707,7 @@ def _run_handoff_context_shard(
                 ),
                 device=torch.device(device),
                 gpu_ids=gpu_ids,
-                num_workers=1,
+                num_workers=max(1, int(num_workers)),
             )
             discovery_df = runner.dataset.iloc[train_idx].reset_index(drop=True)
             logger.info(
@@ -753,8 +770,12 @@ def _config_for_handoff_runner(config: AppliedInferenceConfig) -> AppliedInferen
     mm_config = copy.deepcopy(cfg.architecture.multi_model_forest)
     mm_config.outer_parallelism = "1"
     mm_config.candidate_consistency_parallelism = "1"
-    mm_config.fold_parallelism = "1"
-    mm_config.bow_parallel_backend = "processes"
+    mm_config.fold_parallelism = "auto"
+    mm_config.bow_fold_parallelism = "auto"
+    # Handoff contexts already run in separate loky processes. Threads let the
+    # independent BoW folds share each lane's data without spawning a second
+    # nested process tree or copying the full context again.
+    mm_config.bow_parallel_backend = "threads"
     cfg.architecture.multi_model_agentic_forest = mm_config
     avf_config = getattr(cfg.architecture, "agentic_attention_variable_forest", None)
     if avf_config is None:
@@ -832,6 +853,8 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 @contextmanager
 def _serial_torch_worker_environment():
+    from threadpoolctl import threadpool_limits
+
     env_keys = [
         "OCI_AVF_DATALOADER_WORKERS",
         "OMP_NUM_THREADS",
@@ -852,7 +875,11 @@ def _serial_torch_worker_environment():
     except Exception:
         old_threads = None
     try:
-        yield
+        # Environment variables only affect libraries initialized after they
+        # are set. threadpoolctl also constrains BLAS/OpenMP pools that the
+        # enclosing loky worker imported before entering this context.
+        with threadpool_limits(limits=1):
+            yield
     finally:
         for key, value in previous.items():
             if value is None:

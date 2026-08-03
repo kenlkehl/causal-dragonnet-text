@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 import oci.inference.research_all_evidence_stage1 as stage1_workflow
+import oci.inference.multi_model_forest as multi_model_workflow
 
 from oci.inference.embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
@@ -16,6 +17,7 @@ from oci.inference.research_all_evidence_stage1 import (
     ResearchAllEvidenceStage1,
     Stage1RunContext,
     _context_execution_lanes,
+    _lane_cpu_worker_budgets,
     _stage1_context_specs,
     build_parser,
     compile_config,
@@ -299,7 +301,7 @@ def test_text_model_contexts_are_independently_resumable(tmp_path, monkeypatch):
 
 
 def test_gpu_context_lanes_use_every_gpu_without_device_overlap():
-    pending = [{"scope_id": f"context_{index:02d}"} for index in range(30)]
+    pending = [{"scope_id": f"context_{index:02d}"} for index in range(11)]
 
     lanes = _context_execution_lanes(
         pending,
@@ -307,23 +309,68 @@ def test_gpu_context_lanes_use_every_gpu_without_device_overlap():
             "cuda:0",
             "cuda:1",
             "cuda:2",
-            "cuda:3",
-            "cuda:4",
-            "cuda:5",
-            "cuda:6",
-            "cuda:7",
         ),
-        workers=32,
+        workers=10,
     )
 
-    assert [device for device, _specs in lanes] == [f"cuda:{index}" for index in range(8)]
-    assert [len(specs) for _device, specs in lanes] == [4, 4, 4, 4, 4, 4, 3, 3]
-    scheduled = [
-        spec["scope_id"]
-        for _device, specs in lanes
-        for spec in specs
-    ]
+    assert [device for device, _specs in lanes] == ["cuda:0", "cuda:1", "cuda:2"]
+    assert [len(specs) for _device, specs in lanes] == [4, 4, 3]
+    scheduled = [spec["scope_id"] for _device, specs in lanes for spec in specs]
     assert sorted(scheduled) == sorted(spec["scope_id"] for spec in pending)
+    assert _lane_cpu_worker_budgets(len(lanes), workers=10) == [4, 3, 3]
+
+
+def test_cpu_worker_budget_is_divided_without_being_duplicated():
+    assert _lane_cpu_worker_budgets(3, workers=10) == [4, 3, 3]
+    assert sum(_lane_cpu_worker_budgets(7, workers=23)) == 23
+    assert _lane_cpu_worker_budgets(0, workers=32) == []
+
+
+def test_handoff_runner_parallelizes_bow_folds_with_threads(tmp_path):
+    _raw, config = _inputs(tmp_path, components=("text_models",))
+    context = ResearchAllEvidenceStage1(config)._resolved_context()
+
+    optimized = multi_model_workflow._config_for_handoff_runner(context.applied_config)
+    text_config = optimized.architecture.multi_model_agentic_forest
+
+    assert text_config.fold_parallelism == "auto"
+    assert text_config.bow_fold_parallelism == "auto"
+    assert text_config.bow_parallel_backend == "threads"
+
+
+def test_handoff_context_receives_its_full_lane_cpu_budget(tmp_path, monkeypatch):
+    captured: list[int] = []
+
+    def run_shard(**kwargs):
+        captured.append(int(kwargs["num_workers"]))
+        return []
+
+    monkeypatch.setattr(
+        multi_model_workflow,
+        "_run_handoff_context_shard",
+        run_shard,
+    )
+    plan = multi_model_workflow.resolve_multi_model_forest_parallel_plan(
+        cpus_total=4,
+        num_workers=4,
+        gpu_ids=[0],
+        htr_jobs_per_gpu=1,
+        htr_enabled=True,
+        embedding_enabled=True,
+    )
+
+    rows = multi_model_workflow._run_handoff_contexts(
+        dataset=pd.DataFrame({"clinical_text": ["one"]}),
+        config=None,
+        contexts=[{"fold_key": 1}],
+        handoff_dir=tmp_path,
+        plan=plan,
+        base_device=multi_model_workflow.torch.device("cpu"),
+    )
+
+    assert rows == []
+    assert captured == [4]
+    assert multi_model_workflow._handoff_cpu_worker_budgets(23, 7) == [4, 4, 3, 3, 3, 3, 3]
 
 
 def test_cpu_context_lanes_are_bounded_by_workers():

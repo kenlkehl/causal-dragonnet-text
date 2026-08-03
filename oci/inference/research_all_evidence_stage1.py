@@ -438,6 +438,24 @@ def _context_execution_lanes(
     return lanes
 
 
+def _lane_cpu_worker_budgets(lane_count: int, workers: int) -> list[int]:
+    """Divide the CPU budget across concurrently active context lanes.
+
+    Each lane needs one controller thread even when fewer CPU workers than
+    devices were requested.  Beyond that unavoidable floor, the requested
+    budget is divided as evenly as possible and is never duplicated per lane.
+    """
+
+    lane_count = int(lane_count)
+    if lane_count < 0:
+        raise ValueError("lane_count must be nonnegative")
+    if lane_count == 0:
+        return []
+    total = max(lane_count, int(workers), 1)
+    per_lane, remainder = divmod(total, lane_count)
+    return [per_lane + (1 if lane_index < remainder else 0) for lane_index in range(lane_count)]
+
+
 def _embedding_cache_component(
     context: Stage1RunContext,
     component_dir: Path,
@@ -478,12 +496,20 @@ def _text_models_component(
         devices=context.config.devices,
         workers=context.config.workers,
     )
+    lane_cpu_workers = _lane_cpu_worker_budgets(len(lanes), context.config.workers)
     if pending:
         LOGGER.info(
             "run text_models contexts=%s parallelism=%s lanes=%s",
             len(pending),
             len(lanes),
-            [(device, len(specs)) for device, specs in lanes],
+            [
+                {
+                    "device": device,
+                    "contexts": len(specs),
+                    "cpu_workers": cpu_workers,
+                }
+                for (device, specs), cpu_workers in zip(lanes, lane_cpu_workers)
+            ],
         )
         fitted_lanes = Parallel(
             n_jobs=len(lanes),
@@ -497,8 +523,9 @@ def _text_models_component(
                 specs=specs,
                 component_dir=component_dir,
                 device=device,
+                cpu_workers=cpu_workers,
             )
-            for device, specs in lanes
+            for (device, specs), cpu_workers in zip(lanes, lane_cpu_workers)
         )
         completed.extend(row for lane in fitted_lanes for row in lane)
 
@@ -524,8 +551,9 @@ def _run_text_model_context_lane(
     specs: Sequence[Mapping[str, Any]],
     component_dir: Path,
     device: str,
+    cpu_workers: int,
 ) -> list[dict[str, Any]]:
-    """Run a serial lane of contexts on one fixed device."""
+    """Run a serial lane of contexts with one fixed device and CPU budget."""
 
     if device.startswith("cuda:"):
         import torch
@@ -538,6 +566,7 @@ def _run_text_model_context_lane(
             spec=spec,
             context_dir=component_dir / str(spec["scope_id"]),
             device=device,
+            cpu_workers=cpu_workers,
         )
         for spec in specs
     ]
@@ -550,6 +579,7 @@ def _run_one_text_model_context(
     spec: Mapping[str, Any],
     context_dir: Path,
     device: str,
+    cpu_workers: int,
 ) -> dict[str, Any]:
     """Fit and immediately publish one independently resumable context."""
 
@@ -564,8 +594,8 @@ def _run_one_text_model_context(
     mm_config = applied_config.architecture.multi_model_forest
     gpu_ids = _cuda_ids((device,))
     plan = resolve_multi_model_forest_parallel_plan(
-        cpus_total=1,
-        num_workers=1,
+        cpus_total=max(1, int(cpu_workers)),
+        num_workers=max(1, int(cpu_workers)),
         gpu_ids=gpu_ids,
         htr_jobs_per_gpu=1,
         htr_enabled=bool(mm_config.htr_evidence_enabled),
