@@ -117,6 +117,29 @@ def test_resolved_context_uses_multi_model_forest_embedding_config(tmp_path):
     assert generator.embedding_config.model_name == "test-embedding-model"
 
 
+def test_simple_runner_uses_processes_for_tfidf_contexts_by_default(tmp_path):
+    raw, config = _inputs(tmp_path, components=("tfidf",))
+
+    default_mapping = stage1_workflow._load_stage1_template(config)
+    default_multi_model = default_mapping["architecture"]["multi_model_forest"]
+
+    assert default_multi_model["outer_parallel_backend"] == "processes"
+    assert default_multi_model["cpus_total"] == config.workers
+
+    raw["science"]["stage1"]["architecture"] = {
+        "multi_model_forest": {"outer_parallel_backend": "threads"}
+    }
+    overridden = compile_config(raw, config_dir=tmp_path)
+    overridden_mapping = stage1_workflow._load_stage1_template(overridden)
+
+    assert (
+        overridden_mapping["architecture"]["multi_model_forest"][
+            "outer_parallel_backend"
+        ]
+        == "threads"
+    )
+
+
 def test_completed_components_are_skipped_without_revalidation(tmp_path):
     _raw, config = _inputs(tmp_path)
     calls: list[str] = []

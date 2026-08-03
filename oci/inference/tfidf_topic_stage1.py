@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import builtins
 from contextlib import nullcontext
 import hashlib
 import json
@@ -11,7 +10,6 @@ import multiprocessing as mp
 from dataclasses import asdict
 from pathlib import Path
 import sys
-import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -52,33 +50,6 @@ TFIDF_TOPIC_SPLIT_SCHEMA_VERSION = "tfidf_topic_joint_treatment_outcome_v1"
 TFIDF_TOPIC_DATASET_FINGERPRINT_VERSION = "tfidf_topic_model_inputs_v1"
 _DEFAULT_STAGE1_SEED = 42
 TFIDF_NESTED_CALIBRATION_SCHEMA_VERSION = "tfidf_nested_fit_calibration_v1"
-
-
-def _serialized_loky_import_bootstrap(
-    *,
-    module_name: str,
-    lock_identity: str,
-) -> Dict[str, Any]:
-    """Serialize heavy worker imports across loky children on FUSE/SSHFS."""
-
-    lock_digest = hashlib.sha256(
-        str(lock_identity).encode("utf-8")
-    ).hexdigest()
-    lock_path = (
-        Path(tempfile.gettempdir())
-        / f"oci-stage1-loky-import-{lock_digest}.lock"
-    )
-    code = (
-        "import fcntl, importlib\n"
-        f"with open({str(lock_path)!r}, 'a+b') as _oci_import_lock:\n"
-        "    fcntl.flock(_oci_import_lock.fileno(), fcntl.LOCK_EX)\n"
-        f"    importlib.import_module({str(module_name)!r})\n"
-        "    fcntl.flock(_oci_import_lock.fileno(), fcntl.LOCK_UN)\n"
-    )
-    return {
-        "initializer": builtins.exec,
-        "initargs": (code,),
-    }
 
 
 def _float_hex_sha256(values: Sequence[float]) -> str:
@@ -1260,18 +1231,9 @@ def run_tfidf_topic_stage1(
     if joblib_backend == "loky":
         parallel_kwargs["inner_max_num_threads"] = 1
     with parallel_config(**parallel_kwargs):
-        worker_bootstrap = (
-            _serialized_loky_import_bootstrap(
-                module_name=__name__,
-                lock_identity=str(contexts_dir.resolve()),
-            )
-            if joblib_backend == "loky"
-            else {}
-        )
         completed_contexts = Parallel(
             batch_size=1,
             pre_dispatch="all",
-            **worker_bootstrap,
         )(
             delayed(_fit_tfidf_topic_stage1_spec)(
                 spec,
@@ -1281,7 +1243,7 @@ def run_tfidf_topic_stage1(
                 dataset_identity=dataset_identity,
                 split_semantics_hash=split_semantics_hash,
                 split_schema_version=stage1_identity["split_semantics"]["schema_version"],
-                limit_native_threads=(joblib_backend == "multiprocessing"),
+                limit_native_threads=(joblib_backend in {"loky", "multiprocessing"}),
             )
             for spec in all_context_specs
         )

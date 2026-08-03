@@ -352,6 +352,11 @@ cd onc-causal-inference
 uv sync --frozen
 ```
 
+The committed cloud launchers use the repository-local `.venv`. Each launcher
+runs `uv sync --frozen` from the repository root and then invokes
+`.venv/bin/python` directly. An unrelated activated environment is therefore
+not used by these runs.
+
 An editable `pip` installation is also supported:
 
 ```bash
@@ -486,9 +491,14 @@ The workflow runs its top-level components in order because later components
 reuse artifacts or split definitions produced by earlier ones. Parallelism is
 applied within the computationally expensive components. The embedding cache
 divides the ordered chunk corpus among the configured GPUs. TF-IDF discovery
-uses CPU workers across fold contexts. The text-model and neural-query
-components treat each outer/full or exact-inner discovery context as an
-independent job.
+uses separate CPU processes across independent outer/full and exact-inner
+contexts. Each process performs one context's vectorization, screening,
+stability analysis, and topic fitting with one native numerical thread. This
+process boundary is important because several parts of topic discovery are
+Python-heavy and would contend if they shared one interpreter. The number of
+simultaneous context processes is the smaller of the unfinished context count
+and `run.workers`. The text-model and neural-query components also treat each
+outer/full or exact-inner discovery context as an independent job.
 
 For CUDA runs, the runner creates one fixed process lane per configured GPU and
 assigns whole contexts to those lanes. A lane remains attached to the same GPU,

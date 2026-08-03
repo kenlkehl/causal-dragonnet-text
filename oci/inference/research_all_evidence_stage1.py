@@ -334,6 +334,20 @@ def _load_stage1_template(config: ResearchStage1Config) -> dict[str, Any]:
     multi_model = architecture.setdefault("multi_model_forest", {})
     multi_model["candidate_consistency_inner_folds"] = config.inner_folds
     multi_model["cpus_total"] = config.workers
+    override_architecture = config.stage1_overrides.get("architecture")
+    override_multi_model = (
+        override_architecture.get("multi_model_forest")
+        if isinstance(override_architecture, Mapping)
+        else None
+    )
+    if not (
+        isinstance(override_multi_model, Mapping)
+        and "outer_parallel_backend" in override_multi_model
+    ):
+        # Exact TF-IDF contexts share no fitted state. Separate processes avoid
+        # Python interpreter contention during screening, stability analysis,
+        # and topic fitting while preserving one numeric thread per process.
+        multi_model["outer_parallel_backend"] = "processes"
     embedding = multi_model.setdefault("embedding_contrast", {})
     embedding["model_name"] = config.embedding_model
     embedding["cache_dir"] = str(config.output_dir / "components" / "embedding_cache" / "cache")
