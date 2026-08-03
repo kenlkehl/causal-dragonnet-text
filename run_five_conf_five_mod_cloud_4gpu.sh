@@ -29,16 +29,22 @@ if [[ ! -f "${dataset}" ]]; then
     exit 1
 fi
 
-echo "Installing the locked environment..."
+echo "Synchronizing ${repo_root}/.venv from the lockfile..."
 uv sync --frozen
 
-uv run python -c 'from sentence_transformers import SentenceTransformer'
+python_bin="${repo_root}/.venv/bin/python"
+if [[ ! -x "${python_bin}" ]]; then
+    echo "uv did not create the expected interpreter at ${python_bin}." >&2
+    exit 1
+fi
+
+"${python_bin}" -c 'from sentence_transformers import SentenceTransformer'
 
 # Restrict the process tree to physical GPUs 0-3. Within the process these are
 # addressed as cuda:0 through cuda:3, matching the runner arguments below.
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-gpu_count="$(uv run python -c 'import torch; print(torch.cuda.device_count())')"
+gpu_count="$("${python_bin}" -c 'import torch; print(torch.cuda.device_count())')"
 if [[ "${gpu_count}" != "4" ]]; then
     echo "Expected physical GPUs 0-3 to expose 4 CUDA devices, but PyTorch found ${gpu_count}." >&2
     exit 1
@@ -52,7 +58,7 @@ echo "Parallel: four fixed discovery-context lanes on physical GPUs 0-3"
 
 export PYTHONUNBUFFERED=1
 
-exec uv run python scripts/run_all_evidence.py \
+exec "${python_bin}" -m oci.inference.research_all_evidence_stage1 \
     --dataset "${dataset}" \
     --output-dir "${output_dir}" \
     --unit-id-column patient_id \

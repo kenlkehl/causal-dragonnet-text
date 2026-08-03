@@ -18,10 +18,11 @@ cd "${repo_root}"
 
 dataset="${repo_root}/synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet"
 output_dir="${1:-${repo_root}/artifacts/research_all_evidence/one_conf_one_mod_nsclc_8gpu}"
+outer_folds=5
+inner_folds=5
 
-python_bin="${HOME}/thisenv/bin/python"
-if [[ ! -x "${python_bin}" ]]; then
-    echo "Expected the Python environment at ${python_bin}." >&2
+if ! command -v uv >/dev/null 2>&1; then
+    echo "uv is required but was not found on PATH." >&2
     exit 1
 fi
 
@@ -33,6 +34,15 @@ if ! ldconfig -p 2>/dev/null | grep -E 'libavutil\.so\.(56|57|58|59|60)' >/dev/n
     echo "Installing the shared FFmpeg libraries required by TorchCodec..."
     sudo apt-get update
     sudo apt-get install -y ffmpeg
+fi
+
+echo "Synchronizing ${repo_root}/.venv from the lockfile..."
+uv sync --frozen
+
+python_bin="${repo_root}/.venv/bin/python"
+if [[ ! -x "${python_bin}" ]]; then
+    echo "uv did not create the expected interpreter at ${python_bin}." >&2
+    exit 1
 fi
 
 "${python_bin}" -c 'from sentence_transformers import SentenceTransformer'
@@ -50,18 +60,28 @@ for ((gpu_index = 0; gpu_index < gpu_count; gpu_index++)); do
     fi
     devices+="cuda:${gpu_index}"
 done
-worker_count="$("${python_bin}" -c 'import os; available = getattr(os, "process_cpu_count", os.cpu_count); print(max(1, available() or os.cpu_count() or 1))')"
+available_cpu_count="$("${python_bin}" -c 'import os; available = getattr(os, "process_cpu_count", os.cpu_count); print(max(1, available() or os.cpu_count() or 1))')"
+context_capacity=$((outer_folds * (inner_folds + 1)))
+bow_capacity=$((gpu_count * inner_folds))
+worker_capacity="${context_capacity}"
+if (( bow_capacity > worker_capacity )); then
+    worker_capacity="${bow_capacity}"
+fi
+worker_count="${available_cpu_count}"
+if (( worker_count > worker_capacity )); then
+    worker_count="${worker_capacity}"
+fi
 
 echo "Dataset: ${dataset}"
 echo "Output:  ${output_dir}"
 echo "Progress: ${output_dir}/progress.json"
 echo "Log:      ${output_dir}/logs/workflow.log"
 echo "Parallel: one discovery-context lane per visible GPU (${gpu_count} available)"
-echo "BoW CPUs: ${worker_count} workers divided across active lanes"
+echo "CPU budget: ${worker_count} workers (${available_cpu_count} available; capped by runnable tasks)"
 
 export PYTHONUNBUFFERED=1
 
-exec "${python_bin}" scripts/run_all_evidence.py \
+exec "${python_bin}" -m oci.inference.research_all_evidence_stage1 \
     --dataset "${dataset}" \
     --output-dir "${output_dir}" \
     --unit-id-column patient_id \
@@ -70,8 +90,8 @@ exec "${python_bin}" scripts/run_all_evidence.py \
     --outcome-column outcome_indicator \
     --outcome-type binary \
     --clinical-question "For advanced or metastatic NSCLC, identify pretreatment text features that confound assignment to vinorelbine versus gemcitabine or modify their treatment effect." \
-    --outer-folds 5 \
-    --inner-folds 5 \
+    --outer-folds "${outer_folds}" \
+    --inner-folds "${inner_folds}" \
     --seed 42 \
     --devices "${devices}" \
     --workers "${worker_count}" \
