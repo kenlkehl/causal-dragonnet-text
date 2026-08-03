@@ -8,8 +8,9 @@
 #   ./run_five_conf_five_mod_cloud_4gpu.sh
 #   ./run_five_conf_five_mod_cloud_4gpu.sh /persistent/results/my_run
 #
-# The default output directory is stable. Rerunning this script with the same
-# output directory skips completed components and completed fold contexts.
+# The default is a fresh lossless-text run directory, separate from artifacts
+# produced with the old 160-chunk/single-prompt configuration. Rerunning this
+# updated script resumes only within the new directory.
 
 set -euo pipefail
 
@@ -17,7 +18,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${repo_root}"
 
 dataset="${repo_root}/synthetic_data/example_synthetic_datasets/five_confounders_five_effect_modifiers_nsclc_with_structured/dataset.parquet"
-output_dir="${1:-${repo_root}/artifacts/research_all_evidence/five_conf_five_mod_nsclc_4gpu}"
+output_dir="${1:-${repo_root}/artifacts/research_all_evidence/five_conf_five_mod_nsclc_4gpu_lossless_v2}"
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "uv is required but was not found on PATH." >&2
@@ -74,5 +75,6 @@ exec "${python_bin}" -m oci.inference.research_all_evidence_stage1 \
     --workers 32 \
     --htr-model prajjwal1/bert-tiny \
     --embedding-model Qwen/Qwen3-Embedding-8B \
-    --set science.stage1.architecture.multi_model_forest.embedding_contrast.max_chunks=160 \
+    --set science.stage1.architecture.multi_model_forest.embedding_contrast.max_chunks=512 \
+    --set science.stage1.architecture.htr_max_chunks=512 \
     --stage1-only

@@ -8,8 +8,9 @@
 #   ./run_one_conf_one_mod_cloud_8gpu.sh
 #   ./run_one_conf_one_mod_cloud_8gpu.sh /persistent/results/my_run
 #
-# The default output directory is stable so rerunning this script resumes any
-# completed components and fold contexts. Pass a new directory for a new run.
+# The default is a fresh lossless-text run directory, separate from artifacts
+# produced with the old 128-chunk/single-prompt configuration. Rerunning this
+# updated script resumes only within the new directory.
 
 set -euo pipefail
 
@@ -17,7 +18,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${repo_root}"
 
 dataset="${repo_root}/synthetic_data/example_synthetic_datasets/one_confounder_one_effect_modifier_nsclc_with_structured/dataset.parquet"
-output_dir="${1:-${repo_root}/artifacts/research_all_evidence/one_conf_one_mod_nsclc_8gpu}"
+output_dir="${1:-${repo_root}/artifacts/research_all_evidence/one_conf_one_mod_nsclc_8gpu_lossless_v2}"
 outer_folds=5
 inner_folds=5
 
@@ -97,5 +98,6 @@ exec "${python_bin}" -m oci.inference.research_all_evidence_stage1 \
     --workers "${worker_count}" \
     --htr-model prajjwal1/bert-tiny \
     --embedding-model Qwen/Qwen3-Embedding-8B \
-    --set science.stage1.architecture.multi_model_forest.embedding_contrast.max_chunks=128 \
+    --set science.stage1.architecture.multi_model_forest.embedding_contrast.max_chunks=512 \
+    --set science.stage1.architecture.htr_max_chunks=512 \
     --stage1-only
