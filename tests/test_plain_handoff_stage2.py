@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from oci.inference.plain_handoff_stage2 import (
+    PlainHandoffStage2,
     PlainHandoffStage2Config,
     packetize_handoff,
     run_plain_handoff_stage2,
@@ -282,6 +283,96 @@ def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Pat
     assert "".join(row["text"] for row in ordered_pages) == note
     assert all(size <= 5_000 for size in prompt_sizes)
     assert frame.loc[0, "performance_status"] == "ECOG 2"
+
+
+def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
+    prompt_sizes = []
+
+    def completion(messages, _config):
+        prompt_sizes.append(sum(len(message["content"]) for message in messages))
+        body = json.loads(messages[1]["content"])
+        assert body["job"] == "consolidate_and_operationalize_stage2_features"
+        candidates = body["candidates"]
+        packet_ids = list(
+            dict.fromkeys(
+                packet_id
+                for candidate in candidates
+                for packet_id in candidate["supporting_packet_ids"]
+            )
+        )
+        architectures = list(
+            dict.fromkeys(
+                architecture
+                for candidate in candidates
+                for architecture in [
+                    candidate["architecture"],
+                    *(candidate.get("supporting_architectures") or []),
+                ]
+            )
+        )
+        return json.dumps(
+            {
+                "features": [
+                    {
+                        "name": "performance_status",
+                        "description": "Baseline ECOG performance status.",
+                        "value_type": "ordinal",
+                        "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
+                        "roles": ["confounder"],
+                        "measurement_definition": "Extract the pretreatment ECOG score.",
+                        "missing_value_rule": "Return null when undocumented.",
+                        "supporting_packet_ids": packet_ids,
+                        "supporting_architectures": architectures,
+                        "stability_summary": "Supported across bounded batches.",
+                        "caveats": "none",
+                    }
+                ],
+                "candidate_dispositions": {
+                    candidate["candidate_id"]: {
+                        "status": "retained" if index == 0 else "merged",
+                        "feature_name": "performance_status",
+                        "reason": "Same clinical measurement.",
+                    }
+                    for index, candidate in enumerate(candidates)
+                },
+            }
+        )
+
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        max_prompt_chars=4_000,
+        max_candidates_per_fold=3,
+    )
+    runner = PlainHandoffStage2(
+        config=config,
+        clinical_question="Identify confounders.",
+        completion=completion,
+    )
+    candidates = [
+        {
+            "candidate_id": f"candidate_{index:04d}",
+            "architecture": f"architecture_{index}",
+            "name": f"performance_status_{index}",
+            "description": "ECOG evidence " + ("x" * 1_200),
+            "value_type": "ordinal",
+            "supporting_packet_ids": [f"packet_{index}"],
+            "evidence_axes": ["treatment", "outcome"],
+            "caveats": "none",
+        }
+        for index in range(1, 7)
+    ]
+
+    result = runner._consolidate_candidates(outer_fold=1, candidates=candidates)
+
+    assert len(prompt_sizes) > 1
+    assert all(size <= config.max_prompt_chars for size in prompt_sizes)
+    assert set(result["candidate_dispositions"]) == {
+        candidate["candidate_id"] for candidate in candidates
+    }
+    assert set(result["features"][0]["supporting_packet_ids"]) == {
+        candidate["supporting_packet_ids"][0] for candidate in candidates
+    }
 
 
 def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):

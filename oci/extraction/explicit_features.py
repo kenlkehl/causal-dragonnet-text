@@ -268,8 +268,8 @@ def build_extraction_prompt(
             max_chars=int(max_text_length),
         ).text
     elif strategy == "complete_paged_v1":
-        # Page construction and reconciliation are owned by the production
-        # provider.  Each call here receives one already bounded complete page.
+        # Page construction and reconciliation are owned by the extraction
+        # provider. Each call here receives one already bounded complete page.
         if max_text_length is not None and len(text) > int(max_text_length):
             raise ValueError("complete_paged_v1 received an oversized unpaged input")
     else:

@@ -711,6 +711,52 @@ def _validate_interpretation(
     return {"concepts": clean_concepts, "packet_dispositions": clean_dispositions}
 
 
+def _partition_interpretation_packets(
+    packets: Sequence[Mapping[str, Any]],
+    *,
+    clinical_question: str,
+    architecture: str,
+    max_prompt_chars: int,
+) -> list[list[Mapping[str, Any]]]:
+    """Pack evidence using the exact fully rendered interpretation prompt."""
+
+    batches: list[list[Mapping[str, Any]]] = []
+    current: list[Mapping[str, Any]] = []
+    for packet in packets:
+        candidate = [*current, packet]
+        messages = _interpretation_prompt(
+            clinical_question=clinical_question,
+            architecture=architecture,
+            packets=candidate,
+        )
+        prompt_chars = sum(
+            len(str(message.get("content") or "")) for message in messages
+        )
+        if not current and prompt_chars > int(max_prompt_chars):
+            raise ValueError(
+                "one Stage 2 evidence packet cannot fit the rendered prompt budget"
+            )
+        if current and prompt_chars > int(max_prompt_chars):
+            batches.append(current)
+            current = [packet]
+            singleton = _interpretation_prompt(
+                clinical_question=clinical_question,
+                architecture=architecture,
+                packets=current,
+            )
+            if sum(len(message["content"]) for message in singleton) > int(
+                max_prompt_chars
+            ):
+                raise ValueError(
+                    "one Stage 2 evidence packet cannot fit the rendered prompt budget"
+                )
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _consolidation_prompt(
     *,
     clinical_question: str,
@@ -790,12 +836,24 @@ def _validate_consolidation(
         for candidate in candidates
         for packet_id in candidate["supporting_packet_ids"]
     }
-    allowed_architectures = {str(candidate["architecture"]) for candidate in candidates}
+    allowed_architectures = {
+        str(architecture)
+        for candidate in candidates
+        for architecture in [
+            candidate["architecture"],
+            *(candidate.get("supporting_architectures") or []),
+        ]
+    }
     packet_axes: dict[str, set[str]] = defaultdict(set)
     for candidate in candidates:
         for packet_id in candidate["supporting_packet_ids"]:
+            per_packet = candidate.get("packet_evidence_axes") or {}
             packet_axes[str(packet_id)].update(
-                str(axis) for axis in candidate["evidence_axes"]
+                str(axis)
+                for axis in per_packet.get(
+                    str(packet_id),
+                    candidate["evidence_axes"],
+                )
             )
     clean_features: list[dict[str, Any]] = []
     required = {
@@ -922,6 +980,51 @@ def _validate_consolidation(
                 disposition["reason"] + " No supported Stage 2 causal role remained after routing."
             ).strip()
     return {"features": routed_features, "candidate_dispositions": clean_dispositions}
+
+
+def _partition_consolidation_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    clinical_question: str,
+    outer_fold: int,
+    max_candidates: int,
+    max_prompt_chars: int,
+) -> list[list[Mapping[str, Any]]]:
+    batches: list[list[Mapping[str, Any]]] = []
+    current: list[Mapping[str, Any]] = []
+    for candidate in candidates:
+        proposed = [*current, candidate]
+        messages = _consolidation_prompt(
+            clinical_question=clinical_question,
+            outer_fold=outer_fold,
+            candidates=proposed,
+            max_candidates=max_candidates,
+        )
+        chars = sum(len(message["content"]) for message in messages)
+        if not current and chars > int(max_prompt_chars):
+            raise ValueError(
+                "one interpreted Stage 2 candidate cannot fit the rendered prompt budget"
+            )
+        if current and chars > int(max_prompt_chars):
+            batches.append(current)
+            current = [candidate]
+            singleton = _consolidation_prompt(
+                clinical_question=clinical_question,
+                outer_fold=outer_fold,
+                candidates=current,
+                max_candidates=max_candidates,
+            )
+            if sum(len(message["content"]) for message in singleton) > int(
+                max_prompt_chars
+            ):
+                raise ValueError(
+                    "one interpreted Stage 2 candidate cannot fit the rendered prompt budget"
+                )
+        else:
+            current = proposed
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _load_stage2_splits(
@@ -1056,6 +1159,189 @@ class PlainHandoffStage2:
         _write_json(complete_path, {"status": "complete", "completed_at": _now()})
         return result
 
+    def _consolidate_candidates(
+        self,
+        *,
+        outer_fold: int,
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        """Losslessly map-reduce candidates when one prompt cannot hold them."""
+
+        original_ids = [str(candidate["candidate_id"]) for candidate in candidates]
+        current = [
+            {**dict(candidate), "origin_candidate_ids": [str(candidate["candidate_id"])]}
+            for candidate in candidates
+        ]
+        terminal_exclusions: dict[str, str] = {}
+        stage = 0
+        while True:
+            batches = _partition_consolidation_candidates(
+                current,
+                clinical_question=self.clinical_question,
+                outer_fold=outer_fold,
+                max_candidates=self.config.max_candidates_per_fold,
+                max_prompt_chars=self.config.max_prompt_chars,
+            )
+            if len(batches) == 1:
+                final = _request_json(
+                    messages=_consolidation_prompt(
+                        clinical_question=self.clinical_question,
+                        outer_fold=outer_fold,
+                        candidates=current,
+                        max_candidates=self.config.max_candidates_per_fold,
+                    ),
+                    config=self.config,
+                    completion=self.completion,
+                    validate=lambda value: _validate_consolidation(
+                        value,
+                        candidates=current,
+                        max_candidates=self.config.max_candidates_per_fold,
+                    ),
+                )
+                final_dispositions = final["candidate_dispositions"]
+                resolved: dict[str, dict[str, str]] = {
+                    candidate_id: {
+                        "status": "excluded",
+                        "feature_name": "",
+                        "reason": terminal_exclusions.get(
+                            candidate_id,
+                            "Excluded during bounded candidate consolidation.",
+                        ),
+                    }
+                    for candidate_id in original_ids
+                }
+                retained_by_feature: dict[str, list[str]] = defaultdict(list)
+                for candidate in current:
+                    disposition = final_dispositions[str(candidate["candidate_id"])]
+                    origins = [str(value) for value in candidate["origin_candidate_ids"]]
+                    if disposition["status"] == "excluded":
+                        for origin in origins:
+                            resolved[origin]["reason"] = disposition["reason"]
+                        continue
+                    feature_name = str(disposition["feature_name"])
+                    for origin in origins:
+                        retained_by_feature[feature_name].append(origin)
+                        resolved[origin] = {
+                            "status": "merged",
+                            "feature_name": feature_name,
+                            "reason": disposition["reason"],
+                        }
+                for origins in retained_by_feature.values():
+                    if origins:
+                        resolved[origins[0]]["status"] = "retained"
+                return {
+                    "features": final["features"],
+                    "candidate_dispositions": resolved,
+                }
+
+            stage += 1
+            stage_limit = max(
+                1,
+                self.config.max_candidates_per_fold // max(1, len(batches)),
+            )
+            next_candidates: list[dict[str, Any]] = []
+            for batch_index, batch in enumerate(batches, start=1):
+                partial = _request_json(
+                    messages=_consolidation_prompt(
+                        clinical_question=self.clinical_question,
+                        outer_fold=outer_fold,
+                        candidates=batch,
+                        max_candidates=stage_limit,
+                    ),
+                    config=self.config,
+                    completion=self.completion,
+                    validate=lambda value, batch=batch: _validate_consolidation(
+                        value,
+                        candidates=batch,
+                        max_candidates=stage_limit,
+                    ),
+                )
+                dispositions = partial["candidate_dispositions"]
+                by_id = {str(candidate["candidate_id"]): candidate for candidate in batch}
+                for candidate_id, disposition in dispositions.items():
+                    if disposition["status"] == "excluded":
+                        for origin in by_id[candidate_id]["origin_candidate_ids"]:
+                            terminal_exclusions[str(origin)] = disposition["reason"]
+                for feature_index, feature in enumerate(partial["features"], start=1):
+                    contributing = [
+                        by_id[candidate_id]
+                        for candidate_id, disposition in dispositions.items()
+                        if disposition["status"] != "excluded"
+                        and disposition["feature_name"] == feature["name"]
+                    ]
+                    origins = list(
+                        dict.fromkeys(
+                            str(origin)
+                            for candidate in contributing
+                            for origin in candidate["origin_candidate_ids"]
+                        )
+                    )
+                    if not origins:
+                        continue
+                    evidence_axes = sorted(
+                        {
+                            str(axis)
+                            for candidate in contributing
+                            for axis in candidate["evidence_axes"]
+                        }
+                    )
+                    packet_evidence_axes: dict[str, list[str]] = {}
+                    for candidate in contributing:
+                        inherited = candidate.get("packet_evidence_axes") or {}
+                        for packet_id in candidate["supporting_packet_ids"]:
+                            packet_key = str(packet_id)
+                            packet_evidence_axes[packet_key] = sorted(
+                                {
+                                    *packet_evidence_axes.get(packet_key, []),
+                                    *(
+                                        inherited.get(packet_key)
+                                        or candidate["evidence_axes"]
+                                    ),
+                                }
+                            )
+                    next_candidates.append(
+                        {
+                            "candidate_id": (
+                                f"stage_{stage:02d}_batch_{batch_index:03d}_"
+                                f"feature_{feature_index:03d}"
+                            ),
+                            "architecture": "bounded_multi_architecture_consolidation",
+                            "supporting_architectures": list(
+                                feature["supporting_architectures"]
+                            ),
+                            "name": feature["name"],
+                            "description": feature["description"],
+                            "value_type": feature["value_type"],
+                            "supporting_packet_ids": list(
+                                feature["supporting_packet_ids"]
+                            ),
+                            "evidence_axes": evidence_axes,
+                            "packet_evidence_axes": packet_evidence_axes,
+                            "caveats": feature["caveats"],
+                            "origin_candidate_ids": origins,
+                        }
+                    )
+            if not next_candidates:
+                return {
+                    "features": [],
+                    "candidate_dispositions": {
+                        candidate_id: {
+                            "status": "excluded",
+                            "feature_name": "",
+                            "reason": terminal_exclusions.get(
+                                candidate_id,
+                                "No supported feature remained after bounded consolidation.",
+                            ),
+                        }
+                        for candidate_id in original_ids
+                    },
+                }
+            if len(next_candidates) >= len(current) and stage > 8:
+                raise ValueError(
+                    "bounded Stage 2 consolidation did not reduce the candidate set"
+                )
+            current = next_candidates
+
     def _run_outer_fold(
         self,
         *,
@@ -1114,11 +1400,12 @@ class PlainHandoffStage2:
             final = json.loads(features_path.read_text(encoding="utf-8"))
         else:
             jobs: list[tuple[str, int, list[Mapping[str, Any]], Path]] = []
-            interpretation_budget = max(2_000, self.config.max_prompt_chars - 12_000)
             for architecture_index, architecture in enumerate(sorted(by_architecture), start=1):
-                batches = _partition_packets(
+                batches = _partition_interpretation_packets(
                     by_architecture[architecture],
-                    max_chars=interpretation_budget,
+                    clinical_question=self.clinical_question,
+                    architecture=architecture,
+                    max_prompt_chars=self.config.max_prompt_chars,
                 )
                 for batch_index, batch in enumerate(batches, start=1):
                     jobs.append(
@@ -1186,20 +1473,9 @@ class PlainHandoffStage2:
                     "candidate_dispositions": {},
                 }
             else:
-                consolidated = _request_json(
-                    messages=_consolidation_prompt(
-                        clinical_question=self.clinical_question,
-                        outer_fold=outer_fold,
-                        candidates=candidates,
-                        max_candidates=self.config.max_candidates_per_fold,
-                    ),
-                    config=self.config,
-                    completion=self.completion,
-                    validate=lambda value: _validate_consolidation(
-                        value,
-                        candidates=candidates,
-                        max_candidates=self.config.max_candidates_per_fold,
-                    ),
+                consolidated = self._consolidate_candidates(
+                    outer_fold=outer_fold,
+                    candidates=candidates,
                 )
                 features = []
                 for index, feature in enumerate(consolidated["features"], start=1):

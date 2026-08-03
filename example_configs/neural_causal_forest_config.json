@@ -7,7 +7,7 @@
   "max_length": 128,
   "chunk_size_words": 96,
   "chunk_overlap_words": 24,
-  "max_chunks": 128,
+  "max_chunks": 512,
   "representation_dim": 128,
   "token_attention_dim": 128,
   "chunk_attention_dim": 128,

@@ -9854,6 +9854,9 @@ def _evidence_digest_role_context(
         "outer_fold": context.get("outer_fold"),
         "target_role": role,
         "max_proposals": int(max_proposals),
+        "clinical_text_examples": [
+            str(text) for text in context.get("clinical_text_examples", [])
+        ],
         "text_blurbs": _evidence_digest_text_blurbs(role_evidence),
         "response_contract": {
             "proposals": [

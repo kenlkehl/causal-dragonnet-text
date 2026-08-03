@@ -2763,7 +2763,7 @@ class VLLMExplicitFeatureExtractionProvider:
             {value_column: None, missing_column: True} for _ in texts
         ]
         if not notes:
-            return pd.DataFrame(rows)
+            return pd.DataFrame(rows, columns=[value_column, missing_column])
 
         request_plan = plan_complete_paged_requests(
             notes,
@@ -2879,7 +2879,7 @@ class VLLMExplicitFeatureExtractionProvider:
             + "\n",
             encoding="utf-8",
         )
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=[value_column, missing_column])
 
     def _extract_spec_group_resumable(
         self,

@@ -317,7 +317,7 @@ class ExplicitFeatureExtractionConfig:
     # must receive their limit explicitly from configuration.
     extraction_max_text_length: Optional[int] = None
     # Required for complete_paged_v1. These are scientific settings with no
-    # production-code defaults; they bound one request but never truncate a
+    # implicit defaults; they bound one request but never truncate a
     # note because page cores must cover the full prepared text exactly once.
     complete_page_core_chars: Optional[int] = None
     complete_page_context_chars: Optional[int] = None
@@ -1201,7 +1201,9 @@ class EmbeddingContrastDiscoveryConfig:
     max_seq_length: Optional[int] = 1024
     chunk_size_words: int = 256
     chunk_overlap_words: int = 64
-    max_chunks: int = 64
+    # Complete-note encoder capacity. This must not select a prefix/tail; 512
+    # is nonbinding for the bundled long-note cohorts.
+    max_chunks: int = 512
     chunk_selection: str = "last"
     normalize_embeddings: bool = True
     top_k_chunks_per_tail: int = 12

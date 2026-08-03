@@ -44,6 +44,7 @@ def test_clinical_text_examples_keep_selected_long_note_complete():
 def test_evidence_digest_keeps_complete_clinical_examples():
     from oci.inference.multi_model_agentic_forest import (
         _build_evidence_digest_agent_context,
+        _evidence_digest_role_context,
     )
 
     note = "complete note " + ("z" * 8_000)
@@ -62,10 +63,15 @@ def test_evidence_digest_keeps_complete_clinical_examples():
     )
 
     assert context["clinical_text_examples"] == [note]
+    assert _evidence_digest_role_context(
+        context,
+        role="confounder",
+        max_proposals=2,
+    )["clinical_text_examples"] == [note]
 
 
 def test_complete_paged_provider_processes_and_reconciles_every_page(tmp_path: Path):
-    from oci.extraction import CompletePageResponse
+    from oci.extraction import COMPLETE_PAGED_RESPONSE_SCHEMA, CompletePageResponse
     from oci.inference.agentic_explicit_feature_forest import (
         VLLMExplicitFeatureExtractionProvider,
     )
@@ -99,7 +105,7 @@ def test_complete_paged_provider_processes_and_reconciles_every_page(tmp_path: P
             if marker_start >= 0:
                 return CompletePageResponse.validate(
                     {
-                        "schema_version": "complete_paged_response_v1",
+                        "schema_version": COMPLETE_PAGED_RESPONSE_SCHEMA,
                         "status": "positive",
                         "normalized_value": "ECOG 2",
                         "reason": None,
@@ -116,7 +122,7 @@ def test_complete_paged_provider_processes_and_reconciles_every_page(tmp_path: P
                 )
             return CompletePageResponse.validate(
                 {
-                    "schema_version": "complete_paged_response_v1",
+                    "schema_version": COMPLETE_PAGED_RESPONSE_SCHEMA,
                     "status": "negative",
                     "normalized_value": None,
                     "reason": None,
@@ -136,7 +142,7 @@ def test_complete_paged_provider_processes_and_reconciles_every_page(tmp_path: P
                 None,
             )
             response = positive or {
-                "schema_version": "complete_paged_response_v1",
+                "schema_version": COMPLETE_PAGED_RESPONSE_SCHEMA,
                 "status": "negative",
                 "normalized_value": None,
                 "reason": None,

@@ -78,7 +78,10 @@ class NeuralCausalForestConfig:
     max_length: int = 128
     chunk_size_words: int = 96
     chunk_overlap_words: int = 24
-    max_chunks: int = 128
+    # Sized above the longest bundled complete notes. This is a fail-closed
+    # capacity rather than a note-selection setting, so keep it nonbinding for
+    # the supported cohorts.
+    max_chunks: int = 512
     representation_dim: int = 128
     token_attention_dim: int = 128
     chunk_attention_dim: int = 128
@@ -817,62 +820,15 @@ class HierarchicalTokenAttentionEncoder(nn.Module):
                         parameter.requires_grad = True
 
     def split_texts(self, texts: Sequence[str]) -> List[List[ChunkInfo]]:
-        from .hierarchical_transformer_extractor import (
-            split_text_to_token_bounded_chunks,
-        )
-
-        rows: List[List[ChunkInfo]] = []
-        for text in texts:
-            source = str(text or "")
-            word_chunks = split_text_into_word_span_chunks(
-                source,
+        return [
+            split_text_into_word_span_chunks(
+                text,
                 self.config.chunk_size_words,
                 self.config.chunk_overlap_words,
                 self.config.max_chunks,
             )
-            tokenizer = self.tokenizer
-            if tokenizer is None or self.config.encoder_backend == "hash":
-                rows.append(word_chunks)
-                continue
-
-            bounded: List[ChunkInfo] = []
-            for word_chunk in word_chunks:
-                pieces = split_text_to_token_bounded_chunks(
-                    word_chunk.text,
-                    tokenizer,
-                    self.config.max_length,
-                )
-                cursor = 0
-                for piece in pieces:
-                    if word_chunk.text[cursor : cursor + len(piece)] != piece:
-                        raise RuntimeError(
-                            "NCF HTR secondary chunking changed source text"
-                        )
-                    char_start = word_chunk.char_start + cursor
-                    cursor += len(piece)
-                    bounded.append(
-                        ChunkInfo(
-                            text=piece,
-                            char_start=char_start,
-                            char_end=word_chunk.char_start + cursor,
-                            chunk_index=len(bounded),
-                        )
-                    )
-                if cursor != len(word_chunk.text):
-                    raise RuntimeError(
-                        "NCF HTR secondary chunking omitted source text"
-                    )
-            if len(bounded) > self.config.max_chunks:
-                from .lossless_tokenization import SemanticTruncationError
-
-                raise SemanticTruncationError(
-                    "NeuralCausalForest token-bounded note requires "
-                    f"{len(bounded)} chunks but configured max_chunks="
-                    f"{self.config.max_chunks}; semantic truncation is forbidden. "
-                    "Increase max_chunks so the capacity is nonbinding."
-                )
-            rows.append(bounded)
-        return rows
+            for text in texts
+        ]
 
     def forward(
         self,
@@ -1188,15 +1144,62 @@ class HTRGradientAttentionEncoder(nn.Module):
         return getattr(self.htr, "_tokenizer", None)
 
     def split_texts(self, texts: Sequence[str]) -> List[List[ChunkInfo]]:
-        return [
-            split_text_into_word_span_chunks(
-                text,
+        from .hierarchical_transformer_extractor import (
+            split_text_to_token_bounded_chunks,
+        )
+
+        rows: List[List[ChunkInfo]] = []
+        for text in texts:
+            source = str(text or "")
+            word_chunks = split_text_into_word_span_chunks(
+                source,
                 self.config.chunk_size_words,
                 self.config.chunk_overlap_words,
                 self.config.max_chunks,
             )
-            for text in texts
-        ]
+            tokenizer = self.tokenizer
+            if tokenizer is None or self.config.encoder_backend == "hash":
+                rows.append(word_chunks)
+                continue
+
+            bounded: List[ChunkInfo] = []
+            for word_chunk in word_chunks:
+                pieces = split_text_to_token_bounded_chunks(
+                    word_chunk.text,
+                    tokenizer,
+                    self.config.max_length,
+                )
+                cursor = 0
+                for piece in pieces:
+                    if word_chunk.text[cursor : cursor + len(piece)] != piece:
+                        raise RuntimeError(
+                            "NCF HTR secondary chunking changed source text"
+                        )
+                    char_start = word_chunk.char_start + cursor
+                    cursor += len(piece)
+                    bounded.append(
+                        ChunkInfo(
+                            text=piece,
+                            char_start=char_start,
+                            char_end=word_chunk.char_start + cursor,
+                            chunk_index=len(bounded),
+                        )
+                    )
+                if cursor != len(word_chunk.text):
+                    raise RuntimeError(
+                        "NCF HTR secondary chunking omitted source text"
+                    )
+            if len(bounded) > self.config.max_chunks:
+                from .lossless_tokenization import SemanticTruncationError
+
+                raise SemanticTruncationError(
+                    "NeuralCausalForest token-bounded note requires "
+                    f"{len(bounded)} chunks but configured max_chunks="
+                    f"{self.config.max_chunks}; semantic truncation is forbidden. "
+                    "Increase max_chunks so the capacity is nonbinding."
+                )
+            rows.append(bounded)
+        return rows
 
     def _make_htr_batch(
         self,
