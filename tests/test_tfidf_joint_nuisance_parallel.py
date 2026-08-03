@@ -127,7 +127,6 @@ def test_serial_and_loky_top_level_folds_are_exact_and_overlap(
     parallel = fit_joint_cross_fitted_nuisance_stacks(
         **inputs,
         tfidf_workers=2,
-        tfidf_parallel_backend="processes",
         owner_cpu_budget=2,
         operational_attestation_sink=process_attestations.append,
     )

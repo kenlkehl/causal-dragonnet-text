@@ -1025,7 +1025,7 @@ def fit_joint_cross_fitted_nuisance_stacks(
     random_state: int,
     nuisance_stack_config: TfidfNuisanceStackScientificConfig,
     tfidf_workers: int = 1,
-    tfidf_parallel_backend: str = "threads",
+    tfidf_parallel_backend: str = "processes",
     owner_cpu_budget: Optional[int] = None,
     operational_attestation_sink: Optional[
         Callable[[Mapping[str, Any]], None]
@@ -2035,7 +2035,7 @@ def fit_tfidf_topic_context(
     scope_id: str,
     enable_heldout_score_tests: bool = False,
     tfidf_workers: int = 1,
-    tfidf_parallel_backend: str = "threads",
+    tfidf_parallel_backend: str = "processes",
     owner_cpu_budget: Optional[int] = None,
     operational_attestation_sink: Optional[
         Callable[[Mapping[str, Any]], None]

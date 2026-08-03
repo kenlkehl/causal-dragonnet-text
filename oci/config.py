@@ -2761,7 +2761,7 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
     # incorporated into the Stage 1 cache identity.
     split_registry_path: Optional[str] = None
     # Outer-fold execution backend for CPU-only TF-IDF/NMF contexts.
-    outer_parallel_backend: str = "threads"
+    outer_parallel_backend: str = "processes"
     # Optional overrides for the two nested fold families. When unset, the legacy
     # fold_parallelism setting is used for both.
     bow_fold_parallelism: Optional[str] = None

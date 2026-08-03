@@ -3704,7 +3704,9 @@ class MultiModelForestStage1Runner:
         avf_config.fold_parallelism = str(htr_setting)
 
     def _outer_backend_name(self) -> str:
-        backend = str(getattr(self.nn_config, "outer_parallel_backend", "threads")).strip().lower()
+        backend = str(
+            getattr(self.nn_config, "outer_parallel_backend", "processes")
+        ).strip().lower()
         if backend == "loky":
             backend = "processes"
         if backend not in {"threads", "processes"}:

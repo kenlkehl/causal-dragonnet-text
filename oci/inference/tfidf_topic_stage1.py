@@ -626,7 +626,7 @@ def _fit_tfidf_topic_context_nested_calibration(
     config: AppliedInferenceConfig,
     artifact_dir: Path,
     tfidf_workers: int = 1,
-    tfidf_parallel_backend: str = "threads",
+    tfidf_parallel_backend: str = "processes",
     owner_cpu_budget: Optional[int] = None,
     operational_attestation_sink: Optional[
         Callable[[Mapping[str, Any]], None]
@@ -1216,7 +1216,7 @@ def run_tfidf_topic_stage1(
     requested_workers = int(nn_config.cpus_total or 1)
     context_workers = max(1, min(len(all_context_specs), requested_workers))
     configured_backend, joblib_backend = _resolve_tfidf_topic_stage1_parallel_backend(
-        getattr(nn_config, "outer_parallel_backend", "threads")
+        getattr(nn_config, "outer_parallel_backend", "processes")
     )
     logger.info(
         "Stage 1 scheduling exact contexts=%s workers=%s backend=%s",
