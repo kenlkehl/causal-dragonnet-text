@@ -5485,9 +5485,11 @@ def _agentic_discovery_handoff_row(
         "metrics": result.get("metrics") or {},
         "importance": result.get("importance") or {},
         "embedding_contrast_evidence": result.get("embedding_contrast_evidence") or {},
-        "htr_evidence": result.get("htr_evidence") or {},
         "context": result.get("context") or {},
     }
+    htr_evidence = result.get("htr_evidence") or {}
+    if htr_evidence:
+        row["htr_evidence"] = htr_evidence
     if inner_fold is not None:
         row["inner_fold"] = int(inner_fold)
     if heldout_rows is not None:
@@ -9547,6 +9549,7 @@ def _build_evidence_digest_agent_context(
         "clinical_text_examples": [str(text) for text in clinical_text_examples],
         "model_diagnostics": _agent_visible_metrics(metrics),
         "evidence_digest": _build_role_grouped_evidence_digest(
+            feature_discovery_methods=feature_discovery_methods,
             importance=importance,
             embedding_evidence=embedding_evidence or {},
             htr_evidence=htr_evidence or {},
@@ -9584,22 +9587,18 @@ def _evidence_digest_context_from_rich_context(context: Dict[str, Any]) -> Dict[
 
 def _build_role_grouped_evidence_digest(
     *,
+    feature_discovery_methods: Sequence[str],
     importance: Dict[str, Any],
     embedding_evidence: Dict[str, Any],
     htr_evidence: Dict[str, Any],
 ) -> Dict[str, Any]:
-    return {
+    enabled = {str(method).strip().lower() for method in feature_discovery_methods}
+    digest: Dict[str, Any] = {
         "confounders": {
             "role": "confounder",
             "role_definition": (
                 "Variables that appear predictive of treatment assignment and baseline outcome risk."
             ),
-            "bow_blurbs": _bow_evidence_digest_groups(importance, role="confounder"),
-            "embedding_chunks": _embedding_evidence_digest_groups(
-                embedding_evidence,
-                role="confounder",
-            ),
-            "htr_blurbs": _htr_evidence_digest_groups(htr_evidence, role="confounder"),
         },
         "effect_modifiers": {
             "role": "effect_modifier",
@@ -9607,21 +9606,44 @@ def _build_role_grouped_evidence_digest(
                 "Variables that appear predictive of treatment-effect heterogeneity, "
                 "R-stage pseudo-targets, residual treatment/outcome interactions, or matched-pair uplift."
             ),
-            "bow_blurbs": _bow_evidence_digest_groups(importance, role="effect_modifier"),
-            "embedding_chunks": _embedding_evidence_digest_groups(
-                embedding_evidence,
-                role="effect_modifier",
-            ),
-            "htr_blurbs": _htr_evidence_digest_groups(htr_evidence, role="effect_modifier"),
         },
-        "prompt_compaction": {
-            "bow_rows_per_list": _EVIDENCE_DIGEST_BOW_ROWS_PER_LIST,
-            "embedding_chunks_per_tail": _AGENT_PROMPT_EMBEDDING_CHUNKS_PER_TAIL,
-            "embedding_chunk_text_chars": _AGENT_PROMPT_EMBEDDING_CHUNK_CHARS,
-            "htr_rows_per_stage": _AGENT_PROMPT_HTR_ROWS_PER_STAGE,
-            "htr_snippet_chars": _AGENT_PROMPT_HTR_SNIPPET_CHARS,
-        },
+        "prompt_compaction": {},
     }
+    for role_key, role in (
+        ("confounders", "confounder"),
+        ("effect_modifiers", "effect_modifier"),
+    ):
+        section = digest[role_key]
+        if "bow" in enabled:
+            section["bow_blurbs"] = _bow_evidence_digest_groups(importance, role=role)
+        if "embedding_contrast" in enabled:
+            section["embedding_chunks"] = _embedding_evidence_digest_groups(
+                embedding_evidence,
+                role=role,
+            )
+        if "htr" in enabled:
+            section["htr_blurbs"] = _htr_evidence_digest_groups(
+                htr_evidence,
+                role=role,
+            )
+    compaction = digest["prompt_compaction"]
+    if "bow" in enabled:
+        compaction["bow_rows_per_list"] = _EVIDENCE_DIGEST_BOW_ROWS_PER_LIST
+    if "embedding_contrast" in enabled:
+        compaction.update(
+            {
+                "embedding_chunks_per_tail": _AGENT_PROMPT_EMBEDDING_CHUNKS_PER_TAIL,
+                "embedding_chunk_text_chars": _AGENT_PROMPT_EMBEDDING_CHUNK_CHARS,
+            }
+        )
+    if "htr" in enabled:
+        compaction.update(
+            {
+                "htr_rows_per_stage": _AGENT_PROMPT_HTR_ROWS_PER_STAGE,
+                "htr_snippet_chars": _AGENT_PROMPT_HTR_SNIPPET_CHARS,
+            }
+        )
+    return digest
 
 
 def _bow_evidence_digest_groups(

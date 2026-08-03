@@ -7,6 +7,7 @@
 # Usage:
 #   ./run_five_conf_five_mod.sh
 #   PHYSICAL_GPUS=0,1 ./run_five_conf_five_mod.sh
+#   DISABLE_HTR=1 PHYSICAL_GPUS=0,1 ./run_five_conf_five_mod.sh
 #   PHYSICAL_GPUS=0,1,2,3 ./run_five_conf_five_mod.sh /persistent/results/my_run
 #
 # The default is a fresh lossless-text run directory, separate from artifacts
@@ -19,8 +20,21 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${repo_root}"
 
 dataset="${repo_root}/synthetic_data/example_synthetic_datasets/five_confounders_five_effect_modifiers_nsclc_with_structured/dataset.parquet"
-output_dir="${1:-${repo_root}/artifacts/research_all_evidence/five_conf_five_mod_nsclc_lossless_v2}"
 physical_gpus="${PHYSICAL_GPUS:-0,1,2,3}"
+disable_htr="${DISABLE_HTR:-0}"
+
+if [[ "${disable_htr}" != "0" && "${disable_htr}" != "1" ]]; then
+    echo "DISABLE_HTR must be 0 or 1." >&2
+    exit 1
+fi
+if [[ "${disable_htr}" == "1" ]]; then
+    default_output_dir="${repo_root}/artifacts/research_all_evidence/five_conf_five_mod_nsclc_lossless_no_htr_v3"
+    htr_args=(--disable-htr)
+else
+    default_output_dir="${repo_root}/artifacts/research_all_evidence/five_conf_five_mod_nsclc_lossless_v2"
+    htr_args=()
+fi
+output_dir="${1:-${default_output_dir}}"
 
 IFS=',' read -r -a physical_gpu_ids <<< "${physical_gpus}"
 if (( ${#physical_gpu_ids[@]} < 1 )); then
@@ -86,6 +100,7 @@ echo "Progress: ${output_dir}/progress.json"
 echo "Log:      ${output_dir}/logs/workflow.log"
 echo "Physical GPUs: ${physical_gpus}"
 echo "Logical devices: ${devices}"
+echo "HTR modeling: $([[ "${disable_htr}" == "1" ]] && echo disabled || echo enabled)"
 echo "Parallel: one discovery-context lane per requested GPU (${gpu_count} active)"
 
 export PYTHONUNBUFFERED=1
@@ -108,4 +123,5 @@ exec "${python_bin}" -m oci.inference.research_all_evidence_stage1 \
     --embedding-model Qwen/Qwen3-Embedding-8B \
     --set science.stage1.architecture.multi_model_forest.embedding_contrast.max_chunks=512 \
     --set science.stage1.architecture.htr_max_chunks=512 \
+    "${htr_args[@]}" \
     --stage1-only

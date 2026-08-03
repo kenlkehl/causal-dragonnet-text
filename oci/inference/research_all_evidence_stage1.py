@@ -161,6 +161,47 @@ def _parse_override(raw: str) -> tuple[str, Any]:
     return key, value
 
 
+_HTR_DISCOVERY_METHOD_NAMES = {
+    "htr",
+    "htr_modeling",
+    "htr_modelling",
+    "htr_evidence",
+    "hierarchical_transformer",
+    "attention",
+}
+
+
+def _discovery_methods_without_htr(methods: Any) -> list[Any] | None:
+    """Remove HTR aliases while preserving every other configured method."""
+
+    if methods is None:
+        return None
+    raw_values = methods if isinstance(methods, (list, tuple, set)) else [methods]
+    tokens: list[Any] = []
+    for raw in raw_values:
+        if isinstance(raw, str):
+            tokens.extend(
+                part.strip()
+                for part in raw.replace(";", ",").split(",")
+                if part.strip()
+            )
+        else:
+            tokens.append(raw)
+    if any(str(token).strip().lower() == "all" for token in tokens):
+        return ["bow", "embedding_contrast"]
+    retained = [
+        token
+        for token in tokens
+        if str(token).strip().lower().replace("-", "_")
+        not in _HTR_DISCOVERY_METHOD_NAMES
+    ]
+    if not retained:
+        raise ValueError(
+            "HTR modeling is disabled, but no non-HTR feature discovery method remains"
+        )
+    return retained
+
+
 def _resolve_relative_path(value: Any, *, base: Path) -> str:
     path = Path(str(value)).expanduser()
     if not path.is_absolute():
@@ -214,6 +255,7 @@ class ResearchStage1Config:
     stage1_template: Path
     neural_query_template: Path
     htr_model: str
+    htr_enabled: bool
     embedding_model: str
     stage1_overrides: Mapping[str, Any]
     neural_query_overrides: Mapping[str, Any]
@@ -232,6 +274,10 @@ def compile_config(
     science = dict(raw.get("science") or {})
     run = dict(raw.get("run") or {})
     models = dict(raw.get("models") or {})
+
+    htr_enabled = science.get("htr_enabled", True)
+    if not isinstance(htr_enabled, bool):
+        raise ValueError("science.htr_enabled must be true or false")
 
     dataset_value = raw.get("dataset")
     output_value = raw.get("output_dir")
@@ -297,6 +343,7 @@ def compile_config(
             models.get("htr", "prajjwal1/bert-tiny"),
             base=config_dir,
         ),
+        htr_enabled=htr_enabled,
         embedding_model=_resolve_model_locator(
             models.get("embeddings", "Qwen/Qwen3-Embedding-8B"),
             base=config_dir,
@@ -334,6 +381,19 @@ def _load_stage1_template(config: ResearchStage1Config) -> dict[str, Any]:
     multi_model = architecture.setdefault("multi_model_forest", {})
     multi_model["candidate_consistency_inner_folds"] = config.inner_folds
     multi_model["cpus_total"] = config.workers
+    if not config.htr_enabled:
+        methods = _discovery_methods_without_htr(
+            multi_model.get("feature_discovery_methods")
+        )
+        if methods is not None:
+            multi_model["feature_discovery_methods"] = methods
+        multi_model["htr_evidence_enabled"] = False
+        multi_model["htr_evidence_disable_reason"] = (
+            "disabled by research workflow option"
+        )
+        # Matched-pair HTR is a separate neural HTR path and must follow the
+        # same top-level switch. Its BoW counterpart remains available.
+        multi_model["matched_pair_htr_enabled"] = False
     override_architecture = config.stage1_overrides.get("architecture")
     override_multi_model = (
         override_architecture.get("multi_model_forest")
@@ -1315,6 +1375,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int)
     parser.add_argument("--components", help="comma-separated component names")
     parser.add_argument("--htr-model")
+    parser.add_argument(
+        "--disable-htr",
+        action="store_true",
+        help=(
+            "disable all HTR nuisance/effect and matched-pair modeling while "
+            "retaining the other configured evidence families"
+        ),
+    )
     parser.add_argument("--embedding-model")
     parser.add_argument("--stage1-template", type=Path)
     parser.add_argument("--neural-query-template", type=Path)
@@ -1434,6 +1502,8 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
     for raw_override in args.set:
         key, value = _parse_override(raw_override)
         _set_nested(raw, key, value)
+    if args.disable_htr:
+        _set_nested(raw, "science.htr_enabled", False)
     return raw, config_dir
 
 

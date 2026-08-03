@@ -117,6 +117,98 @@ def test_resolved_context_uses_multi_model_forest_embedding_config(tmp_path):
     assert generator.embedding_config.model_name == "test-embedding-model"
 
 
+def test_disable_htr_keeps_bow_and_embedding_without_scheduling_htr(
+    tmp_path,
+    monkeypatch,
+):
+    raw, _config = _inputs(tmp_path, components=("text_models",))
+    raw["science"]["htr_enabled"] = False
+    raw["science"]["stage1"]["architecture"] = {
+        "multi_model_forest": {
+            "feature_discovery_methods": ["bow", "htr", "embedding_contrast"],
+        }
+    }
+    config = compile_config(raw, config_dir=tmp_path)
+    context = ResearchAllEvidenceStage1(config)._resolved_context()
+    model_config = context.applied_config.architecture.multi_model_forest
+
+    assert config.htr_enabled is False
+    assert model_config.feature_discovery_methods == ["bow", "embedding_contrast"]
+    assert model_config.bow_discovery_enabled is True
+    assert model_config.embedding_contrast.enabled is True
+    assert model_config.htr_evidence_enabled is False
+    assert model_config.htr_evidence_disable_reason == "disabled by research workflow option"
+    assert model_config.matched_pair_htr_enabled is False
+
+    def run_contexts(**kwargs):
+        assert kwargs["plan"].htr_enabled is False
+        assert kwargs["config"].architecture.multi_model_forest.htr_evidence_enabled is False
+        return [{"outer_fold": 1, "scope": "full_outer_train"}]
+
+    monkeypatch.setattr(multi_model_workflow, "_run_handoff_contexts", run_contexts)
+    row = stage1_workflow._run_one_text_model_context(
+        dataset=context.dataset,
+        applied_config=context.applied_config,
+        spec={
+            "scope_id": "outer_001_full",
+            "fold_key": 1,
+            "outer_fold": 1,
+            "scope": "full_outer_train",
+        },
+        context_dir=tmp_path / "no_htr_context",
+        device="cpu",
+        cpu_workers=1,
+    )
+
+    assert row == {"outer_fold": 1, "scope": "full_outer_train"}
+
+
+def test_text_model_handoff_row_omits_empty_htr_evidence():
+    from oci.inference.multi_model_agentic_forest import (
+        _agentic_discovery_handoff_row,
+        _build_evidence_digest_agent_context,
+    )
+
+    result = {
+        "metrics": {"feature_discovery_methods": ["bow", "embedding_contrast"]},
+        "importance": {},
+        "embedding_contrast_evidence": {"available": True},
+        "htr_evidence": {},
+        "context": {"feature_discovery_methods": ["bow", "embedding_contrast"]},
+    }
+
+    row = _agentic_discovery_handoff_row(
+        result,
+        fold_key=1,
+        outer_fold=1,
+        scope="full_outer_train",
+        n_rows=10,
+    )
+
+    assert "htr_evidence" not in row
+    assert row["embedding_contrast_evidence"] == {"available": True}
+
+    context = _build_evidence_digest_agent_context(
+        outer_fold=1,
+        feature_discovery_methods=["bow", "embedding_contrast"],
+        max_proposals=10,
+        clinical_question="test",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        current_features=[],
+        metrics={},
+        importance={},
+        clinical_text_examples=[],
+        embedding_evidence={"available": True},
+        htr_evidence={},
+    )
+    digest = context["evidence_digest"]
+    assert "htr_blurbs" not in digest["confounders"]
+    assert "htr_blurbs" not in digest["effect_modifiers"]
+    assert all(not key.startswith("htr_") for key in digest["prompt_compaction"])
+
+
 def test_simple_runner_uses_processes_for_tfidf_contexts_by_default(tmp_path):
     raw, config = _inputs(tmp_path, components=("tfidf",))
 
@@ -431,6 +523,8 @@ def test_context_lanes_spread_larger_full_contexts_across_devices():
 
 def test_phase_flags_are_mutually_exclusive():
     parser = build_parser()
+
+    assert parser.parse_args(["--disable-htr"]).disable_htr is True
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--stage1-only", "--stage2-only"])
