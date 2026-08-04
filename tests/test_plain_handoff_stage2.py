@@ -5,14 +5,82 @@ import re
 from pathlib import Path
 
 import pandas as pd
+import pytest
+
+import oci.inference.plain_handoff_stage2 as stage2_workflow
 
 from oci.inference.plain_handoff_stage2 import (
     PlainHandoffStage2,
     PlainHandoffStage2Config,
     packetize_handoff,
+    plain_stage2_config_from_mapping,
     run_plain_handoff_stage2,
 )
 from oci.inference.plain_handoff_stage2_analysis import extract_rows, run_fold_analysis
+
+
+def test_stage2_config_allows_endpoint_without_model():
+    config = plain_stage2_config_from_mapping(
+        {"endpoint": "http://stage2.test/v1"},
+        default_workers=8,
+    )
+
+    assert config is not None
+    assert config.endpoint == "http://stage2.test/v1"
+    assert config.model == ""
+
+
+def test_stage2_autodiscovers_the_only_served_model(monkeypatch):
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda _config: ["served-model"],
+    )
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+        ),
+        clinical_question="Identify confounders.",
+        completion=lambda _messages, _config: "{}",
+    )
+
+    assert runner.config.model == "served-model"
+
+
+def test_stage2_autodiscovery_rejects_multiple_served_models(monkeypatch):
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda _config: ["model-a", "model-b"],
+    )
+
+    with pytest.raises(RuntimeError, match="requires exactly one served model"):
+        PlainHandoffStage2(
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+            ),
+            clinical_question="Identify confounders.",
+            completion=lambda _messages, _config: "{}",
+        )
+
+
+def test_explicit_stage2_model_skips_autodiscovery(monkeypatch):
+    def unexpected_discovery(_config):
+        raise AssertionError("model discovery should not run")
+
+    monkeypatch.setattr(stage2_workflow, "_served_model_ids", unexpected_discovery)
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="configured-model",
+        ),
+        clinical_question="Identify confounders.",
+        completion=lambda _messages, _config: "{}",
+    )
+
+    assert runner.config.model == "configured-model"
 
 
 def _fake_completion(calls):

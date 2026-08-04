@@ -18,6 +18,7 @@ from oci.inference.research_all_evidence_stage1 import (
     Stage1RunContext,
     _context_execution_lanes,
     _lane_cpu_worker_budgets,
+    _raw_config_from_args,
     _stage1_context_specs,
     build_parser,
     compile_config,
@@ -611,7 +612,6 @@ def test_stage2_endpoint_makes_full_run_the_default(tmp_path):
     raw, _config = _inputs(tmp_path)
     raw["stage2"] = {
         "endpoint": "http://stage2.test/v1",
-        "model": "test-model",
     }
 
     config = compile_config(raw, config_dir=tmp_path)
@@ -620,6 +620,37 @@ def test_stage2_endpoint_makes_full_run_the_default(tmp_path):
     assert config.components == (*COMPONENT_ORDER, "stage2")
     assert config.stage2 is not None
     assert config.stage2.endpoint == "http://stage2.test/v1"
+    assert config.stage2.model == ""
+
+
+def test_saved_run_config_can_start_stage2_with_endpoint_only(tmp_path):
+    _raw, original = _inputs(tmp_path)
+    saved_config = tmp_path / "run_config.json"
+    saved_config.write_text(
+        json.dumps(original.as_dict(), default=str),
+        encoding="utf-8",
+    )
+    args = build_parser().parse_args(
+        [
+            "--config",
+            str(saved_config),
+            "--stage2-only",
+            "--stage2-endpoint",
+            "http://stage2.test/v1",
+        ]
+    )
+
+    raw, config_dir = _raw_config_from_args(args)
+    resumed = compile_config(raw, config_dir=config_dir)
+
+    assert resumed.mode == "stage2"
+    assert resumed.components == ("stage2",)
+    assert resumed.stage2 is not None
+    assert resumed.stage2.endpoint == "http://stage2.test/v1"
+    assert resumed.stage2.model == ""
+    assert resumed.clinical_question == original.clinical_question
+    assert resumed.unit_id_column == original.unit_id_column
+    assert resumed.htr_enabled == original.htr_enabled
 
 
 def test_old_stage2_command_is_rejected_instead_of_silently_ignored(tmp_path):

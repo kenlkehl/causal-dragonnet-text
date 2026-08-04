@@ -26,8 +26,9 @@
 5. If the process stops, run step 3 again. Completed components are skipped.
 
 Use `--stage1-only` to stop at the handoff or `--stage2-only` to consume an
-existing handoff. Setting both `stage2.endpoint` and `stage2.model` in the
-config makes an unflagged invocation run both phases.
+existing handoff. Setting `stage2.endpoint` in the config makes an unflagged
+invocation run both phases. `stage2.model` may be omitted when the endpoint's
+`/models` API advertises exactly one model ID.
 
 Stage 2 does not stop at variable definitions. For each outer fold it extracts
 the proposed variables on training records, reviews their empirical behavior by

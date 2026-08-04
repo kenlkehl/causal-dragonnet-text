@@ -16,7 +16,7 @@ import math
 import os
 import re
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -65,7 +65,7 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
 @dataclass(frozen=True)
 class PlainHandoffStage2Config:
     endpoint: str
-    model: str
+    model: str = ""
     api_key: str = "EMPTY"
     request_timeout: float = 1_800.0
     max_tokens: int = 4_096
@@ -81,11 +81,11 @@ class PlainHandoffStage2Config:
     temperature: float = 0.0
     enable_thinking: bool = False
 
-    def validate(self) -> None:
+    def validate(self, *, require_model: bool = True) -> None:
         parsed = urlparse(self.endpoint)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("stage2.endpoint must be one HTTP(S) OpenAI-compatible base URL")
-        if not self.model.strip():
+        if require_model and not self.model.strip():
             raise ValueError("stage2.model must be nonempty")
         if self.request_timeout <= 0:
             raise ValueError("stage2.request_timeout must be positive")
@@ -125,15 +125,14 @@ def plain_stage2_config_from_mapping(
 ) -> PlainHandoffStage2Config | None:
     if raw.get("command"):
         raise ValueError(
-            "stage2.command is not used by the plain workflow; configure "
-            "stage2.endpoint and stage2.model"
+            "stage2.command is not used by the plain workflow; configure stage2.endpoint"
         )
     endpoint = str(raw.get("endpoint") or "").strip()
     model = str(raw.get("model") or "").strip()
     if not endpoint and not model:
         return None
-    if not endpoint or not model:
-        raise ValueError("stage2.endpoint and stage2.model must be specified together")
+    if not endpoint:
+        raise ValueError("stage2.endpoint is required when stage2.model is specified")
     api_key = str(raw.get("api_key") or os.environ.get("OCI_STAGE2_API_KEY") or "EMPTY")
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
@@ -153,8 +152,57 @@ def plain_stage2_config_from_mapping(
         temperature=float(raw.get("temperature", 0.0)),
         enable_thinking=bool(raw.get("enable_thinking", False)),
     )
-    config.validate()
+    config.validate(require_model=False)
     return config
+
+
+def _served_model_ids(config: PlainHandoffStage2Config) -> list[str]:
+    """Return the distinct model IDs advertised by an OpenAI-compatible server."""
+
+    from openai import OpenAI
+
+    client = OpenAI(
+        base_url=config.endpoint,
+        api_key=config.api_key,
+        timeout=config.request_timeout,
+        max_retries=2,
+    )
+    try:
+        response = client.models.list()
+    except Exception as exc:
+        raise RuntimeError(
+            "Stage 2 could not auto-discover a model from "
+            f"{config.endpoint}/models: {type(exc).__name__}: {exc}"
+        ) from exc
+    model_ids = {
+        str(getattr(model, "id", "")).strip()
+        for model in response.data
+        if str(getattr(model, "id", "")).strip()
+    }
+    return sorted(model_ids)
+
+
+def _resolve_stage2_model(config: PlainHandoffStage2Config) -> PlainHandoffStage2Config:
+    """Use the sole model advertised by the endpoint when none was configured."""
+
+    if config.model.strip():
+        return config
+    model_ids = _served_model_ids(config)
+    if not model_ids:
+        models_url = f"{config.endpoint}/models"
+        raise RuntimeError(f"Stage 2 model auto-discovery found no models at {models_url}")
+    if len(model_ids) != 1:
+        raise RuntimeError(
+            "Stage 2 model auto-discovery requires exactly one served model; "
+            f"{config.endpoint}/models advertised {model_ids}. Set stage2.model explicitly."
+        )
+    resolved = replace(config, model=model_ids[0])
+    LOGGER.info(
+        "auto-discovered Stage 2 model=%s from %s/models",
+        resolved.model,
+        config.endpoint,
+    )
+    return resolved
 
 
 _DROP_KEYS = {
@@ -1125,6 +1173,7 @@ class PlainHandoffStage2:
         clinical_question: str,
         completion: CompletionFunction | None = None,
     ) -> None:
+        config = _resolve_stage2_model(config)
         config.validate()
         self.config = config
         self.clinical_question = str(clinical_question)

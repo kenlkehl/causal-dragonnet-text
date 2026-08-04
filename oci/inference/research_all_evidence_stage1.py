@@ -275,6 +275,37 @@ def compile_config(
     run = dict(raw.get("run") or {})
     models = dict(raw.get("models") or {})
 
+    # run_config.json contains the resolved dataclass fields at the top level.
+    # Accept those fields as fallbacks so the readable checkpoint config can be
+    # fed back to the CLI for a later Stage 2-only invocation.
+    flat_columns = {
+        "unit_id": "unit_id_column",
+        "text": "text_column",
+        "treatment": "treatment_column",
+        "outcome": "outcome_column",
+    }
+    for key, flat_key in flat_columns.items():
+        if key not in columns and raw.get(flat_key) is not None:
+            columns[key] = raw[flat_key]
+    for key in ("outcome_type", "clinical_question", "outer_folds", "inner_folds", "seed"):
+        if key not in science and raw.get(key) is not None:
+            science[key] = raw[key]
+    if "stage1" not in science and isinstance(raw.get("stage1_overrides"), Mapping):
+        science["stage1"] = raw["stage1_overrides"]
+    if "neural_queries" not in science and isinstance(
+        raw.get("neural_query_overrides"), Mapping
+    ):
+        science["neural_queries"] = raw["neural_query_overrides"]
+    if "htr_enabled" not in science and raw.get("htr_enabled") is not None:
+        science["htr_enabled"] = raw["htr_enabled"]
+    for key in ("devices", "workers", "components", "mode", "log_level"):
+        if key not in run and raw.get(key) is not None:
+            run[key] = raw[key]
+    if "htr" not in models and raw.get("htr_model") is not None:
+        models["htr"] = raw["htr_model"]
+    if "embeddings" not in models and raw.get("embedding_model") is not None:
+        models["embeddings"] = raw["embedding_model"]
+
     htr_enabled = science.get("htr_enabled", True)
     if not isinstance(htr_enabled, bool):
         raise ValueError("science.htr_enabled must be true or false")
@@ -304,7 +335,7 @@ def compile_config(
     if mode not in {"full", "stage1", "stage2"}:
         raise ValueError("run.mode must be 'full', 'stage1', or 'stage2'")
     if mode in {"full", "stage2"} and stage2 is None:
-        raise ValueError(f"run.mode={mode!r} requires stage2.endpoint and stage2.model")
+        raise ValueError(f"run.mode={mode!r} requires stage2.endpoint")
     selected_components = tuple(str(value) for value in raw_components)
     if mode == "full":
         if "handoff" not in selected_components:
@@ -1094,7 +1125,7 @@ def _stage2_component(
     if not handoff_path.is_file() or not handoff_complete.is_file():
         raise FileNotFoundError(f"Stage 2 requires the completed Stage 1 handoff: {handoff_path}")
     if context.config.stage2 is None:
-        raise ValueError("Stage 2 requires stage2.endpoint and stage2.model")
+        raise ValueError("Stage 2 requires stage2.endpoint")
     return run_plain_handoff_stage2(
         handoff_path=handoff_path,
         output_dir=component_dir,
@@ -1398,7 +1429,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip Stage 1 and run/resume Stage 2 from the saved handoff",
     )
     parser.add_argument("--stage2-endpoint", help="OpenAI-compatible Stage 2 base URL")
-    parser.add_argument("--stage2-model", help="model served by the Stage 2 endpoint")
+    parser.add_argument(
+        "--stage2-model",
+        help="model served by the Stage 2 endpoint; auto-discovered when omitted",
+    )
     parser.add_argument("--stage2-api-key", help="endpoint key; defaults to OCI_STAGE2_API_KEY")
     parser.add_argument(
         "--stage2-review-rounds",
@@ -1481,7 +1515,14 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
         run["mode"] = "stage1"
     elif args.stage2_only:
         run["mode"] = "stage2"
-    stage2 = raw.setdefault("stage2", {})
+    stage2_value = raw.get("stage2")
+    if stage2_value is None:
+        stage2: MutableMapping[str, Any] = {}
+        raw["stage2"] = stage2
+    elif isinstance(stage2_value, MutableMapping):
+        stage2 = stage2_value
+    else:
+        raise ValueError("stage2 must be a configuration object or null")
     for key in ("endpoint", "model", "api_key"):
         value = getattr(args, f"stage2_{key}")
         if value is not None:

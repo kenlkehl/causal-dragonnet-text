@@ -536,16 +536,16 @@ Every Stage 1 context and every expensive Stage 2 batch writes its own
 
 ### Stage-specific execution
 
-Empty Stage 2 endpoint and model settings mean that the workflow stops after
-Stage 1. This is useful when a researcher wishes to inspect the discovery
-evidence before permitting any variables to enter the causal analysis.
+An empty Stage 2 endpoint means that the workflow stops after Stage 1. This is
+useful when a researcher wishes to inspect the discovery evidence before
+permitting any variables to enter the causal analysis.
 
 ```bash
 uv run python scripts/run_all_evidence.py --config run.json --stage1-only
 ```
 
-When a Stage 2 endpoint and model have been configured, the same entry point can
-run the complete second stage against an existing handoff:
+When a Stage 2 endpoint has been configured, the same entry point can run the
+complete second stage against an existing handoff:
 
 ```bash
 uv run python scripts/run_all_evidence.py --config run.json --stage2-only
@@ -571,6 +571,11 @@ run. The API key may be stored in `stage2.api_key` or supplied through
   }
 }
 ```
+
+`stage2.model` is optional. When it is empty or omitted, Stage 2 queries the
+endpoint's OpenAI-compatible `/models` API and uses the advertised model if
+exactly one model ID is returned. Configure `stage2.model` explicitly when the
+endpoint advertises multiple IDs.
 
 Stage 2 preserves the outer-fold boundary throughout variable construction and
 estimation. It first interprets each evidence architecture and consolidates the

@@ -9,7 +9,7 @@ uv run python scripts/run_all_evidence.py \
 
 It reads one cohort and writes everything to one output directory. With no
 Stage 2 endpoint configured it runs Stage 1 through the plain handoff. With an
-endpoint and model it continues through fold-scoped feature definitions,
+endpoint it continues through fold-scoped feature definitions,
 patient-level extraction, training-fold empirical review, and cross-fitted
 causal estimation. Interruption and resume are automatic: run the same command
 again.
@@ -87,8 +87,7 @@ model-assisted review may clarify a measurement definition and repeat the
 training-row extraction. The definition is then frozen before it is applied to
 the outer held-out rows. Finally, Stage 2 fits nuisance and effect-modification
 models on the training rows and writes held-out AIPW scores and conditional
-effect estimates. It is enabled by specifying both `stage2.endpoint` and
-`stage2.model`. For example:
+effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
 
 ```json
 {
@@ -104,13 +103,17 @@ effect estimates. It is enabled by specifying both `stage2.endpoint` and
 }
 ```
 
+`stage2.model` is optional. If it is empty or omitted, Stage 2 queries the
+OpenAI-compatible `/models` endpoint once at startup and uses the result when
+exactly one model ID is advertised. If the server advertises multiple model
+IDs, set `stage2.model` explicitly to avoid an ambiguous selection.
+
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `max_prompt_chars`,
 `max_candidates_per_fold`, `extraction_batch_size`, `max_review_rounds`,
 `estimation_trees`, `propensity_clip`, `min_nonmissing_fraction`,
 `max_dominant_fraction`, `temperature`, and `enable_thinking`. A configured
-endpoint and model make the default mode `full`. The modes can always be made
-explicit:
+endpoint makes the default mode `full`. The modes can always be made explicit:
 
 ```bash
 # Run/resume Stage 1 and stop after the handoff.
