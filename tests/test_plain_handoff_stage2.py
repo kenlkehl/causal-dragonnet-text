@@ -83,6 +83,42 @@ def test_explicit_stage2_model_skips_autodiscovery(monkeypatch):
     assert runner.config.model == "configured-model"
 
 
+def test_json_repair_retry_stays_within_full_initial_prompt_budget():
+    conversations = []
+
+    def completion(messages, _config):
+        conversations.append([dict(message) for message in messages])
+        return "{}" if len(conversations) == 1 else '{"ok": true}'
+
+    def validate(value):
+        if value.get("ok") is not True:
+            raise ValueError("missing required ok field")
+        return dict(value)
+
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        max_prompt_chars=4_000,
+    )
+    result = stage2_workflow._request_json(
+        messages=[
+            {"role": "system", "content": "S" * 100},
+            {"role": "user", "content": "U" * 3_900},
+        ],
+        config=config,
+        completion=completion,
+        validate=validate,
+    )
+
+    assert result == {"ok": True}
+    assert len(conversations) == 2
+    assert all(
+        sum(len(message["content"]) for message in conversation) <= 4_000
+        for conversation in conversations
+    )
+    assert conversations[1][0]["content"].startswith("Prior response invalid")
+
+
 def _fake_completion(calls):
     def complete(messages, _config):
         body = json.loads(messages[1]["content"])

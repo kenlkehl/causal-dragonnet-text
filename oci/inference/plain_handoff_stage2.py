@@ -686,15 +686,45 @@ def _request_json(
             if attempt:
                 raise ValueError(f"Stage 2 response remained invalid after one repair: {exc}") from exc
             first_error = exc
-            conversation.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "The response did not satisfy the requested JSON shape "
-                        f"({type(exc).__name__}: {exc}). Return a corrected JSON object only."
-                    ),
-                }
+            LOGGER.warning(
+                "Stage 2 response failed validation; retrying once (%s: %s)",
+                type(exc).__name__,
+                exc,
             )
+            repair_message = {
+                "role": "user",
+                "content": (
+                    "The response did not satisfy the requested JSON shape "
+                    f"({type(exc).__name__}: {exc}). Return a corrected JSON object only."
+                ),
+            }
+            repaired = [*conversation, repair_message]
+            repaired_chars = sum(
+                len(str(message.get("content") or "")) for message in repaired
+            )
+            if repaired_chars <= int(config.max_prompt_chars):
+                conversation = repaired
+                continue
+
+            # A fully packed first attempt may leave no room for another turn.
+            # Preserve the complete user payload and replace the short system
+            # instruction with an equally short repair directive instead.
+            system_index = next(
+                (
+                    index
+                    for index, message in enumerate(conversation)
+                    if str(message.get("role") or "") == "system"
+                ),
+                None,
+            )
+            if system_index is None:
+                raise ValueError(
+                    "Stage 2 repair prompt cannot fit max_prompt_chars and has no "
+                    "system instruction available to replace"
+                ) from exc
+            original_system = str(conversation[system_index].get("content") or "")
+            repair_directive = "Prior response invalid. Match the requested JSON schema exactly."
+            conversation[system_index]["content"] = repair_directive[: len(original_system)]
     raise RuntimeError(f"unreachable Stage 2 response state: {first_error}")
 
 
