@@ -397,8 +397,19 @@ def _json_chars(value: Any) -> int:
     return len(json.dumps(value, separators=(",", ":"), sort_keys=True))
 
 
-def _split_value(value: Any, *, max_chars: int, path: str) -> list[tuple[str, Any]]:
-    if _json_chars(value) <= max_chars:
+def _split_value(
+    value: Any,
+    *,
+    max_chars: int,
+    path: str,
+    fits: Callable[[str, Any], bool] | None = None,
+) -> list[tuple[str, Any]]:
+    def fragment_fits(fragment_path: str, fragment: Any) -> bool:
+        return _json_chars(fragment) <= max_chars and (
+            fits is None or fits(fragment_path, fragment)
+        )
+
+    if fragment_fits(path, value):
         return [(path, value)]
     if isinstance(value, Mapping):
         fragments: list[tuple[str, Any]] = []
@@ -406,16 +417,28 @@ def _split_value(value: Any, *, max_chars: int, path: str) -> list[tuple[str, An
         for key, child in value.items():
             child_path = f"{path}.{key}"
             if isinstance(child, (Mapping, list, tuple)):
-                fragments.extend(_split_value(child, max_chars=max_chars, path=child_path))
+                fragments.extend(
+                    _split_value(
+                        child,
+                        max_chars=max_chars,
+                        path=child_path,
+                        fits=fits,
+                    )
+                )
             else:
                 scalars[str(key)] = child
         if scalars:
-            if _json_chars(scalars) <= max_chars:
+            if fragment_fits(path, scalars):
                 fragments.insert(0, (path, scalars))
             else:
                 for key, child in scalars.items():
                     fragments.extend(
-                        _split_value(child, max_chars=max_chars, path=f"{path}.{key}")
+                        _split_value(
+                            child,
+                            max_chars=max_chars,
+                            path=f"{path}.{key}",
+                            fits=fits,
+                        )
                     )
         return fragments
     if isinstance(value, (list, tuple)):
@@ -423,16 +446,29 @@ def _split_value(value: Any, *, max_chars: int, path: str) -> list[tuple[str, An
         batch: list[Any] = []
         batch_start = 0
         for index, child in enumerate(value):
-            candidate = [*batch, child]
-            if batch and _json_chars(candidate) > max_chars:
+            if batch:
+                candidate = [*batch, child]
+                candidate_path = f"{path}[{batch_start}:{index + 1}]"
+                if fragment_fits(candidate_path, candidate):
+                    batch = candidate
+                    continue
                 output.append((f"{path}[{batch_start}:{index}]", batch))
                 batch = []
+            singleton = [child]
+            singleton_path = f"{path}[{index}:{index + 1}]"
+            if fragment_fits(singleton_path, singleton):
+                batch = singleton
                 batch_start = index
-            if _json_chars(child) > max_chars:
-                output.extend(_split_value(child, max_chars=max_chars, path=f"{path}[{index}]"))
-                batch_start = index + 1
             else:
-                batch.append(child)
+                output.extend(
+                    _split_value(
+                        child,
+                        max_chars=max_chars,
+                        path=f"{path}[{index}]",
+                        fits=fits,
+                    )
+                )
+                batch_start = index + 1
         if batch:
             output.append((f"{path}[{batch_start}:{len(value)}]", batch))
         return output
@@ -440,22 +476,21 @@ def _split_value(value: Any, *, max_chars: int, path: str) -> list[tuple[str, An
     segments: list[tuple[str, Any]] = []
     cursor = 0
     while cursor < len(text):
+        segment_path = f"{path}.text_segment_{len(segments) + 1:03d}"
         low, high = cursor + 1, len(text)
         best = cursor
         while low <= high:
             end = (low + high) // 2
-            if _json_chars(text[cursor:end]) <= max_chars:
+            if fragment_fits(segment_path, text[cursor:end]):
                 best = end
                 low = end + 1
             else:
                 high = end - 1
         if best == cursor:
             raise ValueError(
-                "max_packet_chars cannot encode one source character as JSON"
+                f"max_packet_chars cannot encode one source character at {segment_path}"
             )
-        segments.append(
-            (f"{path}.text_segment_{len(segments) + 1:03d}", text[cursor:best])
-        )
+        segments.append((segment_path, text[cursor:best]))
         cursor = best
     if "".join(str(segment) for _path, segment in segments) != text:
         raise RuntimeError("Stage 2 scalar packetization changed source text")
@@ -480,14 +515,14 @@ def packetize_handoff(
             prototype = {
                 "packet_id": (
                     f"outer_{outer_fold:03d}_row_{row_index:04d}_"
-                    f"section_{section_index:02d}_part_000000"
+                    f"section_{section_index:02d}_part_000000000000"
                 ),
                 "source": str(row.get("source") or "unknown"),
                 "architecture": str(architecture),
                 "outer_fold": outer_fold,
                 "inner_fold": row.get("inner_fold"),
                 "scope": str(row.get("scope") or "unspecified"),
-                "json_path": f"{section_path}.text_segment_000000",
+                "json_path": section_path,
                 "observable_axes": [
                     "matched_pair",
                     "outcome",
@@ -498,38 +533,42 @@ def packetize_handoff(
                 ],
                 "content": "",
             }
-            wrapper_chars = _json_chars(prototype) - _json_chars("")
-            content_budget = int(max_packet_chars) - wrapper_chars
-            if content_budget < 1:
+
+            def packet_fits(json_path: str, content: Any) -> bool:
+                candidate = {**prototype, "json_path": json_path, "content": content}
+                return _json_chars(candidate) <= int(max_packet_chars)
+
+            if not packet_fits(section_path, ""):
                 raise ValueError(
                     "max_packet_chars is too small for the Stage 2 packet envelope"
                 )
             fragments = _split_value(
                 section,
-                max_chars=content_budget,
+                max_chars=int(max_packet_chars),
                 path=section_path,
+                fits=packet_fits,
             )
             for fragment_index, (json_path, content) in enumerate(fragments, start=1):
                 packet = {
-                        "packet_id": (
-                            f"outer_{outer_fold:03d}_row_{row_index:04d}_"
-                            f"section_{section_index:02d}_part_{fragment_index:03d}"
-                        ),
-                        "source": str(row.get("source") or "unknown"),
-                        "architecture": str(architecture),
-                        "outer_fold": outer_fold,
-                        "inner_fold": row.get("inner_fold"),
-                        "scope": str(row.get("scope") or "unspecified"),
-                        "json_path": json_path,
-                        "observable_axes": _infer_evidence_axes(
-                            {
-                                "architecture": architecture,
-                                "json_path": json_path,
-                                "content": content,
-                            }
-                        ),
-                        "content": content,
-                    }
+                    "packet_id": (
+                        f"outer_{outer_fold:03d}_row_{row_index:04d}_"
+                        f"section_{section_index:02d}_part_{fragment_index:03d}"
+                    ),
+                    "source": str(row.get("source") or "unknown"),
+                    "architecture": str(architecture),
+                    "outer_fold": outer_fold,
+                    "inner_fold": row.get("inner_fold"),
+                    "scope": str(row.get("scope") or "unspecified"),
+                    "json_path": json_path,
+                    "observable_axes": _infer_evidence_axes(
+                        {
+                            "architecture": architecture,
+                            "json_path": json_path,
+                            "content": content,
+                        }
+                    ),
+                    "content": content,
+                }
                 if _json_chars(packet) > int(max_packet_chars):
                     raise RuntimeError(
                         "Stage 2 packet planner emitted an oversized packet"

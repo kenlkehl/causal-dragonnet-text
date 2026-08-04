@@ -285,6 +285,32 @@ def test_packetizer_losslessly_splits_json_expanding_unicode():
     )
 
 
+def test_packetizer_accounts_for_deep_generated_json_paths():
+    long_key = "nested_" + ("x" * 500)
+    text = "漢" * 5_000
+    packets = packetize_handoff(
+        [
+            {
+                "source": "custom",
+                "outer_fold": 1,
+                "scope": "full_outer_train",
+                "evidence": {
+                    "architecture": "deep_unicode_witnesses",
+                    "nested": {long_key: {"payload": text}},
+                },
+            }
+        ],
+        max_packet_chars=2_000,
+    )
+
+    payload_packets = [packet for packet in packets if "payload" in packet["json_path"]]
+    assert "".join(str(packet["content"]) for packet in payload_packets) == text
+    assert all(
+        len(json.dumps(packet, separators=(",", ":"), sort_keys=True)) <= 2_000
+        for packet in packets
+    )
+
+
 def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Path):
     note = "start " + ("漢" * 1_800) + " pretreatment ECOG 2 end"
     dataset = pd.DataFrame({"clinical_text": [note]})
