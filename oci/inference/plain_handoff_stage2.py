@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -402,12 +403,15 @@ def _split_value(
     *,
     max_chars: int,
     path: str,
-    fits: Callable[[str, Any], bool] | None = None,
+    path_budget: Callable[[str], int] | None = None,
 ) -> list[tuple[str, Any]]:
+    def fragment_budget(fragment_path: str) -> int:
+        if path_budget is None:
+            return int(max_chars)
+        return min(int(max_chars), int(path_budget(fragment_path)))
+
     def fragment_fits(fragment_path: str, fragment: Any) -> bool:
-        return _json_chars(fragment) <= max_chars and (
-            fits is None or fits(fragment_path, fragment)
-        )
+        return _json_chars(fragment) <= fragment_budget(fragment_path)
 
     if fragment_fits(path, value):
         return [(path, value)]
@@ -422,7 +426,7 @@ def _split_value(
                         child,
                         max_chars=max_chars,
                         path=child_path,
-                        fits=fits,
+                        path_budget=path_budget,
                     )
                 )
             else:
@@ -437,27 +441,32 @@ def _split_value(
                             child,
                             max_chars=max_chars,
                             path=f"{path}.{key}",
-                            fits=fits,
+                            path_budget=path_budget,
                         )
                     )
         return fragments
     if isinstance(value, (list, tuple)):
         output: list[tuple[str, Any]] = []
         batch: list[Any] = []
+        batch_chars = 2  # Opening and closing brackets in compact JSON.
         batch_start = 0
         for index, child in enumerate(value):
+            child_chars = _json_chars(child)
             if batch:
-                candidate = [*batch, child]
                 candidate_path = f"{path}[{batch_start}:{index + 1}]"
-                if fragment_fits(candidate_path, candidate):
-                    batch = candidate
+                candidate_chars = batch_chars + 1 + child_chars
+                if candidate_chars <= fragment_budget(candidate_path):
+                    batch.append(child)
+                    batch_chars = candidate_chars
                     continue
                 output.append((f"{path}[{batch_start}:{index}]", batch))
                 batch = []
-            singleton = [child]
+                batch_chars = 2
             singleton_path = f"{path}[{index}:{index + 1}]"
-            if fragment_fits(singleton_path, singleton):
-                batch = singleton
+            singleton_chars = 2 + child_chars
+            if singleton_chars <= fragment_budget(singleton_path):
+                batch = [child]
+                batch_chars = singleton_chars
                 batch_start = index
             else:
                 output.extend(
@@ -465,7 +474,7 @@ def _split_value(
                         child,
                         max_chars=max_chars,
                         path=f"{path}[{index}]",
-                        fits=fits,
+                        path_budget=path_budget,
                     )
                 )
                 batch_start = index + 1
@@ -534,11 +543,12 @@ def packetize_handoff(
                 "content": "",
             }
 
-            def packet_fits(json_path: str, content: Any) -> bool:
-                candidate = {**prototype, "json_path": json_path, "content": content}
-                return _json_chars(candidate) <= int(max_packet_chars)
+            def packet_content_budget(json_path: str) -> int:
+                envelope = {**prototype, "json_path": json_path}
+                envelope_chars = _json_chars(envelope) - _json_chars("")
+                return int(max_packet_chars) - envelope_chars
 
-            if not packet_fits(section_path, ""):
+            if packet_content_budget(section_path) < 1:
                 raise ValueError(
                     "max_packet_chars is too small for the Stage 2 packet envelope"
                 )
@@ -546,7 +556,7 @@ def packetize_handoff(
                 section,
                 max_chars=int(max_packet_chars),
                 path=section_path,
-                fits=packet_fits,
+                path_budget=packet_content_budget,
             )
             for fragment_index, (json_path, content) in enumerate(fragments, start=1):
                 packet = {
@@ -1662,14 +1672,28 @@ class PlainHandoffStage2:
         inner_folds: int = 5,
         seed: int = 42,
     ) -> Mapping[str, Any]:
+        handoff_path = Path(handoff_path)
+        handoff_text = handoff_path.read_text(encoding="utf-8")
         rows = [
             json.loads(line)
-            for line in Path(handoff_path).read_text(encoding="utf-8").splitlines()
+            for line in handoff_text.splitlines()
             if line.strip()
         ]
+        LOGGER.info(
+            "loaded Stage 1 handoff rows=%s bytes=%s path=%s",
+            len(rows),
+            handoff_path.stat().st_size,
+            handoff_path,
+        )
+        packetize_started = time.monotonic()
         packets = packetize_handoff(
             rows,
             max_packet_chars=max(2_000, self.config.max_prompt_chars // 4),
+        )
+        LOGGER.info(
+            "packetized Stage 1 evidence packets=%s seconds=%.2f",
+            len(packets),
+            time.monotonic() - packetize_started,
         )
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)

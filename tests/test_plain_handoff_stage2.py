@@ -311,6 +311,31 @@ def test_packetizer_accounts_for_deep_generated_json_paths():
     )
 
 
+def test_packetizer_splits_large_flat_lists_without_changing_items():
+    terms = [f"term_{index:05d}" for index in range(20_000)]
+    packets = packetize_handoff(
+        [
+            {
+                "source": "custom",
+                "outer_fold": 1,
+                "scope": "full_outer_train",
+                "evidence": {
+                    "architecture": "large_term_inventory",
+                    "terms": terms,
+                },
+            }
+        ],
+        max_packet_chars=2_000,
+    )
+
+    term_packets = [packet for packet in packets if "terms" in packet["json_path"]]
+    assert [term for packet in term_packets for term in packet["content"]] == terms
+    assert all(
+        len(json.dumps(packet, separators=(",", ":"), sort_keys=True)) <= 2_000
+        for packet in packets
+    )
+
+
 def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Path):
     note = "start " + ("漢" * 1_800) + " pretreatment ECOG 2 end"
     dataset = pd.DataFrame({"clinical_text": [note]})
