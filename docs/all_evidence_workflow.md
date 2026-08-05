@@ -95,6 +95,7 @@ effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
     "endpoint": "http://127.0.0.1:8000/v1",
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
+    "request_timeout": 7200,
     "max_tokens": 25000,
     "extraction_batch_size": 12,
     "max_review_rounds": 2,
@@ -109,7 +110,8 @@ exactly one model ID is advertised. If the server advertises multiple model
 IDs, set `stage2.model` explicitly to avoid an ambiguous selection.
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
-operational controls include `request_timeout`, `max_prompt_chars`,
+operational controls include `request_timeout`, `transport_max_attempts`,
+`transport_retry_backoff`, `max_prompt_chars`,
 `max_candidates_per_fold`, `extraction_batch_size`, `max_review_rounds`,
 `estimation_trees`, `propensity_clip`, `min_nonmissing_fraction`,
 `max_dominant_fraction`, `temperature`, and `enable_thinking`. A configured

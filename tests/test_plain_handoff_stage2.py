@@ -28,6 +28,8 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config is not None
     assert config.endpoint == "http://stage2.test/v1"
     assert config.model == ""
+    assert config.request_timeout == 7_200.0
+    assert config.transport_max_attempts == 3
     assert config.max_tokens == 25_000
 
 
@@ -158,6 +160,107 @@ def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
     )
 
 
+def test_interpretation_drops_only_concepts_without_grounded_packet_citations(caplog):
+    result = stage2_workflow._validate_interpretation(
+        {
+            "concepts": [
+                {
+                    "name": "performance_status",
+                    "supporting_packet_ids": ["packet-a"],
+                    "evidence_axes": ["outcome"],
+                },
+                {
+                    "name": "invented_feature",
+                    "supporting_packet_ids": ["hallucinated-packet"],
+                    "evidence_axes": ["treatment"],
+                },
+            ],
+            "packet_dispositions": {},
+        },
+        packet_ids={"packet-a", "packet-b"},
+    )
+
+    assert [concept["name"] for concept in result["concepts"]] == [
+        "performance_status"
+    ]
+    assert set(result["packet_dispositions"]) == {"packet-a", "packet-b"}
+    assert "dropped ungrounded concept=invented_feature" in caplog.text
+
+
+def test_interpretation_recovers_citation_from_packet_disposition():
+    result = stage2_workflow._validate_interpretation(
+        {
+            "concepts": [
+                {
+                    "name": "performance_status",
+                    "supporting_packet_ids": ["hallucinated-packet"],
+                    "evidence_axes": ["outcome"],
+                }
+            ],
+            "packet_dispositions": {
+                "packet-a": {
+                    "status": "supports_concept",
+                    "concept_names": ["Performance Status"],
+                }
+            },
+        },
+        packet_ids={"packet-a"},
+    )
+
+    assert result["concepts"][0]["supporting_packet_ids"] == ["packet-a"]
+
+
+def test_stage2_retries_retryable_transport_errors_without_using_repair_turns(
+    monkeypatch,
+):
+    class RetryableTransportError(Exception):
+        pass
+
+    calls = []
+    delays = []
+
+    def completion(messages, _config):
+        calls.append([dict(message) for message in messages])
+        if len(calls) < 3:
+            raise RetryableTransportError("temporary timeout")
+        return '{"ok": true}'
+
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_is_retryable_transport_error",
+        lambda exc: isinstance(exc, RetryableTransportError),
+    )
+    monkeypatch.setattr(stage2_workflow.time, "sleep", delays.append)
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        transport_max_attempts=3,
+        transport_retry_backoff=0.25,
+    )
+
+    result = stage2_workflow._request_json(
+        messages=[{"role": "user", "content": "Return JSON."}],
+        config=config,
+        completion=completion,
+        validate=lambda value: dict(value),
+    )
+
+    assert result == {"ok": True}
+    assert calls[0] == calls[1] == calls[2]
+    assert delays == [0.25, 0.5]
+
+
+def test_openai_timeout_is_a_retryable_transport_error():
+    import httpx
+    from openai import APITimeoutError
+
+    error = APITimeoutError(
+        request=httpx.Request("POST", "http://stage2.test/v1/chat/completions")
+    )
+
+    assert stage2_workflow._is_retryable_transport_error(error) is True
+
+
 def test_openai_completion_closes_client(monkeypatch):
     class FakeCompletions:
         @staticmethod
@@ -175,9 +278,14 @@ def test_openai_completion_closes_client(monkeypatch):
             self.closed = True
 
     client = FakeClient()
+    client_kwargs = {}
     import openai
 
-    monkeypatch.setattr(openai, "OpenAI", lambda **_kwargs: client)
+    def fake_client(**kwargs):
+        client_kwargs.update(kwargs)
+        return client
+
+    monkeypatch.setattr(openai, "OpenAI", fake_client)
     content = stage2_workflow._openai_completion(
         [{"role": "user", "content": "Return JSON."}],
         PlainHandoffStage2Config(
@@ -188,6 +296,7 @@ def test_openai_completion_closes_client(monkeypatch):
 
     assert content == '{"ok": true}'
     assert client.closed is True
+    assert client_kwargs["max_retries"] == 0
 
 
 def _fake_completion(calls):

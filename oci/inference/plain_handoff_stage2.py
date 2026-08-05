@@ -95,7 +95,9 @@ class PlainHandoffStage2Config:
     endpoint: str
     model: str = ""
     api_key: str = "EMPTY"
-    request_timeout: float = 1_800.0
+    request_timeout: float = 7_200.0
+    transport_max_attempts: int = 3
+    transport_retry_backoff: float = 2.0
     max_tokens: int = 25_000
     max_prompt_chars: int = 100_000
     max_candidates_per_fold: int = 50
@@ -117,6 +119,10 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.model must be nonempty")
         if self.request_timeout <= 0:
             raise ValueError("stage2.request_timeout must be positive")
+        if self.transport_max_attempts < 1:
+            raise ValueError("stage2.transport_max_attempts must be positive")
+        if self.transport_retry_backoff < 0:
+            raise ValueError("stage2.transport_retry_backoff must be nonnegative")
         if self.max_tokens < 256:
             raise ValueError("stage2.max_tokens must be at least 256")
         if self.max_prompt_chars < 4_000:
@@ -166,7 +172,9 @@ def plain_stage2_config_from_mapping(
         endpoint=endpoint.rstrip("/"),
         model=model,
         api_key=api_key,
-        request_timeout=float(raw.get("request_timeout", 1_800.0)),
+        request_timeout=float(raw.get("request_timeout", 7_200.0)),
+        transport_max_attempts=int(raw.get("transport_max_attempts", 3)),
+        transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
         max_tokens=int(raw.get("max_tokens", 25_000)),
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
         max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
@@ -649,7 +657,9 @@ def _openai_completion(
         base_url=config.endpoint,
         api_key=config.api_key,
         timeout=config.request_timeout,
-        max_retries=2,
+        # Stage 2 owns completion retries so they are logged, bounded, and do
+        # not multiply invisibly with SDK-level retries.
+        max_retries=0,
     )
     kwargs: dict[str, Any] = {
         "model": config.model,
@@ -684,6 +694,48 @@ def _openai_completion(
     return str(content)
 
 
+def _is_retryable_transport_error(exc: Exception) -> bool:
+    """Return whether a failed OpenAI-compatible request is safe to retry."""
+
+    try:
+        from openai import APIConnectionError, APIStatusError
+    except ImportError:  # pragma: no cover - OpenAI is required for live requests
+        return False
+    if isinstance(exc, APIConnectionError):
+        return True
+    if isinstance(exc, APIStatusError):
+        status_code = int(exc.status_code)
+        return status_code in {408, 409, 429} or status_code >= 500
+    return False
+
+
+def _completion_with_transport_retries(
+    messages: Sequence[Mapping[str, str]],
+    config: PlainHandoffStage2Config,
+    completion: CompletionFunction,
+) -> str:
+    max_attempts = max(1, int(config.transport_max_attempts))
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return completion(messages, config)
+        except Exception as exc:
+            if not _is_retryable_transport_error(exc) or attempt == max_attempts:
+                raise
+            delay = float(config.transport_retry_backoff) * (2 ** (attempt - 1))
+            LOGGER.warning(
+                "Stage 2 transport failed; retrying request attempt %s/%s "
+                "after %.1fs (%s: %s)",
+                attempt + 1,
+                max_attempts,
+                delay,
+                type(exc).__name__,
+                exc,
+            )
+            if delay > 0:
+                time.sleep(delay)
+    raise RuntimeError("unreachable Stage 2 transport retry state")
+
+
 def _parse_json_object(text: str) -> dict[str, Any]:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -715,7 +767,12 @@ def _request_json(
                 f"({prompt_chars} > {config.max_prompt_chars})"
             )
         try:
-            return validate(_parse_json_object(completion(conversation, config)))
+            response = _completion_with_transport_retries(
+                conversation,
+                config,
+                completion,
+            )
+            return validate(_parse_json_object(response))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             if attempt == max_attempts - 1:
                 raise ValueError(
@@ -797,10 +854,12 @@ def _interpretation_prompt(
             }
         },
     }
+    supplied_packet_ids = [str(packet["packet_id"]) for packet in packets]
     body = {
         "job": "interpret_one_stage1_architecture",
         "clinical_question": clinical_question,
         "architecture": architecture,
+        "supplied_packet_ids": supplied_packet_ids,
         "rules": [
             "Interpret every packet independently of other architectures.",
             "Name only concrete pretreatment patient characteristics supported by readable evidence.",
@@ -808,6 +867,7 @@ def _interpretation_prompt(
             "Numerical values may indicate an evidence axis but cannot by themselves name a feature.",
             "Do not assign a causal role yet; report only the evidence axes that are visibly supported.",
             "Preserve distinct measurements and uncertainty.",
+            "Copy supporting packet IDs exactly from supplied_packet_ids; never invent an ID.",
             "Every packet must receive one disposition.",
         ],
         "packets": list(packets),
@@ -847,6 +907,7 @@ def _validate_interpretation(
     dispositions = payload.get("packet_dispositions")
     if not isinstance(dispositions, Mapping):
         dispositions = {}
+    dispositions = {str(key): item for key, item in dispositions.items()}
     clean_concepts: list[dict[str, Any]] = []
     for concept in concepts:
         if not isinstance(concept, Mapping):
@@ -855,9 +916,42 @@ def _validate_interpretation(
         if not name:
             raise ValueError("interpreted concept has no name")
         raw_supports = concept.get("supporting_packet_ids") or concept.get("packet_ids") or []
-        supports = list(dict.fromkeys(str(item) for item in raw_supports if str(item) in packet_ids))
+        if isinstance(raw_supports, (str, int)):
+            raw_supports = [raw_supports]
+        elif not isinstance(raw_supports, Sequence):
+            raw_supports = []
+        cited_ids = list(dict.fromkeys(str(item) for item in raw_supports))
+        supports = [packet_id for packet_id in cited_ids if packet_id in packet_ids]
         if not supports:
-            raise ValueError("concept cites an unknown or empty packet set")
+            concept_key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+            for packet_id in sorted(packet_ids):
+                disposition = dispositions.get(packet_id)
+                if not isinstance(disposition, Mapping):
+                    continue
+                raw_names = disposition.get("concept_names") or []
+                if isinstance(raw_names, str):
+                    raw_names = [raw_names]
+                disposition_names = {
+                    re.sub(r"[^a-z0-9]+", "_", str(item).lower()).strip("_")
+                    for item in raw_names
+                }
+                if concept_key in disposition_names:
+                    supports.append(packet_id)
+        unknown_ids = [packet_id for packet_id in cited_ids if packet_id not in packet_ids]
+        if unknown_ids:
+            LOGGER.warning(
+                "Stage 2 interpretation concept=%s ignored %s unknown packet ID(s): %s",
+                name,
+                len(unknown_ids),
+                unknown_ids[:8],
+            )
+        if not supports:
+            LOGGER.warning(
+                "Stage 2 interpretation dropped ungrounded concept=%s; no supplied "
+                "packet cited it",
+                name,
+            )
+            continue
         axes = _canonical_evidence_axes(concept.get("evidence_axes") or concept.get("axes"))
         value_type = str(concept.get("value_type") or "ambiguous").strip().lower()
         value_type = {
