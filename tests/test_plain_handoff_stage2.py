@@ -370,6 +370,58 @@ def test_consolidation_reconciles_feature_limit_and_stale_feature_names(caplog):
     assert "ignored 1 unknown candidate disposition" in caplog.text
 
 
+def test_consolidation_normalizes_scalar_fields_and_recovers_packet_grounding(caplog):
+    result = stage2_workflow._validate_consolidation(
+        {
+            "features": [
+                {
+                    "name": "performance_status",
+                    "description": "Baseline ECOG performance status.",
+                    "value_type": "category",
+                    "categories_or_unit": "ECOG 0, ECOG 1, ECOG 2",
+                    "roles": "confounder",
+                    "measurement_definition": "Extract pretreatment ECOG status.",
+                    "missing_value_rule": "Return null when undocumented.",
+                    "supporting_packet_ids": "hallucinated_packet",
+                    "supporting_architectures": "hallucinated_architecture",
+                    "stability_summary": "Supported by the supplied candidate.",
+                    "caveats": "",
+                }
+            ],
+            "candidate_dispositions": None,
+        },
+        candidates=[
+            {
+                "candidate_id": "candidate_1",
+                "architecture": "test_architecture",
+                "name": "performance_status",
+                "supporting_packet_ids": ["packet_1"],
+                "evidence_axes": ["treatment", "outcome"],
+            }
+        ],
+        max_candidates=1,
+    )
+
+    assert result["features"] == [
+        {
+            "name": "performance_status",
+            "description": "Baseline ECOG performance status.",
+            "value_type": "categorical",
+            "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
+            "roles": ["confounder"],
+            "measurement_definition": "Extract pretreatment ECOG status.",
+            "missing_value_rule": "Return null when undocumented.",
+            "supporting_packet_ids": ["packet_1"],
+            "supporting_architectures": ["test_architecture"],
+            "stability_summary": "Supported by the supplied candidate.",
+            "caveats": "",
+        }
+    ]
+    assert result["candidate_dispositions"]["candidate_1"]["status"] == "merged"
+    assert "ignored 1 unknown packet ID" in caplog.text
+    assert "omitted candidate_dispositions" in caplog.text
+
+
 def _fake_completion(calls):
     def complete(messages, _config):
         body = json.loads(messages[1]["content"])

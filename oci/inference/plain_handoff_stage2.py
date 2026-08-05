@@ -1109,10 +1109,32 @@ def _validate_consolidation(
 ) -> dict[str, Any]:
     features = value.get("features")
     dispositions = value.get("candidate_dispositions")
-    if not isinstance(features, list) or not isinstance(dispositions, Mapping):
-        raise ValueError("consolidation requires features and candidate_dispositions")
+    if not isinstance(features, list):
+        raise ValueError("consolidation requires a features list")
+    if not isinstance(dispositions, Mapping):
+        LOGGER.warning(
+            "Stage 2 consolidation response omitted candidate_dispositions; "
+            "deriving unambiguous routes from packet evidence"
+        )
+        dispositions = {}
     dispositions = {str(candidate_id): row for candidate_id, row in dispositions.items()}
+
+    def feature_name_key(name: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+
+    def string_list(raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, (str, int, float, bool)):
+            return [str(raw)]
+        if not isinstance(raw, Sequence):
+            return []
+        return list(dict.fromkeys(str(item) for item in raw if item is not None))
+
     candidate_ids = {str(candidate["candidate_id"]) for candidate in candidates}
+    candidate_by_id = {
+        str(candidate["candidate_id"]): candidate for candidate in candidates
+    }
     extra_disposition_ids = sorted(set(dispositions) - candidate_ids)
     if extra_disposition_ids:
         LOGGER.warning(
@@ -1123,19 +1145,19 @@ def _validate_consolidation(
     allowed_packets = {
         str(packet_id)
         for candidate in candidates
-        for packet_id in candidate["supporting_packet_ids"]
+        for packet_id in string_list(candidate.get("supporting_packet_ids"))
     }
     allowed_architectures = {
         str(architecture)
         for candidate in candidates
         for architecture in [
             candidate["architecture"],
-            *(candidate.get("supporting_architectures") or []),
+            *string_list(candidate.get("supporting_architectures")),
         ]
     }
     packet_axes: dict[str, set[str]] = defaultdict(set)
     for candidate in candidates:
-        for packet_id in candidate["supporting_packet_ids"]:
+        for packet_id in string_list(candidate.get("supporting_packet_ids")):
             per_packet = candidate.get("packet_evidence_axes") or {}
             packet_axes[str(packet_id)].update(
                 str(axis)
@@ -1145,61 +1167,105 @@ def _validate_consolidation(
                 )
             )
     clean_features: list[dict[str, Any]] = []
-    required = {
-        "name",
-        "description",
-        "value_type",
-        "categories_or_unit",
-        "roles",
-        "measurement_definition",
-        "missing_value_rule",
-        "supporting_packet_ids",
-        "supporting_architectures",
-        "stability_summary",
-        "caveats",
-    }
-    for feature in features:
-        if not isinstance(feature, Mapping) or not required <= set(feature):
-            raise ValueError("each final feature must contain the complete measurement definition")
-        for key in {
-            "categories_or_unit",
-            "roles",
-            "supporting_packet_ids",
-            "supporting_architectures",
-        }:
-            if not isinstance(feature[key], list):
-                raise ValueError(f"final feature {key} must be an array")
-        value_type = str(feature["value_type"])
-        roles = [str(role) for role in feature["roles"]]
-        packets = [str(packet_id) for packet_id in feature["supporting_packet_ids"]]
-        architectures = [str(name) for name in feature["supporting_architectures"]]
-        if value_type not in ALLOWED_VALUE_TYPES:
-            raise ValueError("final feature contains an unsupported value_type")
-        if not roles or not set(roles) <= ALLOWED_ROLES:
-            raise ValueError("final feature contains unsupported or empty causal roles")
-        if not packets or not set(packets) <= allowed_packets:
-            raise ValueError("final feature cites unknown or empty packet evidence")
-        if not set(architectures) <= allowed_architectures:
-            raise ValueError("final feature cites an unknown architecture")
-        axes = {
-            axis
-            for packet_id in packets
-            for axis in packet_axes.get(packet_id, set())
-        }
-        clean_feature = {
-            key: (
-                [str(item) for item in feature[key]]
-                if key in {
-                    "categories_or_unit",
-                    "roles",
-                    "supporting_packet_ids",
-                    "supporting_architectures",
-                }
-                else str(feature[key])
+    for feature_index, feature in enumerate(features, start=1):
+        if not isinstance(feature, Mapping):
+            LOGGER.warning(
+                "Stage 2 consolidation dropped malformed feature at position=%s",
+                feature_index,
             )
-            for key in required
+            continue
+        name = str(feature.get("name") or feature.get("feature_name") or "").strip()
+        if not name:
+            LOGGER.warning(
+                "Stage 2 consolidation dropped unnamed feature at position=%s",
+                feature_index,
+            )
+            continue
+        name_key = feature_name_key(name)
+        matched_candidate_ids = {
+            candidate_id
+            for candidate_id, candidate in candidate_by_id.items()
+            if feature_name_key(candidate.get("name") or "") == name_key
+            or (
+                isinstance(dispositions.get(candidate_id), Mapping)
+                and feature_name_key(
+                    dispositions[candidate_id].get("feature_name") or ""
+                )
+                == name_key
+                and str(dispositions[candidate_id].get("status") or "").lower()
+                not in {"excluded", "exclude", "drop", "dropped"}
+            )
         }
-        categories = clean_feature["categories_or_unit"]
+        if not matched_candidate_ids and len(features) == 1:
+            matched_candidate_ids = {
+                candidate_id
+                for candidate_id in candidate_ids
+                if isinstance(dispositions.get(candidate_id), Mapping)
+                and str(dispositions[candidate_id].get("status") or "").lower()
+                in {
+                    "retained",
+                    "retain",
+                    "keep",
+                    "kept",
+                    "merged",
+                    "merge",
+                    "combine",
+                }
+            }
+
+        cited_packets = string_list(
+            feature.get("supporting_packet_ids") or feature.get("packet_ids")
+        )
+        unknown_packets = [
+            packet_id for packet_id in cited_packets if packet_id not in allowed_packets
+        ]
+        packets = [packet_id for packet_id in cited_packets if packet_id in allowed_packets]
+        for candidate_id in sorted(matched_candidate_ids):
+            packets.extend(
+                string_list(candidate_by_id[candidate_id].get("supporting_packet_ids"))
+            )
+        packets = list(
+            dict.fromkeys(
+                packet_id for packet_id in packets if packet_id in allowed_packets
+            )
+        )
+        if unknown_packets:
+            LOGGER.warning(
+                "Stage 2 consolidation feature=%s ignored %s unknown packet ID(s): %s",
+                name,
+                len(unknown_packets),
+                unknown_packets[:8],
+            )
+        if not packets:
+            LOGGER.warning(
+                "Stage 2 consolidation dropped ungrounded feature=%s; no supplied "
+                "candidate evidence could be recovered",
+                name,
+            )
+            continue
+
+        raw_categories = feature.get("categories_or_unit")
+        if isinstance(raw_categories, Mapping):
+            raw_categories = (
+                raw_categories.get("categories")
+                or raw_categories.get("values")
+                or raw_categories.get("unit")
+            )
+        if raw_categories is None:
+            raw_categories = feature.get("categories") or feature.get("unit")
+        categories = string_list(raw_categories)
+
+        value_type = str(feature.get("value_type") or "ambiguous").strip().lower()
+        value_type = {
+            "bool": "binary",
+            "boolean": "binary",
+            "category": "categorical",
+            "numeric": "continuous",
+            "number": "continuous",
+            "unknown": "ambiguous",
+        }.get(value_type, value_type)
+        if value_type not in ALLOWED_VALUE_TYPES:
+            value_type = "ambiguous"
         if value_type in {"binary", "categorical", "ordinal"} and len(categories) == 1:
             # Models sometimes serialize an enumerated category list as one
             # comma-separated string.  Store the actual categories so later
@@ -1210,12 +1276,78 @@ def _validate_consolidation(
                 if part.strip()
             ]
             if len(separated) > 1:
-                clean_feature["categories_or_unit"] = separated
-        clean_features.append(clean_feature)
-    if len(clean_features) > max_candidates:
-        def feature_name_key(name: Any) -> str:
-            return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+                categories = separated
+        if value_type in {"binary", "categorical", "ordinal"} and not categories:
+            value_type = "ambiguous"
 
+        architectures = [
+            architecture
+            for architecture in string_list(feature.get("supporting_architectures"))
+            if architecture in allowed_architectures
+        ]
+        if not architectures:
+            architectures = list(
+                dict.fromkeys(
+                    str(architecture)
+                    for candidate_id, candidate in candidate_by_id.items()
+                    if candidate_id in matched_candidate_ids
+                    or set(string_list(candidate.get("supporting_packet_ids"))).intersection(
+                        packets
+                    )
+                    for architecture in [
+                        candidate["architecture"],
+                        *string_list(candidate.get("supporting_architectures")),
+                    ]
+                    if str(architecture) in allowed_architectures
+                )
+            )
+
+        description = str(feature.get("description") or name).strip()
+        clean_features.append(
+            {
+                "name": name,
+                "description": description,
+                "value_type": value_type,
+                "categories_or_unit": categories,
+                "roles": [
+                    role
+                    for role in string_list(feature.get("roles"))
+                    if role in ALLOWED_ROLES
+                ],
+                "measurement_definition": str(
+                    feature.get("measurement_definition") or description
+                ).strip(),
+                "missing_value_rule": str(
+                    feature.get("missing_value_rule")
+                    or "Return null when not documented in the pretreatment record."
+                ).strip(),
+                "supporting_packet_ids": packets,
+                "supporting_architectures": architectures,
+                "stability_summary": str(feature.get("stability_summary") or ""),
+                "caveats": str(feature.get("caveats") or ""),
+            }
+        )
+    deduplicated_features: dict[str, dict[str, Any]] = {}
+    for feature in clean_features:
+        key = feature_name_key(feature["name"])
+        existing = deduplicated_features.get(key)
+        if existing is None:
+            deduplicated_features[key] = feature
+            continue
+        LOGGER.warning(
+            "Stage 2 consolidation merged duplicate returned feature name=%s",
+            feature["name"],
+        )
+        for field in (
+            "categories_or_unit",
+            "supporting_packet_ids",
+            "supporting_architectures",
+        ):
+            existing[field] = list(
+                dict.fromkeys([*existing[field], *feature[field]])
+            )
+    clean_features = list(deduplicated_features.values())
+    if len(clean_features) > max_candidates:
         referenced_names = Counter(
             feature_name_key(row.get("feature_name"))
             for row in dispositions.values()
@@ -1259,19 +1391,38 @@ def _validate_consolidation(
     features_by_name = {feature["name"]: feature for feature in clean_features}
     features_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for feature in clean_features:
-        key = re.sub(r"[^a-z0-9]+", "_", feature["name"].lower()).strip("_")
+        key = feature_name_key(feature["name"])
         features_by_key[key].append(feature)
-    candidate_by_id = {
-        str(candidate["candidate_id"]): candidate for candidate in candidates
-    }
     for candidate_id in sorted(candidate_ids):
         raw_disposition = dispositions.get(candidate_id)
+        candidate_packets = {
+            str(packet_id)
+            for packet_id in string_list(
+                candidate_by_id[candidate_id].get("supporting_packet_ids")
+            )
+        }
         if not isinstance(raw_disposition, Mapping):
-            clean_dispositions[candidate_id] = {
-                "status": "excluded",
-                "feature_name": "",
-                "reason": "Candidate disposition was missing or malformed.",
-            }
+            compatible = [
+                candidate_feature
+                for candidate_feature in clean_features
+                if candidate_packets
+                <= set(candidate_feature["supporting_packet_ids"])
+            ]
+            if len(compatible) == 1:
+                clean_dispositions[candidate_id] = {
+                    "status": "merged",
+                    "feature_name": str(compatible[0]["name"]),
+                    "reason": (
+                        "Candidate disposition was missing; routed to the unique "
+                        "returned feature preserving its packet evidence."
+                    ),
+                }
+            else:
+                clean_dispositions[candidate_id] = {
+                    "status": "excluded",
+                    "feature_name": "",
+                    "reason": "Candidate disposition was missing or ambiguous.",
+                }
             continue
         status = str(raw_disposition.get("status") or "").strip().lower()
         status = status_aliases.get(status, status)
@@ -1286,15 +1437,11 @@ def _validate_consolidation(
             continue
         feature = features_by_name.get(feature_name)
         if feature is None and feature_name:
-            key = re.sub(r"[^a-z0-9]+", "_", feature_name.lower()).strip("_")
+            key = feature_name_key(feature_name)
             matches = features_by_key.get(key, [])
             if len(matches) == 1:
                 feature = matches[0]
-        candidate_packets = {
-            str(packet_id)
-            for packet_id in candidate_by_id[candidate_id]["supporting_packet_ids"]
-        }
-        if feature is None and status in {"retained", "merged"}:
+        if feature is None and status != "excluded":
             compatible = [
                 candidate_feature
                 for candidate_feature in clean_features
@@ -1314,14 +1461,12 @@ def _validate_consolidation(
             }
             continue
         if status not in {"retained", "merged"}:
-            clean_dispositions[candidate_id] = {
-                "status": "excluded",
-                "feature_name": "",
-                "reason": (
-                    reason + " Candidate disposition status was unsupported."
-                ).strip(),
-            }
-            continue
+            status = "merged"
+            reason = (
+                reason
+                + " Missing or unsupported status normalized from the grounded "
+                "feature route."
+            ).strip()
         if not candidate_packets <= set(feature["supporting_packet_ids"]):
             clean_dispositions[candidate_id] = {
                 "status": "excluded",
