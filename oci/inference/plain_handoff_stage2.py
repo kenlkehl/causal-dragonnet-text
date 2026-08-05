@@ -854,12 +854,10 @@ def _interpretation_prompt(
             }
         },
     }
-    supplied_packet_ids = [str(packet["packet_id"]) for packet in packets]
     body = {
         "job": "interpret_one_stage1_architecture",
         "clinical_question": clinical_question,
         "architecture": architecture,
-        "supplied_packet_ids": supplied_packet_ids,
         "rules": [
             "Interpret every packet independently of other architectures.",
             "Name only concrete pretreatment patient characteristics supported by readable evidence.",
@@ -867,7 +865,6 @@ def _interpretation_prompt(
             "Numerical values may indicate an evidence axis but cannot by themselves name a feature.",
             "Do not assign a causal role yet; report only the evidence axes that are visibly supported.",
             "Preserve distinct measurements and uncertainty.",
-            "Copy supporting packet IDs exactly from supplied_packet_ids; never invent an ID.",
             "Every packet must receive one disposition.",
         ],
         "packets": list(packets),
