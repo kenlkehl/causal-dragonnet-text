@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 import oci.inference.research_all_evidence_stage1 as stage1_workflow
@@ -162,6 +163,56 @@ def test_disable_htr_keeps_bow_and_embedding_without_scheduling_htr(
     )
 
     assert row == {"outer_fold": 1, "scope": "full_outer_train"}
+
+
+def test_text_model_context_serializes_nonfinite_diagnostics_as_null(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    raw, _config = _inputs(tmp_path, components=("text_models",))
+    config = compile_config(raw, config_dir=tmp_path)
+    context = ResearchAllEvidenceStage1(config)._resolved_context()
+
+    def run_contexts(**_kwargs):
+        return [
+            {
+                "outer_fold": 1,
+                "scope": "full_outer_train",
+                "metrics": {
+                    "undefined_correlation": float("nan"),
+                    "infinite_statistic": np.float64("inf"),
+                },
+                "importance": {
+                    "scores": np.asarray([1.25, float("-inf")]),
+                },
+            }
+        ]
+
+    monkeypatch.setattr(multi_model_workflow, "_run_handoff_contexts", run_contexts)
+    context_dir = tmp_path / "nonfinite_context"
+    row = stage1_workflow._run_one_text_model_context(
+        dataset=context.dataset,
+        applied_config=context.applied_config,
+        spec={
+            "scope_id": "outer_001_full",
+            "fold_key": 1,
+            "outer_fold": 1,
+            "scope": "full_outer_train",
+        },
+        context_dir=context_dir,
+        device="cpu",
+        cpu_workers=1,
+    )
+
+    assert row["metrics"] == {
+        "undefined_correlation": None,
+        "infinite_statistic": None,
+    }
+    assert row["importance"]["scores"] == [1.25, None]
+    assert json.loads((context_dir / "evidence.json").read_text(encoding="utf-8")) == row
+    assert (context_dir / "complete.json").is_file()
+    assert "converted 3 non-finite evidence value(s) to JSON null" in caplog.text
 
 
 def test_text_model_handoff_row_omits_empty_htr_evidence():

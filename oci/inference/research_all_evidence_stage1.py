@@ -69,6 +69,59 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"cannot encode {type(value).__name__} as JSON")
 
 
+def _normalize_evidence_json(
+    value: Any,
+    *,
+    path: str = "$",
+    nonfinite_paths: list[str] | None = None,
+) -> Any:
+    """Represent undefined evidence statistics as JSON null without rounding.
+
+    Some fold-local diagnostics are mathematically undefined for degenerate
+    samples and are returned by numerical libraries as NaN or infinity.  They
+    carry the same meaning as missing diagnostics in the handoff, but strict
+    JSON has no non-finite number representation.  Preserve every finite value
+    exactly and convert only those undefined scalars to ``None``.
+    """
+
+    if nonfinite_paths is None:
+        nonfinite_paths = []
+    if isinstance(value, np.ndarray):
+        return _normalize_evidence_json(
+            value.tolist(),
+            path=path,
+            nonfinite_paths=nonfinite_paths,
+        )
+    if isinstance(value, np.generic):
+        return _normalize_evidence_json(
+            value.item(),
+            path=path,
+            nonfinite_paths=nonfinite_paths,
+        )
+    if isinstance(value, float) and not np.isfinite(value):
+        nonfinite_paths.append(path)
+        return None
+    if isinstance(value, Mapping):
+        return {
+            key: _normalize_evidence_json(
+                item,
+                path=f"{path}.{key}",
+                nonfinite_paths=nonfinite_paths,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _normalize_evidence_json(
+                item,
+                path=f"{path}[{index}]",
+                nonfinite_paths=nonfinite_paths,
+            )
+            for index, item in enumerate(value)
+        ]
+    return value
+
+
 def _write_json(path: Path, value: Any) -> None:
     """Replace one small control file atomically.
 
@@ -716,7 +769,22 @@ def _run_one_text_model_context(
     )
     if len(rows) != 1:
         raise RuntimeError(f"text model context {spec['scope_id']} returned {len(rows)} rows")
-    row = dict(rows[0])
+    nonfinite_paths: list[str] = []
+    row = _normalize_evidence_json(
+        dict(rows[0]),
+        nonfinite_paths=nonfinite_paths,
+    )
+    if nonfinite_paths:
+        preview = ", ".join(nonfinite_paths[:8])
+        if len(nonfinite_paths) > 8:
+            preview += f", ... ({len(nonfinite_paths) - 8} more)"
+        LOGGER.warning(
+            "text_models context=%s converted %s non-finite evidence value(s) "
+            "to JSON null at %s",
+            spec["scope_id"],
+            len(nonfinite_paths),
+            preview,
+        )
     _write_json(context_dir / "evidence.json", row)
     _write_json(
         context_dir / "complete.json",
