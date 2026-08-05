@@ -1111,11 +1111,15 @@ def _validate_consolidation(
     dispositions = value.get("candidate_dispositions")
     if not isinstance(features, list) or not isinstance(dispositions, Mapping):
         raise ValueError("consolidation requires features and candidate_dispositions")
-    if len(features) > max_candidates:
-        raise ValueError("consolidation returned more than the configured feature limit")
+    dispositions = {str(candidate_id): row for candidate_id, row in dispositions.items()}
     candidate_ids = {str(candidate["candidate_id"]) for candidate in candidates}
-    if set(map(str, dispositions)) != candidate_ids:
-        raise ValueError("candidate_dispositions must contain every and only supplied candidate ID")
+    extra_disposition_ids = sorted(set(dispositions) - candidate_ids)
+    if extra_disposition_ids:
+        LOGGER.warning(
+            "Stage 2 consolidation ignored %s unknown candidate disposition(s): %s",
+            len(extra_disposition_ids),
+            extra_disposition_ids[:8],
+        )
     allowed_packets = {
         str(packet_id)
         for candidate in candidates
@@ -1208,35 +1212,131 @@ def _validate_consolidation(
             if len(separated) > 1:
                 clean_feature["categories_or_unit"] = separated
         clean_features.append(clean_feature)
+    if len(clean_features) > max_candidates:
+        def feature_name_key(name: Any) -> str:
+            return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+
+        referenced_names = Counter(
+            feature_name_key(row.get("feature_name"))
+            for row in dispositions.values()
+            if isinstance(row, Mapping)
+            and str(row.get("status") or "").lower() in {"retained", "merged"}
+        )
+        ranked_indices = sorted(
+            range(len(clean_features)),
+            key=lambda index: (
+                referenced_names[feature_name_key(clean_features[index]["name"])],
+                len(clean_features[index]["supporting_packet_ids"]),
+                -index,
+            ),
+            reverse=True,
+        )
+        retained_indices = set(ranked_indices[:max_candidates])
+        LOGGER.warning(
+            "Stage 2 consolidation returned %s features for limit=%s; retaining "
+            "the %s most candidate-supported grounded feature(s)",
+            len(clean_features),
+            max_candidates,
+            len(retained_indices),
+        )
+        clean_features = [
+            feature
+            for index, feature in enumerate(clean_features)
+            if index in retained_indices
+        ]
     clean_dispositions: dict[str, dict[str, str]] = {}
-    for candidate_id in sorted(candidate_ids):
-        raw_disposition = dispositions[candidate_id]
-        if not isinstance(raw_disposition, Mapping):
-            raise ValueError("each candidate disposition must be an object")
-        clean_dispositions[candidate_id] = {
-            "status": str(raw_disposition.get("status") or ""),
-            "feature_name": str(raw_disposition.get("feature_name") or ""),
-            "reason": str(raw_disposition.get("reason") or ""),
-        }
-    if any(
-        row["status"] not in {"retained", "merged", "excluded"}
-        for row in clean_dispositions.values()
-    ):
-        raise ValueError("candidate disposition contains an unsupported status")
+    status_aliases = {
+        "keep": "retained",
+        "kept": "retained",
+        "retain": "retained",
+        "combine": "merged",
+        "combined": "merged",
+        "merge": "merged",
+        "drop": "excluded",
+        "dropped": "excluded",
+        "exclude": "excluded",
+    }
     features_by_name = {feature["name"]: feature for feature in clean_features}
+    features_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for feature in clean_features:
+        key = re.sub(r"[^a-z0-9]+", "_", feature["name"].lower()).strip("_")
+        features_by_key[key].append(feature)
     candidate_by_id = {
         str(candidate["candidate_id"]): candidate for candidate in candidates
     }
-    for candidate_id, disposition in clean_dispositions.items():
-        if disposition["status"] == "excluded":
+    for candidate_id in sorted(candidate_ids):
+        raw_disposition = dispositions.get(candidate_id)
+        if not isinstance(raw_disposition, Mapping):
+            clean_dispositions[candidate_id] = {
+                "status": "excluded",
+                "feature_name": "",
+                "reason": "Candidate disposition was missing or malformed.",
+            }
             continue
-        feature = features_by_name.get(disposition["feature_name"])
+        status = str(raw_disposition.get("status") or "").strip().lower()
+        status = status_aliases.get(status, status)
+        feature_name = str(raw_disposition.get("feature_name") or "").strip()
+        reason = str(raw_disposition.get("reason") or "").strip()
+        if status == "excluded":
+            clean_dispositions[candidate_id] = {
+                "status": "excluded",
+                "feature_name": "",
+                "reason": reason or "Candidate was excluded by consolidation.",
+            }
+            continue
+        feature = features_by_name.get(feature_name)
+        if feature is None and feature_name:
+            key = re.sub(r"[^a-z0-9]+", "_", feature_name.lower()).strip("_")
+            matches = features_by_key.get(key, [])
+            if len(matches) == 1:
+                feature = matches[0]
+        candidate_packets = {
+            str(packet_id)
+            for packet_id in candidate_by_id[candidate_id]["supporting_packet_ids"]
+        }
+        if feature is None and status in {"retained", "merged"}:
+            compatible = [
+                candidate_feature
+                for candidate_feature in clean_features
+                if candidate_packets
+                <= set(candidate_feature["supporting_packet_ids"])
+            ]
+            if len(compatible) == 1:
+                feature = compatible[0]
         if feature is None:
-            raise ValueError("a retained or merged candidate must name a returned feature")
-        if not set(candidate_by_id[candidate_id]["supporting_packet_ids"]) <= set(
-            feature["supporting_packet_ids"]
-        ):
-            raise ValueError("a retained or merged candidate lost its cited evidence")
+            clean_dispositions[candidate_id] = {
+                "status": "excluded",
+                "feature_name": "",
+                "reason": (
+                    reason
+                    + " No uniquely matching returned feature remained during normalization."
+                ).strip(),
+            }
+            continue
+        if status not in {"retained", "merged"}:
+            clean_dispositions[candidate_id] = {
+                "status": "excluded",
+                "feature_name": "",
+                "reason": (
+                    reason + " Candidate disposition status was unsupported."
+                ).strip(),
+            }
+            continue
+        if not candidate_packets <= set(feature["supporting_packet_ids"]):
+            clean_dispositions[candidate_id] = {
+                "status": "excluded",
+                "feature_name": "",
+                "reason": (
+                    reason
+                    + " Returned feature did not preserve this candidate's cited evidence."
+                ).strip(),
+            }
+            continue
+        clean_dispositions[candidate_id] = {
+            "status": status,
+            "feature_name": str(feature["name"]),
+            "reason": reason or "Candidate was reconciled to the returned grounded feature.",
+        }
 
     routed_features: list[dict[str, Any]] = []
     for feature in clean_features:
@@ -1264,6 +1364,14 @@ def _validate_consolidation(
             disposition["reason"] = (
                 disposition["reason"] + " No supported Stage 2 causal role remained after routing."
             ).strip()
+    used_names = {
+        disposition["feature_name"]
+        for disposition in clean_dispositions.values()
+        if disposition["status"] != "excluded"
+    }
+    routed_features = [
+        feature for feature in routed_features if feature["name"] in used_names
+    ]
     return {"features": routed_features, "candidate_dispositions": clean_dispositions}
 
 

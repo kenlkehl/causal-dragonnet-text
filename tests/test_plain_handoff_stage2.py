@@ -299,6 +299,77 @@ def test_openai_completion_closes_client(monkeypatch):
     assert client_kwargs["max_retries"] == 0
 
 
+def test_consolidation_reconciles_feature_limit_and_stale_feature_names(caplog):
+    candidates = [
+        {
+            "candidate_id": "candidate_1",
+            "architecture": "test_architecture",
+            "supporting_packet_ids": ["packet_1"],
+            "evidence_axes": ["treatment", "outcome"],
+        },
+        {
+            "candidate_id": "candidate_2",
+            "architecture": "test_architecture",
+            "supporting_packet_ids": ["packet_2"],
+            "evidence_axes": ["treatment", "outcome"],
+        },
+    ]
+
+    def feature(name, packets):
+        return {
+            "name": name,
+            "description": name.replace("_", " "),
+            "value_type": "ordinal",
+            "categories_or_unit": ["0", "1", "2"],
+            "roles": ["confounder"],
+            "measurement_definition": f"Extract pretreatment {name}.",
+            "missing_value_rule": "Return null when undocumented.",
+            "supporting_packet_ids": packets,
+            "supporting_architectures": ["test_architecture"],
+            "stability_summary": "Supported by supplied candidates.",
+            "caveats": "",
+        }
+
+    result = stage2_workflow._validate_consolidation(
+        {
+            "features": [
+                feature("performance_status", ["packet_1", "packet_2"]),
+                feature("age", ["packet_2"]),
+            ],
+            "candidate_dispositions": {
+                "candidate_1": {
+                    "status": "retained",
+                    "feature_name": "functional_status",
+                    "reason": "Equivalent clinical measurement.",
+                },
+                "candidate_2": {
+                    "status": "merged",
+                    "feature_name": "performance_status",
+                    "reason": "Same measurement.",
+                },
+                "hallucinated_candidate": {
+                    "status": "retained",
+                    "feature_name": "age",
+                },
+            },
+        },
+        candidates=candidates,
+        max_candidates=1,
+    )
+
+    assert [feature["name"] for feature in result["features"]] == [
+        "performance_status"
+    ]
+    assert result["candidate_dispositions"]["candidate_1"]["feature_name"] == (
+        "performance_status"
+    )
+    assert result["candidate_dispositions"]["candidate_2"]["feature_name"] == (
+        "performance_status"
+    )
+    assert "returned 2 features for limit=1" in caplog.text
+    assert "ignored 1 unknown candidate disposition" in caplog.text
+
+
 def _fake_completion(calls):
     def complete(messages, _config):
         body = json.loads(messages[1]["content"])
