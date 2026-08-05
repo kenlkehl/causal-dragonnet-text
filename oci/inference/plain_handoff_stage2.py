@@ -101,6 +101,7 @@ class PlainHandoffStage2Config:
     max_tokens: int = 25_000
     max_prompt_chars: int = 100_000
     max_candidates_per_fold: int = 50
+    consolidation_oversample_factor: int = 4
     workers: int = 4
     extraction_batch_size: int = 12
     max_review_rounds: int = 2
@@ -129,6 +130,8 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.max_candidates_per_fold < 1:
             raise ValueError("stage2.max_candidates_per_fold must be positive")
+        if self.consolidation_oversample_factor < 1:
+            raise ValueError("stage2.consolidation_oversample_factor must be positive")
         if self.workers < 1:
             raise ValueError("stage2.workers must be positive")
         if self.extraction_batch_size < 1:
@@ -178,6 +181,7 @@ def plain_stage2_config_from_mapping(
         max_tokens=int(raw.get("max_tokens", 25_000)),
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
         max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
+        consolidation_oversample_factor=int(raw.get("consolidation_oversample_factor", 4)),
         workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
         extraction_batch_size=int(raw.get("extraction_batch_size", 12)),
         max_review_rounds=int(raw.get("max_review_rounds", 2)),
@@ -377,15 +381,17 @@ def _row_sections(row: Mapping[str, Any]) -> list[tuple[str, Any, str]]:
                 )
         elif embedding:
             sections.append(
-                ("embedding_contrasts_and_retrieval_terms", embedding, "embedding_contrast_evidence")
+                (
+                    "embedding_contrasts_and_retrieval_terms",
+                    embedding,
+                    "embedding_contrast_evidence",
+                )
             )
         htr = payload.get("htr_evidence")
         if isinstance(htr, Mapping):
             for key, value in htr.items():
                 if value:
-                    sections.append(
-                        ("hierarchical_neural_text", value, f"htr_evidence.{key}")
-                    )
+                    sections.append(("hierarchical_neural_text", value, f"htr_evidence.{key}"))
         elif htr:
             sections.append(("hierarchical_neural_text", htr, "htr_evidence"))
     elif source == "tfidf":
@@ -395,13 +401,9 @@ def _row_sections(row: Mapping[str, Any]) -> list[tuple[str, Any, str]]:
             if isinstance(topic_banks, Mapping):
                 for bank, value in topic_banks.items():
                     if value:
-                        sections.append(
-                            ("tfidf_topics", value, f"discovery.topic_banks.{bank}")
-                        )
+                        sections.append(("tfidf_topics", value, f"discovery.topic_banks.{bank}"))
             score_tests = discovery.get("topic_score_tests")
-            if isinstance(score_tests, Mapping) and score_tests.get(
-                "effect_orphan_ngram_branch"
-            ):
+            if isinstance(score_tests, Mapping) and score_tests.get("effect_orphan_ngram_branch"):
                 sections.append(
                     (
                         "tfidf_orphan_ngrams",
@@ -410,9 +412,7 @@ def _row_sections(row: Mapping[str, Any]) -> list[tuple[str, Any, str]]:
                     )
                 )
             elif score_tests:
-                sections.append(
-                    ("tfidf_orphan_ngrams", score_tests, "discovery.topic_score_tests")
-                )
+                sections.append(("tfidf_orphan_ngrams", score_tests, "discovery.topic_score_tests"))
     elif source == "neural_queries":
         query_evidence = payload.get("evidence")
         if isinstance(query_evidence, list):
@@ -586,9 +586,7 @@ def packetize_handoff(
                 return int(max_packet_chars) - envelope_chars
 
             if packet_content_budget(section_path) < 1:
-                raise ValueError(
-                    "max_packet_chars is too small for the Stage 2 packet envelope"
-                )
+                raise ValueError("max_packet_chars is too small for the Stage 2 packet envelope")
             fragments = _split_value(
                 section,
                 max_chars=int(max_packet_chars),
@@ -617,9 +615,7 @@ def packetize_handoff(
                     "content": content,
                 }
                 if _json_chars(packet) > int(max_packet_chars):
-                    raise RuntimeError(
-                        "Stage 2 packet planner emitted an oversized packet"
-                    )
+                    raise RuntimeError("Stage 2 packet planner emitted an oversized packet")
                 packets.append(packet)
     if not packets:
         raise ValueError("the Stage 1 handoff contains no evidence packets")
@@ -668,9 +664,7 @@ def _openai_completion(
         "max_tokens": config.max_tokens,
         "response_format": {"type": "json_object"},
     }
-    kwargs["extra_body"] = {
-        "chat_template_kwargs": {"enable_thinking": config.enable_thinking}
-    }
+    kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": config.enable_thinking}}
     prompt_chars = sum(len(str(message.get("content") or "")) for message in messages)
     if prompt_chars > int(config.max_prompt_chars):
         raise ValueError(
@@ -723,8 +717,7 @@ def _completion_with_transport_retries(
                 raise
             delay = float(config.transport_retry_backoff) * (2 ** (attempt - 1))
             LOGGER.warning(
-                "Stage 2 transport failed; retrying request attempt %s/%s "
-                "after %.1fs (%s: %s)",
+                "Stage 2 transport failed; retrying request attempt %s/%s " "after %.1fs (%s: %s)",
                 attempt + 1,
                 max_attempts,
                 delay,
@@ -758,9 +751,7 @@ def _request_json(
     first_error: Exception | None = None
     max_attempts = 3
     for attempt in range(max_attempts):
-        prompt_chars = sum(
-            len(str(message.get("content") or "")) for message in conversation
-        )
+        prompt_chars = sum(len(str(message.get("content") or "")) for message in conversation)
         if prompt_chars > int(config.max_prompt_chars):
             raise ValueError(
                 "Stage 2 rendered prompt exceeds max_prompt_chars before transport "
@@ -794,9 +785,7 @@ def _request_json(
                 ),
             }
             repaired = [*base_conversation, repair_message]
-            repaired_chars = sum(
-                len(str(message.get("content") or "")) for message in repaired
-            )
+            repaired_chars = sum(len(str(message.get("content") or "")) for message in repaired)
             if repaired_chars <= int(config.max_prompt_chars):
                 conversation = repaired
                 continue
@@ -929,8 +918,7 @@ def _validate_interpretation(
                 if isinstance(raw_names, str):
                     raw_names = [raw_names]
                 disposition_names = {
-                    re.sub(r"[^a-z0-9]+", "_", str(item).lower()).strip("_")
-                    for item in raw_names
+                    re.sub(r"[^a-z0-9]+", "_", str(item).lower()).strip("_") for item in raw_names
                 }
                 if concept_key in disposition_names:
                     supports.append(packet_id)
@@ -979,15 +967,12 @@ def _validate_interpretation(
             if packet_id in concept["supporting_packet_ids"]
         )
         disposition = dispositions.get(packet_id)
-        reason = (
-            str(disposition.get("reason") or "")
-            if isinstance(disposition, Mapping)
-            else ""
-        )
+        reason = str(disposition.get("reason") or "") if isinstance(disposition, Mapping) else ""
         clean_dispositions[packet_id] = {
             "status": "supports_concept" if names else "reviewed_no_specific_concept",
             "concept_names": names,
-            "reason": reason or (
+            "reason": reason
+            or (
                 "Derived from the concepts' packet citations."
                 if names
                 else "No returned concept cited this packet."
@@ -1014,13 +999,9 @@ def _partition_interpretation_packets(
             architecture=architecture,
             packets=candidate,
         )
-        prompt_chars = sum(
-            len(str(message.get("content") or "")) for message in messages
-        )
+        prompt_chars = sum(len(str(message.get("content") or "")) for message in messages)
         if not current and prompt_chars > int(max_prompt_chars):
-            raise ValueError(
-                "one Stage 2 evidence packet cannot fit the rendered prompt budget"
-            )
+            raise ValueError("one Stage 2 evidence packet cannot fit the rendered prompt budget")
         if current and prompt_chars > int(max_prompt_chars):
             batches.append(current)
             current = [packet]
@@ -1029,9 +1010,7 @@ def _partition_interpretation_packets(
                 architecture=architecture,
                 packets=current,
             )
-            if sum(len(message["content"]) for message in singleton) > int(
-                max_prompt_chars
-            ):
+            if sum(len(message["content"]) for message in singleton) > int(max_prompt_chars):
                 raise ValueError(
                     "one Stage 2 evidence packet cannot fit the rendered prompt budget"
                 )
@@ -1063,6 +1042,7 @@ def _consolidation_prompt(
             "Semantic evidence can name a measurement but cannot establish a causal role by itself.",
             "Cite only packet IDs carried by the candidates.",
             "Define a reproducible patient-level extraction target, categories or unit, and missing-value handling.",
+            "When the feature limit requires selection, preserve distinct measurements across evidence axes, causal roles, and supporting architectures; spend the available quota on diversity rather than near-duplicates.",
             f"Retain no more than {max_candidates} supported features.",
             "Give every candidate one disposition.",
         ],
@@ -1073,7 +1053,9 @@ def _consolidation_prompt(
                     "name": "snake_case_feature_name",
                     "description": "one patient-level measurement",
                     "value_type": "binary|categorical|continuous|ordinal|ambiguous",
-                    "categories_or_unit": ["categories for categorical variables, or one unit string"],
+                    "categories_or_unit": [
+                        "categories for categorical variables, or one unit string"
+                    ],
                     "roles": ["confounder|prognostic|effect_modifier"],
                     "measurement_definition": "what to extract from a complete pretreatment record",
                     "missing_value_rule": "how absent or ambiguous documentation is represented",
@@ -1132,9 +1114,7 @@ def _validate_consolidation(
         return list(dict.fromkeys(str(item) for item in raw if item is not None))
 
     candidate_ids = {str(candidate["candidate_id"]) for candidate in candidates}
-    candidate_by_id = {
-        str(candidate["candidate_id"]): candidate for candidate in candidates
-    }
+    candidate_by_id = {str(candidate["candidate_id"]): candidate for candidate in candidates}
     extra_disposition_ids = sorted(set(dispositions) - candidate_ids)
     if extra_disposition_ids:
         LOGGER.warning(
@@ -1188,9 +1168,7 @@ def _validate_consolidation(
             if feature_name_key(candidate.get("name") or "") == name_key
             or (
                 isinstance(dispositions.get(candidate_id), Mapping)
-                and feature_name_key(
-                    dispositions[candidate_id].get("feature_name") or ""
-                )
+                and feature_name_key(dispositions[candidate_id].get("feature_name") or "")
                 == name_key
                 and str(dispositions[candidate_id].get("status") or "").lower()
                 not in {"excluded", "exclude", "drop", "dropped"}
@@ -1221,13 +1199,9 @@ def _validate_consolidation(
         ]
         packets = [packet_id for packet_id in cited_packets if packet_id in allowed_packets]
         for candidate_id in sorted(matched_candidate_ids):
-            packets.extend(
-                string_list(candidate_by_id[candidate_id].get("supporting_packet_ids"))
-            )
+            packets.extend(string_list(candidate_by_id[candidate_id].get("supporting_packet_ids")))
         packets = list(
-            dict.fromkeys(
-                packet_id for packet_id in packets if packet_id in allowed_packets
-            )
+            dict.fromkeys(packet_id for packet_id in packets if packet_id in allowed_packets)
         )
         if unknown_packets:
             LOGGER.warning(
@@ -1271,9 +1245,7 @@ def _validate_consolidation(
             # comma-separated string.  Store the actual categories so later
             # extraction has an unambiguous closed vocabulary.
             separated = [
-                part.strip()
-                for part in re.split(r"\s*[,;|]\s*", categories[0])
-                if part.strip()
+                part.strip() for part in re.split(r"\s*[,;|]\s*", categories[0]) if part.strip()
             ]
             if len(separated) > 1:
                 categories = separated
@@ -1310,9 +1282,7 @@ def _validate_consolidation(
                 "value_type": value_type,
                 "categories_or_unit": categories,
                 "roles": [
-                    role
-                    for role in string_list(feature.get("roles"))
-                    if role in ALLOWED_ROLES
+                    role for role in string_list(feature.get("roles")) if role in ALLOWED_ROLES
                 ],
                 "measurement_definition": str(
                     feature.get("measurement_definition") or description
@@ -1343,9 +1313,7 @@ def _validate_consolidation(
             "supporting_packet_ids",
             "supporting_architectures",
         ):
-            existing[field] = list(
-                dict.fromkeys([*existing[field], *feature[field]])
-            )
+            existing[field] = list(dict.fromkeys([*existing[field], *feature[field]]))
     clean_features = list(deduplicated_features.values())
     if len(clean_features) > max_candidates:
         referenced_names = Counter(
@@ -1372,9 +1340,7 @@ def _validate_consolidation(
             len(retained_indices),
         )
         clean_features = [
-            feature
-            for index, feature in enumerate(clean_features)
-            if index in retained_indices
+            feature for index, feature in enumerate(clean_features) if index in retained_indices
         ]
     clean_dispositions: dict[str, dict[str, str]] = {}
     status_aliases = {
@@ -1397,16 +1363,13 @@ def _validate_consolidation(
         raw_disposition = dispositions.get(candidate_id)
         candidate_packets = {
             str(packet_id)
-            for packet_id in string_list(
-                candidate_by_id[candidate_id].get("supporting_packet_ids")
-            )
+            for packet_id in string_list(candidate_by_id[candidate_id].get("supporting_packet_ids"))
         }
         if not isinstance(raw_disposition, Mapping):
             compatible = [
                 candidate_feature
                 for candidate_feature in clean_features
-                if candidate_packets
-                <= set(candidate_feature["supporting_packet_ids"])
+                if candidate_packets <= set(candidate_feature["supporting_packet_ids"])
             ]
             if len(compatible) == 1:
                 clean_dispositions[candidate_id] = {
@@ -1445,8 +1408,7 @@ def _validate_consolidation(
             compatible = [
                 candidate_feature
                 for candidate_feature in clean_features
-                if candidate_packets
-                <= set(candidate_feature["supporting_packet_ids"])
+                if candidate_packets <= set(candidate_feature["supporting_packet_ids"])
             ]
             if len(compatible) == 1:
                 feature = compatible[0]
@@ -1455,16 +1417,14 @@ def _validate_consolidation(
                 "status": "excluded",
                 "feature_name": "",
                 "reason": (
-                    reason
-                    + " No uniquely matching returned feature remained during normalization."
+                    reason + " No uniquely matching returned feature remained during normalization."
                 ).strip(),
             }
             continue
         if status not in {"retained", "merged"}:
             status = "merged"
             reason = (
-                reason
-                + " Missing or unsupported status normalized from the grounded "
+                reason + " Missing or unsupported status normalized from the grounded "
                 "feature route."
             ).strip()
         if not candidate_packets <= set(feature["supporting_packet_ids"]):
@@ -1472,8 +1432,7 @@ def _validate_consolidation(
                 "status": "excluded",
                 "feature_name": "",
                 "reason": (
-                    reason
-                    + " Returned feature did not preserve this candidate's cited evidence."
+                    reason + " Returned feature did not preserve this candidate's cited evidence."
                 ).strip(),
             }
             continue
@@ -1514,9 +1473,7 @@ def _validate_consolidation(
         for disposition in clean_dispositions.values()
         if disposition["status"] != "excluded"
     }
-    routed_features = [
-        feature for feature in routed_features if feature["name"] in used_names
-    ]
+    routed_features = [feature for feature in routed_features if feature["name"] in used_names]
     return {"features": routed_features, "candidate_dispositions": clean_dispositions}
 
 
@@ -1552,9 +1509,7 @@ def _partition_consolidation_candidates(
                 candidates=current,
                 max_candidates=max_candidates,
             )
-            if sum(len(message["content"]) for message in singleton) > int(
-                max_prompt_chars
-            ):
+            if sum(len(message["content"]) for message in singleton) > int(max_prompt_chars):
                 raise ValueError(
                     "one interpreted Stage 2 candidate cannot fit the rendered prompt budget"
                 )
@@ -1563,6 +1518,119 @@ def _partition_consolidation_candidates(
     if current:
         batches.append(current)
     return batches
+
+
+def _progressive_consolidation_budget(
+    *,
+    candidate_count: int,
+    batch_count: int,
+    final_limit: int,
+    oversample_factor: int,
+    round_index: int,
+) -> int:
+    """Return a convergent intermediate beam budget.
+
+    The first round preserves an oversampled pool so every prompt shard can
+    contribute multiple distinct measurements. Later rounds halve that pool
+    toward the final fold limit after candidates from different shards have
+    been interleaved. A batch always receives at least one slot; if there are
+    more batches than the desired beam, prompt compaction must precede further
+    pruning.
+    """
+
+    if candidate_count < 1 or batch_count < 1:
+        raise ValueError("progressive consolidation requires candidates and batches")
+    if batch_count > candidate_count:
+        raise ValueError("consolidation cannot have more batches than candidates")
+    if final_limit < 1 or oversample_factor < 1 or round_index < 1:
+        raise ValueError("progressive consolidation limits must be positive")
+    if round_index == 1:
+        desired = min(candidate_count, final_limit * oversample_factor)
+    elif candidate_count > final_limit:
+        desired = max(final_limit, math.ceil(candidate_count / 2))
+    else:
+        # This branch is only needed when verbose intermediate definitions do
+        # not fit together despite already numbering no more than the final
+        # feature cap. Continue gradual reduction instead of reverting to an
+        # arbitrary one-feature-per-shard cutoff.
+        desired = math.ceil(candidate_count / 2)
+    return min(candidate_count, max(batch_count, desired))
+
+
+def _allocate_consolidation_batch_limits(
+    batches: Sequence[Sequence[Mapping[str, Any]]],
+    *,
+    total_budget: int,
+    max_per_batch: int,
+) -> list[int]:
+    """Allocate every available beam slot in proportion to shard size.
+
+    Each nonempty shard receives one slot. Remaining slots are apportioned by
+    the number of additional candidates in the shard using largest remainders,
+    subject to the per-request cap. This avoids the old floor-division behavior
+    that assigned 28 one-feature limits from a 50-feature budget and silently
+    left 22 slots unused.
+    """
+
+    if not batches or any(not batch for batch in batches):
+        raise ValueError("consolidation quota allocation requires nonempty batches")
+    if total_budget < 1 or max_per_batch < 1:
+        raise ValueError("consolidation quota limits must be positive")
+    caps = [min(len(batch), int(max_per_batch)) for batch in batches]
+    budget = min(sum(caps), max(len(batches), int(total_budget)))
+    limits = [1 for _batch in batches]
+    remaining = budget - len(limits)
+    capacities = [cap - 1 for cap in caps]
+    if remaining <= 0:
+        return limits
+
+    capacity_total = sum(capacities)
+    raw_additions = [
+        remaining * capacity / capacity_total if capacity_total else 0.0 for capacity in capacities
+    ]
+    additions = [
+        min(capacity, int(math.floor(raw))) for capacity, raw in zip(capacities, raw_additions)
+    ]
+    for index, addition in enumerate(additions):
+        limits[index] += addition
+    leftover = budget - sum(limits)
+    remainder_order = sorted(
+        range(len(batches)),
+        key=lambda index: (
+            raw_additions[index] - additions[index],
+            capacities[index] - additions[index],
+            -index,
+        ),
+        reverse=True,
+    )
+    while leftover:
+        allocated = False
+        for index in remainder_order:
+            if limits[index] >= caps[index]:
+                continue
+            limits[index] += 1
+            leftover -= 1
+            allocated = True
+            if not leftover:
+                break
+        if not allocated:
+            raise RuntimeError("could not allocate the consolidation beam budget")
+    return limits
+
+
+def _interleave_consolidation_batches(
+    batches: Sequence[Sequence[Mapping[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Round-robin shard outputs so the next prompts compare broader evidence."""
+
+    if not batches:
+        return []
+    output: list[dict[str, Any]] = []
+    for item_index in range(max(len(batch) for batch in batches)):
+        for batch in batches:
+            if item_index < len(batch):
+                output.append(dict(batch[item_index]))
+    return output
 
 
 def _load_stage2_splits(
@@ -1704,7 +1772,7 @@ class PlainHandoffStage2:
         outer_fold: int,
         candidates: Sequence[Mapping[str, Any]],
     ) -> Mapping[str, Any]:
-        """Losslessly map-reduce candidates when one prompt cannot hold them."""
+        """Progressively consolidate candidates that exceed one prompt."""
 
         original_ids = [str(candidate["candidate_id"]) for candidate in candidates]
         current = [
@@ -1774,12 +1842,31 @@ class PlainHandoffStage2:
                 }
 
             stage += 1
-            stage_limit = max(
-                1,
-                self.config.max_candidates_per_fold // max(1, len(batches)),
+            stage_budget = _progressive_consolidation_budget(
+                candidate_count=len(current),
+                batch_count=len(batches),
+                final_limit=self.config.max_candidates_per_fold,
+                oversample_factor=self.config.consolidation_oversample_factor,
+                round_index=stage,
             )
-            next_candidates: list[dict[str, Any]] = []
-            for batch_index, batch in enumerate(batches, start=1):
+            batch_limits = _allocate_consolidation_batch_limits(
+                batches,
+                total_budget=stage_budget,
+                max_per_batch=self.config.max_candidates_per_fold,
+            )
+            LOGGER.info(
+                "Stage 2 progressive consolidation round=%s candidates=%s "
+                "batches=%s beam_budget=%s allocated=%s per_batch_limit=%s..%s",
+                stage,
+                len(current),
+                len(batches),
+                stage_budget,
+                sum(batch_limits),
+                min(batch_limits),
+                max(batch_limits),
+            )
+            next_candidate_batches: list[list[dict[str, Any]]] = []
+            for batch_index, (batch, stage_limit) in enumerate(zip(batches, batch_limits), start=1):
                 partial = _request_json(
                     messages=_consolidation_prompt(
                         clinical_question=self.clinical_question,
@@ -1801,6 +1888,7 @@ class PlainHandoffStage2:
                     if disposition["status"] == "excluded":
                         for origin in by_id[candidate_id]["origin_candidate_ids"]:
                             terminal_exclusions[str(origin)] = disposition["reason"]
+                partial_candidates: list[dict[str, Any]] = []
                 for feature_index, feature in enumerate(partial["features"], start=1):
                     contributing = [
                         by_id[candidate_id]
@@ -1832,34 +1920,29 @@ class PlainHandoffStage2:
                             packet_evidence_axes[packet_key] = sorted(
                                 {
                                     *packet_evidence_axes.get(packet_key, []),
-                                    *(
-                                        inherited.get(packet_key)
-                                        or candidate["evidence_axes"]
-                                    ),
+                                    *(inherited.get(packet_key) or candidate["evidence_axes"]),
                                 }
                             )
-                    next_candidates.append(
+                    partial_candidates.append(
                         {
                             "candidate_id": (
                                 f"stage_{stage:02d}_batch_{batch_index:03d}_"
                                 f"feature_{feature_index:03d}"
                             ),
                             "architecture": "bounded_multi_architecture_consolidation",
-                            "supporting_architectures": list(
-                                feature["supporting_architectures"]
-                            ),
+                            "supporting_architectures": list(feature["supporting_architectures"]),
                             "name": feature["name"],
                             "description": feature["description"],
                             "value_type": feature["value_type"],
-                            "supporting_packet_ids": list(
-                                feature["supporting_packet_ids"]
-                            ),
+                            "supporting_packet_ids": list(feature["supporting_packet_ids"]),
                             "evidence_axes": evidence_axes,
                             "packet_evidence_axes": packet_evidence_axes,
                             "caveats": feature["caveats"],
                             "origin_candidate_ids": origins,
                         }
                     )
+                next_candidate_batches.append(partial_candidates)
+            next_candidates = _interleave_consolidation_batches(next_candidate_batches)
             if not next_candidates:
                 return {
                     "features": [],
@@ -1876,9 +1959,7 @@ class PlainHandoffStage2:
                     },
                 }
             if len(next_candidates) >= len(current) and stage > 8:
-                raise ValueError(
-                    "bounded Stage 2 consolidation did not reduce the candidate set"
-                )
+                raise ValueError("bounded Stage 2 consolidation did not reduce the candidate set")
             current = next_candidates
 
     def _run_outer_fold(
@@ -1901,9 +1982,7 @@ class PlainHandoffStage2:
         features_path = output_dir / "feature_definitions.json"
         final_features_path = output_dir / "final_definitions.json"
         completion = (
-            json.loads(complete_path.read_text(encoding="utf-8"))
-            if complete_path.is_file()
-            else {}
+            json.loads(complete_path.read_text(encoding="utf-8")) if complete_path.is_file() else {}
         )
         if (
             completion.get("phase") == "causal_estimation"
@@ -1924,9 +2003,7 @@ class PlainHandoffStage2:
                 ),
                 "review_rounds": int(final.get("review_rounds") or 0),
                 "estimation": json.loads(
-                    (output_dir / "estimation" / "diagnostics.json").read_text(
-                        encoding="utf-8"
-                    )
+                    (output_dir / "estimation" / "diagnostics.json").read_text(encoding="utf-8")
                 ),
             }
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -2115,11 +2192,7 @@ class PlainHandoffStage2:
     ) -> Mapping[str, Any]:
         handoff_path = Path(handoff_path)
         handoff_text = handoff_path.read_text(encoding="utf-8")
-        rows = [
-            json.loads(line)
-            for line in handoff_text.splitlines()
-            if line.strip()
-        ]
+        rows = [json.loads(line) for line in handoff_text.splitlines() if line.strip()]
         LOGGER.info(
             "loaded Stage 1 handoff rows=%s bytes=%s path=%s",
             len(rows),
@@ -2202,8 +2275,7 @@ class PlainHandoffStage2:
             "outer_folds": len(fold_results),
             "evidence_packets": len(packets),
             "features_by_fold": {
-                str(result["outer_fold"]): len(result["features"])
-                for result in fold_results
+                str(result["outer_fold"]): len(result["features"]) for result in fold_results
             },
             "feature_name_fold_counts": dict(sorted(name_counts.items())),
             "features_path": str(output_dir / "features_by_outer_fold.jsonl"),
@@ -2217,10 +2289,7 @@ class PlainHandoffStage2:
             for result in fold_results:
                 outer_fold = int(result["outer_fold"])
                 frame = pd.read_csv(
-                    output_dir
-                    / f"outer_{outer_fold:03d}"
-                    / "estimation"
-                    / "predictions.csv"
+                    output_dir / f"outer_{outer_fold:03d}" / "estimation" / "predictions.csv"
                 )
                 frame.insert(1, "outer_fold", outer_fold)
                 prediction_frames.append(frame)
@@ -2234,9 +2303,7 @@ class PlainHandoffStage2:
                 raise ValueError("a dataset row appears in more than one outer heldout fold")
             predictions = predictions.sort_values("_oci_row_id").reset_index(drop=True)
             predictions_path = output_dir / "cross_fitted_predictions.csv"
-            temporary = predictions_path.with_name(
-                f".{predictions_path.name}.{os.getpid()}.tmp"
-            )
+            temporary = predictions_path.with_name(f".{predictions_path.name}.{os.getpid()}.tmp")
             predictions.to_csv(temporary, index=False)
             os.replace(temporary, predictions_path)
             scores = predictions["aipw_score"].to_numpy(dtype=float)
@@ -2245,9 +2312,7 @@ class PlainHandoffStage2:
                 raise ValueError("cross-fitted Stage 2 estimation produced no finite AIPW scores")
             ate = float(np.mean(scores))
             standard_error = (
-                float(np.std(scores, ddof=1) / math.sqrt(len(scores)))
-                if len(scores) > 1
-                else None
+                float(np.std(scores, ddof=1) / math.sqrt(len(scores))) if len(scores) > 1 else None
             )
             causal_estimate = {
                 "estimator": "cross-fitted_aipw_with_fold_trained_nuisance_models",

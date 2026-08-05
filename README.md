@@ -563,6 +563,7 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "workers": 8,
     "request_timeout": 7200,
     "max_tokens": 25000,
+    "consolidation_oversample_factor": 4,
     "extraction_batch_size": 12,
     "max_review_rounds": 2,
     "estimation_trees": 200
@@ -580,7 +581,11 @@ endpoint advertises multiple IDs.
 
 Stage 2 preserves the outer-fold boundary throughout variable construction and
 estimation. It first interprets each evidence architecture and consolidates the
-result into operational patient-level definitions. It then extracts the
+result into operational patient-level definitions. Candidate collections that
+span multiple prompts use a progressive consolidation beam: the first pass
+retains an oversampled, proportionally allocated pool, outputs from different
+prompt shards are interleaved, and later passes reduce toward the final fold
+limit. It then extracts the
 variables on the outer training rows and measures missingness, variation,
 treatment prediction, outcome prediction, and residual-effect performance by
 inner validation. Leave-one-feature-out measurements show whether each variable

@@ -31,6 +31,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.request_timeout == 7_200.0
     assert config.transport_max_attempts == 3
     assert config.max_tokens == 25_000
+    assert config.consolidation_oversample_factor == 4
 
 
 def test_stage2_autodiscovers_the_only_served_model(monkeypatch):
@@ -154,10 +155,7 @@ def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
     ]
     assert set(result["packet_dispositions"]) == packet_ids
     assert result["packet_dispositions"]["packet-a"]["status"] == "supports_concept"
-    assert (
-        result["packet_dispositions"]["packet-b"]["status"]
-        == "reviewed_no_specific_concept"
-    )
+    assert result["packet_dispositions"]["packet-b"]["status"] == "reviewed_no_specific_concept"
 
 
 def test_interpretation_drops_only_concepts_without_grounded_packet_citations(caplog):
@@ -180,9 +178,7 @@ def test_interpretation_drops_only_concepts_without_grounded_packet_citations(ca
         packet_ids={"packet-a", "packet-b"},
     )
 
-    assert [concept["name"] for concept in result["concepts"]] == [
-        "performance_status"
-    ]
+    assert [concept["name"] for concept in result["concepts"]] == ["performance_status"]
     assert set(result["packet_dispositions"]) == {"packet-a", "packet-b"}
     assert "dropped ungrounded concept=invented_feature" in caplog.text
 
@@ -254,9 +250,7 @@ def test_openai_timeout_is_a_retryable_transport_error():
     import httpx
     from openai import APITimeoutError
 
-    error = APITimeoutError(
-        request=httpx.Request("POST", "http://stage2.test/v1/chat/completions")
-    )
+    error = APITimeoutError(request=httpx.Request("POST", "http://stage2.test/v1/chat/completions"))
 
     assert stage2_workflow._is_retryable_transport_error(error) is True
 
@@ -357,15 +351,9 @@ def test_consolidation_reconciles_feature_limit_and_stale_feature_names(caplog):
         max_candidates=1,
     )
 
-    assert [feature["name"] for feature in result["features"]] == [
-        "performance_status"
-    ]
-    assert result["candidate_dispositions"]["candidate_1"]["feature_name"] == (
-        "performance_status"
-    )
-    assert result["candidate_dispositions"]["candidate_2"]["feature_name"] == (
-        "performance_status"
-    )
+    assert [feature["name"] for feature in result["features"]] == ["performance_status"]
+    assert result["candidate_dispositions"]["candidate_1"]["feature_name"] == ("performance_status")
+    assert result["candidate_dispositions"]["candidate_2"]["feature_name"] == ("performance_status")
     assert "returned 2 features for limit=1" in caplog.text
     assert "ignored 1 unknown candidate disposition" in caplog.text
 
@@ -831,6 +819,83 @@ def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
     assert set(result["features"][0]["supporting_packet_ids"]) == {
         candidate["supporting_packet_ids"][0] for candidate in candidates
     }
+
+
+def test_stage2_progressive_consolidation_uses_oversampled_beam_across_28_batches():
+    batches = [
+        [
+            {"candidate_id": f"batch_{batch_index:02d}_{candidate_index:02d}"}
+            for candidate_index in range(10)
+        ]
+        for batch_index in range(28)
+    ]
+
+    first_budget = stage2_workflow._progressive_consolidation_budget(
+        candidate_count=280,
+        batch_count=28,
+        final_limit=50,
+        oversample_factor=4,
+        round_index=1,
+    )
+    first_limits = stage2_workflow._allocate_consolidation_batch_limits(
+        batches,
+        total_budget=first_budget,
+        max_per_batch=50,
+    )
+
+    assert first_budget == 200
+    assert sum(first_limits) == 200
+    assert min(first_limits) == 7
+    assert max(first_limits) == 8
+    assert 1 not in first_limits
+    uneven_limits = stage2_workflow._allocate_consolidation_batch_limits(
+        [
+            [{"candidate_id": f"large_{index}"} for index in range(20)],
+            [{"candidate_id": f"small_a_{index}"} for index in range(5)],
+            [{"candidate_id": f"small_b_{index}"} for index in range(5)],
+        ],
+        total_budget=15,
+        max_per_batch=50,
+    )
+    assert uneven_limits == [9, 3, 3]
+    assert (
+        stage2_workflow._progressive_consolidation_budget(
+            candidate_count=200,
+            batch_count=20,
+            final_limit=50,
+            oversample_factor=4,
+            round_index=2,
+        )
+        == 100
+    )
+    assert (
+        stage2_workflow._progressive_consolidation_budget(
+            candidate_count=100,
+            batch_count=10,
+            final_limit=50,
+            oversample_factor=4,
+            round_index=3,
+        )
+        == 50
+    )
+
+
+def test_stage2_interleaves_partial_consolidation_results_between_rounds():
+    interleaved = stage2_workflow._interleave_consolidation_batches(
+        [
+            [{"candidate_id": "a1"}, {"candidate_id": "a2"}],
+            [{"candidate_id": "b1"}, {"candidate_id": "b2"}],
+            [{"candidate_id": "c1"}],
+        ]
+    )
+
+    assert [candidate["candidate_id"] for candidate in interleaved] == [
+        "a1",
+        "b1",
+        "c1",
+        "a2",
+        "b2",
+    ]
 
 
 def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):

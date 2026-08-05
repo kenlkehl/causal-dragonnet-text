@@ -112,10 +112,15 @@ IDs, set `stage2.model` explicitly to avoid an ambiguous selection.
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
 `transport_retry_backoff`, `max_prompt_chars`,
-`max_candidates_per_fold`, `extraction_batch_size`, `max_review_rounds`,
-`estimation_trees`, `propensity_clip`, `min_nonmissing_fraction`,
-`max_dominant_fraction`, `temperature`, and `enable_thinking`. A configured
-endpoint makes the default mode `full`. The modes can always be made explicit:
+`max_candidates_per_fold`, `consolidation_oversample_factor`,
+`extraction_batch_size`, `max_review_rounds`, `estimation_trees`,
+`propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
+`temperature`, and `enable_thinking`. The consolidation oversample factor
+defaults to 4: oversized candidate collections retain up to four times the
+final fold feature limit during their first reduction pass, then progressively
+reduce after outputs from different prompt shards have been interleaved. A
+configured endpoint makes the default mode `full`. The modes can always be
+made explicit:
 
 ```bash
 # Run/resume Stage 1 and stop after the handoff.
