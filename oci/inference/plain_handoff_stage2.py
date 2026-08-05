@@ -40,6 +40,33 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 
 
+def _canonical_evidence_axes(value: Any) -> list[str]:
+    raw_axes = [value] if isinstance(value, str) else list(value or [])
+    aliases = {
+        "assignment": ("treatment",),
+        "confounder": ("treatment", "outcome"),
+        "effect": ("residual_effect",),
+        "effect_modifier": ("residual_effect",),
+        "heterogeneity": ("residual_effect",),
+        "interaction": ("residual_effect",),
+        "matched": ("matched_pair",),
+        "propensity": ("treatment",),
+        "prognostic": ("outcome",),
+        "r_loss": ("residual_effect",),
+        "unknown": ("unclear",),
+    }
+    canonical: set[str] = set()
+    for raw_axis in raw_axes:
+        tokens = re.split(r"[,;|/]", str(raw_axis))
+        for token in tokens:
+            normalized = re.sub(r"[^a-z0-9]+", "_", token.strip().lower()).strip("_")
+            if normalized in ALLOWED_EVIDENCE_AXES:
+                canonical.add(normalized)
+            else:
+                canonical.update(aliases.get(normalized, ()))
+    return sorted(canonical or {"unclear"})
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -69,7 +96,7 @@ class PlainHandoffStage2Config:
     model: str = ""
     api_key: str = "EMPTY"
     request_timeout: float = 1_800.0
-    max_tokens: int = 4_096
+    max_tokens: int = 25_000
     max_prompt_chars: int = 100_000
     max_candidates_per_fold: int = 50
     workers: int = 4
@@ -140,7 +167,7 @@ def plain_stage2_config_from_mapping(
         model=model,
         api_key=api_key,
         request_timeout=float(raw.get("request_timeout", 1_800.0)),
-        max_tokens=int(raw.get("max_tokens", 4_096)),
+        max_tokens=int(raw.get("max_tokens", 25_000)),
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
         max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
         workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
@@ -175,6 +202,8 @@ def _served_model_ids(config: PlainHandoffStage2Config) -> list[str]:
             "Stage 2 could not auto-discover a model from "
             f"{config.endpoint}/models: {type(exc).__name__}: {exc}"
         ) from exc
+    finally:
+        client.close()
     model_ids = {
         str(getattr(model, "id", "")).strip()
         for model in response.data
@@ -645,7 +674,10 @@ def _openai_completion(
         config.model,
         prompt_chars,
     )
-    response = client.chat.completions.create(**kwargs)
+    try:
+        response = client.chat.completions.create(**kwargs)
+    finally:
+        client.close()
     content = response.choices[0].message.content
     if not content:
         raise RuntimeError("Stage 2 model returned an empty response")
@@ -669,9 +701,11 @@ def _request_json(
     completion: CompletionFunction,
     validate: Callable[[Mapping[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
-    conversation = [dict(message) for message in messages]
+    base_conversation = [dict(message) for message in messages]
+    conversation = [dict(message) for message in base_conversation]
     first_error: Exception | None = None
-    for attempt in range(2):
+    max_attempts = 3
+    for attempt in range(max_attempts):
         prompt_chars = sum(
             len(str(message.get("content") or "")) for message in conversation
         )
@@ -683,11 +717,15 @@ def _request_json(
         try:
             return validate(_parse_json_object(completion(conversation, config)))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            if attempt:
-                raise ValueError(f"Stage 2 response remained invalid after one repair: {exc}") from exc
+            if attempt == max_attempts - 1:
+                raise ValueError(
+                    f"Stage 2 response remained invalid after {max_attempts - 1} repairs: {exc}"
+                ) from exc
             first_error = exc
             LOGGER.warning(
-                "Stage 2 response failed validation; retrying once (%s: %s)",
+                "Stage 2 response failed validation; repair attempt %s/%s (%s: %s)",
+                attempt + 1,
+                max_attempts - 1,
                 type(exc).__name__,
                 exc,
             )
@@ -698,7 +736,7 @@ def _request_json(
                     f"({type(exc).__name__}: {exc}). Return a corrected JSON object only."
                 ),
             }
-            repaired = [*conversation, repair_message]
+            repaired = [*base_conversation, repair_message]
             repaired_chars = sum(
                 len(str(message.get("content") or "")) for message in repaired
             )
@@ -712,7 +750,7 @@ def _request_json(
             system_index = next(
                 (
                     index
-                    for index, message in enumerate(conversation)
+                    for index, message in enumerate(base_conversation)
                     if str(message.get("role") or "") == "system"
                 ),
                 None,
@@ -722,8 +760,12 @@ def _request_json(
                     "Stage 2 repair prompt cannot fit max_prompt_chars and has no "
                     "system instruction available to replace"
                 ) from exc
+            conversation = [dict(message) for message in base_conversation]
             original_system = str(conversation[system_index].get("content") or "")
-            repair_directive = "Prior response invalid. Match the requested JSON schema exactly."
+            repair_directive = (
+                f"Repair {attempt + 1}: invalid {type(exc).__name__}. "
+                "Match requested JSON schema exactly."
+            )
             conversation[system_index]["content"] = repair_directive[: len(original_system)]
     raise RuntimeError(f"unreachable Stage 2 response state: {first_error}")
 
@@ -785,55 +827,80 @@ def _validate_interpretation(
     *,
     packet_ids: set[str],
 ) -> dict[str, Any]:
-    concepts = value.get("concepts")
-    dispositions = value.get("packet_dispositions")
-    if not isinstance(concepts, list) or not isinstance(dispositions, Mapping):
-        raise ValueError("interpretation requires concepts and packet_dispositions")
-    if set(map(str, dispositions)) != packet_ids:
-        raise ValueError("packet_dispositions must contain every and only supplied packet ID")
+    payload = value
+    if not isinstance(payload.get("concepts"), list):
+        for key in ("result", "response", "interpretation"):
+            nested = payload.get(key)
+            if isinstance(nested, Mapping):
+                payload = nested
+                break
+    concepts = next(
+        (
+            payload.get(key)
+            for key in ("concepts", "features", "variables", "candidates")
+            if isinstance(payload.get(key), list)
+        ),
+        None,
+    )
+    if not isinstance(concepts, list):
+        raise ValueError("interpretation requires a concepts list")
+    dispositions = payload.get("packet_dispositions")
+    if not isinstance(dispositions, Mapping):
+        dispositions = {}
     clean_concepts: list[dict[str, Any]] = []
     for concept in concepts:
         if not isinstance(concept, Mapping):
             raise ValueError("each interpreted concept must be an object")
-        required = {"name", "description", "value_type", "supporting_packet_ids", "evidence_axes", "caveats"}
-        missing = required - set(concept)
-        if missing:
-            raise ValueError(f"interpreted concept is missing {sorted(missing)}")
-        supports = [str(item) for item in concept["supporting_packet_ids"]]
-        axes = [str(item) for item in concept["evidence_axes"]]
-        if not supports or not set(supports) <= packet_ids:
+        name = str(concept.get("name") or concept.get("feature_name") or "").strip()
+        if not name:
+            raise ValueError("interpreted concept has no name")
+        raw_supports = concept.get("supporting_packet_ids") or concept.get("packet_ids") or []
+        supports = list(dict.fromkeys(str(item) for item in raw_supports if str(item) in packet_ids))
+        if not supports:
             raise ValueError("concept cites an unknown or empty packet set")
-        if not axes or not set(axes) <= ALLOWED_EVIDENCE_AXES:
-            raise ValueError("concept contains an unsupported evidence axis")
-        value_type = str(concept["value_type"])
+        axes = _canonical_evidence_axes(concept.get("evidence_axes") or concept.get("axes"))
+        value_type = str(concept.get("value_type") or "ambiguous").strip().lower()
+        value_type = {
+            "bool": "binary",
+            "boolean": "binary",
+            "category": "categorical",
+            "numeric": "continuous",
+            "number": "continuous",
+            "unknown": "ambiguous",
+        }.get(value_type, value_type)
         if value_type not in ALLOWED_VALUE_TYPES:
-            raise ValueError("concept contains an unsupported value_type")
+            value_type = "ambiguous"
         clean_concepts.append(
             {
-                "name": str(concept["name"]),
-                "description": str(concept["description"]),
+                "name": name,
+                "description": str(concept.get("description") or name),
                 "value_type": value_type,
                 "supporting_packet_ids": supports,
                 "evidence_axes": axes,
-                "caveats": str(concept["caveats"]),
+                "caveats": str(concept.get("caveats") or ""),
             }
         )
     clean_dispositions: dict[str, Any] = {}
-    concept_names = {concept["name"] for concept in clean_concepts}
     for packet_id in sorted(packet_ids):
-        disposition = dispositions[packet_id]
-        if not isinstance(disposition, Mapping):
-            raise ValueError("each packet disposition must be an object")
-        status = str(disposition.get("status"))
-        names = [str(item) for item in disposition.get("concept_names") or []]
-        if status not in {"supports_concept", "reviewed_no_specific_concept"}:
-            raise ValueError("packet disposition has an unsupported status")
-        if not set(names) <= concept_names:
-            raise ValueError("packet disposition names an unknown concept")
+        names = sorted(
+            concept["name"]
+            for concept in clean_concepts
+            if packet_id in concept["supporting_packet_ids"]
+        )
+        disposition = dispositions.get(packet_id)
+        reason = (
+            str(disposition.get("reason") or "")
+            if isinstance(disposition, Mapping)
+            else ""
+        )
         clean_dispositions[packet_id] = {
-            "status": status,
+            "status": "supports_concept" if names else "reviewed_no_specific_concept",
             "concept_names": names,
-            "reason": str(disposition.get("reason") or ""),
+            "reason": reason or (
+                "Derived from the concepts' packet citations."
+                if names
+                else "No returned concept cited this packet."
+            ),
         }
     return {"concepts": clean_concepts, "packet_dispositions": clean_dispositions}
 

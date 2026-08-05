@@ -28,6 +28,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config is not None
     assert config.endpoint == "http://stage2.test/v1"
     assert config.model == ""
+    assert config.max_tokens == 25_000
 
 
 def test_stage2_autodiscovers_the_only_served_model(monkeypatch):
@@ -116,7 +117,77 @@ def test_json_repair_retry_stays_within_full_initial_prompt_budget():
         sum(len(message["content"]) for message in conversation) <= 4_000
         for conversation in conversations
     )
-    assert conversations[1][0]["content"].startswith("Prior response invalid")
+    assert conversations[1][0]["content"].startswith("Repair 1: invalid ValueError")
+
+
+def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
+    packet_ids = {"packet-a", "packet-b"}
+    result = stage2_workflow._validate_interpretation(
+        {
+            "features": [
+                {
+                    "feature_name": "performance_status",
+                    "value_type": "numeric",
+                    "packet_ids": ["packet-a", "hallucinated-packet"],
+                    "axes": ["effect-modifier", "unsupported-axis"],
+                }
+            ],
+            "packet_dispositions": {
+                "packet-a": {"status": "kept", "reason": "Relevant evidence."},
+                "extra-packet": {"status": "supports_concept"},
+            },
+        },
+        packet_ids=packet_ids,
+    )
+
+    assert result["concepts"] == [
+        {
+            "name": "performance_status",
+            "description": "performance_status",
+            "value_type": "continuous",
+            "supporting_packet_ids": ["packet-a"],
+            "evidence_axes": ["residual_effect"],
+            "caveats": "",
+        }
+    ]
+    assert set(result["packet_dispositions"]) == packet_ids
+    assert result["packet_dispositions"]["packet-a"]["status"] == "supports_concept"
+    assert (
+        result["packet_dispositions"]["packet-b"]["status"]
+        == "reviewed_no_specific_concept"
+    )
+
+
+def test_openai_completion_closes_client(monkeypatch):
+    class FakeCompletions:
+        @staticmethod
+        def create(**_kwargs):
+            message = type("Message", (), {"content": '{"ok": true}'})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice]})()
+
+    class FakeClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    client = FakeClient()
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", lambda **_kwargs: client)
+    content = stage2_workflow._openai_completion(
+        [{"role": "user", "content": "Return JSON."}],
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+    )
+
+    assert content == '{"ok": true}'
+    assert client.closed is True
 
 
 def _fake_completion(calls):

@@ -95,7 +95,7 @@ effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
     "endpoint": "http://127.0.0.1:8000/v1",
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
-    "max_tokens": 4096,
+    "max_tokens": 25000,
     "extraction_batch_size": 12,
     "max_review_rounds": 2,
     "estimation_trees": 200
