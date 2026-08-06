@@ -112,7 +112,9 @@ def _extraction_prompt(
             "Use only the supplied pretreatment text for the patient in that row.",
             "Apply the measurement definition and missing-value rule literally.",
             "Do not infer a value from treatment received or from the outcome.",
-            "For a categorical or ordinal feature, return one declared category exactly.",
+            "For a binary, categorical, or ordinal feature, return one declared category exactly.",
+            "Do not substitute 0/1 or true/false for a declared category unless that "
+            "exact value is declared.",
             "For a continuous feature, return a JSON number in the declared unit.",
             "Return null when the record does not support a value.",
             "Return every row and every feature exactly once.",
@@ -159,6 +161,9 @@ def _page_reconciliation_prompt(
             "A null page does not override a supported value on another page.",
             "Resolve multiple supported values using document order and the specified temporal or aggregation rule.",
             "Do not invent evidence that is absent from all page results.",
+            "For a binary, categorical, or ordinal feature, return one declared category exactly.",
+            "Do not substitute 0/1 or true/false for a declared category unless that "
+            "exact value is declared.",
             "Return every feature exactly once for the original row_id.",
         ],
         "features": list(definitions),
@@ -223,7 +228,15 @@ def _validate_extraction(
             elif extracted is not None and value_type in {"binary", "categorical", "ordinal"}:
                 canonical = _canonical_category(extracted, declared) if declared else str(extracted)
                 if canonical is None:
-                    raise ValueError(f"feature {name!r} returned undeclared category {extracted!r}")
+                    allowed = json.dumps(
+                        declared,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    raise ValueError(
+                        f"feature {name!r} value {extracted!r} is invalid; "
+                        f"allowed values are {allowed} or null"
+                    )
                 extracted = canonical
             clean_values[name] = extracted
         by_row[row_id] = {"row_id": row_id, "values": clean_values}

@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 import oci.inference.plain_handoff_stage2 as stage2_workflow
+import oci.inference.plain_handoff_stage2_analysis as stage2_analysis
 
 from oci.inference.plain_handoff_stage2 import (
     PlainHandoffStage2,
@@ -94,11 +95,17 @@ def test_json_repair_retry_stays_within_full_initial_prompt_budget():
 
     def completion(messages, _config):
         conversations.append([dict(message) for message in messages])
-        return "{}" if len(conversations) == 1 else '{"ok": true}'
+        if len(conversations) == 1:
+            return "{}"
+        if len(conversations) == 2:
+            return '{"ok": false}'
+        return '{"ok": true}'
 
     def validate(value):
-        if value.get("ok") is not True:
+        if "ok" not in value:
             raise ValueError("missing required ok field")
+        if value["ok"] is not True:
+            raise ValueError("ok must be true")
         return dict(value)
 
     config = PlainHandoffStage2Config(
@@ -117,12 +124,94 @@ def test_json_repair_retry_stays_within_full_initial_prompt_budget():
     )
 
     assert result == {"ok": True}
-    assert len(conversations) == 2
+    assert len(conversations) == 3
     assert all(
         sum(len(message["content"]) for message in conversation) <= 4_000
         for conversation in conversations
     )
-    assert conversations[1][0]["content"].startswith("Repair 1: invalid ValueError")
+    assert "missing required ok field" in conversations[1][0]["content"]
+    assert "ok must be true" in conversations[2][0]["content"]
+
+
+def test_json_repair_losslessly_compacts_json_to_include_the_validation_error():
+    conversations = []
+    payload = {"items": [f"item-{index}" for index in range(500)]}
+    rendered = json.dumps(payload, sort_keys=True)
+
+    def completion(messages, _config):
+        conversations.append([dict(message) for message in messages])
+        return "{}" if len(conversations) == 1 else '{"ok": true}'
+
+    def validate(value):
+        if value.get("ok") is not True:
+            raise ValueError("missing required ok field")
+        return dict(value)
+
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        max_prompt_chars=len(rendered) + 100,
+    )
+    result = stage2_workflow._request_json(
+        messages=[
+            {"role": "system", "content": "S" * 100},
+            {"role": "user", "content": rendered},
+        ],
+        config=config,
+        completion=completion,
+        validate=validate,
+    )
+
+    assert result == {"ok": True}
+    assert len(conversations[1]) == 3
+    assert json.loads(conversations[1][1]["content"]) == payload
+    assert "missing required ok field" in conversations[1][2]["content"]
+    assert sum(len(message["content"]) for message in conversations[1]) <= (
+        config.max_prompt_chars
+    )
+
+
+def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_aliases():
+    definition = {
+        "name": "prior_immunotherapy_history",
+        "value_type": "binary",
+        "categories_or_unit": ["not documented", "documented"],
+    }
+    with pytest.raises(ValueError) as error:
+        stage2_analysis._validate_extraction(
+            {
+                "rows": [
+                    {
+                        "row_id": 7,
+                        "values": {"prior_immunotherapy_history": 1},
+                    }
+                ]
+            },
+            row_ids=[7],
+            definitions=[definition],
+        )
+
+    message = str(error.value)
+    assert "value 1 is invalid" in message
+    assert '["not documented","documented"] or null' in message
+
+    extraction = json.loads(
+        stage2_analysis._extraction_prompt(
+            clinical_question="Estimate treatment effect.",
+            definitions=[definition],
+            rows=[{"row_id": 7, "text": "Prior immunotherapy was documented."}],
+        )[1]["content"]
+    )
+    reconciliation = json.loads(
+        stage2_analysis._page_reconciliation_prompt(
+            clinical_question="Estimate treatment effect.",
+            definitions=[definition],
+            row_id=7,
+            page_results=[],
+        )[1]["content"]
+    )
+    assert any("Do not substitute 0/1" in rule for rule in extraction["rules"])
+    assert any("Do not substitute 0/1" in rule for rule in reconciliation["rules"])
 
 
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():

@@ -797,6 +797,58 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     return value
 
 
+def _compact_json_messages(
+    messages: Sequence[Mapping[str, str]],
+) -> list[dict[str, Any]]:
+    """Losslessly reclaim prompt space from JSON message bodies for repairs."""
+
+    compacted: list[dict[str, Any]] = []
+    for message in messages:
+        row = dict(message)
+        content = row.get("content")
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+                rendered = json.dumps(
+                    parsed,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            else:
+                if len(rendered) < len(content):
+                    row["content"] = rendered
+        compacted.append(row)
+    return compacted
+
+
+def _repair_message(exc: Exception) -> dict[str, str]:
+    return {
+        "role": "user",
+        "content": (
+            "The previous JSON failed validation. Correct this exact error: "
+            f"{type(exc).__name__}: {exc}. Return one corrected JSON object only."
+        ),
+    }
+
+
+def _bounded_repair_directive(exc: Exception, *, max_chars: int) -> str:
+    """Keep the validation failure visible even in a packed repair prompt."""
+
+    if max_chars < 16:
+        raise ValueError("Stage 2 repair prompt has no room for its validation error") from exc
+    message = f"Fix this validation error: {type(exc).__name__}: {exc}. JSON only."
+    if len(message) <= max_chars:
+        return message
+    detail = f"{type(exc).__name__}: {exc}"
+    if len(detail) <= max_chars:
+        return detail
+    return detail[: max_chars - 3].rstrip() + "..."
+
+
 def _request_json(
     *,
     messages: Sequence[Mapping[str, str]],
@@ -835,26 +887,32 @@ def _request_json(
                 type(exc).__name__,
                 exc,
             )
-            repair_message = {
-                "role": "user",
-                "content": (
-                    "The response did not satisfy the requested JSON shape "
-                    f"({type(exc).__name__}: {exc}). Return a corrected JSON object only."
-                ),
-            }
+            repair_message = _repair_message(exc)
             repaired = [*base_conversation, repair_message]
             repaired_chars = sum(len(str(message.get("content") or "")) for message in repaired)
             if repaired_chars <= int(config.max_prompt_chars):
                 conversation = repaired
                 continue
 
-            # A fully packed first attempt may leave no room for another turn.
-            # Preserve the complete user payload and replace the short system
-            # instruction with an equally short repair directive instead.
+            # A fully packed initial prompt may leave no room for another turn.
+            # Minify JSON bodies without changing their content, then retry with
+            # the same explicit validation error.
+            compact_base = _compact_json_messages(base_conversation)
+            compact_repaired = [*compact_base, repair_message]
+            compact_repaired_chars = sum(
+                len(str(message.get("content") or "")) for message in compact_repaired
+            )
+            if compact_repaired_chars <= int(config.max_prompt_chars):
+                conversation = compact_repaired
+                continue
+
+            # If lossless compaction is still insufficient, spend the system
+            # message's full character budget on the concrete validation error.
+            # The complete original user payload remains present.
             system_index = next(
                 (
                     index
-                    for index, message in enumerate(base_conversation)
+                    for index, message in enumerate(compact_base)
                     if str(message.get("role") or "") == "system"
                 ),
                 None,
@@ -864,13 +922,17 @@ def _request_json(
                     "Stage 2 repair prompt cannot fit max_prompt_chars and has no "
                     "system instruction available to replace"
                 ) from exc
-            conversation = [dict(message) for message in base_conversation]
-            original_system = str(conversation[system_index].get("content") or "")
-            repair_directive = (
-                f"Repair {attempt + 1}: invalid {type(exc).__name__}. "
-                "Match requested JSON schema exactly."
+            conversation = [dict(message) for message in compact_base]
+            non_system_chars = sum(
+                len(str(message.get("content") or ""))
+                for index, message in enumerate(conversation)
+                if index != system_index
             )
-            conversation[system_index]["content"] = repair_directive[: len(original_system)]
+            available = int(config.max_prompt_chars) - non_system_chars
+            conversation[system_index]["content"] = _bounded_repair_directive(
+                exc,
+                max_chars=available,
+            )
     raise RuntimeError(f"unreachable Stage 2 response state: {first_error}")
 
 
