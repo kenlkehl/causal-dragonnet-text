@@ -31,6 +31,8 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.request_timeout == 7_200.0
     assert config.transport_max_attempts == 3
     assert config.max_tokens == 25_000
+    assert config.evidence_compiler == "semantic_cluster_cards_v1"
+    assert config.evidence_max_cards_per_fold == 400
     assert config.consolidation_oversample_factor == 4
 
 
@@ -950,7 +952,9 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
         (output / "outer_001" / "feature_definitions.json").read_text(encoding="utf-8")
     )
     assert definitions["features"][0]["roles"] == ["confounder"]
-    assert len(calls) == 3  # two independent architectures, then consolidation
+    # The evidence compiler combines these two tiny generic rows into one
+    # structured-evidence batch, followed by consolidation.
+    assert len(calls) == 2
 
     second = run_plain_handoff_stage2(
         handoff_path=handoff,
@@ -961,7 +965,18 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
     )
 
     assert second["features_by_fold"] == {"1": 1}
-    assert len(calls) == 3
+    assert len(calls) == 2
+
+    rows[0]["evidence"]["terms"].append("newly compiled evidence")
+    handoff.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="different evidence plan"):
+        run_plain_handoff_stage2(
+            handoff_path=handoff,
+            output_dir=output,
+            clinical_question="Identify confounders.",
+            config=config,
+            completion=_fake_completion(calls),
+        )
 
 
 def test_plain_stage2_finishes_extraction_review_and_causal_estimation(tmp_path: Path):

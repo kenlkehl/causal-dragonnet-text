@@ -80,7 +80,10 @@ environment.
 ## Full, Stage-1-only, and Stage-2-only runs
 
 Stage 2 reads `handoff/evidence.jsonl` and completes the remainder of the
-analysis. Within each outer fold, it interprets architecture-specific evidence,
+analysis. It first uses the `all_evidence_fusion` scientific projections to
+compile exact-deduplicated, fold-local semantic evidence cards. It reuses the
+Stage 1 embedding cache by memory map where compatible and retains card/member/
+raw-path lineage for audit. Within each outer fold, it interprets the compiled evidence,
 defines patient-level variables, extracts those variables from the clinical
 text, and evaluates their usefulness on the outer training rows. A bounded
 model-assisted review may clarify a measurement definition and repeat the
@@ -97,6 +100,10 @@ effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
     "workers": 8,
     "request_timeout": 7200,
     "max_tokens": 25000,
+    "evidence_compiler": "semantic_cluster_cards_v1",
+    "evidence_max_cards_per_fold": 400,
+    "evidence_max_exemplars_per_card": 4,
+    "evidence_max_exemplar_chars": 2400,
     "extraction_batch_size": 12,
     "max_review_rounds": 2,
     "estimation_trees": 200
@@ -112,6 +119,8 @@ IDs, set `stage2.model` explicitly to avoid an ambiguous selection.
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
 `transport_retry_backoff`, `max_prompt_chars`,
+`evidence_compiler`, `evidence_max_cards_per_fold`,
+`evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
 `max_candidates_per_fold`, `consolidation_oversample_factor`,
 `extraction_batch_size`, `max_review_rounds`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
@@ -260,6 +269,14 @@ my_stage1_run/
     complete.json
   stage2/
     config.json
+    evidence_compilation/
+      packets.jsonl
+      summary.json
+      compile_complete.json
+      outer_001/
+        cards.jsonl
+        members.jsonl
+        lineage.jsonl
     outer_001/
       input_packets.jsonl
       interpretations/...
@@ -321,15 +338,21 @@ Completion has one intentionally simple rule:
 An interrupted component's partial files are left in place. There is no
 `--resume` flag. Rerun the same command. Stage 2 skips completed interpretation
 and extraction batches, completed review rounds, and completed fold estimates.
+The compiled packet plan is cached under `stage2/evidence_compilation/`; on a
+restart the runner hashes the handoff and normally loads this small cache rather
+than reparsing and reclustering the raw Stage 1 evidence. Interpretation batches
+are skipped only when their input fingerprint (cards plus clinical question)
+matches.
 It writes an outer-fold completion marker only after held-out estimation, and
 writes the final top-level marker only after the cross-fitted estimates have
 been assembled.
 
-A `stage2/complete.json` written by the earlier definition-only implementation
-does not suppress the new phases. The runner recognizes that it lacks the
-`causal_estimation` phase and continues from the saved fold definitions. Thus a
-completed pre-refactor handoff and any already completed interpretation batches
-remain usable; the original evidence does not need to be regenerated.
+Raw-packet interpretation checkpoints do not match semantic-card inputs and are
+therefore rerun automatically. If a prior run already produced
+`feature_definitions.json`, the runner fails closed instead of silently mixing
+those definitions with a new evidence plan; preserve that directory for audit
+and select a fresh Stage 2 output directory for the compiler sensitivity run.
+The Stage 1 handoff itself does not need to be regenerated.
 
 The review boundary is deliberately fold-honest. Extraction summaries and
 performance metrics in `review/round_NNN/` contain outer-training rows only.

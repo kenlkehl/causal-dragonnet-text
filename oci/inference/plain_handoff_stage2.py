@@ -10,6 +10,7 @@ request, content hashes, or checkpoint adoption.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 import math
@@ -25,6 +26,11 @@ from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
+
+from .plain_handoff_stage2_evidence import (
+    EVIDENCE_COMPILER_VERSION,
+    compile_stage2_handoff_evidence,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -90,6 +96,40 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
     os.replace(temporary, path)
 
 
+def _value_fingerprint(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, Mapping):
+                raise ValueError(f"{path} line {line_number} is not a JSON object")
+            yield dict(value)
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return list(_iter_jsonl(path))
+
+
 @dataclass(frozen=True)
 class PlainHandoffStage2Config:
     endpoint: str
@@ -100,6 +140,10 @@ class PlainHandoffStage2Config:
     transport_retry_backoff: float = 2.0
     max_tokens: int = 25_000
     max_prompt_chars: int = 100_000
+    evidence_compiler: str = EVIDENCE_COMPILER_VERSION
+    evidence_max_cards_per_fold: int = 400
+    evidence_max_exemplars_per_card: int = 4
+    evidence_max_exemplar_chars: int = 2_400
     max_candidates_per_fold: int = 50
     consolidation_oversample_factor: int = 4
     workers: int = 4
@@ -128,6 +172,16 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.max_tokens must be at least 256")
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
+        if self.evidence_compiler not in {EVIDENCE_COMPILER_VERSION, "raw_packets_v1"}:
+            raise ValueError(
+                "stage2.evidence_compiler must be semantic_cluster_cards_v1 or " "raw_packets_v1"
+            )
+        if self.evidence_max_cards_per_fold < 16:
+            raise ValueError("stage2.evidence_max_cards_per_fold must be at least 16")
+        if self.evidence_max_exemplars_per_card < 1:
+            raise ValueError("stage2.evidence_max_exemplars_per_card must be positive")
+        if self.evidence_max_exemplar_chars < 256:
+            raise ValueError("stage2.evidence_max_exemplar_chars must be at least 256")
         if self.max_candidates_per_fold < 1:
             raise ValueError("stage2.max_candidates_per_fold must be positive")
         if self.consolidation_oversample_factor < 1:
@@ -180,6 +234,10 @@ def plain_stage2_config_from_mapping(
         transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
         max_tokens=int(raw.get("max_tokens", 25_000)),
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
+        evidence_compiler=str(raw.get("evidence_compiler", EVIDENCE_COMPILER_VERSION)).strip(),
+        evidence_max_cards_per_fold=int(raw.get("evidence_max_cards_per_fold", 400)),
+        evidence_max_exemplars_per_card=int(raw.get("evidence_max_exemplars_per_card", 4)),
+        evidence_max_exemplar_chars=int(raw.get("evidence_max_exemplar_chars", 2_400)),
         max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
         consolidation_oversample_factor=int(raw.get("consolidation_oversample_factor", 4)),
         workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
@@ -1737,6 +1795,118 @@ class PlainHandoffStage2:
         self.clinical_question = str(clinical_question)
         self.completion = completion or _openai_completion
 
+    def _load_or_compile_evidence(
+        self,
+        *,
+        handoff_path: Path,
+        output_dir: Path,
+        seed: int,
+    ) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
+        """Load a valid compiled plan or build it once from the raw handoff."""
+
+        compilation_dir = output_dir / "evidence_compilation"
+        packets_path = compilation_dir / "packets.jsonl"
+        summary_path = compilation_dir / "summary.json"
+        complete_path = compilation_dir / "compile_complete.json"
+        max_packet_chars = max(2_000, self.config.max_prompt_chars // 4)
+        signature = {
+            "compiler": self.config.evidence_compiler,
+            "compiler_version": EVIDENCE_COMPILER_VERSION,
+            "max_cards_per_outer_fold": self.config.evidence_max_cards_per_fold,
+            "max_exemplars_per_card": self.config.evidence_max_exemplars_per_card,
+            "max_exemplar_chars": self.config.evidence_max_exemplar_chars,
+            "max_packet_chars": max_packet_chars,
+            "seed": int(seed),
+        }
+        signature_fingerprint = _value_fingerprint(signature)
+        handoff_size = handoff_path.stat().st_size
+        hash_started = time.monotonic()
+        handoff_sha256 = _file_sha256(handoff_path)
+        LOGGER.info(
+            "fingerprinted Stage 1 handoff bytes=%s seconds=%.2f path=%s",
+            handoff_size,
+            time.monotonic() - hash_started,
+            handoff_path,
+        )
+        if complete_path.is_file() and packets_path.is_file() and summary_path.is_file():
+            complete = json.loads(complete_path.read_text(encoding="utf-8"))
+            if (
+                complete.get("handoff_sha256") == handoff_sha256
+                and complete.get("compiler_signature_sha256") == signature_fingerprint
+            ):
+                packets = _read_jsonl(packets_path)
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                LOGGER.info(
+                    "loaded cached Stage 2 evidence compilation packets=%s path=%s",
+                    len(packets),
+                    compilation_dir,
+                )
+                return packets, summary
+
+        compile_started = time.monotonic()
+        if self.config.evidence_compiler == EVIDENCE_COMPILER_VERSION:
+            compiled = compile_stage2_handoff_evidence(
+                _iter_jsonl(handoff_path),
+                handoff_path=handoff_path,
+                max_cards_per_outer_fold=self.config.evidence_max_cards_per_fold,
+                max_exemplars_per_card=self.config.evidence_max_exemplars_per_card,
+                max_exemplar_chars=self.config.evidence_max_exemplar_chars,
+                max_packet_chars=max_packet_chars,
+                seed=seed,
+            )
+            packets = [dict(packet) for packet in compiled.packets]
+            summary = dict(compiled.summary)
+            for outer_fold, cards in compiled.cards_by_outer_fold.items():
+                fold_dir = compilation_dir / f"outer_{int(outer_fold):03d}"
+                _write_jsonl(fold_dir / "cards.jsonl", cards)
+                _write_jsonl(
+                    fold_dir / "members.jsonl",
+                    compiled.members_by_outer_fold[outer_fold],
+                )
+                _write_jsonl(
+                    fold_dir / "lineage.jsonl",
+                    compiled.lineage_by_outer_fold[outer_fold],
+                )
+        else:
+            rows = _read_jsonl(handoff_path)
+            packets = packetize_handoff(rows, max_packet_chars=max_packet_chars)
+            summary = {
+                "schema_version": "raw_packets_v1",
+                "rows": len(rows),
+                "packets": len(packets),
+                "max_packet_chars": max_packet_chars,
+            }
+        elapsed = time.monotonic() - compile_started
+        summary = {
+            **summary,
+            "handoff_path": str(handoff_path),
+            "handoff_bytes": handoff_size,
+            "handoff_sha256": handoff_sha256,
+            "compiler_signature": signature,
+            "compiler_signature_sha256": signature_fingerprint,
+            "compilation_seconds": elapsed,
+        }
+        _write_jsonl(packets_path, packets)
+        _write_json(summary_path, summary)
+        _write_json(
+            complete_path,
+            {
+                "status": "complete",
+                "completed_at": _now(),
+                "handoff_sha256": handoff_sha256,
+                "compiler_signature_sha256": signature_fingerprint,
+                "packets": len(packets),
+            },
+        )
+        LOGGER.info(
+            "compiled Stage 1 evidence compiler=%s packets=%s seconds=%.2f path=%s",
+            self.config.evidence_compiler,
+            len(packets),
+            elapsed,
+            compilation_dir,
+        )
+        return packets, summary
+
     def _interpret_batch(
         self,
         *,
@@ -1744,13 +1914,32 @@ class PlainHandoffStage2:
         packets: Sequence[Mapping[str, Any]],
         output_dir: Path,
     ) -> Mapping[str, Any]:
+        input_value = {
+            "architecture": architecture,
+            "clinical_question": self.clinical_question,
+            "packets": list(packets),
+        }
+        input_fingerprint = _value_fingerprint(input_value)
         complete_path = output_dir / "complete.json"
         result_path = output_dir / "result.json"
-        if complete_path.is_file():
-            LOGGER.info("skip completed Stage 2 interpretation: %s", output_dir)
-            return json.loads(result_path.read_text(encoding="utf-8"))
+        input_path = output_dir / "input.json"
+        if complete_path.is_file() and result_path.is_file() and input_path.is_file():
+            previous = json.loads(input_path.read_text(encoding="utf-8"))
+            previous_fingerprint = previous.get("input_fingerprint")
+            if previous_fingerprint is None:
+                previous_fingerprint = _value_fingerprint(
+                    {
+                        "architecture": previous.get("architecture"),
+                        "clinical_question": previous.get("clinical_question"),
+                        "packets": previous.get("packets") or [],
+                    }
+                )
+            if previous_fingerprint == input_fingerprint:
+                LOGGER.info("skip completed Stage 2 interpretation: %s", output_dir)
+                return json.loads(result_path.read_text(encoding="utf-8"))
+            LOGGER.info("rerun stale Stage 2 interpretation input: %s", output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        _write_json(output_dir / "input.json", {"architecture": architecture, "packets": packets})
+        _write_json(input_path, {**input_value, "input_fingerprint": input_fingerprint})
         packet_ids = {str(packet["packet_id"]) for packet in packets}
         result = _request_json(
             messages=_interpretation_prompt(
@@ -1763,7 +1952,14 @@ class PlainHandoffStage2:
             validate=lambda value: _validate_interpretation(value, packet_ids=packet_ids),
         )
         _write_json(result_path, result)
-        _write_json(complete_path, {"status": "complete", "completed_at": _now()})
+        _write_json(
+            complete_path,
+            {
+                "status": "complete",
+                "completed_at": _now(),
+                "input_fingerprint": input_fingerprint,
+            },
+        )
         return result
 
     def _consolidate_candidates(
@@ -1981,6 +2177,22 @@ class PlainHandoffStage2:
         complete_path = output_dir / "complete.json"
         features_path = output_dir / "feature_definitions.json"
         final_features_path = output_dir / "final_definitions.json"
+        definitions_complete_path = output_dir / "definitions_complete.json"
+        evidence_input_fingerprint = _value_fingerprint(
+            {
+                "outer_fold": int(outer_fold),
+                "compiler": self.config.evidence_compiler,
+                "clinical_question": self.clinical_question,
+                "max_candidates_per_fold": self.config.max_candidates_per_fold,
+                "consolidation_oversample_factor": (self.config.consolidation_oversample_factor),
+                "packets": list(packets),
+            }
+        )
+        definitions_state = (
+            json.loads(definitions_complete_path.read_text(encoding="utf-8"))
+            if definitions_complete_path.is_file()
+            else {}
+        )
         completion = (
             json.loads(complete_path.read_text(encoding="utf-8")) if complete_path.is_file() else {}
         )
@@ -1989,6 +2201,12 @@ class PlainHandoffStage2:
             and final_features_path.is_file()
             and (output_dir / "estimation" / "complete.json").is_file()
         ):
+            if definitions_state.get("evidence_input_fingerprint") != evidence_input_fingerprint:
+                raise RuntimeError(
+                    f"Stage 2 outer fold {outer_fold} was completed from a different "
+                    "evidence plan. Use a fresh Stage 2 output directory before rerunning "
+                    "with the new evidence compiler."
+                )
             LOGGER.info("skip completed Stage 2 outer fold=%s", outer_fold)
             final = json.loads(final_features_path.read_text(encoding="utf-8"))
             return {
@@ -2013,6 +2231,12 @@ class PlainHandoffStage2:
         for packet in packets:
             by_architecture[str(packet["architecture"])].append(packet)
         if features_path.is_file():
+            if definitions_state.get("evidence_input_fingerprint") != evidence_input_fingerprint:
+                raise RuntimeError(
+                    f"Stage 2 outer fold {outer_fold} has feature definitions from a "
+                    "different evidence plan. Preserve the old output for audit and run "
+                    "the new evidence compiler in a fresh Stage 2 output directory."
+                )
             final = json.loads(features_path.read_text(encoding="utf-8"))
         else:
             jobs: list[tuple[str, int, list[Mapping[str, Any]], Path]] = []
@@ -2108,10 +2332,11 @@ class PlainHandoffStage2:
                 }
             _write_json(features_path, final)
             _write_json(
-                output_dir / "definitions_complete.json",
+                definitions_complete_path,
                 {
                     "status": "complete",
                     "completed_at": _now(),
+                    "evidence_input_fingerprint": evidence_input_fingerprint,
                     "architectures": len(by_architecture),
                     "packets": len(packets),
                     "features": len(final["features"]),
@@ -2125,6 +2350,7 @@ class PlainHandoffStage2:
                     "status": "complete",
                     "phase": "feature_definitions",
                     "completed_at": _now(),
+                    "evidence_input_fingerprint": evidence_input_fingerprint,
                     "features": len(final["features"]),
                 },
             )
@@ -2168,6 +2394,7 @@ class PlainHandoffStage2:
                 "status": "complete",
                 "phase": "causal_estimation",
                 "completed_at": _now(),
+                "evidence_input_fingerprint": evidence_input_fingerprint,
                 "features": len(completed["features"]),
                 "review_rounds": completed["review_rounds"],
                 "estimation": completed["estimation"],
@@ -2191,27 +2418,14 @@ class PlainHandoffStage2:
         seed: int = 42,
     ) -> Mapping[str, Any]:
         handoff_path = Path(handoff_path)
-        handoff_text = handoff_path.read_text(encoding="utf-8")
-        rows = [json.loads(line) for line in handoff_text.splitlines() if line.strip()]
-        LOGGER.info(
-            "loaded Stage 1 handoff rows=%s bytes=%s path=%s",
-            len(rows),
-            handoff_path.stat().st_size,
-            handoff_path,
-        )
-        packetize_started = time.monotonic()
-        packets = packetize_handoff(
-            rows,
-            max_packet_chars=max(2_000, self.config.max_prompt_chars // 4),
-        )
-        LOGGER.info(
-            "packetized Stage 1 evidence packets=%s seconds=%.2f",
-            len(packets),
-            time.monotonic() - packetize_started,
-        )
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_json(output_dir / "config.json", self.config.public_dict())
+        packets, compilation_summary = self._load_or_compile_evidence(
+            handoff_path=handoff_path,
+            output_dir=output_dir,
+            seed=seed,
+        )
 
         packets_by_outer: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
         for packet in packets:
@@ -2274,6 +2488,9 @@ class PlainHandoffStage2:
         summary = {
             "outer_folds": len(fold_results),
             "evidence_packets": len(packets),
+            "evidence_compiler": self.config.evidence_compiler,
+            "evidence_compilation_path": str(output_dir / "evidence_compilation"),
+            "evidence_compilation": compilation_summary,
             "features_by_fold": {
                 str(result["outer_fold"]): len(result["features"]) for result in fold_results
             },

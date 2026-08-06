@@ -12,8 +12,18 @@ $OUT/handoff/evidence.jsonl
   - TF-IDF topics and n-grams
   - neural queries
             |
-            | retain scientific content,
-            | infer evidence axes, packetize
+            | all_evidence_fusion allowlisting
+            | + exact fold-local deduplication
+            | + cached-embedding / lexical clustering
+            v
+$OUT/stage2/evidence_compilation/
+  packets.jsonl                 compact prompt cards
+  outer_NNN/cards.jsonl         readable card inventory
+  outer_NNN/members.jsonl       exact members -> Stage 1 paths
+  outer_NNN/lineage.jsonl       card -> exact member IDs
+  summary.json                  reduction audit
+            |
+            | prompt-size batching
             v
 +---------------------- ONE OUTER FOLD --------------------------+
 |                                                               |
@@ -74,7 +84,7 @@ summary.json
 
 | Stage | Main inputs | Main outputs |
 |---|---|---|
-| Packetization | Stage 1 handoff rows containing `source`, fold/scope metadata, and scientific evidence | Packets containing a stable ID, architecture, outer/inner fold, evidence axes, JSON source path, and content |
+| Evidence compilation | Stage 1 handoff rows plus the existing memory-mapped Stage 1 chunk-embedding cache, when available | Fold-local semantic cards, exact-member and raw-path lineage manifests, a reduction audit, and bounded prompt packets |
 | Interpretation | One architecture-specific packet batch plus the clinical question | Candidate clinical concepts, packet dispositions, and citations to supplied packet IDs |
 | Candidate assembly | Concepts from all interpretation batches | `interpreted_candidates.json`; evidence axes are recomputed from citations and mapped to possible causal roles |
 | Consolidation | Candidates from all Stage 1 architectures | Deduplicated operational definitions in `feature_definitions.json` |
@@ -95,6 +105,44 @@ Potential causal roles are derived from the evidence supporting each feature:
 - Outcome evidence supports a prognostic role.
 - Residual-effect or matched-pair evidence supports a potential effect-modifier
   role.
+
+## Evidence compilation before LLM interpretation
+
+The default compiler is `semantic_cluster_cards_v1`. It reconnects the plain
+Stage 2 route to the audited scientific projections in `all_evidence_fusion`:
+large TF-IDF score arrays and operational diagnostics do not enter the prompt,
+while topic terms, orphan n-grams, sparse terms, retrieved clinical text, HTR
+attention evidence, and neural-query evidence do.
+
+Reduction happens independently inside each outer fold:
+
+1. Normalize the concept-bearing content and remove exact duplicates while
+   unioning source families, evidence axes, polarity, full/inner-fold support,
+   and raw JSON paths.
+2. Stratify exact members by evidence kind, axes, polarity, and semantic-vector
+   availability. This prevents a treatment-only term from being clustered into
+   an unrelated residual-effect group merely because their wording overlaps.
+3. Reuse the Stage 1 chunk embeddings by memory map for compatible retrieved
+   chunks. Other evidence uses deterministic character n-gram projections; no
+   second embedding model is loaded beside vLLM.
+4. Cluster within each stratum and produce conservative cards containing
+   representative text, support/stability counts, source families, axes, and
+   score ranges. The complete raw evidence remains in Stage 1, and the manifests
+   preserve the route from every card back to every raw occurrence.
+
+The default ceiling is `evidence_max_cards_per_fold=400`, with up to four
+representatives per card. This is deliberately an oversampled evidence atlas,
+not the later variable limit. The LLM may recover many concepts from each card,
+and `max_candidates_per_fold` is applied only after interpretation during
+cross-card consolidation. If a sensitivity analysis is warranted, raise the
+card ceiling rather than reverting to raw packetization. `raw_packets_v1`
+remains available as an explicit comparator via `stage2.evidence_compiler`.
+
+Compilation is cached under `stage2/evidence_compilation`. A restart hashes the
+Stage 1 handoff, loads the compact packet cache when its compiler signature
+matches, and avoids reparsing and reclustering the raw evidence. Interpretation
+checkpoints also carry an input fingerprint: completed batches are reused only
+when their exact card inputs and clinical question match.
 
 ## Progressive consolidation
 

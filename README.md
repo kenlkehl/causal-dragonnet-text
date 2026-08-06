@@ -563,6 +563,10 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "workers": 8,
     "request_timeout": 7200,
     "max_tokens": 25000,
+    "evidence_compiler": "semantic_cluster_cards_v1",
+    "evidence_max_cards_per_fold": 400,
+    "evidence_max_exemplars_per_card": 4,
+    "evidence_max_exemplar_chars": 2400,
     "consolidation_oversample_factor": 4,
     "extraction_batch_size": 12,
     "max_review_rounds": 2,
@@ -580,8 +584,18 @@ exactly one model ID is returned. Configure `stage2.model` explicitly when the
 endpoint advertises multiple IDs.
 
 Stage 2 preserves the outer-fold boundary throughout variable construction and
-estimation. It first interprets each evidence architecture and consolidates the
-result into operational patient-level definitions. Candidate collections that
+estimation. Before the first LLM request, its default evidence compiler reuses
+the scientific allowlisting in `all_evidence_fusion`, removes exact duplicates
+with provenance retained, and builds a conservative fold-local semantic-card
+atlas. Compatible clinical chunks reuse the existing Stage 1 embedding cache by
+memory map; other evidence uses deterministic lexical projections, so this step
+does not load another embedding model beside the serving process. The raw Stage
+1 evidence remains unchanged, while cards, exact members, lineage, and a
+reduction audit are written under `stage2/evidence_compilation/`. The compiled
+packet plan is cached and input-fingerprinted for fast, safe restarts.
+
+Stage 2 then interprets the compiled evidence architectures and consolidates
+the result into operational patient-level definitions. Candidate collections that
 span multiple prompts use a progressive consolidation beam: the first pass
 retains an oversampled, proportionally allocated pool, outputs from different
 prompt shards are interleaved, and later passes reduce toward the final fold

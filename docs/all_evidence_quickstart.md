@@ -42,6 +42,8 @@ effect estimates. The common controls are:
     "endpoint": "http://127.0.0.1:8000/v1",
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
+    "evidence_compiler": "semantic_cluster_cards_v1",
+    "evidence_max_cards_per_fold": 400,
     "extraction_batch_size": 12,
     "max_review_rounds": 2,
     "estimation_trees": 200
@@ -50,6 +52,8 @@ effect estimates. The common controls are:
 ```
 
 Interpretation and extraction requests are concurrent up to `stage2.workers`.
+Before interpretation, Stage 2 compiles the raw handoff into fold-local,
+provenance-preserving semantic cards under `stage2/evidence_compilation/`.
 Each completed request is saved beneath the relevant outer-fold directory, so
 the same command resumes after interruption without repeating it.
 
