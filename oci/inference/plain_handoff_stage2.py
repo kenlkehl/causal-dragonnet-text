@@ -44,6 +44,7 @@ ALLOWED_EVIDENCE_AXES = {
     "unclear",
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
+MAX_RESPONSE_REPAIRS = 5
 
 
 def _canonical_evidence_axes(value: Any) -> list[str]:
@@ -859,7 +860,7 @@ def _request_json(
     base_conversation = [dict(message) for message in messages]
     conversation = [dict(message) for message in base_conversation]
     first_error: Exception | None = None
-    max_attempts = 3
+    max_attempts = 1 + MAX_RESPONSE_REPAIRS
     for attempt in range(max_attempts):
         prompt_chars = sum(len(str(message.get("content") or "")) for message in conversation)
         if prompt_chars > int(config.max_prompt_chars):

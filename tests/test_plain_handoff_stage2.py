@@ -95,17 +95,17 @@ def test_json_repair_retry_stays_within_full_initial_prompt_budget():
 
     def completion(messages, _config):
         conversations.append([dict(message) for message in messages])
-        if len(conversations) == 1:
-            return "{}"
-        if len(conversations) == 2:
-            return '{"ok": false}'
-        return '{"ok": true}'
+        response_attempt = len(conversations)
+        return json.dumps(
+            {
+                "ok": response_attempt == 6,
+                "response_attempt": response_attempt,
+            }
+        )
 
     def validate(value):
-        if "ok" not in value:
-            raise ValueError("missing required ok field")
         if value["ok"] is not True:
-            raise ValueError("ok must be true")
+            raise ValueError(f"response attempt {value['response_attempt']} rejected")
         return dict(value)
 
     config = PlainHandoffStage2Config(
@@ -123,14 +123,44 @@ def test_json_repair_retry_stays_within_full_initial_prompt_budget():
         validate=validate,
     )
 
-    assert result == {"ok": True}
-    assert len(conversations) == 3
+    assert result == {"ok": True, "response_attempt": 6}
+    assert len(conversations) == 6
     assert all(
         sum(len(message["content"]) for message in conversation) <= 4_000
         for conversation in conversations
     )
-    assert "missing required ok field" in conversations[1][0]["content"]
-    assert "ok must be true" in conversations[2][0]["content"]
+    for repair_attempt in range(1, 6):
+        assert (
+            f"response attempt {repair_attempt} rejected"
+            in conversations[repair_attempt][0]["content"]
+        )
+
+
+def test_json_repair_stops_after_five_repairs():
+    calls = []
+
+    def completion(messages, _config):
+        calls.append([dict(message) for message in messages])
+        return "{}"
+
+    def reject(_value):
+        raise ValueError("missing ok=true")
+
+    with pytest.raises(ValueError, match="remained invalid after 5 repairs"):
+        stage2_workflow._request_json(
+            messages=[
+                {"role": "system", "content": "Return JSON only."},
+                {"role": "user", "content": "Return an object containing ok=true."},
+            ],
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="test-model",
+            ),
+            completion=completion,
+            validate=reject,
+        )
+
+    assert len(calls) == 6
 
 
 def test_json_repair_losslessly_compacts_json_to_include_the_validation_error():
@@ -210,6 +240,14 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
             page_results=[],
         )[1]["content"]
     )
+    assert extraction["features"][0]["categories_or_unit"] == [
+        "not documented",
+        "documented",
+    ]
+    assert reconciliation["features"][0]["categories_or_unit"] == [
+        "not documented",
+        "documented",
+    ]
     assert any("Do not substitute 0/1" in rule for rule in extraction["rules"])
     assert any("Do not substitute 0/1" in rule for rule in reconciliation["rules"])
 
