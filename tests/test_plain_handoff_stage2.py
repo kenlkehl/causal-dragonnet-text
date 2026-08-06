@@ -208,6 +208,101 @@ def test_interpretation_recovers_citation_from_packet_disposition():
     assert result["concepts"][0]["supporting_packet_ids"] == ["packet-a"]
 
 
+def test_interpretation_does_not_pair_new_input_with_an_old_complete_result(
+    tmp_path: Path,
+):
+    packet = {
+        "packet_id": "outer_001_card_current",
+        "architecture": "semantic_clustered_clinical_text",
+        "outer_fold": 1,
+        "observable_axes": ["outcome"],
+        "content": {"representative_evidence": [{"text": "ECOG 2"}]},
+    }
+    calls = []
+
+    def completion(_messages, _config):
+        calls.append("called")
+        return json.dumps(
+            {
+                "concepts": [
+                    {
+                        "name": "performance_status",
+                        "description": "Pretreatment ECOG performance status.",
+                        "value_type": "ordinal",
+                        "supporting_packet_ids": [packet["packet_id"]],
+                        "evidence_axes": ["outcome"],
+                        "caveats": "",
+                    }
+                ],
+                "packet_dispositions": {
+                    packet["packet_id"]: {
+                        "status": "supports_concept",
+                        "concept_names": ["performance_status"],
+                        "reason": "Explicit ECOG evidence.",
+                    }
+                },
+            }
+        )
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+        clinical_question="Identify confounders.",
+        completion=completion,
+    )
+    output_dir = tmp_path / "batch_001"
+    output_dir.mkdir()
+    input_value = {
+        "architecture": packet["architecture"],
+        "clinical_question": "Identify confounders.",
+        "packets": [packet],
+    }
+    (output_dir / "input.json").write_text(
+        json.dumps(
+            {
+                **input_value,
+                "input_fingerprint": stage2_workflow._value_fingerprint(input_value),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "concepts": [
+                    {
+                        "name": "stale_concept",
+                        "supporting_packet_ids": ["outer_001_row_0002_section_02_part_001"],
+                    }
+                ],
+                "packet_dispositions": {
+                    "outer_001_row_0002_section_02_part_001": {"status": "supports_concept"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    # This marker belongs to the old result. A prior interrupted rerun had
+    # already replaced input.json but had not produced a new result/marker.
+    (output_dir / "complete.json").write_text(
+        json.dumps({"status": "complete"}),
+        encoding="utf-8",
+    )
+
+    result = runner._interpret_batch(
+        architecture=packet["architecture"],
+        packets=[packet],
+        output_dir=output_dir,
+    )
+
+    assert calls == ["called"]
+    assert result["concepts"][0]["supporting_packet_ids"] == [packet["packet_id"]]
+    completion_state = json.loads((output_dir / "complete.json").read_text(encoding="utf-8"))
+    assert completion_state["input_fingerprint"] == stage2_workflow._value_fingerprint(input_value)
+
+
 def test_stage2_retries_retryable_transport_errors_without_using_repair_turns(
     monkeypatch,
 ):

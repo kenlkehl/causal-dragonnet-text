@@ -1039,6 +1039,32 @@ def _validate_interpretation(
     return {"concepts": clean_concepts, "packet_dispositions": clean_dispositions}
 
 
+def _cached_interpretation_matches_packets(
+    value: Any,
+    *,
+    packet_ids: set[str],
+) -> bool:
+    """Return whether a normalized checkpoint cites exactly its current inputs."""
+
+    if not isinstance(value, Mapping):
+        return False
+    concepts = value.get("concepts")
+    dispositions = value.get("packet_dispositions")
+    if not isinstance(concepts, list) or not isinstance(dispositions, Mapping):
+        return False
+    if {str(packet_id) for packet_id in dispositions} != packet_ids:
+        return False
+    for concept in concepts:
+        if not isinstance(concept, Mapping):
+            return False
+        supports = concept.get("supporting_packet_ids")
+        if not isinstance(supports, list) or not supports:
+            return False
+        if not {str(packet_id) for packet_id in supports} <= packet_ids:
+            return False
+    return True
+
+
 def _partition_interpretation_packets(
     packets: Sequence[Mapping[str, Any]],
     *,
@@ -1920,11 +1946,13 @@ class PlainHandoffStage2:
             "packets": list(packets),
         }
         input_fingerprint = _value_fingerprint(input_value)
+        packet_ids = {str(packet["packet_id"]) for packet in packets}
         complete_path = output_dir / "complete.json"
         result_path = output_dir / "result.json"
         input_path = output_dir / "input.json"
         if complete_path.is_file() and result_path.is_file() and input_path.is_file():
             previous = json.loads(input_path.read_text(encoding="utf-8"))
+            completion_state = json.loads(complete_path.read_text(encoding="utf-8"))
             previous_fingerprint = previous.get("input_fingerprint")
             if previous_fingerprint is None:
                 previous_fingerprint = _value_fingerprint(
@@ -1934,13 +1962,23 @@ class PlainHandoffStage2:
                         "packets": previous.get("packets") or [],
                     }
                 )
-            if previous_fingerprint == input_fingerprint:
-                LOGGER.info("skip completed Stage 2 interpretation: %s", output_dir)
-                return json.loads(result_path.read_text(encoding="utf-8"))
-            LOGGER.info("rerun stale Stage 2 interpretation input: %s", output_dir)
+            if (
+                previous_fingerprint == input_fingerprint
+                and completion_state.get("input_fingerprint") == input_fingerprint
+            ):
+                try:
+                    cached_result = json.loads(result_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    cached_result = None
+                if _cached_interpretation_matches_packets(
+                    cached_result,
+                    packet_ids=packet_ids,
+                ):
+                    LOGGER.info("skip completed Stage 2 interpretation: %s", output_dir)
+                    return cached_result
+            LOGGER.info("rerun stale or inconsistent Stage 2 interpretation: %s", output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_json(input_path, {**input_value, "input_fingerprint": input_fingerprint})
-        packet_ids = {str(packet["packet_id"]) for packet in packets}
         result = _request_json(
             messages=_interpretation_prompt(
                 clinical_question=self.clinical_question,
@@ -2289,6 +2327,12 @@ class PlainHandoffStage2:
                     supporting_packet_ids = [
                         str(packet_id) for packet_id in concept["supporting_packet_ids"]
                     ]
+                    unknown_packet_ids = sorted(set(supporting_packet_ids) - set(packet_by_id))
+                    if unknown_packet_ids:
+                        raise RuntimeError(
+                            "Stage 2 interpretation checkpoint cites packets outside "
+                            f"the current evidence plan: {unknown_packet_ids[:8]}"
+                        )
                     evidence_axes = sorted(
                         {
                             str(axis)
