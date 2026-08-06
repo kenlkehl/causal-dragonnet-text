@@ -252,6 +252,149 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
     assert any("Do not substitute 0/1" in rule for rule in reconciliation["rules"])
 
 
+def test_extraction_uses_note_free_category_ontology_after_five_failed_repairs(
+    tmp_path: Path,
+):
+    note = "PRIVATE_NOTE_SENTINEL: prior immunotherapy was documented."
+    dataset = pd.DataFrame({"clinical_text": [note]})
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "prior_immunotherapy_history",
+        "description": "Whether prior immunotherapy was documented.",
+        "value_type": "binary",
+        "categories_or_unit": ["not documented", "documented"],
+        "measurement_definition": "Extract documented pretreatment immunotherapy history.",
+        "missing_value_rule": "Return null when the history is unavailable.",
+    }
+    jobs = []
+    ontology_body = None
+
+    def completion(messages, _config):
+        nonlocal ontology_body
+        body = json.loads(messages[1]["content"])
+        jobs.append(body["job"])
+        if body["job"] == "extract_stage2_patient_variables":
+            return json.dumps(
+                {
+                    "rows": [
+                        {
+                            "row_id": 0,
+                            "values": {"prior_immunotherapy_history": 1},
+                        }
+                    ]
+                }
+            )
+        assert body["job"] == "map_extracted_values_to_declared_category_ontology"
+        ontology_body = body
+        assert note not in json.dumps(messages)
+        item = body["items"][0]
+        return json.dumps(
+            {
+                "corrections": [
+                    {
+                        "mapping_id": item["mapping_id"],
+                        "value": "documented",
+                    }
+                ]
+            }
+        )
+
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+    )
+    frame = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        clinical_question="Estimate treatment effect.",
+        output_dir=tmp_path / "extraction",
+        request_json=lambda messages, validate: stage2_workflow._request_json(
+            messages=messages,
+            config=config,
+            completion=completion,
+            validate=validate,
+        ),
+        workers=1,
+        batch_size=1,
+        max_prompt_chars=config.max_prompt_chars,
+    )
+
+    assert jobs == ["extract_stage2_patient_variables"] * 6 + [
+        "map_extracted_values_to_declared_category_ontology"
+    ]
+    assert ontology_body is not None
+    assert ontology_body["items"][0]["prior_extracted_value"] == 1
+    assert ontology_body["items"][0]["allowed_categories"] == [
+        "not documented",
+        "documented",
+    ]
+    assert frame.loc[0, "prior_immunotherapy_history"] == "documented"
+    audit = json.loads(
+        (
+            tmp_path
+            / "extraction"
+            / "batches"
+            / "batch_00001"
+            / "category_ontology_repair.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert audit["resolution"] == "llm_category_ontology"
+    assert audit["corrections"][0]["value"] == "documented"
+
+
+def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame({"clinical_text": ["Prior immunotherapy was documented."]})
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "prior_immunotherapy_history",
+        "value_type": "binary",
+        "categories_or_unit": ["not documented", "documented"],
+    }
+
+    def request_json(messages, validate):
+        body = json.loads(messages[1]["content"])
+        if body["job"] == "extract_stage2_patient_variables":
+            return validate(
+                {
+                    "rows": [
+                        {
+                            "row_id": 0,
+                            "values": {"prior_immunotherapy_history": 1},
+                        }
+                    ]
+                }
+            )
+        raise ValueError("category ontology response remained invalid")
+
+    output = tmp_path / "extraction"
+    frame = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        clinical_question="Estimate treatment effect.",
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        batch_size=1,
+        max_prompt_chars=10_000,
+    )
+
+    assert pd.isna(frame.loc[0, "prior_immunotherapy_history"])
+    audit = json.loads(
+        (
+            output / "batches" / "batch_00001" / "category_ontology_repair.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert audit["resolution"] == "conservative_null"
+    assert "category ontology response remained invalid" in audit["ontology_validation_error"]
+    assert audit["corrections"][0]["value"] is None
+
+
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
     packet_ids = {"packet-a", "packet-b"}
     result = stage2_workflow._validate_interpretation(

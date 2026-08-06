@@ -9,7 +9,9 @@ the first unfinished operation.
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import json
+import logging
 import math
 import os
 import re
@@ -20,6 +22,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+
+LOGGER = logging.getLogger(__name__)
 
 RequestJSON = Callable[
     [Sequence[Mapping[str, str]], Callable[[Mapping[str, Any]], dict[str, Any]]],
@@ -97,6 +101,273 @@ def _canonical_category(value: Any, declared: Sequence[str]) -> str | None:
         if len(numeric_matches) == 1:
             return numeric_matches[0]
     return None
+
+
+class _ExtractionCategoryError(ValueError):
+    """Closed-vocabulary extraction failures with enough state for safe recovery."""
+
+    def __init__(
+        self,
+        *,
+        issues: Sequence[Mapping[str, Any]],
+        response: Mapping[str, Any],
+    ) -> None:
+        self.issues = tuple(dict(issue) for issue in issues)
+        self.response = copy.deepcopy(dict(response))
+        first = self.issues[0]
+        allowed = json.dumps(
+            first["allowed_categories"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        suffix = (
+            f"; {len(self.issues) - 1} additional invalid categorical value(s)"
+            if len(self.issues) > 1
+            else ""
+        )
+        super().__init__(
+            f"feature {first['feature_name']!r} value "
+            f"{first['prior_extracted_value']!r} is invalid; allowed values are "
+            f"{allowed} or null{suffix}"
+        )
+
+
+def _category_error_from_exception(exc: BaseException) -> _ExtractionCategoryError | None:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, _ExtractionCategoryError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _category_ontology_plan(
+    error: _ExtractionCategoryError,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Deduplicate equal invalid values while preserving their response targets."""
+
+    item_by_key: dict[str, dict[str, Any]] = {}
+    targets_by_key: dict[str, list[dict[str, Any]]] = {}
+    for issue in error.issues:
+        key = json.dumps(
+            {
+                "feature_name": issue["feature_name"],
+                "prior_extracted_value": issue["prior_extracted_value"],
+                "allowed_categories": issue["allowed_categories"],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if key not in item_by_key:
+            definition = issue["definition"]
+            item_by_key[key] = {
+                "mapping_id": "",
+                "feature_name": str(issue["feature_name"]),
+                "value_type": str(definition.get("value_type") or "categorical"),
+                "description": str(definition.get("description") or ""),
+                "measurement_definition": str(
+                    definition.get("measurement_definition") or ""
+                ),
+                "missing_value_rule": str(definition.get("missing_value_rule") or ""),
+                "allowed_categories": list(issue["allowed_categories"]),
+                "prior_extracted_value": issue["prior_extracted_value"],
+                "occurrence_count": 0,
+            }
+            targets_by_key[key] = []
+        item_by_key[key]["occurrence_count"] += 1
+        targets_by_key[key].append(
+            {
+                "row_id": int(issue["row_id"]),
+                "feature_name": str(issue["feature_name"]),
+            }
+        )
+
+    items: list[dict[str, Any]] = []
+    targets: dict[str, list[dict[str, Any]]] = {}
+    for index, key in enumerate(sorted(item_by_key), start=1):
+        mapping_id = f"category_mapping_{index:04d}"
+        item = dict(item_by_key[key])
+        item["mapping_id"] = mapping_id
+        items.append(item)
+        targets[mapping_id] = list(targets_by_key[key])
+    return items, targets
+
+
+def _category_ontology_prompt(items: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Ask the configured Stage 2 LLM to normalize values without patient text."""
+
+    body = {
+        "job": "map_extracted_values_to_declared_category_ontology",
+        "rules": [
+            "Use only the feature definition, allowed categories, and prior extracted value.",
+            "Do not perform clinical extraction and do not infer any new patient information.",
+            "Map by semantic equivalence to exactly one allowed category.",
+            "Return null when the prior value does not map unambiguously.",
+            "Return every mapping_id exactly once and no additional mapping IDs.",
+        ],
+        "items": [dict(item) for item in items],
+        "response": {
+            "corrections": [
+                {
+                    "mapping_id": "one supplied mapping_id",
+                    "value": "one exact allowed category or null",
+                }
+            ]
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You normalize previously extracted categorical values to a closed ontology. "
+                "Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+    ]
+
+
+def _validate_category_ontology(
+    value: Mapping[str, Any],
+    *,
+    items: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    raw_corrections = value.get("corrections")
+    if not isinstance(raw_corrections, list):
+        raise ValueError("category ontology response requires a corrections array")
+    item_by_id = {str(item["mapping_id"]): item for item in items}
+    corrections: dict[str, Any] = {}
+    for raw in raw_corrections:
+        if not isinstance(raw, Mapping):
+            raise ValueError("each category ontology correction must be an object")
+        mapping_id = str(raw.get("mapping_id") or "")
+        if mapping_id not in item_by_id or mapping_id in corrections:
+            raise ValueError("category ontology returned an unknown or duplicate mapping_id")
+        if "value" not in raw:
+            raise ValueError(f"category mapping {mapping_id!r} omitted its value")
+        extracted = _clean_scalar(raw.get("value"))
+        declared = list(item_by_id[mapping_id]["allowed_categories"])
+        if extracted is None:
+            corrections[mapping_id] = None
+            continue
+        if _is_missing_scalar(extracted) and _canonical_category(extracted, declared) is None:
+            corrections[mapping_id] = None
+            continue
+        canonical = _canonical_category(extracted, declared)
+        if canonical is None:
+            allowed = json.dumps(declared, ensure_ascii=False, separators=(",", ":"))
+            raise ValueError(
+                f"category mapping {mapping_id!r} returned {extracted!r}; "
+                f"allowed values are {allowed} or null"
+            )
+        corrections[mapping_id] = canonical
+    if set(corrections) != set(item_by_id):
+        raise ValueError("category ontology response omitted one or more mapping IDs")
+    return {
+        "corrections": [
+            {"mapping_id": mapping_id, "value": corrections[mapping_id]}
+            for mapping_id in item_by_id
+        ]
+    }
+
+
+def _apply_category_corrections(
+    response: Mapping[str, Any],
+    *,
+    corrections: Mapping[str, Any],
+    targets: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    patched = copy.deepcopy(dict(response))
+    rows_by_id = {int(row["row_id"]): row for row in patched["rows"]}
+    values_by_mapping = {
+        str(row["mapping_id"]): row.get("value") for row in corrections["corrections"]
+    }
+    for mapping_id, mapping_targets in targets.items():
+        for target in mapping_targets:
+            rows_by_id[int(target["row_id"])]["values"][str(target["feature_name"])] = (
+                values_by_mapping[mapping_id]
+            )
+    return patched
+
+
+def _request_validated_extraction(
+    *,
+    messages: Sequence[Mapping[str, str]],
+    row_ids: Sequence[int],
+    definitions: Sequence[Mapping[str, Any]],
+    request_json: RequestJSON,
+    ontology_audit_path: Path,
+) -> dict[str, Any]:
+    """Extract rows, then recover closed-category failures without resending notes."""
+
+    try:
+        return request_json(
+            messages,
+            lambda value: _validate_extraction(
+                value,
+                row_ids=row_ids,
+                definitions=definitions,
+            ),
+        )
+    except ValueError as exc:
+        category_error = _category_error_from_exception(exc)
+        if category_error is None:
+            raise
+
+    items, targets = _category_ontology_plan(category_error)
+    LOGGER.warning(
+        "Stage 2 extraction exhausted ordinary repairs for %s invalid categorical "
+        "value(s); requesting note-free ontology mapping",
+        len(category_error.issues),
+    )
+    ontology_error: str | None = None
+    try:
+        corrections = request_json(
+            _category_ontology_prompt(items),
+            lambda value: _validate_category_ontology(value, items=items),
+        )
+        resolution = "llm_category_ontology"
+    except ValueError as exc:
+        ontology_error = f"{type(exc).__name__}: {exc}"
+        resolution = "conservative_null"
+        corrections = {
+            "corrections": [
+                {"mapping_id": str(item["mapping_id"]), "value": None} for item in items
+            ]
+        }
+        LOGGER.warning(
+            "Stage 2 category ontology mapping remained invalid; replacing %s "
+            "unmappable categorical value(s) with null (%s)",
+            len(category_error.issues),
+            ontology_error,
+        )
+
+    patched = _apply_category_corrections(
+        category_error.response,
+        corrections=corrections,
+        targets=targets,
+    )
+    validated = _validate_extraction(
+        patched,
+        row_ids=row_ids,
+        definitions=definitions,
+    )
+    _write_json(
+        ontology_audit_path,
+        {
+            "schema_version": "stage2_category_ontology_repair_v1",
+            "resolution": resolution,
+            "original_validation_error": str(category_error),
+            "ontology_validation_error": ontology_error,
+            "items": items,
+            "targets": targets,
+            "corrections": corrections["corrections"],
+        },
+    )
+    return validated
 
 
 def _extraction_prompt(
@@ -204,6 +475,7 @@ def _validate_extraction(
     expected_features = set(feature_names)
     by_row: dict[int, dict[str, Any]] = {}
     definitions_by_name = {str(feature["name"]): feature for feature in definitions}
+    category_issues: list[dict[str, Any]] = []
     for raw in rows:
         if not isinstance(raw, Mapping):
             raise ValueError("each extraction row must be an object")
@@ -228,20 +500,23 @@ def _validate_extraction(
             elif extracted is not None and value_type in {"binary", "categorical", "ordinal"}:
                 canonical = _canonical_category(extracted, declared) if declared else str(extracted)
                 if canonical is None:
-                    allowed = json.dumps(
-                        declared,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
+                    category_issues.append(
+                        {
+                            "row_id": row_id,
+                            "feature_name": name,
+                            "prior_extracted_value": extracted,
+                            "allowed_categories": list(declared),
+                            "definition": dict(definition),
+                        }
                     )
-                    raise ValueError(
-                        f"feature {name!r} value {extracted!r} is invalid; "
-                        f"allowed values are {allowed} or null"
-                    )
-                extracted = canonical
+                else:
+                    extracted = canonical
             clean_values[name] = extracted
         by_row[row_id] = {"row_id": row_id, "values": clean_values}
     if set(by_row) != expected_rows:
         raise ValueError("extraction response omitted one or more supplied rows")
+    if category_issues:
+        raise _ExtractionCategoryError(issues=category_issues, response=value)
     return {"rows": [by_row[int(row_id)] for row_id in row_ids]}
 
 
@@ -434,17 +709,17 @@ def extract_rows(
             return list(json.loads(result_path.read_text(encoding="utf-8"))["rows"])
         batch_dir.mkdir(parents=True, exist_ok=True)
         _write_json(batch_dir / "row_ids.json", [int(row["row_id"]) for row in batch])
-        result = request_json(
-            (messages := _extraction_prompt(
-                clinical_question=clinical_question,
-                definitions=definitions,
-                rows=batch,
-            )),
-            lambda value: _validate_extraction(
-                value,
-                row_ids=[int(row["row_id"]) for row in batch],
-                definitions=definitions,
-            ),
+        messages = _extraction_prompt(
+            clinical_question=clinical_question,
+            definitions=definitions,
+            rows=batch,
+        )
+        result = _request_validated_extraction(
+            messages=messages,
+            row_ids=[int(row["row_id"]) for row in batch],
+            definitions=definitions,
+            request_json=request_json,
+            ontology_audit_path=batch_dir / "category_ontology_repair.json",
         )
         if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
             raise RuntimeError("Stage 2 extraction planner emitted an oversized batch")
@@ -474,13 +749,12 @@ def extract_rows(
         )
         if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
             raise RuntimeError("Stage 2 extraction planner emitted an oversized page")
-        result = request_json(
-            messages,
-            lambda value: _validate_extraction(
-                value,
-                row_ids=[row_id],
-                definitions=definitions,
-            ),
+        result = _request_validated_extraction(
+            messages=messages,
+            row_ids=[row_id],
+            definitions=definitions,
+            request_json=request_json,
+            ontology_audit_path=page_dir / "category_ontology_repair.json",
         )
         _write_json(result_path, result)
         _write_json(
@@ -539,13 +813,12 @@ def extract_rows(
                 "Stage 2 complete-note page reconciliation exceeds max_prompt_chars; "
                 "increase the prompt budget or reduce the feature set"
             )
-        result = request_json(
-            messages,
-            lambda value: _validate_extraction(
-                value,
-                row_ids=[row_id],
-                definitions=definitions,
-            ),
+        result = _request_validated_extraction(
+            messages=messages,
+            row_ids=[row_id],
+            definitions=definitions,
+            request_json=request_json,
+            ontology_audit_path=reconciliation_dir / "category_ontology_repair.json",
         )
         reconciliation_dir.mkdir(parents=True, exist_ok=True)
         _write_json(reconciliation_dir / "page_manifest.json", page_results)
