@@ -1387,15 +1387,15 @@ def _validate_consolidation(
         }.get(value_type, value_type)
         if value_type not in ALLOWED_VALUE_TYPES:
             value_type = "ambiguous"
-        if value_type in {"binary", "categorical", "ordinal"} and len(categories) == 1:
-            # Models sometimes serialize an enumerated category list as one
-            # comma-separated string.  Store the actual categories so later
-            # extraction has an unambiguous closed vocabulary.
-            separated = [
-                part.strip() for part in re.split(r"\s*[,;|]\s*", categories[0]) if part.strip()
-            ]
-            if len(separated) > 1:
-                categories = separated
+        if value_type in {"binary", "categorical", "ordinal"}:
+            # Models sometimes serialize an enumeration as one delimited string
+            # or an ordinal ontology as an integer range such as ``0-4``.
+            from .plain_handoff_stage2_analysis import _normalized_category_values
+
+            categories = _normalized_category_values(
+                value_type=value_type,
+                values=categories,
+            )
         if value_type in {"binary", "categorical", "ordinal"} and not categories:
             value_type = "ambiguous"
 

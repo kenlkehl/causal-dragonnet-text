@@ -69,16 +69,147 @@ def _is_missing_scalar(value: Any) -> bool:
     return key in {"", "unknown", "notdocumented", "missing", "nan", "na", "null", "none"}
 
 
-def _declared_categories(definition: Mapping[str, Any]) -> list[str]:
-    values = [str(item).strip() for item in definition.get("categories_or_unit") or []]
-    if (
-        str(definition.get("value_type")) in {"binary", "categorical", "ordinal"}
-        and len(values) == 1
-    ):
-        separated = [part.strip() for part in re.split(r"\s*[,;|]\s*", values[0]) if part.strip()]
+def _normalized_category_values(*, value_type: Any, values: Sequence[Any]) -> list[str]:
+    normalized_type = str(value_type or "ambiguous").strip().lower()
+    normalized = [str(item).strip() for item in values if str(item).strip()]
+    if normalized_type in {"binary", "categorical", "ordinal"} and len(normalized) == 1:
+        separated = [
+            part.strip() for part in re.split(r"\s*[,;|]\s*", normalized[0]) if part.strip()
+        ]
         if len(separated) > 1:
-            return separated
-    return values
+            normalized = separated
+
+    expand_integer_ranges = normalized_type in {"binary", "ordinal"} or (
+        normalized_type == "categorical" and len(normalized) == 1
+    )
+    if expand_integer_ranges:
+        expanded: list[str] = []
+        for value in normalized:
+            match = re.fullmatch(
+                r"([+-]?\d+)\s*(?:-|–|—|to)\s*([+-]?\d+)",
+                value,
+                flags=re.IGNORECASE,
+            )
+            if match is None:
+                expanded.append(value)
+                continue
+            start, stop = (int(token) for token in match.groups())
+            if stop < start or stop - start > 100:
+                expanded.append(value)
+                continue
+            expanded.extend(str(category) for category in range(start, stop + 1))
+        normalized = expanded
+    return list(dict.fromkeys(normalized))
+
+
+def _declared_categories(definition: Mapping[str, Any]) -> list[str]:
+    return _normalized_category_values(
+        value_type=definition.get("value_type"),
+        values=definition.get("categories_or_unit") or [],
+    )
+
+
+def _prompt_feature_definitions(
+    definitions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for definition in definitions:
+        row = dict(definition)
+        if str(row.get("value_type")) in {"binary", "categorical", "ordinal"}:
+            row["categories_or_unit"] = _declared_categories(row)
+        output.append(row)
+    return output
+
+
+def _stale_category_ontology_audit(path: Path) -> dict[str, Any] | None:
+    """Return an audit whose old closed ontology now expands more precisely."""
+
+    if not path.is_file():
+        return None
+    try:
+        audit = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(audit, Mapping):
+        return None
+    for item in audit.get("items") or []:
+        if not isinstance(item, Mapping):
+            continue
+        previous = [str(value) for value in item.get("allowed_categories") or []]
+        current = _normalized_category_values(
+            value_type=item.get("value_type"),
+            values=previous,
+        )
+        if current != previous:
+            return dict(audit)
+    return None
+
+
+def _supersede_stale_category_ontology_audit(
+    path: Path,
+    *,
+    previous: Mapping[str, Any] | None,
+) -> None:
+    if previous is None or _stale_category_ontology_audit(path) is None:
+        return
+    _write_json(
+        path,
+        {
+            "schema_version": "stage2_category_ontology_repair_v1",
+            "resolution": "superseded_by_expanded_category_ontology",
+            "superseded_at": _now(),
+            "previous_audit": dict(previous),
+        },
+    )
+
+
+def _feature_name_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+
+
+def _aligned_extraction_values(
+    values: Mapping[Any, Any],
+    *,
+    feature_names: Sequence[str],
+    row_id: int,
+) -> dict[str, Any]:
+    """Recover harmless key drift and conservatively fill omitted features."""
+
+    raw = {str(key): value for key, value in values.items()}
+    expected = set(feature_names)
+    aligned = {name: raw[name] for name in feature_names if name in raw}
+    used = set(aligned)
+    aliases: dict[str, str] = {}
+    missing: list[str] = []
+    for name in feature_names:
+        if name in aligned:
+            continue
+        candidates = [
+            candidate
+            for candidate in raw
+            if candidate not in used and _feature_name_key(candidate) == _feature_name_key(name)
+        ]
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            aligned[name] = raw[candidate]
+            used.add(candidate)
+            aliases[candidate] = name
+        else:
+            aligned[name] = None
+            missing.append(name)
+    extra = sorted(set(raw) - used)
+    if aliases or missing or extra:
+        LOGGER.warning(
+            "Stage 2 extraction normalized feature keys row_id=%s aliases=%s "
+            "missing_as_null=%s extras_dropped=%s",
+            row_id,
+            aliases,
+            missing,
+            extra,
+        )
+    if set(aligned) != expected:  # pragma: no cover - defensive invariant
+        raise RuntimeError("Stage 2 feature-key normalization changed the expected schema")
+    return aligned
 
 
 def _canonical_category(value: Any, declared: Sequence[str]) -> str | None:
@@ -390,7 +521,7 @@ def _extraction_prompt(
             "Return null when the record does not support a value.",
             "Return every row and every feature exactly once.",
         ],
-        "features": list(definitions),
+        "features": _prompt_feature_definitions(definitions),
         "patients": list(rows),
         "response": {
             "rows": [
@@ -437,7 +568,7 @@ def _page_reconciliation_prompt(
             "exact value is declared.",
             "Return every feature exactly once for the original row_id.",
         ],
-        "features": list(definitions),
+        "features": _prompt_feature_definitions(definitions),
         "row_id": int(row_id),
         "page_results": list(page_results),
         "response": {
@@ -472,7 +603,6 @@ def _validate_extraction(
         raise ValueError("extraction response requires a rows array")
     expected_rows = {int(row_id) for row_id in row_ids}
     feature_names = [str(feature["name"]) for feature in definitions]
-    expected_features = set(feature_names)
     by_row: dict[int, dict[str, Any]] = {}
     definitions_by_name = {str(feature["name"]): feature for feature in definitions}
     category_issues: list[dict[str, Any]] = []
@@ -483,11 +613,16 @@ def _validate_extraction(
         if row_id not in expected_rows or row_id in by_row:
             raise ValueError("extraction returned an unknown or duplicate row_id")
         values = raw.get("values")
-        if not isinstance(values, Mapping) or set(map(str, values)) != expected_features:
-            raise ValueError("each extraction row must contain every and only defined feature")
+        if not isinstance(values, Mapping):
+            raise ValueError("each extraction row requires a values object")
+        aligned_values = _aligned_extraction_values(
+            values,
+            feature_names=feature_names,
+            row_id=row_id,
+        )
         clean_values: dict[str, Any] = {}
         for name in feature_names:
-            extracted = _clean_scalar(values[name])
+            extracted = _clean_scalar(aligned_values[name])
             definition = definitions_by_name[name]
             value_type = str(definition.get("value_type") or "ambiguous")
             declared = _declared_categories(definition)
@@ -705,8 +840,12 @@ def extract_rows(
         batch_dir = output_dir / "batches" / f"batch_{index:05d}"
         result_path = batch_dir / "result.json"
         complete_path = batch_dir / "complete.json"
-        if complete_path.is_file() and result_path.is_file():
+        ontology_audit_path = batch_dir / "category_ontology_repair.json"
+        stale_audit = _stale_category_ontology_audit(ontology_audit_path)
+        if complete_path.is_file() and result_path.is_file() and stale_audit is None:
             return list(json.loads(result_path.read_text(encoding="utf-8"))["rows"])
+        if stale_audit is not None:
+            LOGGER.info("retry stale Stage 2 category ontology batch: %s", batch_dir)
         batch_dir.mkdir(parents=True, exist_ok=True)
         _write_json(batch_dir / "row_ids.json", [int(row["row_id"]) for row in batch])
         messages = _extraction_prompt(
@@ -719,11 +858,15 @@ def extract_rows(
             row_ids=[int(row["row_id"]) for row in batch],
             definitions=definitions,
             request_json=request_json,
-            ontology_audit_path=batch_dir / "category_ontology_repair.json",
+            ontology_audit_path=ontology_audit_path,
         )
         if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
             raise RuntimeError("Stage 2 extraction planner emitted an oversized batch")
         _write_json(result_path, result)
+        _supersede_stale_category_ontology_audit(
+            ontology_audit_path,
+            previous=stale_audit,
+        )
         _write_json(
             complete_path,
             {"status": "complete", "completed_at": _now(), "rows": len(batch)},
@@ -737,9 +880,13 @@ def extract_rows(
         page_dir = output_dir / "pages" / f"row_{row_id:08d}" / f"page_{page_index:05d}"
         result_path = page_dir / "result.json"
         complete_path = page_dir / "complete.json"
-        if complete_path.is_file() and result_path.is_file():
+        ontology_audit_path = page_dir / "category_ontology_repair.json"
+        stale_audit = _stale_category_ontology_audit(ontology_audit_path)
+        if complete_path.is_file() and result_path.is_file() and stale_audit is None:
             stored = json.loads(result_path.read_text(encoding="utf-8"))
             return page_meta, dict(stored["rows"][0])
+        if stale_audit is not None:
+            LOGGER.info("retry stale Stage 2 category ontology page: %s", page_dir)
         page_dir.mkdir(parents=True, exist_ok=True)
         _write_json(page_dir / "page.json", page_meta)
         messages = _extraction_prompt(
@@ -754,9 +901,13 @@ def extract_rows(
             row_ids=[row_id],
             definitions=definitions,
             request_json=request_json,
-            ontology_audit_path=page_dir / "category_ontology_repair.json",
+            ontology_audit_path=ontology_audit_path,
         )
         _write_json(result_path, result)
+        _supersede_stale_category_ontology_audit(
+            ontology_audit_path,
+            previous=stale_audit,
+        )
         _write_json(
             complete_path,
             {"status": "complete", "completed_at": _now(), **page_meta},
@@ -796,8 +947,15 @@ def extract_rows(
         reconciliation_dir = output_dir / "pages" / f"row_{row_id:08d}" / "reconciliation"
         result_path = reconciliation_dir / "result.json"
         complete_path = reconciliation_dir / "complete.json"
-        if complete_path.is_file() and result_path.is_file():
+        ontology_audit_path = reconciliation_dir / "category_ontology_repair.json"
+        stale_audit = _stale_category_ontology_audit(ontology_audit_path)
+        if complete_path.is_file() and result_path.is_file() and stale_audit is None:
             return dict(json.loads(result_path.read_text(encoding="utf-8"))["rows"][0]["values"])
+        if stale_audit is not None:
+            LOGGER.info(
+                "retry stale Stage 2 category ontology reconciliation: %s",
+                reconciliation_dir,
+            )
         ordered = sorted(page_values, key=lambda item: int(item[0]["page_index"]))
         page_results = [
             {**dict(meta), "values": dict(result["values"])} for meta, result in ordered
@@ -818,11 +976,15 @@ def extract_rows(
             row_ids=[row_id],
             definitions=definitions,
             request_json=request_json,
-            ontology_audit_path=reconciliation_dir / "category_ontology_repair.json",
+            ontology_audit_path=ontology_audit_path,
         )
         reconciliation_dir.mkdir(parents=True, exist_ok=True)
         _write_json(reconciliation_dir / "page_manifest.json", page_results)
         _write_json(result_path, result)
+        _supersede_stale_category_ontology_audit(
+            ontology_audit_path,
+            previous=stale_audit,
+        )
         _write_json(
             complete_path,
             {

@@ -252,6 +252,170 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
     assert any("Do not substitute 0/1" in rule for rule in reconciliation["rules"])
 
 
+def test_ordinal_integer_range_is_expanded_in_prompt_and_validation():
+    definition = {
+        "name": "performance_status",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0-4"],
+    }
+    prompt = json.loads(
+        stage2_analysis._extraction_prompt(
+            clinical_question="Estimate treatment effect.",
+            definitions=[definition],
+            rows=[{"row_id": 3, "text": "Pretreatment ECOG performance status was 2."}],
+        )[1]["content"]
+    )
+    validated = stage2_analysis._validate_extraction(
+        {
+            "rows": [
+                {
+                    "row_id": 3,
+                    "values": {"performance_status": 2},
+                }
+            ]
+        },
+        row_ids=[3],
+        definitions=[definition],
+    )
+
+    assert prompt["features"][0]["categories_or_unit"] == ["0", "1", "2", "3", "4"]
+    assert validated["rows"][0]["values"]["performance_status"] == "2"
+    assert stage2_analysis._normalized_category_values(
+        value_type="categorical",
+        values=["0-4"],
+    ) == ["0", "1", "2", "3", "4"]
+    assert stage2_analysis._normalized_category_values(
+        value_type="categorical",
+        values=["0-4", "5-9"],
+    ) == ["0-4", "5-9"]
+
+
+def test_extraction_recovers_feature_key_drift_and_defaults_missing_values_to_null(caplog):
+    definitions = [
+        {
+            "name": "prior_immunotherapy_history",
+            "value_type": "binary",
+            "categories_or_unit": ["not documented", "documented"],
+        },
+        {
+            "name": "performance_status",
+            "value_type": "ordinal",
+            "categories_or_unit": ["0-4"],
+        },
+    ]
+    validated = stage2_analysis._validate_extraction(
+        {
+            "rows": [
+                {
+                    "row_id": 9,
+                    "values": {
+                        "Prior Immunotherapy History": "documented",
+                        "invented_feature": "ignore me",
+                    },
+                }
+            ]
+        },
+        row_ids=[9],
+        definitions=definitions,
+    )
+
+    assert validated == {
+        "rows": [
+            {
+                "row_id": 9,
+                "values": {
+                    "prior_immunotherapy_history": "documented",
+                    "performance_status": None,
+                },
+            }
+        ]
+    }
+    assert "missing_as_null=['performance_status']" in caplog.text
+    assert "extras_dropped=['invented_feature']" in caplog.text
+
+
+def test_resume_retries_only_checkpoints_with_stale_range_ontology_repairs(tmp_path: Path):
+    output = tmp_path / "extraction"
+    batch = output / "batches" / "batch_00001"
+    batch.mkdir(parents=True)
+    (batch / "result.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {"performance_status": None},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (batch / "complete.json").write_text(
+        json.dumps({"status": "complete", "rows": 1}),
+        encoding="utf-8",
+    )
+    (batch / "category_ontology_repair.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage2_category_ontology_repair_v1",
+                "resolution": "conservative_null",
+                "items": [
+                    {
+                        "mapping_id": "category_mapping_0001",
+                        "feature_name": "performance_status",
+                        "value_type": "ordinal",
+                        "allowed_categories": ["0-4"],
+                        "prior_extracted_value": 2,
+                    }
+                ],
+                "corrections": [
+                    {"mapping_id": "category_mapping_0001", "value": None}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    definition = {
+        "name": "performance_status",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0-4"],
+    }
+    calls = []
+
+    def request_json(messages, validate):
+        calls.append(json.loads(messages[1]["content"])["job"])
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {"performance_status": 2},
+                    }
+                ]
+            }
+        )
+
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": ["Pretreatment ECOG was 2."]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        clinical_question="Estimate treatment effect.",
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        batch_size=1,
+        max_prompt_chars=10_000,
+    )
+
+    assert calls == ["extract_stage2_patient_variables"]
+    assert frame.loc[0, "performance_status"] == "2"
+    audit = json.loads((batch / "category_ontology_repair.json").read_text(encoding="utf-8"))
+    assert audit["resolution"] == "superseded_by_expanded_category_ontology"
+    assert audit["previous_audit"]["resolution"] == "conservative_null"
+
+
 def test_extraction_uses_note_free_category_ontology_after_five_failed_repairs(
     tmp_path: Path,
 ):
@@ -775,6 +939,44 @@ def test_consolidation_normalizes_scalar_fields_and_recovers_packet_grounding(ca
     assert result["candidate_dispositions"]["candidate_1"]["status"] == "merged"
     assert "ignored 1 unknown packet ID" in caplog.text
     assert "omitted candidate_dispositions" in caplog.text
+
+
+def test_consolidation_expands_ordinal_integer_range_categories():
+    result = stage2_workflow._validate_consolidation(
+        {
+            "features": [
+                {
+                    "name": "performance_status",
+                    "description": "Baseline ECOG performance status.",
+                    "value_type": "ordinal",
+                    "categories_or_unit": ["0-4"],
+                    "roles": ["confounder"],
+                    "measurement_definition": "Extract pretreatment ECOG status.",
+                    "missing_value_rule": "Return null when undocumented.",
+                    "supporting_packet_ids": ["packet_1"],
+                    "supporting_architectures": ["test_architecture"],
+                }
+            ],
+            "candidate_dispositions": {
+                "candidate_1": {
+                    "status": "retained",
+                    "feature_name": "performance_status",
+                }
+            },
+        },
+        candidates=[
+            {
+                "candidate_id": "candidate_1",
+                "architecture": "test_architecture",
+                "name": "performance_status",
+                "supporting_packet_ids": ["packet_1"],
+                "evidence_axes": ["treatment", "outcome"],
+            }
+        ],
+        max_candidates=1,
+    )
+
+    assert result["features"][0]["categories_or_unit"] == ["0", "1", "2", "3", "4"]
 
 
 def _fake_completion(calls):
