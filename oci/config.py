@@ -1229,6 +1229,11 @@ class EmbeddingContrastDiscoveryConfig:
     ] = None
     external_corpus_cache_dirs: List[str] = field(default_factory=list)
     external_top_k_chunks_per_tail: int = 12
+    retrieval_tfidf_enabled: bool = True
+    retrieval_tfidf_ngram_range_min: int = 1
+    retrieval_tfidf_ngram_range_max: int = 3
+    retrieval_tfidf_max_features: int = 20_000
+    retrieval_tfidf_top_terms_per_side: int = 30
     residualize_columns: List[str] = field(default_factory=list)
     concept_phrases: List[str] = field(default_factory=list)
     include_bow_phrases_as_concepts: bool = True
@@ -1267,6 +1272,19 @@ class EmbeddingContrastDiscoveryConfig:
             raise ValueError("embedding_contrast.max_chunks_per_patient must be >= 1")
         if self.external_top_k_chunks_per_tail < 1:
             raise ValueError("embedding_contrast.external_top_k_chunks_per_tail must be >= 1")
+        if self.retrieval_tfidf_ngram_range_min < 1:
+            raise ValueError("embedding_contrast.retrieval_tfidf_ngram_range_min must be >= 1")
+        if self.retrieval_tfidf_ngram_range_max < self.retrieval_tfidf_ngram_range_min:
+            raise ValueError(
+                "embedding_contrast.retrieval_tfidf_ngram_range_max must be at least "
+                "retrieval_tfidf_ngram_range_min"
+            )
+        if self.retrieval_tfidf_max_features < 1:
+            raise ValueError("embedding_contrast.retrieval_tfidf_max_features must be >= 1")
+        if self.retrieval_tfidf_top_terms_per_side < 1:
+            raise ValueError(
+                "embedding_contrast.retrieval_tfidf_top_terms_per_side must be >= 1"
+            )
         if not 0.0 <= self.min_probe_auc <= 1.0:
             raise ValueError("embedding_contrast.min_probe_auc must be in [0, 1]")
         if not 0.0 < self.pseudo_target_quantile < 0.5:

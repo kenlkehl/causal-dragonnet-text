@@ -1058,6 +1058,93 @@ class MultiModelForestStage1Runner:
         )
         return [(1, all_idx, all_idx)]
 
+    def build_discovery_handoff_row(
+        self,
+        *,
+        train_idx: np.ndarray,
+        heldout_idx: np.ndarray,
+        fold_key: int,
+        outer_fold: int,
+        scope: str,
+        inner_fold: Optional[int] = None,
+        heldout_rows: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fit every Stage 1 text architecture for one exact handoff context.
+
+        This uses the same feature-bundle producer as the primary forest.  The
+        handoff-only research path therefore cannot fall back to the older
+        discovery implementation that predates matched-pair uplift.  Evidence
+        is fitted only from ``train_idx``; held-out rows are prediction targets.
+        """
+
+        train_idx = np.asarray(train_idx, dtype=int)
+        heldout_idx = np.asarray(heldout_idx, dtype=int)
+        if train_idx.ndim != 1 or heldout_idx.ndim != 1:
+            raise ValueError("handoff context row indices must be one-dimensional")
+        if not len(train_idx) or not len(heldout_idx):
+            raise ValueError("handoff context requires nonempty fit and held-out rows")
+        if np.intersect1d(train_idx, heldout_idx).size:
+            raise ValueError("handoff context fit and held-out rows must be disjoint")
+        if (
+            np.any(train_idx < 0)
+            or np.any(heldout_idx < 0)
+            or np.any(train_idx >= len(self.dataset))
+            or np.any(heldout_idx >= len(self.dataset))
+        ):
+            raise IndexError("handoff context row index is outside the dataset")
+
+        train_df = self.dataset.iloc[train_idx].reset_index(drop=True)
+        heldout_df = self.dataset.iloc[heldout_idx].reset_index(drop=True)
+        bundle = self._build_feature_bundle(
+            train_df=train_df,
+            test_df=heldout_df,
+            outer_fold=int(fold_key),
+        )
+        result = copy.deepcopy(bundle.handoff_evidence or {})
+        metrics = dict(result.get("metrics") or {})
+        metrics.update(bundle.metrics)
+        metrics["handoff_fold_key"] = int(fold_key)
+        metrics["handoff_fit_rows"] = int(len(train_df))
+        metrics["handoff_heldout_rows"] = int(len(heldout_df))
+        result["metrics"] = metrics
+        result["context"] = self._build_primary_agent_context(
+            outer_fold=int(outer_fold),
+            discovery_df=train_df,
+            metrics=metrics,
+            importance=result.get("importance") or {},
+            embedding_evidence=result.get("embedding_contrast_evidence") or {},
+            htr_evidence=result.get("htr_evidence") or {},
+        )
+        context_payload = result["context"]
+        if isinstance(context_payload, dict):
+            context_payload.update(
+                {
+                    "fold_key": int(fold_key),
+                    "consistency_scope": str(scope),
+                    "inner_fold": None if inner_fold is None else int(inner_fold),
+                    "fit_rows": int(len(train_df)),
+                    "heldout_rows": int(len(heldout_df)),
+                }
+            )
+            provenance = dict(context_payload.get("handoff_provenance") or {})
+            provenance.update(
+                {
+                    "source": "multi_model_forest_stage1_exact_context",
+                    "exact_context_refit": True,
+                    "stage2_raw_text_modeling_required": False,
+                }
+            )
+            context_payload["handoff_provenance"] = provenance
+        return _agentic_discovery_handoff_row(
+            result,
+            fold_key=int(fold_key),
+            outer_fold=int(outer_fold),
+            scope=str(scope),
+            n_rows=len(train_df),
+            inner_fold=inner_fold,
+            heldout_rows=(len(heldout_df) if heldout_rows is None else int(heldout_rows)),
+        )
+
     def _split_provenance_rows(
         self,
         splits: Sequence[Tuple[int, np.ndarray, np.ndarray]],
@@ -1770,6 +1857,10 @@ class MultiModelForestStage1Runner:
                         "view_index": int(view_index),
                     }
                 )
+        if self._matched_pair_bow_enabled() and not bow_pair_uplift_results:
+            raise RuntimeError(
+                "matched-pair uplift is enabled, but every BoW matched-pair producer failed"
+            )
 
         htr_pair_uplift_result = None
         if self._matched_pair_htr_enabled() and self._htr_enabled():
@@ -1924,6 +2015,10 @@ class MultiModelForestStage1Runner:
                             heldout_value,
                             role=f"heldout_{role}",
                         )
+            if htr_pair_uplift_result is None:
+                raise RuntimeError(
+                    "matched-pair HTR uplift is enabled, but its producer returned no evidence"
+                )
 
         if self._bow_enabled():
             for view_index, view in enumerate(self.nn_config.bow_views):

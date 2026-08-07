@@ -313,7 +313,8 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.evidence_compiler not in {EVIDENCE_COMPILER_VERSION, "raw_packets_v1"}:
             raise ValueError(
-                "stage2.evidence_compiler must be semantic_cluster_cards_v1 or " "raw_packets_v1"
+                f"stage2.evidence_compiler must be {EVIDENCE_COMPILER_VERSION} or "
+                "raw_packets_v1"
             )
         if self.evidence_max_cards_per_fold < 16:
             raise ValueError("stage2.evidence_max_cards_per_fold must be at least 16")

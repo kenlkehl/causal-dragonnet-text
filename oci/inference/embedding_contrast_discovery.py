@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.cluster import MiniBatchKMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
@@ -116,6 +117,76 @@ def _canonicalize_svd_component_signs(
             raise ValueError("cluster-local SVD component has no canonical sign pivot")
         if row[pivot] < 0:
             output[index] *= -1
+    return output
+
+
+def _retrieval_tfidf_terms(
+    positive_chunks: Sequence[Mapping[str, Any]],
+    negative_chunks: Sequence[Mapping[str, Any]],
+    *,
+    ngram_range: Tuple[int, int],
+    max_features: int,
+    top_terms_per_side: int,
+) -> List[Dict[str, Any]]:
+    """Return a lexical projection of opposing semantic-retrieval tails."""
+
+    positive = [
+        str(row.get("text") or row.get("chunk_text") or "").strip()
+        for row in positive_chunks
+        if isinstance(row, Mapping)
+    ]
+    negative = [
+        str(row.get("text") or row.get("chunk_text") or "").strip()
+        for row in negative_chunks
+        if isinstance(row, Mapping)
+    ]
+    positive = [text for text in positive if text]
+    negative = [text for text in negative if text]
+    if not positive or not negative:
+        return []
+    documents = [*positive, *negative]
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        ngram_range=tuple(map(int, ngram_range)),
+        min_df=1,
+        max_features=max(1, int(max_features)),
+        sublinear_tf=True,
+        norm="l2",
+        dtype=np.float32,
+        token_pattern=r"(?u)\b[\w][\w+./-]*\b",
+    )
+    try:
+        matrix = vectorizer.fit_transform(documents)
+    except ValueError:
+        return []
+    terms = vectorizer.get_feature_names_out().astype(str)
+    positive_mean = np.asarray(matrix[: len(positive)].mean(axis=0)).ravel()
+    negative_mean = np.asarray(matrix[len(positive) :].mean(axis=0)).ravel()
+    contrast = positive_mean - negative_mean
+    document_frequency = np.asarray((matrix > 0).sum(axis=0)).ravel().astype(int)
+
+    limit = max(1, int(top_terms_per_side))
+    positive_order = sorted(
+        np.flatnonzero(contrast > 0.0),
+        key=lambda index: (-float(contrast[index]), str(terms[index])),
+    )[:limit]
+    negative_order = sorted(
+        np.flatnonzero(contrast < 0.0),
+        key=lambda index: (float(contrast[index]), str(terms[index])),
+    )[:limit]
+    output: List[Dict[str, Any]] = []
+    for polarity, indices in (("positive", positive_order), ("negative", negative_order)):
+        for index in indices:
+            output.append(
+                {
+                    "term": str(terms[index]),
+                    "polarity": polarity,
+                    "tfidf_contrast": float(contrast[index]),
+                    "positive_mean_tfidf": float(positive_mean[index]),
+                    "negative_mean_tfidf": float(negative_mean[index]),
+                    "document_frequency": int(document_frequency[index]),
+                }
+            )
     return output
 
 
@@ -1549,6 +1620,34 @@ class EmbeddingContrastEvidenceGenerator:
             direction,
             descending=False,
         )
+        if bool(self.embedding_config.retrieval_tfidf_enabled):
+            record["tfidf_retrieval_terms"] = _retrieval_tfidf_terms(
+                record["positive_aligned_chunks"],
+                record["negative_aligned_chunks"],
+                ngram_range=(
+                    int(self.embedding_config.retrieval_tfidf_ngram_range_min),
+                    int(self.embedding_config.retrieval_tfidf_ngram_range_max),
+                ),
+                max_features=int(self.embedding_config.retrieval_tfidf_max_features),
+                top_terms_per_side=int(
+                    self.embedding_config.retrieval_tfidf_top_terms_per_side
+                ),
+            )
+            record["tfidf_retrieval"] = {
+                "enabled": True,
+                "fit_unit": "retrieved_fold_local_chunk",
+                "positive_documents": len(record["positive_aligned_chunks"]),
+                "negative_documents": len(record["negative_aligned_chunks"]),
+                "ngram_range": [
+                    int(self.embedding_config.retrieval_tfidf_ngram_range_min),
+                    int(self.embedding_config.retrieval_tfidf_ngram_range_max),
+                ],
+                "max_features": int(self.embedding_config.retrieval_tfidf_max_features),
+                "top_terms_per_side": int(
+                    self.embedding_config.retrieval_tfidf_top_terms_per_side
+                ),
+                "selected_terms": len(record["tfidf_retrieval_terms"]),
+            }
         if self._external_corpora:
             record["positive_external_chunks"] = self._retrieve_external_chunks(
                 direction,

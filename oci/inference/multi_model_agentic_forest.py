@@ -10240,6 +10240,34 @@ def _compact_embedding_contrast_evidence(evidence: Dict[str, Any]) -> Dict[str, 
         compact_contrast["concept_probe_scores"] = _compact_concept_scores(
             contrast.get("concept_probe_scores", []) or []
         )
+        retrieval_terms = list(contrast.get("tfidf_retrieval_terms", []) or [])
+        compact_retrieval_terms = [
+            {
+                key: _round_floats(row.get(key))
+                for key in (
+                    "term",
+                    "polarity",
+                    "tfidf_contrast",
+                    "positive_mean_tfidf",
+                    "negative_mean_tfidf",
+                    "document_frequency",
+                )
+                if key in row
+            }
+            for polarity in ("positive", "negative", "unsigned")
+            for row in [
+                item
+                for item in retrieval_terms
+                if isinstance(item, dict)
+                and str(item.get("polarity") or "unsigned") == polarity
+            ][:_AGENT_PROMPT_CONCEPT_TOP_N]
+            if isinstance(row, dict)
+        ]
+        compact_contrast["tfidf_retrieval_terms"] = compact_retrieval_terms
+        if "tfidf_retrieval" in contrast:
+            compact_contrast["tfidf_retrieval"] = _round_floats(
+                contrast.get("tfidf_retrieval")
+            )
         contrasts.append(compact_contrast)
     compact["contrasts"] = contrasts
     compact["prompt_compaction"] = {

@@ -60,7 +60,7 @@ GPU_COUNT=2 ./run_one_conf_one_mod.sh
 PHYSICAL_GPUS=1,3 ./run_one_conf_one_mod.sh
 
 # Use a server on another port and bypass model autodiscovery if needed.
-STAGE2_ENDPOINT=http://127.0.0.1:8002/v1 \
+STAGE2_ENDPOINT=http://127.0.0.1:8010/v1 \
 STAGE2_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4 \
 ./run_one_conf_one_mod.sh
 ```
@@ -601,7 +601,7 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
     "request_timeout": 7200,
-    "evidence_compiler": "semantic_cluster_cards_v1",
+    "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
@@ -772,6 +772,12 @@ a component, use `--rerun COMPONENT`. This removes completion markers but leaves
 the model files in place. A scientifically different configuration should use a
 new output directory because the simplified runner deliberately does not compare
 or invalidate prior settings.
+
+When a Stage 1 text producer changes, rerun both `text_models` and `handoff`;
+the existing TF-IDF and neural-query components can remain complete. Before
+starting Stage 2 from that changed handoff, move the old `stage2/` directory to
+an audit backup (or choose a new output directory). Stage 2 intentionally rejects
+old feature-definition checkpoints whose evidence fingerprint no longer matches.
 
 The complete operational reference is
 [`docs/all_evidence_workflow.md`](docs/all_evidence_workflow.md),

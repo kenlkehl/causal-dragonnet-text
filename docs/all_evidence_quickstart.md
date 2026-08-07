@@ -40,10 +40,10 @@ effect estimates. The common controls are:
 ```json
 {
   "stage2": {
-    "endpoint": "http://127.0.0.1:8000/v1",
+    "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
-    "evidence_compiler": "semantic_cluster_cards_v1",
+    "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "max_review_rounds": 2,
     "estimation_trees": 200

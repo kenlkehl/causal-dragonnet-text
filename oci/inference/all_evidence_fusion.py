@@ -2805,6 +2805,7 @@ def _compact_tfidf_evidence(
                     cluster.get("terms")
                     or cluster.get("member_terms")
                     or cluster.get("supporting_terms")
+                    or cluster.get("term_scores")
                 )
                 if not terms:
                     continue

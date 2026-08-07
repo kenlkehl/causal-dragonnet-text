@@ -26,8 +26,6 @@ from ..config import (
 )
 from .embedding_contrast_discovery import EmbeddingContrastEvidenceGenerator
 from .multi_model_agentic_forest import (
-    MultiModelAgenticForestRunner,
-    _agentic_discovery_handoff_row,
     _bounded_fold_count,
     _write_json,
     _write_jsonl,
@@ -430,7 +428,7 @@ class MultiModelForestRunner:
         )
         self._write_handoff_rows(
             rows,
-            source="legacy_agentic_discovery_context_precompute",
+            source="multi_model_forest_stage1_exact_context_precompute",
             exact_inner_contexts=True,
         )
 
@@ -535,7 +533,7 @@ class MultiModelForestRunner:
         return expanded
 
     def _handoff_context_specs(self) -> List[Dict[str, Any]]:
-        runner = MultiModelAgenticForestRunner(
+        runner = MultiModelForestStage1Runner(
             dataset=self.dataset.drop(columns=["_oci_row_id"], errors="ignore"),
             config=_config_for_handoff_runner(self.config),
             output_path=self.handoff_dir / "split_probe" / "predictions.parquet",
@@ -545,16 +543,18 @@ class MultiModelForestRunner:
         )
         splits = runner._analysis_splits()
         specs: List[Dict[str, Any]] = []
-        for outer_fold, train_idx, _test_idx in splits:
+        for outer_fold, train_idx, test_idx in splits:
             train_idx = np.asarray(train_idx, dtype=int)
+            test_idx = np.asarray(test_idx, dtype=int)
             specs.append(
                 {
                     "fold_key": int(outer_fold),
                     "outer_fold": int(outer_fold),
                     "scope": "full_outer_train",
                     "train_idx": train_idx,
+                    "heldout_idx": test_idx,
                     "inner_fold": None,
-                    "heldout_rows": None,
+                    "heldout_rows": int(len(test_idx)),
                 }
             )
             if bool(getattr(self.nn_config, "candidate_consistency_enabled", True)):
@@ -581,6 +581,7 @@ class MultiModelForestRunner:
                             "outer_fold": int(outer_fold),
                             "scope": "candidate_consistency_inner_train",
                             "train_idx": train_idx[np.asarray(fit_pos, dtype=int)],
+                            "heldout_idx": train_idx[np.asarray(heldout_pos, dtype=int)],
                             "inner_fold": int(inner_fold),
                             "heldout_rows": int(len(heldout_pos)),
                         }
@@ -695,7 +696,7 @@ def _run_handoff_context_shard(
     with _serial_torch_worker_environment():
         for context in shard:
             train_idx = np.asarray(context["train_idx"], dtype=int)
-            runner = MultiModelAgenticForestRunner(
+            runner = MultiModelForestStage1Runner(
                 dataset=dataset,
                 config=_config_for_handoff_runner(config),
                 output_path=(
@@ -709,22 +710,21 @@ def _run_handoff_context_shard(
                 gpu_ids=gpu_ids,
                 num_workers=max(1, int(num_workers)),
             )
-            discovery_df = runner.dataset.iloc[train_idx].reset_index(drop=True)
+            heldout_idx = np.asarray(context["heldout_idx"], dtype=int)
             logger.info(
                 "Precomputing handoff context fold_key=%s scope=%s rows=%s device=%s",
                 context["fold_key"],
                 context["scope"],
-                len(discovery_df),
+                len(train_idx),
                 device,
             )
-            result = runner._fit_bow_discovery(discovery_df, int(context["fold_key"]))
             rows.append(
-                _agentic_discovery_handoff_row(
-                    result,
+                runner.build_discovery_handoff_row(
+                    train_idx=train_idx,
+                    heldout_idx=heldout_idx,
                     fold_key=int(context["fold_key"]),
                     outer_fold=int(context["outer_fold"]),
                     scope=str(context["scope"]),
-                    n_rows=len(discovery_df),
                     inner_fold=context.get("inner_fold"),
                     heldout_rows=context.get("heldout_rows"),
                 )
@@ -776,6 +776,7 @@ def _config_for_handoff_runner(config: AppliedInferenceConfig) -> AppliedInferen
     # independent BoW folds share each lane's data without spawning a second
     # nested process tree or copying the full context again.
     mm_config.bow_parallel_backend = "threads"
+    cfg.architecture.multi_model_forest = copy.deepcopy(mm_config)
     cfg.architecture.multi_model_agentic_forest = mm_config
     avf_config = getattr(cfg.architecture, "agentic_attention_variable_forest", None)
     if avf_config is None:

@@ -12,6 +12,7 @@ import oci.inference.multi_model_forest as multi_model_workflow
 
 from oci.inference.embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
+    _retrieval_tfidf_terms,
 )
 from oci.inference.research_all_evidence_workflow import (
     COMPONENT_ORDER,
@@ -93,6 +94,27 @@ def test_stage1_era_module_and_class_names_remain_compatible():
         is ResearchAllEvidenceWorkflow
     )
     assert legacy_workflow.main is all_evidence_workflow.main
+
+
+def test_embedding_retrieval_tfidf_producer_keeps_both_semantic_tails():
+    rows = _retrieval_tfidf_terms(
+        [
+            {"text": "oxygen dependence severe dyspnea"},
+            {"text": "oxygen requirement at baseline"},
+        ],
+        [
+            {"text": "active runner excellent stamina"},
+            {"text": "daily exercise without limitation"},
+        ],
+        ngram_range=(1, 2),
+        max_features=100,
+        top_terms_per_side=8,
+    )
+
+    assert rows
+    assert {row["polarity"] for row in rows} == {"positive", "negative"}
+    assert any(row["term"] == "oxygen" and row["tfidf_contrast"] > 0 for row in rows)
+    assert any(row["term"] == "exercise" and row["tfidf_contrast"] < 0 for row in rows)
 
 
 def test_compile_config_keeps_run_and_science_in_one_file(tmp_path):
@@ -526,10 +548,66 @@ def test_handoff_runner_parallelizes_bow_folds_with_threads(tmp_path):
 
     optimized = multi_model_workflow._config_for_handoff_runner(context.applied_config)
     text_config = optimized.architecture.multi_model_agentic_forest
+    primary_text_config = optimized.architecture.multi_model_forest
 
     assert text_config.fold_parallelism == "auto"
     assert text_config.bow_fold_parallelism == "auto"
     assert text_config.bow_parallel_backend == "threads"
+    assert primary_text_config.fold_parallelism == "auto"
+    assert primary_text_config.bow_fold_parallelism == "auto"
+    assert primary_text_config.bow_parallel_backend == "threads"
+
+
+def test_handoff_context_uses_stage1_runner_and_exact_heldout_rows(tmp_path, monkeypatch):
+    _raw, config = _inputs(tmp_path, components=("text_models",))
+    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
+    captured: dict[str, object] = {}
+
+    class FakeStage1Runner:
+        def __init__(self, *, dataset, config, output_path, device, gpu_ids, num_workers):
+            captured["runner"] = "stage1"
+            captured["output_path"] = output_path
+            captured["num_workers"] = num_workers
+
+        def build_discovery_handoff_row(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "outer_fold": kwargs["outer_fold"],
+                "scope": kwargs["scope"],
+                "importance": {"matched_pair_uplift": {"views": []}},
+            }
+
+    monkeypatch.setattr(
+        multi_model_workflow,
+        "MultiModelForestStage1Runner",
+        FakeStage1Runner,
+    )
+    rows = multi_model_workflow._run_handoff_context_shard(
+        dataset=context.dataset,
+        config=context.applied_config,
+        shard=[
+            {
+                "fold_key": 1001,
+                "outer_fold": 1,
+                "scope": "candidate_consistency_inner_train",
+                "train_idx": np.asarray([0, 1, 2, 3]),
+                "heldout_idx": np.asarray([4, 5]),
+                "inner_fold": 1,
+                "heldout_rows": 2,
+            }
+        ],
+        handoff_dir=tmp_path / "handoff",
+        shard_index=0,
+        device="cpu",
+        gpu_ids=None,
+        num_workers=3,
+    )
+
+    assert captured["runner"] == "stage1"
+    assert captured["num_workers"] == 3
+    assert np.asarray(captured["train_idx"]).tolist() == [0, 1, 2, 3]
+    assert np.asarray(captured["heldout_idx"]).tolist() == [4, 5]
+    assert rows[0]["importance"]["matched_pair_uplift"] == {"views": []}
 
 
 def test_handoff_context_receives_its_full_lane_cpu_budget(tmp_path, monkeypatch):

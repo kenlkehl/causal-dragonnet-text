@@ -95,11 +95,11 @@ effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
 ```json
 {
   "stage2": {
-    "endpoint": "http://127.0.0.1:8000/v1",
+    "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
     "request_timeout": 7200,
-    "evidence_compiler": "semantic_cluster_cards_v1",
+    "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
@@ -168,7 +168,7 @@ uv run python scripts/run_all_evidence.py \
   --workers 16 \
   --htr-model /models/bert-tiny \
   --embedding-model /models/qwen3-embedding-8b \
-  --stage2-endpoint http://127.0.0.1:8000/v1 \
+  --stage2-endpoint http://127.0.0.1:8010/v1 \
   --stage2-model Qwen/Qwen3-32B \
   --stage2-review-rounds 2 \
   --stage2-estimation-trees 200

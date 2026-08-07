@@ -39,6 +39,7 @@ from .all_evidence_fusion import (
     MATCHED_PAIR_UPLIFT,
     NEURAL_QUERY_MOMENTS,
     TFIDF_ORPHAN_NGRAMS,
+    TFIDF_SEMANTIC_RETRIEVAL,
     _compact_bow_rows,
     _compact_tfidf_evidence,
     _compact_topic_terms,
@@ -46,7 +47,7 @@ from .all_evidence_fusion import (
     _normalize_evidence_text,
 )
 
-EVIDENCE_COMPILER_VERSION = "semantic_cluster_cards_v1"
+EVIDENCE_COMPILER_VERSION = "semantic_cluster_cards_v2"
 ALLOWED_AXES = {
     "treatment",
     "outcome",
@@ -328,6 +329,9 @@ def _extract_sparse_occurrences(
     ensemble = importance.get("ensemble_r")
     if isinstance(ensemble, Mapping):
         containers.append(("importance.ensemble_r", ensemble))
+    matched_pair = importance.get("matched_pair_uplift")
+    if isinstance(matched_pair, Mapping):
+        containers.append(("importance.matched_pair_uplift", matched_pair))
 
     def add_term(
         compact: Mapping[str, Any],
@@ -339,15 +343,21 @@ def _extract_sparse_occurrences(
         view_name: str = "",
     ) -> None:
         term = compact.get("term")
+        pair_side = None
+        if family == MATCHED_PAIR_UPLIFT and isinstance(term, str) and "::" in term:
+            prefix, candidate = term.split("::", 1)
+            if prefix in {"control", "treated"} and candidate.strip():
+                pair_side = prefix
+                term = candidate.strip()
         item = _occurrence(
             text=term,
             evidence_kind="lexical_term",
             axes=axes,
             polarity=polarity,
             source_families=[family],
-            architecture="sparse_and_matched_pair_models",
+            architecture=family,
             reference=_base_reference(row, handoff_row=handoff_row, json_path=path),
-            details={"term": term, "view_name": view_name},
+            details={"term": term, "view_name": view_name, "pair_side": pair_side},
             scores=_finite_scores(compact),
         )
         if item is not None:
@@ -361,6 +371,28 @@ def _extract_sparse_occurrences(
         "pseudo_target_positive": ({"residual_effect"}, "positive", BOW_R_LOSS),
         "pseudo_target_negative": ({"residual_effect"}, "negative", BOW_R_LOSS),
         "confounder_overlap": ({"treatment", "outcome"}, "unsigned", BOW_NUISANCE),
+        "uplift_pair_features": ({"matched_pair"}, "unsigned", MATCHED_PAIR_UPLIFT),
+        "uplift_delta_logit_positive": (
+            {"matched_pair"},
+            "positive",
+            MATCHED_PAIR_UPLIFT,
+        ),
+        "uplift_delta_logit_negative": (
+            {"matched_pair"},
+            "negative",
+            MATCHED_PAIR_UPLIFT,
+        ),
+        "ridge_delta_probability_positive": (
+            {"matched_pair"},
+            "positive",
+            MATCHED_PAIR_UPLIFT,
+        ),
+        "ridge_delta_probability_negative": (
+            {"matched_pair"},
+            "negative",
+            MATCHED_PAIR_UPLIFT,
+        ),
+        # Read old handoffs without making these obsolete aliases the producer contract.
         "matched_pair_positive": ({"matched_pair"}, "positive", MATCHED_PAIR_UPLIFT),
         "matched_pair_negative": ({"matched_pair"}, "negative", MATCHED_PAIR_UPLIFT),
     }
@@ -389,31 +421,44 @@ def _extract_sparse_occurrences(
                 if not isinstance(raw, Mapping):
                     continue
                 term = raw.get("feature") or raw.get("term") or raw.get("phrase")
-                axes: set[str] = set()
-                if raw.get("best_abs_confounder_score") is not None:
-                    axes.update(("treatment", "outcome"))
-                if raw.get("best_abs_effect_score") is not None:
-                    axes.add("residual_effect")
-                item = _occurrence(
-                    text=term,
-                    evidence_kind="lexical_term",
-                    axes=axes or {"semantic"},
-                    polarity="unsigned",
-                    source_families=[BOW_NUISANCE, BOW_R_LOSS],
-                    architecture="sparse_and_matched_pair_models",
-                    reference=_base_reference(
-                        row,
-                        handoff_row=handoff_row,
-                        json_path=f"{container_path}.{field}[{index}]",
-                    ),
-                    details={
-                        "term": term,
-                        "supporting_views": list(raw.get("supporting_views") or []),
-                    },
-                    scores=_finite_scores(raw),
-                )
-                if item is not None:
-                    output.append(item)
+                scored_families: list[tuple[set[str], str]] = []
+                if container_path == "importance.ensemble_r":
+                    scored_families.append(({"residual_effect"}, BOW_R_LOSS))
+                else:
+                    confounder_scores = (
+                        raw.get("best_abs_confounder_score"),
+                        raw.get("confounder_overlap_score"),
+                    )
+                    effect_scores = (
+                        raw.get("best_abs_effect_score"),
+                        raw.get("abs_pseudo_target_score"),
+                        raw.get("pseudo_target_score"),
+                    )
+                    if any(value not in (None, 0, 0.0) for value in confounder_scores):
+                        scored_families.append(({"treatment", "outcome"}, BOW_NUISANCE))
+                    if any(value not in (None, 0, 0.0) for value in effect_scores):
+                        scored_families.append(({"residual_effect"}, BOW_R_LOSS))
+                for axes, family in scored_families:
+                    item = _occurrence(
+                        text=term,
+                        evidence_kind="lexical_term",
+                        axes=axes,
+                        polarity="unsigned",
+                        source_families=[family],
+                        architecture=family,
+                        reference=_base_reference(
+                            row,
+                            handoff_row=handoff_row,
+                            json_path=f"{container_path}.{field}[{index}]",
+                        ),
+                        details={
+                            "term": term,
+                            "supporting_views": list(raw.get("supporting_views") or []),
+                        },
+                        scores=_finite_scores(raw),
+                    )
+                    if item is not None:
+                        output.append(item)
     return output
 
 
@@ -461,7 +506,7 @@ def _extract_embedding_occurrences(
                     axes=axes,
                     polarity=polarity,
                     source_families=[family],
-                    architecture="embedding_contrasts_and_retrieval_terms",
+                    architecture=family,
                     reference=_base_reference(
                         row,
                         handoff_row=handoff_row,
@@ -489,7 +534,7 @@ def _extract_embedding_occurrences(
                     axes=axes,
                     polarity="unsigned",
                     source_families=[family],
-                    architecture="embedding_contrasts_and_retrieval_terms",
+                    architecture=family,
                     reference=_base_reference(
                         row,
                         handoff_row=handoff_row,
@@ -499,6 +544,38 @@ def _extract_embedding_occurrences(
                         ),
                     ),
                     details={"term": concept, "contrast": contrast_name},
+                    scores=_finite_scores(raw),
+                )
+                if occurrence is not None:
+                    output.append(occurrence)
+        terms = contrast.get("tfidf_retrieval_terms")
+        if isinstance(terms, Sequence) and not isinstance(terms, (str, bytes)):
+            for term_index, raw in enumerate(terms):
+                if not isinstance(raw, Mapping):
+                    continue
+                polarity = str(raw.get("polarity") or "unsigned").lower()
+                if polarity not in {"positive", "negative"}:
+                    polarity = "unsigned"
+                occurrence = _occurrence(
+                    text=raw.get("term") or raw.get("feature") or raw.get("ngram"),
+                    evidence_kind="lexical_term",
+                    axes=axes,
+                    polarity=polarity,
+                    source_families=[TFIDF_SEMANTIC_RETRIEVAL],
+                    architecture=TFIDF_SEMANTIC_RETRIEVAL,
+                    reference=_base_reference(
+                        row,
+                        handoff_row=handoff_row,
+                        json_path=(
+                            f"embedding_contrast_evidence.contrasts[{contrast_index}]."
+                            f"tfidf_retrieval_terms[{term_index}]"
+                        ),
+                    ),
+                    details={
+                        "term": raw.get("term"),
+                        "parent_contrast": contrast_name,
+                        "parent_embedding_family": family,
+                    },
                     scores=_finite_scores(raw),
                 )
                 if occurrence is not None:
@@ -516,14 +593,34 @@ def _extract_htr_occurrences(
     if not isinstance(htr, Mapping):
         return []
     output: list[dict[str, Any]] = []
+    branches: list[tuple[str, Mapping[str, Any]]] = []
+    effect_variants = htr.get("effect_variants")
     for branch, branch_payload in htr.items():
+        if branch == "effect" and isinstance(effect_variants, Mapping):
+            # The canonical effect entry aliases one member of effect_variants.
+            continue
+        if branch == "effect_variants" and isinstance(branch_payload, Mapping):
+            for variant, variant_payload in branch_payload.items():
+                if isinstance(variant_payload, Mapping):
+                    branches.append((f"effect_variants.{variant}", variant_payload))
+            continue
+        if isinstance(branch_payload, Mapping):
+            branches.append((str(branch), branch_payload))
+
+    for branch_name, branch_payload in branches:
         if not isinstance(branch_payload, Mapping):
             continue
         values = branch_payload.get("attention")
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
             continue
-        branch_name = str(branch)
-        axes = {"residual_effect"} if "effect" in branch_name.lower() else {"treatment", "outcome"}
+        normalized_branch = branch_name.lower()
+        is_matched_pair = "pair_uplift" in normalized_branch
+        axes = (
+            {"matched_pair"}
+            if is_matched_pair
+            else ({"residual_effect"} if "effect" in normalized_branch else {"treatment", "outcome"})
+        )
+        family = MATCHED_PAIR_UPLIFT if is_matched_pair else HTR_NEURAL
         for item_index, raw in enumerate(values):
             if not isinstance(raw, Mapping):
                 continue
@@ -536,8 +633,8 @@ def _extract_htr_occurrences(
                 evidence_kind="clinical_text",
                 axes=axes,
                 polarity="unsigned",
-                source_families=[HTR_NEURAL],
-                architecture="hierarchical_neural_text",
+                source_families=[family],
+                architecture=family,
                 reference=_base_reference(
                     row,
                     handoff_row=handoff_row,
@@ -738,6 +835,8 @@ def _aggregate_exact_occurrences(
             {
                 "evidence_kind": occurrence["evidence_kind"],
                 "text": _clean_text(occurrence["text"]).casefold(),
+                "source_families": sorted(occurrence["source_families"]),
+                "architecture": str(occurrence["architecture"]),
             }
         )
         grouped[key].append(occurrence)
@@ -1065,14 +1164,14 @@ def _build_card(
     return card, lineage
 
 
-def _prompt_architecture(evidence_kind: str) -> str:
-    if evidence_kind == "clinical_text":
-        return "semantic_clustered_clinical_text"
-    if evidence_kind == "lexical_term":
-        return "semantic_clustered_lexical_terms"
-    if evidence_kind in {"topic", "orphan_ngram_cluster"}:
-        return "fusion_compacted_topics_and_ngrams"
-    return "fusion_compacted_structured_evidence"
+def _prompt_architecture(card: Mapping[str, Any]) -> str:
+    architectures = list(card.get("source_architectures") or [])
+    if len(architectures) != 1:
+        raise ValueError(
+            "compiled Stage 2 cards must contain exactly one Stage 1 architecture; "
+            f"received {architectures}"
+        )
+    return str(architectures[0])
 
 
 def _fit_packet_to_budget(
@@ -1149,9 +1248,10 @@ def compile_stage2_handoff_evidence(
             occurrences,
             embedding_cache=embedding_cache,
         )
-        grouped: dict[tuple[str, tuple[str, ...], tuple[str, ...], str], list[dict[str, Any]]] = (
-            defaultdict(list)
-        )
+        grouped: dict[
+            tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...], str],
+            list[dict[str, Any]],
+        ] = defaultdict(list)
         for member in members:
             mode = (
                 "cached_embedding"
@@ -1162,6 +1262,7 @@ def compile_stage2_handoff_evidence(
                 str(member["evidence_kind"]),
                 tuple(member["evidence_axes"]),
                 tuple(member["polarities"]),
+                tuple(member["source_architectures"]),
                 mode,
             )
             grouped[key].append(member)
@@ -1207,6 +1308,7 @@ def compile_stage2_handoff_evidence(
                     "evidence_kind": key[0],
                     "evidence_axes": list(key[1]),
                     "polarities": list(key[2]),
+                    "source_architectures": list(key[3]),
                     "semantic_mode": mode,
                     "exact_member_count": len(group_members),
                     "allocated_card_count": cluster_count,
@@ -1223,7 +1325,7 @@ def compile_stage2_handoff_evidence(
                 {
                     "packet_id": str(card["card_id"]),
                     "source": "compiled_stage1_evidence",
-                    "architecture": _prompt_architecture(str(card["evidence_kind"])),
+                    "architecture": _prompt_architecture(card),
                     "outer_fold": int(outer_fold),
                     "inner_fold": None,
                     "scope": "outer_fold_compiled_training_evidence",
@@ -1268,6 +1370,9 @@ def compile_stage2_handoff_evidence(
                         for family in occurrence["source_families"]
                     ).items()
                 )
+            ),
+            "architecture_packets": dict(
+                sorted(Counter(str(packet["architecture"]) for packet in fold_packets).items())
             ),
         }
     summary = {

@@ -108,7 +108,7 @@ Potential causal roles are derived from the evidence supporting each feature:
 
 ## Evidence compilation before LLM interpretation
 
-The default compiler is `semantic_cluster_cards_v1`. It reconnects the plain
+The default compiler is `semantic_cluster_cards_v2`. It reconnects the plain
 Stage 2 route to the audited scientific projections in `all_evidence_fusion`:
 large TF-IDF score arrays and operational diagnostics do not enter the prompt,
 while topic terms, orphan n-grams, sparse terms, retrieved clinical text, HTR

@@ -5,6 +5,18 @@ from pathlib import Path
 
 import numpy as np
 
+from oci.inference.all_evidence_fusion import (
+    BOW_NUISANCE,
+    BOW_R_LOSS,
+    EMBEDDING_CLUSTERED,
+    EMBEDDING_WHOLE_COHORT,
+    HTR_NEURAL,
+    MATCHED_PAIR_UPLIFT,
+    NEURAL_QUERY_MOMENTS,
+    TFIDF_ORPHAN_NGRAMS,
+    TFIDF_SEMANTIC_RETRIEVAL,
+    TFIDF_TOPICS,
+)
 from oci.inference.plain_handoff_stage2_evidence import (
     EVIDENCE_COMPILER_VERSION,
     compile_stage2_handoff_evidence,
@@ -126,6 +138,222 @@ def test_compiler_reuses_fusion_tfidf_allowlist_and_drops_large_score_arrays(
     assert "ECOG performance status" in rendered
     assert sentinel not in rendered
     assert compiled.packets[0]["content"]["source_families"] == ["tfidf_topics"]
+
+
+def test_compiler_preserves_all_ten_architectures_as_independent_interpretation_lanes(
+    tmp_path: Path,
+):
+    rows = [
+        {
+            "source": "text_models",
+            "outer_fold": 1,
+            "scope": "full_outer_train",
+            "evidence": {
+                "importance": {
+                    "views": [
+                        {
+                            "view_name": "word_linear",
+                            "treatment_positive": [{"feature": "treatment wording", "score": 2.0}],
+                            "outcome_negative": [{"feature": "outcome wording", "score": -1.5}],
+                            "pseudo_target_positive": [
+                                {"feature": "residual effect wording", "score": 1.2}
+                            ],
+                        }
+                    ],
+                    "matched_pair_uplift": {
+                        "views": [
+                            {
+                                "view_name": "pair_word_linear",
+                                "uplift_delta_logit_positive": [
+                                    {"feature": "treated::pair response wording", "score": 1.7}
+                                ],
+                                "ridge_delta_probability_negative": [
+                                    {"feature": "control::pair control wording", "score": -0.8}
+                                ],
+                            }
+                        ]
+                    },
+                },
+                "embedding_contrast_evidence": {
+                    "contrasts": [
+                        {
+                            "name": "global treatment contrast",
+                            "contrast_family": "marginal",
+                            "positive_aligned_chunks": [
+                                {
+                                    "row_id": 1,
+                                    "chunk_index": 0,
+                                    "text": "whole cohort semantic witness",
+                                }
+                            ],
+                            "tfidf_retrieval_terms": [
+                                {
+                                    "term": "whole lexical projection",
+                                    "polarity": "positive",
+                                    "tfidf_contrast": 0.4,
+                                }
+                            ],
+                        },
+                        {
+                            "name": "cluster local residual contrast",
+                            "contrast_family": "cluster_local_residualized",
+                            "negative_aligned_chunks": [
+                                {
+                                    "row_id": 2,
+                                    "chunk_index": 0,
+                                    "text": "cluster local semantic witness",
+                                }
+                            ],
+                            "tfidf_retrieval_terms": [
+                                {
+                                    "term": "cluster lexical projection",
+                                    "polarity": "negative",
+                                    "tfidf_contrast": -0.5,
+                                }
+                            ],
+                        },
+                    ]
+                },
+                "htr_evidence": {
+                    "nuisance": {
+                        "attention": [
+                            {"row_id": 3, "chunk_text": "HTR nuisance witness"}
+                        ]
+                    },
+                    "effect": {
+                        "attention": [
+                            {"row_id": 4, "chunk_text": "duplicated canonical HTR effect"}
+                        ]
+                    },
+                    "effect_variants": {
+                        "pseudo_outcome_mse": {
+                            "attention": [
+                                {"row_id": 4, "chunk_text": "HTR pseudo outcome witness"}
+                            ]
+                        },
+                        "squared_r_loss": {
+                            "attention": [
+                                {"row_id": 5, "chunk_text": "HTR squared R loss witness"}
+                            ]
+                        },
+                    },
+                    "pair_uplift": {
+                        "attention": [
+                            {"row_id": 6, "chunk_text": "HTR matched pair witness"}
+                        ]
+                    },
+                },
+            },
+        },
+        {
+            "source": "tfidf",
+            "outer_fold": 1,
+            "scope": "full_outer_train",
+            "evidence": {
+                "discovery": {
+                    "topic_banks": {
+                        "treatment": {
+                            "topics": [
+                                {
+                                    "topic_id": "treatment_topic_1",
+                                    "terms": [{"term": "topic treatment wording", "loading": 0.9}],
+                                }
+                            ]
+                        },
+                        "outcome": {"topics": []},
+                        "effect": {"topics": []},
+                    },
+                    "topic_score_tests": {
+                        "effect_orphan_ngram_branch": {
+                            "selected_cluster_ids": ["orphan_1"],
+                            "selected_clusters": [
+                                {
+                                    "cluster_id": "orphan_1",
+                                    "term_scores": [
+                                        {"term": "orphan residual wording", "fit_rank": 7}
+                                    ],
+                                }
+                            ],
+                        }
+                    },
+                }
+            },
+        },
+        {
+            "source": "neural_queries",
+            "outer_fold": 1,
+            "scope": "full_outer_train",
+            "evidence": {
+                "evidence": [
+                    {
+                        "query_id": "effect_query_1",
+                        "bank": "effect",
+                        "top_chunks": [
+                            {
+                                "_oci_row_id": 7,
+                                "chunk_index": 0,
+                                "text": "learned neural query witness",
+                            }
+                        ],
+                    }
+                ]
+            },
+        },
+    ]
+
+    compiled = compile_stage2_handoff_evidence(
+        rows,
+        handoff_path=tmp_path / "handoff" / "evidence.jsonl",
+        max_cards_per_outer_fold=64,
+        max_packet_chars=4_000,
+    )
+
+    expected = {
+        BOW_NUISANCE,
+        BOW_R_LOSS,
+        HTR_NEURAL,
+        MATCHED_PAIR_UPLIFT,
+        EMBEDDING_WHOLE_COHORT,
+        EMBEDDING_CLUSTERED,
+        TFIDF_SEMANTIC_RETRIEVAL,
+        TFIDF_TOPICS,
+        TFIDF_ORPHAN_NGRAMS,
+        NEURAL_QUERY_MOMENTS,
+    }
+    assert {packet["architecture"] for packet in compiled.packets} == expected
+    assert set(compiled.summary["outer_folds"]["1"]["architecture_packets"]) == expected
+
+    pair_cards = [
+        packet["content"]
+        for packet in compiled.packets
+        if packet["architecture"] == MATCHED_PAIR_UPLIFT
+    ]
+    assert pair_cards
+    assert all("matched_pair" in card["evidence_axes"] for card in pair_cards)
+    rendered_pairs = json.dumps(pair_cards)
+    assert "treated::" not in rendered_pairs
+    assert "control::" not in rendered_pairs
+    assert "HTR matched pair witness" in rendered_pairs
+
+    htr_rendered = json.dumps(
+        [
+            packet["content"]
+            for packet in compiled.packets
+            if packet["architecture"] == HTR_NEURAL
+        ]
+    )
+    assert "HTR pseudo outcome witness" in htr_rendered
+    assert "HTR squared R loss witness" in htr_rendered
+    assert "duplicated canonical HTR effect" not in htr_rendered
+
+    orphan_rendered = json.dumps(
+        [
+            packet["content"]
+            for packet in compiled.packets
+            if packet["architecture"] == TFIDF_ORPHAN_NGRAMS
+        ]
+    )
+    assert "orphan residual wording" in orphan_rendered
 
 
 def test_compiler_memory_maps_existing_stage1_embeddings_for_semantic_cards(
