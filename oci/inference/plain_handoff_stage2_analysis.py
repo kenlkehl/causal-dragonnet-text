@@ -33,6 +33,13 @@ RequestJSON = Callable[
     dict[str, Any],
 ]
 
+_SCALAR_EXTRACTION_RULES = (
+    "Return one scalar value or null per feature; never return an object or array.",
+    "For a continuous feature return one JSON number: from a composite such as "
+    "132/78, use only a component explicitly named by the feature; if the definition "
+    "requests multiple components, return null rather than a ratio string or aggregate.",
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -283,15 +290,61 @@ class _ExtractionCategoryError(ValueError):
         )
 
 
-def _category_error_from_exception(exc: BaseException) -> _ExtractionCategoryError | None:
+class _ExtractionValueError(ValueError):
+    """Scalar/type extraction failures that can be repaired feature by feature."""
+
+    def __init__(
+        self,
+        *,
+        issues: Sequence[Mapping[str, Any]],
+        response: Mapping[str, Any],
+    ) -> None:
+        self.issues = tuple(dict(issue) for issue in issues)
+        self.response = copy.deepcopy(dict(response))
+        first = self.issues[0]
+        suffix = (
+            f"; {len(self.issues) - 1} additional invalid value(s)"
+            if len(self.issues) > 1
+            else ""
+        )
+        super().__init__(
+            f"feature {first['feature_name']!r} {first['reason']}"
+            f"{suffix}"
+        )
+
+
+def _extraction_error_from_exception(
+    exc: BaseException,
+    error_type: type[_ExtractionCategoryError] | type[_ExtractionValueError],
+) -> _ExtractionCategoryError | _ExtractionValueError | None:
     current: BaseException | None = exc
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
-        if isinstance(current, _ExtractionCategoryError):
+        if isinstance(current, error_type):
             return current
         seen.add(id(current))
         current = current.__cause__ or current.__context__
     return None
+
+
+def _category_error_from_exception(exc: BaseException) -> _ExtractionCategoryError | None:
+    result = _extraction_error_from_exception(exc, _ExtractionCategoryError)
+    return result if isinstance(result, _ExtractionCategoryError) else None
+
+
+def _value_error_from_exception(exc: BaseException) -> _ExtractionValueError | None:
+    result = _extraction_error_from_exception(exc, _ExtractionValueError)
+    return result if isinstance(result, _ExtractionValueError) else None
+
+
+def _null_invalid_extraction_values(
+    error: _ExtractionValueError,
+) -> dict[str, Any]:
+    patched = copy.deepcopy(error.response)
+    rows_by_id = {int(row["row_id"]): row for row in patched["rows"]}
+    for issue in error.issues:
+        rows_by_id[int(issue["row_id"])]["values"][str(issue["feature_name"])] = None
+    return patched
 
 
 def _category_ontology_plan(
@@ -464,7 +517,36 @@ def _request_validated_extraction(
             ),
         )
     except ValueError as exc:
+        value_error = _value_error_from_exception(exc)
+        value_repair_audit: dict[str, Any] | None = None
         category_error = _category_error_from_exception(exc)
+        if value_error is not None:
+            patched = _null_invalid_extraction_values(value_error)
+            value_repair_audit = {
+                "schema_version": "stage2_invalid_feature_value_repair_v1",
+                "resolution": "conservative_invalid_features_null",
+                "original_validation_error": str(exc),
+                "issues": [dict(issue) for issue in value_error.issues],
+            }
+            try:
+                validated = _validate_extraction(
+                    patched,
+                    row_ids=row_ids,
+                    definitions=definitions,
+                )
+            except _ExtractionCategoryError as patched_category_error:
+                category_error = patched_category_error
+            else:
+                _write_json(
+                    ontology_audit_path.with_name("invalid_feature_value_repair.json"),
+                    value_repair_audit,
+                )
+                LOGGER.warning(
+                    "Stage 2 extraction retained the valid fields and replaced %s "
+                    "invalid feature value(s) with null",
+                    len(value_error.issues),
+                )
+                return validated
         if category_error is None:
             feature_names = [str(definition["name"]) for definition in definitions]
             conservative = {
@@ -541,6 +623,11 @@ def _request_validated_extraction(
         row_ids=row_ids,
         definitions=definitions,
     )
+    if value_repair_audit is not None:
+        _write_json(
+            ontology_audit_path.with_name("invalid_feature_value_repair.json"),
+            value_repair_audit,
+        )
     _write_json(
         ontology_audit_path,
         {
@@ -576,7 +663,7 @@ def _extraction_prompt(
             "For a binary, categorical, or ordinal feature, return one declared category exactly.",
             "Do not substitute 0/1 or true/false for a declared category unless that "
             "exact value is declared.",
-            "For a continuous feature, return a JSON number in the declared unit.",
+            *_SCALAR_EXTRACTION_RULES,
             "Return null when the record does not support a value.",
             "Return every row and every feature exactly once.",
         ],
@@ -625,6 +712,7 @@ def _page_reconciliation_prompt(
             "For a binary, categorical, or ordinal feature, return one declared category exactly.",
             "Do not substitute 0/1 or true/false for a declared category unless that "
             "exact value is declared.",
+            *_SCALAR_EXTRACTION_RULES,
             "Return every feature exactly once for the original row_id.",
         ],
         "features": _prompt_feature_definitions(definitions),
@@ -665,6 +753,7 @@ def _validate_extraction(
     by_row: dict[int, dict[str, Any]] = {}
     definitions_by_name = {str(feature["name"]): feature for feature in definitions}
     category_issues: list[dict[str, Any]] = []
+    value_issues: list[dict[str, Any]] = []
     for raw in rows:
         if not isinstance(raw, Mapping):
             raise ValueError("each extraction row must be an object")
@@ -681,15 +770,42 @@ def _validate_extraction(
         )
         clean_values: dict[str, Any] = {}
         for name in feature_names:
-            extracted = _clean_scalar(aligned_values[name])
             definition = definitions_by_name[name]
             value_type = str(definition.get("value_type") or "ambiguous")
             declared = _declared_categories(definition)
+            try:
+                extracted = _clean_scalar(aligned_values[name])
+            except ValueError:
+                extracted = aligned_values[name]
+                value_issues.append(
+                    {
+                        "row_id": row_id,
+                        "feature_name": name,
+                        "value_type": value_type,
+                        "reason": (
+                            "requires one scalar JSON value or null, but the model "
+                            f"returned {type(extracted).__name__}"
+                        ),
+                        "prior_extracted_value": extracted,
+                    }
+                )
+                clean_values[name] = extracted
+                continue
             if _is_missing_scalar(extracted) and _canonical_category(extracted, declared) is None:
                 extracted = None
             if extracted is not None and value_type == "continuous":
                 if isinstance(extracted, bool) or not isinstance(extracted, (int, float)):
-                    raise ValueError(f"continuous feature {name!r} requires a JSON number")
+                    value_issues.append(
+                        {
+                            "row_id": row_id,
+                            "feature_name": name,
+                            "value_type": value_type,
+                            "reason": "requires one JSON number or null",
+                            "prior_extracted_value": extracted,
+                        }
+                    )
+                    clean_values[name] = extracted
+                    continue
                 extracted = float(extracted)
             elif extracted is not None and value_type in {"binary", "categorical", "ordinal"}:
                 canonical = _canonical_category(extracted, declared) if declared else str(extracted)
@@ -709,9 +825,15 @@ def _validate_extraction(
         by_row[row_id] = {"row_id": row_id, "values": clean_values}
     if set(by_row) != expected_rows:
         raise ValueError("extraction response omitted one or more supplied rows")
+    normalized_response = {"rows": [by_row[int(row_id)] for row_id in row_ids]}
+    if value_issues:
+        raise _ExtractionValueError(
+            issues=value_issues,
+            response=normalized_response,
+        )
     if category_issues:
-        raise _ExtractionCategoryError(issues=category_issues, response=value)
-    return {"rows": [by_row[int(row_id)] for row_id in row_ids]}
+        raise _ExtractionCategoryError(issues=category_issues, response=normalized_response)
+    return normalized_response
 
 
 def _partition_rows_for_prompt(
@@ -1212,6 +1334,69 @@ def feature_summaries(
             summary["numeric_sd"] = float(numeric.std(ddof=0)) if len(numeric) else None
         summaries.append(summary)
     return summaries
+
+
+def _assert_extraction_health(
+    frame: pd.DataFrame,
+    definitions: Sequence[Mapping[str, Any]],
+    *,
+    scope: str,
+    minimum_row_nonmissing_fraction: float,
+    audit_path: Path,
+) -> dict[str, Any]:
+    """Reject final extraction matrices that are effectively all missing."""
+
+    feature_names = [str(feature["name"]) for feature in definitions]
+    if not feature_names:
+        audit = {
+            "schema_version": "stage2_final_extraction_health_v1",
+            "status": "not_applicable",
+            "scope": scope,
+            "rows": int(len(frame)),
+            "features": 0,
+        }
+        _write_json(audit_path, audit)
+        return audit
+    missing_columns = sorted(set(feature_names) - set(frame.columns))
+    if missing_columns:
+        raise ValueError(
+            f"Stage 2 final {scope} extraction is missing feature columns: "
+            f"{missing_columns}"
+        )
+    values = frame[feature_names]
+    rows_with_any = values.notna().any(axis=1)
+    row_fraction = float(rows_with_any.mean()) if len(values) else 0.0
+    nonmissing_cells = int(values.notna().to_numpy(dtype=bool).sum())
+    total_cells = int(values.shape[0] * values.shape[1])
+    audit = {
+        "schema_version": "stage2_final_extraction_health_v1",
+        "status": (
+            "ok"
+            if row_fraction >= float(minimum_row_nonmissing_fraction)
+            else "failed"
+        ),
+        "scope": scope,
+        "rows": int(len(values)),
+        "features": int(len(feature_names)),
+        "rows_with_any_nonmissing": int(rows_with_any.sum()),
+        "all_null_rows": int((~rows_with_any).sum()),
+        "row_nonmissing_fraction": row_fraction,
+        "minimum_row_nonmissing_fraction": float(minimum_row_nonmissing_fraction),
+        "nonmissing_cells": nonmissing_cells,
+        "nonmissing_cell_fraction": (
+            float(nonmissing_cells / total_cells) if total_cells else 0.0
+        ),
+        "definitions_fingerprint": _value_fingerprint(list(definitions)),
+    }
+    _write_json(audit_path, audit)
+    if audit["status"] != "ok":
+        raise ValueError(
+            f"Stage 2 final {scope} extraction is catastrophically sparse: "
+            f"only {audit['rows_with_any_nonmissing']}/{audit['rows']} rows contain "
+            "any retained feature value "
+            f"({row_fraction:.3f} < {minimum_row_nonmissing_fraction:.3f})"
+        )
+    return audit
 
 
 class _FeatureEncoder:
@@ -2040,10 +2225,12 @@ def run_fold_analysis(
     heldout_ids = [int(value) for value in split["heldout_row_ids"]]
     current = [dict(feature) for feature in definitions]
     final_fit_extraction: pd.DataFrame | None = None
+    final_fit_definitions: list[dict[str, Any]] | None = None
     review_rounds = 0
     for round_index in range(1, int(config.max_review_rounds) + 1):
         review_rounds = round_index
         round_dir = output_dir / "review" / f"round_{round_index:03d}"
+        extraction_definitions = [dict(feature) for feature in current]
         _write_json(round_dir / "definitions.json", {"features": current})
         extracted = extract_rows(
             dataset=dataset,
@@ -2104,15 +2291,44 @@ def run_fold_analysis(
             _write_json(complete_path, {"status": "complete", "completed_at": _now()})
         updated, measurement_changed = _apply_review(current, review)
         final_fit_extraction = extracted
+        final_fit_definitions = extraction_definitions
         current = updated
         if not measurement_changed:
             break
 
-    if final_fit_extraction is None:
+    if final_fit_extraction is None or final_fit_definitions is None:
         raise RuntimeError("Stage 2 review did not produce a training-fold extraction")
     _write_json(
         output_dir / "final_definitions.json",
         {"features": current, "review_rounds": review_rounds},
+    )
+    names = [str(feature["name"]) for feature in current]
+    if _value_fingerprint(final_fit_definitions) == _value_fingerprint(current):
+        fit_selected = final_fit_extraction[["_oci_row_id", *names]].copy()
+    else:
+        LOGGER.info(
+            "Stage 2 final feature set changed during review; re-extracting %s "
+            "training rows against the %s retained definition(s)",
+            len(fit_ids),
+            len(current),
+        )
+        fit_selected = extract_rows(
+            dataset=dataset,
+            row_ids=fit_ids,
+            text_column=text_column,
+            definitions=current,
+            clinical_question=clinical_question,
+            output_dir=output_dir / "extraction" / "fit",
+            request_json=request_json,
+            workers=config.workers,
+            max_prompt_chars=config.max_prompt_chars,
+        )
+    _assert_extraction_health(
+        fit_selected,
+        current,
+        scope="training",
+        minimum_row_nonmissing_fraction=config.min_nonmissing_fraction,
+        audit_path=output_dir / "extraction" / "fit_health.json",
     )
     heldout_extraction = extract_rows(
         dataset=dataset,
@@ -2125,10 +2341,13 @@ def run_fold_analysis(
         workers=config.workers,
         max_prompt_chars=config.max_prompt_chars,
     )
-    # The last training extraction may contain a feature dropped in the final
-    # review.  Selecting columns is sufficient; no model call is needed.
-    names = [str(feature["name"]) for feature in current]
-    fit_selected = final_fit_extraction[["_oci_row_id", *names]].copy()
+    _assert_extraction_health(
+        heldout_extraction,
+        current,
+        scope="heldout",
+        minimum_row_nonmissing_fraction=config.min_nonmissing_fraction,
+        audit_path=output_dir / "extraction" / "heldout_health.json",
+    )
     combined = pd.concat([fit_selected, heldout_extraction], ignore_index=True).sort_values(
         "_oci_row_id"
     )

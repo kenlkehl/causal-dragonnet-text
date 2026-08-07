@@ -1332,6 +1332,7 @@ def _consolidation_prompt(
         "rules": [
             "Merge spelling variants and true aliases, but keep distinct measurements separate.",
             "Prefer a specific named scale, laboratory measurement, diagnosis, or clinical category over a broader paraphrase when the cited evidence supports that specificity.",
+            "Each feature must yield one scalar value; split multi-valued measurements instead of asking the extractor to return a list.",
             "Combine evidence axes across candidates that describe the same measurement before assigning roles.",
             "A confounder requires both treatment and outcome evidence.",
             "A prognostic feature requires outcome evidence but not necessarily treatment evidence.",

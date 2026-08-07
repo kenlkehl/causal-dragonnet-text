@@ -267,6 +267,14 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
     ]
     assert any("Do not substitute 0/1" in rule for rule in extraction["rules"])
     assert any("Do not substitute 0/1" in rule for rule in reconciliation["rules"])
+    for prompt in (extraction, reconciliation):
+        assert any("never return an object or array" in rule for rule in prompt["rules"])
+        composite_rule = next(
+            rule for rule in prompt["rules"] if "composite such as 132/78" in rule
+        )
+        assert "component explicitly named by the feature" in composite_rule
+        assert "requests multiple components, return null" in composite_rule
+        assert "rather than a ratio string or aggregate" in composite_rule
 
 
 def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Path):
@@ -788,6 +796,73 @@ def test_extraction_defaults_structurally_invalid_response_to_audited_null(
     assert audit["feature_names"] == ["performance_status"]
     assert "Unterminated string" in audit["validation_error"]
     assert "remained structurally invalid" in caplog.text
+
+
+def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {"clinical_text": ["Age 67 years. Blood pressure 132/78 mmHg."]}
+    )
+    definitions = [
+        {
+            "feature_id": "outer_001_feature_001",
+            "name": "age",
+            "value_type": "continuous",
+            "categories_or_unit": ["years"],
+        },
+        {
+            "feature_id": "outer_001_feature_002",
+            "name": "blood_pressure",
+            "value_type": "continuous",
+            "categories_or_unit": ["mmHg"],
+        },
+    ]
+
+    def request_json(_messages, validate):
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {
+                            "age": 67,
+                            "blood_pressure": {"systolic": 132, "diastolic": 78},
+                        },
+                    }
+                ]
+            }
+        )
+
+    output = tmp_path / "extraction"
+    frame = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        clinical_question="Estimate treatment effect.",
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=10_000,
+    )
+
+    assert frame.loc[0, "age"] == 67.0
+    assert pd.isna(frame.loc[0, "blood_pressure"])
+    assert not (
+        output / "batches" / "batch_00001" / "extraction_failure.json"
+    ).exists()
+    audit = json.loads(
+        (
+            output
+            / "batches"
+            / "batch_00001"
+            / "invalid_feature_value_repair.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert audit["resolution"] == "conservative_invalid_features_null"
+    assert audit["issues"][0]["feature_name"] == "blood_pressure"
+    assert "dict" in audit["issues"][0]["reason"]
 
 
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
@@ -2099,3 +2174,208 @@ def test_training_fold_review_can_revise_then_retest_a_definition(tmp_path: Path
     assert jobs.count("review_stage2_variables_against_training_fold_performance") == 2
     assert jobs.count("extract_stage2_patient_variables") == 18
     assert (tmp_path / "outer_001" / "review" / "round_002" / "performance.json").is_file()
+
+
+def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "patient_id": [f"p{index:02d}" for index in range(24)],
+            "clinical_text": [
+                f"Age {50 + index} years. Blood pressure 132/78 mmHg."
+                for index in range(24)
+            ],
+            "treatment_indicator": [index % 2 for index in range(24)],
+            "outcome_indicator": [(index // 2) % 2 for index in range(24)],
+        }
+    )
+    definitions = [
+        {
+            "feature_id": "outer_001_feature_001",
+            "name": "age",
+            "description": "Age at treatment.",
+            "value_type": "continuous",
+            "categories_or_unit": ["years"],
+            "roles": ["confounder", "effect_modifier"],
+            "measurement_definition": "Extract age in years.",
+            "missing_value_rule": "Use null when undocumented.",
+        },
+        {
+            "feature_id": "outer_001_feature_002",
+            "name": "blood_pressure",
+            "description": "Systolic and diastolic blood pressure.",
+            "value_type": "continuous",
+            "categories_or_unit": ["mmHg"],
+            "roles": ["confounder"],
+            "measurement_definition": "Extract systolic and diastolic values.",
+            "missing_value_rule": "Use null when undocumented.",
+        },
+    ]
+    fit_ids = list(range(12))
+    heldout_ids = list(range(12, 24))
+    split = {
+        "outer_fold": 1,
+        "fit_row_ids": fit_ids,
+        "heldout_row_ids": heldout_ids,
+        "inner_splits": [
+            {"inner_fold": 1, "fit_row_ids": fit_ids[:6], "heldout_row_ids": fit_ids[6:]},
+            {"inner_fold": 2, "fit_row_ids": fit_ids[6:], "heldout_row_ids": fit_ids[:6]},
+        ],
+    }
+    extraction_feature_sets = []
+
+    def request_json(messages, validate):
+        body = json.loads(messages[1]["content"])
+        if body["job"] == "extract_stage2_patient_variables":
+            names = [feature["name"] for feature in body["features"]]
+            extraction_feature_sets.append(tuple(names))
+            rows = []
+            for patient in body["patients"]:
+                age = int(re.search(r"Age\s+(\d+)", patient["text"]).group(1))
+                values = {"age": age}
+                if "blood_pressure" in names:
+                    values["blood_pressure"] = {"systolic": 132, "diastolic": 78}
+                rows.append({"row_id": patient["row_id"], "values": values})
+            return validate({"rows": rows})
+        return validate(
+            {
+                "feature_decisions": [
+                    {
+                        "feature_id": "outer_001_feature_001",
+                        "action": "keep",
+                        "reason": "Age remains usable.",
+                    },
+                    {
+                        "feature_id": "outer_001_feature_002",
+                        "action": "drop",
+                        "reason": "The definition is not scalar.",
+                    },
+                ],
+                "overall_assessment": "Retain age only.",
+            }
+        )
+
+    output = tmp_path / "outer_001"
+    result = run_fold_analysis(
+        dataset=dataset,
+        definitions=definitions,
+        split=split,
+        clinical_question="Estimate treatment effect.",
+        unit_id_column="patient_id",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        inner_folds=2,
+        seed=17,
+        output_dir=output,
+        request_json=request_json,
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            workers=1,
+            max_review_rounds=1,
+            estimation_trees=10,
+        ),
+    )
+
+    assert [feature["name"] for feature in result["features"]] == ["age"]
+    assert ("age", "blood_pressure") in extraction_feature_sets
+    assert extraction_feature_sets.count(("age",)) == 24
+    final_fit = pd.read_csv(output / "extraction" / "fit" / "extracted.csv")
+    assert final_fit["age"].notna().all()
+    fit_health = json.loads(
+        (output / "extraction" / "fit_health.json").read_text(encoding="utf-8")
+    )
+    assert fit_health["status"] == "ok"
+    assert fit_health["rows_with_any_nonmissing"] == 12
+
+
+def test_final_training_extraction_fails_fast_when_effectively_all_null(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "patient_id": [f"p{index:02d}" for index in range(12)],
+            "clinical_text": ["No supported baseline feature."] * 12,
+            "treatment_indicator": [index % 2 for index in range(12)],
+            "outcome_indicator": [(index // 2) % 2 for index in range(12)],
+        }
+    )
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "age",
+        "description": "Age at treatment.",
+        "value_type": "continuous",
+        "categories_or_unit": ["years"],
+        "roles": ["confounder", "effect_modifier"],
+        "measurement_definition": "Extract age in years.",
+        "missing_value_rule": "Use null when undocumented.",
+    }
+    fit_ids = list(range(6))
+    split = {
+        "outer_fold": 1,
+        "fit_row_ids": fit_ids,
+        "heldout_row_ids": list(range(6, 12)),
+        "inner_splits": [
+            {"inner_fold": 1, "fit_row_ids": fit_ids[:3], "heldout_row_ids": fit_ids[3:]},
+            {"inner_fold": 2, "fit_row_ids": fit_ids[3:], "heldout_row_ids": fit_ids[:3]},
+        ],
+    }
+
+    def request_json(messages, validate):
+        body = json.loads(messages[1]["content"])
+        if body["job"] == "extract_stage2_patient_variables":
+            return validate(
+                {
+                    "rows": [
+                        {"row_id": patient["row_id"], "values": {"age": None}}
+                        for patient in body["patients"]
+                    ]
+                }
+            )
+        return validate(
+            {
+                "feature_decisions": [
+                    {
+                        "feature_id": "outer_001_feature_001",
+                        "action": "keep",
+                        "reason": "Retain for the final health check.",
+                    }
+                ],
+                "overall_assessment": "No measured values.",
+            }
+        )
+
+    output = tmp_path / "outer_001"
+    with pytest.raises(ValueError, match="catastrophically sparse"):
+        run_fold_analysis(
+            dataset=dataset,
+            definitions=[definition],
+            split=split,
+            clinical_question="Estimate treatment effect.",
+            unit_id_column="patient_id",
+            text_column="clinical_text",
+            treatment_column="treatment_indicator",
+            outcome_column="outcome_indicator",
+            outcome_type="binary",
+            inner_folds=2,
+            seed=19,
+            output_dir=output,
+            request_json=request_json,
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="test-model",
+                workers=1,
+                max_review_rounds=1,
+                estimation_trees=10,
+            ),
+        )
+
+    health = json.loads(
+        (output / "extraction" / "fit_health.json").read_text(encoding="utf-8")
+    )
+    assert health["status"] == "failed"
+    assert health["all_null_rows"] == 6
+    assert not (output / "estimation" / "predictions.csv").exists()
