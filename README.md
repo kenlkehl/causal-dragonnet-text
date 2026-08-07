@@ -716,6 +716,8 @@ nsclc_all_evidence/
       complete.json
     features_by_outer_fold.jsonl
     cross_fitted_predictions.csv
+    posthoc_predictions_with_oracle_ite.csv
+    posthoc_oracle_ite_metrics.json
     causal_estimate.json
     summary.json
     complete.json
@@ -729,6 +731,15 @@ the variables, extraction summaries, performance measurements, and fold-level
 estimates. If a process is interrupted, rerunning the same command skips each
 completed interpretation batch, extraction batch, review round, and fold
 estimate, then re-enters the first incomplete directory.
+
+When the input dataset contains `true_ite_prob`, Stage 2 evaluates its frozen
+cross-fitted `estimated_cate` values against that oracle only after all modeling
+is complete. `causal_estimate.json` reports the overall Pearson and Spearman ITE
+correlations, while `posthoc_oracle_ite_metrics.json` adds error, dispersion,
+ATE-bias, and per-fold diagnostics. The frozen prediction file remains
+oracle-free; the joined audit data is written separately to
+`posthoc_predictions_with_oracle_ite.csv`. For real datasets without an oracle,
+the metrics file records that the evaluation is unavailable.
 
 The stable boundary between the stages is `handoff/evidence.jsonl`.
 `handoff/index.json` identifies the contributing files, and the uncombined

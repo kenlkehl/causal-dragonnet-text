@@ -1382,10 +1382,11 @@ class ResearchAllEvidenceStage1:
                         stage2_completion.get("phase") == "causal_estimation"
                         and (component_dir / "causal_estimate.json").is_file()
                         and (component_dir / "cross_fitted_predictions.csv").is_file()
+                        and (component_dir / "posthoc_oracle_ite_metrics.json").is_file()
                     )
                     if not stage2_is_final:
                         LOGGER.info(
-                            "continue earlier definition-only Stage 2 output: %s",
+                            "continue incomplete or legacy Stage 2 output: %s",
                             component_dir,
                         )
                 if complete_path.is_file() and stage2_is_final:

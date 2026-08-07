@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -1738,6 +1739,60 @@ def test_stage2_interleaves_partial_consolidation_results_between_rounds():
     ]
 
 
+def test_stage2_posthoc_oracle_ite_evaluation_uses_frozen_predictions(tmp_path: Path):
+    prediction_path = tmp_path / "cross_fitted_predictions.csv"
+    estimated = np.array([-0.20, -0.05, 0.10, 0.25, 0.40, 0.55])
+    predictions = pd.DataFrame(
+        {
+            "_oci_row_id": list(range(6)),
+            "outer_fold": [1, 1, 1, 2, 2, 2],
+            "estimated_cate": estimated,
+        }
+    )
+    predictions.to_csv(prediction_path, index=False)
+    frozen_sha256 = stage2_workflow._file_sha256(prediction_path)
+    dataset = pd.DataFrame({"true_ite_prob": 2.0 * estimated + 0.03})
+
+    evaluation = stage2_workflow._evaluate_stage2_oracle_ite(
+        prediction_path=prediction_path,
+        dataset=dataset,
+        output_dir=tmp_path,
+    )
+
+    assert evaluation["available"] is True
+    assert evaluation["evaluation_is_post_hoc"] is True
+    assert evaluation["all_outer_predictions_frozen_before_oracle_join"] is True
+    assert evaluation["frozen_prediction_sha256"] == frozen_sha256
+    assert evaluation["overall"]["pearson_correlation"] == pytest.approx(1.0)
+    assert evaluation["overall"]["spearman_correlation"] == pytest.approx(1.0)
+    assert len(evaluation["per_fold"]) == 2
+    assert (tmp_path / "posthoc_oracle_ite_metrics.json").is_file()
+    assert (tmp_path / "posthoc_predictions_with_oracle_ite.csv").is_file()
+    assert "true_ite_prob" not in pd.read_csv(prediction_path).columns
+
+
+def test_stage2_posthoc_oracle_ite_reports_unavailable_for_real_dataset(tmp_path: Path):
+    prediction_path = tmp_path / "cross_fitted_predictions.csv"
+    pd.DataFrame(
+        {
+            "_oci_row_id": [0, 1],
+            "outer_fold": [1, 1],
+            "estimated_cate": [0.1, 0.2],
+        }
+    ).to_csv(prediction_path, index=False)
+
+    evaluation = stage2_workflow._evaluate_stage2_oracle_ite(
+        prediction_path=prediction_path,
+        dataset=pd.DataFrame({"outcome": [0, 1]}),
+        output_dir=tmp_path,
+    )
+
+    assert evaluation["available"] is False
+    assert "does not contain" in evaluation["reason"]
+    assert (tmp_path / "posthoc_oracle_ite_metrics.json").is_file()
+    assert not (tmp_path / "posthoc_predictions_with_oracle_ite.csv").exists()
+
+
 def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
     handoff = tmp_path / "handoff.jsonl"
     rows = [
@@ -1845,6 +1900,7 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(tmp_path:
             "clinical_text": [f"Pretreatment ECOG {index % 2}." for index in range(40)],
             "treatment_indicator": [int(index % 4 in {1, 3}) for index in range(40)],
             "outcome_indicator": [int(index % 5 in {0, 1}) for index in range(40)],
+            "true_ite_prob": np.linspace(-0.2, 0.2, 40),
         }
     )
     split_path = tmp_path / "split_provenance.jsonl"
@@ -1899,8 +1955,13 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(tmp_path:
 
     assert first["phase"] == "causal_estimation"
     assert first["causal_estimate"]["rows"] == 40
+    assert first["causal_estimate"]["oracle_ite_evaluation"]["available"] is True
+    assert "oracle_ite_pearson_correlation" in first["causal_estimate"]
+    assert "oracle_ite_spearman_correlation" in first["causal_estimate"]
     assert (output / "cross_fitted_predictions.csv").is_file()
     assert (output / "causal_estimate.json").is_file()
+    assert (output / "posthoc_oracle_ite_metrics.json").is_file()
+    assert (output / "posthoc_predictions_with_oracle_ite.csv").is_file()
     assert (output / "outer_001" / "review" / "round_001" / "performance.json").is_file()
     performance = json.loads(
         (output / "outer_001" / "review" / "round_001" / "performance.json").read_text(

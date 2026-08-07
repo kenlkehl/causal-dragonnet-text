@@ -606,6 +606,9 @@ def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path, monkeypatch):
         (output_dir / "cross_fitted_predictions.csv").write_text(
             "_oci_row_id,aipw_score\n", encoding="utf-8"
         )
+        (output_dir / "posthoc_oracle_ite_metrics.json").write_text(
+            '{"available":false}\n', encoding="utf-8"
+        )
         return {
             "phase": "causal_estimation",
             "artifacts": [str(output_dir / "result.txt")],
@@ -649,9 +652,60 @@ def test_definition_only_stage2_marker_is_continued_after_upgrade(tmp_path, monk
         (output_dir / "cross_fitted_predictions.csv").write_text(
             "_oci_row_id,aipw_score\n", encoding="utf-8"
         )
+        (output_dir / "posthoc_oracle_ite_metrics.json").write_text(
+            '{"available":false}\n', encoding="utf-8"
+        )
         return {"phase": "causal_estimation"}
 
     monkeypatch.setattr(stage1_workflow, "run_plain_handoff_stage2", finish_stage2)
+
+    result = ResearchAllEvidenceStage1(config).run()
+
+    assert result["components"]["stage2"]["status"] == "complete"
+    assert len(calls) == 1
+
+
+def test_completed_legacy_stage2_without_oracle_metrics_is_backfilled(
+    tmp_path,
+    monkeypatch,
+):
+    raw, _config = _inputs(tmp_path, components=())
+    raw["run"]["mode"] = "stage2"
+    raw["stage2"] = {
+        "endpoint": "http://stage2.test/v1",
+        "model": "test-model",
+    }
+    config = compile_config(raw, config_dir=tmp_path)
+    handoff = config.output_dir / "handoff" / "evidence.jsonl"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text('{"source":"tfidf"}\n', encoding="utf-8")
+    (handoff.parent / "complete.json").write_text("{}", encoding="utf-8")
+    stage2_dir = config.output_dir / "stage2"
+    stage2_dir.mkdir(parents=True)
+    (stage2_dir / "causal_estimate.json").write_text("{}", encoding="utf-8")
+    (stage2_dir / "cross_fitted_predictions.csv").write_text(
+        "_oci_row_id,aipw_score,estimated_cate\n", encoding="utf-8"
+    )
+    (stage2_dir / "complete.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "component": "stage2",
+                "phase": "causal_estimation",
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def backfill_stage2(*, output_dir, **kwargs):
+        calls.append(kwargs)
+        (output_dir / "posthoc_oracle_ite_metrics.json").write_text(
+            '{"available":false}\n', encoding="utf-8"
+        )
+        return {"phase": "causal_estimation"}
+
+    monkeypatch.setattr(stage1_workflow, "run_plain_handoff_stage2", backfill_stage2)
 
     result = ResearchAllEvidenceStage1(config).run()
 

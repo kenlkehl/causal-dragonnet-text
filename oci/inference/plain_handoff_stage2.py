@@ -116,6 +116,148 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _safe_ite_correlation(
+    truth: Sequence[float],
+    estimate: Sequence[float],
+    *,
+    rank: bool,
+) -> float | None:
+    left = np.asarray(truth, dtype=float)
+    right = np.asarray(estimate, dtype=float)
+    finite = np.isfinite(left) & np.isfinite(right)
+    if int(finite.sum()) < 2:
+        return None
+    left = left[finite]
+    right = right[finite]
+    if rank:
+        left = pd.Series(left).rank(method="average").to_numpy(dtype=float)
+        right = pd.Series(right).rank(method="average").to_numpy(dtype=float)
+    if float(np.std(left)) <= 0.0 or float(np.std(right)) <= 0.0:
+        return None
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def _evaluate_stage2_oracle_ite(
+    *,
+    prediction_path: Path,
+    dataset: pd.DataFrame,
+    output_dir: Path,
+    oracle_ite_column: str = "true_ite_prob",
+) -> dict[str, Any]:
+    """Evaluate frozen cross-fitted ITEs without exposing truth to modeling."""
+
+    prediction_path = Path(prediction_path)
+    output_dir = Path(output_dir)
+    metrics_path = output_dir / "posthoc_oracle_ite_metrics.json"
+    frozen_sha256 = _file_sha256(prediction_path)
+    base: dict[str, Any] = {
+        "schema_version": "stage2_posthoc_oracle_ite_v1",
+        "available": False,
+        "evaluation_is_post_hoc": True,
+        "all_outer_predictions_frozen_before_oracle_join": True,
+        "oracle_columns_consumed_by_modeling": False,
+        "oracle_ite_column": oracle_ite_column,
+        "estimated_ite_column": "estimated_cate",
+        "frozen_prediction_path": str(prediction_path),
+        "frozen_prediction_sha256": frozen_sha256,
+        "metrics_path": str(metrics_path),
+    }
+    if oracle_ite_column not in dataset.columns:
+        payload = {
+            **base,
+            "reason": f"dataset does not contain {oracle_ite_column!r}",
+        }
+        _write_json(metrics_path, payload)
+        return payload
+
+    predictions = pd.read_csv(prediction_path)
+    if any(str(column).startswith("true_") for column in predictions.columns):
+        raise RuntimeError("frozen Stage 2 predictions contain an oracle column")
+    required = {"_oci_row_id", "outer_fold", "estimated_cate"}
+    missing = sorted(required - set(predictions.columns))
+    if missing:
+        raise ValueError(f"frozen Stage 2 predictions lack required columns: {missing}")
+
+    oracle_values = pd.to_numeric(dataset[oracle_ite_column], errors="coerce")
+    if oracle_values.isna().any() or not np.isfinite(oracle_values.to_numpy(dtype=float)).all():
+        payload = {
+            **base,
+            "reason": f"dataset column {oracle_ite_column!r} is not complete and finite",
+        }
+        _write_json(metrics_path, payload)
+        return payload
+    oracle = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(len(dataset), dtype=int),
+            oracle_ite_column: oracle_values.to_numpy(dtype=float),
+        }
+    )
+    evaluated = predictions.merge(
+        oracle,
+        on="_oci_row_id",
+        how="left",
+        validate="one_to_one",
+    )
+    if len(evaluated) != len(dataset) or evaluated[oracle_ite_column].isna().any():
+        raise ValueError("oracle ITE join did not cover every frozen Stage 2 prediction")
+
+    def metrics_for(frame: pd.DataFrame) -> dict[str, Any]:
+        truth = frame[oracle_ite_column].to_numpy(dtype=float)
+        estimate = pd.to_numeric(frame["estimated_cate"], errors="coerce").to_numpy(
+            dtype=float
+        )
+        finite = np.isfinite(truth) & np.isfinite(estimate)
+        truth = truth[finite]
+        estimate = estimate[finite]
+        if not len(truth):
+            return {
+                "n": int(len(frame)),
+                "finite_pairs": 0,
+                "pearson_correlation": None,
+                "spearman_correlation": None,
+                "mae": None,
+                "rmse": None,
+                "mean_error": None,
+                "mean_estimated_ite": None,
+                "oracle_ate": None,
+                "ate_bias": None,
+                "estimated_ite_standard_deviation": None,
+                "oracle_ite_standard_deviation": None,
+            }
+        error = estimate - truth
+        return {
+            "n": int(len(frame)),
+            "finite_pairs": int(len(truth)),
+            "pearson_correlation": _safe_ite_correlation(truth, estimate, rank=False),
+            "spearman_correlation": _safe_ite_correlation(truth, estimate, rank=True),
+            "mae": float(np.mean(np.abs(error))),
+            "rmse": float(np.sqrt(np.mean(np.square(error)))),
+            "mean_error": float(np.mean(error)),
+            "mean_estimated_ite": float(np.mean(estimate)),
+            "oracle_ate": float(np.mean(truth)),
+            "ate_bias": float(np.mean(estimate) - np.mean(truth)),
+            "estimated_ite_standard_deviation": float(np.std(estimate)),
+            "oracle_ite_standard_deviation": float(np.std(truth)),
+        }
+
+    evaluated_path = output_dir / "posthoc_predictions_with_oracle_ite.csv"
+    temporary = evaluated_path.with_name(f".{evaluated_path.name}.{os.getpid()}.tmp")
+    evaluated.to_csv(temporary, index=False)
+    os.replace(temporary, evaluated_path)
+    payload = {
+        **base,
+        "available": True,
+        "predictions_with_oracle_path": str(evaluated_path),
+        "overall": metrics_for(evaluated),
+        "per_fold": [
+            {"outer_fold": int(fold), **metrics_for(frame)}
+            for fold, frame in evaluated.groupby("outer_fold", sort=True)
+        ],
+    }
+    _write_json(metrics_path, payload)
+    return payload
+
+
 def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
     with Path(path).open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -2638,6 +2780,12 @@ class PlainHandoffStage2:
             temporary = predictions_path.with_name(f".{predictions_path.name}.{os.getpid()}.tmp")
             predictions.to_csv(temporary, index=False)
             os.replace(temporary, predictions_path)
+            oracle_ite_evaluation = _evaluate_stage2_oracle_ite(
+                prediction_path=predictions_path,
+                dataset=dataset,
+                output_dir=output_dir,
+            )
+            oracle_overall = dict(oracle_ite_evaluation.get("overall") or {})
             scores = predictions["aipw_score"].to_numpy(dtype=float)
             scores = scores[np.isfinite(scores)]
             if not len(scores):
@@ -2658,6 +2806,13 @@ class PlainHandoffStage2:
                     else None
                 ),
                 "mean_estimated_cate": float(predictions["estimated_cate"].mean()),
+                "oracle_ite_pearson_correlation": oracle_overall.get(
+                    "pearson_correlation"
+                ),
+                "oracle_ite_spearman_correlation": oracle_overall.get(
+                    "spearman_correlation"
+                ),
+                "oracle_ite_evaluation": oracle_ite_evaluation,
                 "predictions_path": str(predictions_path),
             }
             causal_path = output_dir / "causal_estimate.json"
@@ -2669,7 +2824,15 @@ class PlainHandoffStage2:
                     "cross_fitted_predictions_path": str(predictions_path),
                 }
             )
-            artifacts.extend([str(predictions_path), str(causal_path)])
+            artifacts.extend(
+                [
+                    str(predictions_path),
+                    str(causal_path),
+                    str(output_dir / "posthoc_oracle_ite_metrics.json"),
+                ]
+            )
+            if oracle_ite_evaluation.get("available"):
+                artifacts.append(str(output_dir / "posthoc_predictions_with_oracle_ite.csv"))
         else:
             summary["phase"] = "feature_definitions"
         _write_json(output_dir / "summary.json", summary)

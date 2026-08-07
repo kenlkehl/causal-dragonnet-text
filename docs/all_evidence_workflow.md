@@ -308,6 +308,8 @@ my_stage1_run/
       complete.json
     features_by_outer_fold.jsonl
     cross_fitted_predictions.csv
+    posthoc_predictions_with_oracle_ite.csv
+    posthoc_oracle_ite_metrics.json
     causal_estimate.json
     summary.json
     complete.json
@@ -367,6 +369,15 @@ is the empirical standard error of those scores. `estimated_cate` in the
 prediction file comes from a random-forest effect model trained on cross-fitted
 training-fold pseudo-outcomes and the variables assigned an effect-modifier
 role.
+
+If the dataset supplies `true_ite_prob`, Stage 2 hashes and freezes
+`cross_fitted_predictions.csv` before joining that oracle column. The final
+`causal_estimate.json` includes overall Pearson and Spearman correlations
+between `estimated_cate` and oracle ITE. Detailed overall and per-fold
+correlations, MAE, RMSE, ATE bias, and ITE dispersion are written to
+`posthoc_oracle_ite_metrics.json`; the joined rows are stored separately in
+`posthoc_predictions_with_oracle_ite.csv`. Without an oracle column, the same
+metrics file records `available: false`.
 
 To intentionally rerun one component, use:
 
