@@ -47,6 +47,7 @@ oci/inference/plain_handoff_stage2_analysis.py
 oci/inference/plain_handoff_stage2_evidence.py
 oci/inference/post_extraction_scientific_policy.py
 oci/inference/research_all_evidence_stage1.py
+oci/inference/research_all_evidence_workflow.py
 oci/inference/sklearn_nmf_compat.py
 oci/inference/tfidf_safe_artifacts.py
 oci/inference/tfidf_topic_agentic_forest.py
@@ -114,7 +115,7 @@ tests/test_lossless_model_tokenization.py
 tests/test_plain_handoff_stage2.py
 tests/test_plain_handoff_stage2_evidence.py
 tests/test_post_extraction_scientific_policy.py
-tests/test_research_all_evidence_stage1.py
+tests/test_research_all_evidence_workflow.py
 tests/test_strict_causal_forest_runtime.py
 tests/test_text_chunking.py
 tests/test_tfidf_joint_nuisance_parallel.py

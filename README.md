@@ -747,7 +747,7 @@ per-component JSONL files remain beside it. Python consumers can stream the
 combined handoff without loading it into memory:
 
 ```python
-from oci.inference.research_all_evidence_stage1 import iter_stage1_handoff
+from oci.inference.research_all_evidence_workflow import iter_stage1_handoff
 
 for evidence_context in iter_stage1_handoff("/results/nsclc_all_evidence"):
     process(evidence_context)

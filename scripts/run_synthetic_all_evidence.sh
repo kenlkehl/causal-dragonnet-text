@@ -127,7 +127,7 @@ echo "HTR modeling:   $([[ "${disable_htr}" == "1" ]] && echo disabled || echo e
 
 export PYTHONUNBUFFERED=1
 
-exec "${python_bin}" -m oci.inference.research_all_evidence_stage1 \
+exec "${python_bin}" -m oci.inference.research_all_evidence_workflow \
     --dataset "${dataset}" \
     --output-dir "${output_dir}" \
     --unit-id-column patient_id \

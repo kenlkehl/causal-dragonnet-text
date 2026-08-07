@@ -7,15 +7,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-import oci.inference.research_all_evidence_stage1 as stage1_workflow
+import oci.inference.research_all_evidence_workflow as all_evidence_workflow
 import oci.inference.multi_model_forest as multi_model_workflow
 
 from oci.inference.embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
 )
-from oci.inference.research_all_evidence_stage1 import (
+from oci.inference.research_all_evidence_workflow import (
     COMPONENT_ORDER,
-    ResearchAllEvidenceStage1,
+    ResearchAllEvidenceWorkflow,
     Stage1RunContext,
     _context_execution_lanes,
     _lane_cpu_worker_budgets,
@@ -81,6 +81,20 @@ def _inputs(tmp_path: Path, *, components=COMPONENT_ORDER):
     return raw, compile_config(raw, config_dir=tmp_path)
 
 
+def test_stage1_era_module_and_class_names_remain_compatible():
+    import oci.inference.research_all_evidence_stage1 as legacy_workflow
+
+    assert (
+        legacy_workflow.ResearchAllEvidenceWorkflow
+        is ResearchAllEvidenceWorkflow
+    )
+    assert (
+        legacy_workflow.ResearchAllEvidenceStage1
+        is ResearchAllEvidenceWorkflow
+    )
+    assert legacy_workflow.main is all_evidence_workflow.main
+
+
 def test_compile_config_keeps_run_and_science_in_one_file(tmp_path):
     _raw, config = _inputs(tmp_path, components=("text_models",))
 
@@ -103,7 +117,7 @@ def test_resolved_context_uses_multi_model_forest_embedding_config(tmp_path):
     }
     config = compile_config(raw, config_dir=tmp_path)
 
-    context = ResearchAllEvidenceStage1(config)._resolved_context()
+    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
     architecture = context.applied_config.architecture
     generator = EmbeddingContrastEvidenceGenerator(
         config=context.applied_config,
@@ -131,7 +145,7 @@ def test_disable_htr_keeps_bow_and_embedding_without_scheduling_htr(
         }
     }
     config = compile_config(raw, config_dir=tmp_path)
-    context = ResearchAllEvidenceStage1(config)._resolved_context()
+    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
     model_config = context.applied_config.architecture.multi_model_forest
 
     assert config.htr_enabled is False
@@ -148,7 +162,7 @@ def test_disable_htr_keeps_bow_and_embedding_without_scheduling_htr(
         return [{"outer_fold": 1, "scope": "full_outer_train"}]
 
     monkeypatch.setattr(multi_model_workflow, "_run_handoff_contexts", run_contexts)
-    row = stage1_workflow._run_one_text_model_context(
+    row = all_evidence_workflow._run_one_text_model_context(
         dataset=context.dataset,
         applied_config=context.applied_config,
         spec={
@@ -172,7 +186,7 @@ def test_text_model_context_serializes_nonfinite_diagnostics_as_null(
 ):
     raw, _config = _inputs(tmp_path, components=("text_models",))
     config = compile_config(raw, config_dir=tmp_path)
-    context = ResearchAllEvidenceStage1(config)._resolved_context()
+    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
 
     def run_contexts(**_kwargs):
         return [
@@ -191,7 +205,7 @@ def test_text_model_context_serializes_nonfinite_diagnostics_as_null(
 
     monkeypatch.setattr(multi_model_workflow, "_run_handoff_contexts", run_contexts)
     context_dir = tmp_path / "nonfinite_context"
-    row = stage1_workflow._run_one_text_model_context(
+    row = all_evidence_workflow._run_one_text_model_context(
         dataset=context.dataset,
         applied_config=context.applied_config,
         spec={
@@ -264,7 +278,7 @@ def test_text_model_handoff_row_omits_empty_htr_evidence():
 def test_simple_runner_uses_processes_for_tfidf_contexts_by_default(tmp_path):
     raw, config = _inputs(tmp_path, components=("tfidf",))
 
-    default_mapping = stage1_workflow._load_stage1_template(config)
+    default_mapping = all_evidence_workflow._load_stage1_template(config)
     default_multi_model = default_mapping["architecture"]["multi_model_forest"]
 
     assert default_multi_model["outer_parallel_backend"] == "processes"
@@ -274,7 +288,7 @@ def test_simple_runner_uses_processes_for_tfidf_contexts_by_default(tmp_path):
         "multi_model_forest": {"outer_parallel_backend": "threads"}
     }
     overridden = compile_config(raw, config_dir=tmp_path)
-    overridden_mapping = stage1_workflow._load_stage1_template(overridden)
+    overridden_mapping = all_evidence_workflow._load_stage1_template(overridden)
 
     assert (
         overridden_mapping["architecture"]["multi_model_forest"][
@@ -285,7 +299,7 @@ def test_simple_runner_uses_processes_for_tfidf_contexts_by_default(tmp_path):
 
 
 def test_default_all_evidence_htr_training_uses_30_epochs():
-    mapping = json.loads(stage1_workflow.DEFAULT_STAGE1_TEMPLATE.read_text(encoding="utf-8"))
+    mapping = json.loads(all_evidence_workflow.DEFAULT_STAGE1_TEMPLATE.read_text(encoding="utf-8"))
     htr_config = mapping["config"]["architecture"][
         "agentic_attention_variable_forest"
     ]
@@ -308,7 +322,7 @@ def test_completed_components_are_reported_already_complete_without_revalidation
         return run
 
     runners = {name: runner(name) for name in COMPONENT_ORDER}
-    workflow = ResearchAllEvidenceStage1(config, component_runners=runners)
+    workflow = ResearchAllEvidenceWorkflow(config, component_runners=runners)
     first = workflow.run()
 
     assert first["status"] == "complete"
@@ -347,7 +361,7 @@ def test_partial_component_is_reentered_after_interruption(tmp_path):
         (component_dir / "partial.txt").write_text("keep me", encoding="utf-8")
         raise RuntimeError("interrupted model")
 
-    workflow = ResearchAllEvidenceStage1(
+    workflow = ResearchAllEvidenceWorkflow(
         config,
         component_runners={
             "embedding_cache": embedding,
@@ -367,7 +381,7 @@ def test_partial_component_is_reentered_after_interruption(tmp_path):
         assert (component_dir / "partial.txt").read_text(encoding="utf-8") == "keep me"
         (component_dir / "result.txt").write_text("done", encoding="utf-8")
 
-    resumed = ResearchAllEvidenceStage1(
+    resumed = ResearchAllEvidenceWorkflow(
         config,
         component_runners={
             "embedding_cache": embedding,
@@ -461,22 +475,22 @@ def test_text_model_contexts_are_independently_resumable(tmp_path, monkeypatch):
         (context_dir / "complete.json").write_text("{}", encoding="utf-8")
         return row
 
-    monkeypatch.setattr(stage1_workflow, "_run_one_text_model_context", fit_one)
+    monkeypatch.setattr(all_evidence_workflow, "_run_one_text_model_context", fit_one)
     component_dir = context.component_dir("text_models")
-    first = stage1_workflow._text_models_component(context, component_dir)
+    first = all_evidence_workflow._text_models_component(context, component_dir)
     expected_contexts = 2 * (1 + 2)
 
     assert first["contexts"] == expected_contexts
     assert len(calls) == expected_contexts
 
     calls.clear()
-    second = stage1_workflow._text_models_component(context, component_dir)
+    second = all_evidence_workflow._text_models_component(context, component_dir)
     assert second["contexts"] == expected_contexts
     assert calls == []
 
     marker = component_dir / "outer_001_inner_001" / "complete.json"
     marker.unlink()
-    stage1_workflow._text_models_component(context, component_dir)
+    all_evidence_workflow._text_models_component(context, component_dir)
     assert calls == ["outer_001_inner_001"]
 
 
@@ -508,7 +522,7 @@ def test_cpu_worker_budget_is_divided_without_being_duplicated():
 
 def test_handoff_runner_parallelizes_bow_folds_with_threads(tmp_path):
     _raw, config = _inputs(tmp_path, components=("text_models",))
-    context = ResearchAllEvidenceStage1(config)._resolved_context()
+    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
 
     optimized = multi_model_workflow._config_for_handoff_runner(context.applied_config)
     text_config = optimized.architecture.multi_model_agentic_forest
@@ -607,7 +621,7 @@ def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path, monkeypatch):
     handoff.parent.mkdir(parents=True)
     handoff.write_text('{"source":"tfidf"}\n', encoding="utf-8")
     (handoff.parent / "complete.json").write_text("{}", encoding="utf-8")
-    workflow = ResearchAllEvidenceStage1(config)
+    workflow = ResearchAllEvidenceWorkflow(config)
 
     calls = []
 
@@ -627,7 +641,7 @@ def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path, monkeypatch):
             "artifacts": [str(output_dir / "result.txt")],
         }
 
-    monkeypatch.setattr(stage1_workflow, "run_plain_handoff_stage2", run_stage2)
+    monkeypatch.setattr(all_evidence_workflow, "run_plain_handoff_stage2", run_stage2)
 
     first = workflow.run()
     assert first["mode"] == "stage2"
@@ -670,9 +684,9 @@ def test_definition_only_stage2_marker_is_continued_after_upgrade(tmp_path, monk
         )
         return {"phase": "causal_estimation"}
 
-    monkeypatch.setattr(stage1_workflow, "run_plain_handoff_stage2", finish_stage2)
+    monkeypatch.setattr(all_evidence_workflow, "run_plain_handoff_stage2", finish_stage2)
 
-    result = ResearchAllEvidenceStage1(config).run()
+    result = ResearchAllEvidenceWorkflow(config).run()
 
     assert result["components"]["stage2"]["status"] == "complete"
     assert len(calls) == 1
@@ -718,9 +732,9 @@ def test_completed_legacy_stage2_without_oracle_metrics_is_backfilled(
         )
         return {"phase": "causal_estimation"}
 
-    monkeypatch.setattr(stage1_workflow, "run_plain_handoff_stage2", backfill_stage2)
+    monkeypatch.setattr(all_evidence_workflow, "run_plain_handoff_stage2", backfill_stage2)
 
-    result = ResearchAllEvidenceStage1(config).run()
+    result = ResearchAllEvidenceWorkflow(config).run()
 
     assert result["components"]["stage2"]["status"] == "complete"
     assert len(calls) == 1

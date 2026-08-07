@@ -322,7 +322,7 @@ the original per-family JSONL files remain beside it. Python consumers can
 stream the combined rows with:
 
 ```python
-from oci.inference.research_all_evidence_stage1 import iter_stage1_handoff
+from oci.inference.research_all_evidence_workflow import iter_stage1_handoff
 
 for evidence_context in iter_stage1_handoff("/results/my_stage1_run"):
     ...

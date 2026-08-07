@@ -12,7 +12,7 @@ os.environ.setdefault(
     str(Path(tempfile.gettempdir()) / "oci-matplotlib"),
 )
 
-from oci.inference.research_all_evidence_stage1 import main
+from oci.inference.research_all_evidence_workflow import main
 
 if __name__ == "__main__":
     raise SystemExit(main())
