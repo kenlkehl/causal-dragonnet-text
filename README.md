@@ -36,7 +36,7 @@ pip install -e ".[extraction]"  # Optional API-based extraction clients.
 ## Try the complete Stage 1 → 2 workflow
 
 Start an OpenAI-compatible language-model server for Stage 2. The example
-launcher expects it at `http://127.0.0.1:8000/v1` and automatically uses the
+launcher expects it at `http://127.0.0.1:8010/v1` and automatically uses the
 only model advertised by its `/models` endpoint. Then run the bundled
 one-confounder, one-effect-modifier NSCLC experiment:
 
@@ -573,8 +573,22 @@ When a Stage 2 endpoint has been configured, the same entry point can run the
 complete second stage against an existing handoff:
 
 ```bash
-uv run python scripts/run_all_evidence.py --config run.json --stage2-only
+OPENBLAS_NUM_THREADS=1 \
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+uv run python scripts/run_all_evidence.py \
+  --config run.json \
+  --stage2-only \
+  --stage2-endpoint http://127.0.0.1:8010/v1
 ```
+
+Set these thread limits before starting Python on high-core-count machines.
+Stage 2 already controls request concurrency with `stage2.workers`; allowing
+OpenBLAS, OpenMP, MKL, or NumExpr to create another native thread pool per
+concurrent task can exhaust OpenBLAS's thread metadata or memory regions and
+terminate the process. A configured `stage2.model` is reused; otherwise the
+runner discovers the sole model advertised by the endpoint.
 
 A configured endpoint makes the unflagged default a full Stage 1 and Stage 2
 run. The API key may be stored in `stage2.api_key` or supplied through
@@ -583,7 +597,7 @@ run. The API key may be stored in `stage2.api_key` or supplied through
 ```json
 {
   "stage2": {
-    "endpoint": "http://127.0.0.1:8000/v1",
+    "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
     "request_timeout": 7200,
