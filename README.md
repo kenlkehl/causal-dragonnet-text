@@ -1,22 +1,80 @@
 # Oncology Causal Inference (OCI)
 
-OCI is a research codebase for studying treatment-effect heterogeneity in
-longitudinal clinical text. It is designed for observational settings in which
-important pretreatment characteristics are described in notes but are absent,
-incomplete, or coarsely represented in structured data.
+OCI is a research codebase for finding clinically meaningful pretreatment
+characteristics in longitudinal notes and using them in fold-honest causal
+analyses of treatment effects and treatment-effect heterogeneity. Its primary
+workflow triangulates evidence from multiple lexical, neural, semantic, and
+matched-patient models in Stage 1, then uses Stage 2 to interpret that evidence,
+define measurable patient variables, extract them without crossing patient or
+fold boundaries, and estimate causal effects with diagnostics.
 
-The central methodological problem is not simply to predict treatment or
-outcome from text. A term can be highly predictive without identifying a
-well-defined patient characteristic, and a predictive characteristic does not
-automatically have a causal role. OCI therefore separates feature discovery
-from causal estimation. Its all-evidence workflow first asks several different
-text models what the cohort appears to contain. A subsequent stage interprets
-that evidence, defines measurable patient variables, and uses those variables
-in a fold-honest causal analysis.
+## Installation
 
-This repository also contains standalone neural and non-neural treatment-effect
-models. Those models are useful for benchmarking and focused experiments, but
-they should not be confused with the all-evidence workflow described below.
+OCI supports Python 3.12 and 3.13 and uses
+[`uv`](https://docs.astral.sh/uv/) for reproducible environments. The complete
+multi-model workflow requires NVIDIA CUDA GPUs; the default embedding model
+needs approximately 20 GiB of free VRAM on each selected GPU. FFmpeg's shared
+libraries are also required by the locked text-model environment.
+
+On Debian or Ubuntu, install the system dependency and then create the project
+environment:
+
+```bash
+sudo apt-get install ffmpeg
+git clone https://github.com/kenlkehl/onc-causal-inference.git
+cd onc-causal-inference
+uv sync --frozen
+```
+
+An editable `pip` installation is also supported when `uv` is not desired:
+
+```bash
+pip install -e .
+pip install -e ".[extraction]"  # Optional API-based extraction clients.
+```
+
+## Try the complete Stage 1 → 2 workflow
+
+Start an OpenAI-compatible language-model server for Stage 2. The example
+launcher expects it at `http://127.0.0.1:8000/v1` and automatically uses the
+only model advertised by its `/models` endpoint. Then run the bundled
+one-confounder, one-effect-modifier NSCLC experiment:
+
+```bash
+./run_one_conf_one_mod.sh
+```
+
+That single command synchronizes the environment, discovers visible GPUs and
+their free VRAM, selects every GPU with at least 20 GiB free, sizes Stage 1 CPU
+workers and Stage 2 request concurrency, and runs or resumes the complete
+multi-model workflow. Results default to
+`artifacts/research_all_evidence/one_conf_one_mod_nsclc_full/`.
+
+The most useful overrides are environment variables:
+
+```bash
+# Use exactly two eligible visible GPUs.
+GPU_COUNT=2 ./run_one_conf_one_mod.sh
+
+# Use exact host GPU IDs; CUDA remaps these to logical devices for the run.
+PHYSICAL_GPUS=1,3 ./run_one_conf_one_mod.sh
+
+# Use a server on another port and bypass model autodiscovery if needed.
+STAGE2_ENDPOINT=http://127.0.0.1:8002/v1 \
+STAGE2_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4 \
+./run_one_conf_one_mod.sh
+```
+
+`GPU_COUNT` and `PHYSICAL_GPUS` are mutually exclusive. Advanced overrides are
+`MIN_FREE_GPU_GB`, `STAGE1_WORKERS`, `STAGE2_WORKERS`, `DISABLE_HTR`, and
+`STAGE2_ENDPOINT` (set it to an empty string for a Stage-1-only run). Set
+`OCI_PYTHON` to an existing environment's interpreter to skip `uv sync`. An
+optional positional argument changes the output directory. The larger synthetic
+example uses the identical hardware and endpoint behavior:
+
+```bash
+./run_five_conf_five_mod.sh
+```
 
 ## Scientific setting
 
@@ -341,33 +399,6 @@ reducing all evidence to a global importance ranking.
 
 ## Running the all-evidence workflow
 
-### Installation
-
-OCI supports Python 3.12 and 3.13. A CUDA-capable GPU is required for the neural
-and embedding models, although the TF-IDF models can run on CPUs.
-
-```bash
-git clone https://github.com/kenlkehl/onc-causal-inference.git
-cd onc-causal-inference
-uv sync --frozen
-```
-
-The committed cloud launchers use the repository-local `.venv`. Each launcher
-runs `uv sync --frozen` from the repository root and then invokes
-`.venv/bin/python` directly. An unrelated activated environment is therefore
-not used by these runs.
-
-An editable `pip` installation is also supported:
-
-```bash
-pip install -e .
-pip install -e ".[extraction]"  # This adds optional API-based extraction clients.
-```
-
-TorchCodec requires shared FFmpeg libraries. On Debian or Ubuntu, a missing
-`libavutil` error can be resolved with `sudo apt-get install ffmpeg`. The
-committed cloud example launcher performs this check before it starts.
-
 ### Dataset requirements
 
 The researcher-facing runner accepts Parquet and CSV files. A cohort should have
@@ -472,17 +503,11 @@ uv run python scripts/run_all_evidence.py \
   --stage1-only
 ```
 
-The bundled one-confounder, one-effect-modifier NSCLC example has a dedicated
-foreground cloud launcher:
+The bundled one-confounder, one-effect-modifier NSCLC example can also write to
+an explicit output directory:
 
 ```bash
-./run_one_conf_one_mod_cloud_8gpu.sh
-```
-
-An optional argument selects another output directory:
-
-```bash
-./run_one_conf_one_mod_cloud_8gpu.sh /persistent/results/nsclc_example
+./run_one_conf_one_mod.sh /persistent/results/nsclc_example
 ```
 
 ### Parallel execution
@@ -562,7 +587,6 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
     "request_timeout": 7200,
-    "max_tokens": 25000,
     "evidence_compiler": "semantic_cluster_cards_v1",
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,

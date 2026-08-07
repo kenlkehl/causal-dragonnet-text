@@ -99,7 +99,6 @@ effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
     "model": "Qwen/Qwen3-32B",
     "workers": 8,
     "request_timeout": 7200,
-    "max_tokens": 25000,
     "evidence_compiler": "semantic_cluster_cards_v1",
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,

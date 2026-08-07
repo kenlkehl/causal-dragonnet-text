@@ -92,6 +92,12 @@ def _normalized_category_values(*, value_type: Any, values: Sequence[Any]) -> li
         ]
         if len(separated) > 1:
             normalized = separated
+    if normalized_type == "binary" and len(normalized) == 1:
+        slash_separated = [
+            part.strip() for part in normalized[0].split("/") if part.strip()
+        ]
+        if len(slash_separated) == 2:
+            normalized = slash_separated
 
     expand_integer_ranges = normalized_type in {"binary", "ordinal"} or (
         normalized_type == "categorical" and len(normalized) == 1
@@ -460,7 +466,42 @@ def _request_validated_extraction(
     except ValueError as exc:
         category_error = _category_error_from_exception(exc)
         if category_error is None:
-            raise
+            feature_names = [str(definition["name"]) for definition in definitions]
+            conservative = {
+                "rows": [
+                    {
+                        "row_id": int(row_id),
+                        "values": {name: None for name in feature_names},
+                    }
+                    for row_id in row_ids
+                ]
+            }
+            validated = _validate_extraction(
+                conservative,
+                row_ids=row_ids,
+                definitions=definitions,
+            )
+            failure_path = ontology_audit_path.with_name("extraction_failure.json")
+            _write_json(
+                failure_path,
+                {
+                    "schema_version": "stage2_extraction_failure_v1",
+                    "resolution": "conservative_all_null",
+                    "failed_at": _now(),
+                    "row_ids": [int(row_id) for row_id in row_ids],
+                    "feature_names": feature_names,
+                    "validation_error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            LOGGER.warning(
+                "Stage 2 extraction remained structurally invalid after repairs; "
+                "replacing %s extracted value(s) for %s patient(s) with null (%s: %s)",
+                len(feature_names) * len(row_ids),
+                len(row_ids),
+                type(exc).__name__,
+                exc,
+            )
+            return validated
 
     items, targets = _category_ontology_plan(category_error)
     LOGGER.warning(
@@ -811,6 +852,58 @@ def extract_rows(
             )
         )
 
+    # Snapshot every saved singleton result before concurrent workers begin
+    # rewriting the newly numbered batch directories.  Removing an old
+    # multi-patient batch shifts every later singleton's batch number, but its
+    # row_id remains a stable identity that lets us safely relocate it.
+    singleton_checkpoints: dict[int, list[dict[str, Any]]] = {}
+    for saved_dir in sorted((output_dir / "batches").glob("batch_*")):
+        if not saved_dir.is_dir() or saved_dir.is_symlink():
+            continue
+        saved_complete_path = saved_dir / "complete.json"
+        saved_result_path = saved_dir / "result.json"
+        saved_manifest_path = saved_dir / "row_ids.json"
+        saved_audit_path = saved_dir / "category_ontology_repair.json"
+        if not (
+            saved_complete_path.is_file()
+            and saved_result_path.is_file()
+            and saved_manifest_path.is_file()
+        ):
+            continue
+        if _stale_category_ontology_audit(saved_audit_path) is not None:
+            continue
+        try:
+            saved_completion = json.loads(saved_complete_path.read_text(encoding="utf-8"))
+            saved_result = json.loads(saved_result_path.read_text(encoding="utf-8"))
+            saved_row_ids = json.loads(saved_manifest_path.read_text(encoding="utf-8"))
+            saved_audit = (
+                json.loads(saved_audit_path.read_text(encoding="utf-8"))
+                if saved_audit_path.is_file()
+                else None
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(saved_completion, Mapping)
+            or saved_completion.get("status") != "complete"
+            or not isinstance(saved_result, Mapping)
+            or not isinstance(saved_row_ids, list)
+            or len(saved_row_ids) != 1
+        ):
+            continue
+        try:
+            saved_row_id = int(saved_row_ids[0])
+        except (TypeError, ValueError):
+            continue
+        singleton_checkpoints.setdefault(saved_row_id, []).append(
+            {
+                "source_dir": saved_dir,
+                "completion": dict(saved_completion),
+                "result": dict(saved_result),
+                "category_ontology_audit": saved_audit,
+            }
+        )
+
     def run_batch(index: int, batch: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         if len(batch) != 1:  # pragma: no cover - enforced by the planner
             raise RuntimeError("Stage 2 extraction planner created a multi-patient batch")
@@ -828,23 +921,87 @@ def extract_rows(
             }
         )
         stale_audit = _stale_category_ontology_audit(ontology_audit_path)
-        if complete_path.is_file() and result_path.is_file() and stale_audit is None:
-            try:
-                completion = json.loads(complete_path.read_text(encoding="utf-8"))
-                cached = json.loads(result_path.read_text(encoding="utf-8"))
+        candidates = list(singleton_checkpoints.get(row_ids[0], []))
+        candidates.sort(
+            key=lambda candidate: (
+                0
                 if (
-                    completion.get("schema_version") == EXTRACTION_CHECKPOINT_SCHEMA_VERSION
-                    and completion.get("input_fingerprint") == input_fingerprint
-                ):
-                    return list(
-                        _validate_extraction(
-                            cached,
-                            row_ids=row_ids,
-                            definitions=definitions,
-                        )["rows"]
+                    candidate["completion"].get("schema_version")
+                    == EXTRACTION_CHECKPOINT_SCHEMA_VERSION
+                    and candidate["completion"].get("input_fingerprint")
+                    == input_fingerprint
+                )
+                else 1,
+                str(candidate["source_dir"]),
+            )
+        )
+        for candidate in candidates:
+            completion = candidate["completion"]
+            schema_version = completion.get("schema_version")
+            if schema_version == EXTRACTION_CHECKPOINT_SCHEMA_VERSION:
+                if completion.get("input_fingerprint") != input_fingerprint:
+                    continue
+            elif schema_version is not None:
+                continue
+            try:
+                validated = _validate_extraction(
+                    candidate["result"],
+                    row_ids=row_ids,
+                    definitions=definitions,
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            source_dir = Path(candidate["source_dir"])
+            legacy = schema_version is None
+            relocated = source_dir != batch_dir
+            if not legacy and not relocated and stale_audit is None:
+                return list(validated["rows"])
+
+            batch_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(batch_dir / "row_ids.json", row_ids)
+            _write_json(result_path, validated)
+            source_audit = candidate.get("category_ontology_audit")
+            if isinstance(source_audit, Mapping):
+                _write_json(ontology_audit_path, source_audit)
+            elif ontology_audit_path.is_file():
+                try:
+                    previous_audit = json.loads(
+                        ontology_audit_path.read_text(encoding="utf-8")
                     )
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                pass
+                except (OSError, json.JSONDecodeError):
+                    previous_audit = None
+                _write_json(
+                    ontology_audit_path,
+                    {
+                        "schema_version": "stage2_category_ontology_repair_v1",
+                        "resolution": "superseded_by_single_patient_checkpoint_reindex",
+                        "superseded_at": _now(),
+                        "previous_audit": previous_audit,
+                    },
+                )
+            _write_json(
+                complete_path,
+                {
+                    "status": "complete",
+                    "schema_version": EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                    "input_fingerprint": input_fingerprint,
+                    "completed_at": completion.get("completed_at") or _now(),
+                    "rows": 1,
+                    "adopted_legacy_single_patient_checkpoint": legacy,
+                    "relocated_single_patient_checkpoint": relocated,
+                    "checkpoint_source": str(source_dir),
+                    "adopted_at": _now(),
+                },
+            )
+            LOGGER.info(
+                "%s single-patient Stage 2 extraction checkpoint: %s -> %s",
+                "relocate" if relocated else "adopt legacy",
+                source_dir,
+                batch_dir,
+            )
+            return list(validated["rows"])
+
+        if complete_path.is_file() or result_path.is_file():
             LOGGER.info("rerun incompatible Stage 2 extraction checkpoint: %s", batch_dir)
         if stale_audit is not None:
             LOGGER.info("retry stale Stage 2 category ontology batch: %s", batch_dir)

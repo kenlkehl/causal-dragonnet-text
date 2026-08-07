@@ -31,7 +31,6 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.model == ""
     assert config.request_timeout == 7_200.0
     assert config.transport_max_attempts == 3
-    assert config.max_tokens == 25_000
     assert config.evidence_compiler == "semantic_cluster_cards_v1"
     assert config.evidence_max_cards_per_fold == 400
     assert config.consolidation_oversample_factor == 4
@@ -42,13 +41,16 @@ def test_stage2_ignores_legacy_extraction_batch_size(caplog):
         {
             "endpoint": "http://stage2.test/v1",
             "extraction_batch_size": 100,
+            "max_tokens": 25_000,
         },
         default_workers=8,
     )
 
     assert config is not None
     assert "extraction_batch_size" not in config.public_dict()
+    assert "max_tokens" not in config.public_dict()
     assert "permanently isolated to one patient per prompt" in caplog.text
+    assert "does not send an output-token limit" in caplog.text
 
 
 def test_stage2_autodiscovers_the_only_served_model(monkeypatch):
@@ -359,6 +361,10 @@ def test_ordinal_integer_range_is_expanded_in_prompt_and_validation():
         value_type="categorical",
         values=["0-4", "5-9"],
     ) == ["0-4", "5-9"]
+    assert stage2_analysis._normalized_category_values(
+        value_type="binary",
+        values=["presence/absence"],
+    ) == ["presence", "absence"]
 
 
 def test_extraction_recovers_feature_key_drift_and_defaults_missing_values_to_null(caplog):
@@ -403,6 +409,116 @@ def test_extraction_recovers_feature_key_drift_and_defaults_missing_values_to_nu
     }
     assert "missing_as_null=['performance_status']" in caplog.text
     assert "extras_dropped=['invented_feature']" in caplog.text
+
+
+def test_resume_adopts_valid_legacy_single_patient_extraction_checkpoint(
+    tmp_path: Path,
+    caplog,
+):
+    caplog.set_level("INFO", logger=stage2_analysis.__name__)
+    output = tmp_path / "extraction"
+    batch = output / "batches" / "batch_00001"
+    batch.mkdir(parents=True)
+    (batch / "row_ids.json").write_text("[0]\n", encoding="utf-8")
+    (batch / "result.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {"performance_status": "2"},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (batch / "complete.json").write_text(
+        json.dumps({"status": "complete", "rows": 1}),
+        encoding="utf-8",
+    )
+    definition = {
+        "name": "performance_status",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0-4"],
+    }
+
+    def unexpected_request(_messages, _validate):
+        raise AssertionError("valid legacy singleton checkpoint should be adopted")
+
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": ["Pretreatment ECOG was 2."]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        clinical_question="Estimate treatment effect.",
+        output_dir=output,
+        request_json=unexpected_request,
+        workers=1,
+        max_prompt_chars=10_000,
+    )
+
+    assert frame.loc[0, "performance_status"] == "2"
+    completion = json.loads((batch / "complete.json").read_text(encoding="utf-8"))
+    assert completion["schema_version"] == "stage2_single_patient_extraction_v1"
+    assert completion["adopted_legacy_single_patient_checkpoint"] is True
+    assert "adopt legacy single-patient" in caplog.text
+
+
+def test_resume_relocates_legacy_singleton_by_row_id_after_batch_numbers_shift(
+    tmp_path: Path,
+    caplog,
+):
+    caplog.set_level("INFO", logger=stage2_analysis.__name__)
+    output = tmp_path / "extraction"
+    old_batch = output / "batches" / "batch_00002"
+    old_batch.mkdir(parents=True)
+    (old_batch / "row_ids.json").write_text("[0]\n", encoding="utf-8")
+    (old_batch / "result.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {"performance_status": "2"},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (old_batch / "complete.json").write_text(
+        json.dumps({"status": "complete", "rows": 1}),
+        encoding="utf-8",
+    )
+    definition = {
+        "name": "performance_status",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0-4"],
+    }
+
+    def unexpected_request(_messages, _validate):
+        raise AssertionError("shifted legacy singleton should be relocated")
+
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": ["Pretreatment ECOG was 2."]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        clinical_question="Estimate treatment effect.",
+        output_dir=output,
+        request_json=unexpected_request,
+        workers=1,
+        max_prompt_chars=10_000,
+    )
+
+    new_batch = output / "batches" / "batch_00001"
+    assert frame.loc[0, "performance_status"] == "2"
+    assert json.loads((new_batch / "row_ids.json").read_text(encoding="utf-8")) == [0]
+    completion = json.loads((new_batch / "complete.json").read_text(encoding="utf-8"))
+    assert completion["relocated_single_patient_checkpoint"] is True
+    assert completion["checkpoint_source"] == str(old_batch)
+    assert "relocate single-patient" in caplog.text
 
 
 def test_resume_retries_only_checkpoints_with_stale_range_ontology_repairs(tmp_path: Path):
@@ -625,6 +741,52 @@ def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
     assert audit["resolution"] == "conservative_null"
     assert "category ontology response remained invalid" in audit["ontology_validation_error"]
     assert audit["corrections"][0]["value"] is None
+
+
+def test_extraction_defaults_structurally_invalid_response_to_audited_null(
+    tmp_path: Path,
+    caplog,
+):
+    caplog.set_level("WARNING", logger=stage2_analysis.__name__)
+    output = tmp_path / "extraction"
+    definition = {
+        "name": "performance_status",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0-4"],
+    }
+
+    def request_json(_messages, _validate):
+        raise ValueError(
+            "Stage 2 response remained invalid after 5 repairs: "
+            "Unterminated string at character 104409"
+        )
+
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": ["Pretreatment ECOG was 2."]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        clinical_question="Estimate treatment effect.",
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=10_000,
+    )
+
+    assert pd.isna(frame.loc[0, "performance_status"])
+    audit = json.loads(
+        (
+            output
+            / "batches"
+            / "batch_00001"
+            / "extraction_failure.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert audit["resolution"] == "conservative_all_null"
+    assert audit["row_ids"] == [0]
+    assert audit["feature_names"] == ["performance_status"]
+    assert "Unterminated string" in audit["validation_error"]
+    assert "remained structurally invalid" in caplog.text
 
 
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
@@ -855,11 +1017,14 @@ def test_openai_timeout_is_a_retryable_transport_error():
 
 
 def test_openai_completion_closes_client(monkeypatch):
+    request_kwargs = {}
+
     class FakeCompletions:
         @staticmethod
-        def create(**_kwargs):
+        def create(**kwargs):
+            request_kwargs.update(kwargs)
             message = type("Message", (), {"content": '{"ok": true}'})()
-            choice = type("Choice", (), {"message": message})()
+            choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
             return type("Response", (), {"choices": [choice]})()
 
     class FakeClient:
@@ -890,6 +1055,45 @@ def test_openai_completion_closes_client(monkeypatch):
     assert content == '{"ok": true}'
     assert client.closed is True
     assert client_kwargs["max_retries"] == 0
+    assert "max_tokens" not in request_kwargs
+    assert "max_completion_tokens" not in request_kwargs
+
+
+def test_openai_completion_reports_output_token_truncation(monkeypatch):
+    class FakeCompletions:
+        @staticmethod
+        def create(**_kwargs):
+            message = type("Message", (), {"content": '{"rows": ['})()
+            choice = type(
+                "Choice",
+                (),
+                {"message": message, "finish_reason": "length"},
+            )()
+            return type("Response", (), {"choices": [choice]})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    import openai
+
+    client = FakeClient()
+    monkeypatch.setattr(openai, "OpenAI", lambda **_kwargs: client)
+
+    with pytest.raises(ValueError, match="finish_reason=length"):
+        stage2_workflow._openai_completion(
+            [{"role": "user", "content": "Return JSON."}],
+            PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="test-model",
+            ),
+        )
+
+    assert client.closed is True
 
 
 def test_consolidation_reconciles_feature_limit_and_stale_feature_names(caplog):

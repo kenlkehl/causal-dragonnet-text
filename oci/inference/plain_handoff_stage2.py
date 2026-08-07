@@ -139,7 +139,6 @@ class PlainHandoffStage2Config:
     request_timeout: float = 7_200.0
     transport_max_attempts: int = 3
     transport_retry_backoff: float = 2.0
-    max_tokens: int = 25_000
     max_prompt_chars: int = 100_000
     evidence_compiler: str = EVIDENCE_COMPILER_VERSION
     evidence_max_cards_per_fold: int = 400
@@ -168,8 +167,6 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.transport_max_attempts must be positive")
         if self.transport_retry_backoff < 0:
             raise ValueError("stage2.transport_retry_backoff must be nonnegative")
-        if self.max_tokens < 256:
-            raise ValueError("stage2.max_tokens must be at least 256")
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.evidence_compiler not in {EVIDENCE_COMPILER_VERSION, "raw_packets_v1"}:
@@ -230,6 +227,10 @@ def plain_stage2_config_from_mapping(
             "isolated to one patient per prompt",
             legacy_extraction_batch_size,
         )
+    if raw.get("max_tokens") is not None:
+        LOGGER.warning(
+            "stage2.max_tokens is ignored; Stage 2 does not send an output-token limit"
+        )
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
         model=model,
@@ -237,7 +238,6 @@ def plain_stage2_config_from_mapping(
         request_timeout=float(raw.get("request_timeout", 7_200.0)),
         transport_max_attempts=int(raw.get("transport_max_attempts", 3)),
         transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
-        max_tokens=int(raw.get("max_tokens", 25_000)),
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
         evidence_compiler=str(raw.get("evidence_compiler", EVIDENCE_COMPILER_VERSION)).strip(),
         evidence_max_cards_per_fold=int(raw.get("evidence_max_cards_per_fold", 400)),
@@ -723,7 +723,6 @@ def _openai_completion(
         "model": config.model,
         "messages": list(messages),
         "temperature": config.temperature,
-        "max_tokens": config.max_tokens,
         "response_format": {"type": "json_object"},
     }
     kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": config.enable_thinking}}
@@ -744,7 +743,13 @@ def _openai_completion(
         response = client.chat.completions.create(**kwargs)
     finally:
         client.close()
-    content = response.choices[0].message.content
+    choice = response.choices[0]
+    finish_reason = str(getattr(choice, "finish_reason", "") or "")
+    if finish_reason == "length":
+        raise ValueError(
+            "Stage 2 server stopped the response with finish_reason=length"
+        )
+    content = choice.message.content
     if not content:
         raise RuntimeError("Stage 2 model returned an empty response")
     return str(content)

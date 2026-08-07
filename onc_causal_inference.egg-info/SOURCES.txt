@@ -44,6 +44,7 @@ oci/inference/neural_query_agentic_forest.py
 oci/inference/neural_query_discovery_runtime.py
 oci/inference/plain_handoff_stage2.py
 oci/inference/plain_handoff_stage2_analysis.py
+oci/inference/plain_handoff_stage2_evidence.py
 oci/inference/post_extraction_scientific_policy.py
 oci/inference/research_all_evidence_stage1.py
 oci/inference/sklearn_nmf_compat.py
@@ -106,10 +107,12 @@ tests/test_all_evidence_post_extraction_causal_review.py
 tests/test_all_evidence_post_extraction_review.py
 tests/test_calibration.py
 tests/test_complete_paged_extraction.py
+tests/test_detect_all_evidence_hardware.py
 tests/test_explicit_features.py
 tests/test_extractors.py
 tests/test_lossless_model_tokenization.py
 tests/test_plain_handoff_stage2.py
+tests/test_plain_handoff_stage2_evidence.py
 tests/test_post_extraction_scientific_policy.py
 tests/test_research_all_evidence_stage1.py
 tests/test_strict_causal_forest_runtime.py
