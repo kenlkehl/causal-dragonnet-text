@@ -104,7 +104,6 @@ effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
-    "extraction_batch_size": 12,
     "max_review_rounds": 2,
     "estimation_trees": 200
   }
@@ -122,7 +121,7 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
 `max_candidates_per_fold`, `consolidation_oversample_factor`,
-`extraction_batch_size`, `max_review_rounds`, `estimation_trees`,
+`max_review_rounds`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
 `temperature`, and `enable_thinking`. The consolidation oversample factor
 defaults to 4: oversized candidate collections retain up to four times the
@@ -130,6 +129,9 @@ final fold feature limit during their first reduction pass, then progressively
 reduce after outputs from different prompt shards have been interleaved. A
 configured endpoint makes the default mode `full`. The modes can always be
 made explicit:
+
+Patient-variable extraction always sends exactly one patient's text per model
+prompt. `stage2.workers` provides concurrency without combining patients.
 
 ```bash
 # Run/resume Stage 1 and stop after the handoff.
@@ -170,7 +172,6 @@ uv run python scripts/run_all_evidence.py \
   --stage2-endpoint http://127.0.0.1:8000/v1 \
   --stage2-model Qwen/Qwen3-32B \
   --stage2-review-rounds 2 \
-  --stage2-extraction-batch-size 12 \
   --stage2-estimation-trees 200
 ```
 

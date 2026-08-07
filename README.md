@@ -568,7 +568,6 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
     "consolidation_oversample_factor": 4,
-    "extraction_batch_size": 12,
     "max_review_rounds": 2,
     "estimation_trees": 200
   },
@@ -582,6 +581,9 @@ run. The API key may be stored in `stage2.api_key` or supplied through
 endpoint's OpenAI-compatible `/models` API and uses the advertised model if
 exactly one model ID is returned. Configure `stage2.model` explicitly when the
 endpoint advertises multiple IDs.
+
+Stage 2 extraction is permanently isolated to one patient per model prompt.
+Concurrency is controlled by `stage2.workers`; patient batching is not configurable.
 
 Stage 2 preserves the outer-fold boundary throughout variable construction and
 estimation. Before the first LLM request, its default evidence compiler reuses

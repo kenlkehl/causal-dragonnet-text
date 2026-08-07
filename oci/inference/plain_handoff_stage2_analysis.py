@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -24,6 +25,8 @@ import numpy as np
 import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
+
+EXTRACTION_CHECKPOINT_SCHEMA_VERSION = "stage2_single_patient_extraction_v1"
 
 RequestJSON = Callable[
     [Sequence[Mapping[str, str]], Callable[[Mapping[str, Any]], dict[str, Any]]],
@@ -50,6 +53,17 @@ def _write_frame(path: Path, frame: pd.DataFrame) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     frame.to_csv(temporary, index=False)
     os.replace(temporary, path)
+
+
+def _value_fingerprint(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _clean_scalar(value: Any) -> Any:
@@ -507,6 +521,10 @@ def _extraction_prompt(
     definitions: Sequence[Mapping[str, Any]],
     rows: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
+    if len(rows) != 1:
+        raise ValueError(
+            "Stage 2 extraction prompts must contain exactly one patient's record"
+        )
     body = {
         "job": "extract_stage2_patient_variables",
         "clinical_question": clinical_question,
@@ -655,46 +673,23 @@ def _validate_extraction(
     return {"rows": [by_row[int(row_id)] for row_id in row_ids]}
 
 
-def _partition_rows(
-    rows: Sequence[Mapping[str, Any]],
-    *,
-    batch_size: int,
-    max_chars: int,
-) -> list[list[Mapping[str, Any]]]:
-    output: list[list[Mapping[str, Any]]] = []
-    current: list[Mapping[str, Any]] = []
-    current_chars = 0
-    for row in rows:
-        row_chars = len(json.dumps(row, sort_keys=True))
-        if current and (len(current) >= batch_size or current_chars + row_chars > max_chars):
-            output.append(current)
-            current = []
-            current_chars = 0
-        current.append(row)
-        current_chars += row_chars
-    if current:
-        output.append(current)
-    return output
-
-
 def _partition_rows_for_prompt(
     rows: Sequence[Mapping[str, Any]],
     *,
-    batch_size: int,
     max_prompt_chars: int,
     clinical_question: str,
     definitions: Sequence[Mapping[str, Any]],
 ) -> tuple[list[list[Mapping[str, Any]]], list[Mapping[str, Any]]]:
-    """Pack rows by their exact rendered prompt size.
+    """Create only singleton extraction requests, measured at exact prompt size.
 
     Rows that cannot fit even by themselves are returned separately for
     lossless page planning.  This avoids the old oversized-singleton hole in
-    the approximate JSON-size partitioner.
+    the approximate JSON-size partitioner.  Multi-patient prompts are forbidden
+    by construction as well as by ``_extraction_prompt``.
     """
 
     batches: list[list[Mapping[str, Any]]] = []
     oversized: list[Mapping[str, Any]] = []
-    current: list[Mapping[str, Any]] = []
     for row in rows:
         singleton = _extraction_prompt(
             clinical_question=clinical_question,
@@ -702,27 +697,9 @@ def _partition_rows_for_prompt(
             rows=[row],
         )
         if _prompt_chars(singleton) > int(max_prompt_chars):
-            if current:
-                batches.append(current)
-                current = []
             oversized.append(row)
-            continue
-        candidate = [*current, row]
-        candidate_prompt = _extraction_prompt(
-            clinical_question=clinical_question,
-            definitions=definitions,
-            rows=candidate,
-        )
-        if current and (
-            len(candidate) > max(1, int(batch_size))
-            or _prompt_chars(candidate_prompt) > int(max_prompt_chars)
-        ):
-            batches.append(current)
-            current = [row]
         else:
-            current = candidate
-    if current:
-        batches.append(current)
+            batches.append([row])
     return batches, oversized
 
 
@@ -793,10 +770,9 @@ def extract_rows(
     output_dir: Path,
     request_json: RequestJSON,
     workers: int,
-    batch_size: int,
     max_prompt_chars: int,
 ) -> pd.DataFrame:
-    """Extract one frozen definition set, resuming at the batch level."""
+    """Extract one frozen definition set with exactly one patient per prompt."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
     feature_names = [str(feature["name"]) for feature in definitions]
@@ -819,7 +795,6 @@ def extract_rows(
     ]
     batches, oversized_rows = _partition_rows_for_prompt(
         request_rows,
-        batch_size=max(1, int(batch_size)),
         max_prompt_chars=int(max_prompt_chars),
         clinical_question=clinical_question,
         definitions=definitions,
@@ -837,17 +812,44 @@ def extract_rows(
         )
 
     def run_batch(index: int, batch: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        if len(batch) != 1:  # pragma: no cover - enforced by the planner
+            raise RuntimeError("Stage 2 extraction planner created a multi-patient batch")
         batch_dir = output_dir / "batches" / f"batch_{index:05d}"
         result_path = batch_dir / "result.json"
         complete_path = batch_dir / "complete.json"
         ontology_audit_path = batch_dir / "category_ontology_repair.json"
+        row_ids = [int(row["row_id"]) for row in batch]
+        input_fingerprint = _value_fingerprint(
+            {
+                "schema_version": EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                "clinical_question": clinical_question,
+                "definitions": list(definitions),
+                "rows": list(batch),
+            }
+        )
         stale_audit = _stale_category_ontology_audit(ontology_audit_path)
         if complete_path.is_file() and result_path.is_file() and stale_audit is None:
-            return list(json.loads(result_path.read_text(encoding="utf-8"))["rows"])
+            try:
+                completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                cached = json.loads(result_path.read_text(encoding="utf-8"))
+                if (
+                    completion.get("schema_version") == EXTRACTION_CHECKPOINT_SCHEMA_VERSION
+                    and completion.get("input_fingerprint") == input_fingerprint
+                ):
+                    return list(
+                        _validate_extraction(
+                            cached,
+                            row_ids=row_ids,
+                            definitions=definitions,
+                        )["rows"]
+                    )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+            LOGGER.info("rerun incompatible Stage 2 extraction checkpoint: %s", batch_dir)
         if stale_audit is not None:
             LOGGER.info("retry stale Stage 2 category ontology batch: %s", batch_dir)
         batch_dir.mkdir(parents=True, exist_ok=True)
-        _write_json(batch_dir / "row_ids.json", [int(row["row_id"]) for row in batch])
+        _write_json(batch_dir / "row_ids.json", row_ids)
         messages = _extraction_prompt(
             clinical_question=clinical_question,
             definitions=definitions,
@@ -855,7 +857,7 @@ def extract_rows(
         )
         result = _request_validated_extraction(
             messages=messages,
-            row_ids=[int(row["row_id"]) for row in batch],
+            row_ids=row_ids,
             definitions=definitions,
             request_json=request_json,
             ontology_audit_path=ontology_audit_path,
@@ -869,7 +871,13 @@ def extract_rows(
         )
         _write_json(
             complete_path,
-            {"status": "complete", "completed_at": _now(), "rows": len(batch)},
+            {
+                "status": "complete",
+                "schema_version": EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                "input_fingerprint": input_fingerprint,
+                "completed_at": _now(),
+                "rows": 1,
+            },
         )
         return list(result["rows"])
 
@@ -1889,7 +1897,6 @@ def run_fold_analysis(
             output_dir=round_dir / "extraction",
             request_json=request_json,
             workers=config.workers,
-            batch_size=config.extraction_batch_size,
             max_prompt_chars=config.max_prompt_chars,
         )
         summaries = feature_summaries(extracted, current)
@@ -1959,7 +1966,6 @@ def run_fold_analysis(
         output_dir=output_dir / "extraction" / "heldout",
         request_json=request_json,
         workers=config.workers,
-        batch_size=config.extraction_batch_size,
         max_prompt_chars=config.max_prompt_chars,
     )
     # The last training extraction may contain a feature dropped in the final

@@ -44,7 +44,6 @@ effect estimates. The common controls are:
     "workers": 8,
     "evidence_compiler": "semantic_cluster_cards_v1",
     "evidence_max_cards_per_fold": 400,
-    "extraction_batch_size": 12,
     "max_review_rounds": 2,
     "estimation_trees": 200
   }
@@ -52,6 +51,8 @@ effect estimates. The common controls are:
 ```
 
 Interpretation and extraction requests are concurrent up to `stage2.workers`.
+Each extraction request contains exactly one patient's text; this isolation is
+an invariant rather than a configurable batch-size choice.
 Before interpretation, Stage 2 compiles the raw handoff into fold-local,
 provenance-preserving semantic cards under `stage2/evidence_compilation/`.
 Each completed request is saved beneath the relevant outer-fold directory, so

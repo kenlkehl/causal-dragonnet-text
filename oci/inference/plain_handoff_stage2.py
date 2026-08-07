@@ -148,7 +148,6 @@ class PlainHandoffStage2Config:
     max_candidates_per_fold: int = 50
     consolidation_oversample_factor: int = 4
     workers: int = 4
-    extraction_batch_size: int = 12
     max_review_rounds: int = 2
     estimation_trees: int = 200
     propensity_clip: float = 0.02
@@ -189,8 +188,6 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.consolidation_oversample_factor must be positive")
         if self.workers < 1:
             raise ValueError("stage2.workers must be positive")
-        if self.extraction_batch_size < 1:
-            raise ValueError("stage2.extraction_batch_size must be positive")
         if self.max_review_rounds < 1:
             raise ValueError("stage2.max_review_rounds must be positive")
         if self.estimation_trees < 10:
@@ -226,6 +223,13 @@ def plain_stage2_config_from_mapping(
     if not endpoint:
         raise ValueError("stage2.endpoint is required when stage2.model is specified")
     api_key = str(raw.get("api_key") or os.environ.get("OCI_STAGE2_API_KEY") or "EMPTY")
+    legacy_extraction_batch_size = raw.get("extraction_batch_size")
+    if legacy_extraction_batch_size is not None and int(legacy_extraction_batch_size) != 1:
+        LOGGER.warning(
+            "stage2.extraction_batch_size=%s is ignored; Stage 2 extraction is permanently "
+            "isolated to one patient per prompt",
+            legacy_extraction_batch_size,
+        )
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
         model=model,
@@ -242,7 +246,6 @@ def plain_stage2_config_from_mapping(
         max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
         consolidation_oversample_factor=int(raw.get("consolidation_oversample_factor", 4)),
         workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
-        extraction_batch_size=int(raw.get("extraction_batch_size", 12)),
         max_review_rounds=int(raw.get("max_review_rounds", 2)),
         estimation_trees=int(raw.get("estimation_trees", 200)),
         propensity_clip=float(raw.get("propensity_clip", 0.02)),

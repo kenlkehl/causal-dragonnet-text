@@ -1508,11 +1508,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum training-fold extraction and empirical-review rounds",
     )
     parser.add_argument(
-        "--stage2-extraction-batch-size",
-        type=int,
-        help="patient records sent in each Stage 2 extraction request",
-    )
-    parser.add_argument(
         "--stage2-estimation-trees",
         type=int,
         help="trees in the final effect-modification model",
@@ -1597,7 +1592,6 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
             stage2[key] = value
     stage2_numeric_overrides = {
         "max_review_rounds": args.stage2_review_rounds,
-        "extraction_batch_size": args.stage2_extraction_batch_size,
         "estimation_trees": args.stage2_estimation_trees,
     }
     for key, value in stage2_numeric_overrides.items():

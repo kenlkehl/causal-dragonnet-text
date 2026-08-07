@@ -37,6 +37,20 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.consolidation_oversample_factor == 4
 
 
+def test_stage2_ignores_legacy_extraction_batch_size(caplog):
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "extraction_batch_size": 100,
+        },
+        default_workers=8,
+    )
+
+    assert config is not None
+    assert "extraction_batch_size" not in config.public_dict()
+    assert "permanently isolated to one patient per prompt" in caplog.text
+
+
 def test_stage2_autodiscovers_the_only_served_model(monkeypatch):
     monkeypatch.setattr(
         stage2_workflow,
@@ -252,6 +266,63 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
     assert any("Do not substitute 0/1" in rule for rule in reconciliation["rules"])
 
 
+def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Path):
+    definition = {
+        "name": "performance_status",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0", "1"],
+    }
+    with pytest.raises(ValueError, match="exactly one patient's record"):
+        stage2_analysis._extraction_prompt(
+            clinical_question="Estimate treatment effect.",
+            definitions=[definition],
+            rows=[
+                {"row_id": 0, "text": "ECOG 0."},
+                {"row_id": 1, "text": "ECOG 1."},
+            ],
+        )
+
+    prompt_row_ids = []
+
+    def request_json(messages, validate):
+        body = json.loads(messages[1]["content"])
+        assert body["job"] == "extract_stage2_patient_variables"
+        assert len(body["patients"]) == 1
+        patient = body["patients"][0]
+        prompt_row_ids.append(patient["row_id"])
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "values": {
+                            "performance_status": (
+                                "1" if "ECOG 1" in patient["text"] else "0"
+                            )
+                        },
+                    }
+                ]
+            }
+        )
+
+    extracted = extract_rows(
+        dataset=pd.DataFrame(
+            {"clinical_text": ["ECOG 0.", "ECOG 1.", "ECOG 0 again."]}
+        ),
+        row_ids=[0, 1, 2],
+        text_column="clinical_text",
+        definitions=[definition],
+        clinical_question="Estimate treatment effect.",
+        output_dir=tmp_path / "extraction",
+        request_json=request_json,
+        workers=3,
+        max_prompt_chars=10_000,
+    )
+
+    assert sorted(prompt_row_ids) == [0, 1, 2]
+    assert extracted["_oci_row_id"].tolist() == [0, 1, 2]
+
+
 def test_ordinal_integer_range_is_expanded_in_prompt_and_validation():
     definition = {
         "name": "performance_status",
@@ -405,7 +476,6 @@ def test_resume_retries_only_checkpoints_with_stale_range_ontology_repairs(tmp_p
         output_dir=output,
         request_json=request_json,
         workers=1,
-        batch_size=1,
         max_prompt_chars=10_000,
     )
 
@@ -481,7 +551,6 @@ def test_extraction_uses_note_free_category_ontology_after_five_failed_repairs(
             validate=validate,
         ),
         workers=1,
-        batch_size=1,
         max_prompt_chars=config.max_prompt_chars,
     )
 
@@ -544,7 +613,6 @@ def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
         output_dir=output,
         request_json=request_json,
         workers=1,
-        batch_size=1,
         max_prompt_chars=10_000,
     )
 
@@ -1290,7 +1358,6 @@ def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Pat
         output_dir=tmp_path / "extraction",
         request_json=request_json,
         workers=3,
-        batch_size=12,
         max_prompt_chars=5_000,
     )
 
@@ -1610,7 +1677,6 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(tmp_path:
         model="test-model",
         max_prompt_chars=12_000,
         workers=4,
-        extraction_batch_size=5,
         max_review_rounds=1,
         estimation_trees=10,
     )
@@ -1758,7 +1824,6 @@ def test_training_fold_review_can_revise_then_retest_a_definition(tmp_path: Path
         config=PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
             model="test-model",
-            extraction_batch_size=6,
             max_review_rounds=2,
             estimation_trees=10,
         ),
@@ -1767,5 +1832,5 @@ def test_training_fold_review_can_revise_then_retest_a_definition(tmp_path: Path
     assert result["review_rounds"] == 2
     assert result["features"][0]["measurement_definition"].startswith("Extract the last")
     assert jobs.count("review_stage2_variables_against_training_fold_performance") == 2
-    assert jobs.count("extract_stage2_patient_variables") == 3
+    assert jobs.count("extract_stage2_patient_variables") == 18
     assert (tmp_path / "outer_001" / "review" / "round_002" / "performance.json").is_file()

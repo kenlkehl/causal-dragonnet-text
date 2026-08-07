@@ -25,7 +25,6 @@
     "model": "",
     "api_key": "EMPTY",
     "workers": 4,
-    "extraction_batch_size": 12,
     "max_review_rounds": 2,
     "estimation_trees": 200,
     "propensity_clip": 0.02
