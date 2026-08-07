@@ -330,7 +330,8 @@ for evidence_context in iter_stage1_handoff("/results/my_stage1_run"):
 
 Completion has one intentionally simple rule:
 
-- if `components/<name>/complete.json` exists, that component is skipped
+- if `components/<name>/complete.json` exists, that component is reused and its
+  progress status is `already_complete`
   (`handoff/complete.json` and a causal-estimation `stage2/complete.json` serve
   the same purpose for those components);
 - if it does not exist, the component runs in the existing directory;

@@ -294,7 +294,7 @@ def test_default_all_evidence_htr_training_uses_30_epochs():
     assert htr_config["effect_epochs"] == 30
 
 
-def test_completed_components_are_skipped_without_revalidation(tmp_path):
+def test_completed_components_are_reported_already_complete_without_revalidation(tmp_path):
     _raw, config = _inputs(tmp_path)
     calls: list[str] = []
 
@@ -320,7 +320,10 @@ def test_completed_components_are_skipped_without_revalidation(tmp_path):
     second = workflow.run()
     assert second["status"] == "complete"
     assert calls == []
-    assert all(record["status"] == "skipped" for record in second["components"].values())
+    assert all(
+        record["status"] == "already_complete"
+        for record in second["components"].values()
+    )
 
     (workflow._component_dir("tfidf") / "complete.json").unlink()
     third = workflow.run()
@@ -632,7 +635,7 @@ def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path, monkeypatch):
     assert (config.output_dir / "stage2" / "complete.json").is_file()
 
     second = workflow.run()
-    assert second["components"]["stage2"]["status"] == "skipped"
+    assert second["components"]["stage2"]["status"] == "already_complete"
     assert len(calls) == 1
 
 

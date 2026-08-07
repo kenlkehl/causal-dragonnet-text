@@ -1390,9 +1390,9 @@ class ResearchAllEvidenceStage1:
                             component_dir,
                         )
                 if complete_path.is_file() and stage2_is_final:
-                    LOGGER.info("skip completed component: %s", name)
+                    LOGGER.info("component already complete: %s", name)
                     progress["components"][name] = {
-                        "status": "skipped",
+                        "status": "already_complete",
                         "path": str(component_dir),
                         "completion_file": str(complete_path),
                     }

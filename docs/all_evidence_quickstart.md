@@ -23,7 +23,8 @@
    tail -f /path/to/output/logs/workflow.log
    ```
 
-5. If the process stops, run step 3 again. Completed components are skipped.
+5. If the process stops, run step 3 again. Completed components are reused and
+   reported as `already_complete`.
 
 Use `--stage1-only` to stop at the handoff or `--stage2-only` to consume an
 existing handoff. Setting `stage2.endpoint` in the config makes an unflagged
