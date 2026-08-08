@@ -285,7 +285,7 @@ def _outer_split_plan(
             "fallback_reason": None,
         }
     raise ValueError(
-        "multi_model_forest v2 requires cv_folds > 1 or an explicit held-out test split"
+        "multi_model_forest Stage 1 requires cv_folds > 1 or an explicit held-out test split"
     )
 
 

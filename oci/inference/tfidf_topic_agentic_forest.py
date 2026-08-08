@@ -1,4 +1,8 @@
-"""Stage 2 structured-feature workflow for TF-IDF topic handoffs."""
+"""Legacy TF-IDF topic helpers retained for shared prompt compatibility.
+
+The runnable Stage 2 workflow formerly implemented here was retired with
+``MultiModelForestRunner``. Research runs use ``plain_handoff_stage2``.
+"""
 
 from __future__ import annotations
 
@@ -220,7 +224,7 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
             row = json.loads(text)
             if row.get("schema_version") != HANDOFF_SCHEMA_VERSION:
                 raise ValueError(
-                    "multi_model_forest v2 rejects legacy handoffs. "
+                    "the retired TF-IDF-topic Stage 2 accepts only its exact-scope handoffs. "
                     f"Line {line_number} has schema {row.get('schema_version')!r}; "
                     "rerun Stage 1 to generate exact TF-IDF topic contexts."
                 )
@@ -3435,7 +3439,7 @@ def parsimony_replacement_passes(
     return not reasons, reasons
 
 
-class TfidfTopicAgenticForestRunner:
+class _RetiredTfidfTopicAgenticForestRunner:
     def __init__(
         self,
         *,
@@ -6349,13 +6353,17 @@ def run_tfidf_topic_agentic_forest(
     evaluator: Optional[Any] = None,
     resume: bool = True,
 ) -> None:
-    TfidfTopicAgenticForestRunner(
-        dataset=dataset,
-        config=config,
-        output_path=output_path,
-        handoff_path=handoff_path,
-        proposal_agent=proposal_agent,
-        extraction_provider=extraction_provider,
-        evaluator=evaluator,
-        resume=resume,
-    ).run()
+    del (
+        dataset,
+        config,
+        output_path,
+        handoff_path,
+        proposal_agent,
+        extraction_provider,
+        evaluator,
+        resume,
+    )
+    raise RuntimeError(
+        "run_tfidf_topic_agentic_forest was retired with MultiModelForestRunner. "
+        "Use ResearchAllEvidenceWorkflow and plain_handoff_stage2."
+    )

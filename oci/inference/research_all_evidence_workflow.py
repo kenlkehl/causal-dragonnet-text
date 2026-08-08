@@ -743,15 +743,15 @@ def _run_one_text_model_context(
 
     import torch
 
-    from .multi_model_forest import (
-        _run_handoff_contexts,
-        resolve_multi_model_forest_parallel_plan,
+    from .multi_model_forest_stage1 import (
+        resolve_multi_model_forest_stage1_parallel_plan,
+        run_multi_model_forest_handoff_contexts,
     )
 
     context_dir.mkdir(parents=True, exist_ok=True)
     mm_config = applied_config.architecture.multi_model_forest
     gpu_ids = _cuda_ids((device,))
-    plan = resolve_multi_model_forest_parallel_plan(
+    plan = resolve_multi_model_forest_stage1_parallel_plan(
         cpus_total=max(1, int(cpu_workers)),
         num_workers=max(1, int(cpu_workers)),
         gpu_ids=gpu_ids,
@@ -759,7 +759,7 @@ def _run_one_text_model_context(
         htr_enabled=bool(mm_config.htr_evidence_enabled),
         embedding_enabled=bool(mm_config.embedding_contrast.enabled),
     )
-    rows = _run_handoff_contexts(
+    rows = run_multi_model_forest_handoff_contexts(
         dataset=dataset,
         config=applied_config,
         contexts=[dict(spec)],

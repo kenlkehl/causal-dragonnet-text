@@ -25,93 +25,6 @@ MULTI_MODEL_FEATURE_DISCOVERY_METHODS = (
     "embedding_contrast",
 )
 
-# The integrated ``multi_model_forest`` runner has a deliberately narrower v2
-# contract than the legacy ``multi_model_agentic_forest`` runner. Keep the
-# legacy normalizer readable for old configuration files, but never use it to
-# validate the new pathway.
-TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS = (
-    "bow",
-    "tfidf_topic_contrast",
-)
-
-
-def normalize_tfidf_topic_feature_discovery_methods(
-    methods: Any,
-    *,
-    source: str = "feature_discovery_methods",
-) -> List[str]:
-    """Normalize discovery methods for the v2 TF-IDF-topic pathway."""
-    if methods is None:
-        return list(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS)
-    if isinstance(methods, str):
-        raw_values = [methods]
-    elif isinstance(methods, (list, tuple, set)):
-        raw_values = list(methods)
-    else:
-        raw_values = [methods]
-    tokens = [
-        token.strip().lower().replace("-", "_")
-        for raw in raw_values
-        for token in str(raw).replace(";", ",").split(",")
-        if token.strip()
-    ]
-    if "all" in tokens:
-        return list(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS)
-    aliases = {
-        "bow": "bow",
-        "bag_of_words": "bow",
-        "bagofwords": "bow",
-        "tfidf": "bow",
-        "tf_idf": "bow",
-        "tfidf_topic_contrast": "tfidf_topic_contrast",
-        "tfidf_topics": "tfidf_topic_contrast",
-        "topic_contrast": "tfidf_topic_contrast",
-        "topics": "tfidf_topic_contrast",
-    }
-    legacy = {
-        "htr",
-        "htr_evidence",
-        "hierarchical_transformer",
-        "embedding",
-        "embeddings",
-        "embedding_contrast",
-        "matched_pair_uplift",
-        "uplift",
-        "r_learner",
-        "rlearner",
-    }
-    normalized: List[str] = []
-    for token in tokens:
-        if token in legacy:
-            raise ValueError(
-                f"{source}={token!r} is a legacy discovery method and is not "
-                "available in multi_model_forest v2. Use 'bow' and "
-                "'tfidf_topic_contrast'; use the legacy runner only to read or "
-                "reproduce old artifacts."
-            )
-        canonical = aliases.get(token)
-        if canonical is None:
-            raise ValueError(
-                f"Unknown {source} entry {token!r}; expected one or more of "
-                f"{list(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS)}"
-            )
-        if canonical not in normalized:
-            normalized.append(canonical)
-    if not normalized:
-        raise ValueError(
-            f"{source} must include at least one of "
-            f"{list(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS)}"
-        )
-    missing = set(TFIDF_TOPIC_FEATURE_DISCOVERY_METHODS) - set(normalized)
-    if missing:
-        raise ValueError(
-            "multi_model_forest v2 requires both deterministic BoW nuisance "
-            "modeling and TF-IDF topic contrast discovery; missing "
-            f"{sorted(missing)}"
-        )
-    return normalized
-
-
 _MULTI_MODEL_FEATURE_DISCOVERY_METHOD_ALIASES = {
     "bow": {
         "bow",
@@ -2772,11 +2685,11 @@ class MultiModelAgenticForestConfig:
 
 @dataclass
 class MultiModelForestConfig(MultiModelAgenticForestConfig):
-    """Configuration for the integrated two-stage multi-model forest path."""
+    """Stage 1 scientific configuration for the all-evidence workflow."""
 
     tfidf_topic: TfidfTopicDiscoveryConfig = field(default_factory=TfidfTopicDiscoveryConfig)
-    # Optional audited outer/inner fold registry for exact-context Stage 1/2
-    # artifact reproduction.  The registry content, rather than its path, is
+    # Optional audited outer/inner fold registry for exact-context Stage 1
+    # artifact reproduction. The registry content, rather than its path, is
     # incorporated into the Stage 1 cache identity.
     split_registry_path: Optional[str] = None
     # Outer-fold execution backend for CPU-only TF-IDF/NMF contexts.
@@ -2785,9 +2698,7 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
     # fold_parallelism setting is used for both.
     bow_fold_parallelism: Optional[str] = None
     htr_fold_parallelism: Optional[str] = None
-    # Public scheduler controls for the integrated path. The runner derives
-    # outer/inner fold execution from these rather than exposing separate fold
-    # parallelism flags.
+    # Public scheduler controls for exact Stage 1 context fits.
     cpus_total: Optional[int] = None
     htr_jobs_per_gpu: int = 1
     # Matched-pair uplift evidence. Inner folds fit pair-level models on
@@ -2839,43 +2750,7 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
     structured_effect_estimator: str = "causal_forest"
 
     def __post_init__(self):
-        raw_methods = self.feature_discovery_methods
-        raw_tokens = {
-            str(value).strip().lower().replace("-", "_")
-            for value in (
-                raw_methods
-                if isinstance(raw_methods, (list, tuple, set))
-                else ([] if raw_methods is None else [raw_methods])
-            )
-        }
-        v2_requested = raw_methods is None or bool(
-            raw_tokens & {"tfidf_topic_contrast", "tfidf_topics", "topic_contrast", "topics"}
-        )
-        if v2_requested:
-            selected = normalize_tfidf_topic_feature_discovery_methods(
-                raw_methods,
-                source="multi_model_forest.feature_discovery_methods",
-            )
-            # Prevent the legacy parent from enabling neural/embedding evidence.
-            self.feature_discovery_methods = None
-            self.bow_discovery_enabled = True
-            self.htr_evidence_enabled = False
-            self.htr_evidence_disable_reason = "not part of multi_model_forest v2"
-            if isinstance(self.embedding_contrast, dict):
-                self.embedding_contrast = EmbeddingContrastDiscoveryConfig(
-                    **self.embedding_contrast
-                )
-            self.embedding_contrast.enabled = False
-            self.embedding_contrast.disable_reason = "not part of multi_model_forest v2"
-            super().__post_init__()
-            self.feature_discovery_methods = selected
-            self.matched_pair_uplift_enabled = False
-            self.matched_pair_bow_enabled = False
-            self.matched_pair_htr_enabled = False
-        else:
-            # Old objects remain parseable for artifact reproduction. The v2
-            # integrated runner performs its own strict method validation.
-            super().__post_init__()
+        super().__post_init__()
         if isinstance(self.tfidf_topic, dict):
             self.tfidf_topic = TfidfTopicDiscoveryConfig(**self.tfidf_topic)
         if self.split_registry_path is not None:
@@ -3659,7 +3534,7 @@ class ModelArchitectureConfig:
         default_factory=MultiModelAgenticForestConfig
     )
 
-    # Integrated two-stage multi-model forest
+    # All-evidence Stage 1 scientific configuration
     multi_model_forest: MultiModelForestConfig = field(default_factory=MultiModelForestConfig)
 
 
@@ -4035,17 +3910,6 @@ class ExperimentConfig:
                 raise ValueError(
                     "multi_model_agentic_forest.htr_evidence_enabled=False "
                     "requires htr_evidence_disable_reason"
-                )
-        if self.applied_inference.architecture.model_type == "multi_model_forest":
-            mm_config = self.applied_inference.architecture.multi_model_forest
-            methods = normalize_tfidf_topic_feature_discovery_methods(
-                getattr(mm_config, "feature_discovery_methods", None),
-                source="multi_model_forest.feature_discovery_methods",
-            )
-            if not methods:
-                raise ValueError(
-                    "multi_model_forest v2 must enable BoW nuisance modeling "
-                    "and TF-IDF topic contrast discovery"
                 )
         if self.applied_inference.architecture.model_type == "causal_forest":
             cf_config = self.applied_inference.architecture.causal_forest

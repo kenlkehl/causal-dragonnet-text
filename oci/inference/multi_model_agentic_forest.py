@@ -116,19 +116,19 @@ def _make_configured_explicit_evaluator(
     config: AppliedInferenceConfig,
     cf_config: ExplicitFeatureForestConfig,
 ) -> Any:
-    """Select the integrated structured head without changing legacy defaults.
+    """Select the configured structured head without changing legacy defaults.
 
-    Older/standalone configurations do not necessarily contain the integrated
+    Older/standalone configurations do not necessarily contain the Stage 1
     ``multi_model_forest`` block.  Those continue to use the causal forest.
     When the block is present, its validated estimator selector is authoritative
     for both the ordinary and precomputed-discovery runners.
     """
     architecture = getattr(config, "architecture", None)
-    integrated_config = getattr(architecture, "multi_model_forest", None)
-    if integrated_config is None:
+    stage1_config = getattr(architecture, "multi_model_forest", None)
+    if stage1_config is None:
         return CausalForestExplicitEvaluator(config=config, cf_config=cf_config)
 
-    estimator = getattr(integrated_config, "structured_effect_estimator", None)
+    estimator = getattr(stage1_config, "structured_effect_estimator", None)
     if estimator is None:
         return CausalForestExplicitEvaluator(config=config, cf_config=cf_config)
     estimator = str(estimator).strip().lower().replace("-", "_")

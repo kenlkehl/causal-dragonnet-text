@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 import oci.inference.research_all_evidence_workflow as all_evidence_workflow
-import oci.inference.multi_model_forest as multi_model_workflow
+import oci.inference.multi_model_forest_stage1 as multi_model_stage1
 
 from oci.inference.embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
@@ -51,7 +52,8 @@ def _inputs(tmp_path: Path, *, components=COMPONENT_ORDER):
                         "multi_model_forest": {
                             "feature_discovery_methods": [
                                 "bow",
-                                "tfidf_topic_contrast",
+                                "htr",
+                                "embedding_contrast",
                             ]
                         },
                     }
@@ -97,6 +99,49 @@ def test_stage1_era_module_and_class_names_remain_compatible():
         is ResearchAllEvidenceWorkflow
     )
     assert legacy_workflow.main is all_evidence_workflow.main
+
+
+def test_multi_model_forest_defaults_to_the_full_stage1_architecture_set():
+    from oci.config import MultiModelForestConfig
+
+    config = MultiModelForestConfig()
+
+    assert config.feature_discovery_methods == ["bow", "htr", "embedding_contrast"]
+    assert config.bow_discovery_enabled is True
+    assert config.htr_evidence_enabled is True
+    assert config.embedding_contrast.enabled is True
+    assert config.matched_pair_uplift_enabled is True
+    assert config.matched_pair_bow_enabled is True
+    assert config.matched_pair_htr_enabled is True
+
+
+def test_generic_applied_dispatch_rejects_retired_multi_model_orchestration(tmp_path):
+    from oci.inference.applied import run_applied_inference
+
+    config = SimpleNamespace(
+        architecture=SimpleNamespace(model_type="multi_model_forest")
+    )
+    with pytest.raises(RuntimeError, match="ResearchAllEvidenceWorkflow"):
+        run_applied_inference(
+            dataset=pd.DataFrame(),
+            config=config,
+            output_path=tmp_path / "predictions.parquet",
+            device=multi_model_stage1.torch.device("cpu"),
+        )
+
+
+def test_legacy_tfidf_topic_stage2_entry_point_is_retired():
+    from oci.inference.tfidf_topic_agentic_forest import (
+        run_tfidf_topic_agentic_forest,
+    )
+
+    with pytest.raises(RuntimeError, match="plain_handoff_stage2"):
+        run_tfidf_topic_agentic_forest(
+            dataset=pd.DataFrame(),
+            config=None,
+            output_path=Path("unused"),
+            handoff_path=Path("unused"),
+        )
 
 
 def test_embedding_retrieval_tfidf_producer_keeps_both_semantic_tails():
@@ -189,7 +234,11 @@ def test_disable_htr_keeps_bow_and_embedding_without_scheduling_htr(
         assert kwargs["config"].architecture.multi_model_forest.htr_evidence_enabled is False
         return [{"outer_fold": 1, "scope": "full_outer_train"}]
 
-    monkeypatch.setattr(multi_model_workflow, "_run_handoff_contexts", run_contexts)
+    monkeypatch.setattr(
+        multi_model_stage1,
+        "run_multi_model_forest_handoff_contexts",
+        run_contexts,
+    )
     row = all_evidence_workflow._run_one_text_model_context(
         dataset=context.dataset,
         applied_config=context.applied_config,
@@ -231,7 +280,11 @@ def test_text_model_context_serializes_nonfinite_diagnostics_as_null(
             }
         ]
 
-    monkeypatch.setattr(multi_model_workflow, "_run_handoff_contexts", run_contexts)
+    monkeypatch.setattr(
+        multi_model_stage1,
+        "run_multi_model_forest_handoff_contexts",
+        run_contexts,
+    )
     context_dir = tmp_path / "nonfinite_context"
     row = all_evidence_workflow._run_one_text_model_context(
         dataset=context.dataset,
@@ -548,11 +601,13 @@ def test_cpu_worker_budget_is_divided_without_being_duplicated():
     assert _lane_cpu_worker_budgets(0, workers=32) == []
 
 
-def test_handoff_runner_parallelizes_bow_folds_with_threads(tmp_path):
+def test_handoff_context_config_parallelizes_bow_folds_with_threads(tmp_path):
     _raw, config = _inputs(tmp_path, components=("text_models",))
     context = ResearchAllEvidenceWorkflow(config)._resolved_context()
 
-    optimized = multi_model_workflow._config_for_handoff_runner(context.applied_config)
+    optimized = multi_model_stage1.config_for_multi_model_forest_handoff(
+        context.applied_config
+    )
     text_config = optimized.architecture.multi_model_agentic_forest
     primary_text_config = optimized.architecture.multi_model_forest
 
@@ -584,11 +639,11 @@ def test_handoff_context_uses_stage1_runner_and_exact_heldout_rows(tmp_path, mon
             }
 
     monkeypatch.setattr(
-        multi_model_workflow,
+        multi_model_stage1,
         "MultiModelForestStage1Runner",
         FakeStage1Runner,
     )
-    rows = multi_model_workflow._run_handoff_context_shard(
+    rows = multi_model_stage1._run_handoff_context_shard(
         dataset=context.dataset,
         config=context.applied_config,
         shard=[
@@ -616,66 +671,8 @@ def test_handoff_context_uses_stage1_runner_and_exact_heldout_rows(tmp_path, mon
     assert rows[0]["importance"]["matched_pair_uplift"] == {"views": []}
 
 
-def test_integrated_handoff_always_uses_exact_context_producer(tmp_path, monkeypatch):
-    _raw, config = _inputs(tmp_path, components=("text_models",))
-    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
-    runner = object.__new__(multi_model_workflow.MultiModelForestRunner)
-    runner.dataset = context.dataset
-    runner.config = context.applied_config
-    runner.artifact_dir = tmp_path / "integrated"
-    runner.force_stage1 = True
-    runner.plan = multi_model_workflow.resolve_multi_model_forest_parallel_plan(
-        cpus_total=1,
-        num_workers=1,
-        gpu_ids=None,
-        htr_jobs_per_gpu=1,
-        htr_enabled=False,
-        embedding_enabled=False,
-    )
-    runner.device = multi_model_workflow.torch.device("cpu")
-    specs = [
-        {
-            "fold_key": 1001,
-            "outer_fold": 1,
-            "scope": "candidate_consistency_inner_train",
-            "train_idx": np.asarray([0, 1, 2, 3]),
-            "heldout_idx": np.asarray([4, 5]),
-            "inner_fold": 1,
-            "heldout_rows": 2,
-        }
-    ]
-    monkeypatch.setattr(runner, "_handoff_context_specs", lambda: specs)
-    captured: dict[str, object] = {}
-
-    def run_contexts(**kwargs):
-        captured["contexts"] = kwargs["contexts"]
-        return [{"fold_key": 1001, "scope": "candidate_consistency_inner_train"}]
-
-    def write_rows(rows, *, source, exact_inner_contexts):
-        captured.update(
-            rows=list(rows),
-            source=source,
-            exact_inner_contexts=exact_inner_contexts,
-        )
-
-    monkeypatch.setattr(multi_model_workflow, "_run_handoff_contexts", run_contexts)
-    monkeypatch.setattr(runner, "_write_handoff_rows", write_rows)
-
-    runner._build_handoff()
-
-    assert captured["contexts"] == specs
-    assert captured["source"] == "multi_model_forest_stage1_exact_context_precompute"
-    assert captured["exact_inner_contexts"] is True
-
-
 def test_default_research_config_requires_all_ten_stage2_architectures(tmp_path):
-    raw, _config = _inputs(tmp_path, components=())
-    raw["science"]["stage1"]["architecture"] = {
-        "multi_model_forest": {
-            "feature_discovery_methods": ["bow", "htr", "embedding_contrast"],
-        }
-    }
-    config = compile_config(raw, config_dir=tmp_path)
+    _raw, config = _inputs(tmp_path, components=())
     context = ResearchAllEvidenceWorkflow(config)._resolved_context()
 
     assert _required_stage2_architectures(context) == SUPPORTED_STAGE2_ARCHITECTURES
@@ -689,11 +686,11 @@ def test_handoff_context_receives_its_full_lane_cpu_budget(tmp_path, monkeypatch
         return []
 
     monkeypatch.setattr(
-        multi_model_workflow,
+        multi_model_stage1,
         "_run_handoff_context_shard",
         run_shard,
     )
-    plan = multi_model_workflow.resolve_multi_model_forest_parallel_plan(
+    plan = multi_model_stage1.resolve_multi_model_forest_stage1_parallel_plan(
         cpus_total=4,
         num_workers=4,
         gpu_ids=[0],
@@ -702,18 +699,18 @@ def test_handoff_context_receives_its_full_lane_cpu_budget(tmp_path, monkeypatch
         embedding_enabled=True,
     )
 
-    rows = multi_model_workflow._run_handoff_contexts(
+    rows = multi_model_stage1.run_multi_model_forest_handoff_contexts(
         dataset=pd.DataFrame({"clinical_text": ["one"]}),
         config=None,
         contexts=[{"fold_key": 1}],
         handoff_dir=tmp_path,
         plan=plan,
-        base_device=multi_model_workflow.torch.device("cpu"),
+        base_device=multi_model_stage1.torch.device("cpu"),
     )
 
     assert rows == []
     assert captured == [4]
-    assert multi_model_workflow._handoff_cpu_worker_budgets(23, 7) == [4, 4, 3, 3, 3, 3, 3]
+    assert multi_model_stage1._handoff_cpu_worker_budgets(23, 7) == [4, 4, 3, 3, 3, 3, 3]
 
 
 def test_cpu_context_lanes_are_bounded_by_workers():

@@ -19,6 +19,12 @@ files and completion markers rather than a separate source snapshot, immutable
 request, checkpoint-adoption system, trust policy, artifact-authentication
 layer, or content-hash protocol.
 
+The former `MultiModelForestRunner` and its TF-IDF-topic agentic Stage 2 were
+retired. `multi_model_forest` remains the name of the Stage 1 scientific
+configuration, not a second runnable workflow. Generic `oci run` configurations
+using that model type now stop with a migration message; use this workflow
+instead.
+
 ## Configuration
 
 Copy

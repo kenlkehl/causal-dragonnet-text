@@ -1,4 +1,4 @@
-"""Stage 1 text-model training for the integrated multi-model forest."""
+"""Stage 1 text-model training for the researcher all-evidence workflow."""
 
 from __future__ import annotations
 
@@ -112,6 +112,294 @@ class _FeatureBundle:
     metrics: Dict[str, Any]
     handoff_evidence: Optional[Dict[str, Any]]
     inner_model_rows: List[Dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class MultiModelForestStage1ParallelPlan:
+    """Resolved worker budget for exact Stage 1 discovery contexts."""
+
+    cpus_total: int
+    gpu_ids: List[int]
+    htr_jobs_per_gpu: int
+    htr_enabled: bool
+    embedding_enabled: bool
+    htr_slots: int
+    reserved_htr_cpus: int
+    cpu_loky_workers: int
+    context_workers: int
+    htr_inner_jobs_per_outer: int
+    htr_device_slots: List[Optional[int]]
+
+    def to_log_dict(self) -> Dict[str, Any]:
+        return {
+            "cpus_total": self.cpus_total,
+            "cpu_loky_workers": self.cpu_loky_workers,
+            "gpu_ids": self.gpu_ids,
+            "htr_jobs_per_gpu": self.htr_jobs_per_gpu,
+            "htr_slots": self.htr_slots,
+            "htr_inner_jobs_per_outer": self.htr_inner_jobs_per_outer,
+            "context_workers": self.context_workers,
+            "embedding_enabled": self.embedding_enabled,
+            "htr_enabled": self.htr_enabled,
+        }
+
+
+def resolve_multi_model_forest_stage1_parallel_plan(
+    *,
+    cpus_total: Optional[int],
+    num_workers: int,
+    gpu_ids: Optional[Sequence[int]],
+    htr_jobs_per_gpu: int,
+    htr_enabled: bool,
+    embedding_enabled: bool,
+) -> MultiModelForestStage1ParallelPlan:
+    """Resolve the public CPU/GPU budget for exact Stage 1 context fits."""
+
+    total = int(cpus_total if cpus_total is not None else num_workers)
+    total = max(1, total)
+    gpus = [int(gpu_id) for gpu_id in (gpu_ids or [])]
+    jobs_per_gpu = max(1, int(htr_jobs_per_gpu))
+    htr_slots = len(gpus) * jobs_per_gpu if htr_enabled and gpus else (1 if htr_enabled else 0)
+    reserved = min(total - 1, htr_slots) if htr_slots > 0 else 0
+    cpu_workers = max(1, total - reserved)
+    if htr_enabled and gpus:
+        context_workers = max(1, min(total, len(gpus)))
+        htr_inner_jobs = jobs_per_gpu
+    elif htr_enabled:
+        context_workers = 1
+        htr_inner_jobs = 1
+    else:
+        context_workers = cpu_workers
+        htr_inner_jobs = 1
+    device_slots: List[Optional[int]] = []
+    if htr_enabled and gpus:
+        for _job_index in range(jobs_per_gpu):
+            for gpu_id in gpus:
+                device_slots.append(int(gpu_id))
+    if not device_slots:
+        device_slots = [None] * context_workers
+    return MultiModelForestStage1ParallelPlan(
+        cpus_total=total,
+        gpu_ids=gpus,
+        htr_jobs_per_gpu=jobs_per_gpu,
+        htr_enabled=bool(htr_enabled),
+        embedding_enabled=bool(embedding_enabled),
+        htr_slots=int(htr_slots),
+        reserved_htr_cpus=int(reserved),
+        cpu_loky_workers=int(cpu_workers),
+        context_workers=int(max(1, context_workers)),
+        htr_inner_jobs_per_outer=int(max(1, htr_inner_jobs)),
+        htr_device_slots=device_slots,
+    )
+
+
+def config_for_multi_model_forest_handoff(
+    config: AppliedInferenceConfig,
+) -> AppliedInferenceConfig:
+    """Return an isolated configuration for one exact handoff context fit."""
+
+    cfg = copy.deepcopy(config)
+    mm_config = getattr(cfg.architecture, "multi_model_forest", None)
+    if mm_config is None:
+        mm_config = MultiModelForestConfig()
+        cfg.architecture.multi_model_forest = mm_config
+    cfg.architecture.model_type = "multi_model_forest"
+    mm_config = copy.deepcopy(mm_config)
+    mm_config.outer_parallelism = "1"
+    mm_config.candidate_consistency_parallelism = "1"
+    mm_config.fold_parallelism = "auto"
+    mm_config.bow_fold_parallelism = "auto"
+    # Whole contexts already occupy separate loky processes. Threads let the
+    # independent BoW folds share each lane's data without another process tree.
+    mm_config.bow_parallel_backend = "threads"
+    cfg.architecture.multi_model_forest = copy.deepcopy(mm_config)
+    cfg.architecture.multi_model_agentic_forest = mm_config
+    avf_config = getattr(cfg.architecture, "agentic_attention_variable_forest", None)
+    if avf_config is None:
+        avf_config = AgenticAttentionVariableForestConfig()
+        cfg.architecture.agentic_attention_variable_forest = avf_config
+    avf_config.fold_parallelism = "1"
+    return cfg
+
+
+def run_multi_model_forest_handoff_contexts(
+    *,
+    dataset: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    contexts: Sequence[Dict[str, Any]],
+    handoff_dir: Path,
+    plan: MultiModelForestStage1ParallelPlan,
+    base_device: torch.device,
+) -> List[Dict[str, Any]]:
+    """Fit all enabled Stage 1 architectures in each exact discovery context."""
+
+    if not contexts:
+        return []
+    n_workers = max(1, min(int(plan.context_workers), len(contexts)))
+    slots = _handoff_worker_slots(plan, n_workers, base_device)
+    cpu_workers = _handoff_cpu_worker_budgets(plan.cpus_total, n_workers)
+    shards = [[] for _ in range(n_workers)]
+    for index, context in enumerate(contexts):
+        shards[index % n_workers].append(context)
+    logger.info(
+        "Precomputing multi-model forest Stage 1 contexts=%s loky_workers=%s "
+        "cpu_workers_per_lane=%s slots=%s",
+        len(contexts),
+        n_workers,
+        cpu_workers,
+        slots,
+    )
+    if n_workers <= 1:
+        return _run_handoff_context_shard(
+            dataset=dataset,
+            config=config,
+            shard=shards[0],
+            handoff_dir=handoff_dir,
+            shard_index=0,
+            device=str(slots[0][0]),
+            gpu_ids=slots[0][1],
+            num_workers=cpu_workers[0],
+        )
+    shard_rows = Parallel(
+        n_jobs=n_workers,
+        backend="loky",
+        batch_size=1,
+        pre_dispatch="all",
+    )(
+        delayed(_run_handoff_context_shard)(
+            dataset=dataset,
+            config=config,
+            shard=shard,
+            handoff_dir=handoff_dir,
+            shard_index=shard_index,
+            device=str(slots[shard_index][0]),
+            gpu_ids=slots[shard_index][1],
+            num_workers=cpu_workers[shard_index],
+        )
+        for shard_index, shard in enumerate(shards)
+        if shard
+    )
+    return [row for rows in shard_rows for row in rows]
+
+
+def _handoff_cpu_worker_budgets(cpus_total: int, lane_count: int) -> List[int]:
+    """Divide an overall CPU budget among concurrent handoff lanes."""
+
+    lane_count = int(lane_count)
+    if lane_count < 1:
+        raise ValueError("lane_count must be positive")
+    total = max(lane_count, int(cpus_total), 1)
+    per_lane, remainder = divmod(total, lane_count)
+    return [per_lane + (1 if lane_index < remainder else 0) for lane_index in range(lane_count)]
+
+
+def _handoff_worker_slots(
+    plan: MultiModelForestStage1ParallelPlan,
+    n_workers: int,
+    base_device: torch.device,
+) -> List[Tuple[torch.device, Optional[List[int]]]]:
+    slots: List[Tuple[torch.device, Optional[List[int]]]] = []
+    if plan.htr_enabled and plan.gpu_ids:
+        gpu_slots = plan.htr_device_slots or plan.gpu_ids
+        for index in range(n_workers):
+            gpu_id = int(gpu_slots[index % len(gpu_slots)])
+            slots.append((torch.device(f"cuda:{gpu_id}"), [gpu_id]))
+        return slots
+    for _ in range(n_workers):
+        slots.append((base_device, None))
+    return slots
+
+
+def _run_handoff_context_shard(
+    *,
+    dataset: pd.DataFrame,
+    config: AppliedInferenceConfig,
+    shard: Sequence[Dict[str, Any]],
+    handoff_dir: Path,
+    shard_index: int,
+    device: str,
+    gpu_ids: Optional[List[int]],
+    num_workers: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with _serial_torch_worker_environment():
+        for context in shard:
+            train_idx = np.asarray(context["train_idx"], dtype=int)
+            runner = MultiModelForestStage1Runner(
+                dataset=dataset,
+                config=config_for_multi_model_forest_handoff(config),
+                output_path=(
+                    Path(handoff_dir)
+                    / "worker_artifacts"
+                    / f"shard_{int(shard_index):03d}"
+                    / f"fold_{int(context['fold_key']):06d}"
+                    / "predictions.parquet"
+                ),
+                device=torch.device(device),
+                gpu_ids=gpu_ids,
+                num_workers=max(1, int(num_workers)),
+            )
+            heldout_idx = np.asarray(context["heldout_idx"], dtype=int)
+            logger.info(
+                "Precomputing handoff context fold_key=%s scope=%s rows=%s device=%s",
+                context["fold_key"],
+                context["scope"],
+                len(train_idx),
+                device,
+            )
+            rows.append(
+                runner.build_discovery_handoff_row(
+                    train_idx=train_idx,
+                    heldout_idx=heldout_idx,
+                    fold_key=int(context["fold_key"]),
+                    outer_fold=int(context["outer_fold"]),
+                    scope=str(context["scope"]),
+                    inner_fold=context.get("inner_fold"),
+                    heldout_rows=context.get("heldout_rows"),
+                )
+            )
+    return rows
+
+
+@contextmanager
+def _serial_torch_worker_environment():
+    """Constrain nested numerical pools inside one Stage 1 context worker."""
+
+    from threadpoolctl import threadpool_limits
+
+    env_keys = [
+        "OCI_AVF_DATALOADER_WORKERS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ]
+    previous = {key: os.environ.get(key) for key in env_keys}
+    os.environ["OCI_AVF_DATALOADER_WORKERS"] = "0"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    old_threads = None
+    try:
+        old_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+    except Exception:
+        old_threads = None
+    try:
+        with threadpool_limits(limits=1):
+            yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if old_threads is not None:
+            try:
+                torch.set_num_threads(old_threads)
+            except Exception:
+                pass
 
 
 def _run_stage1_outer_fold_job(
@@ -3896,7 +4184,7 @@ class MultiModelForestStage1Runner:
             f"- Feature discovery methods: {', '.join(self._enabled_feature_discovery_methods())}",
             f"- Primary predictions: {self.output_path}",
             "- Agents used in primary forest: no",
-            "- Agentic Stage 2 owner: multi_model_forest",
+            "- Stage 2 owner: ResearchAllEvidenceWorkflow/plain_handoff_stage2",
         ]
         (self.artifact_dir / "report.txt").write_text("\n".join(report) + "\n")
         logger.info("Multi-model stage1 forest predictions saved to: %s", self.output_path)
