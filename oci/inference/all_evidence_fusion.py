@@ -62,20 +62,26 @@ SPARSE_QUERY_MOMENTS = "sparse_query_moments"
 # family and can no longer masquerade as the neural method.
 QUERY_MOMENTS = NEURAL_QUERY_MOMENTS
 
-ALL_SOURCE_FAMILIES = (
+PRIMARY_SOURCE_FAMILIES = (
     BOW_NUISANCE,
     BOW_R_LOSS,
     MATCHED_PAIR_UPLIFT,
     HTR_NEURAL,
     EMBEDDING_WHOLE_COHORT,
     EMBEDDING_CLUSTERED,
+    TFIDF_SEMANTIC_RETRIEVAL,
     TFIDF_TOPICS,
     TFIDF_ORPHAN_NGRAMS,
     NEURAL_QUERY_MOMENTS,
+)
+# Sparse query moments are an accepted auxiliary/legacy evidence family, not
+# one of the ten architectures promised by the researcher all-evidence path.
+ALL_SOURCE_FAMILIES = (
+    *PRIMARY_SOURCE_FAMILIES,
     SPARSE_QUERY_MOMENTS,
 )
 _SOURCE_FAMILY_SET = frozenset(ALL_SOURCE_FAMILIES)
-_CANDIDATE_SOURCE_FAMILY_SET = _SOURCE_FAMILY_SET | {TFIDF_SEMANTIC_RETRIEVAL}
+_CANDIDATE_SOURCE_FAMILY_SET = _SOURCE_FAMILY_SET
 
 _VALID_SCOPES = frozenset({"outer_train", "inner_train"})
 _VALID_ROLES = frozenset({"confounder", "effect_modifier"})
@@ -242,10 +248,11 @@ _PROMPT_FAMILY_PRIORITY = {
     BOW_NUISANCE: 3,
     EMBEDDING_CLUSTERED: 4,
     EMBEDDING_WHOLE_COHORT: 5,
-    TFIDF_ORPHAN_NGRAMS: 6,
-    TFIDF_TOPICS: 7,
-    NEURAL_QUERY_MOMENTS: 8,
-    SPARSE_QUERY_MOMENTS: 9,
+    TFIDF_SEMANTIC_RETRIEVAL: 6,
+    TFIDF_ORPHAN_NGRAMS: 7,
+    TFIDF_TOPICS: 8,
+    NEURAL_QUERY_MOMENTS: 9,
+    SPARSE_QUERY_MOMENTS: 10,
 }
 
 
@@ -2577,6 +2584,42 @@ def _compact_legacy_all_source(
         selected_embedding = _canonicalize_legacy_groups(embedding_records)
         retained_records.extend(selected_embedding)
 
+        semantic_retrieval_records: list[dict[str, Any]] = []
+        for contrast in list(section.get("embedding_chunks") or []):
+            if not isinstance(contrast, Mapping):
+                continue
+            terms = _compact_topic_terms(contrast.get("tfidf_retrieval_terms"))
+            if not terms:
+                continue
+            content = {
+                "kind": "semantic_retrieval_terms",
+                "parent_contrast": _normalize_evidence_text(
+                    contrast.get("name") or contrast.get("contrast_family")
+                ),
+                "parent_embedding_family": _embedding_family(contrast),
+                "terms": terms,
+            }
+            semantic_retrieval_records.append(
+                {
+                    "kind": "embedding",
+                    "families": (TFIDF_SEMANTIC_RETRIEVAL,),
+                    "role": role,
+                    "content": content,
+                    "dimensions": _legacy_group_dimensions(
+                        kind="embedding",
+                        families=(TFIDF_SEMANTIC_RETRIEVAL,),
+                        raw=contrast,
+                    ),
+                    "canonical": {
+                        "families": (TFIDF_SEMANTIC_RETRIEVAL,),
+                        "role": role,
+                        "content": content,
+                    },
+                }
+            )
+        discovered_records.extend(semantic_retrieval_records)
+        retained_records.extend(_canonicalize_legacy_groups(semantic_retrieval_records))
+
         htr_records: list[dict[str, Any]] = []
         for group in list(section.get("htr_blurbs") or []):
             if not isinstance(group, Mapping):
@@ -3077,6 +3120,7 @@ def source_text_temporal_policy_audit() -> dict[str, Any]:
 
 __all__ = [
     "ALL_SOURCE_FAMILIES",
+    "PRIMARY_SOURCE_FAMILIES",
     "BOW_NUISANCE",
     "BOW_R_LOSS",
     "CandidateContract",
@@ -3101,6 +3145,7 @@ __all__ = [
     "SOURCE_TEXT_TEMPORAL_BOUNDARY_ENFORCED",
     "SOURCE_TEXT_TEMPORAL_POLICY",
     "TFIDF_ORPHAN_NGRAMS",
+    "TFIDF_SEMANTIC_RETRIEVAL",
     "TFIDF_TOPICS",
     "TFIDF_TOPIC_SOURCE",
     "AllEvidenceFusionRequest",

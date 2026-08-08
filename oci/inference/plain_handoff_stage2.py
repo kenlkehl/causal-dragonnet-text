@@ -29,6 +29,7 @@ import pandas as pd
 
 from .plain_handoff_stage2_evidence import (
     EVIDENCE_COMPILER_VERSION,
+    SUPPORTED_STAGE2_ARCHITECTURES,
     compile_stage2_handoff_evidence,
 )
 
@@ -283,6 +284,7 @@ class PlainHandoffStage2Config:
     transport_retry_backoff: float = 2.0
     max_prompt_chars: int = 100_000
     evidence_compiler: str = EVIDENCE_COMPILER_VERSION
+    required_architectures: tuple[str, ...] = SUPPORTED_STAGE2_ARCHITECTURES
     evidence_max_cards_per_fold: int = 400
     evidence_max_exemplars_per_card: int = 4
     evidence_max_exemplar_chars: int = 2_400
@@ -311,10 +313,19 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.transport_retry_backoff must be nonnegative")
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
-        if self.evidence_compiler not in {EVIDENCE_COMPILER_VERSION, "raw_packets_v1"}:
+        if self.evidence_compiler != EVIDENCE_COMPILER_VERSION:
             raise ValueError(
-                f"stage2.evidence_compiler must be {EVIDENCE_COMPILER_VERSION} or "
-                "raw_packets_v1"
+                f"stage2.evidence_compiler must be {EVIDENCE_COMPILER_VERSION}; "
+                "raw_packets_v1 was retired because it merged distinct scientific "
+                "architectures"
+            )
+        required = tuple(self.required_architectures)
+        if len(required) != len(set(required)):
+            raise ValueError("stage2.required_architectures must not contain duplicates")
+        unsupported = sorted(set(required) - set(SUPPORTED_STAGE2_ARCHITECTURES))
+        if unsupported:
+            raise ValueError(
+                f"stage2.required_architectures contains unsupported values: {unsupported}"
             )
         if self.evidence_max_cards_per_fold < 16:
             raise ValueError("stage2.evidence_max_cards_per_fold must be at least 16")
@@ -2053,6 +2064,7 @@ class PlainHandoffStage2:
         signature = {
             "compiler": self.config.evidence_compiler,
             "compiler_version": EVIDENCE_COMPILER_VERSION,
+            "required_architectures": list(self.config.required_architectures),
             "max_cards_per_outer_fold": self.config.evidence_max_cards_per_fold,
             "max_exemplars_per_card": self.config.evidence_max_exemplars_per_card,
             "max_exemplar_chars": self.config.evidence_max_exemplar_chars,
@@ -2085,38 +2097,29 @@ class PlainHandoffStage2:
                 return packets, summary
 
         compile_started = time.monotonic()
-        if self.config.evidence_compiler == EVIDENCE_COMPILER_VERSION:
-            compiled = compile_stage2_handoff_evidence(
-                _iter_jsonl(handoff_path),
-                handoff_path=handoff_path,
-                max_cards_per_outer_fold=self.config.evidence_max_cards_per_fold,
-                max_exemplars_per_card=self.config.evidence_max_exemplars_per_card,
-                max_exemplar_chars=self.config.evidence_max_exemplar_chars,
-                max_packet_chars=max_packet_chars,
-                seed=seed,
+        compiled = compile_stage2_handoff_evidence(
+            _iter_jsonl(handoff_path),
+            handoff_path=handoff_path,
+            max_cards_per_outer_fold=self.config.evidence_max_cards_per_fold,
+            max_exemplars_per_card=self.config.evidence_max_exemplars_per_card,
+            max_exemplar_chars=self.config.evidence_max_exemplar_chars,
+            max_packet_chars=max_packet_chars,
+            seed=seed,
+            required_architectures=self.config.required_architectures,
+        )
+        packets = [dict(packet) for packet in compiled.packets]
+        summary = dict(compiled.summary)
+        for outer_fold, cards in compiled.cards_by_outer_fold.items():
+            fold_dir = compilation_dir / f"outer_{int(outer_fold):03d}"
+            _write_jsonl(fold_dir / "cards.jsonl", cards)
+            _write_jsonl(
+                fold_dir / "members.jsonl",
+                compiled.members_by_outer_fold[outer_fold],
             )
-            packets = [dict(packet) for packet in compiled.packets]
-            summary = dict(compiled.summary)
-            for outer_fold, cards in compiled.cards_by_outer_fold.items():
-                fold_dir = compilation_dir / f"outer_{int(outer_fold):03d}"
-                _write_jsonl(fold_dir / "cards.jsonl", cards)
-                _write_jsonl(
-                    fold_dir / "members.jsonl",
-                    compiled.members_by_outer_fold[outer_fold],
-                )
-                _write_jsonl(
-                    fold_dir / "lineage.jsonl",
-                    compiled.lineage_by_outer_fold[outer_fold],
-                )
-        else:
-            rows = _read_jsonl(handoff_path)
-            packets = packetize_handoff(rows, max_packet_chars=max_packet_chars)
-            summary = {
-                "schema_version": "raw_packets_v1",
-                "rows": len(rows),
-                "packets": len(packets),
-                "max_packet_chars": max_packet_chars,
-            }
+            _write_jsonl(
+                fold_dir / "lineage.jsonl",
+                compiled.lineage_by_outer_fold[outer_fold],
+            )
         elapsed = time.monotonic() - compile_started
         summary = {
             **summary,

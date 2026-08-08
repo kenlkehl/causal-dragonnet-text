@@ -1315,14 +1315,6 @@ class MultiModelForestStage1Runner:
                     n_rows=len(train_df),
                 )
             )
-            self.agentic_handoff_rows.extend(
-                self._inner_model_handoff_rows(
-                    base_result=handoff_result,
-                    inner_model_rows=bundle.inner_model_rows,
-                    outer_fold=outer_fold,
-                    n_outer_train_rows=len(train_df),
-                )
-            )
 
         fold_dir = self.artifact_dir / f"outer_fold_{int(outer_fold):03d}"
         fold_dir.mkdir(parents=True, exist_ok=True)
@@ -2743,26 +2735,6 @@ class MultiModelForestStage1Runner:
             prompt_chars / 1000.0,
         )
         return compact_context
-
-    def _inner_model_handoff_rows(
-        self,
-        *,
-        base_result: Dict[str, Any],
-        inner_model_rows: Sequence[Dict[str, Any]],
-        outer_fold: int,
-        n_outer_train_rows: int,
-    ) -> List[Dict[str, Any]]:
-        if not bool(getattr(self.nn_config, "candidate_consistency_enabled", True)):
-            return []
-        del base_result, inner_model_rows, n_outer_train_rows
-        raise RuntimeError(
-            "refusing to synthesize exact-inner Stage 1 handoffs for outer fold "
-            f"{int(outer_fold)}: architecture-local cross-fit row numbers do not share "
-            "one canonical split registry, and copying full-outer importance, embedding, "
-            "or HTR evidence into an inner_train row is leakage. Use the authenticated "
-            "stage1_exact_inner_evidence producer contract and refit all ten active "
-            "families on each exact canonical inner scope."
-        )
 
     def _fit_bow_binary_train_test(
         self,

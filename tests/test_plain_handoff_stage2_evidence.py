@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from oci.inference.all_evidence_fusion import (
     BOW_NUISANCE,
@@ -19,6 +20,7 @@ from oci.inference.all_evidence_fusion import (
 )
 from oci.inference.plain_handoff_stage2_evidence import (
     EVIDENCE_COMPILER_VERSION,
+    SUPPORTED_STAGE2_ARCHITECTURES,
     compile_stage2_handoff_evidence,
 )
 
@@ -306,6 +308,7 @@ def test_compiler_preserves_all_ten_architectures_as_independent_interpretation_
         handoff_path=tmp_path / "handoff" / "evidence.jsonl",
         max_cards_per_outer_fold=64,
         max_packet_chars=4_000,
+        required_architectures=SUPPORTED_STAGE2_ARCHITECTURES,
     )
 
     expected = {
@@ -322,6 +325,7 @@ def test_compiler_preserves_all_ten_architectures_as_independent_interpretation_
     }
     assert {packet["architecture"] for packet in compiled.packets} == expected
     assert set(compiled.summary["outer_folds"]["1"]["architecture_packets"]) == expected
+    assert set(compiled.summary["required_architectures"]) == expected
 
     pair_cards = [
         packet["content"]
@@ -354,6 +358,41 @@ def test_compiler_preserves_all_ten_architectures_as_independent_interpretation_
         ]
     )
     assert "orphan residual wording" in orphan_rendered
+
+
+def test_compiler_rejects_a_missing_enabled_architecture_before_interpretation(
+    tmp_path: Path,
+):
+    rows = [
+        {
+            "source": "tfidf",
+            "outer_fold": 1,
+            "scope": "full_outer_train",
+            "evidence": {
+                "discovery": {
+                    "topic_banks": {
+                        "treatment": {
+                            "topics": [
+                                {
+                                    "topic_id": "topic_1",
+                                    "terms": [{"term": "treatment wording"}],
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+        }
+    ]
+
+    with pytest.raises(ValueError, match="missing enabled Stage 1 architectures"):
+        compile_stage2_handoff_evidence(
+            rows,
+            handoff_path=tmp_path / "handoff" / "evidence.jsonl",
+            max_cards_per_outer_fold=16,
+            max_packet_chars=4_000,
+            required_architectures=(TFIDF_TOPICS, MATCHED_PAIR_UPLIFT),
+        )
 
 
 def test_compiler_memory_maps_existing_stage1_embeddings_for_semantic_cards(

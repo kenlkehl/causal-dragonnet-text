@@ -9776,6 +9776,9 @@ def _embedding_evidence_digest_groups(
         concept_scores = contrast.get("concept_probe_scores") or []
         if concept_scores:
             item["concept_probe_scores"] = concept_scores
+        retrieval_terms = contrast.get("tfidf_retrieval_terms") or []
+        if retrieval_terms:
+            item["tfidf_retrieval_terms"] = retrieval_terms
         groups.append(item)
         if len(groups) >= _EVIDENCE_DIGEST_EMBEDDING_CONTRASTS_PER_ROLE:
             break

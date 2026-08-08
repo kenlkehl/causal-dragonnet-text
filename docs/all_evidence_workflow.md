@@ -92,6 +92,14 @@ the outer held-out rows. Finally, Stage 2 fits nuisance and effect-modification
 models on the training rows and writes held-out AIPW scores and conditional
 effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
 
+The only supported compiler is `semantic_cluster_cards_v2`. It checks each
+outer fold for every architecture enabled by the resolved Stage 1 scientific
+configuration before making an interpretation request. Missing evidence fails
+with a readable Stage 1 rerun instruction. This is an in-process set comparison,
+not an artifact-authentication, byte-attestation, or deployment-gate system.
+The former `raw_packets_v1` compatibility option is intentionally unsupported
+because it combined scientifically distinct architectures.
+
 ```json
 {
   "stage2": {

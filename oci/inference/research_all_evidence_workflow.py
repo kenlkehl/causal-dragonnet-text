@@ -19,7 +19,7 @@ import logging
 import os
 import shutil
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Sequence
@@ -1194,11 +1194,15 @@ def _stage2_component(
         raise FileNotFoundError(f"Stage 2 requires the completed Stage 1 handoff: {handoff_path}")
     if context.config.stage2 is None:
         raise ValueError("Stage 2 requires stage2.endpoint")
+    stage2_config = replace(
+        context.config.stage2,
+        required_architectures=_required_stage2_architectures(context),
+    )
     return run_plain_handoff_stage2(
         handoff_path=handoff_path,
         output_dir=component_dir,
         clinical_question=context.config.clinical_question,
-        config=context.config.stage2,
+        config=stage2_config,
         dataset=context.dataset,
         split_provenance_path=(
             context.output_dir / "components" / "tfidf" / "split_provenance.jsonl"
@@ -1210,6 +1214,70 @@ def _stage2_component(
         outcome_type=context.config.outcome_type,
         inner_folds=context.config.inner_folds,
         seed=context.config.seed,
+    )
+
+
+def _required_stage2_architectures(
+    context: Stage1RunContext,
+) -> tuple[str, ...]:
+    """Return the scientific architectures enabled by the resolved Stage 1 config."""
+
+    from .all_evidence_fusion import (
+        BOW_NUISANCE,
+        BOW_R_LOSS,
+        EMBEDDING_CLUSTERED,
+        EMBEDDING_WHOLE_COHORT,
+        HTR_NEURAL,
+        MATCHED_PAIR_UPLIFT,
+        NEURAL_QUERY_MOMENTS,
+        PRIMARY_SOURCE_FAMILIES,
+        TFIDF_ORPHAN_NGRAMS,
+        TFIDF_SEMANTIC_RETRIEVAL,
+        TFIDF_TOPICS,
+    )
+
+    mm_config = context.applied_config.architecture.multi_model_forest
+    enabled: set[str] = set()
+    bow_enabled = bool(getattr(mm_config, "bow_discovery_enabled", True))
+    htr_enabled = bool(getattr(mm_config, "htr_evidence_enabled", True))
+    if bow_enabled:
+        enabled.update((BOW_NUISANCE, BOW_R_LOSS))
+    if htr_enabled:
+        enabled.add(HTR_NEURAL)
+
+    matched_enabled = (
+        str(context.config.outcome_type).lower() != "continuous"
+        and bool(getattr(mm_config, "matched_pair_uplift_enabled", True))
+        and (
+            (
+                bow_enabled
+                and bool(getattr(mm_config, "matched_pair_bow_enabled", True))
+            )
+            or (
+                htr_enabled
+                and bool(getattr(mm_config, "matched_pair_htr_enabled", True))
+            )
+        )
+    )
+    if matched_enabled:
+        enabled.add(MATCHED_PAIR_UPLIFT)
+
+    embedding = mm_config.embedding_contrast
+    if bool(getattr(embedding, "enabled", False)):
+        enabled.add(EMBEDDING_WHOLE_COHORT)
+        if bool(getattr(embedding, "include_cluster_contrast_vectors", True)):
+            enabled.add(EMBEDDING_CLUSTERED)
+        if bool(getattr(embedding, "retrieval_tfidf_enabled", True)):
+            enabled.add(TFIDF_SEMANTIC_RETRIEVAL)
+
+    enabled.add(TFIDF_TOPICS)
+    if bool(getattr(mm_config.tfidf_topic, "orphan_ngram_enabled", True)):
+        enabled.add(TFIDF_ORPHAN_NGRAMS)
+    enabled.add(NEURAL_QUERY_MOMENTS)
+    return tuple(
+        architecture
+        for architecture in PRIMARY_SOURCE_FAMILIES
+        if architecture in enabled
     )
 
 
@@ -1319,6 +1387,23 @@ class ResearchAllEvidenceWorkflow:
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         (self.config.output_dir / "logs").mkdir(exist_ok=True)
+        resolved_config_path = (
+            self.config.output_dir / "resolved_stage1_model_config.json"
+        )
+        applied_mapping = (
+            _read_mapping(resolved_config_path)
+            if resolved_config_path.is_file()
+            else _load_stage1_template(self.config)
+        )
+        experiment = ExperimentConfig.from_dict(
+            {
+                "seed": self.config.seed,
+                "device": self.config.devices[0],
+                "num_workers": self.config.workers,
+                "gpu_ids": _cuda_ids(self.config.devices) or None,
+                "applied_inference": applied_mapping,
+            }
+        )
         if self.config.dataset.suffix.lower() in {".parquet", ".pq"}:
             dataset = pd.read_parquet(self.config.dataset)
         elif self.config.dataset.suffix.lower() == ".csv":
@@ -1337,7 +1422,7 @@ class ResearchAllEvidenceWorkflow:
         return Stage1RunContext(
             config=self.config,
             dataset=dataset.reset_index(drop=True),
-            applied_config=None,
+            applied_config=experiment.applied_inference,
             neural_query_config=None,
         )
 

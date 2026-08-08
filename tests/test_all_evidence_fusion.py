@@ -26,11 +26,13 @@ from oci.inference.all_evidence_fusion import (
     MATCHED_PAIR_UPLIFT,
     NEURAL_QUERY_MOMENTS,
     NEURAL_QUERY_SOURCE,
+    PRIMARY_SOURCE_FAMILIES,
     QUERY_MOMENTS,
     SPARSE_QUERY_MOMENTS,
     SPARSE_QUERY_SOURCE,
     SOURCE_TEXT_TEMPORAL_POLICY,
     TFIDF_ORPHAN_NGRAMS,
+    TFIDF_SEMANTIC_RETRIEVAL,
     TFIDF_TOPICS,
     TFIDF_TOPIC_SOURCE,
     _normalize_agent_response_citation_families,
@@ -71,6 +73,13 @@ def _legacy_payload() -> dict:
                             "contrast_family": "whole_cohort",
                             "positive_aligned_chunks": [
                                 {"text": "inlet valve position documented"}
+                            ],
+                            "tfidf_retrieval_terms": [
+                                {
+                                    "term": "inlet valve",
+                                    "polarity": "positive",
+                                    "tfidf_contrast": 0.7,
+                                }
                             ],
                         }
                     ],
@@ -243,10 +252,14 @@ def test_compacts_every_evidence_family_and_removes_row_identifiers():
         HTR_NEURAL: 3,
         EMBEDDING_WHOLE_COHORT: 1,
         EMBEDDING_CLUSTERED: 1,
+        TFIDF_SEMANTIC_RETRIEVAL: 1,
         TFIDF_TOPICS: 3,
         TFIDF_ORPHAN_NGRAMS: 1,
         NEURAL_QUERY_MOMENTS: 1,
         SPARSE_QUERY_MOMENTS: 1,
+    }
+    assert set(PRIMARY_SOURCE_FAMILIES) == set(ALL_SOURCE_FAMILIES) - {
+        SPARSE_QUERY_MOMENTS
     }
     prompt = request.render_prompt()
     assert request.mode == "select"

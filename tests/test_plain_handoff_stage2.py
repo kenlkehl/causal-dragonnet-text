@@ -37,6 +37,17 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.consolidation_oversample_factor == 4
 
 
+def test_stage2_rejects_retired_raw_packet_compiler():
+    with pytest.raises(ValueError, match="raw_packets_v1 was retired"):
+        plain_stage2_config_from_mapping(
+            {
+                "endpoint": "http://stage2.test/v1",
+                "evidence_compiler": "raw_packets_v1",
+            },
+            default_workers=1,
+        )
+
+
 def test_stage2_ignores_legacy_extraction_batch_size(caplog):
     config = plain_stage2_config_from_mapping(
         {
@@ -1904,6 +1915,7 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
         model="test-model",
         max_prompt_chars=8_000,
         workers=2,
+        required_architectures=(),
     )
 
     first = run_plain_handoff_stage2(
@@ -2014,6 +2026,7 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(tmp_path:
         workers=4,
         max_review_rounds=1,
         estimation_trees=10,
+        required_architectures=(),
     )
 
     first = run_plain_handoff_stage2(

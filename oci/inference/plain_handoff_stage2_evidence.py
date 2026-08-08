@@ -38,6 +38,7 @@ from .all_evidence_fusion import (
     HTR_NEURAL,
     MATCHED_PAIR_UPLIFT,
     NEURAL_QUERY_MOMENTS,
+    PRIMARY_SOURCE_FAMILIES,
     TFIDF_ORPHAN_NGRAMS,
     TFIDF_SEMANTIC_RETRIEVAL,
     _compact_bow_rows,
@@ -48,6 +49,7 @@ from .all_evidence_fusion import (
 )
 
 EVIDENCE_COMPILER_VERSION = "semantic_cluster_cards_v2"
+SUPPORTED_STAGE2_ARCHITECTURES = tuple(PRIMARY_SOURCE_FAMILIES)
 ALLOWED_AXES = {
     "treatment",
     "outcome",
@@ -1224,6 +1226,7 @@ def compile_stage2_handoff_evidence(
     max_exemplar_chars: int = 2_400,
     max_packet_chars: int = 25_000,
     seed: int = 42,
+    required_architectures: Sequence[str] = (),
 ) -> CompiledStage2Evidence:
     """Compile raw Stage 1 rows into fold-local semantic evidence cards."""
 
@@ -1235,6 +1238,12 @@ def compile_stage2_handoff_evidence(
         raise ValueError("Stage 2 evidence exemplar limit must be at least 256 characters")
     if max_packet_chars < 1_200:
         raise ValueError("Stage 2 evidence packet limit must be at least 1200 characters")
+    required = tuple(dict.fromkeys(str(value).strip() for value in required_architectures))
+    if any(not value for value in required):
+        raise ValueError("required Stage 2 architecture names must be nonempty")
+    unsupported = sorted(set(required) - set(SUPPORTED_STAGE2_ARCHITECTURES))
+    if unsupported:
+        raise ValueError(f"unsupported required Stage 2 architectures: {unsupported}")
     embedding_cache = _ChunkEmbeddingCache.discover(Path(handoff_path))
     occurrences_by_outer = _extract_occurrences(rows)
     packets: list[dict[str, Any]] = []
@@ -1244,6 +1253,21 @@ def compile_stage2_handoff_evidence(
     fold_summaries: dict[str, Any] = {}
     for outer_fold in sorted(occurrences_by_outer):
         occurrences = occurrences_by_outer[outer_fold]
+        present_architectures = {
+            str(occurrence["architecture"]) for occurrence in occurrences
+        }
+        missing_architectures = [
+            architecture
+            for architecture in required
+            if architecture not in present_architectures
+        ]
+        if missing_architectures:
+            raise ValueError(
+                f"Stage 2 outer_fold={int(outer_fold)} is missing enabled Stage 1 "
+                f"architectures {missing_architectures}; present architectures are "
+                f"{sorted(present_architectures)}. Rerun the corresponding Stage 1 "
+                "component(s) and rebuild the handoff before interpretation."
+            )
         members = _aggregate_exact_occurrences(
             occurrences,
             embedding_cache=embedding_cache,
@@ -1377,6 +1401,7 @@ def compile_stage2_handoff_evidence(
         }
     summary = {
         "schema_version": EVIDENCE_COMPILER_VERSION,
+        "required_architectures": list(required),
         "embedding_cache": str(embedding_cache.directory) if embedding_cache else None,
         "embedding_cache_model": (
             embedding_cache.metadata.get("sentence_model_name") if embedding_cache else None

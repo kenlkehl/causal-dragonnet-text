@@ -634,6 +634,16 @@ does not load another embedding model beside the serving process. The raw Stage
 reduction audit are written under `stage2/evidence_compilation/`. The compiled
 packet plan is cached and input-fingerprinted for fast, safe restarts.
 
+`semantic_cluster_cards_v2` is the only supported Stage 2 evidence compiler.
+Before any interpretation request, it compares the architectures present in
+each outer fold with the architectures enabled by the resolved Stage 1 model
+configuration. A missing enabled architecture stops with a direct instruction
+to rerun its Stage 1 component and rebuild the handoff. This is a local
+scientific completeness check; it does not introduce artifact authentication,
+bundle attestation, checkpoint adoption, or deployment gates. The former
+`raw_packets_v1` option was retired because it merged distinct architectures
+into broad prompt buckets.
+
 Stage 2 then interprets the compiled evidence architectures and consolidates
 the result into operational patient-level definitions. Candidate collections that
 span multiple prompts use a progressive consolidation beam: the first pass

@@ -14,6 +14,8 @@ from oci.inference.embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
     _retrieval_tfidf_terms,
 )
+from oci.inference.all_evidence_fusion import HTR_NEURAL, MATCHED_PAIR_UPLIFT
+from oci.inference.plain_handoff_stage2_evidence import SUPPORTED_STAGE2_ARCHITECTURES
 from oci.inference.research_all_evidence_workflow import (
     COMPONENT_ORDER,
     ResearchAllEvidenceWorkflow,
@@ -21,6 +23,7 @@ from oci.inference.research_all_evidence_workflow import (
     _context_execution_lanes,
     _lane_cpu_worker_budgets,
     _raw_config_from_args,
+    _required_stage2_architectures,
     _stage1_context_specs,
     build_parser,
     compile_config,
@@ -177,6 +180,9 @@ def test_disable_htr_keeps_bow_and_embedding_without_scheduling_htr(
     assert model_config.htr_evidence_enabled is False
     assert model_config.htr_evidence_disable_reason == "disabled by research workflow option"
     assert model_config.matched_pair_htr_enabled is False
+    required = _required_stage2_architectures(context)
+    assert HTR_NEURAL not in required
+    assert MATCHED_PAIR_UPLIFT in required
 
     def run_contexts(**kwargs):
         assert kwargs["plan"].htr_enabled is False
@@ -608,6 +614,71 @@ def test_handoff_context_uses_stage1_runner_and_exact_heldout_rows(tmp_path, mon
     assert np.asarray(captured["train_idx"]).tolist() == [0, 1, 2, 3]
     assert np.asarray(captured["heldout_idx"]).tolist() == [4, 5]
     assert rows[0]["importance"]["matched_pair_uplift"] == {"views": []}
+
+
+def test_integrated_handoff_always_uses_exact_context_producer(tmp_path, monkeypatch):
+    _raw, config = _inputs(tmp_path, components=("text_models",))
+    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
+    runner = object.__new__(multi_model_workflow.MultiModelForestRunner)
+    runner.dataset = context.dataset
+    runner.config = context.applied_config
+    runner.artifact_dir = tmp_path / "integrated"
+    runner.force_stage1 = True
+    runner.plan = multi_model_workflow.resolve_multi_model_forest_parallel_plan(
+        cpus_total=1,
+        num_workers=1,
+        gpu_ids=None,
+        htr_jobs_per_gpu=1,
+        htr_enabled=False,
+        embedding_enabled=False,
+    )
+    runner.device = multi_model_workflow.torch.device("cpu")
+    specs = [
+        {
+            "fold_key": 1001,
+            "outer_fold": 1,
+            "scope": "candidate_consistency_inner_train",
+            "train_idx": np.asarray([0, 1, 2, 3]),
+            "heldout_idx": np.asarray([4, 5]),
+            "inner_fold": 1,
+            "heldout_rows": 2,
+        }
+    ]
+    monkeypatch.setattr(runner, "_handoff_context_specs", lambda: specs)
+    captured: dict[str, object] = {}
+
+    def run_contexts(**kwargs):
+        captured["contexts"] = kwargs["contexts"]
+        return [{"fold_key": 1001, "scope": "candidate_consistency_inner_train"}]
+
+    def write_rows(rows, *, source, exact_inner_contexts):
+        captured.update(
+            rows=list(rows),
+            source=source,
+            exact_inner_contexts=exact_inner_contexts,
+        )
+
+    monkeypatch.setattr(multi_model_workflow, "_run_handoff_contexts", run_contexts)
+    monkeypatch.setattr(runner, "_write_handoff_rows", write_rows)
+
+    runner._build_handoff()
+
+    assert captured["contexts"] == specs
+    assert captured["source"] == "multi_model_forest_stage1_exact_context_precompute"
+    assert captured["exact_inner_contexts"] is True
+
+
+def test_default_research_config_requires_all_ten_stage2_architectures(tmp_path):
+    raw, _config = _inputs(tmp_path, components=())
+    raw["science"]["stage1"]["architecture"] = {
+        "multi_model_forest": {
+            "feature_discovery_methods": ["bow", "htr", "embedding_contrast"],
+        }
+    }
+    config = compile_config(raw, config_dir=tmp_path)
+    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
+
+    assert _required_stage2_architectures(context) == SUPPORTED_STAGE2_ARCHITECTURES
 
 
 def test_handoff_context_receives_its_full_lane_cpu_budget(tmp_path, monkeypatch):
