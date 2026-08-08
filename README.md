@@ -483,11 +483,10 @@ Start or resume the run with one command:
 uv run python scripts/run_all_evidence.py --config run.json
 ```
 
-This is the sole supported Stage 1-to-Stage 2 multi-model orchestration path.
-The former `MultiModelForestRunner` and its oracle wrapper were retired;
-`multi_model_forest` now names the Stage 1 scientific configuration used here,
-not a separate runnable workflow. Generic `oci run` dispatch rejects that model
-type with a migration message instead of selecting a different Stage 2.
+`scripts/run_all_evidence.py` orchestrates the complete multi-model Stage 1 and
+Stage 2 workflow. Fold-local BoW, HTR, embedding, matched-pair, and
+structured-effect settings live under
+`science.stage1.architecture.multi_model_forest`.
 
 The same program accepts direct arguments when a separate configuration file is
 not useful. The following command defines an equivalent Stage 1 run explicitly:
@@ -845,14 +844,11 @@ not require `fit_tokenizer()`.
 | `explicit_feature_forest` | Investigator-defined variables are extracted from text and assigned to adjustment covariates `W`, effect-modifier covariates `X`, or both before fitting `CausalForestDML`. |
 | `agentic_explicit_feature_forest` | A nested-cross-validation search proposes and evaluates additional explicit variables. The outer folds evaluate the adaptive search procedure rather than a feature set chosen on all rows. |
 | `agentic_attention_variable_forest` | Hierarchical attention evidence supports an adaptive variable-discovery process before the explicit-feature forest is fit. This model emphasizes readable spans and post-extraction adequacy review. |
-| `multi_model_agentic_forest` | Sparse, hierarchical, and embedding evidence are combined to propose explicit variables, which are extracted and passed to a causal forest. The language model proposes variables but is not the causal estimator. |
-| `multi_model_forest` | Stage 1 scientific configuration used by the researcher all-evidence workflow for fold-local BoW, HTR, embedding, matched-pair, and structured-effect modeling. It is not a separate Stage 1/Stage 2 entry point; run it through `scripts/run_all_evidence.py` or the bundled workflow scripts. |
+| `multi_model_agentic_forest` | Sparse, hierarchical, and embedding evidence are combined to propose explicit variables, which are extracted and passed to a causal forest for effect estimation. |
 
 The feature extractor and causal head are separate choices for the basic neural
-models. Runnable forest model types own their complete pipelines and therefore
-do not use every generic extractor option. `multi_model_forest` is the schema
-exception described above: it configures Stage 1 inside the all-evidence
-workflow and is not dispatched as a standalone model.
+models. Each forest model type owns its complete pipeline and consumes its
+model-specific options.
 
 A minimal standalone run can be created with `oci init` and then edited:
 
