@@ -27,6 +27,9 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 EXTRACTION_CHECKPOINT_SCHEMA_VERSION = "stage2_single_patient_extraction_v1"
+PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_lossless_feature_partition_reconciliation_v1"
+)
 
 RequestJSON = Callable[
     [Sequence[Mapping[str, str]], Callable[[Mapping[str, Any]], dict[str, Any]]],
@@ -797,6 +800,62 @@ def _page_reconciliation_prompt(
     ]
 
 
+def _page_results_for_definitions(
+    page_results: Sequence[Mapping[str, Any]],
+    definitions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Retain every page while projecting values to one feature subset."""
+
+    feature_names = [str(definition["name"]) for definition in definitions]
+    return [
+        {
+            **{key: value for key, value in page.items() if key != "values"},
+            "values": {
+                name: dict(page.get("values") or {}).get(name) for name in feature_names
+            },
+        }
+        for page in page_results
+    ]
+
+
+def _partition_page_reconciliation_definitions(
+    *,
+    clinical_question: str,
+    definitions: Sequence[Mapping[str, Any]],
+    row_id: int,
+    page_results: Sequence[Mapping[str, Any]],
+    max_prompt_chars: int,
+) -> list[list[Mapping[str, Any]]]:
+    """Partition only features; every batch continues to see every note page."""
+
+    batches: list[list[Mapping[str, Any]]] = []
+    current: list[Mapping[str, Any]] = []
+    for definition in definitions:
+        proposed = [*current, definition]
+        proposed_results = _page_results_for_definitions(page_results, proposed)
+        messages = _page_reconciliation_prompt(
+            clinical_question=clinical_question,
+            definitions=proposed,
+            row_id=row_id,
+            page_results=proposed_results,
+        )
+        prompt_chars = _prompt_chars(messages)
+        if not current and prompt_chars > int(max_prompt_chars):
+            raise ValueError(
+                "Stage 2 cannot reconcile every lossless note page for one feature "
+                f"within max_prompt_chars ({prompt_chars} > {max_prompt_chars}); "
+                "increase the prompt budget"
+            )
+        if current and prompt_chars > int(max_prompt_chars):
+            batches.append(current)
+            current = [definition]
+        else:
+            current = proposed
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _validate_extraction(
     value: Mapping[str, Any],
     *,
@@ -1305,23 +1364,125 @@ def extract_rows(
         page_results = [
             {**dict(meta), "values": dict(result["values"])} for meta, result in ordered
         ]
-        messages = _page_reconciliation_prompt(
+        definition_batches = _partition_page_reconciliation_definitions(
             clinical_question=clinical_question,
             definitions=definitions,
             row_id=row_id,
             page_results=page_results,
+            max_prompt_chars=int(max_prompt_chars),
         )
-        if _prompt_chars(messages) > int(max_prompt_chars):
-            raise ValueError(
-                "Stage 2 complete-note page reconciliation exceeds max_prompt_chars; "
-                "increase the prompt budget or reduce the feature set"
+        if len(definition_batches) > 1:
+            LOGGER.info(
+                "Stage 2 lossless page reconciliation row_id=%s pages=%s features=%s "
+                "feature_batches=%s",
+                row_id,
+                len(page_results),
+                len(definitions),
+                len(definition_batches),
             )
-        result = _request_validated_extraction(
-            messages=messages,
+
+        merged_values: dict[str, Any] = {}
+        for batch_index, batch_definitions in enumerate(definition_batches, start=1):
+            batch_page_results = _page_results_for_definitions(
+                page_results,
+                batch_definitions,
+            )
+            messages = _page_reconciliation_prompt(
+                clinical_question=clinical_question,
+                definitions=batch_definitions,
+                row_id=row_id,
+                page_results=batch_page_results,
+            )
+            prompt_chars = _prompt_chars(messages)
+            if prompt_chars > int(max_prompt_chars):  # pragma: no cover - planner invariant
+                raise RuntimeError(
+                    "Stage 2 feature-partitioned page reconciliation exceeded "
+                    "max_prompt_chars"
+                )
+            if len(definition_batches) == 1:
+                batch_dir = reconciliation_dir
+                batch_ontology_audit_path = ontology_audit_path
+            else:
+                batch_dir = reconciliation_dir / "feature_batches" / f"batch_{batch_index:05d}"
+                batch_ontology_audit_path = batch_dir / "category_ontology_repair.json"
+            batch_result_path = batch_dir / "result.json"
+            batch_complete_path = batch_dir / "complete.json"
+            batch_stale_audit = _stale_category_ontology_audit(
+                batch_ontology_audit_path
+            )
+            batch_input = {
+                "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
+                "clinical_question": clinical_question,
+                "row_id": int(row_id),
+                "definitions": list(batch_definitions),
+                "page_results": batch_page_results,
+            }
+            batch_fingerprint = _value_fingerprint(batch_input)
+            batch_result: dict[str, Any] | None = None
+            if (
+                batch_complete_path.is_file()
+                and batch_result_path.is_file()
+                and batch_stale_audit is None
+            ):
+                try:
+                    completion = json.loads(
+                        batch_complete_path.read_text(encoding="utf-8")
+                    )
+                    cached = json.loads(batch_result_path.read_text(encoding="utf-8"))
+                    if completion.get("input_fingerprint") == batch_fingerprint:
+                        batch_result = _validate_extraction(
+                            cached,
+                            row_ids=[row_id],
+                            definitions=batch_definitions,
+                        )
+                except (
+                    KeyError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    batch_result = None
+            if batch_result is None:
+                if batch_stale_audit is not None:
+                    LOGGER.info(
+                        "retry stale Stage 2 category ontology reconciliation batch: %s",
+                        batch_dir,
+                    )
+                batch_dir.mkdir(parents=True, exist_ok=True)
+                _write_json(
+                    batch_dir / "input.json",
+                    {**batch_input, "input_fingerprint": batch_fingerprint},
+                )
+                batch_result = _request_validated_extraction(
+                    messages=messages,
+                    row_ids=[row_id],
+                    definitions=batch_definitions,
+                    request_json=request_json,
+                    ontology_audit_path=batch_ontology_audit_path,
+                )
+                _write_json(batch_result_path, batch_result)
+                _supersede_stale_category_ontology_audit(
+                    batch_ontology_audit_path,
+                    previous=batch_stale_audit,
+                )
+                _write_json(
+                    batch_complete_path,
+                    {
+                        "status": "complete",
+                        "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
+                        "input_fingerprint": batch_fingerprint,
+                        "completed_at": _now(),
+                        "pages": len(batch_page_results),
+                        "features": len(batch_definitions),
+                    },
+                )
+            merged_values.update(dict(batch_result["rows"][0]["values"]))
+
+        result = _validate_extraction(
+            {"rows": [{"row_id": int(row_id), "values": merged_values}]},
             row_ids=[row_id],
             definitions=definitions,
-            request_json=request_json,
-            ontology_audit_path=ontology_audit_path,
         )
         reconciliation_dir.mkdir(parents=True, exist_ok=True)
         _write_json(reconciliation_dir / "page_manifest.json", page_results)
@@ -1334,14 +1495,25 @@ def extract_rows(
             complete_path,
             {
                 "status": "complete",
+                "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
                 "completed_at": _now(),
                 "pages": len(page_results),
+                "feature_batches": len(definition_batches),
             },
         )
         return dict(result["rows"][0]["values"])
 
-    for row_id, page_values in completed_pages.items():
-        values_by_row[row_id] = reconcile_row(row_id, page_values)
+    if completed_pages:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(int(workers), len(completed_pages)))
+        ) as executor:
+            reconciliation_futures = {
+                executor.submit(reconcile_row, row_id, page_values): row_id
+                for row_id, page_values in completed_pages.items()
+            }
+            for future in concurrent.futures.as_completed(reconciliation_futures):
+                row_id = reconciliation_futures[future]
+                values_by_row[row_id] = future.result()
     records = []
     for row_id in row_ids:
         record: dict[str, Any] = {"_oci_row_id": int(row_id)}

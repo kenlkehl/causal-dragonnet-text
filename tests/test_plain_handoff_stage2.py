@@ -1800,6 +1800,92 @@ def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Pat
     assert frame.loc[0, "performance_status"] == "ECOG 2"
 
 
+def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
+    tmp_path: Path,
+):
+    note = "n" * 2_500
+    definitions = []
+    expected_values = {}
+    for index in range(2):
+        name = f"generic_state_{index}"
+        selected = f"state_{index}_" + ("x" * 300)
+        expected_values[name] = selected
+        definitions.append(
+            {
+                "feature_id": f"feature_{index}",
+                "name": name,
+                "description": "d" * 200,
+                "value_type": "categorical",
+                "categories_or_unit": [selected, f"other_state_{index}"],
+                "roles": ["confounder"],
+                "measurement_definition": "m" * 300,
+                "missing_value_rule": "z" * 100,
+            }
+        )
+
+    page_bodies = []
+    reconciliation_bodies = []
+    prompt_sizes = []
+
+    def request_json(messages, validate):
+        prompt_sizes.append(sum(len(message["content"]) for message in messages))
+        body = json.loads(messages[1]["content"])
+        if body["job"] == "extract_stage2_patient_variables":
+            page_bodies.extend(body["patients"])
+            row_id = body["patients"][0]["row_id"]
+        else:
+            assert body["job"] == "reconcile_stage2_patient_variable_pages"
+            reconciliation_bodies.append(body)
+            row_id = body["row_id"]
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": row_id,
+                        "values": {
+                            feature["name"]: expected_values[feature["name"]]
+                            for feature in body["features"]
+                        },
+                    }
+                ]
+            }
+        )
+
+    output = tmp_path / "extraction"
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": [note]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        clinical_question="Estimate treatment effect.",
+        output_dir=output,
+        request_json=request_json,
+        workers=4,
+        max_prompt_chars=5_000,
+    )
+
+    ordered_pages = sorted(page_bodies, key=lambda row: row["page"]["page_index"])
+    assert "".join(row["text"] for row in ordered_pages) == note
+    assert len(ordered_pages) >= 2
+    assert len(reconciliation_bodies) == 2
+    assert all(len(body["features"]) == 1 for body in reconciliation_bodies)
+    expected_page_indices = list(range(1, len(ordered_pages) + 1))
+    assert all(
+        [page["page_index"] for page in body["page_results"]]
+        == expected_page_indices
+        for body in reconciliation_bodies
+    )
+    assert all(size <= 5_000 for size in prompt_sizes)
+    assert frame.loc[0, definitions[0]["name"]] == expected_values[definitions[0]["name"]]
+    assert frame.loc[0, definitions[1]["name"]] == expected_values[definitions[1]["name"]]
+    completion = json.loads(
+        (output / "pages" / "row_00000000" / "reconciliation" / "complete.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert completion["feature_batches"] == 2
+
+
 def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
     prompt_sizes = []
 
