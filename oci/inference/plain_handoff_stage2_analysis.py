@@ -129,6 +129,64 @@ def _normalized_category_values(*, value_type: Any, values: Sequence[Any]) -> li
     return list(dict.fromkeys(normalized))
 
 
+_CATEGORY_SCHEMA_LABEL = re.compile(
+    r"^(?:binary|boolean|categorical|category|categories|ordinal|class|classes|"
+    r"level|levels|allowed\s+(?:category|categories|value|values))$",
+    flags=re.IGNORECASE,
+)
+
+
+def _validated_closed_category_values(
+    *,
+    value_type: Any,
+    values: Sequence[Any],
+    source: str,
+) -> list[str]:
+    """Normalize and validate one extraction-ready closed ontology.
+
+    This is deliberately domain-agnostic.  It validates the shape of the
+    ontology, not which clinical labels should appear in it.
+    """
+
+    normalized_type = str(value_type or "ambiguous").strip().lower()
+    if normalized_type not in {"binary", "categorical", "ordinal"}:
+        raise ValueError(f"{source} is not a closed-ontology value type")
+    categories = _normalized_category_values(
+        value_type=normalized_type,
+        values=values,
+    )
+    identity_keys = [
+        re.sub(r"[\W_]+", " ", category, flags=re.UNICODE).strip().casefold()
+        for category in categories
+    ]
+    if len(identity_keys) != len(set(identity_keys)):
+        raise ValueError(
+            f"{source} categories_or_unit must contain categories that are distinct "
+            "after case and spacing normalization"
+        )
+    if normalized_type == "binary" and len(categories) != 2:
+        raise ValueError(
+            f"{source} binary categories_or_unit must contain exactly two distinct "
+            "scalar categories as separate array items; "
+            f"received {len(categories)}: {categories!r}"
+        )
+    if normalized_type in {"categorical", "ordinal"} and len(categories) < 2:
+        raise ValueError(
+            f"{source} {normalized_type} categories_or_unit must contain at least two "
+            "distinct scalar categories as separate array items; "
+            f"received {len(categories)}: {categories!r}"
+        )
+    placeholders = [
+        category for category in categories if _CATEGORY_SCHEMA_LABEL.fullmatch(category.strip())
+    ]
+    if placeholders:
+        raise ValueError(
+            f"{source} categories_or_unit contains schema label(s) rather than "
+            f"extractable values: {placeholders!r}"
+        )
+    return categories
+
+
 def _declared_categories(definition: Mapping[str, Any]) -> list[str]:
     return _normalized_category_values(
         value_type=definition.get("value_type"),
@@ -1899,6 +1957,8 @@ def _review_prompt(
             "Drop a feature when it is essentially unmeasured, invariant, or unsupported after extraction.",
             "Use leave-one-feature-out metrics to distinguish a feature's contribution from overall model performance.",
             "Use revise only to clarify how the same evidence-supported measurement is extracted.",
+            "For a revised binary variable, provide exactly two distinct scalar ontology values as separate categories_or_unit array items.",
+            "For a revised categorical or ordinal variable, provide at least two distinct scalar ontology values as separate categories_or_unit array items.",
             "Do not add a new feature, change a causal role, or change supporting evidence.",
             "Predictive performance is diagnostic evidence, not permission to use a post-treatment variable.",
             (
@@ -1968,6 +2028,12 @@ def _validate_review(
                 raise ValueError("a revised variable requires an operational value_type")
             if not isinstance(categories, list) or not categories:
                 raise ValueError("a revised variable requires categories_or_unit")
+            if value_type in {"binary", "categorical", "ordinal"}:
+                categories = _validated_closed_category_values(
+                    value_type=value_type,
+                    values=categories,
+                    source=f"revised feature {feature_id!r}",
+                )
             for key in ("measurement_definition", "missing_value_rule"):
                 if not str(decision.get(key) or "").strip():
                     raise ValueError(f"a revised variable requires {key}")
@@ -2223,7 +2289,17 @@ def run_fold_analysis(
 
     fit_ids = [int(value) for value in split["fit_row_ids"]]
     heldout_ids = [int(value) for value in split["heldout_row_ids"]]
-    current = [dict(feature) for feature in definitions]
+    current: list[dict[str, Any]] = []
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        value_type = str(feature.get("value_type") or "ambiguous").strip().lower()
+        if value_type in {"binary", "categorical", "ordinal"}:
+            feature["categories_or_unit"] = _validated_closed_category_values(
+                value_type=value_type,
+                values=feature.get("categories_or_unit") or [],
+                source=f"feature {feature.get('name')!r}",
+            )
+        current.append(feature)
     final_fit_extraction: pd.DataFrame | None = None
     final_fit_definitions: list[dict[str, Any]] | None = None
     review_rounds = 0

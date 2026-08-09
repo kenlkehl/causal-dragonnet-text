@@ -46,7 +46,7 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
-CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v3"
+CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v4_closed_ontology"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
     "assessment",
@@ -1715,14 +1715,13 @@ def _validate_consolidation(
         if value_type in {"binary", "categorical", "ordinal"}:
             # Models sometimes serialize an enumeration as one delimited string
             # or an ordinal ontology as an integer range such as ``0-4``.
-            from .plain_handoff_stage2_analysis import _normalized_category_values
+            from .plain_handoff_stage2_analysis import _validated_closed_category_values
 
-            categories = _normalized_category_values(
+            categories = _validated_closed_category_values(
                 value_type=value_type,
                 values=categories,
+                source=f"returned feature {name!r}",
             )
-        if value_type in {"binary", "categorical", "ordinal"} and not categories:
-            value_type = "ambiguous"
 
         architectures = [
             architecture
@@ -2443,6 +2442,9 @@ def _operationalization_prompt(
             "Define exactly the named scalar pretreatment measurement; do not rename, merge, or split it in this step.",
             "Specify a reproducible extraction target from a complete patient record.",
             "For categorical or ordinal variables, enumerate the extraction ontology; for continuous variables, provide the unit when applicable.",
+            "For a binary variable, categories_or_unit must contain exactly two distinct extractable scalar values as separate array items.",
+            "For a categorical or ordinal variable, categories_or_unit must contain at least two distinct extractable scalar values as separate array items.",
+            "Never use a type label such as binary or categorical, or a combined phrase such as present-or-absent, as one ontology value.",
             "Define how absent, ambiguous, and conflicting documentation is represented.",
             "Do not return packet IDs, candidate IDs, group IDs, architectures, causal roles, or dispositions.",
             "Return one flat JSON object with every response field shown below; measurement_definition and missing_value_rule are required nonempty strings.",
@@ -2521,11 +2523,13 @@ def _validate_operationalization(
     if value_type not in ALLOWED_VALUE_TYPES:
         value_type = "ambiguous"
     if value_type in {"binary", "categorical", "ordinal"}:
-        from .plain_handoff_stage2_analysis import _normalized_category_values
+        from .plain_handoff_stage2_analysis import _validated_closed_category_values
 
-        categories = _normalized_category_values(value_type=value_type, values=categories)
-        if not categories:
-            value_type = "ambiguous"
+        categories = _validated_closed_category_values(
+            value_type=value_type,
+            values=categories,
+            source="operationalization",
+        )
     description = str(
         normalized.get("description")
         or normalized.get("clinical_definition")

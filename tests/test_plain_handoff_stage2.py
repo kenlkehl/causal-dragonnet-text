@@ -2099,6 +2099,109 @@ def test_operationalization_supplies_safe_defaults_for_omitted_leaf_fields():
     )
 
 
+@pytest.mark.parametrize(
+    ("value_type", "categories", "message"),
+    [
+        ("binary", ["binary"], "exactly two distinct"),
+        ("binary", ["enabled or disabled"], "exactly two distinct"),
+        ("binary", ["disabled", "enabled", "unknown"], "exactly two distinct"),
+        ("categorical", ["only_state"], "at least two distinct"),
+        ("ordinal", ["single_level"], "at least two distinct"),
+        ("binary", ["Disabled", "disabled"], "distinct after case and spacing"),
+        ("binary", ["binary", "disabled"], "schema label"),
+    ],
+)
+def test_operationalization_rejects_malformed_closed_ontologies(value_type, categories, message):
+    with pytest.raises(ValueError, match=message):
+        stage2_workflow._validate_operationalization(
+            {
+                "description": "A generic scalar state.",
+                "value_type": value_type,
+                "categories_or_unit": categories,
+                "measurement_definition": "Extract the documented pretreatment state.",
+                "missing_value_rule": "Return null when undocumented.",
+            },
+            group={
+                "name": "generic_state",
+                "description": "A generic scalar state.",
+                "value_type": value_type,
+                "supporting_packet_ids": ["packet_1"],
+                "supporting_architectures": ["architecture_1"],
+            },
+        )
+
+
+def test_operationalization_retries_malformed_ontology_then_accepts_repair():
+    calls = []
+
+    def completion(messages, _config):
+        calls.append(messages)
+        categories = ["binary"] if len(calls) == 1 else ["disabled", "enabled"]
+        return json.dumps(
+            {
+                "description": "A generic scalar state.",
+                "value_type": "binary",
+                "categories_or_unit": categories,
+                "measurement_definition": "Extract the documented pretreatment state.",
+                "missing_value_rule": "Return null when undocumented.",
+            }
+        )
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+        clinical_question="Estimate a treatment effect.",
+        completion=completion,
+    )
+    result = runner._operationalize_candidate_group(
+        outer_fold=1,
+        group={
+            "candidate_id": "group_001",
+            "name": "generic_state",
+            "description": "A generic scalar state.",
+            "value_type": "binary",
+            "evidence_axes": ["outcome"],
+            "supporting_packet_ids": ["packet_1"],
+            "supporting_architectures": ["architecture_1"],
+        },
+    )
+
+    assert result["categories_or_unit"] == ["disabled", "enabled"]
+    assert len(calls) == 2
+    assert "exactly two distinct" in calls[1][-1]["content"]
+
+
+def test_review_rejects_revision_with_malformed_closed_ontology():
+    definitions = [
+        {
+            "feature_id": "feature_001",
+            "name": "generic_state",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="exactly two distinct"):
+        stage2_analysis._validate_review(
+            {
+                "feature_decisions": [
+                    {
+                        "feature_id": "feature_001",
+                        "action": "revise",
+                        "reason": "Clarify the measurement.",
+                        "value_type": "binary",
+                        "categories_or_unit": ["enabled or disabled"],
+                        "measurement_definition": ("Extract the documented pretreatment state."),
+                        "missing_value_rule": "Return null when undocumented.",
+                    }
+                ],
+                "overall_assessment": "Retest the revision.",
+            },
+            definitions=definitions,
+            allow_measurement_revision=True,
+        )
+
+
 def test_stage2_progressive_consolidation_uses_oversampled_beam_across_28_batches():
     batches = [
         [
