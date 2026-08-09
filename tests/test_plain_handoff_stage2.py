@@ -1183,17 +1183,19 @@ def test_openai_completion_reports_output_token_truncation(monkeypatch):
     assert client.closed is True
 
 
-def test_consolidation_reconciles_feature_limit_and_stale_feature_names(caplog):
+def test_consolidation_rejects_feature_limit_overflow_for_repair(caplog):
     candidates = [
         {
             "candidate_id": "candidate_1",
             "architecture": "test_architecture",
+            "name": "performance_status",
             "supporting_packet_ids": ["packet_1"],
             "evidence_axes": ["treatment", "outcome"],
         },
         {
             "candidate_id": "candidate_2",
             "architecture": "test_architecture",
+            "name": "age",
             "supporting_packet_ids": ["packet_2"],
             "evidence_axes": ["treatment", "outcome"],
         },
@@ -1214,41 +1216,38 @@ def test_consolidation_reconciles_feature_limit_and_stale_feature_names(caplog):
             "caveats": "",
         }
 
-    result = stage2_workflow._validate_consolidation(
-        {
-            "features": [
-                feature("performance_status", ["packet_1", "packet_2"]),
-                feature("age", ["packet_2"]),
-            ],
-            "candidate_dispositions": {
-                "candidate_1": {
-                    "status": "retained",
-                    "feature_name": "functional_status",
-                    "reason": "Equivalent clinical measurement.",
-                },
-                "candidate_2": {
-                    "status": "merged",
-                    "feature_name": "performance_status",
-                    "reason": "Same measurement.",
-                },
-                "hallucinated_candidate": {
-                    "status": "retained",
-                    "feature_name": "age",
+    with pytest.raises(ValueError, match="returned 2 features for limit=1"):
+        stage2_workflow._validate_consolidation(
+            {
+                "features": [
+                    feature("performance_status", ["packet_1"]),
+                    feature("age", ["packet_2"]),
+                ],
+                "candidate_dispositions": {
+                    "candidate_1": {
+                        "status": "retained",
+                        "feature_name": "performance_status",
+                        "reason": "Distinct supported measurement.",
+                    },
+                    "candidate_2": {
+                        "status": "retained",
+                        "feature_name": "age",
+                        "reason": "Distinct supported measurement.",
+                    },
+                    "hallucinated_candidate": {
+                        "status": "retained",
+                        "feature_name": "age",
+                    },
                 },
             },
-        },
-        candidates=candidates,
-        max_candidates=1,
-    )
+            candidates=candidates,
+            max_candidates=1,
+        )
 
-    assert [feature["name"] for feature in result["features"]] == ["performance_status"]
-    assert result["candidate_dispositions"]["candidate_1"]["feature_name"] == ("performance_status")
-    assert result["candidate_dispositions"]["candidate_2"]["feature_name"] == ("performance_status")
-    assert "returned 2 features for limit=1" in caplog.text
     assert "ignored 1 unknown candidate disposition" in caplog.text
 
 
-def test_consolidation_normalizes_scalar_fields_and_recovers_packet_grounding(caplog):
+def test_consolidation_normalizes_scalar_fields_and_recovers_packet_grounding():
     result = stage2_workflow._validate_consolidation(
         {
             "features": [
@@ -1260,13 +1259,18 @@ def test_consolidation_normalizes_scalar_fields_and_recovers_packet_grounding(ca
                     "roles": "confounder",
                     "measurement_definition": "Extract pretreatment ECOG status.",
                     "missing_value_rule": "Return null when undocumented.",
-                    "supporting_packet_ids": "hallucinated_packet",
+                    "supporting_packet_ids": "packet_1",
                     "supporting_architectures": "hallucinated_architecture",
                     "stability_summary": "Supported by the supplied candidate.",
                     "caveats": "",
                 }
             ],
-            "candidate_dispositions": None,
+            "candidate_dispositions": {
+                "candidate_1": {
+                    "status": "retained",
+                    "feature_name": "performance_status",
+                }
+            },
         },
         candidates=[
             {
@@ -1295,9 +1299,106 @@ def test_consolidation_normalizes_scalar_fields_and_recovers_packet_grounding(ca
             "caveats": "",
         }
     ]
-    assert result["candidate_dispositions"]["candidate_1"]["status"] == "merged"
-    assert "ignored 1 unknown packet ID" in caplog.text
-    assert "omitted candidate_dispositions" in caplog.text
+    assert result["candidate_dispositions"]["candidate_1"]["status"] == "retained"
+
+
+def test_consolidation_rejects_missing_candidate_dispositions_for_repair():
+    with pytest.raises(ValueError, match="requires candidate_dispositions"):
+        stage2_workflow._validate_consolidation(
+            {"features": [], "candidate_dispositions": None},
+            candidates=[
+                {
+                    "candidate_id": "candidate_1",
+                    "architecture": "test_architecture",
+                    "name": "age",
+                    "supporting_packet_ids": ["packet_1"],
+                    "evidence_axes": ["treatment", "outcome"],
+                }
+            ],
+            max_candidates=1,
+        )
+
+
+def test_consolidation_rejects_semantically_incompatible_cross_concept_merge():
+    candidates = [
+        {
+            "candidate_id": "candidate_1",
+            "architecture": "embedding_whole_cohort",
+            "name": "pd_l1_tps",
+            "description": "PD-L1 Tumor Proportion Score",
+            "supporting_packet_ids": ["shared_packet"],
+            "evidence_axes": ["outcome", "residual_effect", "treatment"],
+        },
+        {
+            "candidate_id": "candidate_2",
+            "architecture": "embedding_whole_cohort",
+            "name": "kras_g12c_mutation",
+            "description": "KRAS G12C mutation status",
+            "supporting_packet_ids": ["shared_packet"],
+            "evidence_axes": ["outcome", "residual_effect", "treatment"],
+        },
+    ]
+    response = {
+        "features": [
+            {
+                "name": "kras_g12c_mutation",
+                "description": "Presence of KRAS G12C mutation.",
+                "value_type": "binary",
+                "categories_or_unit": ["present", "absent"],
+                "roles": ["confounder", "effect_modifier"],
+                "measurement_definition": "Extract KRAS G12C mutation status.",
+                "missing_value_rule": "Return null when undocumented.",
+                "supporting_packet_ids": ["shared_packet"],
+                "supporting_architectures": ["embedding_whole_cohort"],
+            }
+        ],
+        "candidate_dispositions": {
+            "candidate_1": {
+                "status": "merged",
+                "feature_name": "kras_g12c_mutation",
+                "reason": "Specific biomarker measurement.",
+            },
+            "candidate_2": {
+                "status": "retained",
+                "feature_name": "kras_g12c_mutation",
+                "reason": "Specific mutation measurement.",
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="semantically incompatible"):
+        stage2_workflow._validate_consolidation(
+            response,
+            candidates=candidates,
+            max_candidates=2,
+        )
+
+
+def test_consolidation_rejects_retained_candidate_with_missing_feature():
+    with pytest.raises(ValueError, match="references missing returned feature 'age'"):
+        stage2_workflow._validate_consolidation(
+            {
+                "features": [],
+                "candidate_dispositions": {
+                    "candidate_1": {
+                        "status": "retained",
+                        "feature_name": "age",
+                        "reason": "Standard demographic confounder.",
+                    }
+                },
+            },
+            candidates=[
+                {
+                    "candidate_id": "candidate_1",
+                    "architecture": "bow_nuisance",
+                    "name": "age",
+                    "description": "Patient age in years.",
+                    "supporting_packet_ids": ["packet_1"],
+                    "evidence_axes": ["treatment", "outcome"],
+                }
+            ],
+            max_candidates=1,
+        )
 
 
 def test_consolidation_expands_ordinal_integer_range_categories():
@@ -1714,7 +1815,7 @@ def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
     config = PlainHandoffStage2Config(
         endpoint="http://stage2.test/v1",
         model="test-model",
-        max_prompt_chars=4_000,
+        max_prompt_chars=6_000,
         max_candidates_per_fold=3,
     )
     runner = PlainHandoffStage2(

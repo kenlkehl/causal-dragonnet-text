@@ -47,6 +47,104 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 
+_CONCEPT_IDENTITY_STOPWORDS = {
+    "assessment",
+    "baseline",
+    "biomarker",
+    "clinical",
+    "confounder",
+    "diagnosis",
+    "disease",
+    "documentation",
+    "effect",
+    "evidence",
+    "expression",
+    "feature",
+    "history",
+    "information",
+    "level",
+    "measurement",
+    "metastasis",
+    "modifier",
+    "mutation",
+    "outcome",
+    "patient",
+    "presence",
+    "pretreatment",
+    "prognostic",
+    "record",
+    "residual",
+    "score",
+    "specific",
+    "status",
+    "treatment",
+    "value",
+    "variable",
+}
+_CONCEPT_TOKEN_ALIASES = {
+    "activities": "adl",
+    "activity": "adl",
+    "adls": "adl",
+    "daily": "adl",
+    "diameter": "size",
+    "dimension": "size",
+    "functional": "performance",
+    "intracranial": "brain",
+    "krash": "kras",
+    "lesion": "tumor",
+    "living": "adl",
+    "smoking": "tobacco",
+    "tumour": "tumor",
+}
+
+
+def _concept_identity_tokens(*values: Any) -> set[str]:
+    """Return conservative lexical anchors for one patient-level measurement."""
+
+    text = " ".join(str(value) for value in values if value is not None).lower()
+    phrase_aliases = (
+        (r"\bprogrammed[\s_-]+death[\s_-]+ligand[\s_-]*1\b", " pdl1 "),
+        (r"\bpd[\s_-]*l[\s_-]*1\b", " pdl1 "),
+        (r"\btumou?r[\s_-]+proportion[\s_-]+score\b", " tps "),
+        (r"\bactivities[\s_-]+of[\s_-]+daily[\s_-]+living\b", " adl "),
+        (r"\bk[\s_-]*ras\b", " kras "),
+    )
+    for pattern, replacement in phrase_aliases:
+        text = re.sub(pattern, replacement, text)
+    tokens: set[str] = set()
+    for raw_token in re.findall(r"[a-z]+[a-z0-9]*", text):
+        token = _CONCEPT_TOKEN_ALIASES.get(raw_token, raw_token)
+        if token.endswith("ies") and len(token) > 4:
+            token = token[:-3] + "y"
+        elif token.endswith("s") and len(token) > 4 and not token.endswith("ss"):
+            token = token[:-1]
+        token = _CONCEPT_TOKEN_ALIASES.get(token, token)
+        if len(token) > 1 and token not in _CONCEPT_IDENTITY_STOPWORDS:
+            tokens.add(token)
+    return tokens
+
+
+def _consolidation_route_is_semantically_compatible(
+    candidate: Mapping[str, Any],
+    feature: Mapping[str, Any],
+) -> bool:
+    """Require a shared measurement anchor before two concepts may be routed together."""
+
+    candidate_tokens = _concept_identity_tokens(
+        candidate.get("name"),
+        candidate.get("description"),
+    )
+    feature_tokens = _concept_identity_tokens(
+        feature.get("name"),
+        feature.get("description"),
+        feature.get("measurement_definition"),
+    )
+    # Old/custom candidate producers may not supply concept text. In that case
+    # packet grounding remains the only available check.
+    if not candidate_tokens or not feature_tokens:
+        return True
+    return bool(candidate_tokens.intersection(feature_tokens))
+
 
 def _canonical_evidence_axes(value: Any) -> list[str]:
     raw_axes = [value] if isinstance(value, str) else list(value or [])
@@ -1353,8 +1451,11 @@ def _consolidation_prompt(
             "Cite only packet IDs carried by the candidates.",
             "Define a reproducible patient-level extraction target, categories or unit, and missing-value handling.",
             "When the feature limit requires selection, preserve distinct measurements across evidence axes, causal roles, and supporting architectures; spend the available quota on diversity rather than near-duplicates.",
+            "Treat the same clearly defined measurement recurring across independent architectures or evidence axes as replicated support: consolidate those aliases into one feature and prioritize retaining it.",
             f"Retain no more than {max_candidates} supported features.",
             "Give every candidate one disposition.",
+            "Every retained or merged disposition must name one returned feature exactly; never mark a candidate retained or merged when that feature is absent.",
+            "Route candidates together only when they describe the same patient-level measurement. Shared packet IDs do not make distinct concepts aliases; for example, PD-L1 expression and KRAS mutation must remain separate.",
         ],
         "candidates": list(candidates),
         "response": {
@@ -1404,11 +1505,9 @@ def _validate_consolidation(
     if not isinstance(features, list):
         raise ValueError("consolidation requires a features list")
     if not isinstance(dispositions, Mapping):
-        LOGGER.warning(
-            "Stage 2 consolidation response omitted candidate_dispositions; "
-            "deriving unambiguous routes from packet evidence"
+        raise ValueError(
+            "consolidation requires candidate_dispositions for every supplied candidate"
         )
-        dispositions = {}
     dispositions = {str(candidate_id): row for candidate_id, row in dispositions.items()}
 
     def feature_name_key(name: Any) -> str:
@@ -1425,6 +1524,11 @@ def _validate_consolidation(
 
     candidate_ids = {str(candidate["candidate_id"]) for candidate in candidates}
     candidate_by_id = {str(candidate["candidate_id"]): candidate for candidate in candidates}
+    missing_disposition_ids = sorted(candidate_ids - set(dispositions))
+    if missing_disposition_ids:
+        raise ValueError(
+            "consolidation omitted candidate disposition(s): " f"{missing_disposition_ids[:8]}"
+        )
     extra_disposition_ids = sorted(set(dispositions) - candidate_ids)
     if extra_disposition_ids:
         LOGGER.warning(
@@ -1432,6 +1536,39 @@ def _validate_consolidation(
             len(extra_disposition_ids),
             extra_disposition_ids[:8],
         )
+    status_aliases = {
+        "keep": "retained",
+        "kept": "retained",
+        "retain": "retained",
+        "combine": "merged",
+        "combined": "merged",
+        "merge": "merged",
+        "drop": "excluded",
+        "dropped": "excluded",
+        "exclude": "excluded",
+    }
+    normalized_dispositions: dict[str, dict[str, str]] = {}
+    for candidate_id in sorted(candidate_ids):
+        raw_disposition = dispositions[candidate_id]
+        if not isinstance(raw_disposition, Mapping):
+            raise ValueError(f"candidate disposition {candidate_id!r} must be an object")
+        status = str(raw_disposition.get("status") or "").strip().lower()
+        status = status_aliases.get(status, status)
+        if status not in {"retained", "merged", "excluded"}:
+            raise ValueError(
+                f"candidate disposition {candidate_id!r} has unsupported status {status!r}"
+            )
+        feature_name = str(raw_disposition.get("feature_name") or "").strip()
+        if status != "excluded" and not feature_name:
+            raise ValueError(
+                f"candidate disposition {candidate_id!r} with status={status!r} "
+                "must name a returned feature"
+            )
+        normalized_dispositions[candidate_id] = {
+            "status": status,
+            "feature_name": feature_name,
+            "reason": str(raw_disposition.get("reason") or "").strip(),
+        }
     allowed_packets = {
         str(packet_id)
         for candidate in candidates
@@ -1459,47 +1596,39 @@ def _validate_consolidation(
     clean_features: list[dict[str, Any]] = []
     for feature_index, feature in enumerate(features, start=1):
         if not isinstance(feature, Mapping):
-            LOGGER.warning(
-                "Stage 2 consolidation dropped malformed feature at position=%s",
-                feature_index,
-            )
-            continue
+            raise ValueError(f"consolidation feature at position={feature_index} must be an object")
         name = str(feature.get("name") or feature.get("feature_name") or "").strip()
         if not name:
-            LOGGER.warning(
-                "Stage 2 consolidation dropped unnamed feature at position=%s",
-                feature_index,
-            )
-            continue
+            raise ValueError(f"consolidation feature at position={feature_index} has no name")
         name_key = feature_name_key(name)
         matched_candidate_ids = {
             candidate_id
-            for candidate_id, candidate in candidate_by_id.items()
-            if feature_name_key(candidate.get("name") or "") == name_key
-            or (
-                isinstance(dispositions.get(candidate_id), Mapping)
-                and feature_name_key(dispositions[candidate_id].get("feature_name") or "")
-                == name_key
-                and str(dispositions[candidate_id].get("status") or "").lower()
-                not in {"excluded", "exclude", "drop", "dropped"}
-            )
+            for candidate_id, disposition in normalized_dispositions.items()
+            if disposition["status"] != "excluded"
+            and feature_name_key(disposition["feature_name"]) == name_key
         }
-        if not matched_candidate_ids and len(features) == 1:
-            matched_candidate_ids = {
-                candidate_id
-                for candidate_id in candidate_ids
-                if isinstance(dispositions.get(candidate_id), Mapping)
-                and str(dispositions[candidate_id].get("status") or "").lower()
-                in {
-                    "retained",
-                    "retain",
-                    "keep",
-                    "kept",
-                    "merged",
-                    "merge",
-                    "combine",
-                }
-            }
+        if not matched_candidate_ids:
+            raise ValueError(
+                f"returned feature {name!r} is not referenced by any retained or merged "
+                "candidate disposition"
+            )
+        incompatible_candidate_ids = [
+            candidate_id
+            for candidate_id in sorted(matched_candidate_ids)
+            if not _consolidation_route_is_semantically_compatible(
+                candidate_by_id[candidate_id], feature
+            )
+        ]
+        if incompatible_candidate_ids:
+            incompatible_names = [
+                str(candidate_by_id[candidate_id].get("name") or candidate_id)
+                for candidate_id in incompatible_candidate_ids
+            ]
+            raise ValueError(
+                f"returned feature {name!r} has semantically incompatible candidate "
+                f"route(s): {incompatible_names[:8]}. Distinct measurements must not "
+                "be merged merely because packet evidence overlaps"
+            )
 
         cited_packets = string_list(
             feature.get("supporting_packet_ids") or feature.get("packet_ids")
@@ -1507,26 +1636,29 @@ def _validate_consolidation(
         unknown_packets = [
             packet_id for packet_id in cited_packets if packet_id not in allowed_packets
         ]
-        packets = [packet_id for packet_id in cited_packets if packet_id in allowed_packets]
+        if unknown_packets:
+            raise ValueError(
+                f"returned feature {name!r} cites unknown packet ID(s): " f"{unknown_packets[:8]}"
+            )
+        routed_packets = {
+            str(packet_id)
+            for candidate_id in matched_candidate_ids
+            for packet_id in string_list(candidate_by_id[candidate_id].get("supporting_packet_ids"))
+        }
+        unrelated_packets = sorted(set(cited_packets) - routed_packets)
+        if unrelated_packets:
+            raise ValueError(
+                f"returned feature {name!r} cites packet(s) not carried by its routed "
+                f"candidates: {unrelated_packets[:8]}"
+            )
+        packets = [packet_id for packet_id in cited_packets if packet_id in routed_packets]
         for candidate_id in sorted(matched_candidate_ids):
             packets.extend(string_list(candidate_by_id[candidate_id].get("supporting_packet_ids")))
         packets = list(
             dict.fromkeys(packet_id for packet_id in packets if packet_id in allowed_packets)
         )
-        if unknown_packets:
-            LOGGER.warning(
-                "Stage 2 consolidation feature=%s ignored %s unknown packet ID(s): %s",
-                name,
-                len(unknown_packets),
-                unknown_packets[:8],
-            )
         if not packets:
-            LOGGER.warning(
-                "Stage 2 consolidation dropped ungrounded feature=%s; no supplied "
-                "candidate evidence could be recovered",
-                name,
-            )
-            continue
+            raise ValueError(f"returned feature {name!r} has no supplied candidate evidence")
 
         raw_categories = feature.get("categories_or_unit")
         if isinstance(raw_categories, Mapping):
@@ -1614,93 +1746,28 @@ def _validate_consolidation(
         if existing is None:
             deduplicated_features[key] = feature
             continue
-        LOGGER.warning(
-            "Stage 2 consolidation merged duplicate returned feature name=%s",
-            feature["name"],
-        )
-        for field in (
-            "categories_or_unit",
-            "supporting_packet_ids",
-            "supporting_architectures",
-        ):
-            existing[field] = list(dict.fromkeys([*existing[field], *feature[field]]))
+        raise ValueError(f"consolidation returned duplicate feature name {feature['name']!r}")
     clean_features = list(deduplicated_features.values())
     if len(clean_features) > max_candidates:
-        referenced_names = Counter(
-            feature_name_key(row.get("feature_name"))
-            for row in dispositions.values()
-            if isinstance(row, Mapping)
-            and str(row.get("status") or "").lower() in {"retained", "merged"}
+        raise ValueError(
+            f"consolidation returned {len(clean_features)} features for limit="
+            f"{max_candidates}; select within the limit and return consistent dispositions"
         )
-        ranked_indices = sorted(
-            range(len(clean_features)),
-            key=lambda index: (
-                referenced_names[feature_name_key(clean_features[index]["name"])],
-                len(clean_features[index]["supporting_packet_ids"]),
-                -index,
-            ),
-            reverse=True,
-        )
-        retained_indices = set(ranked_indices[:max_candidates])
-        LOGGER.warning(
-            "Stage 2 consolidation returned %s features for limit=%s; retaining "
-            "the %s most candidate-supported grounded feature(s)",
-            len(clean_features),
-            max_candidates,
-            len(retained_indices),
-        )
-        clean_features = [
-            feature for index, feature in enumerate(clean_features) if index in retained_indices
-        ]
     clean_dispositions: dict[str, dict[str, str]] = {}
-    status_aliases = {
-        "keep": "retained",
-        "kept": "retained",
-        "retain": "retained",
-        "combine": "merged",
-        "combined": "merged",
-        "merge": "merged",
-        "drop": "excluded",
-        "dropped": "excluded",
-        "exclude": "excluded",
-    }
     features_by_name = {feature["name"]: feature for feature in clean_features}
     features_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for feature in clean_features:
         key = feature_name_key(feature["name"])
         features_by_key[key].append(feature)
     for candidate_id in sorted(candidate_ids):
-        raw_disposition = dispositions.get(candidate_id)
+        raw_disposition = normalized_dispositions[candidate_id]
         candidate_packets = {
             str(packet_id)
             for packet_id in string_list(candidate_by_id[candidate_id].get("supporting_packet_ids"))
         }
-        if not isinstance(raw_disposition, Mapping):
-            compatible = [
-                candidate_feature
-                for candidate_feature in clean_features
-                if candidate_packets <= set(candidate_feature["supporting_packet_ids"])
-            ]
-            if len(compatible) == 1:
-                clean_dispositions[candidate_id] = {
-                    "status": "merged",
-                    "feature_name": str(compatible[0]["name"]),
-                    "reason": (
-                        "Candidate disposition was missing; routed to the unique "
-                        "returned feature preserving its packet evidence."
-                    ),
-                }
-            else:
-                clean_dispositions[candidate_id] = {
-                    "status": "excluded",
-                    "feature_name": "",
-                    "reason": "Candidate disposition was missing or ambiguous.",
-                }
-            continue
-        status = str(raw_disposition.get("status") or "").strip().lower()
-        status = status_aliases.get(status, status)
-        feature_name = str(raw_disposition.get("feature_name") or "").strip()
-        reason = str(raw_disposition.get("reason") or "").strip()
+        status = raw_disposition["status"]
+        feature_name = raw_disposition["feature_name"]
+        reason = raw_disposition["reason"]
         if status == "excluded":
             clean_dispositions[candidate_id] = {
                 "status": "excluded",
@@ -1714,38 +1781,24 @@ def _validate_consolidation(
             matches = features_by_key.get(key, [])
             if len(matches) == 1:
                 feature = matches[0]
-        if feature is None and status != "excluded":
-            compatible = [
-                candidate_feature
-                for candidate_feature in clean_features
-                if candidate_packets <= set(candidate_feature["supporting_packet_ids"])
-            ]
-            if len(compatible) == 1:
-                feature = compatible[0]
         if feature is None:
-            clean_dispositions[candidate_id] = {
-                "status": "excluded",
-                "feature_name": "",
-                "reason": (
-                    reason + " No uniquely matching returned feature remained during normalization."
-                ).strip(),
-            }
-            continue
-        if status not in {"retained", "merged"}:
-            status = "merged"
-            reason = (
-                reason + " Missing or unsupported status normalized from the grounded "
-                "feature route."
-            ).strip()
+            raise ValueError(
+                f"candidate disposition {candidate_id!r} references missing returned "
+                f"feature {feature_name!r}"
+            )
+        if not _consolidation_route_is_semantically_compatible(
+            candidate_by_id[candidate_id], feature
+        ):
+            raise ValueError(
+                f"candidate {candidate_id!r} "
+                f"({candidate_by_id[candidate_id].get('name')!r}) cannot be merged "
+                f"into semantically incompatible feature {feature['name']!r}"
+            )
         if not candidate_packets <= set(feature["supporting_packet_ids"]):
-            clean_dispositions[candidate_id] = {
-                "status": "excluded",
-                "feature_name": "",
-                "reason": (
-                    reason + " Returned feature did not preserve this candidate's cited evidence."
-                ).strip(),
-            }
-            continue
+            raise ValueError(
+                f"returned feature {feature['name']!r} did not preserve all packet "
+                f"evidence for candidate {candidate_id!r}"
+            )
         clean_dispositions[candidate_id] = {
             "status": status,
             "feature_name": str(feature["name"]),
@@ -1766,24 +1819,33 @@ def _validate_consolidation(
             derived_roles.append("prognostic")
         if axes.intersection({"residual_effect", "matched_pair"}):
             derived_roles.append("effect_modifier")
-        if derived_roles:
-            feature["roles"] = derived_roles
-            routed_features.append(feature)
+        if not derived_roles:
+            raise ValueError(
+                f"returned feature {feature['name']!r} has no supported Stage 2 causal role"
+            )
+        feature["roles"] = derived_roles
+        routed_features.append(feature)
 
     routed_names = {feature["name"] for feature in routed_features}
     for disposition in clean_dispositions.values():
-        if disposition["feature_name"] not in routed_names:
-            disposition["status"] = "excluded"
-            disposition["feature_name"] = ""
-            disposition["reason"] = (
-                disposition["reason"] + " No supported Stage 2 causal role remained after routing."
-            ).strip()
+        if disposition["status"] != "excluded" and disposition["feature_name"] not in routed_names:
+            raise ValueError(
+                "candidate disposition references unrouted feature "
+                f"{disposition['feature_name']!r}"
+            )
     used_names = {
         disposition["feature_name"]
         for disposition in clean_dispositions.values()
         if disposition["status"] != "excluded"
     }
-    routed_features = [feature for feature in routed_features if feature["name"] in used_names]
+    unused_features = [
+        feature["name"] for feature in routed_features if feature["name"] not in used_names
+    ]
+    if unused_features:
+        raise ValueError(
+            "returned feature(s) have no retained or merged candidate route: "
+            f"{unused_features[:8]}"
+        )
     return {"features": routed_features, "candidate_dispositions": clean_dispositions}
 
 
