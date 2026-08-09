@@ -36,7 +36,7 @@ RequestJSON = Callable[
 _SCALAR_EXTRACTION_RULES = (
     "Return one scalar value or null per feature; never return an object or array.",
     "For a continuous feature return one JSON number: from a composite such as "
-    "132/78, use only a component explicitly named by the feature; if the definition "
+    "147/93, use only a component explicitly named by the feature; if the definition "
     "requests multiple components, return null rather than a ratio string or aggregate.",
 )
 

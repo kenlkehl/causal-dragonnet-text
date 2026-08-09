@@ -281,7 +281,7 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
     for prompt in (extraction, reconciliation):
         assert any("never return an object or array" in rule for rule in prompt["rules"])
         composite_rule = next(
-            rule for rule in prompt["rules"] if "composite such as 132/78" in rule
+            rule for rule in prompt["rules"] if "composite such as 147/93" in rule
         )
         assert "component explicitly named by the feature" in composite_rule
         assert "requests multiple components, return null" in composite_rule
@@ -813,7 +813,7 @@ def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
     tmp_path: Path,
 ):
     dataset = pd.DataFrame(
-        {"clinical_text": ["Age 67 years. Blood pressure 132/78 mmHg."]}
+        {"clinical_text": ["Age 67 years. Blood pressure 147/93 mmHg."]}
     )
     definitions = [
         {
@@ -838,7 +838,7 @@ def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
                         "row_id": 0,
                         "values": {
                             "age": 67,
-                            "blood_pressure": {"systolic": 132, "diastolic": 78},
+                            "blood_pressure": {"systolic": 147, "diastolic": 93},
                         },
                     }
                 ]
@@ -2297,7 +2297,7 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
         {
             "patient_id": [f"p{index:02d}" for index in range(24)],
             "clinical_text": [
-                f"Age {50 + index} years. Blood pressure 132/78 mmHg."
+                f"Age {50 + index} years. Blood pressure 147/93 mmHg."
                 for index in range(24)
             ],
             "treatment_indicator": [index % 2 for index in range(24)],
@@ -2349,7 +2349,7 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
                 age = int(re.search(r"Age\s+(\d+)", patient["text"]).group(1))
                 values = {"age": age}
                 if "blood_pressure" in names:
-                    values["blood_pressure"] = {"systolic": 132, "diastolic": 78}
+                    values["blood_pressure"] = {"systolic": 147, "diastolic": 93}
                 rows.append({"row_id": patient["row_id"], "values": values})
             return validate({"rows": rows})
         return validate(
