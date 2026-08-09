@@ -1448,6 +1448,7 @@ def _consolidation_prompt(
             "An effect modifier requires residual-effect or matched-pair evidence.",
             "Semantic evidence can name a measurement but cannot establish a causal role by itself.",
             "Cite only packet IDs carried by the candidates.",
+            "For each returned feature, cite only packets carried by candidates whose disposition routes to that feature; omit packets from excluded or differently routed candidates.",
             "Define a reproducible patient-level extraction target, categories or unit, and missing-value handling.",
             "When the feature limit requires selection, preserve distinct measurements across evidence axes, causal roles, and supporting architectures; spend the available quota on diversity rather than near-duplicates.",
             "Treat the same clearly defined measurement recurring across independent architectures or evidence axes as replicated support: consolidate those aliases into one feature and prioritize retaining it.",
@@ -1646,9 +1647,12 @@ def _validate_consolidation(
         }
         unrelated_packets = sorted(set(cited_packets) - routed_packets)
         if unrelated_packets:
-            raise ValueError(
-                f"returned feature {name!r} cites packet(s) not carried by its routed "
-                f"candidates: {unrelated_packets[:8]}"
+            LOGGER.warning(
+                "Stage 2 consolidation feature=%s discarded %s known packet citation(s) "
+                "not carried by candidates routed to that feature: %s",
+                name,
+                len(unrelated_packets),
+                unrelated_packets[:8],
             )
         packets = [packet_id for packet_id in cited_packets if packet_id in routed_packets]
         for candidate_id in sorted(matched_candidate_ids):

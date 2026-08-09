@@ -1374,6 +1374,60 @@ def test_consolidation_rejects_semantically_incompatible_cross_concept_merge():
         )
 
 
+def test_consolidation_discards_known_packets_not_carried_by_routed_candidates(caplog):
+    result = stage2_workflow._validate_consolidation(
+        {
+            "features": [
+                {
+                    "name": "signal_alpha",
+                    "description": "Continuous alpha signal.",
+                    "value_type": "continuous",
+                    "categories_or_unit": ["units"],
+                    "roles": ["confounder", "effect_modifier"],
+                    "measurement_definition": "Extract the alpha signal.",
+                    "missing_value_rule": "Return null when undocumented.",
+                    "supporting_packet_ids": ["packet_alpha", "packet_beta"],
+                    "supporting_architectures": ["embedding_whole_cohort"],
+                }
+            ],
+            "candidate_dispositions": {
+                "candidate_1": {
+                    "status": "retained",
+                    "feature_name": "signal_alpha",
+                    "reason": "Supported measurement.",
+                },
+                "candidate_2": {
+                    "status": "excluded",
+                    "feature_name": "",
+                    "reason": "Different measurement.",
+                },
+            },
+        },
+        candidates=[
+            {
+                "candidate_id": "candidate_1",
+                "architecture": "embedding_whole_cohort",
+                "name": "signal_alpha",
+                "description": "Continuous alpha signal.",
+                "supporting_packet_ids": ["packet_alpha"],
+                "evidence_axes": ["outcome", "residual_effect", "treatment"],
+            },
+            {
+                "candidate_id": "candidate_2",
+                "architecture": "embedding_whole_cohort",
+                "name": "attribute_beta",
+                "description": "Binary beta attribute.",
+                "supporting_packet_ids": ["packet_beta"],
+                "evidence_axes": ["outcome"],
+            },
+        ],
+        max_candidates=2,
+    )
+
+    assert result["features"][0]["supporting_packet_ids"] == ["packet_alpha"]
+    assert "discarded 1 known packet citation" in caplog.text
+
+
 def test_consolidation_rejects_retained_candidate_with_missing_feature():
     with pytest.raises(ValueError, match="references missing returned feature 'age'"):
         stage2_workflow._validate_consolidation(
