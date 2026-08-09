@@ -1324,16 +1324,16 @@ def test_consolidation_rejects_semantically_incompatible_cross_concept_merge():
         {
             "candidate_id": "candidate_1",
             "architecture": "embedding_whole_cohort",
-            "name": "pd_l1_tps",
-            "description": "PD-L1 Tumor Proportion Score",
+            "name": "signal_alpha",
+            "description": "Continuous alpha signal",
             "supporting_packet_ids": ["shared_packet"],
             "evidence_axes": ["outcome", "residual_effect", "treatment"],
         },
         {
             "candidate_id": "candidate_2",
             "architecture": "embedding_whole_cohort",
-            "name": "kras_g12c_mutation",
-            "description": "KRAS G12C mutation status",
+            "name": "attribute_beta",
+            "description": "Binary beta attribute",
             "supporting_packet_ids": ["shared_packet"],
             "evidence_axes": ["outcome", "residual_effect", "treatment"],
         },
@@ -1341,12 +1341,12 @@ def test_consolidation_rejects_semantically_incompatible_cross_concept_merge():
     response = {
         "features": [
             {
-                "name": "kras_g12c_mutation",
-                "description": "Presence of KRAS G12C mutation.",
+                "name": "attribute_beta",
+                "description": "Binary beta attribute.",
                 "value_type": "binary",
                 "categories_or_unit": ["present", "absent"],
                 "roles": ["confounder", "effect_modifier"],
-                "measurement_definition": "Extract KRAS G12C mutation status.",
+                "measurement_definition": "Extract the beta attribute.",
                 "missing_value_rule": "Return null when undocumented.",
                 "supporting_packet_ids": ["shared_packet"],
                 "supporting_architectures": ["embedding_whole_cohort"],
@@ -1355,13 +1355,13 @@ def test_consolidation_rejects_semantically_incompatible_cross_concept_merge():
         "candidate_dispositions": {
             "candidate_1": {
                 "status": "merged",
-                "feature_name": "kras_g12c_mutation",
-                "reason": "Specific biomarker measurement.",
+                "feature_name": "attribute_beta",
+                "reason": "Specific measurement.",
             },
             "candidate_2": {
                 "status": "retained",
-                "feature_name": "kras_g12c_mutation",
-                "reason": "Specific mutation measurement.",
+                "feature_name": "attribute_beta",
+                "reason": "Specific measurement.",
             },
         },
     }

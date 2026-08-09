@@ -81,46 +81,45 @@ _CONCEPT_IDENTITY_STOPWORDS = {
     "value",
     "variable",
 }
-_CONCEPT_TOKEN_ALIASES = {
-    "activities": "adl",
-    "activity": "adl",
-    "adls": "adl",
-    "daily": "adl",
-    "diameter": "size",
-    "dimension": "size",
-    "functional": "performance",
-    "intracranial": "brain",
-    "krash": "kras",
-    "lesion": "tumor",
-    "living": "adl",
-    "smoking": "tobacco",
-    "tumour": "tumor",
-}
 
 
 def _concept_identity_tokens(*values: Any) -> set[str]:
     """Return conservative lexical anchors for one patient-level measurement."""
 
     text = " ".join(str(value) for value in values if value is not None).lower()
-    phrase_aliases = (
-        (r"\bprogrammed[\s_-]+death[\s_-]+ligand[\s_-]*1\b", " pdl1 "),
-        (r"\bpd[\s_-]*l[\s_-]*1\b", " pdl1 "),
-        (r"\btumou?r[\s_-]+proportion[\s_-]+score\b", " tps "),
-        (r"\bactivities[\s_-]+of[\s_-]+daily[\s_-]+living\b", " adl "),
-        (r"\bk[\s_-]*ras\b", " kras "),
-    )
-    for pattern, replacement in phrase_aliases:
-        text = re.sub(pattern, replacement, text)
     tokens: set[str] = set()
     for raw_token in re.findall(r"[a-z]+[a-z0-9]*", text):
-        token = _CONCEPT_TOKEN_ALIASES.get(raw_token, raw_token)
+        if raw_token in _CONCEPT_IDENTITY_STOPWORDS:
+            continue
+        token = raw_token
         if token.endswith("ies") and len(token) > 4:
             token = token[:-3] + "y"
-        elif token.endswith("s") and len(token) > 4 and not token.endswith("ss"):
+        elif (
+            token.endswith("s")
+            and len(token) > 4
+            and not token.endswith(("ss", "us", "is"))
+        ):
             token = token[:-1]
-        token = _CONCEPT_TOKEN_ALIASES.get(token, token)
         if len(token) > 1 and token not in _CONCEPT_IDENTITY_STOPWORDS:
             tokens.add(token)
+
+    # Add compact variants for separator-delimited identifier fragments without
+    # knowing anything about the clinical domain. This makes forms such as
+    # ``ab_c1`` and ``ab-c1`` comparable while remaining conservative for words.
+    for compound in re.findall(r"[a-z0-9]+(?:[_-][a-z0-9]+)+", text):
+        parts = re.split(r"[_-]", compound)
+        for start in range(len(parts) - 1):
+            for stop in range(start + 2, len(parts) + 1):
+                segment = parts[start:stop]
+                has_digit = any(
+                    any(char.isdigit() for char in part) for part in segment
+                )
+                all_short = all(len(part) <= 3 for part in segment)
+                if not (has_digit or all_short):
+                    continue
+                compact = "".join(segment)
+                if len(compact) > 2:
+                    tokens.add(compact)
     return tokens
 
 
@@ -1455,7 +1454,7 @@ def _consolidation_prompt(
             f"Retain no more than {max_candidates} supported features.",
             "Give every candidate one disposition.",
             "Every retained or merged disposition must name one returned feature exactly; never mark a candidate retained or merged when that feature is absent.",
-            "Route candidates together only when they describe the same patient-level measurement. Shared packet IDs do not make distinct concepts aliases; for example, PD-L1 expression and KRAS mutation must remain separate.",
+            "Route candidates together only when they describe the same patient-level measurement. Shared packet IDs do not make two different biomarkers or clinical measurements aliases.",
         ],
         "candidates": list(candidates),
         "response": {
