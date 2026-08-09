@@ -133,15 +133,13 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `transport_retry_backoff`, `max_prompt_chars`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
-`max_candidates_per_fold`, `consolidation_oversample_factor`,
-`max_review_rounds`, `estimation_trees`,
+`max_candidates_per_fold`, `max_review_rounds`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
-`temperature`, and `enable_thinking`. The consolidation oversample factor
-defaults to 4: oversized candidate collections retain up to four times the
-final fold feature limit during their first reduction pass, then progressively
-reduce after outputs from different prompt shards have been interleaved. A
-configured endpoint makes the default mode `full`. The modes can always be
-made explicit:
+`temperature`, and `enable_thinking`. The legacy
+`consolidation_oversample_factor` field is still accepted in existing run files,
+but candidate grouping and bounded group selection no longer use a feature
+beam. A configured endpoint makes the default mode `full`. The modes can always
+be made explicit:
 
 Patient-variable extraction always sends exactly one patient's text per model
 prompt. `stage2.workers` provides concurrency without combining patients.

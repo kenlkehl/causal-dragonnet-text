@@ -221,12 +221,11 @@ def test_json_repair_losslessly_compacts_json_to_include_the_validation_error():
     )
 
     assert result == {"ok": True}
-    assert len(conversations[1]) == 3
+    assert len(conversations[1]) == 4
+    assert conversations[1][2] == {"role": "assistant", "content": "{}"}
     assert json.loads(conversations[1][1]["content"]) == payload
-    assert "missing required ok field" in conversations[1][2]["content"]
-    assert sum(len(message["content"]) for message in conversations[1]) <= (
-        config.max_prompt_chars
-    )
+    assert "missing required ok field" in conversations[1][3]["content"]
+    assert sum(len(message["content"]) for message in conversations[1]) <= (config.max_prompt_chars)
 
 
 def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_aliases():
@@ -318,9 +317,7 @@ def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Pat
                     {
                         "row_id": patient["row_id"],
                         "values": {
-                            "performance_status": (
-                                "1" if "ECOG 1" in patient["text"] else "0"
-                            )
+                            "performance_status": ("1" if "ECOG 1" in patient["text"] else "0")
                         },
                     }
                 ]
@@ -328,9 +325,7 @@ def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Pat
         )
 
     extracted = extract_rows(
-        dataset=pd.DataFrame(
-            {"clinical_text": ["ECOG 0.", "ECOG 1.", "ECOG 0 again."]}
-        ),
+        dataset=pd.DataFrame({"clinical_text": ["ECOG 0.", "ECOG 1.", "ECOG 0 again."]}),
         row_ids=[0, 1, 2],
         text_column="clinical_text",
         definitions=[definition],
@@ -576,9 +571,7 @@ def test_resume_retries_only_checkpoints_with_stale_range_ontology_repairs(tmp_p
                         "prior_extracted_value": 2,
                     }
                 ],
-                "corrections": [
-                    {"mapping_id": "category_mapping_0001", "value": None}
-                ],
+                "corrections": [{"mapping_id": "category_mapping_0001", "value": None}],
             }
         ),
         encoding="utf-8",
@@ -702,11 +695,7 @@ def test_extraction_uses_note_free_category_ontology_after_five_failed_repairs(
     assert frame.loc[0, "prior_immunotherapy_history"] == "documented"
     audit = json.loads(
         (
-            tmp_path
-            / "extraction"
-            / "batches"
-            / "batch_00001"
-            / "category_ontology_repair.json"
+            tmp_path / "extraction" / "batches" / "batch_00001" / "category_ontology_repair.json"
         ).read_text(encoding="utf-8")
     )
     assert audit["resolution"] == "llm_category_ontology"
@@ -754,9 +743,9 @@ def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
 
     assert pd.isna(frame.loc[0, "prior_immunotherapy_history"])
     audit = json.loads(
-        (
-            output / "batches" / "batch_00001" / "category_ontology_repair.json"
-        ).read_text(encoding="utf-8")
+        (output / "batches" / "batch_00001" / "category_ontology_repair.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert audit["resolution"] == "conservative_null"
     assert "category ontology response remained invalid" in audit["ontology_validation_error"]
@@ -795,12 +784,7 @@ def test_extraction_defaults_structurally_invalid_response_to_audited_null(
 
     assert pd.isna(frame.loc[0, "performance_status"])
     audit = json.loads(
-        (
-            output
-            / "batches"
-            / "batch_00001"
-            / "extraction_failure.json"
-        ).read_text(encoding="utf-8")
+        (output / "batches" / "batch_00001" / "extraction_failure.json").read_text(encoding="utf-8")
     )
     assert audit["resolution"] == "conservative_all_null"
     assert audit["row_ids"] == [0]
@@ -812,9 +796,7 @@ def test_extraction_defaults_structurally_invalid_response_to_audited_null(
 def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
     tmp_path: Path,
 ):
-    dataset = pd.DataFrame(
-        {"clinical_text": ["Age 67 years. Blood pressure 147/93 mmHg."]}
-    )
+    dataset = pd.DataFrame({"clinical_text": ["Age 67 years. Blood pressure 147/93 mmHg."]})
     definitions = [
         {
             "feature_id": "outer_001_feature_001",
@@ -860,16 +842,11 @@ def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
 
     assert frame.loc[0, "age"] == 67.0
     assert pd.isna(frame.loc[0, "blood_pressure"])
-    assert not (
-        output / "batches" / "batch_00001" / "extraction_failure.json"
-    ).exists()
+    assert not (output / "batches" / "batch_00001" / "extraction_failure.json").exists()
     audit = json.loads(
-        (
-            output
-            / "batches"
-            / "batch_00001"
-            / "invalid_feature_value_repair.json"
-        ).read_text(encoding="utf-8")
+        (output / "batches" / "batch_00001" / "invalid_feature_value_repair.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert audit["resolution"] == "conservative_invalid_features_null"
     assert audit["issues"][0]["feature_name"] == "blood_pressure"
@@ -1544,40 +1521,42 @@ def _fake_completion(calls):
                     },
                 }
             )
-        candidates = body["candidates"]
-        packet_ids = sorted(
-            {
-                packet_id
-                for candidate in candidates
-                for packet_id in candidate["supporting_packet_ids"]
-            }
-        )
-        architectures = sorted({candidate["architecture"] for candidate in candidates})
+        if body["job"] == "group_stage2_candidate_measurements":
+            assert "packet_id" not in messages[1]["content"]
+            return json.dumps(
+                {
+                    "groups": [
+                        {
+                            "group_id": "group_001",
+                            "member_candidate_ids": [
+                                candidate["candidate_id"] for candidate in body["candidates"]
+                            ],
+                            "canonical_name": "performance_status",
+                            "canonical_description": "Baseline ECOG performance status.",
+                        }
+                    ],
+                    "excluded_candidate_ids": [],
+                }
+            )
+        if body["job"] == "select_stage2_candidate_groups":
+            assert "packet_id" not in messages[1]["content"]
+            return json.dumps(
+                {
+                    "retained_group_ids": [group["group_id"] for group in body["groups"]],
+                    "excluded_group_ids": [],
+                }
+            )
+        assert body["job"] == "operationalize_stage2_candidate_group"
+        assert "packet_id" not in messages[1]["content"]
         return json.dumps(
             {
-                "features": [
-                    {
-                        "name": "performance_status",
-                        "description": "Baseline ECOG performance status.",
-                        "value_type": "ordinal",
-                        "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2", "ECOG 3", "ECOG 4"],
-                        "roles": ["confounder"],
-                        "measurement_definition": "Extract the last pretreatment ECOG score.",
-                        "missing_value_rule": "Record undocumented separately from ECOG 0.",
-                        "supporting_packet_ids": packet_ids,
-                        "supporting_architectures": architectures,
-                        "stability_summary": "Supported in the supplied discovery contexts.",
-                        "caveats": "Resolve conflicting scores by date.",
-                    }
-                ],
-                "candidate_dispositions": {
-                    candidate["candidate_id"]: {
-                        "status": "retained" if index == 0 else "merged",
-                        "feature_name": "performance_status",
-                        "reason": "The candidates describe the same measurement.",
-                    }
-                    for index, candidate in enumerate(candidates)
-                },
+                "description": "Baseline ECOG performance status.",
+                "value_type": "ordinal",
+                "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2", "ECOG 3", "ECOG 4"],
+                "measurement_definition": "Extract the last pretreatment ECOG score.",
+                "missing_value_rule": "Record undocumented separately from ECOG 0.",
+                "stability_summary": "Supported in the supplied discovery contexts.",
+                "caveats": "Resolve conflicting scores by date.",
             }
         )
 
@@ -1819,50 +1798,33 @@ def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
     def completion(messages, _config):
         prompt_sizes.append(sum(len(message["content"]) for message in messages))
         body = json.loads(messages[1]["content"])
-        assert body["job"] == "consolidate_and_operationalize_stage2_features"
-        candidates = body["candidates"]
-        packet_ids = list(
-            dict.fromkeys(
-                packet_id
-                for candidate in candidates
-                for packet_id in candidate["supporting_packet_ids"]
+        assert "packet_1" not in messages[1]["content"]
+        if body["job"] == "group_stage2_candidate_measurements":
+            return json.dumps(
+                {
+                    "groups": [
+                        {
+                            "group_id": "group_001",
+                            "member_candidate_ids": [
+                                candidate["candidate_id"] for candidate in body["candidates"]
+                            ],
+                            "canonical_name": "performance_status",
+                            "canonical_description": "Baseline ECOG performance status.",
+                        }
+                    ],
+                    "excluded_candidate_ids": [],
+                }
             )
-        )
-        architectures = list(
-            dict.fromkeys(
-                architecture
-                for candidate in candidates
-                for architecture in [
-                    candidate["architecture"],
-                    *(candidate.get("supporting_architectures") or []),
-                ]
-            )
-        )
+        assert body["job"] == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
-                "features": [
-                    {
-                        "name": "performance_status",
-                        "description": "Baseline ECOG performance status.",
-                        "value_type": "ordinal",
-                        "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
-                        "roles": ["confounder"],
-                        "measurement_definition": "Extract the pretreatment ECOG score.",
-                        "missing_value_rule": "Return null when undocumented.",
-                        "supporting_packet_ids": packet_ids,
-                        "supporting_architectures": architectures,
-                        "stability_summary": "Supported across bounded batches.",
-                        "caveats": "none",
-                    }
-                ],
-                "candidate_dispositions": {
-                    candidate["candidate_id"]: {
-                        "status": "retained" if index == 0 else "merged",
-                        "feature_name": "performance_status",
-                        "reason": "Same clinical measurement.",
-                    }
-                    for index, candidate in enumerate(candidates)
-                },
+                "description": "Baseline ECOG performance status.",
+                "value_type": "ordinal",
+                "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
+                "measurement_definition": "Extract the pretreatment ECOG score.",
+                "missing_value_rule": "Return null when undocumented.",
+                "stability_summary": "Supported across bounded batches.",
+                "caveats": "none",
             }
         )
 
@@ -1901,6 +1863,139 @@ def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
     assert set(result["features"][0]["supporting_packet_ids"]) == {
         candidate["supporting_packet_ids"][0] for candidate in candidates
     }
+
+
+def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in_python():
+    prompt_bodies = []
+    packet_ids = ["packet_alpha_long_id", "packet_beta_long_id", "packet_gamma_long_id"]
+
+    def completion(messages, _config):
+        rendered = messages[1]["content"]
+        assert all(packet_id not in rendered for packet_id in packet_ids)
+        body = json.loads(rendered)
+        prompt_bodies.append(body)
+        if body["job"] == "group_stage2_candidate_measurements":
+            return json.dumps(
+                {
+                    "groups": [
+                        {
+                            "group_id": f"proposed_{index:03d}",
+                            "member_candidate_ids": [candidate["candidate_id"]],
+                            "canonical_name": candidate["name"],
+                            "canonical_description": candidate["description"],
+                        }
+                        for index, candidate in enumerate(body["candidates"], start=1)
+                    ],
+                    "excluded_candidate_ids": [],
+                }
+            )
+        if body["job"] == "select_stage2_candidate_groups":
+            retained = [group["group_id"] for group in body["groups"][:2]]
+            return json.dumps(
+                {
+                    "retained_group_ids": retained,
+                    "excluded_group_ids": [
+                        group["group_id"]
+                        for group in body["groups"]
+                        if group["group_id"] not in retained
+                    ],
+                }
+            )
+        assert body["job"] == "operationalize_stage2_candidate_group"
+        return json.dumps(
+            {
+                "description": body["group"]["canonical_description"],
+                "value_type": "continuous",
+                "categories_or_unit": ["standard unit"],
+                "measurement_definition": "Extract the last pretreatment scalar value.",
+                "missing_value_rule": "Return null when no value is documented.",
+                "stability_summary": "Supported by candidate evidence.",
+                "caveats": "",
+            }
+        )
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            max_candidates_per_fold=2,
+        ),
+        clinical_question="Estimate a treatment effect.",
+        completion=completion,
+    )
+    candidates = [
+        {
+            "candidate_id": "candidate_0001",
+            "architecture": "architecture_alpha",
+            "name": "serum_sodium",
+            "description": "Pretreatment serum sodium concentration.",
+            "value_type": "continuous",
+            "supporting_packet_ids": [packet_ids[0]],
+            "evidence_axes": ["treatment", "outcome"],
+            "caveats": "",
+        },
+        {
+            "candidate_id": "candidate_0002",
+            "architecture": "architecture_beta",
+            "name": "body_mass_index",
+            "description": "Pretreatment body mass index.",
+            "value_type": "continuous",
+            "supporting_packet_ids": [packet_ids[1]],
+            "evidence_axes": ["outcome", "residual_effect"],
+            "caveats": "",
+        },
+        {
+            "candidate_id": "candidate_0003",
+            "architecture": "architecture_gamma",
+            "name": "heart_rate",
+            "description": "Pretreatment resting heart rate.",
+            "value_type": "continuous",
+            "supporting_packet_ids": [packet_ids[2]],
+            "evidence_axes": ["outcome"],
+            "caveats": "",
+        },
+    ]
+
+    result = runner._consolidate_candidates(outer_fold=1, candidates=candidates)
+
+    assert [feature["supporting_packet_ids"] for feature in result["features"]] == [
+        [packet_ids[0]],
+        [packet_ids[1]],
+    ]
+    assert [feature["supporting_architectures"] for feature in result["features"]] == [
+        ["architecture_alpha"],
+        ["architecture_beta"],
+    ]
+    assert result["features"][0]["roles"] == ["confounder"]
+    assert result["features"][1]["roles"] == ["prognostic", "effect_modifier"]
+    assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
+    assert result["candidate_dispositions"]["candidate_0002"]["status"] == "retained"
+    assert result["candidate_dispositions"]["candidate_0003"]["status"] == "excluded"
+    assert {body["job"] for body in prompt_bodies} == {
+        "group_stage2_candidate_measurements",
+        "select_stage2_candidate_groups",
+        "operationalize_stage2_candidate_group",
+    }
+
+
+def test_operationalization_rejects_model_authored_provenance_and_roles():
+    with pytest.raises(ValueError, match="Python-owned field"):
+        stage2_workflow._validate_operationalization(
+            {
+                "description": "A scalar measurement.",
+                "value_type": "continuous",
+                "categories_or_unit": ["unit"],
+                "measurement_definition": "Extract the pretreatment value.",
+                "missing_value_rule": "Return null when undocumented.",
+                "supporting_packet_ids": ["mistyped_packet_id"],
+                "roles": ["confounder"],
+            },
+            group={
+                "name": "scalar_measurement",
+                "description": "A scalar measurement.",
+                "value_type": "continuous",
+            },
+        )
 
 
 def test_stage2_progressive_consolidation_uses_oversampled_beam_across_28_batches():
@@ -2089,7 +2184,9 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
     assert definitions["features"][0]["roles"] == ["confounder"]
     # Architecture-stratified compilation interprets the two producers
     # independently, then consolidates their candidates.
-    assert len(calls) == 3
+    assert calls.count("interpret_one_stage1_architecture") == 2
+    assert calls.count("group_stage2_candidate_measurements") == 1
+    assert calls.count("operationalize_stage2_candidate_group") == 1
 
     second = run_plain_handoff_stage2(
         handoff_path=handoff,
@@ -2100,7 +2197,7 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
     )
 
     assert second["features_by_fold"] == {"1": 1}
-    assert len(calls) == 3
+    assert len(calls) == 4
 
     rows[0]["evidence"]["terms"].append("newly compiled evidence")
     handoff.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
@@ -2351,8 +2448,7 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
         {
             "patient_id": [f"p{index:02d}" for index in range(24)],
             "clinical_text": [
-                f"Age {50 + index} years. Blood pressure 147/93 mmHg."
-                for index in range(24)
+                f"Age {50 + index} years. Blood pressure 147/93 mmHg." for index in range(24)
             ],
             "treatment_indicator": [index % 2 for index in range(24)],
             "outcome_indicator": [(index // 2) % 2 for index in range(24)],
@@ -2453,9 +2549,7 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
     assert extraction_feature_sets.count(("age",)) == 24
     final_fit = pd.read_csv(output / "extraction" / "fit" / "extracted.csv")
     assert final_fit["age"].notna().all()
-    fit_health = json.loads(
-        (output / "extraction" / "fit_health.json").read_text(encoding="utf-8")
-    )
+    fit_health = json.loads((output / "extraction" / "fit_health.json").read_text(encoding="utf-8"))
     assert fit_health["status"] == "ok"
     assert fit_health["rows_with_any_nonmissing"] == 12
 
@@ -2541,9 +2635,7 @@ def test_final_training_extraction_fails_fast_when_effectively_all_null(
             ),
         )
 
-    health = json.loads(
-        (output / "extraction" / "fit_health.json").read_text(encoding="utf-8")
-    )
+    health = json.loads((output / "extraction" / "fit_health.json").read_text(encoding="utf-8"))
     assert health["status"] == "failed"
     assert health["all_null_rows"] == 6
     assert not (output / "estimation" / "predictions.csv").exists()

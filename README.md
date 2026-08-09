@@ -610,7 +610,6 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
-    "consolidation_oversample_factor": 4,
     "max_review_rounds": 2,
     "estimation_trees": 200
   },
@@ -650,12 +649,16 @@ bundle attestation, checkpoint adoption, or deployment gates. The former
 into broad prompt buckets.
 
 Stage 2 then interprets the compiled evidence architectures and consolidates
-the result into operational patient-level definitions. Candidate collections that
-span multiple prompts use a progressive consolidation beam: the first pass
-retains an oversampled, proportionally allocated pool, outputs from different
-prompt shards are interleaved, and later passes reduce toward the final fold
-limit. It then extracts the
-variables on the outer training rows and measures missingness, variation,
+the result into operational patient-level definitions. Consolidation first asks
+the language model to group short candidate IDs that denote the same scalar
+measurement. Python deterministically carries the supporting packets,
+architectures, evidence axes, causal roles, and original-candidate dispositions
+through those groups. If the group count exceeds the fold limit, a separate
+selection request operates only on short group summaries. Finally, independent
+one-group requests define value types, units or categories, measurement rules,
+and missingness handling without asking the model to reproduce provenance IDs
+or cross-object references. It then extracts the variables on the outer
+training rows and measures missingness, variation,
 treatment prediction, outcome prediction, and residual-effect performance by
 inner validation. Leave-one-feature-out measurements show whether each variable
 improves or degrades those metrics relative to the complete extracted feature

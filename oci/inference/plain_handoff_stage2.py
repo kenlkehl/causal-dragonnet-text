@@ -46,6 +46,7 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
+CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v2"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
     "assessment",
@@ -94,11 +95,7 @@ def _concept_identity_tokens(*values: Any) -> set[str]:
         token = raw_token
         if token.endswith("ies") and len(token) > 4:
             token = token[:-3] + "y"
-        elif (
-            token.endswith("s")
-            and len(token) > 4
-            and not token.endswith(("ss", "us", "is"))
-        ):
+        elif token.endswith("s") and len(token) > 4 and not token.endswith(("ss", "us", "is")):
             token = token[:-1]
         if len(token) > 1 and token not in _CONCEPT_IDENTITY_STOPWORDS:
             tokens.add(token)
@@ -111,9 +108,7 @@ def _concept_identity_tokens(*values: Any) -> set[str]:
         for start in range(len(parts) - 1):
             for stop in range(start + 2, len(parts) + 1):
                 segment = parts[start:stop]
-                has_digit = any(
-                    any(char.isdigit() for char in part) for part in segment
-                )
+                has_digit = any(any(char.isdigit() for char in part) for part in segment)
                 all_short = all(len(part) <= 3 for part in segment)
                 if not (has_digit or all_short):
                     continue
@@ -301,9 +296,7 @@ def _evaluate_stage2_oracle_ite(
 
     def metrics_for(frame: pd.DataFrame) -> dict[str, Any]:
         truth = frame[oracle_ite_column].to_numpy(dtype=float)
-        estimate = pd.to_numeric(frame["estimated_cate"], errors="coerce").to_numpy(
-            dtype=float
-        )
+        estimate = pd.to_numeric(frame["estimated_cate"], errors="coerce").to_numpy(dtype=float)
         finite = np.isfinite(truth) & np.isfinite(estimate)
         truth = truth[finite]
         estimate = estimate[finite]
@@ -386,6 +379,8 @@ class PlainHandoffStage2Config:
     evidence_max_exemplars_per_card: int = 4
     evidence_max_exemplar_chars: int = 2_400
     max_candidates_per_fold: int = 50
+    # Accepted for compatibility with existing run files. Candidate grouping
+    # and bounded group selection replaced the former progressive feature beam.
     consolidation_oversample_factor: int = 4
     workers: int = 4
     max_review_rounds: int = 2
@@ -479,9 +474,7 @@ def plain_stage2_config_from_mapping(
             legacy_extraction_batch_size,
         )
     if raw.get("max_tokens") is not None:
-        LOGGER.warning(
-            "stage2.max_tokens is ignored; Stage 2 does not send an output-token limit"
-        )
+        LOGGER.warning("stage2.max_tokens is ignored; Stage 2 does not send an output-token limit")
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
         model=model,
@@ -997,9 +990,7 @@ def _openai_completion(
     choice = response.choices[0]
     finish_reason = str(getattr(choice, "finish_reason", "") or "")
     if finish_reason == "length":
-        raise ValueError(
-            "Stage 2 server stopped the response with finish_reason=length"
-        )
+        raise ValueError("Stage 2 server stopped the response with finish_reason=length")
     content = choice.message.content
     if not content:
         raise RuntimeError("Stage 2 model returned an empty response")
@@ -1121,6 +1112,7 @@ def _request_json(
     first_error: Exception | None = None
     max_attempts = 1 + MAX_RESPONSE_REPAIRS
     for attempt in range(max_attempts):
+        response: str | None = None
         prompt_chars = sum(len(str(message.get("content") or "")) for message in conversation)
         if prompt_chars > int(config.max_prompt_chars):
             raise ValueError(
@@ -1148,21 +1140,35 @@ def _request_json(
                 exc,
             )
             repair_message = _repair_message(exc)
-            repaired = [*base_conversation, repair_message]
-            repaired_chars = sum(len(str(message.get("content") or "")) for message in repaired)
-            if repaired_chars <= int(config.max_prompt_chars):
-                conversation = repaired
+            repair_context = [dict(message) for message in base_conversation]
+            if response is not None:
+                repair_context.append({"role": "assistant", "content": str(response)})
+            for candidate_context in (repair_context, base_conversation):
+                repaired = [*candidate_context, repair_message]
+                repaired_chars = sum(len(str(message.get("content") or "")) for message in repaired)
+                if repaired_chars <= int(config.max_prompt_chars):
+                    conversation = repaired
+                    break
+            else:
+                repaired = []
+            if repaired:
                 continue
 
             # A fully packed initial prompt may leave no room for another turn.
             # Minify JSON bodies without changing their content, then retry with
             # the same explicit validation error.
+            compact_context = _compact_json_messages(repair_context)
+            compact_repaired = [*compact_context, repair_message]
+            if sum(len(str(message.get("content") or "")) for message in compact_repaired) <= int(
+                config.max_prompt_chars
+            ):
+                conversation = compact_repaired
+                continue
             compact_base = _compact_json_messages(base_conversation)
             compact_repaired = [*compact_base, repair_message]
-            compact_repaired_chars = sum(
-                len(str(message.get("content") or "")) for message in compact_repaired
-            )
-            if compact_repaired_chars <= int(config.max_prompt_chars):
+            if sum(len(str(message.get("content") or "")) for message in compact_repaired) <= int(
+                config.max_prompt_chars
+            ):
                 conversation = compact_repaired
                 continue
 
@@ -1434,64 +1440,11 @@ def _consolidation_prompt(
     candidates: Sequence[Mapping[str, Any]],
     max_candidates: int,
 ) -> list[dict[str, str]]:
-    body = {
-        "job": "consolidate_and_operationalize_stage2_features",
-        "clinical_question": clinical_question,
-        "outer_fold": outer_fold,
-        "rules": [
-            "Merge spelling variants and true aliases, but keep distinct measurements separate.",
-            "Prefer a specific named scale, laboratory measurement, diagnosis, or clinical category over a broader paraphrase when the cited evidence supports that specificity.",
-            "Each feature must yield one scalar value; split multi-valued measurements instead of asking the extractor to return a list.",
-            "Combine evidence axes across candidates that describe the same measurement before assigning roles.",
-            "A confounder requires both treatment and outcome evidence.",
-            "A prognostic feature requires outcome evidence but not necessarily treatment evidence.",
-            "An effect modifier requires residual-effect or matched-pair evidence.",
-            "Semantic evidence can name a measurement but cannot establish a causal role by itself.",
-            "Cite only packet IDs carried by the candidates.",
-            "For each returned feature, cite only packets carried by candidates whose disposition routes to that feature; omit packets from excluded or differently routed candidates.",
-            "Define a reproducible patient-level extraction target, categories or unit, and missing-value handling.",
-            "When the feature limit requires selection, preserve distinct measurements across evidence axes, causal roles, and supporting architectures; spend the available quota on diversity rather than near-duplicates.",
-            "Treat the same clearly defined measurement recurring across independent architectures or evidence axes as replicated support: consolidate those aliases into one feature and prioritize retaining it.",
-            f"Retain no more than {max_candidates} supported features.",
-            "Give every candidate one disposition.",
-            "Every retained or merged disposition must name one returned feature exactly; never mark a candidate retained or merged when that feature is absent.",
-            "Route candidates together only when they describe the same patient-level measurement. Shared packet IDs do not make two different biomarkers or clinical measurements aliases.",
-        ],
-        "candidates": list(candidates),
-        "response": {
-            "features": [
-                {
-                    "name": "snake_case_feature_name",
-                    "description": "one patient-level measurement",
-                    "value_type": "binary|categorical|continuous|ordinal|ambiguous",
-                    "categories_or_unit": [
-                        "categories for categorical variables, or one unit string"
-                    ],
-                    "roles": ["confounder|prognostic|effect_modifier"],
-                    "measurement_definition": "what to extract from a complete pretreatment record",
-                    "missing_value_rule": "how absent or ambiguous documentation is represented",
-                    "supporting_packet_ids": ["cited packet IDs"],
-                    "supporting_architectures": ["architecture names"],
-                    "stability_summary": "full-outer and inner-context support",
-                    "caveats": "remaining scientific limitations",
-                }
-            ],
-            "candidate_dispositions": {
-                "every supplied candidate ID": {
-                    "status": "retained|merged|excluded",
-                    "feature_name": "retained feature name, or empty string",
-                    "reason": "brief reason",
-                }
-            },
-        },
-    }
-    return [
-        {
-            "role": "system",
-            "content": "You operationalize cited Stage 1 evidence into causal-study variables. Return JSON only.",
-        },
-        {"role": "user", "content": json.dumps(body, sort_keys=True)},
-    ]
+    del clinical_question, outer_fold, candidates, max_candidates
+    raise RuntimeError(
+        "the monolithic Stage 2 consolidation prompt is retired; use candidate-ID "
+        "grouping, bounded group selection, and per-group operationalization"
+    )
 
 
 def _validate_consolidation(
@@ -1850,6 +1803,637 @@ def _validate_consolidation(
             f"{unused_features[:8]}"
         )
     return {"features": routed_features, "candidate_dispositions": clean_dispositions}
+
+
+def _string_values(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (str, int, float, bool)):
+        return [str(raw)]
+    if not isinstance(raw, Sequence):
+        return []
+    return list(dict.fromkeys(str(item) for item in raw if item is not None))
+
+
+def _short_text(value: Any, *, max_chars: int) -> str:
+    rendered = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[: max_chars - 3].rstrip() + "..."
+
+
+def _snake_case_name(value: Any, *, fallback: str) -> str:
+    name = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return name or fallback
+
+
+def _candidate_architectures(candidate: Mapping[str, Any]) -> list[str]:
+    primary = str(candidate.get("architecture") or "").strip()
+    inherited = _string_values(candidate.get("supporting_architectures"))
+    if inherited and primary in {
+        "deterministic_candidate_group",
+        "bounded_multi_architecture_consolidation",
+    }:
+        primary = ""
+    return list(
+        dict.fromkeys(
+            architecture
+            for architecture in [
+                primary,
+                *inherited,
+            ]
+            if architecture
+        )
+    )
+
+
+def _candidate_grouping_view(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the semantic view exposed to grouping; never expose provenance IDs."""
+
+    origins = _string_values(candidate.get("origin_candidate_ids")) or [
+        str(candidate["candidate_id"])
+    ]
+    return {
+        "candidate_id": str(candidate["candidate_id"]),
+        "name": str(candidate.get("name") or "").strip(),
+        "description": _short_text(candidate.get("description"), max_chars=1_000),
+        "value_type": str(candidate.get("value_type") or "ambiguous"),
+        "evidence_axes": _canonical_evidence_axes(candidate.get("evidence_axes")),
+        "supporting_architectures": _candidate_architectures(candidate),
+        "origin_candidate_count": len(origins),
+        "packet_support_count": len(_string_values(candidate.get("supporting_packet_ids"))),
+        "caveats": _short_text(candidate.get("caveats"), max_chars=500),
+    }
+
+
+def _candidate_grouping_prompt(
+    *,
+    clinical_question: str,
+    outer_fold: int,
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    body = {
+        "job": "group_stage2_candidate_measurements",
+        "clinical_question": clinical_question,
+        "outer_fold": int(outer_fold),
+        "rules": [
+            "Group only true aliases of the same patient-level pretreatment measurement.",
+            "Different biomarkers, diagnoses, scales, laboratory measurements, or clinical quantities must remain in different groups even when they share evidence or a causal role.",
+            "Every eventual feature must be one scalar. Keep independently varying components of a compound measurement in different groups.",
+            "Merge spelling variants, abbreviations, and equivalent names when they denote the same scalar measurement.",
+            "Do not copy, invent, or return evidence packet IDs, architectures, causal roles, or operational definitions.",
+            "Use only supplied candidate IDs as group members or exclusions, exactly once each.",
+            "Exclude only entries that are not a concrete patient-level pretreatment measurement; do not exclude merely because support is weak or duplicated.",
+        ],
+        "candidates": [_candidate_grouping_view(candidate) for candidate in candidates],
+        "response": {
+            "groups": [
+                {
+                    "group_id": "group_001",
+                    "member_candidate_ids": ["supplied candidate IDs"],
+                    "canonical_name": "snake_case_scalar_measurement_name",
+                    "canonical_description": "concise description of the common measurement",
+                }
+            ],
+            "excluded_candidate_ids": ["supplied candidate IDs that are not measurements"],
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You reconcile semantic aliases among candidate clinical measurements. "
+                "Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+    ]
+
+
+def _validate_candidate_grouping(
+    value: Mapping[str, Any],
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    raw_groups = value.get("groups")
+    raw_excluded = value.get("excluded_candidate_ids")
+    if not isinstance(raw_groups, list):
+        raise ValueError("candidate grouping requires a groups list")
+    if raw_excluded is None:
+        raw_excluded = []
+    if not isinstance(raw_excluded, Sequence) or isinstance(raw_excluded, str):
+        raise ValueError("candidate grouping requires an excluded_candidate_ids list")
+
+    supplied_ids = [str(candidate["candidate_id"]) for candidate in candidates]
+    if len(supplied_ids) != len(set(supplied_ids)):
+        raise ValueError("candidate grouping received duplicate supplied candidate IDs")
+    supplied = set(supplied_ids)
+    seen: set[str] = set()
+    groups: list[dict[str, Any]] = []
+    for index, raw_group in enumerate(raw_groups, start=1):
+        if not isinstance(raw_group, Mapping):
+            raise ValueError(f"candidate group at position={index} must be an object")
+        members = _string_values(raw_group.get("member_candidate_ids"))
+        if not members:
+            raise ValueError(f"candidate group at position={index} has no members")
+        unknown = sorted(set(members) - supplied)
+        if unknown:
+            raise ValueError(f"candidate group cites unknown candidate ID(s): {unknown[:8]}")
+        duplicates = sorted(set(members).intersection(seen))
+        if duplicates:
+            raise ValueError(f"candidate grouping assigns candidate ID(s) twice: {duplicates[:8]}")
+        seen.update(members)
+        fallback_name = _snake_case_name(
+            next(
+                candidate.get("name")
+                for candidate in candidates
+                if str(candidate["candidate_id"]) == members[0]
+            ),
+            fallback=f"measurement_{index:03d}",
+        )
+        groups.append(
+            {
+                "group_id": str(raw_group.get("group_id") or f"group_{index:03d}"),
+                "member_candidate_ids": members,
+                "canonical_name": _snake_case_name(
+                    raw_group.get("canonical_name"), fallback=fallback_name
+                ),
+                "canonical_description": _short_text(
+                    raw_group.get("canonical_description"), max_chars=2_000
+                ),
+            }
+        )
+
+    excluded = _string_values(raw_excluded)
+    unknown_excluded = sorted(set(excluded) - supplied)
+    if unknown_excluded:
+        raise ValueError(
+            "candidate grouping excludes unknown candidate ID(s): " f"{unknown_excluded[:8]}"
+        )
+    duplicate_excluded = sorted(set(excluded).intersection(seen))
+    if duplicate_excluded:
+        raise ValueError(
+            "candidate grouping both groups and excludes candidate ID(s): "
+            f"{duplicate_excluded[:8]}"
+        )
+    if len(excluded) != len(set(excluded)):
+        raise ValueError("candidate grouping repeats an excluded candidate ID")
+    seen.update(excluded)
+    missing = sorted(supplied - seen)
+    if missing:
+        raise ValueError(f"candidate grouping omitted candidate ID(s): {missing[:8]}")
+    return {"groups": groups, "excluded_candidate_ids": excluded}
+
+
+def _candidate_pair_is_semantically_compatible(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
+    return _consolidation_route_is_semantically_compatible(
+        left,
+        {
+            "name": right.get("name"),
+            "description": right.get("description"),
+        },
+    )
+
+
+def _semantically_safe_member_clusters(
+    members: Sequence[Mapping[str, Any]],
+    *,
+    canonical_name: str,
+    canonical_description: str,
+) -> list[list[Mapping[str, Any]]]:
+    """Conservatively split a model-proposed group when lexical anchors conflict."""
+
+    canonical = {
+        "name": canonical_name,
+        "description": canonical_description,
+    }
+    canonical_tokens = _concept_identity_tokens(canonical_name, canonical_description)
+    compatible_members: list[Mapping[str, Any]] = []
+    incompatible_members: list[Mapping[str, Any]] = []
+    for member in members:
+        compatible = bool(canonical_tokens) and _consolidation_route_is_semantically_compatible(
+            member, canonical
+        )
+        (compatible_members if compatible else incompatible_members).append(member)
+
+    # The canonical description is where the semantic grouper can explicitly
+    # bridge abbreviations and full names that do not share literal tokens.
+    clusters: list[list[Mapping[str, Any]]] = [compatible_members] if compatible_members else []
+    for member in incompatible_members:
+        placed = False
+        for cluster in clusters:
+            if all(
+                _candidate_pair_is_semantically_compatible(member, existing) for existing in cluster
+            ):
+                cluster.append(member)
+                placed = True
+                break
+        if not placed:
+            clusters.append([member])
+    return clusters
+
+
+def _materialize_candidate_group(
+    *,
+    candidate_id: str,
+    members: Sequence[Mapping[str, Any]],
+    canonical_name: str,
+    canonical_description: str,
+) -> dict[str, Any]:
+    packets = list(
+        dict.fromkeys(
+            packet_id
+            for member in members
+            for packet_id in _string_values(member.get("supporting_packet_ids"))
+        )
+    )
+    architectures = list(
+        dict.fromkeys(
+            architecture for member in members for architecture in _candidate_architectures(member)
+        )
+    )
+    evidence_axes = sorted(
+        {
+            axis
+            for member in members
+            for axis in _canonical_evidence_axes(member.get("evidence_axes"))
+        }
+    )
+    packet_evidence_axes: dict[str, list[str]] = {}
+    for member in members:
+        inherited = member.get("packet_evidence_axes") or {}
+        member_axes = _canonical_evidence_axes(member.get("evidence_axes"))
+        for packet_id in _string_values(member.get("supporting_packet_ids")):
+            packet_evidence_axes[packet_id] = sorted(
+                {
+                    *packet_evidence_axes.get(packet_id, []),
+                    *_canonical_evidence_axes(inherited.get(packet_id) or member_axes),
+                }
+            )
+    origins = list(
+        dict.fromkeys(
+            origin
+            for member in members
+            for origin in (
+                _string_values(member.get("origin_candidate_ids")) or [str(member["candidate_id"])]
+            )
+        )
+    )
+    value_types = list(
+        dict.fromkeys(str(member.get("value_type") or "ambiguous") for member in members)
+    )
+    descriptions = [
+        str(member.get("description") or "").strip()
+        for member in members
+        if str(member.get("description") or "").strip()
+    ]
+    caveats = list(
+        dict.fromkeys(
+            str(member.get("caveats") or "").strip()
+            for member in members
+            if str(member.get("caveats") or "").strip()
+        )
+    )
+    description = canonical_description or (descriptions[0] if descriptions else canonical_name)
+    return {
+        "candidate_id": candidate_id,
+        "architecture": "deterministic_candidate_group",
+        "supporting_architectures": architectures,
+        "name": canonical_name,
+        "description": description,
+        "value_type": value_types[0] if len(value_types) == 1 else "ambiguous",
+        "supporting_packet_ids": packets,
+        "evidence_axes": evidence_axes,
+        "packet_evidence_axes": packet_evidence_axes,
+        "caveats": " ".join(caveats),
+        "origin_candidate_ids": origins,
+        "member_measurements": [
+            {
+                "name": str(member.get("name") or "").strip(),
+                "description": _short_text(member.get("description"), max_chars=500),
+                "value_type": str(member.get("value_type") or "ambiguous"),
+            }
+            for member in members[:12]
+        ],
+    }
+
+
+def _materialize_grouping_response(
+    grouping: Mapping[str, Any],
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    id_prefix: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    by_id = {str(candidate["candidate_id"]): candidate for candidate in candidates}
+    materialized: list[dict[str, Any]] = []
+    for proposed in grouping["groups"]:
+        members = [by_id[candidate_id] for candidate_id in proposed["member_candidate_ids"]]
+        clusters = _semantically_safe_member_clusters(
+            members,
+            canonical_name=proposed["canonical_name"],
+            canonical_description=proposed["canonical_description"],
+        )
+        if len(clusters) > 1:
+            LOGGER.warning(
+                "Stage 2 candidate grouping split semantically incompatible proposed "
+                "group=%s into %s conservative groups",
+                proposed["group_id"],
+                len(clusters),
+            )
+        for cluster in clusters:
+            singleton_split = len(clusters) > 1 and len(cluster) == 1
+            canonical_name = (
+                _snake_case_name(
+                    cluster[0].get("name"),
+                    fallback=proposed["canonical_name"],
+                )
+                if singleton_split
+                else proposed["canonical_name"]
+            )
+            canonical_description = (
+                str(cluster[0].get("description") or "").strip()
+                if singleton_split
+                else proposed["canonical_description"]
+            )
+            materialized.append(
+                _materialize_candidate_group(
+                    candidate_id=f"{id_prefix}_{len(materialized) + 1:04d}",
+                    members=cluster,
+                    canonical_name=canonical_name,
+                    canonical_description=canonical_description,
+                )
+            )
+    excluded_origins = list(
+        dict.fromkeys(
+            origin
+            for candidate_id in grouping["excluded_candidate_ids"]
+            for origin in (
+                _string_values(by_id[candidate_id].get("origin_candidate_ids")) or [candidate_id]
+            )
+        )
+    )
+    return materialized, excluded_origins
+
+
+def _partition_candidate_grouping(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    clinical_question: str,
+    outer_fold: int,
+    max_prompt_chars: int,
+) -> list[list[Mapping[str, Any]]]:
+    batches: list[list[Mapping[str, Any]]] = []
+    current: list[Mapping[str, Any]] = []
+    for candidate in candidates:
+        proposed = [*current, candidate]
+        messages = _candidate_grouping_prompt(
+            clinical_question=clinical_question,
+            outer_fold=outer_fold,
+            candidates=proposed,
+        )
+        chars = sum(len(message["content"]) for message in messages)
+        if not current and chars > int(max_prompt_chars):
+            raise ValueError("one Stage 2 candidate cannot fit the grouping prompt budget")
+        if current and chars > int(max_prompt_chars):
+            batches.append(current)
+            current = [candidate]
+        else:
+            current = proposed
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _derive_roles(evidence_axes: Sequence[str]) -> list[str]:
+    axes = set(_canonical_evidence_axes(evidence_axes))
+    roles: list[str] = []
+    if {"treatment", "outcome"} <= axes:
+        roles.append("confounder")
+    elif "outcome" in axes:
+        roles.append("prognostic")
+    if axes.intersection({"residual_effect", "matched_pair"}):
+        roles.append("effect_modifier")
+    return roles
+
+
+def _group_selection_view(group: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "group_id": str(group["candidate_id"]),
+        "name": str(group.get("name") or ""),
+        "description": _short_text(group.get("description"), max_chars=700),
+        "value_type": str(group.get("value_type") or "ambiguous"),
+        "evidence_axes": _canonical_evidence_axes(group.get("evidence_axes")),
+        "derived_roles": _derive_roles(group.get("evidence_axes") or []),
+        "supporting_architectures": _candidate_architectures(group),
+        "origin_candidate_count": len(_string_values(group.get("origin_candidate_ids"))),
+        "packet_support_count": len(_string_values(group.get("supporting_packet_ids"))),
+    }
+
+
+def _group_selection_prompt(
+    *,
+    clinical_question: str,
+    outer_fold: int,
+    groups: Sequence[Mapping[str, Any]],
+    max_groups: int,
+) -> list[dict[str, str]]:
+    body = {
+        "job": "select_stage2_candidate_groups",
+        "clinical_question": clinical_question,
+        "outer_fold": int(outer_fold),
+        "max_groups": int(max_groups),
+        "rules": [
+            "Select no more than max_groups distinct scalar measurements for downstream extraction.",
+            "Preserve diversity across measurements, derived causal roles, evidence axes, and supporting architectures.",
+            "Prefer replicated support across independent architectures or evidence axes, while retaining uniquely supported measurements when capacity permits.",
+            "Do not merge or rename groups in this step.",
+            "Return each supplied group ID exactly once as retained or excluded.",
+            "Do not return packet IDs, candidate IDs, feature definitions, or causal-role judgments.",
+        ],
+        "groups": [_group_selection_view(group) for group in groups],
+        "response": {
+            "retained_group_ids": ["supplied group IDs"],
+            "excluded_group_ids": ["all remaining supplied group IDs"],
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": "You select a diverse bounded set of grounded measurements. Return JSON only.",
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+    ]
+
+
+def _validate_group_selection(
+    value: Mapping[str, Any],
+    *,
+    groups: Sequence[Mapping[str, Any]],
+    max_groups: int,
+) -> dict[str, list[str]]:
+    retained = _string_values(value.get("retained_group_ids"))
+    excluded = _string_values(value.get("excluded_group_ids"))
+    supplied = {str(group["candidate_id"]) for group in groups}
+    returned = set(retained).union(excluded)
+    unknown = sorted(returned - supplied)
+    if unknown:
+        raise ValueError(f"group selection cites unknown group ID(s): {unknown[:8]}")
+    duplicates = sorted(set(retained).intersection(excluded))
+    if duplicates or len(retained) != len(set(retained)) or len(excluded) != len(set(excluded)):
+        raise ValueError(f"group selection assigns group ID(s) more than once: {duplicates[:8]}")
+    missing = sorted(supplied - returned)
+    if missing:
+        raise ValueError(f"group selection omitted group ID(s): {missing[:8]}")
+    if len(retained) > int(max_groups):
+        raise ValueError(f"group selection retained {len(retained)} groups for limit={max_groups}")
+    return {"retained_group_ids": retained, "excluded_group_ids": excluded}
+
+
+def _partition_group_selection(
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    clinical_question: str,
+    outer_fold: int,
+    max_groups: int,
+    max_prompt_chars: int,
+) -> list[list[Mapping[str, Any]]]:
+    batches: list[list[Mapping[str, Any]]] = []
+    current: list[Mapping[str, Any]] = []
+    for group in groups:
+        proposed = [*current, group]
+        messages = _group_selection_prompt(
+            clinical_question=clinical_question,
+            outer_fold=outer_fold,
+            groups=proposed,
+            max_groups=min(max_groups, len(proposed)),
+        )
+        chars = sum(len(message["content"]) for message in messages)
+        if not current and chars > int(max_prompt_chars):
+            raise ValueError("one Stage 2 group cannot fit the selection prompt budget")
+        if current and chars > int(max_prompt_chars):
+            batches.append(current)
+            current = [group]
+        else:
+            current = proposed
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _operationalization_prompt(
+    *,
+    clinical_question: str,
+    outer_fold: int,
+    group: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    member_measurements = list(group.get("member_measurements") or [])[:8]
+    body = {
+        "job": "operationalize_stage2_candidate_group",
+        "clinical_question": clinical_question,
+        "outer_fold": int(outer_fold),
+        "group": {
+            "group_id": str(group["candidate_id"]),
+            "canonical_name": str(group.get("name") or ""),
+            "canonical_description": _short_text(group.get("description"), max_chars=1_000),
+            "candidate_value_type": str(group.get("value_type") or "ambiguous"),
+            "evidence_axes": _canonical_evidence_axes(group.get("evidence_axes")),
+            "supporting_architectures": _candidate_architectures(group),
+            "member_measurements": member_measurements,
+            "origin_candidate_count": len(_string_values(group.get("origin_candidate_ids"))),
+            "packet_support_count": len(_string_values(group.get("supporting_packet_ids"))),
+        },
+        "rules": [
+            "Define exactly the named scalar pretreatment measurement; do not rename, merge, or split it in this step.",
+            "Specify a reproducible extraction target from a complete patient record.",
+            "For categorical or ordinal variables, enumerate the extraction ontology; for continuous variables, provide the unit when applicable.",
+            "Define how absent, ambiguous, and conflicting documentation is represented.",
+            "Do not return packet IDs, candidate IDs, group IDs, architectures, causal roles, or dispositions.",
+        ],
+        "response": {
+            "description": "one patient-level scalar measurement",
+            "value_type": "binary|categorical|continuous|ordinal|ambiguous",
+            "categories_or_unit": ["categories or one unit string"],
+            "measurement_definition": "what to extract from the pretreatment record",
+            "missing_value_rule": "how missing or ambiguous documentation is represented",
+            "stability_summary": "scientific support summary without provenance identifiers",
+            "caveats": "remaining scientific limitations",
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": "You operationalize one grounded clinical measurement. Return JSON only.",
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+    ]
+
+
+def _validate_operationalization(
+    value: Mapping[str, Any],
+    *,
+    group: Mapping[str, Any],
+) -> dict[str, Any]:
+    forbidden = {
+        "supporting_packet_ids",
+        "packet_ids",
+        "supporting_architectures",
+        "roles",
+        "candidate_dispositions",
+        "group_id",
+        "feature_id",
+        "name",
+        "feature_name",
+    }.intersection(value)
+    if forbidden:
+        raise ValueError(
+            "operationalization returned Python-owned field(s): " f"{sorted(forbidden)}"
+        )
+    raw_categories = value.get("categories_or_unit")
+    if isinstance(raw_categories, Mapping):
+        raw_categories = (
+            raw_categories.get("categories")
+            or raw_categories.get("values")
+            or raw_categories.get("unit")
+        )
+    if raw_categories is None:
+        raw_categories = value.get("categories") or value.get("unit")
+    categories = _string_values(raw_categories)
+    value_type = str(value.get("value_type") or group.get("value_type") or "ambiguous")
+    value_type = value_type.strip().lower()
+    value_type = {
+        "bool": "binary",
+        "boolean": "binary",
+        "category": "categorical",
+        "numeric": "continuous",
+        "number": "continuous",
+        "unknown": "ambiguous",
+    }.get(value_type, value_type)
+    if value_type not in ALLOWED_VALUE_TYPES:
+        value_type = "ambiguous"
+    if value_type in {"binary", "categorical", "ordinal"}:
+        from .plain_handoff_stage2_analysis import _normalized_category_values
+
+        categories = _normalized_category_values(value_type=value_type, values=categories)
+        if not categories:
+            value_type = "ambiguous"
+    description = str(value.get("description") or group.get("description") or "").strip()
+    measurement_definition = str(value.get("measurement_definition") or "").strip()
+    if not measurement_definition:
+        raise ValueError("operationalization requires a measurement_definition")
+    missing_value_rule = str(value.get("missing_value_rule") or "").strip()
+    if not missing_value_rule:
+        raise ValueError("operationalization requires a missing_value_rule")
+    return {
+        "description": description or str(group.get("name") or ""),
+        "value_type": value_type,
+        "categories_or_unit": categories,
+        "measurement_definition": measurement_definition,
+        "missing_value_rule": missing_value_rule,
+        "stability_summary": str(value.get("stability_summary") or "").strip(),
+        "caveats": str(value.get("caveats") or group.get("caveats") or "").strip(),
+    }
 
 
 def _partition_consolidation_candidates(
@@ -2283,201 +2867,308 @@ class PlainHandoffStage2:
         )
         return result
 
+    def _group_candidates(
+        self,
+        *,
+        outer_fold: int,
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        current = [
+            {**dict(candidate), "origin_candidate_ids": [str(candidate["candidate_id"])]}
+            for candidate in candidates
+        ]
+        exclusions: dict[str, str] = {}
+        stalled_rounds = 0
+        for round_index in range(1, 9):
+            batches = _partition_candidate_grouping(
+                current,
+                clinical_question=self.clinical_question,
+                outer_fold=outer_fold,
+                max_prompt_chars=self.config.max_prompt_chars,
+            )
+            LOGGER.info(
+                "Stage 2 candidate grouping round=%s candidates=%s batches=%s",
+                round_index,
+                len(current),
+                len(batches),
+            )
+            grouped_batches: list[list[dict[str, Any]]] = []
+            for batch_index, batch in enumerate(batches, start=1):
+                grouping = _request_json(
+                    messages=_candidate_grouping_prompt(
+                        clinical_question=self.clinical_question,
+                        outer_fold=outer_fold,
+                        candidates=batch,
+                    ),
+                    config=self.config,
+                    completion=self.completion,
+                    validate=lambda value, batch=batch: _validate_candidate_grouping(
+                        value, candidates=batch
+                    ),
+                )
+                materialized, excluded_origins = _materialize_grouping_response(
+                    grouping,
+                    candidates=batch,
+                    id_prefix=f"group_r{round_index:02d}_b{batch_index:03d}",
+                )
+                for origin in excluded_origins:
+                    exclusions[origin] = (
+                        "Excluded during semantic grouping because it was not identified "
+                        "as a concrete patient-level pretreatment measurement."
+                    )
+                grouped_batches.append(materialized)
+
+            next_candidates = _interleave_consolidation_batches(grouped_batches)
+            if len(batches) == 1:
+                return next_candidates, exclusions
+            if not next_candidates:
+                return [], exclusions
+            stalled_rounds = stalled_rounds + 1 if len(next_candidates) >= len(current) else 0
+            current = next_candidates
+            if stalled_rounds >= 2:
+                LOGGER.warning(
+                    "Stage 2 candidate grouping stopped after %s nonreducing bounded "
+                    "rounds; preserving %s conservative groups",
+                    stalled_rounds,
+                    len(current),
+                )
+                return current, exclusions
+        LOGGER.warning(
+            "Stage 2 candidate grouping reached its bounded round limit; preserving %s groups",
+            len(current),
+        )
+        return current, exclusions
+
+    def _select_candidate_groups(
+        self,
+        *,
+        outer_fold: int,
+        groups: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        limit = int(self.config.max_candidates_per_fold)
+        current = [dict(group) for group in groups]
+        exclusions: dict[str, str] = {}
+        round_index = 0
+        while len(current) > limit:
+            round_index += 1
+            batches = _partition_group_selection(
+                current,
+                clinical_question=self.clinical_question,
+                outer_fold=outer_fold,
+                max_groups=limit,
+                max_prompt_chars=self.config.max_prompt_chars,
+            )
+            if len(batches) == 1:
+                batch_limits = [limit]
+            else:
+                stage_budget = min(
+                    len(current),
+                    max(limit, len(batches), math.ceil(len(current) / 2)),
+                )
+                batch_limits = _allocate_consolidation_batch_limits(
+                    batches,
+                    total_budget=stage_budget,
+                    max_per_batch=limit,
+                )
+            LOGGER.info(
+                "Stage 2 group selection round=%s groups=%s batches=%s retained_budget=%s",
+                round_index,
+                len(current),
+                len(batches),
+                sum(batch_limits),
+            )
+            retained_batches: list[list[dict[str, Any]]] = []
+            for batch, batch_limit in zip(batches, batch_limits):
+                by_id = {str(group["candidate_id"]): group for group in batch}
+                if batch_limit >= len(batch):
+                    selection = {
+                        "retained_group_ids": list(by_id),
+                        "excluded_group_ids": [],
+                    }
+                else:
+                    selection = _request_json(
+                        messages=_group_selection_prompt(
+                            clinical_question=self.clinical_question,
+                            outer_fold=outer_fold,
+                            groups=batch,
+                            max_groups=batch_limit,
+                        ),
+                        config=self.config,
+                        completion=self.completion,
+                        validate=lambda value, batch=batch, batch_limit=batch_limit: (
+                            _validate_group_selection(
+                                value,
+                                groups=batch,
+                                max_groups=batch_limit,
+                            )
+                        ),
+                    )
+                retained_batches.append(
+                    [by_id[group_id] for group_id in selection["retained_group_ids"]]
+                )
+                for group_id in selection["excluded_group_ids"]:
+                    for origin in _string_values(by_id[group_id].get("origin_candidate_ids")):
+                        exclusions[origin] = (
+                            "Excluded by the bounded diversity selection after semantic grouping."
+                        )
+            next_groups = _interleave_consolidation_batches(retained_batches)
+            if len(next_groups) >= len(current):
+                raise ValueError("bounded Stage 2 group selection did not reduce the group set")
+            current = next_groups
+            if round_index >= 12 and len(current) > limit:
+                raise ValueError("bounded Stage 2 group selection exceeded its round limit")
+        return current, exclusions
+
+    def _operationalize_candidate_group(
+        self,
+        *,
+        outer_fold: int,
+        group: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        messages = _operationalization_prompt(
+            clinical_question=self.clinical_question,
+            outer_fold=outer_fold,
+            group=group,
+        )
+        prompt_chars = sum(len(message["content"]) for message in messages)
+        if prompt_chars > int(self.config.max_prompt_chars):
+            raise ValueError(
+                "one Stage 2 group cannot fit the operationalization prompt budget "
+                f"({prompt_chars} > {self.config.max_prompt_chars})"
+            )
+        operational = _request_json(
+            messages=messages,
+            config=self.config,
+            completion=self.completion,
+            validate=lambda value: _validate_operationalization(value, group=group),
+        )
+        roles = _derive_roles(group.get("evidence_axes") or [])
+        if not roles:
+            raise ValueError(
+                f"Stage 2 group {group.get('name')!r} has no evidence-supported causal role"
+            )
+        return {
+            "name": str(group["name"]),
+            **operational,
+            "roles": roles,
+            "supporting_packet_ids": _string_values(group.get("supporting_packet_ids")),
+            "supporting_architectures": _string_values(group.get("supporting_architectures")),
+        }
+
+    @staticmethod
+    def _unique_group_names(
+        groups: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        used: set[str] = set()
+        counters: Counter[str] = Counter()
+        output: list[dict[str, Any]] = []
+        for index, raw_group in enumerate(groups, start=1):
+            group = dict(raw_group)
+            base = _snake_case_name(group.get("name"), fallback=f"measurement_{index:03d}")
+            name = base
+            if name in used:
+                alternatives = [
+                    _snake_case_name(member.get("name"), fallback="")
+                    for member in list(group.get("member_measurements") or [])
+                ]
+                name = next(
+                    (
+                        alternative
+                        for alternative in alternatives
+                        if alternative and alternative not in used
+                    ),
+                    "",
+                )
+            if not name or name in used:
+                counters[base] += 1
+                suffix = max(2, counters[base] + 1)
+                name = f"{base}_{suffix}"
+                while name in used:
+                    suffix += 1
+                    name = f"{base}_{suffix}"
+                counters[base] = suffix - 1
+            used.add(name)
+            group["name"] = name
+            output.append(group)
+        return output
+
     def _consolidate_candidates(
         self,
         *,
         outer_fold: int,
         candidates: Sequence[Mapping[str, Any]],
     ) -> Mapping[str, Any]:
-        """Progressively consolidate candidates that exceed one prompt."""
+        """Group IDs, select groups, then let Python assemble all provenance."""
 
         original_ids = [str(candidate["candidate_id"]) for candidate in candidates]
-        current = [
-            {**dict(candidate), "origin_candidate_ids": [str(candidate["candidate_id"])]}
-            for candidate in candidates
-        ]
-        terminal_exclusions: dict[str, str] = {}
-        stage = 0
-        while True:
-            batches = _partition_consolidation_candidates(
-                current,
-                clinical_question=self.clinical_question,
-                outer_fold=outer_fold,
-                max_candidates=self.config.max_candidates_per_fold,
-                max_prompt_chars=self.config.max_prompt_chars,
-            )
-            if len(batches) == 1:
-                final = _request_json(
-                    messages=_consolidation_prompt(
-                        clinical_question=self.clinical_question,
-                        outer_fold=outer_fold,
-                        candidates=current,
-                        max_candidates=self.config.max_candidates_per_fold,
-                    ),
-                    config=self.config,
-                    completion=self.completion,
-                    validate=lambda value: _validate_consolidation(
-                        value,
-                        candidates=current,
-                        max_candidates=self.config.max_candidates_per_fold,
-                    ),
+        groups, grouping_exclusions = self._group_candidates(
+            outer_fold=outer_fold,
+            candidates=candidates,
+        )
+        exclusions = dict(grouping_exclusions)
+        routable_groups: list[dict[str, Any]] = []
+        for group in groups:
+            if _derive_roles(group.get("evidence_axes") or []):
+                routable_groups.append(dict(group))
+                continue
+            for origin in _string_values(group.get("origin_candidate_ids")):
+                exclusions[origin] = (
+                    "Excluded because its Stage 1 evidence does not support a Stage 2 "
+                    "confounder, prognostic, or effect-modifier role."
                 )
-                final_dispositions = final["candidate_dispositions"]
-                resolved: dict[str, dict[str, str]] = {
-                    candidate_id: {
-                        "status": "excluded",
-                        "feature_name": "",
-                        "reason": terminal_exclusions.get(
-                            candidate_id,
-                            "Excluded during bounded candidate consolidation.",
-                        ),
-                    }
-                    for candidate_id in original_ids
-                }
-                retained_by_feature: dict[str, list[str]] = defaultdict(list)
-                for candidate in current:
-                    disposition = final_dispositions[str(candidate["candidate_id"])]
-                    origins = [str(value) for value in candidate["origin_candidate_ids"]]
-                    if disposition["status"] == "excluded":
-                        for origin in origins:
-                            resolved[origin]["reason"] = disposition["reason"]
-                        continue
-                    feature_name = str(disposition["feature_name"])
-                    for origin in origins:
-                        retained_by_feature[feature_name].append(origin)
-                        resolved[origin] = {
-                            "status": "merged",
-                            "feature_name": feature_name,
-                            "reason": disposition["reason"],
-                        }
-                for origins in retained_by_feature.values():
-                    if origins:
-                        resolved[origins[0]]["status"] = "retained"
-                return {
-                    "features": final["features"],
-                    "candidate_dispositions": resolved,
-                }
 
-            stage += 1
-            stage_budget = _progressive_consolidation_budget(
-                candidate_count=len(current),
-                batch_count=len(batches),
-                final_limit=self.config.max_candidates_per_fold,
-                oversample_factor=self.config.consolidation_oversample_factor,
-                round_index=stage,
-            )
-            batch_limits = _allocate_consolidation_batch_limits(
-                batches,
-                total_budget=stage_budget,
-                max_per_batch=self.config.max_candidates_per_fold,
-            )
-            LOGGER.info(
-                "Stage 2 progressive consolidation round=%s candidates=%s "
-                "batches=%s beam_budget=%s allocated=%s per_batch_limit=%s..%s",
-                stage,
-                len(current),
-                len(batches),
-                stage_budget,
-                sum(batch_limits),
-                min(batch_limits),
-                max(batch_limits),
-            )
-            next_candidate_batches: list[list[dict[str, Any]]] = []
-            for batch_index, (batch, stage_limit) in enumerate(zip(batches, batch_limits), start=1):
-                partial = _request_json(
-                    messages=_consolidation_prompt(
-                        clinical_question=self.clinical_question,
+        selected_groups, selection_exclusions = self._select_candidate_groups(
+            outer_fold=outer_fold,
+            groups=routable_groups,
+        )
+        exclusions.update(selection_exclusions)
+        selected_groups = self._unique_group_names(selected_groups)
+
+        features_by_group_id: dict[str, dict[str, Any]] = {}
+        if selected_groups:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, min(self.config.workers, len(selected_groups)))
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._operationalize_candidate_group,
                         outer_fold=outer_fold,
-                        candidates=batch,
-                        max_candidates=stage_limit,
-                    ),
-                    config=self.config,
-                    completion=self.completion,
-                    validate=lambda value, batch=batch: _validate_consolidation(
-                        value,
-                        candidates=batch,
-                        max_candidates=stage_limit,
-                    ),
-                )
-                dispositions = partial["candidate_dispositions"]
-                by_id = {str(candidate["candidate_id"]): candidate for candidate in batch}
-                for candidate_id, disposition in dispositions.items():
-                    if disposition["status"] == "excluded":
-                        for origin in by_id[candidate_id]["origin_candidate_ids"]:
-                            terminal_exclusions[str(origin)] = disposition["reason"]
-                partial_candidates: list[dict[str, Any]] = []
-                for feature_index, feature in enumerate(partial["features"], start=1):
-                    contributing = [
-                        by_id[candidate_id]
-                        for candidate_id, disposition in dispositions.items()
-                        if disposition["status"] != "excluded"
-                        and disposition["feature_name"] == feature["name"]
-                    ]
-                    origins = list(
-                        dict.fromkeys(
-                            str(origin)
-                            for candidate in contributing
-                            for origin in candidate["origin_candidate_ids"]
-                        )
-                    )
-                    if not origins:
-                        continue
-                    evidence_axes = sorted(
-                        {
-                            str(axis)
-                            for candidate in contributing
-                            for axis in candidate["evidence_axes"]
-                        }
-                    )
-                    packet_evidence_axes: dict[str, list[str]] = {}
-                    for candidate in contributing:
-                        inherited = candidate.get("packet_evidence_axes") or {}
-                        for packet_id in candidate["supporting_packet_ids"]:
-                            packet_key = str(packet_id)
-                            packet_evidence_axes[packet_key] = sorted(
-                                {
-                                    *packet_evidence_axes.get(packet_key, []),
-                                    *(inherited.get(packet_key) or candidate["evidence_axes"]),
-                                }
-                            )
-                    partial_candidates.append(
-                        {
-                            "candidate_id": (
-                                f"stage_{stage:02d}_batch_{batch_index:03d}_"
-                                f"feature_{feature_index:03d}"
-                            ),
-                            "architecture": "bounded_multi_architecture_consolidation",
-                            "supporting_architectures": list(feature["supporting_architectures"]),
-                            "name": feature["name"],
-                            "description": feature["description"],
-                            "value_type": feature["value_type"],
-                            "supporting_packet_ids": list(feature["supporting_packet_ids"]),
-                            "evidence_axes": evidence_axes,
-                            "packet_evidence_axes": packet_evidence_axes,
-                            "caveats": feature["caveats"],
-                            "origin_candidate_ids": origins,
-                        }
-                    )
-                next_candidate_batches.append(partial_candidates)
-            next_candidates = _interleave_consolidation_batches(next_candidate_batches)
-            if not next_candidates:
-                return {
-                    "features": [],
-                    "candidate_dispositions": {
-                        candidate_id: {
-                            "status": "excluded",
-                            "feature_name": "",
-                            "reason": terminal_exclusions.get(
-                                candidate_id,
-                                "No supported feature remained after bounded consolidation.",
-                            ),
-                        }
-                        for candidate_id in original_ids
-                    },
+                        group=group,
+                    ): str(group["candidate_id"])
+                    for group in selected_groups
                 }
-            if len(next_candidates) >= len(current) and stage > 8:
-                raise ValueError("bounded Stage 2 consolidation did not reduce the candidate set")
-            current = next_candidates
+                for future in concurrent.futures.as_completed(futures):
+                    features_by_group_id[futures[future]] = future.result()
+        features = [features_by_group_id[str(group["candidate_id"])] for group in selected_groups]
+
+        dispositions: dict[str, dict[str, str]] = {
+            candidate_id: {
+                "status": "excluded",
+                "feature_name": "",
+                "reason": exclusions.get(
+                    candidate_id,
+                    "Excluded before final Stage 2 operationalization.",
+                ),
+            }
+            for candidate_id in original_ids
+        }
+        for group, feature in zip(selected_groups, features):
+            origins = [
+                origin
+                for origin in _string_values(group.get("origin_candidate_ids"))
+                if origin in dispositions
+            ]
+            for origin_index, origin in enumerate(origins):
+                dispositions[origin] = {
+                    "status": "retained" if origin_index == 0 else "merged",
+                    "feature_name": str(feature["name"]),
+                    "reason": (
+                        "Retained as the canonical candidate for this scalar measurement."
+                        if origin_index == 0
+                        else "Merged with candidates describing the same scalar measurement."
+                    ),
+                }
+        return {"features": features, "candidate_dispositions": dispositions}
 
     def _run_outer_fold(
         self,
@@ -2503,9 +3194,9 @@ class PlainHandoffStage2:
             {
                 "outer_fold": int(outer_fold),
                 "compiler": self.config.evidence_compiler,
+                "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                 "clinical_question": self.clinical_question,
                 "max_candidates_per_fold": self.config.max_candidates_per_fold,
-                "consolidation_oversample_factor": (self.config.consolidation_oversample_factor),
                 "packets": list(packets),
             }
         )
@@ -2664,6 +3355,7 @@ class PlainHandoffStage2:
                     "status": "complete",
                     "completed_at": _now(),
                     "evidence_input_fingerprint": evidence_input_fingerprint,
+                    "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                     "architectures": len(by_architecture),
                     "packets": len(packets),
                     "features": len(final["features"]),
@@ -2876,12 +3568,8 @@ class PlainHandoffStage2:
                     else None
                 ),
                 "mean_estimated_cate": float(predictions["estimated_cate"].mean()),
-                "oracle_ite_pearson_correlation": oracle_overall.get(
-                    "pearson_correlation"
-                ),
-                "oracle_ite_spearman_correlation": oracle_overall.get(
-                    "spearman_correlation"
-                ),
+                "oracle_ite_pearson_correlation": oracle_overall.get("pearson_correlation"),
+                "oracle_ite_spearman_correlation": oracle_overall.get("spearman_correlation"),
                 "oracle_ite_evaluation": oracle_ite_evaluation,
                 "predictions_path": str(predictions_path),
             }
