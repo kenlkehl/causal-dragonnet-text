@@ -46,7 +46,7 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
-CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v2"
+CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v3"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
     "assessment",
@@ -949,6 +949,10 @@ def _partition_packets(
 CompletionFunction = Callable[[Sequence[Mapping[str, str]], PlainHandoffStage2Config], str]
 
 
+class _RetryableStage2ResponseError(RuntimeError):
+    """A completed transport that did not yield any response content."""
+
+
 def _openai_completion(
     messages: Sequence[Mapping[str, str]],
     config: PlainHandoffStage2Config,
@@ -993,13 +997,15 @@ def _openai_completion(
         raise ValueError("Stage 2 server stopped the response with finish_reason=length")
     content = choice.message.content
     if not content:
-        raise RuntimeError("Stage 2 model returned an empty response")
+        raise _RetryableStage2ResponseError("Stage 2 model returned an empty response")
     return str(content)
 
 
 def _is_retryable_transport_error(exc: Exception) -> bool:
     """Return whether a failed OpenAI-compatible request is safe to retry."""
 
+    if isinstance(exc, _RetryableStage2ResponseError):
+        return True
     try:
         from openai import APIConnectionError, APIStatusError
     except ImportError:  # pragma: no cover - OpenAI is required for live requests
@@ -1200,6 +1206,74 @@ def _request_json(
                 max_chars=available,
             )
     raise RuntimeError(f"unreachable Stage 2 response state: {first_error}")
+
+
+def _checkpointed_request_json(
+    *,
+    output_dir: Path | None,
+    input_value: Mapping[str, Any],
+    messages: Sequence[Mapping[str, str]],
+    config: PlainHandoffStage2Config,
+    completion: CompletionFunction,
+    validate: Callable[[Mapping[str, Any]], dict[str, Any]],
+) -> dict[str, Any]:
+    """Cache one validated LLM leaf by its complete deterministic input."""
+
+    if output_dir is None:
+        return _request_json(
+            messages=messages,
+            config=config,
+            completion=completion,
+            validate=validate,
+        )
+    output_dir = Path(output_dir)
+    checkpoint_input = {
+        "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+        **dict(input_value),
+    }
+    input_fingerprint = _value_fingerprint(checkpoint_input)
+    input_path = output_dir / "input.json"
+    result_path = output_dir / "result.json"
+    complete_path = output_dir / "complete.json"
+    if input_path.is_file() and result_path.is_file() and complete_path.is_file():
+        try:
+            previous_input = json.loads(input_path.read_text(encoding="utf-8"))
+            completion_state = json.loads(complete_path.read_text(encoding="utf-8"))
+            cached_result = json.loads(result_path.read_text(encoding="utf-8"))
+            if (
+                previous_input.get("input_fingerprint") == input_fingerprint
+                and completion_state.get("input_fingerprint") == input_fingerprint
+            ):
+                validated = validate(cached_result)
+                LOGGER.info("skip completed Stage 2 consolidation request: %s", output_dir)
+                return validated
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        LOGGER.info("rerun stale or inconsistent Stage 2 consolidation request: %s", output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        input_path,
+        {
+            **checkpoint_input,
+            "input_fingerprint": input_fingerprint,
+        },
+    )
+    result = _request_json(
+        messages=messages,
+        config=config,
+        completion=completion,
+        validate=validate,
+    )
+    _write_json(result_path, result)
+    _write_json(
+        complete_path,
+        {
+            "status": "complete",
+            "completed_at": _now(),
+            "input_fingerprint": input_fingerprint,
+        },
+    )
+    return result
 
 
 def _interpretation_prompt(
@@ -1981,7 +2055,28 @@ def _validate_candidate_grouping(
     seen.update(excluded)
     missing = sorted(supplied - seen)
     if missing:
-        raise ValueError(f"candidate grouping omitted candidate ID(s): {missing[:8]}")
+        LOGGER.warning(
+            "Stage 2 candidate grouping preserved %s omitted candidate ID(s) as "
+            "conservative singleton groups: %s",
+            len(missing),
+            missing[:8],
+        )
+        candidate_by_id = {str(candidate["candidate_id"]): candidate for candidate in candidates}
+        for candidate_id in missing:
+            candidate = candidate_by_id[candidate_id]
+            groups.append(
+                {
+                    "group_id": f"python_singleton_{len(groups) + 1:03d}",
+                    "member_candidate_ids": [candidate_id],
+                    "canonical_name": _snake_case_name(
+                        candidate.get("name"),
+                        fallback=f"measurement_{len(groups) + 1:03d}",
+                    ),
+                    "canonical_description": _short_text(
+                        candidate.get("description"), max_chars=2_000
+                    ),
+                }
+            )
     return {"groups": groups, "excluded_candidate_ids": excluded}
 
 
@@ -2350,6 +2445,7 @@ def _operationalization_prompt(
             "For categorical or ordinal variables, enumerate the extraction ontology; for continuous variables, provide the unit when applicable.",
             "Define how absent, ambiguous, and conflicting documentation is represented.",
             "Do not return packet IDs, candidate IDs, group IDs, architectures, causal roles, or dispositions.",
+            "Return one flat JSON object with every response field shown below; measurement_definition and missing_value_rule are required nonempty strings.",
         ],
         "response": {
             "description": "one patient-level scalar measurement",
@@ -2375,22 +2471,23 @@ def _validate_operationalization(
     *,
     group: Mapping[str, Any],
 ) -> dict[str, Any]:
-    forbidden = {
-        "supporting_packet_ids",
-        "packet_ids",
-        "supporting_architectures",
-        "roles",
-        "candidate_dispositions",
-        "group_id",
-        "feature_id",
-        "name",
-        "feature_name",
-    }.intersection(value)
-    if forbidden:
-        raise ValueError(
-            "operationalization returned Python-owned field(s): " f"{sorted(forbidden)}"
-        )
-    raw_categories = value.get("categories_or_unit")
+    # Some instruction-following models wrap the requested fields in a named
+    # object or helpfully repeat the feature name/provenance. Those extras are
+    # harmless here: Python never reads them when assembling the final feature.
+    # Prefer the first recognized nested object while preserving usable scalar
+    # fields returned at the top level.
+    normalized = dict(value)
+    for key in ("operationalization", "feature", "definition", "variable", "result"):
+        nested = value.get(key)
+        if isinstance(nested, Mapping):
+            normalized.update(nested)
+            break
+    raw_features = value.get("features")
+    if isinstance(raw_features, Sequence) and not isinstance(raw_features, str):
+        if len(raw_features) == 1 and isinstance(raw_features[0], Mapping):
+            normalized.update(raw_features[0])
+
+    raw_categories = normalized.get("categories_or_unit")
     if isinstance(raw_categories, Mapping):
         raw_categories = (
             raw_categories.get("categories")
@@ -2398,9 +2495,20 @@ def _validate_operationalization(
             or raw_categories.get("unit")
         )
     if raw_categories is None:
-        raw_categories = value.get("categories") or value.get("unit")
+        raw_categories = (
+            normalized.get("categories")
+            or normalized.get("allowed_values")
+            or normalized.get("levels")
+            or normalized.get("unit")
+        )
     categories = _string_values(raw_categories)
-    value_type = str(value.get("value_type") or group.get("value_type") or "ambiguous")
+    value_type = str(
+        normalized.get("value_type")
+        or normalized.get("data_type")
+        or normalized.get("type")
+        or group.get("value_type")
+        or "ambiguous"
+    )
     value_type = value_type.strip().lower()
     value_type = {
         "bool": "binary",
@@ -2418,21 +2526,69 @@ def _validate_operationalization(
         categories = _normalized_category_values(value_type=value_type, values=categories)
         if not categories:
             value_type = "ambiguous"
-    description = str(value.get("description") or group.get("description") or "").strip()
-    measurement_definition = str(value.get("measurement_definition") or "").strip()
+    description = str(
+        normalized.get("description")
+        or normalized.get("clinical_definition")
+        or normalized.get("summary")
+        or group.get("description")
+        or ""
+    ).strip()
+    measurement_definition = str(
+        normalized.get("measurement_definition")
+        or normalized.get("operational_definition")
+        or normalized.get("extraction_definition")
+        or normalized.get("extraction_instruction")
+        or normalized.get("measurement_rule")
+        or normalized.get("how_to_measure")
+        or (
+            normalized.get("definition")
+            if not isinstance(normalized.get("definition"), Mapping)
+            else ""
+        )
+        or ""
+    ).strip()
     if not measurement_definition:
-        raise ValueError("operationalization requires a measurement_definition")
-    missing_value_rule = str(value.get("missing_value_rule") or "").strip()
+        canonical_name = str(group.get("name") or "measurement").replace("_", " ")
+        canonical_description = description or canonical_name
+        measurement_definition = (
+            f"Extract one pretreatment scalar for {canonical_name} according to this "
+            f"canonical definition: {canonical_description}"
+        )
+    missing_value_rule = str(
+        normalized.get("missing_value_rule")
+        or normalized.get("missingness_rule")
+        or normalized.get("missing_data_rule")
+        or normalized.get("missing_value_handling")
+        or ""
+    ).strip()
     if not missing_value_rule:
-        raise ValueError("operationalization requires a missing_value_rule")
+        missing_value_rule = (
+            "Return null when the pretreatment record does not explicitly document "
+            "a single unambiguous value."
+        )
+    architecture_count = len(_candidate_architectures(group))
+    packet_count = len(_string_values(group.get("supporting_packet_ids")))
+    stability_summary = str(
+        normalized.get("stability_summary")
+        or normalized.get("support_summary")
+        or normalized.get("evidence_summary")
+        or ""
+    ).strip()
+    if not stability_summary:
+        stability_summary = (
+            f"Supported by {packet_count} evidence packet(s) across "
+            f"{architecture_count} Stage 1 architecture(s)."
+        )
     return {
         "description": description or str(group.get("name") or ""),
         "value_type": value_type,
         "categories_or_unit": categories,
         "measurement_definition": measurement_definition,
         "missing_value_rule": missing_value_rule,
-        "stability_summary": str(value.get("stability_summary") or "").strip(),
-        "caveats": str(value.get("caveats") or group.get("caveats") or "").strip(),
+        "stability_summary": stability_summary,
+        "caveats": str(
+            normalized.get("caveats") or normalized.get("limitations") or group.get("caveats") or ""
+        ).strip(),
     }
 
 
@@ -2872,6 +3028,7 @@ class PlainHandoffStage2:
         *,
         outer_fold: int,
         candidates: Sequence[Mapping[str, Any]],
+        output_dir: Path | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         current = [
             {**dict(candidate), "origin_candidate_ids": [str(candidate["candidate_id"])]}
@@ -2894,12 +3051,29 @@ class PlainHandoffStage2:
             )
             grouped_batches: list[list[dict[str, Any]]] = []
             for batch_index, batch in enumerate(batches, start=1):
-                grouping = _request_json(
-                    messages=_candidate_grouping_prompt(
-                        clinical_question=self.clinical_question,
-                        outer_fold=outer_fold,
-                        candidates=batch,
+                messages = _candidate_grouping_prompt(
+                    clinical_question=self.clinical_question,
+                    outer_fold=outer_fold,
+                    candidates=batch,
+                )
+                grouping = _checkpointed_request_json(
+                    output_dir=(
+                        output_dir
+                        / "grouping"
+                        / f"round_{round_index:03d}"
+                        / f"batch_{batch_index:03d}"
+                        if output_dir is not None
+                        else None
                     ),
+                    input_value={
+                        "phase": "candidate_grouping",
+                        "clinical_question": self.clinical_question,
+                        "outer_fold": int(outer_fold),
+                        "round_index": round_index,
+                        "batch_index": batch_index,
+                        "candidates": list(batch),
+                    },
+                    messages=messages,
                     config=self.config,
                     completion=self.completion,
                     validate=lambda value, batch=batch: _validate_candidate_grouping(
@@ -2944,6 +3118,7 @@ class PlainHandoffStage2:
         *,
         outer_fold: int,
         groups: Sequence[Mapping[str, Any]],
+        output_dir: Path | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         limit = int(self.config.max_candidates_per_fold)
         current = [dict(group) for group in groups]
@@ -2978,7 +3153,7 @@ class PlainHandoffStage2:
                 sum(batch_limits),
             )
             retained_batches: list[list[dict[str, Any]]] = []
-            for batch, batch_limit in zip(batches, batch_limits):
+            for batch_index, (batch, batch_limit) in enumerate(zip(batches, batch_limits), start=1):
                 by_id = {str(group["candidate_id"]): group for group in batch}
                 if batch_limit >= len(batch):
                     selection = {
@@ -2986,13 +3161,31 @@ class PlainHandoffStage2:
                         "excluded_group_ids": [],
                     }
                 else:
-                    selection = _request_json(
-                        messages=_group_selection_prompt(
-                            clinical_question=self.clinical_question,
-                            outer_fold=outer_fold,
-                            groups=batch,
-                            max_groups=batch_limit,
+                    messages = _group_selection_prompt(
+                        clinical_question=self.clinical_question,
+                        outer_fold=outer_fold,
+                        groups=batch,
+                        max_groups=batch_limit,
+                    )
+                    selection = _checkpointed_request_json(
+                        output_dir=(
+                            output_dir
+                            / "selection"
+                            / f"round_{round_index:03d}"
+                            / f"batch_{batch_index:03d}"
+                            if output_dir is not None
+                            else None
                         ),
+                        input_value={
+                            "phase": "group_selection",
+                            "clinical_question": self.clinical_question,
+                            "outer_fold": int(outer_fold),
+                            "round_index": round_index,
+                            "batch_index": batch_index,
+                            "max_groups": int(batch_limit),
+                            "groups": list(batch),
+                        },
+                        messages=messages,
                         config=self.config,
                         completion=self.completion,
                         validate=lambda value, batch=batch, batch_limit=batch_limit: (
@@ -3024,6 +3217,7 @@ class PlainHandoffStage2:
         *,
         outer_fold: int,
         group: Mapping[str, Any],
+        output_dir: Path | None = None,
     ) -> dict[str, Any]:
         messages = _operationalization_prompt(
             clinical_question=self.clinical_question,
@@ -3036,7 +3230,14 @@ class PlainHandoffStage2:
                 "one Stage 2 group cannot fit the operationalization prompt budget "
                 f"({prompt_chars} > {self.config.max_prompt_chars})"
             )
-        operational = _request_json(
+        operational = _checkpointed_request_json(
+            output_dir=output_dir,
+            input_value={
+                "phase": "group_operationalization",
+                "clinical_question": self.clinical_question,
+                "outer_fold": int(outer_fold),
+                "group": dict(group),
+            },
             messages=messages,
             config=self.config,
             completion=self.completion,
@@ -3097,6 +3298,7 @@ class PlainHandoffStage2:
         *,
         outer_fold: int,
         candidates: Sequence[Mapping[str, Any]],
+        output_dir: Path | None = None,
     ) -> Mapping[str, Any]:
         """Group IDs, select groups, then let Python assemble all provenance."""
 
@@ -3104,6 +3306,7 @@ class PlainHandoffStage2:
         groups, grouping_exclusions = self._group_candidates(
             outer_fold=outer_fold,
             candidates=candidates,
+            output_dir=output_dir,
         )
         exclusions = dict(grouping_exclusions)
         routable_groups: list[dict[str, Any]] = []
@@ -3120,6 +3323,7 @@ class PlainHandoffStage2:
         selected_groups, selection_exclusions = self._select_candidate_groups(
             outer_fold=outer_fold,
             groups=routable_groups,
+            output_dir=output_dir,
         )
         exclusions.update(selection_exclusions)
         selected_groups = self._unique_group_names(selected_groups)
@@ -3134,8 +3338,13 @@ class PlainHandoffStage2:
                         self._operationalize_candidate_group,
                         outer_fold=outer_fold,
                         group=group,
+                        output_dir=(
+                            output_dir / "operationalization" / f"group_{group_index:03d}"
+                            if output_dir is not None
+                            else None
+                        ),
                     ): str(group["candidate_id"])
-                    for group in selected_groups
+                    for group_index, group in enumerate(selected_groups, start=1)
                 }
                 for future in concurrent.futures.as_completed(futures):
                     features_by_group_id[futures[future]] = future.result()
@@ -3334,6 +3543,7 @@ class PlainHandoffStage2:
                 consolidated = self._consolidate_candidates(
                     outer_fold=outer_fold,
                     candidates=candidates,
+                    output_dir=output_dir / "consolidation",
                 )
                 features = []
                 for index, feature in enumerate(consolidated["features"], start=1):

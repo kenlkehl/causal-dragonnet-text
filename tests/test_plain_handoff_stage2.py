@@ -1080,6 +1080,14 @@ def test_openai_timeout_is_a_retryable_transport_error():
     assert stage2_workflow._is_retryable_transport_error(error) is True
 
 
+def test_empty_model_response_is_a_retryable_call_failure():
+    error = stage2_workflow._RetryableStage2ResponseError(
+        "Stage 2 model returned an empty response"
+    )
+
+    assert stage2_workflow._is_retryable_transport_error(error) is True
+
+
 def test_openai_completion_closes_client(monkeypatch):
     request_kwargs = {}
 
@@ -1865,7 +1873,43 @@ def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
     }
 
 
-def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in_python():
+def test_candidate_grouping_preserves_model_omissions_as_singletons(caplog):
+    candidates = [
+        {
+            "candidate_id": "candidate_0001",
+            "name": "measurement_alpha",
+            "description": "Pretreatment measurement alpha.",
+        },
+        {
+            "candidate_id": "candidate_0002",
+            "name": "measurement_beta",
+            "description": "Pretreatment measurement beta.",
+        },
+    ]
+
+    result = stage2_workflow._validate_candidate_grouping(
+        {
+            "groups": [
+                {
+                    "group_id": "group_001",
+                    "member_candidate_ids": ["candidate_0001"],
+                    "canonical_name": "measurement_alpha",
+                    "canonical_description": "Pretreatment measurement alpha.",
+                }
+            ],
+            "excluded_candidate_ids": [],
+        },
+        candidates=candidates,
+    )
+
+    assert result["groups"][-1]["member_candidate_ids"] == ["candidate_0002"]
+    assert result["groups"][-1]["canonical_name"] == "measurement_beta"
+    assert "preserved 1 omitted candidate ID" in caplog.text
+
+
+def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in_python(
+    tmp_path: Path,
+):
     prompt_bodies = []
     packet_ids = ["packet_alpha_long_id", "packet_beta_long_id", "packet_gamma_long_id"]
 
@@ -1956,7 +2000,12 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
         },
     ]
 
-    result = runner._consolidate_candidates(outer_fold=1, candidates=candidates)
+    checkpoint_dir = tmp_path / "consolidation"
+    result = runner._consolidate_candidates(
+        outer_fold=1,
+        candidates=candidates,
+        output_dir=checkpoint_dir,
+    )
 
     assert [feature["supporting_packet_ids"] for feature in result["features"]] == [
         [packet_ids[0]],
@@ -1976,26 +2025,78 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
         "select_stage2_candidate_groups",
         "operationalize_stage2_candidate_group",
     }
+    assert len(list(checkpoint_dir.rglob("complete.json"))) == 4
+
+    def unexpected_completion(_messages, _config):
+        raise AssertionError("completed consolidation leaves must resume from checkpoints")
+
+    resumed = PlainHandoffStage2(
+        config=runner.config,
+        clinical_question=runner.clinical_question,
+        completion=unexpected_completion,
+    )._consolidate_candidates(
+        outer_fold=1,
+        candidates=candidates,
+        output_dir=checkpoint_dir,
+    )
+    assert resumed == result
 
 
-def test_operationalization_rejects_model_authored_provenance_and_roles():
-    with pytest.raises(ValueError, match="Python-owned field"):
-        stage2_workflow._validate_operationalization(
-            {
+def test_operationalization_ignores_model_authored_provenance_and_uses_aliases():
+    result = stage2_workflow._validate_operationalization(
+        {
+            "feature": {
+                "name": "model_renamed_measurement",
                 "description": "A scalar measurement.",
-                "value_type": "continuous",
-                "categories_or_unit": ["unit"],
-                "measurement_definition": "Extract the pretreatment value.",
-                "missing_value_rule": "Return null when undocumented.",
+                "data_type": "numeric",
+                "unit": "standard unit",
+                "operational_definition": "Extract the pretreatment value.",
+                "missingness_rule": "Return null when undocumented.",
                 "supporting_packet_ids": ["mistyped_packet_id"],
                 "roles": ["confounder"],
             },
-            group={
-                "name": "scalar_measurement",
-                "description": "A scalar measurement.",
-                "value_type": "continuous",
-            },
-        )
+        },
+        group={
+            "name": "scalar_measurement",
+            "description": "A scalar measurement.",
+            "value_type": "continuous",
+            "supporting_packet_ids": ["real_packet_id"],
+            "supporting_architectures": ["real_architecture"],
+        },
+    )
+
+    assert result["value_type"] == "continuous"
+    assert result["categories_or_unit"] == ["standard unit"]
+    assert result["measurement_definition"] == "Extract the pretreatment value."
+    assert result["missing_value_rule"] == "Return null when undocumented."
+    assert "name" not in result
+    assert "supporting_packet_ids" not in result
+    assert "roles" not in result
+
+
+def test_operationalization_supplies_safe_defaults_for_omitted_leaf_fields():
+    result = stage2_workflow._validate_operationalization(
+        {
+            "description": "Pretreatment scalar measurement.",
+            "value_type": "continuous",
+            "categories_or_unit": ["standard unit"],
+        },
+        group={
+            "name": "scalar_measurement",
+            "description": "Pretreatment scalar measurement.",
+            "value_type": "continuous",
+            "supporting_packet_ids": ["packet_1", "packet_2"],
+            "supporting_architectures": ["architecture_1"],
+        },
+    )
+
+    assert result["measurement_definition"].startswith(
+        "Extract one pretreatment scalar for scalar measurement"
+    )
+    assert result["missing_value_rule"].startswith("Return null")
+    assert result["stability_summary"] == (
+        "Supported by 2 evidence packet(s) across 1 Stage 1 architecture(s)."
+    )
 
 
 def test_stage2_progressive_consolidation_uses_oversampled_beam_across_28_batches():

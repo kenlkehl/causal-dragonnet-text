@@ -657,7 +657,9 @@ through those groups. If the group count exceeds the fold limit, a separate
 selection request operates only on short group summaries. Finally, independent
 one-group requests define value types, units or categories, measurement rules,
 and missingness handling without asking the model to reproduce provenance IDs
-or cross-object references. It then extracts the variables on the outer
+or cross-object references. Grouping, bounded selection, and every one-group
+operationalization request are input-fingerprinted separately, so a retry skips
+successful leaves instead of repeating the whole fan-out. It then extracts the variables on the outer
 training rows and measures missingness, variation,
 treatment prediction, outcome prediction, and residual-effect performance by
 inner validation. Leave-one-feature-out measurements show whether each variable
