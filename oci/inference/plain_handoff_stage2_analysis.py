@@ -30,6 +30,7 @@ EXTRACTION_CHECKPOINT_SCHEMA_VERSION = "stage2_single_patient_extraction_v1"
 PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_lossless_feature_partition_reconciliation_v1"
 )
+REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v1"
 
 RequestJSON = Callable[
     [Sequence[Mapping[str, str]], Callable[[Mapping[str, Any]], dict[str, Any]]],
@@ -2110,7 +2111,9 @@ def _review_prompt(
     allow_measurement_revision: bool,
     min_nonmissing_fraction: float,
     max_dominant_fraction: float,
+    feature_set_index: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
+    detailed_feature_ids = [str(feature["feature_id"]) for feature in definitions]
     body = {
         "job": "review_stage2_variables_against_training_fold_performance",
         "clinical_question": clinical_question,
@@ -2123,8 +2126,14 @@ def _review_prompt(
             "minimum_nonmissing_fraction": min_nonmissing_fraction,
             "maximum_dominant_value_fraction": max_dominant_fraction,
         },
+        "review_scope": {
+            "detailed_feature_ids": detailed_feature_ids,
+            "feature_count_in_entire_set": len(feature_set_index or definitions),
+        },
         "rules": [
-            "Give every feature exactly one decision.",
+            "Give every detailed feature exactly one decision.",
+            "Do not return decisions for index-only features; they are reviewed in other requests.",
+            "Use the feature-set index to recognize related or potentially redundant variables.",
             "Keep a feature when extraction is usable and its scientific role remains plausible.",
             "Drop a feature when it is essentially unmeasured, invariant, or unsupported after extraction.",
             "Use leave-one-feature-out metrics to distinguish a feature's contribution from overall model performance.",
@@ -2139,6 +2148,7 @@ def _review_prompt(
                 else "This is the final review round; choose only keep or drop."
             ),
         ],
+        "feature_set_index": list(feature_set_index or []),
         "features": list(definitions),
         "extraction_summaries": list(summaries),
         "inner_validation_performance": dict(performance),
@@ -2164,6 +2174,146 @@ def _review_prompt(
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
     ]
+
+
+def _review_feature_set_index(
+    definitions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Retain compact whole-set context in every partitioned review request."""
+
+    return [
+        {
+            "feature_id": str(feature["feature_id"]),
+            "name": str(feature["name"]),
+            "description": str(feature.get("description") or ""),
+            "roles": list(feature.get("roles") or []),
+            "value_type": str(feature.get("value_type") or ""),
+        }
+        for feature in definitions
+    ]
+
+
+def _review_performance_for_features(
+    performance: Mapping[str, Any],
+    *,
+    feature_ids: set[str],
+) -> dict[str, Any]:
+    """Return global metrics plus each detailed feature's own ablation metrics."""
+
+    selected = {
+        key: copy.deepcopy(value)
+        for key, value in performance.items()
+        if key != "leave_one_feature_out"
+    }
+    selected["leave_one_feature_out"] = [
+        copy.deepcopy(row)
+        for row in performance.get("leave_one_feature_out") or []
+        if str(row.get("feature_id") or "") in feature_ids
+    ]
+    return selected
+
+
+def _review_prompt_for_features(
+    *,
+    clinical_question: str,
+    definitions: Sequence[Mapping[str, Any]],
+    summaries_by_id: Mapping[str, Mapping[str, Any]],
+    performance: Mapping[str, Any],
+    feature_set_index: Sequence[Mapping[str, Any]],
+    allow_measurement_revision: bool,
+    min_nonmissing_fraction: float,
+    max_dominant_fraction: float,
+) -> list[dict[str, str]]:
+    feature_ids = {str(feature["feature_id"]) for feature in definitions}
+    return _review_prompt(
+        clinical_question=clinical_question,
+        definitions=definitions,
+        summaries=[
+            summaries_by_id[str(feature["feature_id"])] for feature in definitions
+        ],
+        performance=_review_performance_for_features(
+            performance,
+            feature_ids=feature_ids,
+        ),
+        allow_measurement_revision=allow_measurement_revision,
+        min_nonmissing_fraction=min_nonmissing_fraction,
+        max_dominant_fraction=max_dominant_fraction,
+        feature_set_index=feature_set_index,
+    )
+
+
+def _partition_review_features(
+    *,
+    clinical_question: str,
+    definitions: Sequence[Mapping[str, Any]],
+    summaries: Sequence[Mapping[str, Any]],
+    performance: Mapping[str, Any],
+    allow_measurement_revision: bool,
+    min_nonmissing_fraction: float,
+    max_dominant_fraction: float,
+    max_prompt_chars: int,
+) -> list[list[dict[str, Any]]]:
+    """Partition detailed review inputs while preserving every per-feature diagnostic.
+
+    The soft limit leaves space for validation-repair turns. A single unusually
+    verbose feature may exceed that soft limit, but it must still fit the configured
+    hard transport limit.
+    """
+
+    hard_limit = int(max_prompt_chars)
+    if hard_limit < 1:
+        raise ValueError("Stage 2 max_prompt_chars must be positive")
+    soft_limit = min(hard_limit, max(20_000, int(hard_limit * 0.6)))
+    summaries_by_id = {str(row["feature_id"]): row for row in summaries}
+    expected_ids = {str(feature["feature_id"]) for feature in definitions}
+    missing_summaries = sorted(expected_ids - set(summaries_by_id))
+    if missing_summaries:
+        raise ValueError(
+            "Stage 2 review is missing extraction summaries for feature ID(s): "
+            f"{missing_summaries[:8]}"
+        )
+    feature_set_index = _review_feature_set_index(definitions)
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        proposed = [*current, feature]
+        messages = _review_prompt_for_features(
+            clinical_question=clinical_question,
+            definitions=proposed,
+            summaries_by_id=summaries_by_id,
+            performance=performance,
+            feature_set_index=feature_set_index,
+            allow_measurement_revision=allow_measurement_revision,
+            min_nonmissing_fraction=min_nonmissing_fraction,
+            max_dominant_fraction=max_dominant_fraction,
+        )
+        prompt_chars = _prompt_chars(messages)
+        if current and prompt_chars > soft_limit:
+            batches.append(current)
+            current = [feature]
+            singleton_messages = _review_prompt_for_features(
+                clinical_question=clinical_question,
+                definitions=current,
+                summaries_by_id=summaries_by_id,
+                performance=performance,
+                feature_set_index=feature_set_index,
+                allow_measurement_revision=allow_measurement_revision,
+                min_nonmissing_fraction=min_nonmissing_fraction,
+                max_dominant_fraction=max_dominant_fraction,
+            )
+            prompt_chars = _prompt_chars(singleton_messages)
+        else:
+            current = proposed
+        if prompt_chars > hard_limit:
+            raise ValueError(
+                "Stage 2 cannot review one complete feature within max_prompt_chars "
+                f"({prompt_chars} > {hard_limit}); shorten that feature's metadata or "
+                "increase the prompt budget"
+            )
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _validate_review(
@@ -2224,6 +2374,147 @@ def _validate_review(
         "feature_decisions": [clean[feature_id] for feature_id in by_id],
         "overall_assessment": str(value.get("overall_assessment") or ""),
     }
+
+
+def _request_partitioned_review(
+    *,
+    clinical_question: str,
+    definitions: Sequence[Mapping[str, Any]],
+    summaries: Sequence[Mapping[str, Any]],
+    performance: Mapping[str, Any],
+    allow_measurement_revision: bool,
+    min_nonmissing_fraction: float,
+    max_dominant_fraction: float,
+    max_prompt_chars: int,
+    output_dir: Path,
+    request_json: RequestJSON,
+) -> dict[str, Any]:
+    """Review every feature in resumable prompt-sized groups."""
+
+    batches = _partition_review_features(
+        clinical_question=clinical_question,
+        definitions=definitions,
+        summaries=summaries,
+        performance=performance,
+        allow_measurement_revision=allow_measurement_revision,
+        min_nonmissing_fraction=min_nonmissing_fraction,
+        max_dominant_fraction=max_dominant_fraction,
+        max_prompt_chars=max_prompt_chars,
+    )
+    summaries_by_id = {str(row["feature_id"]): row for row in summaries}
+    feature_set_index = _review_feature_set_index(definitions)
+    prompt_sizes: list[int] = []
+    decisions: list[dict[str, Any]] = []
+    assessments: list[str] = []
+    for batch_index, batch_definitions in enumerate(batches, start=1):
+        messages = _review_prompt_for_features(
+            clinical_question=clinical_question,
+            definitions=batch_definitions,
+            summaries_by_id=summaries_by_id,
+            performance=performance,
+            feature_set_index=feature_set_index,
+            allow_measurement_revision=allow_measurement_revision,
+            min_nonmissing_fraction=min_nonmissing_fraction,
+            max_dominant_fraction=max_dominant_fraction,
+        )
+        prompt_chars = _prompt_chars(messages)
+        prompt_sizes.append(prompt_chars)
+        if prompt_chars > int(max_prompt_chars):  # pragma: no cover - planner invariant
+            raise RuntimeError("Stage 2 review partition exceeded max_prompt_chars")
+        batch_dir = output_dir / f"batch_{batch_index:05d}"
+        input_value = {
+            "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+            "clinical_question": clinical_question,
+            "allow_measurement_revision": allow_measurement_revision,
+            "feature_set_index": feature_set_index,
+            "definitions": list(batch_definitions),
+            "summaries": [
+                summaries_by_id[str(feature["feature_id"])]
+                for feature in batch_definitions
+            ],
+            "performance": _review_performance_for_features(
+                performance,
+                feature_ids={
+                    str(feature["feature_id"]) for feature in batch_definitions
+                },
+            ),
+            "quality_guides": {
+                "minimum_nonmissing_fraction": min_nonmissing_fraction,
+                "maximum_dominant_value_fraction": max_dominant_fraction,
+            },
+        }
+        input_fingerprint = _value_fingerprint(input_value)
+        result_path = batch_dir / "result.json"
+        complete_path = batch_dir / "complete.json"
+        batch_review: dict[str, Any] | None = None
+        if result_path.is_file() and complete_path.is_file():
+            try:
+                completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                cached = json.loads(result_path.read_text(encoding="utf-8"))
+                if (
+                    completion.get("schema_version")
+                    == REVIEW_CHECKPOINT_SCHEMA_VERSION
+                    and completion.get("input_fingerprint") == input_fingerprint
+                ):
+                    batch_review = _validate_review(
+                        cached,
+                        definitions=batch_definitions,
+                        allow_measurement_revision=allow_measurement_revision,
+                    )
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                batch_review = None
+        if batch_review is None:
+            batch_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                batch_dir / "input.json",
+                {**input_value, "input_fingerprint": input_fingerprint},
+            )
+            batch_review = request_json(
+                messages,
+                lambda value, batch_definitions=batch_definitions: _validate_review(
+                    value,
+                    definitions=batch_definitions,
+                    allow_measurement_revision=allow_measurement_revision,
+                ),
+            )
+            _write_json(result_path, batch_review)
+            _write_json(
+                complete_path,
+                {
+                    "status": "complete",
+                    "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+                    "input_fingerprint": input_fingerprint,
+                    "completed_at": _now(),
+                    "batch_index": batch_index,
+                    "batches": len(batches),
+                    "features": len(batch_definitions),
+                    "prompt_chars": prompt_chars,
+                },
+            )
+        decisions.extend(batch_review["feature_decisions"])
+        assessment = str(batch_review.get("overall_assessment") or "").strip()
+        if assessment:
+            assessments.append(f"Review group {batch_index}/{len(batches)}: {assessment}")
+    LOGGER.info(
+        "Stage 2 feature review groups=%s features=%s prompt_chars=%s",
+        len(batches),
+        len(definitions),
+        prompt_sizes,
+    )
+    return _validate_review(
+        {
+            "feature_decisions": decisions,
+            "overall_assessment": "\n".join(assessments),
+        },
+        definitions=definitions,
+        allow_measurement_revision=allow_measurement_revision,
+    )
 
 
 def _apply_review(
@@ -2512,21 +2803,17 @@ def run_fold_analysis(
         if complete_path.is_file() and review_path.is_file():
             review = json.loads(review_path.read_text(encoding="utf-8"))
         elif current:
-            review = request_json(
-                _review_prompt(
-                    clinical_question=clinical_question,
-                    definitions=current,
-                    summaries=summaries,
-                    performance=performance,
-                    allow_measurement_revision=allow_revision,
-                    min_nonmissing_fraction=config.min_nonmissing_fraction,
-                    max_dominant_fraction=config.max_dominant_fraction,
-                ),
-                lambda value: _validate_review(
-                    value,
-                    definitions=current,
-                    allow_measurement_revision=allow_revision,
-                ),
+            review = _request_partitioned_review(
+                clinical_question=clinical_question,
+                definitions=current,
+                summaries=summaries,
+                performance=performance,
+                allow_measurement_revision=allow_revision,
+                min_nonmissing_fraction=config.min_nonmissing_fraction,
+                max_dominant_fraction=config.max_dominant_fraction,
+                max_prompt_chars=config.max_prompt_chars,
+                output_dir=round_dir / "review_batches",
+                request_json=request_json,
             )
             _write_json(review_path, review)
             _write_json(

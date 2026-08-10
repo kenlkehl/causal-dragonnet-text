@@ -2288,6 +2288,112 @@ def test_review_rejects_revision_with_malformed_closed_ontology():
         )
 
 
+def test_stage2_review_partitions_complete_feature_diagnostics_and_resumes(
+    tmp_path: Path,
+):
+    definitions = [
+        {
+            "feature_id": f"feature_{index:03d}",
+            "name": f"generic_feature_{index:03d}",
+            "description": f"Pretreatment concept {index}. " + "d" * 300,
+            "value_type": "continuous",
+            "categories_or_unit": ["units"],
+            "roles": ["confounder"],
+            "measurement_definition": "Extract the documented value. " + "m" * 1_400,
+            "missing_value_rule": "Return null when undocumented. " + "n" * 700,
+            "supporting_packet_ids": [f"packet_{index:03d}"],
+            "supporting_architectures": ["generic"],
+            "stability_summary": "Repeatedly supported.",
+            "caveats": "No additional caveat.",
+        }
+        for index in range(6)
+    ]
+    summaries = [
+        {
+            "feature_id": feature["feature_id"],
+            "name": feature["name"],
+            "rows": 100,
+            "nonmissing": 90,
+            "nonmissing_fraction": 0.9,
+            "unique_nonmissing": 20,
+            "dominant_value_fraction": 0.1,
+            "most_common_values": {"1": 10},
+        }
+        for feature in definitions
+    ]
+    performance = {
+        "evaluation_rows": 100,
+        "inner_folds": 3,
+        "baseline": {"outcome_log_loss": 0.7},
+        "with_extracted_features": {"outcome_log_loss": 0.6},
+        "improvement_positive_is_better": {"outcome_log_loss": 0.1},
+        "leave_one_feature_out": [
+            {
+                "feature_id": feature["feature_id"],
+                "name": feature["name"],
+                "metrics_without_feature": {"outcome_log_loss": 0.61},
+                "feature_contribution_positive_is_better": {
+                    "outcome_log_loss": 0.01
+                },
+            }
+            for feature in definitions
+        ],
+    }
+    calls: list[list[str]] = []
+
+    def request_json(messages, validate):
+        assert stage2_analysis._prompt_chars(messages) <= 12_000
+        body = json.loads(messages[1]["content"])
+        detailed_ids = list(body["review_scope"]["detailed_feature_ids"])
+        calls.append(detailed_ids)
+        assert len(body["feature_set_index"]) == len(definitions)
+        assert {
+            row["feature_id"]
+            for row in body["inner_validation_performance"][
+                "leave_one_feature_out"
+            ]
+        } == set(detailed_ids)
+        return validate(
+            {
+                "feature_decisions": [
+                    {
+                        "feature_id": feature_id,
+                        "action": "keep",
+                        "reason": "Usable training-fold measurement.",
+                    }
+                    for feature_id in detailed_ids
+                ],
+                "overall_assessment": "Keep this review group.",
+            }
+        )
+
+    kwargs = {
+        "clinical_question": "Estimate a treatment effect.",
+        "definitions": definitions,
+        "summaries": summaries,
+        "performance": performance,
+        "allow_measurement_revision": True,
+        "min_nonmissing_fraction": 0.05,
+        "max_dominant_fraction": 0.98,
+        "max_prompt_chars": 12_000,
+        "output_dir": tmp_path / "review_batches",
+        "request_json": request_json,
+    }
+    first = stage2_analysis._request_partitioned_review(**kwargs)
+    first_call_count = len(calls)
+    second = stage2_analysis._request_partitioned_review(**kwargs)
+
+    assert first_call_count > 1
+    assert len(calls) == first_call_count
+    assert first == second
+    assert [row["feature_id"] for row in first["feature_decisions"]] == [
+        feature["feature_id"] for feature in definitions
+    ]
+    assert sorted(feature_id for batch in calls for feature_id in batch) == sorted(
+        feature["feature_id"] for feature in definitions
+    )
+
+
 def test_stage2_progressive_consolidation_uses_oversampled_beam_across_28_batches():
     batches = [
         [
