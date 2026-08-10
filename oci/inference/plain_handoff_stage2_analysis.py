@@ -26,9 +26,12 @@ import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
 
-EXTRACTION_CHECKPOINT_SCHEMA_VERSION = "stage2_single_patient_extraction_v1"
+EXTRACTION_CHECKPOINT_SCHEMA_VERSION = "stage2_single_patient_extraction_v2_minimal_prompt"
+PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_single_patient_page_extraction_v1_minimal_prompt"
+)
 PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_lossless_feature_partition_reconciliation_v1"
+    "stage2_lossless_feature_partition_reconciliation_v2_minimal_prompt"
 )
 REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v1"
 
@@ -201,9 +204,21 @@ def _declared_categories(definition: Mapping[str, Any]) -> list[str]:
 def _prompt_feature_definitions(
     definitions: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Project frozen definitions to fields needed for patient measurement."""
+
     output: list[dict[str, Any]] = []
     for definition in definitions:
-        row = dict(definition)
+        row = {
+            key: definition.get(key)
+            for key in (
+                "name",
+                "description",
+                "value_type",
+                "categories_or_unit",
+                "measurement_definition",
+                "missing_value_rule",
+            )
+        }
         if str(row.get("value_type")) in {"binary", "categorical", "ordinal"}:
             row["categories_or_unit"] = _declared_categories(row)
         output.append(row)
@@ -707,7 +722,6 @@ def _request_validated_extraction(
 
 def _extraction_prompt(
     *,
-    clinical_question: str,
     definitions: Sequence[Mapping[str, Any]],
     rows: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
@@ -717,11 +731,9 @@ def _extraction_prompt(
         )
     body = {
         "job": "extract_stage2_patient_variables",
-        "clinical_question": clinical_question,
         "rules": [
-            "Use only the supplied pretreatment text for the patient in that row.",
+            "Use only the supplied clinical text for the patient in that row.",
             "Apply the measurement definition and missing-value rule literally.",
-            "Do not infer a value from treatment received or from the outcome.",
             "For a binary, categorical, or ordinal feature, return one declared category exactly.",
             "Do not substitute 0/1 or true/false for a declared category unless that "
             "exact value is declared.",
@@ -743,7 +755,7 @@ def _extraction_prompt(
     return [
         {
             "role": "system",
-            "content": "You extract prespecified variables from pretreatment clinical text. Return JSON only.",
+            "content": "You extract prespecified variables from supplied clinical text. Return JSON only.",
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
     ]
@@ -757,14 +769,12 @@ def _prompt_chars(messages: Sequence[Mapping[str, str]]) -> int:
 
 def _page_reconciliation_prompt(
     *,
-    clinical_question: str,
     definitions: Sequence[Mapping[str, Any]],
     row_id: int,
     page_results: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
     body = {
         "job": "reconcile_stage2_patient_variable_pages",
-        "clinical_question": clinical_question,
         "rules": [
             "Every supplied page was extracted from a lossless contiguous span of one note.",
             "Review every page result and apply each feature's measurement and missing-value rules.",
@@ -821,7 +831,6 @@ def _page_results_for_definitions(
 
 def _partition_page_reconciliation_definitions(
     *,
-    clinical_question: str,
     definitions: Sequence[Mapping[str, Any]],
     row_id: int,
     page_results: Sequence[Mapping[str, Any]],
@@ -835,7 +844,6 @@ def _partition_page_reconciliation_definitions(
         proposed = [*current, definition]
         proposed_results = _page_results_for_definitions(page_results, proposed)
         messages = _page_reconciliation_prompt(
-            clinical_question=clinical_question,
             definitions=proposed,
             row_id=row_id,
             page_results=proposed_results,
@@ -958,7 +966,6 @@ def _partition_rows_for_prompt(
     rows: Sequence[Mapping[str, Any]],
     *,
     max_prompt_chars: int,
-    clinical_question: str,
     definitions: Sequence[Mapping[str, Any]],
 ) -> tuple[list[list[Mapping[str, Any]]], list[Mapping[str, Any]]]:
     """Create only singleton extraction requests, measured at exact prompt size.
@@ -973,7 +980,6 @@ def _partition_rows_for_prompt(
     oversized: list[Mapping[str, Any]] = []
     for row in rows:
         singleton = _extraction_prompt(
-            clinical_question=clinical_question,
             definitions=definitions,
             rows=[row],
         )
@@ -987,7 +993,6 @@ def _partition_rows_for_prompt(
 def _lossless_extraction_pages(
     row: Mapping[str, Any],
     *,
-    clinical_question: str,
     definitions: Sequence[Mapping[str, Any]],
     max_prompt_chars: int,
 ) -> list[dict[str, Any]]:
@@ -1019,7 +1024,6 @@ def _lossless_extraction_pages(
                 },
             }
             prompt = _extraction_prompt(
-                clinical_question=clinical_question,
                 definitions=definitions,
                 rows=[candidate],
             )
@@ -1047,7 +1051,6 @@ def extract_rows(
     row_ids: Sequence[int],
     text_column: str,
     definitions: Sequence[Mapping[str, Any]],
-    clinical_question: str,
     output_dir: Path,
     request_json: RequestJSON,
     workers: int,
@@ -1074,10 +1077,10 @@ def extract_rows(
         }
         for row_id in row_ids
     ]
+    extraction_definitions = _prompt_feature_definitions(definitions)
     batches, oversized_rows = _partition_rows_for_prompt(
         request_rows,
         max_prompt_chars=int(max_prompt_chars),
-        clinical_question=clinical_question,
         definitions=definitions,
     )
 
@@ -1086,7 +1089,6 @@ def extract_rows(
         page_requests.extend(
             _lossless_extraction_pages(
                 row,
-                clinical_question=clinical_question,
                 definitions=definitions,
                 max_prompt_chars=int(max_prompt_chars),
             )
@@ -1155,8 +1157,7 @@ def extract_rows(
         input_fingerprint = _value_fingerprint(
             {
                 "schema_version": EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
-                "clinical_question": clinical_question,
-                "definitions": list(definitions),
+                "definitions": extraction_definitions,
                 "rows": list(batch),
             }
         )
@@ -1248,7 +1249,6 @@ def extract_rows(
         batch_dir.mkdir(parents=True, exist_ok=True)
         _write_json(batch_dir / "row_ids.json", row_ids)
         messages = _extraction_prompt(
-            clinical_question=clinical_question,
             definitions=definitions,
             rows=batch,
         )
@@ -1286,16 +1286,37 @@ def extract_rows(
         result_path = page_dir / "result.json"
         complete_path = page_dir / "complete.json"
         ontology_audit_path = page_dir / "category_ontology_repair.json"
+        input_fingerprint = _value_fingerprint(
+            {
+                "schema_version": PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                "definitions": extraction_definitions,
+                "row": dict(page),
+            }
+        )
         stale_audit = _stale_category_ontology_audit(ontology_audit_path)
         if complete_path.is_file() and result_path.is_file() and stale_audit is None:
-            stored = json.loads(result_path.read_text(encoding="utf-8"))
-            return page_meta, dict(stored["rows"][0])
+            try:
+                completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                stored = json.loads(result_path.read_text(encoding="utf-8"))
+                if (
+                    completion.get("schema_version")
+                    == PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION
+                    and completion.get("input_fingerprint") == input_fingerprint
+                ):
+                    validated = _validate_extraction(
+                        stored,
+                        row_ids=[row_id],
+                        definitions=definitions,
+                    )
+                    return page_meta, dict(validated["rows"][0])
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+            LOGGER.info("rerun incompatible Stage 2 extraction page: %s", page_dir)
         if stale_audit is not None:
             LOGGER.info("retry stale Stage 2 category ontology page: %s", page_dir)
         page_dir.mkdir(parents=True, exist_ok=True)
         _write_json(page_dir / "page.json", page_meta)
         messages = _extraction_prompt(
-            clinical_question=clinical_question,
             definitions=definitions,
             rows=[page],
         )
@@ -1315,7 +1336,13 @@ def extract_rows(
         )
         _write_json(
             complete_path,
-            {"status": "complete", "completed_at": _now(), **page_meta},
+            {
+                "status": "complete",
+                "schema_version": PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                "input_fingerprint": input_fingerprint,
+                "completed_at": _now(),
+                **page_meta,
+            },
         )
         return page_meta, dict(result["rows"][0])
 
@@ -1354,19 +1381,45 @@ def extract_rows(
         complete_path = reconciliation_dir / "complete.json"
         ontology_audit_path = reconciliation_dir / "category_ontology_repair.json"
         stale_audit = _stale_category_ontology_audit(ontology_audit_path)
+        ordered = sorted(page_values, key=lambda item: int(item[0]["page_index"]))
+        page_results = [
+            {**dict(meta), "values": dict(result["values"])} for meta, result in ordered
+        ]
+        reconciliation_fingerprint = _value_fingerprint(
+            {
+                "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
+                "row_id": int(row_id),
+                "definitions": extraction_definitions,
+                "page_results": page_results,
+            }
+        )
         if complete_path.is_file() and result_path.is_file() and stale_audit is None:
-            return dict(json.loads(result_path.read_text(encoding="utf-8"))["rows"][0]["values"])
+            try:
+                completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                stored = json.loads(result_path.read_text(encoding="utf-8"))
+                if (
+                    completion.get("schema_version")
+                    == PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION
+                    and completion.get("input_fingerprint") == reconciliation_fingerprint
+                ):
+                    validated = _validate_extraction(
+                        stored,
+                        row_ids=[row_id],
+                        definitions=definitions,
+                    )
+                    return dict(validated["rows"][0]["values"])
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+            LOGGER.info(
+                "rerun incompatible Stage 2 page reconciliation: %s",
+                reconciliation_dir,
+            )
         if stale_audit is not None:
             LOGGER.info(
                 "retry stale Stage 2 category ontology reconciliation: %s",
                 reconciliation_dir,
             )
-        ordered = sorted(page_values, key=lambda item: int(item[0]["page_index"]))
-        page_results = [
-            {**dict(meta), "values": dict(result["values"])} for meta, result in ordered
-        ]
         definition_batches = _partition_page_reconciliation_definitions(
-            clinical_question=clinical_question,
             definitions=definitions,
             row_id=row_id,
             page_results=page_results,
@@ -1389,7 +1442,6 @@ def extract_rows(
                 batch_definitions,
             )
             messages = _page_reconciliation_prompt(
-                clinical_question=clinical_question,
                 definitions=batch_definitions,
                 row_id=row_id,
                 page_results=batch_page_results,
@@ -1413,9 +1465,8 @@ def extract_rows(
             )
             batch_input = {
                 "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
-                "clinical_question": clinical_question,
                 "row_id": int(row_id),
-                "definitions": list(batch_definitions),
+                "definitions": _prompt_feature_definitions(batch_definitions),
                 "page_results": batch_page_results,
             }
             batch_fingerprint = _value_fingerprint(batch_input)
@@ -1497,6 +1548,7 @@ def extract_rows(
             {
                 "status": "complete",
                 "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
+                "input_fingerprint": reconciliation_fingerprint,
                 "completed_at": _now(),
                 "pages": len(page_results),
                 "feature_batches": len(definition_batches),
@@ -2776,7 +2828,6 @@ def run_fold_analysis(
             row_ids=fit_ids,
             text_column=text_column,
             definitions=current,
-            clinical_question=clinical_question,
             output_dir=round_dir / "extraction",
             request_json=request_json,
             workers=config.workers,
@@ -2852,7 +2903,6 @@ def run_fold_analysis(
             row_ids=fit_ids,
             text_column=text_column,
             definitions=current,
-            clinical_question=clinical_question,
             output_dir=output_dir / "extraction" / "fit",
             request_json=request_json,
             workers=config.workers,
@@ -2870,7 +2920,6 @@ def run_fold_analysis(
         row_ids=heldout_ids,
         text_column=text_column,
         definitions=current,
-        clinical_question=clinical_question,
         output_dir=output_dir / "extraction" / "heldout",
         request_json=request_json,
         workers=config.workers,

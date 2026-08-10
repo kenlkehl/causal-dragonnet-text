@@ -230,9 +230,18 @@ def test_json_repair_losslessly_compacts_json_to_include_the_validation_error():
 
 def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_aliases():
     definition = {
+        "feature_id": "outer_001_feature_001",
         "name": "prior_immunotherapy_history",
+        "description": "Whether prior immunotherapy was documented.",
         "value_type": "binary",
         "categories_or_unit": ["not documented", "documented"],
+        "roles": ["confounder"],
+        "measurement_definition": "Extract documented immunotherapy history.",
+        "missing_value_rule": "Return null when the history is unavailable.",
+        "supporting_packet_ids": ["packet_001"],
+        "supporting_architectures": ["test_architecture"],
+        "stability_summary": "Supported by several discovery contexts.",
+        "caveats": "Documentation may be incomplete.",
     }
     with pytest.raises(ValueError) as error:
         stage2_analysis._validate_extraction(
@@ -254,14 +263,12 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
 
     extraction = json.loads(
         stage2_analysis._extraction_prompt(
-            clinical_question="Estimate treatment effect.",
             definitions=[definition],
             rows=[{"row_id": 7, "text": "Prior immunotherapy was documented."}],
         )[1]["content"]
     )
     reconciliation = json.loads(
         stage2_analysis._page_reconciliation_prompt(
-            clinical_question="Estimate treatment effect.",
             definitions=[definition],
             row_id=7,
             page_results=[],
@@ -275,8 +282,34 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
         "not documented",
         "documented",
     ]
+    expected_extraction_fields = {
+        "name",
+        "description",
+        "value_type",
+        "categories_or_unit",
+        "measurement_definition",
+        "missing_value_rule",
+    }
+    assert set(extraction["features"][0]) == expected_extraction_fields
+    assert set(reconciliation["features"][0]) == expected_extraction_fields
+    assert "clinical_question" not in extraction
+    assert "clinical_question" not in reconciliation
     assert any("Do not substitute 0/1" in rule for rule in extraction["rules"])
     assert any("Do not substitute 0/1" in rule for rule in reconciliation["rules"])
+    extraction_messages = stage2_analysis._extraction_prompt(
+        definitions=[definition],
+        rows=[{"row_id": 7, "text": "Prior immunotherapy was documented."}],
+    )
+    extraction_instructions = " ".join(
+        [
+            extraction_messages[0]["content"],
+            *extraction["rules"],
+        ]
+    ).lower()
+    assert "pretreatment" not in extraction_instructions
+    assert "pre-treatment" not in extraction_instructions
+    assert "treatment received" not in extraction_instructions
+    assert any("supplied clinical text" in rule for rule in extraction["rules"])
     for prompt in (extraction, reconciliation):
         assert any("never return an object or array" in rule for rule in prompt["rules"])
         composite_rule = next(
@@ -295,7 +328,6 @@ def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Pat
     }
     with pytest.raises(ValueError, match="exactly one patient's record"):
         stage2_analysis._extraction_prompt(
-            clinical_question="Estimate treatment effect.",
             definitions=[definition],
             rows=[
                 {"row_id": 0, "text": "ECOG 0."},
@@ -329,7 +361,6 @@ def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Pat
         row_ids=[0, 1, 2],
         text_column="clinical_text",
         definitions=[definition],
-        clinical_question="Estimate treatment effect.",
         output_dir=tmp_path / "extraction",
         request_json=request_json,
         workers=3,
@@ -348,7 +379,6 @@ def test_ordinal_integer_range_is_expanded_in_prompt_and_validation():
     }
     prompt = json.loads(
         stage2_analysis._extraction_prompt(
-            clinical_question="Estimate treatment effect.",
             definitions=[definition],
             rows=[{"row_id": 3, "text": "Pretreatment ECOG performance status was 2."}],
         )[1]["content"]
@@ -466,7 +496,6 @@ def test_resume_adopts_valid_legacy_single_patient_extraction_checkpoint(
         row_ids=[0],
         text_column="clinical_text",
         definitions=[definition],
-        clinical_question="Estimate treatment effect.",
         output_dir=output,
         request_json=unexpected_request,
         workers=1,
@@ -475,7 +504,7 @@ def test_resume_adopts_valid_legacy_single_patient_extraction_checkpoint(
 
     assert frame.loc[0, "performance_status"] == "2"
     completion = json.loads((batch / "complete.json").read_text(encoding="utf-8"))
-    assert completion["schema_version"] == "stage2_single_patient_extraction_v1"
+    assert completion["schema_version"] == stage2_analysis.EXTRACTION_CHECKPOINT_SCHEMA_VERSION
     assert completion["adopted_legacy_single_patient_checkpoint"] is True
     assert "adopt legacy single-patient" in caplog.text
 
@@ -520,7 +549,6 @@ def test_resume_relocates_legacy_singleton_by_row_id_after_batch_numbers_shift(
         row_ids=[0],
         text_column="clinical_text",
         definitions=[definition],
-        clinical_question="Estimate treatment effect.",
         output_dir=output,
         request_json=unexpected_request,
         workers=1,
@@ -601,7 +629,6 @@ def test_resume_retries_only_checkpoints_with_stale_range_ontology_repairs(tmp_p
         row_ids=[0],
         text_column="clinical_text",
         definitions=[definition],
-        clinical_question="Estimate treatment effect.",
         output_dir=output,
         request_json=request_json,
         workers=1,
@@ -671,7 +698,6 @@ def test_extraction_uses_note_free_category_ontology_after_five_failed_repairs(
         row_ids=[0],
         text_column="clinical_text",
         definitions=[definition],
-        clinical_question="Estimate treatment effect.",
         output_dir=tmp_path / "extraction",
         request_json=lambda messages, validate: stage2_workflow._request_json(
             messages=messages,
@@ -734,7 +760,6 @@ def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
         row_ids=[0],
         text_column="clinical_text",
         definitions=[definition],
-        clinical_question="Estimate treatment effect.",
         output_dir=output,
         request_json=request_json,
         workers=1,
@@ -775,7 +800,6 @@ def test_extraction_defaults_structurally_invalid_response_to_audited_null(
         row_ids=[0],
         text_column="clinical_text",
         definitions=[definition],
-        clinical_question="Estimate treatment effect.",
         output_dir=output,
         request_json=request_json,
         workers=1,
@@ -833,7 +857,6 @@ def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
         row_ids=[0],
         text_column="clinical_text",
         definitions=definitions,
-        clinical_question="Estimate treatment effect.",
         output_dir=output,
         request_json=request_json,
         workers=1,
@@ -1787,7 +1810,6 @@ def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Pat
         row_ids=[0],
         text_column="clinical_text",
         definitions=[definition],
-        clinical_question="Estimate treatment effect.",
         output_dir=tmp_path / "extraction",
         request_json=request_json,
         workers=3,
@@ -1818,7 +1840,7 @@ def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
                 "value_type": "categorical",
                 "categories_or_unit": [selected, f"other_state_{index}"],
                 "roles": ["confounder"],
-                "measurement_definition": "m" * 300,
+                "measurement_definition": "m" * 350,
                 "missing_value_rule": "z" * 100,
             }
         )
@@ -1857,7 +1879,6 @@ def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
         row_ids=[0],
         text_column="clinical_text",
         definitions=definitions,
-        clinical_question="Estimate treatment effect.",
         output_dir=output,
         request_json=request_json,
         workers=4,
