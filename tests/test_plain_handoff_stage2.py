@@ -876,6 +876,36 @@ def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
     assert "dict" in audit["issues"][0]["reason"]
 
 
+def test_interpretation_prompt_requests_latent_features_that_could_generate_noisy_evidence():
+    packet = {
+        "packet_id": "packet-a",
+        "architecture": "htr_neural",
+        "observable_axes": ["outcome", "residual_effect"],
+        "content": {
+            "representative_evidence": [
+                {"text": "Needs help with activities of daily living; spends most of day in bed."}
+            ]
+        },
+    }
+
+    messages = stage2_workflow._interpretation_prompt(
+        clinical_question="Which pretreatment features modify treatment effect?",
+        architecture="htr_neural",
+        packets=[packet],
+    )
+    body = json.loads(messages[1]["content"])
+    rules = " ".join(body["rules"])
+
+    assert "candidate latent clinical features" in messages[0]["content"]
+    assert "candidate latent pretreatment features" in body["interpretive_goal"]
+    assert "noisy, incomplete observations" in rules
+    assert "synthesize recurring or jointly coherent clues" in rules
+    assert "Do not merely copy prominent words" in rules
+    assert "may be implicit rather than literally named" in rules
+    assert "multiple materially different clinical explanations" in rules
+    assert "evidence_rationale" in body["response"]["concepts"][0]
+
+
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
     packet_ids = {"packet-a", "packet-b"}
     result = stage2_workflow._validate_interpretation(
@@ -886,6 +916,7 @@ def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
                     "value_type": "numeric",
                     "packet_ids": ["packet-a", "hallucinated-packet"],
                     "axes": ["effect-modifier", "unsupported-axis"],
+                    "rationale": "Functional limitation could produce the cited pattern.",
                 }
             ],
             "packet_dispositions": {
@@ -903,12 +934,30 @@ def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
             "value_type": "continuous",
             "supporting_packet_ids": ["packet-a"],
             "evidence_axes": ["residual_effect"],
+            "evidence_rationale": "Functional limitation could produce the cited pattern.",
             "caveats": "",
         }
     ]
     assert set(result["packet_dispositions"]) == packet_ids
     assert result["packet_dispositions"]["packet-a"]["status"] == "supports_concept"
     assert result["packet_dispositions"]["packet-b"]["status"] == "reviewed_no_specific_concept"
+
+
+def test_interpretation_requires_a_latent_feature_evidence_rationale():
+    with pytest.raises(ValueError, match="has no evidence_rationale"):
+        stage2_workflow._validate_interpretation(
+            {
+                "concepts": [
+                    {
+                        "name": "performance_status",
+                        "supporting_packet_ids": ["packet-a"],
+                        "evidence_axes": ["outcome"],
+                    }
+                ],
+                "packet_dispositions": {},
+            },
+            packet_ids={"packet-a"},
+        )
 
 
 def test_interpretation_drops_only_concepts_without_grounded_packet_citations(caplog):
@@ -919,6 +968,7 @@ def test_interpretation_drops_only_concepts_without_grounded_packet_citations(ca
                     "name": "performance_status",
                     "supporting_packet_ids": ["packet-a"],
                     "evidence_axes": ["outcome"],
+                    "evidence_rationale": "Functional limitation could explain the evidence.",
                 },
                 {
                     "name": "invented_feature",
@@ -944,6 +994,7 @@ def test_interpretation_recovers_citation_from_packet_disposition():
                     "name": "performance_status",
                     "supporting_packet_ids": ["hallucinated-packet"],
                     "evidence_axes": ["outcome"],
+                    "evidence_rationale": "Functional limitation could explain the evidence.",
                 }
             ],
             "packet_dispositions": {
@@ -982,6 +1033,10 @@ def test_interpretation_does_not_pair_new_input_with_an_old_complete_result(
                         "value_type": "ordinal",
                         "supporting_packet_ids": [packet["packet_id"]],
                         "evidence_axes": ["outcome"],
+                        "evidence_rationale": (
+                            "The functional-status language is a noisy manifestation of "
+                            "baseline performance status."
+                        ),
                         "caveats": "",
                     }
                 ],
@@ -1006,6 +1061,7 @@ def test_interpretation_does_not_pair_new_input_with_an_old_complete_result(
     output_dir = tmp_path / "batch_001"
     output_dir.mkdir()
     input_value = {
+        "interpretation_schema": stage2_workflow.INTERPRETATION_SCHEMA_VERSION,
         "architecture": packet["architecture"],
         "clinical_question": "Identify confounders.",
         "packets": [packet],
@@ -1539,6 +1595,10 @@ def _fake_completion(calls):
                             "value_type": "ordinal",
                             "supporting_packet_ids": packet_ids,
                             "evidence_axes": ["treatment", "outcome"],
+                            "evidence_rationale": (
+                                "Repeated functional-status language could be generated by "
+                                "latent baseline performance status."
+                            ),
                             "caveats": "The exact scale must be extracted.",
                         }
                     ],

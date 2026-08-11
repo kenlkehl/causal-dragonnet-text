@@ -47,6 +47,7 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v4_closed_ontology"
+INTERPRETATION_SCHEMA_VERSION = "latent_feature_hypotheses_v1"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
     "assessment",
@@ -1285,14 +1286,21 @@ def _interpretation_prompt(
     contract = {
         "concepts": [
             {
-                "name": "snake_case_patient_feature",
-                "description": "one patient-level pretreatment measurement",
+                "name": "snake_case_candidate_latent_feature",
+                "description": (
+                    "one clinically interpretable patient-level pretreatment feature that "
+                    "could generate the observed evidence pattern"
+                ),
                 "value_type": "binary|categorical|continuous|ordinal|ambiguous",
                 "supporting_packet_ids": ["one or more supplied packet IDs"],
                 "evidence_axes": [
                     "treatment|outcome|residual_effect|matched_pair|semantic|unclear"
                 ],
-                "caveats": "limitations or ambiguity",
+                "evidence_rationale": (
+                    "how the cited noisy evidence could arise from this feature and whether "
+                    "the feature is explicit or inferred"
+                ),
+                "caveats": "limitations, ambiguity, or competing latent explanations",
             }
         ],
         "packet_dispositions": {
@@ -1307,13 +1315,24 @@ def _interpretation_prompt(
         "job": "interpret_one_stage1_architecture",
         "clinical_question": clinical_question,
         "architecture": architecture,
+        "interpretive_goal": (
+            "Generate candidate latent pretreatment features that could plausibly yield the "
+            "types of noisy evidence returned by this Stage 1 architecture for the supplied "
+            "clinical modeling task."
+        ),
         "rules": [
-            "Interpret every packet independently of other architectures.",
-            "Name only concrete pretreatment patient characteristics supported by readable evidence.",
-            "Prefer an explicit named clinical scale or measurement in the evidence over a broader paraphrase.",
-            "Numerical values may indicate an evidence axis but cannot by themselves name a feature.",
+            "Treat the packets as noisy, incomplete observations of underlying clinical features, not as a ready-made feature list.",
+            "Interpret this architecture independently of other architectures, but synthesize recurring or jointly coherent clues across its supplied packets.",
+            "Use the clinical question and each packet's readable evidence, evidence kind, observable axes, polarity, support, and score summaries to ask which latent pretreatment features could have made that evidence useful to the modeling task.",
+            "Do not merely copy prominent words, n-grams, or packet summaries; translate each supported pattern into a clinically meaningful candidate feature.",
+            "A candidate may be implicit rather than literally named in the evidence, but it must be a clinically coherent patient-level pretreatment characteristic that could be reproducibly measured from a complete record.",
+            "When the evidence clearly identifies a named scale or measurement, prefer it; otherwise propose the narrowest defensible latent feature rather than a broad syndrome or vague clinical state.",
+            "If the same pattern has multiple materially different clinical explanations, return separate candidates and describe the ambiguity rather than choosing one without support.",
+            "Readable clinical evidence must make every candidate plausible; numerical values, axes, support counts, and model scores may strengthen or contextualize a hypothesis but cannot name a feature by themselves.",
             "Do not assign a causal role yet; report only the evidence axes that are visibly supported.",
-            "Preserve distinct measurements and uncertainty.",
+            "Do not turn treatment, outcome, posttreatment events, or documentation artifacts into a pretreatment patient feature.",
+            "Preserve distinct candidate measurements, competing explanations, and uncertainty.",
+            "For every candidate, explain how its cited packets could be noisy manifestations of that feature.",
             "Every packet must receive one disposition.",
         ],
         "packets": list(packets),
@@ -1322,7 +1341,10 @@ def _interpretation_prompt(
     return [
         {
             "role": "system",
-            "content": "You interpret empirical Stage 1 evidence for a causal study. Return JSON only.",
+            "content": (
+                "You infer candidate latent clinical features that could generate noisy "
+                "empirical Stage 1 evidence for a causal study. Return JSON only."
+            ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
     ]
@@ -1409,6 +1431,17 @@ def _validate_interpretation(
         }.get(value_type, value_type)
         if value_type not in ALLOWED_VALUE_TYPES:
             value_type = "ambiguous"
+        evidence_rationale = str(
+            concept.get("evidence_rationale")
+            or concept.get("pattern_rationale")
+            or concept.get("rationale")
+            or ""
+        ).strip()
+        if not evidence_rationale:
+            raise ValueError(
+                f"interpreted candidate {name!r} has no evidence_rationale explaining "
+                "how the cited Stage 1 evidence could arise from it"
+            )
         clean_concepts.append(
             {
                 "name": name,
@@ -1416,6 +1449,7 @@ def _validate_interpretation(
                 "value_type": value_type,
                 "supporting_packet_ids": supports,
                 "evidence_axes": axes,
+                "evidence_rationale": evidence_rationale,
                 "caveats": str(concept.get("caveats") or ""),
             }
         )
@@ -1463,6 +1497,8 @@ def _cached_interpretation_matches_packets(
         if not isinstance(supports, list) or not supports:
             return False
         if not {str(packet_id) for packet_id in supports} <= packet_ids:
+            return False
+        if not str(concept.get("evidence_rationale") or "").strip():
             return False
     return True
 
@@ -1930,6 +1966,7 @@ def _candidate_grouping_view(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_id": str(candidate["candidate_id"]),
         "name": str(candidate.get("name") or "").strip(),
         "description": _short_text(candidate.get("description"), max_chars=1_000),
+        "evidence_rationale": _short_text(candidate.get("evidence_rationale"), max_chars=1_000),
         "value_type": str(candidate.get("value_type") or "ambiguous"),
         "evidence_axes": _canonical_evidence_axes(candidate.get("evidence_axes")),
         "supporting_architectures": _candidate_architectures(candidate),
@@ -2207,6 +2244,7 @@ def _materialize_candidate_group(
             {
                 "name": str(member.get("name") or "").strip(),
                 "description": _short_text(member.get("description"), max_chars=500),
+                "evidence_rationale": _short_text(member.get("evidence_rationale"), max_chars=700),
                 "value_type": str(member.get("value_type") or "ambiguous"),
             }
             for member in members[:12]
@@ -2968,6 +3006,7 @@ class PlainHandoffStage2:
         output_dir: Path,
     ) -> Mapping[str, Any]:
         input_value = {
+            "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
             "architecture": architecture,
             "clinical_question": self.clinical_question,
             "packets": list(packets),
@@ -2984,6 +3023,7 @@ class PlainHandoffStage2:
             if previous_fingerprint is None:
                 previous_fingerprint = _value_fingerprint(
                     {
+                        "interpretation_schema": previous.get("interpretation_schema"),
                         "architecture": previous.get("architecture"),
                         "clinical_question": previous.get("clinical_question"),
                         "packets": previous.get("packets") or [],
@@ -3407,6 +3447,7 @@ class PlainHandoffStage2:
             {
                 "outer_fold": int(outer_fold),
                 "compiler": self.config.evidence_compiler,
+                "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
                 "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                 "clinical_question": self.clinical_question,
                 "max_candidates_per_fold": self.config.max_candidates_per_fold,
