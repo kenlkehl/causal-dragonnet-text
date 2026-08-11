@@ -889,7 +889,6 @@ def test_interpretation_prompt_requests_latent_features_that_could_generate_nois
     }
 
     messages = stage2_workflow._interpretation_prompt(
-        clinical_question="Which pretreatment features modify treatment effect?",
         architecture="htr_neural",
         packets=[packet],
     )
@@ -900,10 +899,33 @@ def test_interpretation_prompt_requests_latent_features_that_could_generate_nois
     assert "candidate latent pretreatment features" in body["interpretive_goal"]
     assert "noisy, incomplete observations" in rules
     assert "synthesize recurring or jointly coherent clues" in rules
-    assert "Do not merely copy prominent words" in rules
+    assert "clinical_question" not in body
+    assert "Do not merely copy prominent words" not in rules
     assert "may be implicit rather than literally named" in rules
     assert "multiple materially different clinical explanations" in rules
     assert "evidence_rationale" in body["response"]["concepts"][0]
+
+
+def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
+    packet = {
+        "packet_id": "packet-a",
+        "architecture": "bow_r_loss",
+        "observable_axes": ["residual_effect"],
+        "content": {"representative_evidence": [{"text": "pretreatment serum albumin 2.8 g/dL"}]},
+    }
+
+    messages = stage2_workflow._rejected_packet_audit_prompt(
+        architecture="bow_r_loss",
+        packets=[packet],
+    )
+    body = json.loads(messages[1]["content"])
+    rules = " ".join(body["rules"]).lower()
+
+    assert body["job"] == "audit_rejected_stage1_packets_for_missed_measurements"
+    assert "clinical_question" not in body
+    assert "top-k" in rules
+    assert "one packet is sufficient" in rules
+    assert "particular treatment comparison" in rules
 
 
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
@@ -1010,6 +1032,114 @@ def test_interpretation_recovers_citation_from_packet_disposition():
     assert result["concepts"][0]["supporting_packet_ids"] == ["packet-a"]
 
 
+def test_interpretation_second_pass_recovers_rejected_named_measurement(tmp_path: Path):
+    packet = {
+        "packet_id": "outer_001_card_albumin",
+        "architecture": "bow_r_loss",
+        "outer_fold": 1,
+        "observable_axes": ["residual_effect"],
+        "content": {
+            "evidence_kind": "lexical_term",
+            "representative_evidence": [{"text": "pretreatment serum albumin 2.8 g/dL"}],
+            "support": {"inner_folds": [1, 2, 3, 4, 5]},
+        },
+    }
+    calls = []
+    secret_question = "SECRET CLINICAL QUESTION THAT MUST NOT REACH INTERPRETATION"
+
+    def completion(messages, _config):
+        body = json.loads(messages[1]["content"])
+        calls.append(body["job"])
+        assert secret_question not in messages[1]["content"]
+        assert "clinical_question" not in body
+        if body["job"] == "interpret_one_stage1_architecture":
+            return json.dumps(
+                {
+                    "concepts": [],
+                    "packet_dispositions": {
+                        packet["packet_id"]: {
+                            "status": "reviewed_no_specific_concept",
+                            "concept_names": [],
+                            "reason": "Not selected as a primary latent feature.",
+                        }
+                    },
+                }
+            )
+        assert body["job"] == "audit_rejected_stage1_packets_for_missed_measurements"
+        return json.dumps(
+            {
+                "concepts": [
+                    {
+                        "name": "baseline_serum_albumin",
+                        "description": "Pretreatment serum albumin concentration.",
+                        "value_type": "continuous",
+                        "supporting_packet_ids": [packet["packet_id"]],
+                        "evidence_axes": ["residual_effect"],
+                        "evidence_rationale": (
+                            "The packet directly names a reproducibly measurable "
+                            "pretreatment laboratory value."
+                        ),
+                        "caveats": "Confirm units during extraction.",
+                    }
+                ],
+                "packet_dispositions": {
+                    packet["packet_id"]: {
+                        "status": "supports_concept",
+                        "concept_names": ["baseline_serum_albumin"],
+                        "reason": "Explicit named pretreatment laboratory measurement.",
+                    }
+                },
+            }
+        )
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+        clinical_question=secret_question,
+        completion=completion,
+    )
+    output_dir = tmp_path / "batch_001"
+
+    result = runner._interpret_batch(
+        architecture=packet["architecture"],
+        packets=[packet],
+        output_dir=output_dir,
+    )
+
+    assert calls == [
+        "interpret_one_stage1_architecture",
+        "audit_rejected_stage1_packets_for_missed_measurements",
+    ]
+    assert [concept["name"] for concept in result["concepts"]] == ["baseline_serum_albumin"]
+    assert result["packet_dispositions"][packet["packet_id"]]["status"] == ("supports_concept")
+    assert result["rejected_packet_audit"]["recovered_packet_ids"] == [packet["packet_id"]]
+    assert not result["rejected_packet_audit"]["remaining_rejected_packet_ids"]
+    assert (output_dir / "rejected_packet_audit" / "batch_001" / "complete.json").is_file()
+    request_paths = [
+        output_dir / "input.json",
+        output_dir / "initial" / "input.json",
+        output_dir / "rejected_packet_audit" / "batch_001" / "input.json",
+    ]
+    for request_path in request_paths:
+        saved_input = json.loads(request_path.read_text(encoding="utf-8"))
+        assert "clinical_question" not in saved_input
+        assert secret_question not in json.dumps(saved_input)
+
+    cached = runner._interpret_batch(
+        architecture=packet["architecture"],
+        packets=[packet],
+        output_dir=output_dir,
+    )
+
+    assert calls == [
+        "interpret_one_stage1_architecture",
+        "audit_rejected_stage1_packets_for_missed_measurements",
+    ]
+    assert cached == result
+
+
 def test_interpretation_does_not_pair_new_input_with_an_old_complete_result(
     tmp_path: Path,
 ):
@@ -1063,7 +1193,6 @@ def test_interpretation_does_not_pair_new_input_with_an_old_complete_result(
     input_value = {
         "interpretation_schema": stage2_workflow.INTERPRETATION_SCHEMA_VERSION,
         "architecture": packet["architecture"],
-        "clinical_question": "Identify confounders.",
         "packets": [packet],
     }
     (output_dir / "input.json").write_text(
@@ -1952,8 +2081,7 @@ def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
     assert all(len(body["features"]) == 1 for body in reconciliation_bodies)
     expected_page_indices = list(range(1, len(ordered_pages) + 1))
     assert all(
-        [page["page_index"] for page in body["page_results"]]
-        == expected_page_indices
+        [page["page_index"] for page in body["page_results"]] == expected_page_indices
         for body in reconciliation_bodies
     )
     assert all(size <= 5_000 for size in prompt_sizes)
@@ -2413,9 +2541,7 @@ def test_stage2_review_partitions_complete_feature_diagnostics_and_resumes(
                 "feature_id": feature["feature_id"],
                 "name": feature["name"],
                 "metrics_without_feature": {"outcome_log_loss": 0.61},
-                "feature_contribution_positive_is_better": {
-                    "outcome_log_loss": 0.01
-                },
+                "feature_contribution_positive_is_better": {"outcome_log_loss": 0.01},
             }
             for feature in definitions
         ],
@@ -2430,9 +2556,7 @@ def test_stage2_review_partitions_complete_feature_diagnostics_and_resumes(
         assert len(body["feature_set_index"]) == len(definitions)
         assert {
             row["feature_id"]
-            for row in body["inner_validation_performance"][
-                "leave_one_feature_out"
-            ]
+            for row in body["inner_validation_performance"]["leave_one_feature_out"]
         } == set(detailed_ids)
         return validate(
             {

@@ -47,7 +47,8 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v4_closed_ontology"
-INTERPRETATION_SCHEMA_VERSION = "latent_feature_hypotheses_v1"
+INTERPRETATION_SCHEMA_VERSION = "latent_feature_hypotheses_v2_rejected_packet_audit"
+INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v1"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
     "assessment",
@@ -1277,13 +1278,10 @@ def _checkpointed_request_json(
     return result
 
 
-def _interpretation_prompt(
-    *,
-    clinical_question: str,
-    architecture: str,
-    packets: Sequence[Mapping[str, Any]],
-) -> list[dict[str, str]]:
-    contract = {
+def _interpretation_response_contract() -> dict[str, Any]:
+    """Return the shared response contract for interpretation passes."""
+
+    return {
         "concepts": [
             {
                 "name": "snake_case_candidate_latent_feature",
@@ -1311,20 +1309,24 @@ def _interpretation_prompt(
             }
         },
     }
+
+
+def _interpretation_prompt(
+    *,
+    architecture: str,
+    packets: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
     body = {
         "job": "interpret_one_stage1_architecture",
-        "clinical_question": clinical_question,
         "architecture": architecture,
         "interpretive_goal": (
             "Generate candidate latent pretreatment features that could plausibly yield the "
-            "types of noisy evidence returned by this Stage 1 architecture for the supplied "
-            "clinical modeling task."
+            "types of noisy evidence returned by this Stage 1 architecture."
         ),
         "rules": [
             "Treat the packets as noisy, incomplete observations of underlying clinical features, not as a ready-made feature list.",
             "Interpret this architecture independently of other architectures, but synthesize recurring or jointly coherent clues across its supplied packets.",
-            "Use the clinical question and each packet's readable evidence, evidence kind, observable axes, polarity, support, and score summaries to ask which latent pretreatment features could have made that evidence useful to the modeling task.",
-            "Do not merely copy prominent words, n-grams, or packet summaries; translate each supported pattern into a clinically meaningful candidate feature.",
+            "Use each packet's readable evidence, evidence kind, observable axes, polarity, support, and score summaries to ask which latent pretreatment features could have generated the observed pattern.",
             "A candidate may be implicit rather than literally named in the evidence, but it must be a clinically coherent patient-level pretreatment characteristic that could be reproducibly measured from a complete record.",
             "When the evidence clearly identifies a named scale or measurement, prefer it; otherwise propose the narrowest defensible latent feature rather than a broad syndrome or vague clinical state.",
             "If the same pattern has multiple materially different clinical explanations, return separate candidates and describe the ambiguity rather than choosing one without support.",
@@ -1336,7 +1338,7 @@ def _interpretation_prompt(
             "Every packet must receive one disposition.",
         ],
         "packets": list(packets),
-        "response": contract,
+        "response": _interpretation_response_contract(),
     }
     return [
         {
@@ -1344,6 +1346,49 @@ def _interpretation_prompt(
             "content": (
                 "You infer candidate latent clinical features that could generate noisy "
                 "empirical Stage 1 evidence for a causal study. Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+    ]
+
+
+def _rejected_packet_audit_prompt(
+    *,
+    architecture: str,
+    packets: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Build a recall-oriented second pass over initially rejected packets."""
+
+    body = {
+        "job": "audit_rejected_stage1_packets_for_missed_measurements",
+        "architecture": architecture,
+        "audit_goal": (
+            "Independently re-review packets that an initial interpretation did not map to "
+            "a candidate. Recover every defensible patient-level pretreatment measurement "
+            "without ranking candidates or limiting the result to primary features."
+        ),
+        "rules": [
+            "Review every packet independently; this is a recall guardrail, not a top-k selection pass.",
+            "Do not require a clue to recur across packets. One packet is sufficient when it explicitly identifies a reproducibly extractable pretreatment measurement.",
+            "An explicit named biomarker, clinical scale, laboratory value, genomic alteration, symptom, comorbidity, demographic attribute, or pretreatment exposure must support a candidate when it is patient-level and reproducibly measurable.",
+            "Do not decide from whether a measurement is an expected determinant of a particular treatment comparison; use only the supplied evidence and observable axes.",
+            "Treat lexical terms as possible direct names of measurements as well as noisy clues to latent measurements.",
+            "A candidate may be implicit, but it must be a clinically coherent patient-level pretreatment characteristic that could be reproducibly measured from a complete record.",
+            "Do not assign a causal role; report only the evidence axes visibly supported by each cited packet.",
+            "Do not turn treatment, outcome, posttreatment events, patient names, administrative identifiers, or documentation artifacts into pretreatment patient features.",
+            "Use reviewed_no_specific_concept only when no defensible pretreatment measurement can be recovered, and explain the concrete reason.",
+            "Every packet must receive one disposition.",
+        ],
+        "packets": list(packets),
+        "response": _interpretation_response_contract(),
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You audit rejected Stage 1 evidence packets for missed patient-level "
+                "pretreatment measurements. Favor recall while remaining grounded. Return "
+                "JSON only."
             ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
@@ -1503,35 +1548,26 @@ def _cached_interpretation_matches_packets(
     return True
 
 
-def _partition_interpretation_packets(
+def _partition_packets_for_prompt(
     packets: Sequence[Mapping[str, Any]],
     *,
-    clinical_question: str,
-    architecture: str,
+    render_prompt: Callable[[Sequence[Mapping[str, Any]]], Sequence[Mapping[str, str]]],
     max_prompt_chars: int,
 ) -> list[list[Mapping[str, Any]]]:
-    """Pack evidence using the exact fully rendered interpretation prompt."""
+    """Pack evidence using the exact rendered prompt supplied by the caller."""
 
     batches: list[list[Mapping[str, Any]]] = []
     current: list[Mapping[str, Any]] = []
     for packet in packets:
         candidate = [*current, packet]
-        messages = _interpretation_prompt(
-            clinical_question=clinical_question,
-            architecture=architecture,
-            packets=candidate,
-        )
+        messages = render_prompt(candidate)
         prompt_chars = sum(len(str(message.get("content") or "")) for message in messages)
         if not current and prompt_chars > int(max_prompt_chars):
             raise ValueError("one Stage 2 evidence packet cannot fit the rendered prompt budget")
         if current and prompt_chars > int(max_prompt_chars):
             batches.append(current)
             current = [packet]
-            singleton = _interpretation_prompt(
-                clinical_question=clinical_question,
-                architecture=architecture,
-                packets=current,
-            )
+            singleton = render_prompt(current)
             if sum(len(message["content"]) for message in singleton) > int(max_prompt_chars):
                 raise ValueError(
                     "one Stage 2 evidence packet cannot fit the rendered prompt budget"
@@ -1541,6 +1577,105 @@ def _partition_interpretation_packets(
     if current:
         batches.append(current)
     return batches
+
+
+def _partition_interpretation_packets(
+    packets: Sequence[Mapping[str, Any]],
+    *,
+    architecture: str,
+    max_prompt_chars: int,
+) -> list[list[Mapping[str, Any]]]:
+    """Pack evidence using the exact fully rendered interpretation prompt."""
+
+    return _partition_packets_for_prompt(
+        packets,
+        render_prompt=lambda batch: _interpretation_prompt(
+            architecture=architecture,
+            packets=batch,
+        ),
+        max_prompt_chars=max_prompt_chars,
+    )
+
+
+def _partition_rejected_packet_audit(
+    packets: Sequence[Mapping[str, Any]],
+    *,
+    architecture: str,
+    max_prompt_chars: int,
+) -> list[list[Mapping[str, Any]]]:
+    """Pack rejected packets using the exact rendered audit prompt."""
+
+    return _partition_packets_for_prompt(
+        packets,
+        render_prompt=lambda batch: _rejected_packet_audit_prompt(
+            architecture=architecture,
+            packets=batch,
+        ),
+        max_prompt_chars=max_prompt_chars,
+    )
+
+
+def _merge_interpretation_audit(
+    *,
+    packet_ids: set[str],
+    initial: Mapping[str, Any],
+    audits: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Merge grounded audit recoveries into an initial interpretation result."""
+
+    concepts = [
+        dict(concept)
+        for result in [initial, *audits]
+        for concept in list(result.get("concepts") or [])
+    ]
+    initial_dispositions = dict(initial.get("packet_dispositions") or {})
+    latest_dispositions = dict(initial_dispositions)
+    for audit in audits:
+        latest_dispositions.update(dict(audit.get("packet_dispositions") or {}))
+
+    dispositions: dict[str, Any] = {}
+    for packet_id in sorted(packet_ids):
+        names = sorted(
+            str(concept["name"])
+            for concept in concepts
+            if packet_id in set(map(str, concept.get("supporting_packet_ids") or []))
+        )
+        source = latest_dispositions.get(packet_id)
+        reason = str(source.get("reason") or "") if isinstance(source, Mapping) else ""
+        dispositions[packet_id] = {
+            "status": "supports_concept" if names else "reviewed_no_specific_concept",
+            "concept_names": names,
+            "reason": reason
+            or (
+                "Recovered by the rejected-packet audit."
+                if names
+                else "No interpretation pass recovered a defensible pretreatment measurement."
+            ),
+        }
+
+    initially_rejected = {
+        str(packet_id)
+        for packet_id, disposition in initial_dispositions.items()
+        if isinstance(disposition, Mapping)
+        and disposition.get("status") == "reviewed_no_specific_concept"
+    }
+    recovered = sorted(
+        packet_id
+        for packet_id in initially_rejected
+        if dispositions.get(packet_id, {}).get("status") == "supports_concept"
+    )
+    remaining = sorted(initially_rejected - set(recovered))
+    return {
+        "concepts": concepts,
+        "packet_dispositions": dispositions,
+        "rejected_packet_audit": {
+            "schema_version": INTERPRETATION_AUDIT_SCHEMA_VERSION,
+            "initially_rejected_packet_ids": sorted(initially_rejected),
+            "recovered_packet_ids": recovered,
+            "remaining_rejected_packet_ids": remaining,
+            "audit_batches": len(audits),
+        },
+    }
 
 
 def _consolidation_prompt(
@@ -3008,7 +3143,6 @@ class PlainHandoffStage2:
         input_value = {
             "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
             "architecture": architecture,
-            "clinical_question": self.clinical_question,
             "packets": list(packets),
         }
         input_fingerprint = _value_fingerprint(input_value)
@@ -3025,7 +3159,6 @@ class PlainHandoffStage2:
                     {
                         "interpretation_schema": previous.get("interpretation_schema"),
                         "architecture": previous.get("architecture"),
-                        "clinical_question": previous.get("clinical_question"),
                         "packets": previous.get("packets") or [],
                     }
                 )
@@ -3040,21 +3173,80 @@ class PlainHandoffStage2:
                 if _cached_interpretation_matches_packets(
                     cached_result,
                     packet_ids=packet_ids,
+                ) and (
+                    cached_result.get("rejected_packet_audit", {}).get("schema_version")
+                    == INTERPRETATION_AUDIT_SCHEMA_VERSION
                 ):
                     LOGGER.info("skip completed Stage 2 interpretation: %s", output_dir)
                     return cached_result
             LOGGER.info("rerun stale or inconsistent Stage 2 interpretation: %s", output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_json(input_path, {**input_value, "input_fingerprint": input_fingerprint})
-        result = _request_json(
+        initial = _checkpointed_request_json(
+            output_dir=output_dir / "initial",
+            input_value={
+                "phase": "initial_interpretation",
+                **input_value,
+            },
             messages=_interpretation_prompt(
-                clinical_question=self.clinical_question,
                 architecture=architecture,
                 packets=packets,
             ),
             config=self.config,
             completion=self.completion,
             validate=lambda value: _validate_interpretation(value, packet_ids=packet_ids),
+        )
+
+        packet_by_id = {str(packet["packet_id"]): packet for packet in packets}
+        rejected_packets = [
+            packet_by_id[packet_id]
+            for packet_id, disposition in initial["packet_dispositions"].items()
+            if disposition.get("status") == "reviewed_no_specific_concept"
+        ]
+        audit_results: list[Mapping[str, Any]] = []
+        if rejected_packets:
+            audit_batches = _partition_rejected_packet_audit(
+                rejected_packets,
+                architecture=architecture,
+                max_prompt_chars=self.config.max_prompt_chars,
+            )
+            LOGGER.info(
+                "Stage 2 rejected-packet audit architecture=%s rejected_packets=%s " "batches=%s",
+                architecture,
+                len(rejected_packets),
+                len(audit_batches),
+            )
+            for batch_index, batch in enumerate(audit_batches, start=1):
+                batch_ids = {str(packet["packet_id"]) for packet in batch}
+                audit_results.append(
+                    _checkpointed_request_json(
+                        output_dir=(
+                            output_dir / "rejected_packet_audit" / f"batch_{batch_index:03d}"
+                        ),
+                        input_value={
+                            "phase": "rejected_packet_audit",
+                            "audit_schema": INTERPRETATION_AUDIT_SCHEMA_VERSION,
+                            "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
+                            "architecture": architecture,
+                            "packets": list(batch),
+                        },
+                        messages=_rejected_packet_audit_prompt(
+                            architecture=architecture,
+                            packets=batch,
+                        ),
+                        config=self.config,
+                        completion=self.completion,
+                        validate=lambda value, batch_ids=batch_ids: _validate_interpretation(
+                            value,
+                            packet_ids=batch_ids,
+                        ),
+                    )
+                )
+
+        result = _merge_interpretation_audit(
+            packet_ids=packet_ids,
+            initial=initial,
+            audits=audit_results,
         )
         _write_json(result_path, result)
         _write_json(
@@ -3063,6 +3255,9 @@ class PlainHandoffStage2:
                 "status": "complete",
                 "completed_at": _now(),
                 "input_fingerprint": input_fingerprint,
+                "initially_rejected_packets": len(rejected_packets),
+                "recovered_packets": len(result["rejected_packet_audit"]["recovered_packet_ids"]),
+                "audit_batches": len(audit_results),
             },
         )
         return result
@@ -3509,7 +3704,6 @@ class PlainHandoffStage2:
             for architecture_index, architecture in enumerate(sorted(by_architecture), start=1):
                 batches = _partition_interpretation_packets(
                     by_architecture[architecture],
-                    clinical_question=self.clinical_question,
                     architecture=architecture,
                     max_prompt_chars=self.config.max_prompt_chars,
                 )
