@@ -48,7 +48,7 @@ ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v4_closed_ontology"
 GROUP_SELECTION_CONTRACT_VERSION = "retained_group_ids_v2_python_complement"
-INTERPRETATION_SCHEMA_VERSION = "latent_feature_hypotheses_v3_scalar_rejected_packet_audit"
+INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v4"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v2_scalar"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
@@ -1320,33 +1320,37 @@ def _interpretation_response_contract() -> dict[str, Any]:
     """Return the shared response contract for interpretation passes."""
 
     return {
-        "concepts": [
+        "candidates": [
             {
-                "name": "snake_case_candidate_latent_feature",
+                "name": "snake_case_clinical_feature_name",
                 "description": (
-                    "exactly one clinically interpretable patient-level pretreatment scalar "
-                    "measurement that could generate the observed evidence pattern"
+                    "exactly one underlying or explicitly documented patient-level clinical "
+                    "feature that could produce the observed text evidence pattern"
                 ),
                 "value_type": "binary|categorical|continuous|ordinal|ambiguous",
-                "supporting_packet_ids": ["one or more supplied packet IDs"],
-                "evidence_axes": [
-                    "treatment|outcome|residual_effect|matched_pair|semantic|unclear"
-                ],
+                "supporting_evidence_item_ids": ["one or more supplied evidence-item IDs"],
                 "evidence_rationale": (
-                    "how the cited noisy evidence could arise from this feature and whether "
-                    "the feature is explicit or inferred"
+                    "how the cited words, phrases, or clinical context could arise from this "
+                    "feature, including whether the feature is explicit or inferred"
                 ),
-                "caveats": "limitations, ambiguity, or competing latent explanations",
+                "caveats": "limitations, ambiguity, or competing clinical explanations",
             }
         ],
-        "packet_dispositions": {
-            "every supplied packet ID": {
-                "status": "supports_concept|reviewed_no_specific_concept",
-                "concept_names": ["supported concept names, or an empty list"],
-                "reason": "brief reason",
-            }
-        },
     }
+
+
+def _interpretation_evidence_items(
+    packets: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expose evidence under task-facing IDs without transport provenance jargon."""
+
+    return [
+        {
+            "evidence_item_id": str(packet["packet_id"]),
+            "evidence": packet.get("content"),
+        }
+        for packet in packets
+    ]
 
 
 def _interpretation_prompt(
@@ -1354,38 +1358,36 @@ def _interpretation_prompt(
     architecture: str,
     packets: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
+    del architecture
     body = {
-        "job": "interpret_one_stage1_architecture",
-        "architecture": architecture,
-        "interpretive_goal": (
-            "Generate candidate latent pretreatment features that could plausibly yield the "
-            "types of noisy evidence returned by this Stage 1 architecture."
+        "job": "infer_clinical_features_from_text_evidence",
+        "task": (
+            "The supplied evidence items are noisy summaries of text patterns found by "
+            "prediction models. These patterns arose because underlying or explicit patient "
+            "features were documented in clinical text. Work backward from the evidence "
+            "patterns to identify the clinical features that could have produced them."
         ),
         "rules": [
-            "Treat the packets as noisy, incomplete observations of underlying clinical features, not as a ready-made feature list.",
-            "Interpret this architecture independently of other architectures. Use recurring or jointly coherent clues to corroborate the same measurement, never to bundle distinct measurements into one candidate.",
-            "Use each packet's readable evidence, evidence kind, observable axes, polarity, support, and score summaries to ask which latent pretreatment features could have generated the observed pattern.",
-            "Every candidate must be exactly one patient-level scalar measurement that can occupy one table column. Do not combine distinct demographics, laboratory values, symptoms, genomic alterations, exposures, or disease attributes into a profile, burden, status, or other composite.",
-            "When the evidence supports multiple distinct measurements, return separate candidates and cite the packets supporting each. Keep a named scale or index together only when the evidence identifies that established scalar measurement.",
-            "A candidate may be implicit rather than literally named in the evidence, but it must be a clinically coherent patient-level pretreatment characteristic that could be reproducibly measured from a complete record.",
-            "When the evidence clearly identifies a named scale or measurement, prefer it; otherwise propose the narrowest defensible latent feature rather than a broad syndrome or vague clinical state.",
-            "If the same pattern has multiple materially different clinical explanations, return separate candidates and describe the ambiguity rather than choosing one without support.",
-            "Readable clinical evidence must make every candidate plausible; numerical values, axes, support counts, and model scores may strengthen or contextualize a hypothesis but cannot name a feature by themselves.",
-            "Do not assign a causal role yet; report only the evidence axes that are visibly supported.",
-            "Do not turn treatment, outcome, posttreatment events, or documentation artifacts into a pretreatment patient feature.",
-            "Preserve distinct candidate measurements, competing explanations, and uncertainty.",
-            "For every candidate, explain how its cited packets could be noisy manifestations of that feature.",
-            "Every packet must receive one disposition.",
+            "Identify explicitly documented clinical features and narrower latent features reasonably implied by the readable evidence.",
+            "Each candidate must represent one patient-level clinical variable with one value per patient.",
+            "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
+            "When multiple underlying features could plausibly explain the same evidence, return them as separate alternatives and describe the ambiguity.",
+            "Use readable words, phrases, and clinical context to identify features. Statistical scores and support counts describe the evidence pattern but cannot identify a clinical feature by themselves.",
+            "Use longitudinal information as clinical context when it appears in the evidence. Do not perform temporal eligibility filtering.",
+            "Do not turn patient names, administrative identifiers, or documentation artifacts into clinical features.",
+            "For each candidate, cite the evidence-item IDs supporting it and explain how the observed text pattern could arise from that feature.",
+            "Do not invent a candidate when the evidence does not support a plausible underlying or explicitly documented clinical feature.",
         ],
-        "packets": list(packets),
+        "evidence_items": _interpretation_evidence_items(packets),
         "response": _interpretation_response_contract(),
     }
     return [
         {
             "role": "system",
             "content": (
-                "You infer candidate latent clinical features that could generate noisy "
-                "empirical Stage 1 evidence for a causal study. Return JSON only."
+                "You infer underlying or explicitly documented patient-level clinical "
+                "features from noisy evidence about predictive patterns in clinical text. "
+                "Return JSON only."
             ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
@@ -1399,39 +1401,37 @@ def _rejected_packet_audit_prompt(
 ) -> list[dict[str, str]]:
     """Build a recall-oriented second pass over initially rejected packets."""
 
+    del architecture
     body = {
-        "job": "audit_rejected_stage1_packets_for_missed_measurements",
-        "architecture": architecture,
-        "audit_goal": (
-            "Independently re-review packets that an initial interpretation did not map to "
-            "a candidate. Recover every defensible patient-level pretreatment measurement "
-            "without ranking candidates or limiting the result to primary features."
+        "job": "audit_unmapped_text_evidence_for_missed_clinical_features",
+        "task": (
+            "The supplied evidence items were not cited by an initial review. Re-examine "
+            "each item for an underlying or explicitly documented patient feature that could "
+            "have produced its text pattern. Recover supported features without ranking them "
+            "or limiting the result to the most prominent patterns."
         ),
         "rules": [
-            "Review every packet independently; this is a recall guardrail, not a top-k selection pass.",
-            "Do not require a clue to recur across packets. One packet is sufficient when it explicitly identifies a reproducibly extractable pretreatment measurement.",
-            "An explicit named biomarker, clinical scale, laboratory value, genomic alteration, symptom, comorbidity, demographic attribute, or pretreatment exposure must support a candidate when it is patient-level and reproducibly measurable.",
-            "Every recovered candidate must be exactly one patient-level scalar measurement that can occupy one table column.",
-            "When a packet contains multiple distinct measurements, return separate candidates with the evidence applicable to each; do not bundle them into a profile, burden, status, or other composite.",
-            "Do not invent a score, formula, or index to force distinct measurements into one scalar. Keep an established scale or index together only when the evidence identifies it.",
-            "Do not decide from whether a measurement is an expected determinant of a particular treatment comparison; use only the supplied evidence and observable axes.",
-            "Treat lexical terms as possible direct names of measurements as well as noisy clues to latent measurements.",
-            "A candidate may be implicit, but it must be a clinically coherent patient-level pretreatment characteristic that could be reproducibly measured from a complete record.",
-            "Do not assign a causal role; report only the evidence axes visibly supported by each cited packet.",
-            "Do not turn treatment, outcome, posttreatment events, patient names, administrative identifiers, or documentation artifacts into pretreatment patient features.",
-            "Use reviewed_no_specific_concept only when no defensible pretreatment measurement can be recovered, and explain the concrete reason.",
-            "Every packet must receive one disposition.",
+            "Review every evidence item independently. One clear item is sufficient to support a candidate; a clue does not need to recur.",
+            "Identify explicitly documented clinical features and narrower latent features reasonably implied by the readable evidence.",
+            "Each candidate must represent one patient-level clinical variable with one value per patient.",
+            "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
+            "When multiple underlying features could plausibly explain the same evidence, return them as separate alternatives and describe the ambiguity.",
+            "Use readable words, phrases, and clinical context to identify features. Statistical scores and support counts describe the evidence pattern but cannot identify a clinical feature by themselves.",
+            "Use longitudinal information as clinical context when it appears in the evidence. Do not perform temporal eligibility filtering.",
+            "Do not turn patient names, administrative identifiers, or documentation artifacts into clinical features.",
+            "For each candidate, cite the evidence-item IDs supporting it and explain how the observed text pattern could arise from that feature.",
+            "Do not invent a candidate when the evidence does not support a plausible underlying or explicitly documented clinical feature.",
         ],
-        "packets": list(packets),
+        "evidence_items": _interpretation_evidence_items(packets),
         "response": _interpretation_response_contract(),
     }
     return [
         {
             "role": "system",
             "content": (
-                "You audit rejected Stage 1 evidence packets for missed patient-level "
-                "pretreatment measurements. Favor recall while remaining grounded. Return "
-                "JSON only."
+                "You re-examine unmapped evidence about predictive patterns in clinical text "
+                "for missed underlying or explicitly documented patient-level clinical "
+                "features. Favor recall while remaining grounded. Return JSON only."
             ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
@@ -1442,6 +1442,7 @@ def _validate_interpretation(
     value: Mapping[str, Any],
     *,
     packet_ids: set[str],
+    packet_evidence_axes: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
     payload = value
     if not isinstance(payload.get("concepts"), list):
@@ -1471,7 +1472,12 @@ def _validate_interpretation(
         name = str(concept.get("name") or concept.get("feature_name") or "").strip()
         if not name:
             raise ValueError("interpreted concept has no name")
-        raw_supports = concept.get("supporting_packet_ids") or concept.get("packet_ids") or []
+        raw_supports = (
+            concept.get("supporting_evidence_item_ids")
+            or concept.get("supporting_packet_ids")
+            or concept.get("packet_ids")
+            or []
+        )
         if isinstance(raw_supports, (str, int)):
             raw_supports = [raw_supports]
         elif not isinstance(raw_supports, Sequence):
@@ -1495,7 +1501,7 @@ def _validate_interpretation(
         unknown_ids = [packet_id for packet_id in cited_ids if packet_id not in packet_ids]
         if unknown_ids:
             LOGGER.warning(
-                "Stage 2 interpretation concept=%s ignored %s unknown packet ID(s): %s",
+                "Stage 2 interpretation concept=%s ignored %s unknown evidence item ID(s): %s",
                 name,
                 len(unknown_ids),
                 unknown_ids[:8],
@@ -1503,11 +1509,20 @@ def _validate_interpretation(
         if not supports:
             LOGGER.warning(
                 "Stage 2 interpretation dropped ungrounded concept=%s; no supplied "
-                "packet cited it",
+                "evidence item cited it",
                 name,
             )
             continue
-        axes = _canonical_evidence_axes(concept.get("evidence_axes") or concept.get("axes"))
+        if packet_evidence_axes is None:
+            axes = _canonical_evidence_axes(concept.get("evidence_axes") or concept.get("axes"))
+        else:
+            axes = sorted(
+                {
+                    axis
+                    for packet_id in supports
+                    for axis in _canonical_evidence_axes(packet_evidence_axes.get(packet_id))
+                }
+            )
         value_type = str(concept.get("value_type") or "ambiguous").strip().lower()
         value_type = {
             "bool": "binary",
@@ -1528,7 +1543,7 @@ def _validate_interpretation(
         if not evidence_rationale:
             raise ValueError(
                 f"interpreted candidate {name!r} has no evidence_rationale explaining "
-                "how the cited Stage 1 evidence could arise from it"
+                "how the cited text evidence could arise from it"
             )
         clean_concepts.append(
             {
@@ -1555,9 +1570,9 @@ def _validate_interpretation(
             "concept_names": names,
             "reason": reason
             or (
-                "Derived from the concepts' packet citations."
+                "Derived from the candidates' evidence-item citations."
                 if names
-                else "No returned concept cited this packet."
+                else "No returned candidate cited this evidence item."
             ),
         }
     return {"concepts": clean_concepts, "packet_dispositions": clean_dispositions}
@@ -1692,7 +1707,7 @@ def _merge_interpretation_audit(
             or (
                 "Recovered by the rejected-packet audit."
                 if names
-                else "No interpretation pass recovered a defensible pretreatment measurement."
+                else "No interpretation pass recovered a defensible clinical feature."
             ),
         }
 
@@ -3279,6 +3294,14 @@ class PlainHandoffStage2:
             LOGGER.info("rerun stale or inconsistent Stage 2 interpretation: %s", output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_json(input_path, {**input_value, "input_fingerprint": input_fingerprint})
+        packet_evidence_axes: dict[str, list[str]] = {}
+        for packet in packets:
+            packet_id = str(packet["packet_id"])
+            raw_axes = packet.get("observable_axes") or packet.get("evidence_axes")
+            content = packet.get("content")
+            if not raw_axes and isinstance(content, Mapping):
+                raw_axes = content.get("evidence_axes") or content.get("observable_axes")
+            packet_evidence_axes[packet_id] = _canonical_evidence_axes(raw_axes)
         initial = _checkpointed_request_json(
             output_dir=output_dir / "initial",
             input_value={
@@ -3291,7 +3314,11 @@ class PlainHandoffStage2:
             ),
             config=self.config,
             completion=self.completion,
-            validate=lambda value: _validate_interpretation(value, packet_ids=packet_ids),
+            validate=lambda value: _validate_interpretation(
+                value,
+                packet_ids=packet_ids,
+                packet_evidence_axes=packet_evidence_axes,
+            ),
         )
 
         packet_by_id = {str(packet["packet_id"]): packet for packet in packets}
@@ -3336,6 +3363,7 @@ class PlainHandoffStage2:
                         validate=lambda value, batch_ids=batch_ids: _validate_interpretation(
                             value,
                             packet_ids=batch_ids,
+                            packet_evidence_axes=packet_evidence_axes,
                         ),
                     )
                 )

@@ -876,7 +876,7 @@ def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
     assert "dict" in audit["issues"][0]["reason"]
 
 
-def test_interpretation_prompt_requests_latent_features_that_could_generate_noisy_evidence():
+def test_interpretation_prompt_inverts_noisy_text_evidence_without_temporal_filtering():
     packet = {
         "packet_id": "packet-a",
         "architecture": "htr_neural",
@@ -893,19 +893,34 @@ def test_interpretation_prompt_requests_latent_features_that_could_generate_nois
         packets=[packet],
     )
     body = json.loads(messages[1]["content"])
-    rules = " ".join(body["rules"])
+    rules = " ".join(body["rules"]).lower()
 
-    assert "candidate latent clinical features" in messages[0]["content"]
-    assert "candidate latent pretreatment features" in body["interpretive_goal"]
-    assert "noisy, incomplete observations" in rules
-    assert "corroborate the same measurement" in rules
-    assert "exactly one patient-level scalar measurement" in rules
-    assert "return separate candidates" in rules
+    instructions = " ".join(
+        [messages[0]["content"], body["task"], rules, json.dumps(body["response"])]
+    ).lower()
+
+    assert body["job"] == "infer_clinical_features_from_text_evidence"
+    assert "underlying or explicit patient features" in body["task"]
+    assert "work backward from the evidence patterns" in body["task"].lower()
+    assert "one value per patient" in rules
+    assert "separate alternatives" in rules
+    assert "longitudinal information as clinical context" in rules
+    assert "do not perform temporal eligibility filtering" in rules
     assert "clinical_question" not in body
-    assert "Do not merely copy prominent words" not in rules
-    assert "may be implicit rather than literally named" in rules
-    assert "multiple materially different clinical explanations" in rules
-    assert "evidence_rationale" in body["response"]["concepts"][0]
+    assert "architecture" not in body
+    assert body["evidence_items"] == [
+        {
+            "evidence_item_id": "packet-a",
+            "evidence": packet["content"],
+        }
+    ]
+    assert "pretreatment" not in instructions
+    assert "posttreatment" not in instructions
+    assert "causal" not in instructions
+    assert "stage 1" not in instructions
+    assert "evidence_axes" not in instructions
+    assert "packet_dispositions" not in instructions
+    assert "evidence_rationale" in body["response"]["candidates"][0]
 
 
 def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
@@ -923,35 +938,44 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
     body = json.loads(messages[1]["content"])
     rules = " ".join(body["rules"]).lower()
 
-    assert body["job"] == "audit_rejected_stage1_packets_for_missed_measurements"
+    instructions = " ".join(
+        [messages[0]["content"], body["task"], rules, json.dumps(body["response"])]
+    ).lower()
+
+    assert body["job"] == "audit_unmapped_text_evidence_for_missed_clinical_features"
     assert "clinical_question" not in body
-    assert "top-k" in rules
-    assert "one packet is sufficient" in rules
-    assert "exactly one patient-level scalar measurement" in rules
-    assert "return separate candidates" in rules
-    assert "do not invent a score" in rules
-    assert "particular treatment comparison" in rules
+    assert "one clear item is sufficient" in rules
+    assert "one value per patient" in rules
+    assert "separate alternatives" in rules
+    assert "longitudinal information as clinical context" in rules
+    assert "pretreatment" not in instructions
+    assert "posttreatment" not in instructions
+    assert "causal" not in instructions
+    assert "stage 1" not in instructions
+    assert "evidence_axes" not in instructions
+    assert "packet_dispositions" not in instructions
 
 
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
     packet_ids = {"packet-a", "packet-b"}
     result = stage2_workflow._validate_interpretation(
         {
-            "features": [
+            "candidates": [
                 {
-                    "feature_name": "performance_status",
+                    "name": "performance_status",
                     "value_type": "numeric",
-                    "packet_ids": ["packet-a", "hallucinated-packet"],
-                    "axes": ["effect-modifier", "unsupported-axis"],
-                    "rationale": "Functional limitation could produce the cited pattern.",
+                    "supporting_evidence_item_ids": ["packet-a", "hallucinated-packet"],
+                    "evidence_rationale": (
+                        "Functional limitation could produce the cited text pattern."
+                    ),
                 }
             ],
-            "packet_dispositions": {
-                "packet-a": {"status": "kept", "reason": "Relevant evidence."},
-                "extra-packet": {"status": "supports_concept"},
-            },
         },
         packet_ids=packet_ids,
+        packet_evidence_axes={
+            "packet-a": ["effect-modifier", "unsupported-axis"],
+            "packet-b": ["outcome"],
+        },
     )
 
     assert result["concepts"] == [
@@ -961,7 +985,7 @@ def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
             "value_type": "continuous",
             "supporting_packet_ids": ["packet-a"],
             "evidence_axes": ["residual_effect"],
-            "evidence_rationale": "Functional limitation could produce the cited pattern.",
+            "evidence_rationale": "Functional limitation could produce the cited text pattern.",
             "caveats": "",
         }
     ]
@@ -1057,43 +1081,24 @@ def test_interpretation_second_pass_recovers_rejected_named_measurement(tmp_path
         calls.append(body["job"])
         assert secret_question not in messages[1]["content"]
         assert "clinical_question" not in body
-        if body["job"] == "interpret_one_stage1_architecture":
-            return json.dumps(
-                {
-                    "concepts": [],
-                    "packet_dispositions": {
-                        packet["packet_id"]: {
-                            "status": "reviewed_no_specific_concept",
-                            "concept_names": [],
-                            "reason": "Not selected as a primary latent feature.",
-                        }
-                    },
-                }
-            )
-        assert body["job"] == "audit_rejected_stage1_packets_for_missed_measurements"
+        if body["job"] == "infer_clinical_features_from_text_evidence":
+            return json.dumps({"candidates": []})
+        assert body["job"] == "audit_unmapped_text_evidence_for_missed_clinical_features"
         return json.dumps(
             {
-                "concepts": [
+                "candidates": [
                     {
-                        "name": "baseline_serum_albumin",
-                        "description": "Pretreatment serum albumin concentration.",
+                        "name": "serum_albumin",
+                        "description": "Serum albumin concentration.",
                         "value_type": "continuous",
-                        "supporting_packet_ids": [packet["packet_id"]],
-                        "evidence_axes": ["residual_effect"],
+                        "supporting_evidence_item_ids": [packet["packet_id"]],
                         "evidence_rationale": (
-                            "The packet directly names a reproducibly measurable "
-                            "pretreatment laboratory value."
+                            "The evidence item directly names a reproducibly measurable "
+                            "laboratory value."
                         ),
                         "caveats": "Confirm units during extraction.",
                     }
                 ],
-                "packet_dispositions": {
-                    packet["packet_id"]: {
-                        "status": "supports_concept",
-                        "concept_names": ["baseline_serum_albumin"],
-                        "reason": "Explicit named pretreatment laboratory measurement.",
-                    }
-                },
             }
         )
 
@@ -1114,10 +1119,10 @@ def test_interpretation_second_pass_recovers_rejected_named_measurement(tmp_path
     )
 
     assert calls == [
-        "interpret_one_stage1_architecture",
-        "audit_rejected_stage1_packets_for_missed_measurements",
+        "infer_clinical_features_from_text_evidence",
+        "audit_unmapped_text_evidence_for_missed_clinical_features",
     ]
-    assert [concept["name"] for concept in result["concepts"]] == ["baseline_serum_albumin"]
+    assert [concept["name"] for concept in result["concepts"]] == ["serum_albumin"]
     assert result["packet_dispositions"][packet["packet_id"]]["status"] == ("supports_concept")
     assert result["rejected_packet_audit"]["recovered_packet_ids"] == [packet["packet_id"]]
     assert not result["rejected_packet_audit"]["remaining_rejected_packet_ids"]
@@ -1139,8 +1144,8 @@ def test_interpretation_second_pass_recovers_rejected_named_measurement(tmp_path
     )
 
     assert calls == [
-        "interpret_one_stage1_architecture",
-        "audit_rejected_stage1_packets_for_missed_measurements",
+        "infer_clinical_features_from_text_evidence",
+        "audit_unmapped_text_evidence_for_missed_clinical_features",
     ]
     assert cached == result
 
@@ -1718,17 +1723,16 @@ def _fake_completion(calls):
                     "overall_assessment": "Keep the operational definitions.",
                 }
             )
-        if body["job"] == "interpret_one_stage1_architecture":
-            packet_ids = [row["packet_id"] for row in body["packets"]]
+        if body["job"] == "infer_clinical_features_from_text_evidence":
+            packet_ids = [row["evidence_item_id"] for row in body["evidence_items"]]
             return json.dumps(
                 {
-                    "concepts": [
+                    "candidates": [
                         {
                             "name": "performance_status",
                             "description": "Baseline functional performance status.",
                             "value_type": "ordinal",
-                            "supporting_packet_ids": packet_ids,
-                            "evidence_axes": ["treatment", "outcome"],
+                            "supporting_evidence_item_ids": packet_ids,
                             "evidence_rationale": (
                                 "Repeated functional-status language could be generated by "
                                 "latent baseline performance status."
@@ -1736,14 +1740,6 @@ def _fake_completion(calls):
                             "caveats": "The exact scale must be extracted.",
                         }
                     ],
-                    "packet_dispositions": {
-                        packet_id: {
-                            "status": "supports_concept",
-                            "concept_names": ["performance_status"],
-                            "reason": "Readable ECOG evidence.",
-                        }
-                        for packet_id in packet_ids
-                    },
                 }
             )
         if body["job"] == "group_stage2_candidate_measurements":
@@ -2934,7 +2930,7 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
     assert definitions["features"][0]["roles"] == ["confounder"]
     # Architecture-stratified compilation interprets the two producers
     # independently, then consolidates their candidates.
-    assert calls.count("interpret_one_stage1_architecture") == 2
+    assert calls.count("infer_clinical_features_from_text_evidence") == 2
     assert calls.count("group_stage2_candidate_measurements") == 1
     assert calls.count("operationalize_stage2_candidate_group") == 1
 
