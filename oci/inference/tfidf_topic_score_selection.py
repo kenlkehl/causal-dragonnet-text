@@ -31,7 +31,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 
 from ..config import TfidfTopicDiscoveryConfig
-from .multi_model_agentic_forest import _make_bow_vectorizer
+from .sparse_text_modeling import _make_bow_vectorizer
 
 
 TOPIC_SCORE_TEST_SCHEMA_VERSION = "tfidf_topic_and_ngram_score_test_v6"

@@ -13,14 +13,13 @@ fold boundaries, and estimate causal effects with diagnostics.
 OCI supports Python 3.12 and 3.13 and uses
 [`uv`](https://docs.astral.sh/uv/) for reproducible environments. The complete
 multi-model workflow requires NVIDIA CUDA GPUs; the default embedding model
-needs approximately 20 GiB of free VRAM on each selected GPU. FFmpeg's shared
-libraries are also required by the locked text-model environment.
+needs approximately 20 GiB of free VRAM on each selected GPU. A local vLLM
+server is an optional installation rather than part of the Stage 1/Stage 2
+client environment.
 
-On Debian or Ubuntu, install the system dependency and then create the project
-environment:
+Create the project environment with:
 
 ```bash
-sudo apt-get install ffmpeg
 git clone https://github.com/kenlkehl/onc-causal-inference.git
 cd onc-causal-inference
 uv sync --frozen
@@ -31,7 +30,11 @@ An editable `pip` installation is also supported when `uv` is not desired:
 ```bash
 pip install -e .
 pip install -e ".[extraction]"  # Optional API-based extraction clients.
+pip install -e ".[local-llm]"   # Optional in-process/local vLLM support.
 ```
+
+When installing the `local-llm` extra, provide the system CUDA and FFmpeg
+libraries required by the chosen vLLM/Torch build.
 
 ## Try the complete Stage 1 → 2 workflow
 
@@ -66,8 +69,9 @@ STAGE2_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4 \
 ```
 
 `GPU_COUNT` and `PHYSICAL_GPUS` are mutually exclusive. Advanced overrides are
-`MIN_FREE_GPU_GB`, `STAGE1_WORKERS`, `STAGE2_WORKERS`, `DISABLE_HTR`, and
-`STAGE2_ENDPOINT` (set it to an empty string for a Stage-1-only run). Set
+`MIN_FREE_GPU_GB`, `STAGE1_WORKERS`, `STAGE2_WORKERS`, `DISABLE_HTR`,
+`STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (set it to an empty string for a
+Stage-1-only run). Set
 `OCI_PYTHON` to an existing environment's interpreter to skip `uv sync`. An
 optional positional argument changes the output directory. The larger synthetic
 example uses the identical hardware and endpoint behavior:
@@ -214,8 +218,8 @@ flowchart TB
     L --> L2["2. Sparse residual effects"]
     L --> L3["8. TF-IDF topics"]
     L --> L4["9. Residual or orphan n-grams"]
-    H --> H1["3. Hierarchical transformer evidence"]
-    H --> M["4. Matched-patient uplift"]
+    H --> H1["4. Hierarchical transformer evidence"]
+    H --> M["3. Matched-patient uplift"]
     E --> E1["5. Whole-cohort contrasts"]
     E --> E2["6. Cluster-local contrasts"]
     E1 --> E3["7. Lexical views of embedding contrasts"]
@@ -279,20 +283,7 @@ heterogeneity. They are not proof that the named characteristic modifies the
 treatment effect, but they provide a different signal from ordinary outcome
 prediction.
 
-### 3. Hierarchical transformer evidence (`htr_neural`)
-
-The hierarchical transformer divides a long record into overlapping clinical
-chunks, encodes each chunk, and uses a document-level transformer to combine
-them. Separate nuisance and residual-effect heads learn from the ordered chunk
-representations. Attention and span summaries translate influential parts of the
-record back into readable phrases.
-
-This model is useful when meaning depends on context or on evidence distributed
-across a long history. Unlike a bag-of-words model, it can distinguish some uses
-of the same vocabulary and can combine information across notes. Its attention
-weights should be read as model-use diagnostics, not as causal explanations.
-
-### 4. Matched-patient uplift evidence (`matched_pair_uplift`)
+### 3. Matched-patient uplift evidence (`matched_pair_uplift`)
 
 This architecture constructs local comparisons between treated and untreated
 patients who are similar according to learned nuisance structure. Sparse and
@@ -305,6 +296,19 @@ in the records of otherwise similar patients receiving different treatments.
 Because matching can only balance measured and modeled information, the result
 is evidence for a candidate characteristic rather than proof of an individual
 treatment effect or its direction.
+
+### 4. Hierarchical transformer evidence (`htr_neural`)
+
+The hierarchical transformer divides a long record into overlapping clinical
+chunks, encodes each chunk, and uses a document-level transformer to combine
+them. Separate nuisance and residual-effect heads learn from the ordered chunk
+representations. Attention and span summaries translate influential parts of the
+record back into readable phrases.
+
+This model is useful when meaning depends on context or on evidence distributed
+across a long history. Unlike a bag-of-words model, it can distinguish some uses
+of the same vocabulary and can combine information across notes. Its attention
+weights should be read as model-use diagnostics, not as causal explanations.
 
 ### 5. Whole-cohort embedding contrasts (`embedding_whole_cohort`)
 
@@ -470,6 +474,22 @@ Paths in a configuration file are resolved relative to that file. JSON and YAML
 are accepted; YAML requires PyYAML. Less common model settings can be placed
 under `science.stage1` or `science.neural_queries`. The resolved settings used by
 the run are written beside the results.
+
+`science.stage1_architectures` is an optional list of architecture names. When
+it is omitted, the workflow preserves the existing enable-flag behavior and
+runs every architecture enabled by the Stage 1 model configuration. An explicit
+selection runs only the required producer components and private prerequisites,
+and exposes only the selected architecture lanes to Stage 2. For example:
+
+```bash
+uv run python scripts/run_all_evidence.py \
+  --config run.json \
+  --architectures bow_nuisance,tfidf_topics
+```
+
+Architecture selection is part of the scientific run definition. Resume with
+the same selection; use a fresh output directory to change it. `--architectures
+all` explicitly selects all ten lanes.
 
 Chunk-based models fail rather than silently discard the end of an unusually
 long record. If a capacity error reports that a record requires more embedding
@@ -640,9 +660,10 @@ packet plan is cached and input-fingerprinted for fast, safe restarts.
 
 `semantic_cluster_cards_v2` is the only supported Stage 2 evidence compiler.
 Before any interpretation request, it compares the architectures present in
-each outer fold with the architectures enabled by the resolved Stage 1 model
-configuration. A missing enabled architecture stops with a direct instruction
-to rerun its Stage 1 component and rebuild the handoff. This is a local
+each outer fold with the run's frozen Stage 1 selection: either the explicit
+selector or, for legacy runs, the resolved enable flags. A missing selected
+architecture stops with a direct instruction to rerun its Stage 1 component and
+rebuild the handoff. This is a local
 scientific completeness check; it does not introduce artifact authentication,
 bundle attestation, checkpoint adoption, or deployment gates. The former
 `raw_packets_v1` option was retired because it merged distinct architectures
@@ -720,6 +741,10 @@ nsclc_all_evidence/
       outer_001_inner_001/...
       evidence.jsonl
       complete.json
+  stage1_architectures/
+    manifest.json
+    bow_nuisance/evidence.jsonl
+    ...
   handoff/
     text_models.jsonl
     tfidf.jsonl
@@ -727,6 +752,13 @@ nsclc_all_evidence/
     evidence.jsonl
     index.json
     complete.json
+  evaluations/
+    stage1/
+      evaluation_manifest.json
+      metrics.jsonl
+      comparison.csv
+      summary.json
+      architectures/.../metrics.jsonl
   stage2/
     config.json
     outer_001/
@@ -786,6 +818,12 @@ from oci.inference.research_all_evidence_workflow import iter_stage1_handoff
 for evidence_context in iter_stage1_handoff("/results/nsclc_all_evidence"):
     process(evidence_context)
 ```
+
+The additive `stage1_architectures/` contract is the architecture-oriented
+view of the same frozen evidence. Its manifest records the selected lanes,
+private support services, producer artifacts, hashes, and row-score sidecars.
+Targeted runs use these canonical envelopes as the handoff itself; legacy runs
+retain their existing component handoff and receive the sidecars additively.
 
 To inspect status without starting work, use `--status`. To intentionally rerun
 a component, use `--rerun COMPONENT`. This removes completion markers but leaves
@@ -918,7 +956,7 @@ treatment-outcome groups among clinically similar patients. It is an experimenta
 representation-learning term, not a substitute for nuisance adjustment or a
 causal identification assumption.
 
-## Synthetic data and oracle experiments
+## Synthetic data and Stage 1 architecture evaluation
 
 The `synthetic_data/` package creates clinical narratives with known confounders,
 effect modifiers, treatment equations, outcome equations, and ground-truth
@@ -936,29 +974,48 @@ python -m synthetic_data.cli \
   --output-dir ./my_synthetic_data
 ```
 
-The oracle experiment runner compares causal heads over repeated synthetic
-datasets and includes a `best_attainable` analysis based on the known generating
-variables.
+Oracle truth is never supplied to Stage 1. After a Stage 1 handoff has been
+completed and frozen, evaluate each architecture independently against a
+synthetic dataset's known variables and treatment effects:
 
 ```bash
-python oracle_experiment_scripts/run_oracle_experiments.py \
-  --output-dir ../my_results \
-  --devices cuda:0 cuda:1 cuda:2 cuda:3 \
-  --n-folds 5 \
-  --n-repeats 10
+uv run oci-evaluate-stage1 \
+  --run-dir /results/nsclc_all_evidence \
+  --metadata /data/synthetic/metadata.json \
+  --architectures all
 ```
 
-Results can be summarized with:
+The evaluator reads saved per-architecture evidence and held-out row-score
+sidecars; it never refits or selects a Stage 1 model. It hashes those artifacts
+before loading oracle-bearing columns, then writes common recovery metrics and
+architecture-native metrics under `evaluations/stage1/`. Each architecture has
+its own metrics file, while `comparison.csv` provides a common cross-lane view.
+Use a comma-separated subset to evaluate only lanes present in the run:
+
+| Architecture | Native evaluation emphasis |
+|---|---|
+| `bow_nuisance` | Held-out treatment/outcome nuisance performance and treatment/outcome evidence balance |
+| `bow_r_loss` | Normalized held-out R-loss gain and residual-effect evidence coverage |
+| `matched_pair_uplift` | Positive-match coverage, pair-side representation, and uplift association |
+| `htr_neural` | Held-out nuisance/R-loss behavior, represented HTR stages, and witness-patient coverage |
+| `embedding_whole_cohort` | Contrast and polarity coverage, semantic witnesses, and oracle-feature association |
+| `embedding_clustered` | Cluster-local contrast coverage and cluster representation |
+| `tfidf_semantic_retrieval_contrasts` | Parent-contrast coverage and recovered lexical evidence |
+| `tfidf_topics` | Topic count, treatment/outcome/effect bank coverage, and inner-fold stability |
+| `tfidf_orphan_ngrams` | Orphan-cluster coverage, lexical recovery, and inner-fold stability |
+| `neural_query_moments` | Query and bank coverage, witness-patient coverage, activation association, and stability |
 
 ```bash
-python oracle_experiment_scripts/analyze_results.py \
-  --results-dir ../my_results/results
+uv run oci-evaluate-stage1 \
+  --run-dir /results/nsclc_all_evidence \
+  --architectures htr_neural,neural_query_moments
 ```
 
-Specialized oracle launchers for the multi-model and attention-based pathways
-are stored in [`oracle_experiment_scripts/`](oracle_experiment_scripts/). They
-are intended for controlled method evaluation rather than as the primary entry
-point for an observational study.
+Older runs with only `handoff/evidence.jsonl` are backfilled into the same
+architecture artifact contract without rerunning Stage 1. The reusable
+semi-synthetic data-generating process lives in
+`synthetic_data/semisynthetic_dgp.py`; one-off architecture-specific oracle
+launchers have been retired.
 
 ## Interpreting results
 
@@ -1000,8 +1057,9 @@ above.
 ## Dependencies
 
 The principal dependencies are PyTorch, Transformers, Sentence Transformers,
-pandas, NumPy, scikit-learn, econml, PyArrow, Accelerate, and vLLM. Optional
-extraction clients are installed with `pip install -e ".[extraction]"`.
+pandas, NumPy, SciPy, scikit-learn, econml, PyArrow, Accelerate, and the OpenAI
+client used for Stage 2 endpoints. Local vLLM and OpenAI Harmony are isolated in
+the `local-llm` extra; Google extraction credentials are in `extraction`.
 
 ## Citation
 

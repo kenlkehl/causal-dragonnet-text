@@ -21,6 +21,7 @@ never loads another embedding model beside the Stage 2 serving process.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -33,23 +34,25 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 from .all_evidence_fusion import (
-    BOW_NUISANCE,
-    BOW_R_LOSS,
-    HTR_NEURAL,
-    MATCHED_PAIR_UPLIFT,
-    NEURAL_QUERY_MOMENTS,
-    PRIMARY_SOURCE_FAMILIES,
-    TFIDF_ORPHAN_NGRAMS,
-    TFIDF_SEMANTIC_RETRIEVAL,
     _compact_bow_rows,
     _compact_tfidf_evidence,
     _compact_topic_terms,
     _embedding_family,
     _normalize_evidence_text,
 )
+from .stage1_architectures import (
+    BOW_NUISANCE,
+    BOW_R_LOSS,
+    HTR_NEURAL,
+    MATCHED_PAIR_UPLIFT,
+    NEURAL_QUERY_MOMENTS,
+    STAGE1_ARCHITECTURES,
+    TFIDF_ORPHAN_NGRAMS,
+    TFIDF_SEMANTIC_RETRIEVAL,
+)
 
 EVIDENCE_COMPILER_VERSION = "semantic_cluster_cards_v2"
-SUPPORTED_STAGE2_ARCHITECTURES = tuple(PRIMARY_SOURCE_FAMILIES)
+SUPPORTED_STAGE2_ARCHITECTURES = STAGE1_ARCHITECTURES
 ALLOWED_AXES = {
     "treatment",
     "outcome",
@@ -802,7 +805,27 @@ def _extract_occurrences(rows: Iterable[Mapping[str, Any]]) -> dict[int, list[di
         payload = row.get("evidence")
         source = str(row.get("source") or "unknown")
         occurrences: list[dict[str, Any]] = []
-        if isinstance(payload, Mapping) and source == "text_models":
+        if isinstance(payload, Mapping) and source == "stage1_architecture":
+            architecture = str(payload.get("architecture") or "").strip()
+            occurrence_value = payload.get("occurrence")
+            if architecture not in SUPPORTED_STAGE2_ARCHITECTURES:
+                raise ValueError(
+                    f"handoff row {handoff_row} has unsupported architecture {architecture!r}"
+                )
+            if not isinstance(occurrence_value, Mapping):
+                raise ValueError(
+                    f"handoff row {handoff_row} has no canonical architecture occurrence"
+                )
+            occurrence = copy.deepcopy(dict(occurrence_value))
+            if str(occurrence.get("architecture") or "") != architecture:
+                raise ValueError(
+                    f"handoff row {handoff_row} architecture envelope is inconsistent"
+                )
+            reference = dict(occurrence.get("reference") or {})
+            reference["handoff_row"] = int(handoff_row)
+            occurrence["reference"] = reference
+            occurrences.append(occurrence)
+        elif isinstance(payload, Mapping) and source == "text_models":
             occurrences.extend(_extract_sparse_occurrences(row, payload, handoff_row=handoff_row))
             occurrences.extend(
                 _extract_embedding_occurrences(row, payload, handoff_row=handoff_row)
@@ -824,6 +847,32 @@ def _extract_occurrences(rows: Iterable[Mapping[str, Any]]) -> dict[int, list[di
     if not by_outer or not any(by_outer.values()):
         raise ValueError("the Stage 1 handoff contains no compilable scientific evidence")
     return by_outer
+
+
+def extract_stage1_architecture_occurrences(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    included_architectures: Sequence[str] | None = None,
+) -> dict[int, tuple[dict[str, Any], ...]]:
+    """Project raw handoff rows into the canonical per-architecture evidence form."""
+
+    included = (
+        set(SUPPORTED_STAGE2_ARCHITECTURES)
+        if included_architectures is None
+        else set(map(str, included_architectures))
+    )
+    unsupported = sorted(included - set(SUPPORTED_STAGE2_ARCHITECTURES))
+    if unsupported:
+        raise ValueError(f"unsupported included Stage 1 architectures: {unsupported}")
+    by_outer = _extract_occurrences(rows)
+    return {
+        outer_fold: tuple(
+            copy.deepcopy(occurrence)
+            for occurrence in occurrences
+            if str(occurrence["architecture"]) in included
+        )
+        for outer_fold, occurrences in sorted(by_outer.items())
+    }
 
 
 def _aggregate_exact_occurrences(
@@ -1227,6 +1276,7 @@ def compile_stage2_handoff_evidence(
     max_packet_chars: int = 25_000,
     seed: int = 42,
     required_architectures: Sequence[str] = (),
+    included_architectures: Sequence[str] | None = None,
 ) -> CompiledStage2Evidence:
     """Compile raw Stage 1 rows into fold-local semantic evidence cards."""
 
@@ -1244,8 +1294,37 @@ def compile_stage2_handoff_evidence(
     unsupported = sorted(set(required) - set(SUPPORTED_STAGE2_ARCHITECTURES))
     if unsupported:
         raise ValueError(f"unsupported required Stage 2 architectures: {unsupported}")
+    included = (
+        tuple(dict.fromkeys(str(value).strip() for value in included_architectures))
+        if included_architectures is not None
+        else None
+    )
+    if included is not None:
+        if any(not value for value in included):
+            raise ValueError("included Stage 2 architecture names must be nonempty")
+        unsupported_included = sorted(
+            set(included) - set(SUPPORTED_STAGE2_ARCHITECTURES)
+        )
+        if unsupported_included:
+            raise ValueError(
+                f"unsupported included Stage 2 architectures: {unsupported_included}"
+            )
+        if not set(required).issubset(included):
+            raise ValueError(
+                "required Stage 2 architectures must be included in the compiler selection"
+            )
     embedding_cache = _ChunkEmbeddingCache.discover(Path(handoff_path))
     occurrences_by_outer = _extract_occurrences(rows)
+    if included is not None:
+        included_set = set(included)
+        occurrences_by_outer = {
+            outer_fold: [
+                occurrence
+                for occurrence in occurrences
+                if str(occurrence["architecture"]) in included_set
+            ]
+            for outer_fold, occurrences in occurrences_by_outer.items()
+        }
     packets: list[dict[str, Any]] = []
     cards_by_outer: dict[int, tuple[dict[str, Any], ...]] = {}
     members_by_outer: dict[int, tuple[dict[str, Any], ...]] = {}
@@ -1402,6 +1481,7 @@ def compile_stage2_handoff_evidence(
     summary = {
         "schema_version": EVIDENCE_COMPILER_VERSION,
         "required_architectures": list(required),
+        "included_architectures": None if included is None else list(included),
         "embedding_cache": str(embedding_cache.directory) if embedding_cache else None,
         "embedding_cache_model": (
             embedding_cache.metadata.get("sentence_model_name") if embedding_cache else None
@@ -1425,5 +1505,7 @@ def compile_stage2_handoff_evidence(
 __all__ = [
     "CompiledStage2Evidence",
     "EVIDENCE_COMPILER_VERSION",
+    "SUPPORTED_STAGE2_ARCHITECTURES",
     "compile_stage2_handoff_evidence",
+    "extract_stage1_architecture_occurrences",
 ]

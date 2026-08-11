@@ -33,6 +33,24 @@ from .plain_handoff_stage2 import (
     plain_stage2_config_from_mapping,
     run_plain_handoff_stage2,
 )
+from .stage1_architectures import (
+    BOW_NUISANCE,
+    BOW_R_LOSS,
+    EMBEDDING_CLUSTERED,
+    EMBEDDING_WHOLE_COHORT,
+    HTR_NEURAL,
+    MATCHED_PAIR_UPLIFT,
+    NEURAL_QUERY_MOMENTS,
+    STAGE1_ARCHITECTURES,
+    TFIDF_ORPHAN_NGRAMS,
+    TFIDF_SEMANTIC_RETRIEVAL,
+    TFIDF_TOPICS,
+    canonicalize_stage1_architectures,
+    legacy_enabled_stage1_architectures,
+    resolve_support_services,
+    selected_components,
+    unavailable_explicit_architectures,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -303,6 +321,7 @@ class ResearchStage1Config:
     devices: tuple[str, ...]
     workers: int
     components: tuple[str, ...]
+    stage1_architectures: tuple[str, ...] | None
     mode: str
     stage2: PlainHandoffStage2Config | None
     stage1_template: Path
@@ -315,7 +334,11 @@ class ResearchStage1Config:
     log_level: str = "INFO"
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        # Keep legacy run_config.json stable when the new selector was omitted.
+        if self.stage1_architectures is None:
+            values.pop("stage1_architectures", None)
+        return values
 
 
 def compile_config(
@@ -351,6 +374,11 @@ def compile_config(
         science["neural_queries"] = raw["neural_query_overrides"]
     if "htr_enabled" not in science and raw.get("htr_enabled") is not None:
         science["htr_enabled"] = raw["htr_enabled"]
+    if (
+        "stage1_architectures" not in science
+        and raw.get("stage1_architectures") is not None
+    ):
+        science["stage1_architectures"] = raw["stage1_architectures"]
     for key in ("devices", "workers", "components", "mode", "log_level"):
         if key not in run and raw.get(key) is not None:
             run[key] = raw[key]
@@ -397,6 +425,11 @@ def compile_config(
     elif mode == "stage2":
         selected_components = ("stage2",)
 
+    architecture_selection = canonicalize_stage1_architectures(
+        science.get("stage1_architectures"),
+        allow_none=True,
+    )
+
     stage1_template = raw.get("stage1_template", DEFAULT_STAGE1_TEMPLATE)
     neural_template = raw.get("neural_query_template", DEFAULT_NEURAL_QUERY_TEMPLATE)
     return ResearchStage1Config(
@@ -419,6 +452,7 @@ def compile_config(
         devices=tuple(str(value) for value in raw_devices),
         workers=max(1, int(run.get("workers", 1))),
         components=selected_components,
+        stage1_architectures=architecture_selection,
         mode=mode,
         stage2=stage2,
         stage1_template=Path(_resolve_relative_path(stage1_template, base=config_dir)),
@@ -499,6 +533,71 @@ def _load_stage1_template(config: ResearchStage1Config) -> dict[str, Any]:
     return applied
 
 
+def _apply_explicit_architecture_selection(
+    applied: Mapping[str, Any],
+    selected: Sequence[str],
+) -> dict[str, Any]:
+    """Narrow model work while retaining prerequisites for selected lanes."""
+
+    narrowed = copy.deepcopy(dict(applied))
+    selected_set = set(selected)
+    architecture = narrowed.setdefault("architecture", {})
+    multi_model = architecture.setdefault("multi_model_forest", {})
+
+    matched_selected = MATCHED_PAIR_UPLIFT in selected_set
+    bow_available = bool(multi_model.get("bow_discovery_enabled", True))
+    htr_available = bool(multi_model.get("htr_evidence_enabled", True))
+    matched_bow_available = bool(multi_model.get("matched_pair_bow_enabled", True))
+    matched_htr_available = bool(multi_model.get("matched_pair_htr_enabled", True))
+    bow_needed = bool(
+        selected_set.intersection({BOW_NUISANCE, BOW_R_LOSS})
+        or matched_selected and bow_available and matched_bow_available
+    )
+    htr_needed = bool(
+        HTR_NEURAL in selected_set
+        or matched_selected and htr_available and matched_htr_available
+    )
+    embedding_needed = bool(
+        selected_set.intersection(
+            {
+                EMBEDDING_WHOLE_COHORT,
+                EMBEDDING_CLUSTERED,
+                TFIDF_SEMANTIC_RETRIEVAL,
+            }
+        )
+    )
+
+    multi_model["bow_discovery_enabled"] = bow_needed
+    multi_model["htr_evidence_enabled"] = htr_needed
+    multi_model["matched_pair_uplift_enabled"] = matched_selected
+    multi_model["matched_pair_bow_enabled"] = bool(
+        matched_selected and bow_available and matched_bow_available
+    )
+    multi_model["matched_pair_htr_enabled"] = bool(
+        matched_selected and htr_available and matched_htr_available
+    )
+    methods: list[str] = []
+    if bow_needed:
+        methods.append("bow")
+    if htr_needed:
+        methods.append("htr")
+    if embedding_needed:
+        methods.append("embedding_contrast")
+    multi_model["feature_discovery_methods"] = methods
+
+    embedding = multi_model.setdefault("embedding_contrast", {})
+    embedding["enabled"] = embedding_needed
+    embedding["include_cluster_contrast_vectors"] = (
+        EMBEDDING_CLUSTERED in selected_set
+    )
+    embedding["retrieval_tfidf_enabled"] = (
+        TFIDF_SEMANTIC_RETRIEVAL in selected_set
+    )
+    topic = multi_model.setdefault("tfidf_topic", {})
+    topic["orphan_ngram_enabled"] = TFIDF_ORPHAN_NGRAMS in selected_set
+    return narrowed
+
+
 def _load_neural_query_template(config: ResearchStage1Config) -> dict[str, Any]:
     raw = _read_mapping(config.neural_query_template)
     values = _deep_merge(raw, config.neural_query_overrides)
@@ -514,6 +613,8 @@ class Stage1RunContext:
     dataset: pd.DataFrame
     applied_config: Any
     neural_query_config: Any
+    selected_architectures: tuple[str, ...] = STAGE1_ARCHITECTURES
+    support_services: tuple[str, ...] = ()
 
     @property
     def output_dir(self) -> Path:
@@ -915,6 +1016,22 @@ def _stage1_context_specs(context: Stage1RunContext) -> list[dict[str, Any]]:
     return specs
 
 
+def _ensure_split_provenance(context: Stage1RunContext) -> Path:
+    """Materialize the shared split plan for targeted non-TF-IDF runs."""
+
+    path = context.component_dir("tfidf") / "split_provenance.jsonl"
+    if path.is_file():
+        return path
+    from .tfidf_topic_stage1 import build_tfidf_topic_split_provenance
+
+    rows = build_tfidf_topic_split_provenance(
+        context.dataset,
+        context.applied_config,
+    )
+    _write_jsonl(path, rows)
+    return path
+
+
 def _neural_queries_component(
     context: Stage1RunContext,
     component_dir: Path,
@@ -1026,12 +1143,14 @@ def _run_one_neural_query_context(
 ) -> dict[str, Any]:
     """Fit and immediately publish one independently resumable context."""
 
+    from .neural_cohort_witness import soft_retrieval_activations
     from .neural_query_agentic_forest import build_query_evidence
     from .neural_query_discovery_runtime import fit_context_query_discovery
 
     outer_fold = int(spec["outer_fold"])
     inner_fold = spec.get("inner_fold")
     fit_rows = tuple(int(value) for value in spec["train_idx"])
+    heldout_rows = tuple(int(value) for value in spec["heldout_idx"])
     fold_dir.mkdir(parents=True, exist_ok=True)
     fit_frame = dataset.iloc[list(fit_rows)]
     texts = tuple(
@@ -1041,6 +1160,7 @@ def _run_one_neural_query_context(
     treatment = fit_frame[config.treatment_column].to_numpy(dtype=float)
     outcome = fit_frame[config.outcome_column].to_numpy(dtype=float)
     chunks = generator.chunk_matrices(fit_rows)
+    heldout_chunks = generator.chunk_matrices(heldout_rows)
     fit_chunk_texts = generator.chunk_texts(fit_rows)
     # build_query_evidence indexes text by the original dataset row number.
     # Populate only the fit rows instead of copying the entire text cache for
@@ -1070,13 +1190,38 @@ def _run_one_neural_query_context(
         "fit_row_ids": np.asarray(fit_rows, dtype=np.int64)
     }
     query_records: dict[str, Any] = {}
+    fit_score_frame = pd.DataFrame(
+        {
+            "_oci_row_id": np.asarray(fit_rows, dtype=np.int64),
+            "split_role": "fit_inner_oof_or_full_refit",
+        }
+    )
+    heldout_score_frame = pd.DataFrame(
+        {
+            "_oci_row_id": np.asarray(heldout_rows, dtype=np.int64),
+            "split_role": "heldout_query_projection",
+        }
+    )
     for bank, bank_result in discovery["banks"].items():
         queries = np.asarray(bank_result["queries"], dtype=np.float32)
-        arrays[f"{bank}_queries"] = queries
-        arrays[f"{bank}_train_activations"] = np.asarray(
+        train_activations = np.asarray(
             bank_result["train_activations"],
             dtype=np.float32,
         )
+        heldout_activations = soft_retrieval_activations(
+            heldout_chunks,
+            queries,
+            temperature=float(neural_query_config.temperature),
+            device=device,
+            patient_batch_size=int(neural_query_config.retrieval_patient_batch_size),
+        ).astype(np.float32, copy=False)
+        arrays[f"{bank}_queries"] = queries
+        arrays[f"{bank}_train_activations"] = train_activations
+        arrays[f"{bank}_heldout_activations"] = heldout_activations
+        for query_index in range(queries.shape[0]):
+            column = f"{bank}__query_{query_index + 1:03d}"
+            fit_score_frame[column] = train_activations[:, query_index]
+            heldout_score_frame[column] = heldout_activations[:, query_index]
         query_records[bank] = copy.deepcopy(bank_result["records"])
         evidence_rows.extend(
             build_query_evidence(
@@ -1093,13 +1238,22 @@ def _run_one_neural_query_context(
         )
 
     np.savez_compressed(fold_dir / "queries.npz", **arrays)
+    scores = pd.concat(
+        [fit_score_frame, heldout_score_frame],
+        ignore_index=True,
+    )
+    scores["outer_fold"] = outer_fold
+    scores["inner_fold"] = inner_fold
+    scores["scope"] = str(spec["scope"])
+    scores["architecture"] = NEURAL_QUERY_MOMENTS
+    scores.to_parquet(fold_dir / "scores.parquet", index=False)
     _write_json(fold_dir / "query_records.json", query_records)
     evidence = {
         "outer_fold": outer_fold,
         "inner_fold": inner_fold,
         "scope": str(spec["scope"]),
         "fit_row_ids": list(fit_rows),
-        "heldout_row_ids": [int(value) for value in spec["heldout_idx"]],
+        "heldout_row_ids": list(heldout_rows),
         "evidence": evidence_rows,
     }
     _write_json(fold_dir / "evidence.json", evidence)
@@ -1108,7 +1262,12 @@ def _run_one_neural_query_context(
         {
             "status": "complete",
             "completed_at": _now(),
-            "artifacts": ["evidence.json", "query_records.json", "queries.npz"],
+            "artifacts": [
+                "evidence.json",
+                "query_records.json",
+                "queries.npz",
+                "scores.parquet",
+            ],
         },
     )
     return evidence
@@ -1132,13 +1291,18 @@ def _handoff_component(
     }
     combined: list[dict[str, Any]] = []
     copied: dict[str, str] = {}
+    source_artifacts: dict[str, Path] = {}
     for source, source_path in sources.items():
         rows = _load_jsonl(source_path)
         if not rows:
             continue
-        destination = component_dir / f"{source}.jsonl"
-        shutil.copyfile(source_path, destination)
-        copied[source] = destination.name
+        source_artifacts[source] = source_path
+        if context.config.stage1_architectures is None:
+            destination = component_dir / f"{source}.jsonl"
+            shutil.copyfile(source_path, destination)
+            copied[source] = destination.name
+        else:
+            copied[source] = os.path.relpath(source_path, start=component_dir)
         for row in rows:
             combined.append(
                 {
@@ -1152,18 +1316,49 @@ def _handoff_component(
     if not combined:
         raise RuntimeError("handoff has no completed Stage 1 evidence components")
 
+    from .stage1_architecture_artifacts import (
+        materialize_stage1_architecture_artifacts,
+    )
+
+    architecture_rows, architecture_manifest = materialize_stage1_architecture_artifacts(
+        output_dir=context.output_dir,
+        raw_handoff_rows=combined,
+        selected_architectures=context.selected_architectures,
+        source_artifacts=source_artifacts,
+        selection_mode=(
+            "legacy_inferred"
+            if context.config.stage1_architectures is None
+            else "explicit"
+        ),
+    )
+    missing_architectures = [
+        architecture
+        for architecture in context.selected_architectures
+        if int(
+            architecture_manifest["architectures"][architecture]["occurrences"]
+        )
+        == 0
+    ]
+    if context.config.stage1_architectures is not None and missing_architectures:
+        raise RuntimeError(
+            "Stage 1 produced no evidence for selected architectures: "
+            f"{missing_architectures}"
+        )
+
+    if context.config.stage1_architectures is not None:
+        combined = architecture_rows
+
     combined.sort(
         key=lambda row: (
             int(row.get("outer_fold") or 0),
             int(row.get("inner_fold") or 0),
             str(row["source"]),
+            str((row.get("evidence") or {}).get("architecture") or ""),
         )
     )
     evidence_path = component_dir / "evidence.jsonl"
     _write_jsonl(evidence_path, combined)
-    _write_json(
-        component_dir / "index.json",
-        {
+    index = {
             "dataset": str(context.config.dataset),
             "columns": {
                 "unit_id": context.config.unit_id_column,
@@ -1174,8 +1369,19 @@ def _handoff_component(
             "sources": copied,
             "combined_evidence": evidence_path.name,
             "rows": len(combined),
-        },
-    )
+        }
+    if context.config.stage1_architectures is not None:
+        index.update(
+            {
+                "schema_version": "stage1_architecture_handoff_v1",
+                "selected_architectures": list(context.selected_architectures),
+                "architecture_manifest": os.path.relpath(
+                    context.output_dir / "stage1_architectures" / "manifest.json",
+                    start=component_dir,
+                ),
+            }
+        )
+    _write_json(component_dir / "index.json", index)
     return {
         "artifacts": [str(evidence_path), str(component_dir / "index.json")],
         "rows": len(combined),
@@ -1197,6 +1403,7 @@ def _stage2_component(
     stage2_config = replace(
         context.config.stage2,
         required_architectures=_required_stage2_architectures(context),
+        included_architectures=_required_stage2_architectures(context),
     )
     return run_plain_handoff_stage2(
         handoff_path=handoff_path,
@@ -1220,65 +1427,9 @@ def _stage2_component(
 def _required_stage2_architectures(
     context: Stage1RunContext,
 ) -> tuple[str, ...]:
-    """Return the scientific architectures enabled by the resolved Stage 1 config."""
+    """Return the architecture selection frozen on the run context."""
 
-    from .all_evidence_fusion import (
-        BOW_NUISANCE,
-        BOW_R_LOSS,
-        EMBEDDING_CLUSTERED,
-        EMBEDDING_WHOLE_COHORT,
-        HTR_NEURAL,
-        MATCHED_PAIR_UPLIFT,
-        NEURAL_QUERY_MOMENTS,
-        PRIMARY_SOURCE_FAMILIES,
-        TFIDF_ORPHAN_NGRAMS,
-        TFIDF_SEMANTIC_RETRIEVAL,
-        TFIDF_TOPICS,
-    )
-
-    mm_config = context.applied_config.architecture.multi_model_forest
-    enabled: set[str] = set()
-    bow_enabled = bool(getattr(mm_config, "bow_discovery_enabled", True))
-    htr_enabled = bool(getattr(mm_config, "htr_evidence_enabled", True))
-    if bow_enabled:
-        enabled.update((BOW_NUISANCE, BOW_R_LOSS))
-    if htr_enabled:
-        enabled.add(HTR_NEURAL)
-
-    matched_enabled = (
-        str(context.config.outcome_type).lower() != "continuous"
-        and bool(getattr(mm_config, "matched_pair_uplift_enabled", True))
-        and (
-            (
-                bow_enabled
-                and bool(getattr(mm_config, "matched_pair_bow_enabled", True))
-            )
-            or (
-                htr_enabled
-                and bool(getattr(mm_config, "matched_pair_htr_enabled", True))
-            )
-        )
-    )
-    if matched_enabled:
-        enabled.add(MATCHED_PAIR_UPLIFT)
-
-    embedding = mm_config.embedding_contrast
-    if bool(getattr(embedding, "enabled", False)):
-        enabled.add(EMBEDDING_WHOLE_COHORT)
-        if bool(getattr(embedding, "include_cluster_contrast_vectors", True)):
-            enabled.add(EMBEDDING_CLUSTERED)
-        if bool(getattr(embedding, "retrieval_tfidf_enabled", True)):
-            enabled.add(TFIDF_SEMANTIC_RETRIEVAL)
-
-    enabled.add(TFIDF_TOPICS)
-    if bool(getattr(mm_config.tfidf_topic, "orphan_ngram_enabled", True)):
-        enabled.add(TFIDF_ORPHAN_NGRAMS)
-    enabled.add(NEURAL_QUERY_MOMENTS)
-    return tuple(
-        architecture
-        for architecture in PRIMARY_SOURCE_FAMILIES
-        if architecture in enabled
-    )
+    return tuple(context.selected_architectures)
 
 
 DEFAULT_COMPONENT_RUNNERS: Mapping[str, ComponentRunner] = {
@@ -1291,6 +1442,28 @@ DEFAULT_COMPONENT_RUNNERS: Mapping[str, ComponentRunner] = {
 }
 
 
+def _saved_architecture_selection(output_dir: Path) -> tuple[str, ...] | None:
+    path = Path(output_dir) / "stage1_architectures" / "manifest.json"
+    if not path.is_file():
+        return None
+    raw = _read_mapping(path)
+    if str(raw.get("selection_mode") or "") != "explicit":
+        return None
+    return canonicalize_stage1_architectures(
+        raw.get("selected_architectures"),
+        allow_none=False,
+    )
+
+
+def _has_completed_pipeline_work(output_dir: Path) -> bool:
+    roots = (
+        Path(output_dir) / "components",
+        Path(output_dir) / "handoff",
+        Path(output_dir) / "stage2",
+    )
+    return any(root.is_dir() and next(root.rglob("complete.json"), None) for root in roots)
+
+
 class ResearchAllEvidenceWorkflow:
     """Run and resume the plain-directory all-evidence workflow."""
 
@@ -1300,11 +1473,48 @@ class ResearchAllEvidenceWorkflow:
         *,
         component_runners: Mapping[str, ComponentRunner] | None = None,
     ) -> None:
-        self.config = config
+        saved_selection = _saved_architecture_selection(config.output_dir)
+        if (
+            config.stage1_architectures is not None
+            and saved_selection is not None
+            and tuple(config.stage1_architectures) != tuple(saved_selection)
+        ):
+            raise ValueError(
+                "Stage 1 architecture selection does not match the existing output "
+                f"directory: requested={list(config.stage1_architectures)} "
+                f"saved={list(saved_selection)}"
+            )
+        if (
+            config.stage1_architectures is not None
+            and saved_selection is None
+            and _has_completed_pipeline_work(config.output_dir)
+        ):
+            raise ValueError(
+                "cannot add a Stage 1 architecture selector to an existing legacy "
+                "output directory; use a fresh output directory"
+            )
+        effective_selection = config.stage1_architectures or saved_selection
+        self.config = (
+            replace(config, stage1_architectures=effective_selection)
+            if effective_selection is not None
+            else config
+        )
         self.component_runners = dict(component_runners or DEFAULT_COMPONENT_RUNNERS)
         unknown = set(config.components) - set(self.component_runners)
         if unknown:
             raise ValueError(f"unknown workflow components: {sorted(unknown)}")
+        if effective_selection is None or config.components == ("stage2",):
+            self.components = tuple(config.components)
+        else:
+            required = set(selected_components(effective_selection)) - {"handoff"}
+            missing = sorted(required - set(config.components))
+            if missing:
+                raise ValueError(
+                    "selected Stage 1 architectures require missing workflow "
+                    f"components: {missing}"
+                )
+            allowed = required | {"handoff", "stage2"}
+            self.components = tuple(name for name in config.components if name in allowed)
 
     @property
     def progress_path(self) -> Path:
@@ -1327,6 +1537,47 @@ class ResearchAllEvidenceWorkflow:
 
         applied_mapping = _load_stage1_template(self.config)
         neural_mapping = _load_neural_query_template(self.config)
+        original_experiment = ExperimentConfig.from_dict(
+            {
+                "seed": self.config.seed,
+                "device": self.config.devices[0],
+                "num_workers": self.config.workers,
+                "gpu_ids": _cuda_ids(self.config.devices) or None,
+                "applied_inference": applied_mapping,
+            }
+        )
+        selected = self.config.stage1_architectures
+        if selected is None:
+            selected = legacy_enabled_stage1_architectures(
+                original_experiment.applied_inference,
+                outcome_type=self.config.outcome_type,
+            )
+            experiment = original_experiment
+        else:
+            unavailable = unavailable_explicit_architectures(
+                selected,
+                original_experiment.applied_inference,
+                outcome_type=self.config.outcome_type,
+            )
+            if unavailable:
+                raise ValueError(
+                    "selected Stage 1 architectures are disabled by their direct "
+                    f"implementation settings: {list(unavailable)}"
+                )
+            applied_mapping = _apply_explicit_architecture_selection(
+                applied_mapping,
+                selected,
+            )
+            experiment = ExperimentConfig.from_dict(
+                {
+                    "seed": self.config.seed,
+                    "device": self.config.devices[0],
+                    "num_workers": self.config.workers,
+                    "gpu_ids": _cuda_ids(self.config.devices) or None,
+                    "applied_inference": applied_mapping,
+                }
+            )
+
         run_config = _redact_credentials(self.config.as_dict())
         _write_json(self.config.output_dir / "run_config.json", run_config)
         _write_json(
@@ -1338,15 +1589,6 @@ class ResearchAllEvidenceWorkflow:
             _redact_credentials(neural_mapping),
         )
 
-        experiment = ExperimentConfig.from_dict(
-            {
-                "seed": self.config.seed,
-                "device": self.config.devices[0],
-                "num_workers": self.config.workers,
-                "gpu_ids": _cuda_ids(self.config.devices) or None,
-                "applied_inference": applied_mapping,
-            }
-        )
         embedding_config = (
             experiment.applied_inference.architecture.multi_model_forest.embedding_contrast
         )
@@ -1356,10 +1598,12 @@ class ResearchAllEvidenceWorkflow:
             embedding_config.max_chunks,
             embedding_config.cache_dir,
         )
-        from .neural_query_agentic_forest import NeuralQueryAgenticForestConfig
+        neural_config = None
+        if "neural_queries" in self.components:
+            from .neural_query_agentic_forest import NeuralQueryAgenticForestConfig
 
-        neural_config = NeuralQueryAgenticForestConfig(**neural_mapping)
-        neural_config.validate()
+            neural_config = NeuralQueryAgenticForestConfig(**neural_mapping)
+            neural_config.validate()
         if self.config.dataset.suffix.lower() in {".parquet", ".pq"}:
             dataset = pd.read_parquet(self.config.dataset)
         elif self.config.dataset.suffix.lower() == ".csv":
@@ -1375,11 +1619,29 @@ class ResearchAllEvidenceWorkflow:
         missing = sorted(required - set(dataset.columns))
         if missing:
             raise ValueError(f"dataset is missing configured columns: {missing}")
+        if self.config.stage1_architectures is not None:
+            manifest_path = (
+                self.config.output_dir / "stage1_architectures" / "manifest.json"
+            )
+            if not manifest_path.is_file():
+                _write_json(
+                    manifest_path,
+                    {
+                        "schema_version": "stage1_architecture_manifest_v1",
+                        "created_at": _now(),
+                        "selection_mode": "explicit",
+                        "selected_architectures": list(selected),
+                        "support_services": list(resolve_support_services(selected)),
+                        "producer_components": list(selected_components(selected)),
+                    },
+                )
         return Stage1RunContext(
             config=self.config,
             dataset=dataset.reset_index(drop=True),
             applied_config=experiment.applied_inference,
             neural_query_config=neural_config,
+            selected_architectures=tuple(selected),
+            support_services=resolve_support_services(selected),
         )
 
     def _stage2_only_context(self) -> Stage1RunContext:
@@ -1419,19 +1681,31 @@ class ResearchAllEvidenceWorkflow:
         missing = sorted(required - set(dataset.columns))
         if missing:
             raise ValueError(f"dataset is missing configured columns: {missing}")
+        selected = self.config.stage1_architectures or legacy_enabled_stage1_architectures(
+            experiment.applied_inference,
+            outcome_type=self.config.outcome_type,
+        )
         return Stage1RunContext(
             config=self.config,
             dataset=dataset.reset_index(drop=True),
             applied_config=experiment.applied_inference,
             neural_query_config=None,
+            selected_architectures=tuple(selected),
+            support_services=resolve_support_services(selected),
         )
 
     def run(self) -> Mapping[str, Any]:
         context = (
             self._stage2_only_context()
-            if self.config.components == ("stage2",)
+            if self.components == ("stage2",)
             else self._resolved_context()
         )
+        if (
+            self.config.stage1_architectures is not None
+            and "tfidf" not in self.components
+            and {"text_models", "neural_queries"}.intersection(self.components)
+        ):
+            _ensure_split_provenance(context)
         previous: dict[str, Any] = {}
         if self.progress_path.is_file():
             try:
@@ -1446,13 +1720,13 @@ class ResearchAllEvidenceWorkflow:
             "current_component": None,
             "components": {
                 name: {"status": "pending", "path": str(self._component_dir(name))}
-                for name in self.config.components
+            for name in self.components
             },
         }
         self._write_progress(progress)
 
         try:
-            for name in self.config.components:
+            for name in self.components:
                 component_dir = self._component_dir(name)
                 complete_path = component_dir / "complete.json"
                 stage2_is_final = True
@@ -1544,6 +1818,17 @@ def iter_stage1_handoff(output_dir: Path | str) -> Iterable[Mapping[str, Any]]:
                 yield json.loads(line)
 
 
+def iter_stage1_architecture_evidence(
+    output_dir: Path | str,
+    architecture: str | None = None,
+) -> Iterable[Mapping[str, Any]]:
+    """Yield the additive per-architecture Stage 1 evidence rows."""
+
+    from .stage1_architecture_artifacts import iter_stage1_architecture_evidence as _iter
+
+    yield from _iter(output_dir, architecture)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the simple, automatically resumable all-evidence workflow."
@@ -1563,6 +1848,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--devices", help="comma-separated devices, for example cuda:0,cuda:1")
     parser.add_argument("--workers", type=int)
     parser.add_argument("--components", help="comma-separated component names")
+    parser.add_argument(
+        "--architectures",
+        help=(
+            "comma-separated Stage 1 architecture names, or 'all'; "
+            "defaults to the legacy enable-flag resolution"
+        ),
+    )
     parser.add_argument("--htr-model")
     parser.add_argument(
         "--disable-htr",
@@ -1659,6 +1951,8 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
         value = getattr(args, key)
         if value is not None:
             science[key] = value
+    if args.architectures is not None:
+        science["stage1_architectures"] = args.architectures
     run = raw.setdefault("run", {})
     for key in ("devices", "workers", "components"):
         value = getattr(args, key)
@@ -1762,6 +2056,7 @@ __all__ = [
     "Stage1RunContext",
     "build_parser",
     "compile_config",
+    "iter_stage1_architecture_evidence",
     "iter_stage1_handoff",
     "main",
 ]

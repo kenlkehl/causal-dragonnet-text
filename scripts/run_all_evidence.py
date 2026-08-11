@@ -5,8 +5,8 @@ import os
 import tempfile
 from pathlib import Path
 
-# Importing OCI also imports plotting support. Give Matplotlib a writable cache
-# location on research clusters where the account's home directory is read-only.
+# Some optional standalone components import plotting support. Give Matplotlib
+# a writable cache location when those components are selected on a cluster.
 os.environ.setdefault(
     "MPLCONFIGDIR",
     str(Path(tempfile.gettempdir()) / "oci-matplotlib"),

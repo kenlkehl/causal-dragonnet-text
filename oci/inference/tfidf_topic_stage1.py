@@ -349,6 +349,77 @@ def _inner_split_plan(
     )
 
 
+def build_tfidf_topic_split_provenance(
+    dataset: pd.DataFrame,
+    config: AppliedInferenceConfig,
+) -> List[Dict[str, Any]]:
+    """Build the canonical Stage 1 outer/inner split registry without fitting.
+
+    Independent non-TF-IDF architecture runs use this function so every lane
+    sees exactly the same rows as the full Stage 1 workflow.
+    """
+
+    data = dataset.reset_index(drop=True).copy()
+    data["_oci_row_id"] = np.arange(len(data), dtype=int)
+    identity = tfidf_topic_stage1_identity(config, data)
+    dataset_identity = identity["dataset"]
+    configured_registry = _configured_split_registry(data, config)
+    outer_splits, outer_metadata = _outer_split_plan(
+        data,
+        config,
+        validated_registry=configured_registry,
+    )
+    rows: List[Dict[str, Any]] = []
+    for outer_fold, (train_idx, test_idx) in enumerate(outer_splits, start=1):
+        outer_train = data.iloc[np.asarray(train_idx, dtype=int)].copy()
+        outer_test = data.iloc[np.asarray(test_idx, dtype=int)].copy()
+        row: Dict[str, Any] = {
+            "split_schema_version": identity["split_semantics"]["schema_version"],
+            "outer_fold": int(outer_fold),
+            "fit_row_ids": outer_train["_oci_row_id"].astype(int).tolist(),
+            "heldout_row_ids": outer_test["_oci_row_id"].astype(int).tolist(),
+            "fit_row_fingerprint": row_set_fingerprint(outer_train["_oci_row_id"]),
+            "heldout_row_fingerprint": row_set_fingerprint(outer_test["_oci_row_id"]),
+            "honest_outer_holdout": True,
+            "split_method": outer_metadata["method"],
+            "split_seed": outer_metadata.get("seed"),
+            "split_metadata": outer_metadata,
+            "dataset_content_fingerprint": dataset_identity["content_fingerprint"],
+            "dataset_ordered_row_fingerprint": dataset_identity[
+                "ordered_row_fingerprint"
+            ],
+            "split_semantics_hash": identity["split_semantics_hash"],
+            "inner_splits": [],
+        }
+        inner_splits, inner_metadata = _inner_split_plan(
+            outer_train,
+            config,
+            outer_fold=int(outer_fold),
+            validated_registry=configured_registry,
+        )
+        for inner_fold, (fit_local, heldout_local) in enumerate(inner_splits, start=1):
+            inner_fit = outer_train.iloc[np.asarray(fit_local, dtype=int)]
+            inner_heldout = outer_train.iloc[np.asarray(heldout_local, dtype=int)]
+            row["inner_splits"].append(
+                {
+                    "inner_fold": int(inner_fold),
+                    "fit_row_ids": inner_fit["_oci_row_id"].astype(int).tolist(),
+                    "heldout_row_ids": inner_heldout["_oci_row_id"].astype(int).tolist(),
+                    "fit_row_fingerprint": row_set_fingerprint(
+                        inner_fit["_oci_row_id"]
+                    ),
+                    "heldout_row_fingerprint": row_set_fingerprint(
+                        inner_heldout["_oci_row_id"]
+                    ),
+                    "split_method": inner_metadata["method"],
+                    "split_seed": inner_metadata.get("seed"),
+                    "split_metadata": inner_metadata,
+                }
+            )
+        rows.append(row)
+    return rows
+
+
 def tfidf_topic_dataset_fingerprints(
     dataset: pd.DataFrame,
     config: AppliedInferenceConfig,

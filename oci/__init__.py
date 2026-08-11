@@ -1,29 +1,38 @@
-"""
-Oncology Causal Inference (OCI)
+"""Oncology Causal Inference (OCI).
 
-A package for causal inference from clinical text using frozen LLM feature
-extraction and causal inference heads (DragonNet, R-Learner, Causal Forest).
+Public compatibility names are loaded on first access so lightweight workflow
+commands do not initialize the standalone model stack.
 """
+
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
 
 __version__ = "0.1.0"
 
-from .config import (
-    ExperimentConfig,
-    AppliedInferenceConfig,
-    ModelArchitectureConfig,
-    TrainingConfig,
-    MatchingAnalysisConfig,
-    create_default_config
-)
+_LAZY_EXPORTS = {
+    "ExperimentConfig": ("oci.config", "ExperimentConfig"),
+    "AppliedInferenceConfig": ("oci.config", "AppliedInferenceConfig"),
+    "ModelArchitectureConfig": ("oci.config", "ModelArchitectureConfig"),
+    "TrainingConfig": ("oci.config", "TrainingConfig"),
+    "MatchingAnalysisConfig": ("oci.config", "MatchingAnalysisConfig"),
+    "create_default_config": ("oci.config", "create_default_config"),
+    "ExperimentRunner": ("oci.experiments", "ExperimentRunner"),
+}
 
-from .experiments import ExperimentRunner
+__all__ = list(_LAZY_EXPORTS)
 
-__all__ = [
-    'ExperimentConfig',
-    'AppliedInferenceConfig',
-    'ModelArchitectureConfig',
-    'TrainingConfig',
-    'MatchingAnalysisConfig',
-    'ExperimentRunner',
-    'create_default_config',
-]
+
+def __getattr__(name: str) -> Any:
+    try:
+        module_name, attribute = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *__all__})

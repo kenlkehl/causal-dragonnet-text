@@ -377,6 +377,7 @@ class PlainHandoffStage2Config:
     max_prompt_chars: int = 100_000
     evidence_compiler: str = EVIDENCE_COMPILER_VERSION
     required_architectures: tuple[str, ...] = SUPPORTED_STAGE2_ARCHITECTURES
+    included_architectures: tuple[str, ...] | None = None
     evidence_max_cards_per_fold: int = 400
     evidence_max_exemplars_per_card: int = 4
     evidence_max_exemplar_chars: int = 2_400
@@ -421,6 +422,27 @@ class PlainHandoffStage2Config:
             raise ValueError(
                 f"stage2.required_architectures contains unsupported values: {unsupported}"
             )
+        included = (
+            tuple(self.included_architectures)
+            if self.included_architectures is not None
+            else None
+        )
+        if included is not None:
+            if len(included) != len(set(included)):
+                raise ValueError("stage2.included_architectures must not contain duplicates")
+            unsupported_included = sorted(
+                set(included) - set(SUPPORTED_STAGE2_ARCHITECTURES)
+            )
+            if unsupported_included:
+                raise ValueError(
+                    "stage2.included_architectures contains unsupported values: "
+                    f"{unsupported_included}"
+                )
+            if not set(required).issubset(included):
+                raise ValueError(
+                    "stage2.required_architectures must be a subset of "
+                    "stage2.included_architectures"
+                )
         if self.evidence_max_cards_per_fold < 16:
             raise ValueError("stage2.evidence_max_cards_per_fold must be at least 16")
         if self.evidence_max_exemplars_per_card < 1:
@@ -477,6 +499,13 @@ def plain_stage2_config_from_mapping(
         )
     if raw.get("max_tokens") is not None:
         LOGGER.warning("stage2.max_tokens is ignored; Stage 2 does not send an output-token limit")
+    def architecture_names(value: Any) -> tuple[str, ...]:
+        if isinstance(value, str):
+            if value.strip().lower() == "all":
+                return SUPPORTED_STAGE2_ARCHITECTURES
+            return tuple(part.strip() for part in value.split(",") if part.strip())
+        return tuple(value)
+
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
         model=model,
@@ -486,6 +515,14 @@ def plain_stage2_config_from_mapping(
         transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
         evidence_compiler=str(raw.get("evidence_compiler", EVIDENCE_COMPILER_VERSION)).strip(),
+        required_architectures=architecture_names(
+            raw.get("required_architectures", SUPPORTED_STAGE2_ARCHITECTURES)
+        ),
+        included_architectures=(
+            architecture_names(raw["included_architectures"])
+            if raw.get("included_architectures") is not None
+            else None
+        ),
         evidence_max_cards_per_fold=int(raw.get("evidence_max_cards_per_fold", 400)),
         evidence_max_exemplars_per_card=int(raw.get("evidence_max_exemplars_per_card", 4)),
         evidence_max_exemplar_chars=int(raw.get("evidence_max_exemplar_chars", 2_400)),
@@ -3054,6 +3091,11 @@ class PlainHandoffStage2:
             "compiler": self.config.evidence_compiler,
             "compiler_version": EVIDENCE_COMPILER_VERSION,
             "required_architectures": list(self.config.required_architectures),
+            "included_architectures": (
+                None
+                if self.config.included_architectures is None
+                else list(self.config.included_architectures)
+            ),
             "max_cards_per_outer_fold": self.config.evidence_max_cards_per_fold,
             "max_exemplars_per_card": self.config.evidence_max_exemplars_per_card,
             "max_exemplar_chars": self.config.evidence_max_exemplar_chars,
@@ -3095,6 +3137,7 @@ class PlainHandoffStage2:
             max_packet_chars=max_packet_chars,
             seed=seed,
             required_architectures=self.config.required_architectures,
+            included_architectures=self.config.included_architectures,
         )
         packets = [dict(packet) for packet in compiled.packets]
         summary = dict(compiled.summary)

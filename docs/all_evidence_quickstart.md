@@ -31,6 +31,12 @@ existing handoff. Setting `stage2.endpoint` in the config makes an unflagged
 invocation run both phases. `stage2.model` may be omitted when the endpoint's
 `/models` API advertises exactly one model ID.
 
+To run a scientific subset of Stage 1, add (for example)
+`--architectures bow_nuisance,tfidf_topics`. Private prerequisites are resolved
+automatically and Stage 2 receives only those selected lanes. Keep the same
+selection when resuming; changing it requires a fresh output directory. Omit
+the option for legacy all-enabled behavior.
+
 Stage 2 does not stop at variable definitions. For each outer fold it extracts
 the proposed variables on training records, reviews their empirical behavior by
 inner validation, freezes the retained definitions, extracts the held-out
@@ -70,6 +76,16 @@ The final estimate and row-level cross-fitted results are:
 ```text
 /path/to/output/stage2/causal_estimate.json
 /path/to/output/stage2/cross_fitted_predictions.csv
+```
+
+For synthetic data with known truth, evaluate the frozen Stage 1 lanes in their
+own right:
+
+```bash
+uv run oci-evaluate-stage1 \
+  --run-dir /path/to/output \
+  --metadata /path/to/metadata.json \
+  --architectures all
 ```
 
 See the [complete workflow guide](all_evidence_workflow.md) for

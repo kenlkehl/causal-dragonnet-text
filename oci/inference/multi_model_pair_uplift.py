@@ -18,7 +18,7 @@ from scipy.special import expit, logit
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import KFold
 
-from .multi_model_agentic_forest import (
+from .sparse_text_modeling import (
     _fit_regressor,
     _make_bow_regressor,
     _make_bow_vectorizer,

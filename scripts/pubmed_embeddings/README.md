@@ -47,8 +47,8 @@ saved chunk offset. After all parts finish, the script merges them into
 `chunk_embeddings.npy`, `offsets.npy`, `chunk_texts.jsonl`, `row_metadata.jsonl`,
 and `metadata.json`.
 
-Use the result in the oracle multi-model path with:
+Use the result in the research Stage 1 embedding configuration with:
 
 ```bash
---embedding-external-cache-dir /absolute/path/to/pubmed_embeddings/pubmed_cancer_embedding_cache
+--set 'science.stage1.architecture.multi_model_forest.embedding_contrast.external_corpus_cache_dirs=["/absolute/path/to/pubmed_embeddings/pubmed_cancer_embedding_cache"]'
 ```

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from scipy import sparse
 from sklearn.decomposition import NMF
 
@@ -49,7 +50,12 @@ def _model() -> NMF:
 def test_c_order_compatibility_is_identical_on_working_runtime() -> None:
     matrix = _matrix()
     reference = _model()
-    expected = reference.fit_transform(matrix)
+    try:
+        expected = reference.fit_transform(matrix)
+    except ValueError as exc:
+        if "C-contiguous" not in str(exc):
+            raise
+        pytest.skip("installed sklearn/NumPy combination requires the compatibility path")
 
     subject = _model()
     observed = fit_transform_nmf_with_c_order_initial_w(subject, matrix)

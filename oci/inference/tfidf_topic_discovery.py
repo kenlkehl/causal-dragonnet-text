@@ -50,7 +50,7 @@ from ..config import (
     TfidfNuisanceStackScientificConfig,
     TfidfTopicDiscoveryConfig,
 )
-from .multi_model_agentic_forest import (
+from .sparse_text_modeling import (
     _bow_model_params,
     _bow_vectorizer_params,
     _make_bow_classifier,

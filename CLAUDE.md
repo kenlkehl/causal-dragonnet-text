@@ -54,7 +54,7 @@ oci/
     ├── io.py                  # File I/O, hashing, atomic save
     └── system.py              # Thread limiting, seeding, CUDA cleanup
 
-oracle_experiment_scripts/   # Oracle experiment runner and analysis
+oci/evaluation/              # Frozen-artifact Stage 1 architecture evaluation
 example_configs/             # Config files for frozen_llm_pooler and tfidf_forest
 synthetic_data/              # LLM-based synthetic data generation
 ├── cli.py                 # CLI: `python -m synthetic_data.cli`
@@ -569,7 +569,7 @@ results = run_psm_analysis(predictions_df, config, output_dir)
 ## Workflow Modes
 
 1. **Applied Inference**: K-fold CV or fixed splits -> `predictions.parquet`
-2. **Semi-Synthetic Simulation**: Real text + simulated T/Y with known ITE for sensitivity analysis (see `oracle_experiment_scripts/`)
+2. **Stage 1 Architecture Evaluation**: Post-hoc evaluation of frozen Stage 1 lanes against synthetic truth
 3. **PSM Analysis**: Post-hoc matching with ATT/ATE estimation, Rosenbaum bounds
 
 ## Output Files
@@ -584,73 +584,25 @@ output_dir/
 |   +-- psm_analysis/           # If enabled
 ```
 
-## Semi-Synthetic Simulation (Sensitivity Analysis)
+## Stage 1 Architecture Evaluation
 
-The `oracle_experiment_scripts/` module provides a semi-synthetic simulation framework for
-evaluating how well text extractors capture confounding beyond explicitly specified confounders.
-
-### How It Works
-
-1. LLM generates K realistic confounders for the clinical question
-2. vLLM extracts confounders from real clinical text
-3. Regression equations produce simulated treatment/outcome with known true ITE
-4. Applied inference uses real text + simulated T/Y
-5. ITE correlation measures recovery of true treatment effects
-
-### Two Equation Modes
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `random` | LLM generates regression equations with random coefficients, calibrated to target rates | Stress-testing across diverse DGPs |
-| `fitted` | Logistic regression fit on extracted structured features to predict real T/Y | Stability analysis for specific dataset |
-
-### Key Files
-
-| File | Purpose |
-|------|---------|
-| `oracle_experiment_scripts/semisynthetic_dgp.py` | DGP generation: confounder extraction, equation generation/fitting, outcome simulation |
-| `oracle_experiment_scripts/run_semisynthetic_experiments.py` | Main runner: outer/inner loops, CLI, checkpoint/resume |
-| `oracle_experiment_scripts/analyze_semisynthetic_results.py` | Results aggregation, summary statistics, plots |
-
-### CLI
+The research workflow writes an additive `stage1_architectures/` manifest and
+one canonical evidence stream per selected lane. Row-level held-out score
+sidecars are saved by the producing components. Evaluate these artifacts only
+after Stage 1 is frozen:
 
 ```bash
-# Random mode: M=5 DGPs, N=5 repeats each
-python oracle_experiment_scripts/run_semisynthetic_experiments.py \
-    --dataset-path /path/to/real/dataset.parquet \
-    --clinical-question "Compare pembrolizumab vs docetaxel for advanced NSCLC" \
-    --output-dir ../pcori_experiments/semisynthetic \
-    --equation-mode random --num-dgps 5 --num-repeats 5 --devices cuda:0
-
-# Fitted mode: learn equations from real T/Y, measure stability
-python oracle_experiment_scripts/run_semisynthetic_experiments.py \
-    --dataset-path /path/to/real/dataset.parquet \
-    --clinical-question "Compare pembrolizumab vs docetaxel for advanced NSCLC" \
-    --output-dir ../pcori_experiments/semisynthetic_fitted \
-    --equation-mode fitted --num-dgps 5 --num-repeats 10 --devices cuda:0
-
-# Analyze results
-python oracle_experiment_scripts/analyze_semisynthetic_results.py \
-    --results-dir ../pcori_experiments/semisynthetic
+uv run oci-evaluate-stage1 \
+    --run-dir /results/my_stage1_run \
+    --metadata /data/synthetic/metadata.json \
+    --architectures all
 ```
 
-### Experiment Arms
-
-For each DGP and confounder fraction f (0, 0.25, 0.5, 0.75, 1.0):
-- **confounder_forest**: Confounder-only CausalForestDML (no text)
-- **text_forest**: Frozen LLM pooler + CausalForestDML (with optional confounder subset)
-- **best_attainable**: All K confounders (upper bound reference)
-
-### Key Flags
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--equation-mode` | "random" or "fitted" | `random` |
-| `--num-dgps` | Number of DGPs (M) | `5` |
-| `--num-repeats` | Repeats per DGP (N) | `5` |
-| `--vary-confounders-per-dgp` | Fresh confounders per DGP | `True` for random, `False` for fitted |
-| `--cache` / `--gpu-cache` | Pre-cache frozen LLM hidden states | `False` |
-| `--resume` | Skip completed arms | `False` |
+The evaluator hashes the Stage 1 evidence and score artifacts before loading
+oracle-bearing columns. It does not fit or select models. Outputs include
+per-architecture native and common recovery metrics, a combined JSONL stream,
+and `comparison.csv`. The reusable real-text semi-synthetic DGP was moved to
+`synthetic_data/semisynthetic_dgp.py`; the one-off oracle launchers were retired.
 
 ## Synthetic Data Generation
 
@@ -757,7 +709,8 @@ python -m synthetic_data.cli --config my_config.json
 | Explicit features | `oci/extraction/explicit_confounders.py`, `oci/extraction/cache.py`, `oci/models/explicit_confounder_featurizer.py` |
 | Propensity/Outcome models | `oci/models/propensity_model.py`, `oci/models/outcome_model.py` |
 | Training | `oci/inference/applied.py`, `oci/inference/applied_forest.py`, `oci/inference/applied_tfidf_forest.py` |
-| Semi-synthetic simulation | `oracle_experiment_scripts/semisynthetic_dgp.py`, `run_semisynthetic_experiments.py` |
+| Stage 1 evaluation | `oci/evaluation/stage1.py`, `oci/inference/stage1_architectures.py` |
+| Semi-synthetic DGP | `synthetic_data/semisynthetic_dgp.py` |
 | Config | `oci/config.py` |
 | PSM | `oci/analysis/psm_analysis.py`, `oci/analysis/statistical_analysis.py`, `oci/matching/propensity_matcher.py` |
 | Utilities | `oci/utils/io.py`, `oci/utils/system.py` |
@@ -766,9 +719,9 @@ python -m synthetic_data.cli --config my_config.json
 
 ## Dependencies
 
-**Core**: torch, transformers, pandas, numpy, scikit-learn, tqdm, pyarrow, joblib, accelerate, econml
+**Core**: torch, transformers, pandas, numpy, scipy, scikit-learn, tqdm, pyarrow, joblib, accelerate, econml, openai
 
-**Optional**: openai (explicit feature extraction via vLLM server)
+**Optional `local-llm`**: vllm, openai-harmony
 
 **Device support**: CUDA (NVIDIA GPUs), MPS (Apple Silicon M1/M2/M3), CPU
 

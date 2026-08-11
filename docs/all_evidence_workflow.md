@@ -83,6 +83,25 @@ in these readable copies but remain available to the in-memory model config.
 JSON and YAML config files are accepted. YAML requires PyYAML in the current
 environment.
 
+### Architecture selection
+
+By default, Stage 1 retains the historical behavior: it runs every architecture
+enabled by the resolved model configuration. To make an architecture subset a
+first-class scientific choice, set `science.stage1_architectures` to a JSON list
+or pass a comma-separated CLI value:
+
+```bash
+uv run python scripts/run_all_evidence.py \
+  --config my_run.json \
+  --architectures embedding_whole_cohort,tfidf_semantic_retrieval_contrasts
+```
+
+The registry resolves private prerequisites such as the embedding cache and
+whole-cohort contrast computation, but only selected architecture envelopes are
+written to a targeted handoff and admitted to Stage 2. A saved explicit
+selection cannot be changed while resuming. Omit the setting to resume an older
+run unchanged, or choose a fresh output directory for a different subset.
+
 ## Full, Stage-1-only, and Stage-2-only runs
 
 Stage 2 reads `handoff/evidence.jsonl` and completes the remainder of the
@@ -99,8 +118,8 @@ models on the training rows and writes held-out AIPW scores and conditional
 effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
 
 The only supported compiler is `semantic_cluster_cards_v2`. It checks each
-outer fold for every architecture enabled by the resolved Stage 1 scientific
-configuration before making an interpretation request. Missing evidence fails
+outer fold for every architecture in the frozen Stage 1 selection (or the
+resolved legacy enable flags) before making an interpretation request. Missing evidence fails
 with a readable Stage 1 rerun instruction. This is an in-process set comparison,
 not an artifact-authentication, byte-attestation, or deployment-gate system.
 The former `raw_packets_v1` compatibility option is intentionally unsupported
@@ -272,6 +291,9 @@ my_stage1_run/
       outer_001_inner_001/...
       evidence.jsonl
       complete.json
+  stage1_architectures/
+    manifest.json
+    <architecture>/evidence.jsonl
   handoff/
     text_models.jsonl
     tfidf.jsonl
@@ -279,6 +301,13 @@ my_stage1_run/
     evidence.jsonl
     index.json
     complete.json
+  evaluations/
+    stage1/
+      evaluation_manifest.json
+      metrics.jsonl
+      comparison.csv
+      summary.json
+      architectures/<architecture>/metrics.jsonl
   stage2/
     config.json
     evidence_compilation/
@@ -391,6 +420,23 @@ correlations, MAE, RMSE, ATE bias, and ITE dispersion are written to
 `posthoc_oracle_ite_metrics.json`; the joined rows are stored separately in
 `posthoc_predictions_with_oracle_ite.csv`. Without an oracle column, the same
 metrics file records `available: false`.
+
+Stage 1 itself can be evaluated architecture by architecture after the handoff
+has frozen its evidence:
+
+```bash
+uv run oci-evaluate-stage1 \
+  --run-dir /results/my_stage1_run \
+  --metadata /data/synthetic/metadata.json \
+  --architectures all
+```
+
+The evaluator hashes all consumed evidence and row-score sidecars before it
+loads oracle-bearing data. It never fits, ranks, or selects Stage 1 models. The
+per-architecture files contain native metrics appropriate to each evidence
+representation plus a common recovery view; `comparison.csv` is the compact
+cross-architecture summary. A completed legacy handoff is backfilled into the
+same additive `stage1_architectures/` contract without refitting.
 
 To intentionally rerun one component, use:
 

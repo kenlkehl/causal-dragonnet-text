@@ -26,6 +26,20 @@ import re
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Hashable, Mapping, Sequence
 
+from .stage1_architectures import (
+    BOW_NUISANCE,
+    BOW_R_LOSS,
+    EMBEDDING_CLUSTERED,
+    EMBEDDING_WHOLE_COHORT,
+    HTR_NEURAL,
+    MATCHED_PAIR_UPLIFT,
+    NEURAL_QUERY_MOMENTS,
+    STAGE1_ARCHITECTURES,
+    TFIDF_ORPHAN_NGRAMS,
+    TFIDF_SEMANTIC_RETRIEVAL,
+    TFIDF_TOPICS,
+)
+
 FUSION_PROMPT_VERSION = "all_evidence_candidate_fusion_v10"
 EVIDENCE_CONTRACT_GROUNDING_VERSION = "all_evidence_contract_name_grounding_v2"
 LEGACY_COMPACTION_STRATEGY_VERSION = "legacy_complete_canonical_order_v2"
@@ -46,34 +60,13 @@ VALID_EVIDENCE_INPUT_KINDS = frozenset(
     }
 )
 
-BOW_NUISANCE = "bow_nuisance"
-BOW_R_LOSS = "bow_r_loss"
-MATCHED_PAIR_UPLIFT = "matched_pair_uplift"
-HTR_NEURAL = "htr_neural"
-EMBEDDING_WHOLE_COHORT = "embedding_whole_cohort"
-EMBEDDING_CLUSTERED = "embedding_clustered"
-TFIDF_SEMANTIC_RETRIEVAL = "tfidf_semantic_retrieval_contrasts"
-TFIDF_TOPICS = "tfidf_topics"
-TFIDF_ORPHAN_NGRAMS = "tfidf_orphan_ngrams"
-NEURAL_QUERY_MOMENTS = "neural_query_moments"
 SPARSE_QUERY_MOMENTS = "sparse_query_moments"
 # Backward-compatible import name.  It intentionally denotes only learned
 # neural cohort-query evidence now; sparse lexical moments have their own
 # family and can no longer masquerade as the neural method.
 QUERY_MOMENTS = NEURAL_QUERY_MOMENTS
 
-PRIMARY_SOURCE_FAMILIES = (
-    BOW_NUISANCE,
-    BOW_R_LOSS,
-    MATCHED_PAIR_UPLIFT,
-    HTR_NEURAL,
-    EMBEDDING_WHOLE_COHORT,
-    EMBEDDING_CLUSTERED,
-    TFIDF_SEMANTIC_RETRIEVAL,
-    TFIDF_TOPICS,
-    TFIDF_ORPHAN_NGRAMS,
-    NEURAL_QUERY_MOMENTS,
-)
+PRIMARY_SOURCE_FAMILIES = STAGE1_ARCHITECTURES
 # Sparse query moments are an accepted auxiliary/legacy evidence family, not
 # one of the ten architectures promised by the researcher all-evidence path.
 ALL_SOURCE_FAMILIES = (

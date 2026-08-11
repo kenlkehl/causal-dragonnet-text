@@ -13,8 +13,9 @@ idea behind a causal forest in a differentiable text model:
 * effect-modifier evidence is exported at token level via gradient x attention
   of the neural causal-forest CATE output.
 
-The files under ``oci/inference`` and ``oracle_experiment_scripts`` wrap this
-module in train/predict/oracle command line scripts.
+Standalone inference code wraps this module for train/predict use. The research
+workflow evaluates any architecture artifacts post hoc through
+``oci.evaluation.stage1``.
 """
 
 from __future__ import annotations

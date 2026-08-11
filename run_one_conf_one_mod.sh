@@ -7,6 +7,7 @@
 #   ./run_one_conf_one_mod.sh
 #   GPU_COUNT=2 ./run_one_conf_one_mod.sh
 #   PHYSICAL_GPUS=1,3 STAGE2_ENDPOINT=http://127.0.0.1:8010/v1 ./run_one_conf_one_mod.sh
+#   STAGE1_ARCHITECTURES=bow_nuisance,tfidf_topics ./run_one_conf_one_mod.sh
 #   ./run_one_conf_one_mod.sh /persistent/results/my_run
 
 set -euo pipefail

@@ -937,3 +937,62 @@ def test_old_stage2_command_is_rejected_instead_of_silently_ignored(tmp_path):
 
     with pytest.raises(ValueError, match="stage2.command is not used"):
         compile_config(raw, config_dir=tmp_path)
+
+
+def test_stage1_architecture_selector_is_scientific_and_prunes_producers(tmp_path):
+    raw, _legacy = _inputs(tmp_path)
+    raw["science"]["stage1_architectures"] = ["bow_nuisance"]
+    config = compile_config(raw, config_dir=tmp_path)
+    workflow = ResearchAllEvidenceWorkflow(config)
+
+    assert config.stage1_architectures == ("bow_nuisance",)
+    assert workflow.components == ("text_models", "handoff")
+    assert config.components == COMPONENT_ORDER
+
+
+def test_cli_architecture_selector_populates_science_config(tmp_path):
+    raw, _config = _inputs(tmp_path)
+    config_path = tmp_path / "run.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "--config",
+            str(config_path),
+            "--architectures",
+            "tfidf_topics,bow_nuisance",
+        ]
+    )
+
+    overridden, config_dir = _raw_config_from_args(args)
+    config = compile_config(overridden, config_dir=config_dir)
+
+    assert config.stage1_architectures == ("bow_nuisance", "tfidf_topics")
+
+
+def test_legacy_run_config_omits_unset_architecture_selector(tmp_path):
+    _raw, config = _inputs(tmp_path)
+
+    assert "stage1_architectures" not in config.as_dict()
+
+
+def test_architecture_selector_cannot_be_added_to_existing_legacy_output(tmp_path):
+    raw, _config = _inputs(tmp_path)
+    completion = tmp_path / "output" / "components" / "tfidf" / "complete.json"
+    completion.parent.mkdir(parents=True)
+    completion.write_text('{"status":"complete"}', encoding="utf-8")
+    raw["science"]["stage1_architectures"] = ["tfidf_topics"]
+    selected = compile_config(raw, config_dir=tmp_path)
+
+    with pytest.raises(ValueError, match="fresh output directory"):
+        ResearchAllEvidenceWorkflow(selected)
+
+
+def test_selected_direct_architecture_must_not_be_disabled(tmp_path):
+    raw, _config = _inputs(tmp_path)
+    raw["science"]["stage1_architectures"] = ["htr_neural"]
+    raw["science"]["htr_enabled"] = False
+    selected = compile_config(raw, config_dir=tmp_path)
+    workflow = ResearchAllEvidenceWorkflow(selected)
+
+    with pytest.raises(ValueError, match="disabled by their direct implementation"):
+        workflow._resolved_context()

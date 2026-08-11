@@ -30,7 +30,7 @@ from ..config import (
 )
 from ..models.causal_forest_head import CausalForestHead
 from ..utils.calibration import BinaryProbabilityCalibrator
-from .agentic_attention_variable_forest import (
+from .htr_modeling_support import (
     _EffectNet,
     _NuisanceNet,
     _binary_log_loss_from_logits,
@@ -41,13 +41,13 @@ from .agentic_attention_variable_forest import (
     _run_crossfit_fold_tasks,
     clip_probability,
 )
-from .agentic_explicit_feature_forest import (
+from .causal_modeling_support import (
     _fit_predict_outcome,
     _fit_predict_propensity,
     _r_loss,
     _safe_roc_auc,
 )
-from .applied_explicit_feature_forest import _hstack_present
+from .causal_modeling_support import _hstack_present
 from .embedding_contrast_discovery import (
     EmbeddingContrastEvidenceGenerator,
     _binary_labels,
@@ -63,32 +63,36 @@ from .embedding_contrast_discovery import (
     _tail_labels,
 )
 from .discovery_randomness import derive_discovery_seed
-from .multi_model_agentic_forest import (
-    MultiModelHTREvidenceProvider,
+from .stage1_agent_context_support import (
+    _build_evidence_digest_agent_context,
+    _compact_multi_model_agent_context,
+)
+from .stage1_modeling_support import (
     _agent_visible_metrics,
     _agentic_discovery_handoff_row,
     _align_htr_prediction_frame,
+    _clinical_text_examples,
+    _htr_effect_metrics,
+    _htr_nuisance_metrics,
+    _multi_view_importance,
+    _normalize_texts,
+    _split_is_honest,
+    _top_phrase_feature_rows,
+    _write_json,
+    _write_jsonl,
+)
+from .htr_evidence_provider import MultiModelHTREvidenceProvider
+from .sparse_text_modeling import (
     _binary_split_items,
     _bow_model_params,
     _bow_vectorizer_params,
     _bounded_fold_count,
-    _build_evidence_digest_agent_context,
-    _clinical_text_examples,
-    _compact_multi_model_agent_context,
     _fit_regressor,
-    _htr_effect_metrics,
-    _htr_nuisance_metrics,
     _make_bow_classifier,
     _make_bow_regressor,
     _make_bow_vectorizer,
     _model_feature_scores,
-    _multi_view_importance,
-    _normalize_texts,
-    _split_is_honest,
     _top_feature_rows,
-    _top_phrase_feature_rows,
-    _write_json,
-    _write_jsonl,
 )
 from .multi_model_pair_uplift import (
     fit_bow_pair_uplift_train_test,
@@ -1388,6 +1392,19 @@ class MultiModelForestStage1Runner:
             test_df=heldout_df,
             outer_fold=int(fold_key),
         )
+        if bundle.prediction_frames:
+            predictions = pd.concat(bundle.prediction_frames, ignore_index=True)
+            predictions["fold_key"] = predictions["outer_fold"].astype(int)
+            predictions["outer_fold"] = int(outer_fold)
+            predictions["inner_fold"] = (
+                None if inner_fold is None else int(inner_fold)
+            )
+            predictions["scope"] = str(scope)
+            predictions["architecture"] = predictions["source_name"].map(
+                _source_prediction_architecture
+            )
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            predictions.to_parquet(self.output_path, index=False)
         result = copy.deepcopy(bundle.handoff_evidence or {})
         metrics = dict(result.get("metrics") or {})
         metrics.update(bundle.metrics)
@@ -2635,6 +2652,19 @@ class MultiModelForestStage1Runner:
                 )
             embedding_rows.extend(emb["metadata"])
             inner_model_rows.extend(emb.get("inner_model_rows", []))
+            for item in [*emb["w_features"], *emb["x_features"]]:
+                contrast_family = str(item.get("contrast_family") or "whole_cohort")
+                prediction_frames.append(
+                    _source_prediction_frame(
+                        train_df,
+                        test_df,
+                        outer_fold=outer_fold,
+                        source_name=(
+                            f"embedding__{contrast_family}__{item['name']}"
+                        ),
+                        values={"score": (item["train"], item["test"])},
+                    )
+                )
             embedding_evidence = self._build_primary_embedding_contrast_evidence(
                 discovery_df=train_df,
                 y=y,
@@ -4279,6 +4309,27 @@ def _source_prediction_frame(
             payload[column] = np.asarray(pair[index], dtype=float)
         rows.append(pd.DataFrame(payload))
     return pd.concat(rows, ignore_index=True)
+
+
+def _source_prediction_architecture(source_name: Any) -> str:
+    """Map a row-score producer onto the public Stage 1 architecture contract."""
+
+    source = str(source_name).lower()
+    if "matched_pair" in source or "pair_uplift" in source:
+        return "matched_pair_uplift"
+    if source.startswith("bow__") and "__nuisance" in source:
+        return "bow_nuisance"
+    if source.startswith("bow__") and "__effect" in source:
+        return "bow_r_loss"
+    if source.startswith("htr__"):
+        return "htr_neural"
+    if source.startswith("embedding__"):
+        if "retrieval" in source or "tfidf" in source:
+            return "tfidf_semantic_retrieval_contrasts"
+        if "cluster" in source:
+            return "embedding_clustered"
+        return "embedding_whole_cohort"
+    return "private_support"
 
 
 def _weighted_binary_direction(

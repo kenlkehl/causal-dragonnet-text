@@ -2,8 +2,8 @@
 """Embed a PubMed JSONL corpus into an external retrieval cache.
 
 The final output directory is directly consumable by
-``EmbeddingContrastDiscoveryConfig.external_corpus_cache_dirs`` and the oracle
-script's ``--embedding-external-cache-dir`` flag.
+``EmbeddingContrastDiscoveryConfig.external_corpus_cache_dirs`` in the research
+Stage 1 workflow.
 """
 
 from __future__ import annotations

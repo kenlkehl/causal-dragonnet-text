@@ -22,6 +22,7 @@ stage1_workers="${STAGE1_WORKERS:-auto}"
 stage2_workers="${STAGE2_WORKERS:-auto}"
 stage2_endpoint="${STAGE2_ENDPOINT-http://127.0.0.1:8010/v1}"
 stage2_model="${STAGE2_MODEL:-}"
+stage1_architectures="${STAGE1_ARCHITECTURES:-}"
 min_free_gpu_gib="${MIN_FREE_GPU_GB:-20}"
 python_bin="${OCI_PYTHON:-}"
 outer_folds=5
@@ -115,6 +116,14 @@ else
     stage2_description="${stage2_endpoint} (${resolved_stage2_workers} concurrent requests)"
 fi
 
+if [[ -n "${stage1_architectures}" ]]; then
+    architecture_args=(--architectures "${stage1_architectures}")
+    architecture_description="${stage1_architectures}"
+else
+    architecture_args=()
+    architecture_description="legacy enabled set"
+fi
+
 echo "Dataset:        ${dataset}"
 echo "Output:         ${output_dir}"
 echo "Progress:       ${output_dir}/progress.json"
@@ -123,6 +132,7 @@ echo "CUDA devices:   ${devices}"
 echo "GPU memory:     ${gpu_summary}"
 echo "CPU budget:     ${worker_count} workers (${cpu_count} available)"
 echo "Stage 2:        ${stage2_description}"
+echo "Architectures:  ${architecture_description}"
 echo "HTR modeling:   $([[ "${disable_htr}" == "1" ]] && echo disabled || echo enabled)"
 
 export PYTHONUNBUFFERED=1
@@ -145,5 +155,6 @@ exec "${python_bin}" -m oci.inference.research_all_evidence_workflow \
     --embedding-model Qwen/Qwen3-Embedding-8B \
     --set science.stage1.architecture.multi_model_forest.embedding_contrast.max_chunks=512 \
     --set science.stage1.architecture.htr_max_chunks=512 \
+    "${architecture_args[@]}" \
     "${htr_args[@]}" \
     "${stage_mode_args[@]}"
