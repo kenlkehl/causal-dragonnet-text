@@ -1742,23 +1742,10 @@ def _fake_completion(calls):
                     ],
                 }
             )
-        if body["job"] == "group_stage2_candidate_measurements":
+        if body["job"] == "decide_stage2_candidate_alias_pair":
             assert "packet_id" not in messages[1]["content"]
-            return json.dumps(
-                {
-                    "groups": [
-                        {
-                            "group_id": "group_001",
-                            "member_candidate_ids": [
-                                candidate["candidate_id"] for candidate in body["candidates"]
-                            ],
-                            "canonical_name": "performance_status",
-                            "canonical_description": "Baseline ECOG performance status.",
-                        }
-                    ],
-                    "excluded_candidate_ids": [],
-                }
-            )
+            assert set(body) >= {"left_candidate", "right_candidate"}
+            return json.dumps({"same_scalar_measurement": True})
         if body["job"] == "select_stage2_candidate_groups":
             assert "packet_id" not in messages[1]["content"]
             return json.dumps(
@@ -2095,29 +2082,15 @@ def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
     assert completion["feature_batches"] == 2
 
 
-def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
+def test_stage2_pairwise_consolidation_does_not_lose_candidates():
     prompt_sizes = []
 
     def completion(messages, _config):
         prompt_sizes.append(sum(len(message["content"]) for message in messages))
         body = json.loads(messages[1]["content"])
         assert "packet_1" not in messages[1]["content"]
-        if body["job"] == "group_stage2_candidate_measurements":
-            return json.dumps(
-                {
-                    "groups": [
-                        {
-                            "group_id": "group_001",
-                            "member_candidate_ids": [
-                                candidate["candidate_id"] for candidate in body["candidates"]
-                            ],
-                            "canonical_name": "performance_status",
-                            "canonical_description": "Baseline ECOG performance status.",
-                        }
-                    ],
-                    "excluded_candidate_ids": [],
-                }
-            )
+        if body["job"] == "decide_stage2_candidate_alias_pair":
+            return json.dumps({"same_scalar_measurement": True})
         assert body["job"] == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
@@ -2134,7 +2107,7 @@ def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
     config = PlainHandoffStage2Config(
         endpoint="http://stage2.test/v1",
         model="test-model",
-        max_prompt_chars=6_000,
+        max_prompt_chars=8_000,
         max_candidates_per_fold=3,
     )
     runner = PlainHandoffStage2(
@@ -2168,75 +2141,94 @@ def test_stage2_map_reduces_oversized_consolidation_without_losing_candidates():
     }
 
 
-def test_candidate_grouping_preserves_model_omissions_as_singletons(caplog):
+def test_candidate_pair_prompt_exposes_semantics_without_candidate_ids():
+    messages = stage2_workflow._candidate_pair_prompt(
+        left={
+            "candidate_id": "opaque_candidate_alpha",
+            "name": "resting_pulse_rate",
+            "description": "Resting pulse rate before treatment.",
+        },
+        right={
+            "candidate_id": "opaque_candidate_beta",
+            "name": "pulse_rate_at_rest",
+            "description": "Pulse rate measured at rest before treatment.",
+        },
+    )
+
+    body = json.loads(messages[1]["content"])
+
+    assert body["job"] == "decide_stage2_candidate_alias_pair"
+    assert body["response"] == {"same_scalar_measurement": "boolean"}
+    assert "opaque_candidate_alpha" not in messages[1]["content"]
+    assert "opaque_candidate_beta" not in messages[1]["content"]
+    assert "candidate_id" not in messages[1]["content"]
+
+
+def test_candidate_pair_validator_requires_one_boolean_decision():
+    assert stage2_workflow._validate_candidate_pair_decision(
+        {"same_scalar_measurement": False}
+    ) == {"same_scalar_measurement": False}
+
+    with pytest.raises(ValueError, match="requires boolean"):
+        stage2_workflow._validate_candidate_pair_decision(
+            {"same_scalar_measurement": "false"}
+        )
+
+
+def test_fuzzy_candidate_blocking_proposes_generic_similar_names_only():
     candidates = [
+        {"name": "resting_pulse_rate", "description": "Pulse measured at rest."},
+        {"name": "pulse_rate_at_rest", "description": "Resting pulse measurement."},
+        {"name": "serum_osmolality", "description": "Laboratory osmolality."},
         {
-            "candidate_id": "candidate_0001",
-            "name": "measurement_alpha",
-            "description": "Pretreatment measurement alpha.",
+            "name": "left_ventricular_ejection_fraction",
+            "description": "Cardiac ejection fraction.",
+        },
+        {"name": "lvef", "description": "A cardiac fraction."},
+    ]
+
+    pairs = stage2_workflow._candidate_comparison_pairs(candidates)
+    indices = {(row["left_index"], row["right_index"]) for row in pairs}
+
+    assert (0, 1) in indices
+    assert (3, 4) in indices
+    assert (0, 2) not in indices
+    assert (2, 4) not in indices
+
+
+def test_pairwise_clustering_preserves_groups_across_transitive_conflict(caplog):
+    candidates = [
+        {"candidate_id": "candidate_alpha"},
+        {"candidate_id": "candidate_beta"},
+        {"candidate_id": "candidate_gamma"},
+    ]
+    decisions = [
+        {
+            "left_index": 0,
+            "right_index": 1,
+            "fuzzy_score": 0.9,
+            "same_scalar_measurement": True,
         },
         {
-            "candidate_id": "candidate_0002",
-            "name": "measurement_beta",
-            "description": "Pretreatment measurement beta.",
+            "left_index": 1,
+            "right_index": 2,
+            "fuzzy_score": 0.8,
+            "same_scalar_measurement": True,
+        },
+        {
+            "left_index": 0,
+            "right_index": 2,
+            "fuzzy_score": 0.7,
+            "same_scalar_measurement": False,
         },
     ]
 
-    result = stage2_workflow._validate_candidate_grouping(
-        {
-            "groups": [
-                {
-                    "group_id": "group_001",
-                    "member_candidate_ids": ["candidate_0001"],
-                    "canonical_name": "measurement_alpha",
-                    "canonical_description": "Pretreatment measurement alpha.",
-                }
-            ],
-            "excluded_candidate_ids": [],
-        },
-        candidates=candidates,
+    clusters = stage2_workflow._candidate_clusters_from_pair_decisions(
+        candidates, decisions
     )
 
-    assert result["groups"][-1]["member_candidate_ids"] == ["candidate_0002"]
-    assert result["groups"][-1]["canonical_name"] == "measurement_beta"
-    assert "preserved 1 omitted candidate ID" in caplog.text
-
-
-def test_candidate_grouping_split_warning_includes_clinical_names(caplog):
-    candidates = [
-        {
-            "candidate_id": "candidate_alpha",
-            "name": "signal_alpha",
-            "description": "Continuous alpha signal.",
-        },
-        {
-            "candidate_id": "candidate_beta",
-            "name": "attribute_beta",
-            "description": "Binary beta attribute.",
-        },
-    ]
-
-    materialized, excluded = stage2_workflow._materialize_grouping_response(
-        {
-            "groups": [
-                {
-                    "group_id": "group_003",
-                    "member_candidate_ids": ["candidate_alpha", "candidate_beta"],
-                    "canonical_name": "attribute_beta",
-                    "canonical_description": "Binary beta attribute.",
-                }
-            ],
-            "excluded_candidate_ids": [],
-        },
-        candidates=candidates,
-        id_prefix="group_r01_b001",
-    )
-
-    assert len(materialized) == 2
-    assert excluded == []
-    assert "group=group_003 canonical_name=attribute_beta" in caplog.text
-    assert "signal_alpha" in caplog.text
-    assert "attribute_beta" in caplog.text
+    assert clusters == [[0, 1], [2]]
+    assert "transitive conflict" in caplog.text
 
 
 def test_group_selection_prompt_requests_only_ranked_retained_ids():
@@ -2315,26 +2307,27 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     tmp_path: Path,
 ):
     prompt_bodies = []
-    packet_ids = ["packet_alpha_long_id", "packet_beta_long_id", "packet_gamma_long_id"]
+    packet_ids = [
+        "packet_alpha_long_id",
+        "packet_beta_long_id",
+        "packet_gamma_long_id",
+        "packet_delta_long_id",
+    ]
 
     def completion(messages, _config):
         rendered = messages[1]["content"]
         assert all(packet_id not in rendered for packet_id in packet_ids)
         body = json.loads(rendered)
         prompt_bodies.append(body)
-        if body["job"] == "group_stage2_candidate_measurements":
+        if body["job"] == "decide_stage2_candidate_alias_pair":
+            names = {
+                body["left_candidate"]["name"],
+                body["right_candidate"]["name"],
+            }
             return json.dumps(
                 {
-                    "groups": [
-                        {
-                            "group_id": f"proposed_{index:03d}",
-                            "member_candidate_ids": [candidate["candidate_id"]],
-                            "canonical_name": candidate["name"],
-                            "canonical_description": candidate["description"],
-                        }
-                        for index, candidate in enumerate(body["candidates"], start=1)
-                    ],
-                    "excluded_candidate_ids": [],
+                    "same_scalar_measurement": names
+                    == {"serum_sodium", "blood_sodium_concentration"}
                 }
             )
         if body["job"] == "select_stage2_candidate_groups":
@@ -2393,6 +2386,16 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
             "evidence_axes": ["outcome"],
             "caveats": "",
         },
+        {
+            "candidate_id": "candidate_0004",
+            "architecture": "architecture_delta",
+            "name": "blood_sodium_concentration",
+            "description": "Pretreatment sodium concentration in blood.",
+            "value_type": "continuous",
+            "supporting_packet_ids": [packet_ids[3]],
+            "evidence_axes": ["treatment", "outcome"],
+            "caveats": "",
+        },
     ]
 
     checkpoint_dir = tmp_path / "consolidation"
@@ -2403,11 +2406,11 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     )
 
     assert [feature["supporting_packet_ids"] for feature in result["features"]] == [
-        [packet_ids[0]],
+        [packet_ids[0], packet_ids[3]],
         [packet_ids[1]],
     ]
     assert [feature["supporting_architectures"] for feature in result["features"]] == [
-        ["architecture_alpha"],
+        ["architecture_alpha", "architecture_delta"],
         ["architecture_beta"],
     ]
     assert result["features"][0]["roles"] == ["confounder"]
@@ -2415,8 +2418,9 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0002"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0003"]["status"] == "excluded"
+    assert result["candidate_dispositions"]["candidate_0004"]["status"] == "merged"
     assert {body["job"] for body in prompt_bodies} == {
-        "group_stage2_candidate_measurements",
+        "decide_stage2_candidate_alias_pair",
         "select_stage2_candidate_groups",
         "operationalize_stage2_candidate_group",
     }
@@ -2931,7 +2935,7 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
     # Architecture-stratified compilation interprets the two producers
     # independently, then consolidates their candidates.
     assert calls.count("infer_clinical_features_from_text_evidence") == 2
-    assert calls.count("group_stage2_candidate_measurements") == 1
+    assert calls.count("decide_stage2_candidate_alias_pair") == 1
     assert calls.count("operationalize_stage2_candidate_group") == 1
 
     second = run_plain_handoff_stage2(

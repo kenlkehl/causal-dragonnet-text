@@ -20,6 +20,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
@@ -46,15 +47,25 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
-CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v4_closed_ontology"
+CONSOLIDATION_SCHEMA_VERSION = "candidate_pair_alias_v5_python_groups"
 GROUP_SELECTION_CONTRACT_VERSION = "retained_group_ids_v2_python_complement"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v4"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v2_scalar"
+PAIRWISE_ALIAS_MIN_FUZZY_SCORE = 0.44
+PAIRWISE_ALIAS_MAX_NEIGHBORS = 4
 
 _CONCEPT_IDENTITY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
     "assessment",
+    "at",
     "baseline",
+    "be",
     "biomarker",
+    "by",
     "clinical",
     "confounder",
     "diagnosis",
@@ -64,14 +75,23 @@ _CONCEPT_IDENTITY_STOPWORDS = {
     "evidence",
     "expression",
     "feature",
+    "for",
+    "from",
+    "has",
+    "have",
     "history",
+    "in",
     "information",
+    "is",
     "level",
     "measurement",
     "metastasis",
     "modifier",
     "mutation",
     "outcome",
+    "of",
+    "on",
+    "or",
     "patient",
     "presence",
     "pretreatment",
@@ -81,9 +101,18 @@ _CONCEPT_IDENTITY_STOPWORDS = {
     "score",
     "specific",
     "status",
+    "that",
+    "the",
+    "this",
+    "to",
     "treatment",
+    "use",
     "value",
     "variable",
+    "was",
+    "were",
+    "with",
+    "without",
 }
 
 
@@ -2149,214 +2178,271 @@ def _candidate_architectures(candidate: Mapping[str, Any]) -> list[str]:
     )
 
 
-def _candidate_grouping_view(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the semantic view exposed to grouping; never expose provenance IDs."""
+def _candidate_pair_view(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Return semantic candidate text without IDs or provenance bookkeeping."""
 
-    origins = _string_values(candidate.get("origin_candidate_ids")) or [
-        str(candidate["candidate_id"])
-    ]
     return {
-        "candidate_id": str(candidate["candidate_id"]),
-        "name": str(candidate.get("name") or "").strip(),
-        "description": _short_text(candidate.get("description"), max_chars=1_000),
-        "evidence_rationale": _short_text(candidate.get("evidence_rationale"), max_chars=1_000),
+        "name": _short_text(candidate.get("name"), max_chars=200),
+        "description": _short_text(candidate.get("description"), max_chars=400),
+        "evidence_rationale": _short_text(candidate.get("evidence_rationale"), max_chars=300),
         "value_type": str(candidate.get("value_type") or "ambiguous"),
-        "evidence_axes": _canonical_evidence_axes(candidate.get("evidence_axes")),
-        "supporting_architectures": _candidate_architectures(candidate),
-        "origin_candidate_count": len(origins),
-        "packet_support_count": len(_string_values(candidate.get("supporting_packet_ids"))),
-        "caveats": _short_text(candidate.get("caveats"), max_chars=500),
+        "caveats": _short_text(candidate.get("caveats"), max_chars=100),
     }
 
 
-def _candidate_grouping_prompt(
+def _candidate_pair_prompt(
     *,
-    clinical_question: str,
-    outer_fold: int,
-    candidates: Sequence[Mapping[str, Any]],
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
 ) -> list[dict[str, str]]:
     body = {
-        "job": "group_stage2_candidate_measurements",
-        "clinical_question": clinical_question,
-        "outer_fold": int(outer_fold),
+        "job": "decide_stage2_candidate_alias_pair",
+        "question": (
+            "Do these two candidates denote the same single patient-level pretreatment "
+            "measurement?"
+        ),
         "rules": [
-            "Group only true aliases of the same patient-level pretreatment measurement.",
-            "Different biomarkers, diagnoses, scales, laboratory measurements, or clinical quantities must remain in different groups even when they share evidence or a causal role.",
-            "Every eventual feature must be one scalar. Keep independently varying components of a compound measurement in different groups.",
-            "Merge spelling variants, abbreviations, and equivalent names when they denote the same scalar measurement.",
-            "Do not copy, invent, or return evidence packet IDs, architectures, causal roles, or operational definitions.",
-            "Use only supplied candidate IDs as group members or exclusions, exactly once each.",
-            "Exclude only entries that are not a concrete patient-level pretreatment measurement; do not exclude merely because support is weak or duplicated.",
+            "Return true only for aliases of the same scalar measurement.",
+            "Return false for related but independently varying measurements.",
+            "Return false for a broad concept versus one of its components or states.",
+            "Return false for different biomarkers, diagnoses, anatomical sites, scales, "
+            "laboratory quantities, or treatment variables.",
+            "Spelling variants, abbreviations, and equivalent clinical names may be true.",
+            "Respond with exactly one JSON boolean field and no explanation.",
         ],
-        "candidates": [_candidate_grouping_view(candidate) for candidate in candidates],
-        "response": {
-            "groups": [
-                {
-                    "group_id": "group_001",
-                    "member_candidate_ids": ["supplied candidate IDs"],
-                    "canonical_name": "snake_case_scalar_measurement_name",
-                    "canonical_description": "concise description of the common measurement",
-                }
-            ],
-            "excluded_candidate_ids": ["supplied candidate IDs that are not measurements"],
-        },
+        "left_candidate": _candidate_pair_view(left),
+        "right_candidate": _candidate_pair_view(right),
+        "response": {"same_scalar_measurement": "boolean"},
     }
     return [
         {
             "role": "system",
-            "content": (
-                "You reconcile semantic aliases among candidate clinical measurements. "
-                "Return JSON only."
-            ),
+            "content": "Judge one clinical measurement alias pair. Return JSON only.",
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
     ]
 
 
-def _validate_candidate_grouping(
-    value: Mapping[str, Any],
-    *,
-    candidates: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    raw_groups = value.get("groups")
-    raw_excluded = value.get("excluded_candidate_ids")
-    if not isinstance(raw_groups, list):
-        raise ValueError("candidate grouping requires a groups list")
-    if raw_excluded is None:
-        raw_excluded = []
-    if not isinstance(raw_excluded, Sequence) or isinstance(raw_excluded, str):
-        raise ValueError("candidate grouping requires an excluded_candidate_ids list")
-
-    supplied_ids = [str(candidate["candidate_id"]) for candidate in candidates]
-    if len(supplied_ids) != len(set(supplied_ids)):
-        raise ValueError("candidate grouping received duplicate supplied candidate IDs")
-    supplied = set(supplied_ids)
-    seen: set[str] = set()
-    groups: list[dict[str, Any]] = []
-    for index, raw_group in enumerate(raw_groups, start=1):
-        if not isinstance(raw_group, Mapping):
-            raise ValueError(f"candidate group at position={index} must be an object")
-        members = _string_values(raw_group.get("member_candidate_ids"))
-        if not members:
-            raise ValueError(f"candidate group at position={index} has no members")
-        unknown = sorted(set(members) - supplied)
-        if unknown:
-            raise ValueError(f"candidate group cites unknown candidate ID(s): {unknown[:8]}")
-        duplicates = sorted(set(members).intersection(seen))
-        if duplicates:
-            raise ValueError(f"candidate grouping assigns candidate ID(s) twice: {duplicates[:8]}")
-        seen.update(members)
-        fallback_name = _snake_case_name(
-            next(
-                candidate.get("name")
-                for candidate in candidates
-                if str(candidate["candidate_id"]) == members[0]
-            ),
-            fallback=f"measurement_{index:03d}",
-        )
-        groups.append(
-            {
-                "group_id": str(raw_group.get("group_id") or f"group_{index:03d}"),
-                "member_candidate_ids": members,
-                "canonical_name": _snake_case_name(
-                    raw_group.get("canonical_name"), fallback=fallback_name
-                ),
-                "canonical_description": _short_text(
-                    raw_group.get("canonical_description"), max_chars=2_000
-                ),
-            }
-        )
-
-    excluded = _string_values(raw_excluded)
-    unknown_excluded = sorted(set(excluded) - supplied)
-    if unknown_excluded:
-        raise ValueError(
-            "candidate grouping excludes unknown candidate ID(s): " f"{unknown_excluded[:8]}"
-        )
-    duplicate_excluded = sorted(set(excluded).intersection(seen))
-    if duplicate_excluded:
-        raise ValueError(
-            "candidate grouping both groups and excludes candidate ID(s): "
-            f"{duplicate_excluded[:8]}"
-        )
-    if len(excluded) != len(set(excluded)):
-        raise ValueError("candidate grouping repeats an excluded candidate ID")
-    seen.update(excluded)
-    missing = sorted(supplied - seen)
-    if missing:
-        LOGGER.warning(
-            "Stage 2 candidate grouping preserved %s omitted candidate ID(s) as "
-            "conservative singleton groups: %s",
-            len(missing),
-            missing[:8],
-        )
-        candidate_by_id = {str(candidate["candidate_id"]): candidate for candidate in candidates}
-        for candidate_id in missing:
-            candidate = candidate_by_id[candidate_id]
-            groups.append(
-                {
-                    "group_id": f"python_singleton_{len(groups) + 1:03d}",
-                    "member_candidate_ids": [candidate_id],
-                    "canonical_name": _snake_case_name(
-                        candidate.get("name"),
-                        fallback=f"measurement_{len(groups) + 1:03d}",
-                    ),
-                    "canonical_description": _short_text(
-                        candidate.get("description"), max_chars=2_000
-                    ),
-                }
-            )
-    return {"groups": groups, "excluded_candidate_ids": excluded}
+def _validate_candidate_pair_decision(value: Mapping[str, Any]) -> dict[str, bool]:
+    decision = value.get("same_scalar_measurement")
+    if not isinstance(decision, bool):
+        raise ValueError("candidate pair requires boolean same_scalar_measurement")
+    return {"same_scalar_measurement": decision}
 
 
-def _candidate_pair_is_semantically_compatible(
-    left: Mapping[str, Any], right: Mapping[str, Any]
-) -> bool:
-    return _consolidation_route_is_semantically_compatible(
-        left,
-        {
-            "name": right.get("name"),
-            "description": right.get("description"),
-        },
+def _normalized_fuzzy_text(value: Any) -> str:
+    return " ".join(sorted(_concept_identity_tokens(value)))
+
+
+def _fuzzy_token_similarity(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+    ratio = SequenceMatcher(None, left, right).ratio()
+    common_prefix = len(os.path.commonprefix((left, right)))
+    if ratio >= 0.78 or (common_prefix >= 4 and ratio >= 0.68):
+        return ratio
+    return 0.0
+
+
+def _fuzzy_token_containment(left: set[str], right: set[str]) -> float:
+    """Return fuzzy token coverage of the smaller nonempty token set."""
+
+    if not left or not right:
+        return 0.0
+    similarities = sorted(
+        (
+            _fuzzy_token_similarity(left_token, right_token),
+            left_token,
+            right_token,
+        )
+        for left_token in left
+        for right_token in right
+    )
+    used_left: set[str] = set()
+    used_right: set[str] = set()
+    matched = 0.0
+    for similarity, left_token, right_token in reversed(similarities):
+        if similarity <= 0 or left_token in used_left or right_token in used_right:
+            continue
+        used_left.add(left_token)
+        used_right.add(right_token)
+        matched += similarity
+    return matched / min(len(left), len(right))
+
+
+def _name_acronyms(value: Any) -> set[str]:
+    words = [
+        word
+        for word in re.findall(r"[a-z]+[a-z0-9]*", str(value or "").lower())
+        if word not in _CONCEPT_IDENTITY_STOPWORDS
+    ]
+    if len(words) < 2:
+        return set()
+    acronym = "".join(word[0] for word in words)
+    if not 2 <= len(acronym) <= 12:
+        return set()
+    return {acronym[:stop] for stop in range(2, len(acronym) + 1)}
+
+
+def _character_ngram_similarity(left: str, right: str, *, width: int = 3) -> float:
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if len(left) < width or len(right) < width:
+        return SequenceMatcher(None, left, right).ratio()
+    left_ngrams = {left[index : index + width] for index in range(len(left) - width + 1)}
+    right_ngrams = {right[index : index + width] for index in range(len(right) - width + 1)}
+    return 2.0 * len(left_ngrams.intersection(right_ngrams)) / (
+        len(left_ngrams) + len(right_ngrams)
     )
 
 
-def _semantically_safe_member_clusters(
-    members: Sequence[Mapping[str, Any]],
-    *,
-    canonical_name: str,
-    canonical_description: str,
-) -> list[list[Mapping[str, Any]]]:
-    """Conservatively split a model-proposed group when lexical anchors conflict."""
-
-    canonical = {
-        "name": canonical_name,
-        "description": canonical_description,
+def _candidate_fuzzy_signature(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    name = str(candidate.get("name") or "")
+    return {
+        "name_tokens": _concept_identity_tokens(name),
+        "all_tokens": _concept_identity_tokens(name, candidate.get("description")),
+        "compact": _normalized_fuzzy_text(name),
+        "acronyms": _name_acronyms(name),
     }
-    canonical_tokens = _concept_identity_tokens(canonical_name, canonical_description)
-    compatible_members: list[Mapping[str, Any]] = []
-    incompatible_members: list[Mapping[str, Any]] = []
-    for member in members:
-        compatible = bool(canonical_tokens) and _consolidation_route_is_semantically_compatible(
-            member, canonical
-        )
-        (compatible_members if compatible else incompatible_members).append(member)
 
-    # The canonical description is where the semantic grouper can explicitly
-    # bridge abbreviations and full names that do not share literal tokens.
-    clusters: list[list[Mapping[str, Any]]] = [compatible_members] if compatible_members else []
-    for member in incompatible_members:
-        placed = False
-        for cluster in clusters:
-            if all(
-                _candidate_pair_is_semantically_compatible(member, existing) for existing in cluster
-            ):
-                cluster.append(member)
-                placed = True
-                break
-        if not placed:
-            clusters.append([member])
-    return clusters
+
+def _candidate_fuzzy_signature_score(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> float:
+    left_name_tokens = left["name_tokens"]
+    right_name_tokens = right["name_tokens"]
+    left_all_tokens = left["all_tokens"]
+    right_all_tokens = right["all_tokens"]
+    left_compact = str(left["compact"])
+    right_compact = str(right["compact"])
+
+    scores = [
+        0.90 * _fuzzy_token_containment(left_name_tokens, right_name_tokens),
+        0.78 * _fuzzy_token_containment(left_name_tokens, right_all_tokens),
+        0.78 * _fuzzy_token_containment(right_name_tokens, left_all_tokens),
+        0.82 * SequenceMatcher(None, left_compact, right_compact).ratio()
+        if left_compact and right_compact
+        else 0.0,
+        0.85 * _character_ngram_similarity(left_compact, right_compact),
+    ]
+    if left_compact and right_compact and left_compact == right_compact:
+        scores.append(1.0)
+    if left_compact in right["acronyms"] or right_compact in left["acronyms"]:
+        scores.append(0.96)
+    return max(scores)
+
+
+def _candidate_pair_fuzzy_score(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> float:
+    """Score generic string similarity for deciding which pairs deserve LLM review."""
+
+    return _candidate_fuzzy_signature_score(
+        _candidate_fuzzy_signature(left),
+        _candidate_fuzzy_signature(right),
+    )
+
+
+def _candidate_comparison_pairs(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    min_score: float = PAIRWISE_ALIAS_MIN_FUZZY_SCORE,
+    max_neighbors: int = PAIRWISE_ALIAS_MAX_NEIGHBORS,
+) -> list[dict[str, Any]]:
+    """Fuzzy-block plausible aliases without making the semantic merge decision."""
+
+    if max_neighbors < 1:
+        raise ValueError("candidate comparison max_neighbors must be positive")
+    signatures = [_candidate_fuzzy_signature(candidate) for candidate in candidates]
+    scored: list[tuple[float, int, int]] = []
+    by_candidate: dict[int, list[tuple[float, int, int]]] = defaultdict(list)
+    for left_index in range(len(candidates)):
+        for right_index in range(left_index + 1, len(candidates)):
+            score = _candidate_fuzzy_signature_score(
+                signatures[left_index], signatures[right_index]
+            )
+            if score < float(min_score):
+                continue
+            row = (score, left_index, right_index)
+            scored.append(row)
+            by_candidate[left_index].append(row)
+            by_candidate[right_index].append(row)
+
+    retained: set[tuple[int, int]] = set()
+    for rows in by_candidate.values():
+        for _score, left_index, right_index in sorted(
+            rows,
+            key=lambda row: (-row[0], row[1], row[2]),
+        )[:max_neighbors]:
+            retained.add((left_index, right_index))
+    score_by_pair = {
+        (left_index, right_index): score for score, left_index, right_index in scored
+    }
+    return [
+        {
+            "left_index": left_index,
+            "right_index": right_index,
+            "fuzzy_score": score_by_pair[(left_index, right_index)],
+        }
+        for left_index, right_index in sorted(retained)
+    ]
+
+
+def _candidate_clusters_from_pair_decisions(
+    candidates: Sequence[Mapping[str, Any]],
+    decisions: Sequence[Mapping[str, Any]],
+) -> list[list[int]]:
+    """Build a conservative partition in Python from independent pair judgments."""
+
+    parent = list(range(len(candidates)))
+    members = {index: {index} for index in range(len(candidates))}
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    rejected = {
+        tuple(sorted((int(row["left_index"]), int(row["right_index"]))))
+        for row in decisions
+        if row.get("same_scalar_measurement") is False
+    }
+    accepted = sorted(
+        (row for row in decisions if row.get("same_scalar_measurement") is True),
+        key=lambda row: (
+            -float(row.get("fuzzy_score") or 0.0),
+            int(row["left_index"]),
+            int(row["right_index"]),
+        ),
+    )
+    for row in accepted:
+        left_index = int(row["left_index"])
+        right_index = int(row["right_index"])
+        left_root = find(left_index)
+        right_root = find(right_index)
+        if left_root == right_root:
+            continue
+        conflicts = [
+            (left_member, right_member)
+            for left_member in members[left_root]
+            for right_member in members[right_root]
+            if tuple(sorted((left_member, right_member))) in rejected
+        ]
+        if conflicts:
+            LOGGER.warning(
+                "Stage 2 pairwise alias decisions contained a transitive conflict; "
+                "preserving separate groups for candidate index pair(s): %s",
+                conflicts[:8],
+            )
+            continue
+        keep_root, merge_root = sorted((left_root, right_root))
+        parent[merge_root] = keep_root
+        members[keep_root].update(members.pop(merge_root))
+
+    return [sorted(component) for _root, component in sorted(members.items())]
 
 
 def _materialize_candidate_group(
@@ -2445,98 +2531,48 @@ def _materialize_candidate_group(
     }
 
 
-def _materialize_grouping_response(
-    grouping: Mapping[str, Any],
-    *,
-    candidates: Sequence[Mapping[str, Any]],
-    id_prefix: str,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    by_id = {str(candidate["candidate_id"]): candidate for candidate in candidates}
-    materialized: list[dict[str, Any]] = []
-    for proposed in grouping["groups"]:
-        members = [by_id[candidate_id] for candidate_id in proposed["member_candidate_ids"]]
-        clusters = _semantically_safe_member_clusters(
-            members,
-            canonical_name=proposed["canonical_name"],
-            canonical_description=proposed["canonical_description"],
-        )
-        if len(clusters) > 1:
-            member_names = list(
-                dict.fromkeys(
-                    str(member.get("name") or member.get("candidate_id") or "").strip()
-                    for member in members
-                )
-            )
-            LOGGER.warning(
-                "Stage 2 candidate grouping split semantically incompatible proposed "
-                "group=%s canonical_name=%s into %s conservative groups; members=%s",
-                proposed["group_id"],
-                proposed["canonical_name"],
-                len(clusters),
-                member_names[:8],
-            )
-        for cluster in clusters:
-            singleton_split = len(clusters) > 1 and len(cluster) == 1
-            canonical_name = (
-                _snake_case_name(
-                    cluster[0].get("name"),
-                    fallback=proposed["canonical_name"],
-                )
-                if singleton_split
-                else proposed["canonical_name"]
-            )
-            canonical_description = (
-                str(cluster[0].get("description") or "").strip()
-                if singleton_split
-                else proposed["canonical_description"]
-            )
-            materialized.append(
-                _materialize_candidate_group(
-                    candidate_id=f"{id_prefix}_{len(materialized) + 1:04d}",
-                    members=cluster,
-                    canonical_name=canonical_name,
-                    canonical_description=canonical_description,
-                )
-            )
-    excluded_origins = list(
-        dict.fromkeys(
-            origin
-            for candidate_id in grouping["excluded_candidate_ids"]
-            for origin in (
-                _string_values(by_id[candidate_id].get("origin_candidate_ids")) or [candidate_id]
-            )
-        )
+def _canonical_cluster_member(
+    members: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    name_counts = Counter(
+        _snake_case_name(member.get("name"), fallback="") for member in members
     )
-    return materialized, excluded_origins
+    return max(
+        enumerate(members),
+        key=lambda item: (
+            name_counts[_snake_case_name(item[1].get("name"), fallback="")],
+            len(_string_values(item[1].get("origin_candidate_ids"))),
+            len(_string_values(item[1].get("supporting_packet_ids"))),
+            bool(str(item[1].get("description") or "").strip()),
+            -item[0],
+        ),
+    )[1]
 
 
-def _partition_candidate_grouping(
-    candidates: Sequence[Mapping[str, Any]],
+def _materialize_pairwise_groups(
     *,
-    clinical_question: str,
-    outer_fold: int,
-    max_prompt_chars: int,
-) -> list[list[Mapping[str, Any]]]:
-    batches: list[list[Mapping[str, Any]]] = []
-    current: list[Mapping[str, Any]] = []
-    for candidate in candidates:
-        proposed = [*current, candidate]
-        messages = _candidate_grouping_prompt(
-            clinical_question=clinical_question,
-            outer_fold=outer_fold,
-            candidates=proposed,
+    candidates: Sequence[Mapping[str, Any]],
+    clusters: Sequence[Sequence[int]],
+) -> list[dict[str, Any]]:
+    materialized: list[dict[str, Any]] = []
+    for group_index, cluster in enumerate(clusters, start=1):
+        members = [candidates[index] for index in cluster]
+        canonical = _canonical_cluster_member(members)
+        canonical_name = _snake_case_name(
+            canonical.get("name"), fallback=f"measurement_{group_index:03d}"
         )
-        chars = sum(len(message["content"]) for message in messages)
-        if not current and chars > int(max_prompt_chars):
-            raise ValueError("one Stage 2 candidate cannot fit the grouping prompt budget")
-        if current and chars > int(max_prompt_chars):
-            batches.append(current)
-            current = [candidate]
-        else:
-            current = proposed
-    if current:
-        batches.append(current)
-    return batches
+        materialized.append(
+            _materialize_candidate_group(
+                candidate_id=f"pairwise_group_{group_index:04d}",
+                members=members,
+                canonical_name=canonical_name,
+                canonical_description=_short_text(
+                    canonical.get("description") or canonical_name,
+                    max_chars=2_000,
+                ),
+            )
+        )
+    return materialized
 
 
 def _derive_roles(evidence_axes: Sequence[str]) -> list[str]:
@@ -3394,88 +3430,77 @@ class PlainHandoffStage2:
         candidates: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        candidate_ids = [str(candidate["candidate_id"]) for candidate in candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("candidate pairing received duplicate supplied candidate IDs")
         current = [
             {**dict(candidate), "origin_candidate_ids": [str(candidate["candidate_id"])]}
             for candidate in candidates
         ]
-        exclusions: dict[str, str] = {}
-        stalled_rounds = 0
-        for round_index in range(1, 9):
-            batches = _partition_candidate_grouping(
-                current,
-                clinical_question=self.clinical_question,
-                outer_fold=outer_fold,
-                max_prompt_chars=self.config.max_prompt_chars,
-            )
-            LOGGER.info(
-                "Stage 2 candidate grouping round=%s candidates=%s batches=%s",
-                round_index,
-                len(current),
-                len(batches),
-            )
-            grouped_batches: list[list[dict[str, Any]]] = []
-            for batch_index, batch in enumerate(batches, start=1):
-                messages = _candidate_grouping_prompt(
-                    clinical_question=self.clinical_question,
-                    outer_fold=outer_fold,
-                    candidates=batch,
-                )
-                grouping = _checkpointed_request_json(
-                    output_dir=(
-                        output_dir
-                        / "grouping"
-                        / f"round_{round_index:03d}"
-                        / f"batch_{batch_index:03d}"
-                        if output_dir is not None
-                        else None
-                    ),
-                    input_value={
-                        "phase": "candidate_grouping",
-                        "clinical_question": self.clinical_question,
-                        "outer_fold": int(outer_fold),
-                        "round_index": round_index,
-                        "batch_index": batch_index,
-                        "candidates": list(batch),
-                    },
-                    messages=messages,
-                    config=self.config,
-                    completion=self.completion,
-                    validate=lambda value, batch=batch: _validate_candidate_grouping(
-                        value, candidates=batch
-                    ),
-                )
-                materialized, excluded_origins = _materialize_grouping_response(
-                    grouping,
-                    candidates=batch,
-                    id_prefix=f"group_r{round_index:02d}_b{batch_index:03d}",
-                )
-                for origin in excluded_origins:
-                    exclusions[origin] = (
-                        "Excluded during semantic grouping because it was not identified "
-                        "as a concrete patient-level pretreatment measurement."
-                    )
-                grouped_batches.append(materialized)
-
-            next_candidates = _interleave_consolidation_batches(grouped_batches)
-            if len(batches) == 1:
-                return next_candidates, exclusions
-            if not next_candidates:
-                return [], exclusions
-            stalled_rounds = stalled_rounds + 1 if len(next_candidates) >= len(current) else 0
-            current = next_candidates
-            if stalled_rounds >= 2:
-                LOGGER.warning(
-                    "Stage 2 candidate grouping stopped after %s nonreducing bounded "
-                    "rounds; preserving %s conservative groups",
-                    stalled_rounds,
-                    len(current),
-                )
-                return current, exclusions
-        LOGGER.warning(
-            "Stage 2 candidate grouping reached its bounded round limit; preserving %s groups",
+        comparisons = _candidate_comparison_pairs(current)
+        LOGGER.info(
+            "Stage 2 candidate alias pairing candidates=%s fuzzy_comparisons=%s workers=%s",
             len(current),
+            len(comparisons),
+            min(self.config.workers, len(comparisons)),
         )
-        return current, exclusions
+
+        decisions_by_index: dict[int, dict[str, Any]] = {}
+
+        def compare_pair(
+            comparison_index: int,
+            comparison: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            left_index = int(comparison["left_index"])
+            right_index = int(comparison["right_index"])
+            left = current[left_index]
+            right = current[right_index]
+            decision = _checkpointed_request_json(
+                output_dir=(
+                    output_dir / "grouping" / "pairs" / f"pair_{comparison_index:06d}"
+                    if output_dir is not None
+                    else None
+                ),
+                input_value={
+                    "phase": "candidate_alias_pair",
+                    "clinical_question": self.clinical_question,
+                    "outer_fold": int(outer_fold),
+                    "left_candidate": left,
+                    "right_candidate": right,
+                    "fuzzy_score": float(comparison["fuzzy_score"]),
+                },
+                messages=_candidate_pair_prompt(
+                    left=left,
+                    right=right,
+                ),
+                config=self.config,
+                completion=self.completion,
+                validate=_validate_candidate_pair_decision,
+            )
+            return {**dict(comparison), **decision}
+
+        if comparisons:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, min(self.config.workers, len(comparisons)))
+            ) as executor:
+                futures = {
+                    executor.submit(compare_pair, comparison_index, comparison): comparison_index
+                    for comparison_index, comparison in enumerate(comparisons, start=1)
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    decisions_by_index[futures[future]] = future.result()
+
+        decisions = [decisions_by_index[index] for index in sorted(decisions_by_index)]
+        clusters = _candidate_clusters_from_pair_decisions(current, decisions)
+        LOGGER.info(
+            "Stage 2 candidate alias pairing accepted=%s groups=%s",
+            sum(bool(row["same_scalar_measurement"]) for row in decisions),
+            len(clusters),
+        )
+        return (
+            _materialize_pairwise_groups(candidates=current, clusters=clusters),
+            {},
+        )
 
     def _select_candidate_groups(
         self,
@@ -3665,7 +3690,7 @@ class PlainHandoffStage2:
         candidates: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> Mapping[str, Any]:
-        """Group IDs, select groups, then let Python assemble all provenance."""
+        """Build alias groups in Python, select them, and assemble all provenance."""
 
         original_ids = [str(candidate["candidate_id"]) for candidate in candidates]
         groups, grouping_exclusions = self._group_candidates(

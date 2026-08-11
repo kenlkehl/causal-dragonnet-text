@@ -147,6 +147,16 @@ OpenAI-compatible `/models` endpoint once at startup and uses the result when
 exactly one model ID is advertised. If the server advertises multiple model
 IDs, set `stage2.model` explicitly to avoid an ambiguous selection.
 
+Candidate alias consolidation separates fuzzy retrieval from semantic judgment.
+Python uses generic normalized-token, character-similarity, and acronym signals
+to propose a bounded set of nearby candidate pairs. Each proposed pair is sent
+in its own request without candidate or group IDs, and the model returns only
+`{"same_scalar_measurement": true|false}`. Python then constructs the complete
+partition, resolves contradictory transitive decisions conservatively, assigns
+all group IDs, and preserves unmatched candidates as singleton groups. The
+fuzzy matcher proposes comparisons only; it never decides that two clinical
+measurements are equivalent.
+
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
 `transport_retry_backoff`, `max_prompt_chars`,
