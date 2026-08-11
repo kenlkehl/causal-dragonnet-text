@@ -898,7 +898,9 @@ def test_interpretation_prompt_requests_latent_features_that_could_generate_nois
     assert "candidate latent clinical features" in messages[0]["content"]
     assert "candidate latent pretreatment features" in body["interpretive_goal"]
     assert "noisy, incomplete observations" in rules
-    assert "synthesize recurring or jointly coherent clues" in rules
+    assert "corroborate the same measurement" in rules
+    assert "exactly one patient-level scalar measurement" in rules
+    assert "return separate candidates" in rules
     assert "clinical_question" not in body
     assert "Do not merely copy prominent words" not in rules
     assert "may be implicit rather than literally named" in rules
@@ -925,6 +927,9 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
     assert "clinical_question" not in body
     assert "top-k" in rules
     assert "one packet is sufficient" in rules
+    assert "exactly one patient-level scalar measurement" in rules
+    assert "return separate candidates" in rules
+    assert "do not invent a score" in rules
     assert "particular treatment comparison" in rules
 
 
@@ -2466,6 +2471,51 @@ def test_operationalization_retries_malformed_ontology_then_accepts_repair():
     assert result["categories_or_unit"] == ["disabled", "enabled"]
     assert len(calls) == 2
     assert "exactly two distinct" in calls[1][-1]["content"]
+
+
+def test_operationalization_duplicate_category_repair_names_colliding_values():
+    calls = []
+
+    def completion(messages, _config):
+        calls.append(messages)
+        categories = ["Disabled", "disabled"] if len(calls) == 1 else ["disabled", "enabled"]
+        return json.dumps(
+            {
+                "description": "A generic scalar state.",
+                "value_type": "binary",
+                "categories_or_unit": categories,
+                "measurement_definition": "Extract the documented pretreatment state.",
+                "missing_value_rule": "Return null when undocumented.",
+            }
+        )
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+        clinical_question="Estimate a treatment effect.",
+        completion=completion,
+    )
+    result = runner._operationalize_candidate_group(
+        outer_fold=1,
+        group={
+            "candidate_id": "group_001",
+            "name": "generic_state",
+            "description": "A generic scalar state.",
+            "value_type": "binary",
+            "evidence_axes": ["outcome"],
+            "supporting_packet_ids": ["packet_1"],
+            "supporting_architectures": ["architecture_1"],
+        },
+    )
+
+    assert result["categories_or_unit"] == ["disabled", "enabled"]
+    assert len(calls) == 2
+    repair = calls[1][-1]["content"]
+    assert "return each category once" in repair
+    assert "Disabled" in repair
+    assert "disabled" in repair
 
 
 def test_review_rejects_revision_with_malformed_closed_ontology():

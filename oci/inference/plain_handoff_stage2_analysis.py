@@ -167,9 +167,22 @@ def _validated_closed_category_values(
         for category in categories
     ]
     if len(identity_keys) != len(set(identity_keys)):
+        duplicate_keys = sorted(
+            {
+                identity_key
+                for identity_key in identity_keys
+                if identity_keys.count(identity_key) > 1
+            }
+        )
+        duplicate_values = [
+            category
+            for category, identity_key in zip(categories, identity_keys)
+            if identity_key in duplicate_keys
+        ]
         raise ValueError(
             f"{source} categories_or_unit must contain categories that are distinct "
-            "after case and spacing normalization"
+            "after case and spacing normalization; return each category once and remove "
+            f"these normalization-equivalent values: {duplicate_values[:12]!r}"
         )
     if normalized_type == "binary" and len(categories) != 2:
         raise ValueError(

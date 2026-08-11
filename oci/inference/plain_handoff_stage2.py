@@ -47,8 +47,8 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v4_closed_ontology"
-INTERPRETATION_SCHEMA_VERSION = "latent_feature_hypotheses_v2_rejected_packet_audit"
-INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v1"
+INTERPRETATION_SCHEMA_VERSION = "latent_feature_hypotheses_v3_scalar_rejected_packet_audit"
+INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v2_scalar"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
     "assessment",
@@ -1286,8 +1286,8 @@ def _interpretation_response_contract() -> dict[str, Any]:
             {
                 "name": "snake_case_candidate_latent_feature",
                 "description": (
-                    "one clinically interpretable patient-level pretreatment feature that "
-                    "could generate the observed evidence pattern"
+                    "exactly one clinically interpretable patient-level pretreatment scalar "
+                    "measurement that could generate the observed evidence pattern"
                 ),
                 "value_type": "binary|categorical|continuous|ordinal|ambiguous",
                 "supporting_packet_ids": ["one or more supplied packet IDs"],
@@ -1325,8 +1325,10 @@ def _interpretation_prompt(
         ),
         "rules": [
             "Treat the packets as noisy, incomplete observations of underlying clinical features, not as a ready-made feature list.",
-            "Interpret this architecture independently of other architectures, but synthesize recurring or jointly coherent clues across its supplied packets.",
+            "Interpret this architecture independently of other architectures. Use recurring or jointly coherent clues to corroborate the same measurement, never to bundle distinct measurements into one candidate.",
             "Use each packet's readable evidence, evidence kind, observable axes, polarity, support, and score summaries to ask which latent pretreatment features could have generated the observed pattern.",
+            "Every candidate must be exactly one patient-level scalar measurement that can occupy one table column. Do not combine distinct demographics, laboratory values, symptoms, genomic alterations, exposures, or disease attributes into a profile, burden, status, or other composite.",
+            "When the evidence supports multiple distinct measurements, return separate candidates and cite the packets supporting each. Keep a named scale or index together only when the evidence identifies that established scalar measurement.",
             "A candidate may be implicit rather than literally named in the evidence, but it must be a clinically coherent patient-level pretreatment characteristic that could be reproducibly measured from a complete record.",
             "When the evidence clearly identifies a named scale or measurement, prefer it; otherwise propose the narrowest defensible latent feature rather than a broad syndrome or vague clinical state.",
             "If the same pattern has multiple materially different clinical explanations, return separate candidates and describe the ambiguity rather than choosing one without support.",
@@ -1371,6 +1373,9 @@ def _rejected_packet_audit_prompt(
             "Review every packet independently; this is a recall guardrail, not a top-k selection pass.",
             "Do not require a clue to recur across packets. One packet is sufficient when it explicitly identifies a reproducibly extractable pretreatment measurement.",
             "An explicit named biomarker, clinical scale, laboratory value, genomic alteration, symptom, comorbidity, demographic attribute, or pretreatment exposure must support a candidate when it is patient-level and reproducibly measurable.",
+            "Every recovered candidate must be exactly one patient-level scalar measurement that can occupy one table column.",
+            "When a packet contains multiple distinct measurements, return separate candidates with the evidence applicable to each; do not bundle them into a profile, burden, status, or other composite.",
+            "Do not invent a score, formula, or index to force distinct measurements into one scalar. Keep an established scale or index together only when the evidence identifies it.",
             "Do not decide from whether a measurement is an expected determinant of a particular treatment comparison; use only the supplied evidence and observable axes.",
             "Treat lexical terms as possible direct names of measurements as well as noisy clues to latent measurements.",
             "A candidate may be implicit, but it must be a clinically coherent patient-level pretreatment characteristic that could be reproducibly measured from a complete record.",
@@ -2614,9 +2619,11 @@ def _operationalization_prompt(
         "rules": [
             "Define exactly the named scalar pretreatment measurement; do not rename, merge, or split it in this step.",
             "Specify a reproducible extraction target from a complete patient record.",
+            "Do not invent an ad hoc score, formula, or index to force multiple distinct measurements into one scalar.",
             "For categorical or ordinal variables, enumerate the extraction ontology; for continuous variables, provide the unit when applicable.",
             "For a binary variable, categories_or_unit must contain exactly two distinct extractable scalar values as separate array items.",
             "For a categorical or ordinal variable, categories_or_unit must contain at least two distinct extractable scalar values as separate array items.",
+            "List each category exactly once. Categories that differ only by capitalization, punctuation, underscores, or spacing are duplicates and must not both appear.",
             "Never use a type label such as binary or categorical, or a combined phrase such as present-or-absent, as one ontology value.",
             "Define how absent, ambiguous, and conflicting documentation is represented.",
             "Do not return packet IDs, candidate IDs, group IDs, architectures, causal roles, or dispositions.",
