@@ -47,6 +47,7 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 CONSOLIDATION_SCHEMA_VERSION = "candidate_grouping_v4_closed_ontology"
+GROUP_SELECTION_CONTRACT_VERSION = "retained_group_ids_v2_python_complement"
 INTERPRETATION_SCHEMA_VERSION = "latent_feature_hypotheses_v3_scalar_rejected_packet_audit"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v2_scalar"
 
@@ -2445,11 +2446,19 @@ def _materialize_grouping_response(
             canonical_description=proposed["canonical_description"],
         )
         if len(clusters) > 1:
+            member_names = list(
+                dict.fromkeys(
+                    str(member.get("name") or member.get("candidate_id") or "").strip()
+                    for member in members
+                )
+            )
             LOGGER.warning(
                 "Stage 2 candidate grouping split semantically incompatible proposed "
-                "group=%s into %s conservative groups",
+                "group=%s canonical_name=%s into %s conservative groups; members=%s",
                 proposed["group_id"],
+                proposed["canonical_name"],
                 len(clusters),
+                member_names[:8],
             )
         for cluster in clusters:
             singleton_split = len(clusters) > 1 and len(cluster) == 1
@@ -2558,13 +2567,16 @@ def _group_selection_prompt(
             "Preserve diversity across measurements, derived causal roles, evidence axes, and supporting architectures.",
             "Prefer replicated support across independent architectures or evidence axes, while retaining uniquely supported measurements when capacity permits.",
             "Do not merge or rename groups in this step.",
-            "Return each supplied group ID exactly once as retained or excluded.",
+            "Return only supplied group IDs selected for retention; Python computes the exact excluded complement.",
+            "Order retained_group_ids from most to least preferred and do not repeat an ID.",
+            "Return exactly one response field and do not enumerate groups that are not retained.",
             "Do not return packet IDs, candidate IDs, feature definitions, or causal-role judgments.",
         ],
         "groups": [_group_selection_view(group) for group in groups],
         "response": {
-            "retained_group_ids": ["supplied group IDs"],
-            "excluded_group_ids": ["all remaining supplied group IDs"],
+            "retained_group_ids": [
+                "at most max_groups supplied group IDs, ordered from most to least preferred"
+            ],
         },
     }
     return [
@@ -2582,21 +2594,56 @@ def _validate_group_selection(
     groups: Sequence[Mapping[str, Any]],
     max_groups: int,
 ) -> dict[str, list[str]]:
-    retained = _string_values(value.get("retained_group_ids"))
-    excluded = _string_values(value.get("excluded_group_ids"))
-    supplied = {str(group["candidate_id"]) for group in groups}
-    returned = set(retained).union(excluded)
-    unknown = sorted(returned - supplied)
+    raw_retained = value.get("retained_group_ids")
+    if not isinstance(raw_retained, Sequence) or isinstance(raw_retained, (str, bytes)):
+        raise ValueError("group selection requires a retained_group_ids list")
+
+    supplied_ids = [str(group["candidate_id"]) for group in groups]
+    if len(supplied_ids) != len(set(supplied_ids)):
+        raise ValueError("group selection received duplicate supplied group IDs")
+    supplied = set(supplied_ids)
+    group_names = {
+        str(group["candidate_id"]): str(group.get("name") or "").strip() for group in groups
+    }
+    returned = [str(item) for item in raw_retained if item is not None]
+    duplicate_ids = [group_id for group_id, count in Counter(returned).items() if count > 1]
+    if duplicate_ids:
+        LOGGER.warning(
+            "Stage 2 group selection deduplicated retained group ID(s): %s",
+            [
+                f"{group_id} ({group_names.get(group_id) or 'unknown name'})"
+                for group_id in duplicate_ids[:8]
+            ],
+        )
+    returned = list(dict.fromkeys(returned))
+    unknown = [group_id for group_id in returned if group_id not in supplied]
     if unknown:
-        raise ValueError(f"group selection cites unknown group ID(s): {unknown[:8]}")
-    duplicates = sorted(set(retained).intersection(excluded))
-    if duplicates or len(retained) != len(set(retained)) or len(excluded) != len(set(excluded)):
-        raise ValueError(f"group selection assigns group ID(s) more than once: {duplicates[:8]}")
-    missing = sorted(supplied - returned)
-    if missing:
-        raise ValueError(f"group selection omitted group ID(s): {missing[:8]}")
+        LOGGER.warning(
+            "Stage 2 group selection ignored %s unknown retained group ID(s): %s",
+            len(unknown),
+            unknown[:8],
+        )
+    retained = [group_id for group_id in returned if group_id in supplied]
+    if not retained:
+        raise ValueError(
+            "group selection returned no supplied retained group IDs"
+            + (f" after ignoring unknown IDs: {unknown[:8]}" if unknown else "")
+        )
     if len(retained) > int(max_groups):
-        raise ValueError(f"group selection retained {len(retained)} groups for limit={max_groups}")
+        dropped = retained[int(max_groups) :]
+        LOGGER.warning(
+            "Stage 2 group selection truncated %s over-budget retained group ID(s) "
+            "for limit=%s: %s",
+            len(dropped),
+            max_groups,
+            [
+                f"{group_id} ({group_names.get(group_id) or 'unknown name'})"
+                for group_id in dropped[:8]
+            ],
+        )
+        retained = retained[: int(max_groups)]
+    retained_set = set(retained)
+    excluded = [group_id for group_id in supplied_ids if group_id not in retained_set]
     return {"retained_group_ids": retained, "excluded_group_ids": excluded}
 
 
@@ -3467,6 +3514,7 @@ class PlainHandoffStage2:
                         ),
                         input_value={
                             "phase": "group_selection",
+                            "selection_contract": GROUP_SELECTION_CONTRACT_VERSION,
                             "clinical_question": self.clinical_question,
                             "outer_fold": int(outer_fold),
                             "round_index": round_index,

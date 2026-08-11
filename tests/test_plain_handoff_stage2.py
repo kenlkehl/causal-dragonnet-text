@@ -1768,7 +1768,6 @@ def _fake_completion(calls):
             return json.dumps(
                 {
                     "retained_group_ids": [group["group_id"] for group in body["groups"]],
-                    "excluded_group_ids": [],
                 }
             )
         assert body["job"] == "operationalize_stage2_candidate_group"
@@ -2207,6 +2206,115 @@ def test_candidate_grouping_preserves_model_omissions_as_singletons(caplog):
     assert "preserved 1 omitted candidate ID" in caplog.text
 
 
+def test_candidate_grouping_split_warning_includes_clinical_names(caplog):
+    candidates = [
+        {
+            "candidate_id": "candidate_alpha",
+            "name": "signal_alpha",
+            "description": "Continuous alpha signal.",
+        },
+        {
+            "candidate_id": "candidate_beta",
+            "name": "attribute_beta",
+            "description": "Binary beta attribute.",
+        },
+    ]
+
+    materialized, excluded = stage2_workflow._materialize_grouping_response(
+        {
+            "groups": [
+                {
+                    "group_id": "group_003",
+                    "member_candidate_ids": ["candidate_alpha", "candidate_beta"],
+                    "canonical_name": "attribute_beta",
+                    "canonical_description": "Binary beta attribute.",
+                }
+            ],
+            "excluded_candidate_ids": [],
+        },
+        candidates=candidates,
+        id_prefix="group_r01_b001",
+    )
+
+    assert len(materialized) == 2
+    assert excluded == []
+    assert "group=group_003 canonical_name=attribute_beta" in caplog.text
+    assert "signal_alpha" in caplog.text
+    assert "attribute_beta" in caplog.text
+
+
+def test_group_selection_prompt_requests_only_ranked_retained_ids():
+    messages = stage2_workflow._group_selection_prompt(
+        clinical_question="Estimate a treatment effect.",
+        outer_fold=1,
+        groups=[
+            {
+                "candidate_id": "group_alpha",
+                "name": "serum_sodium",
+                "description": "Pretreatment serum sodium concentration.",
+                "evidence_axes": ["treatment", "outcome"],
+            }
+        ],
+        max_groups=1,
+    )
+
+    body = json.loads(messages[1]["content"])
+
+    assert list(body["response"]) == ["retained_group_ids"]
+    assert "excluded_group_ids" not in messages[1]["content"]
+    assert "most to least preferred" in body["response"]["retained_group_ids"][0]
+
+
+def test_group_selection_normalizes_ids_and_computes_excluded_complement(caplog):
+    groups = [
+        {
+            "candidate_id": "group_alpha",
+            "name": "serum_sodium",
+        },
+        {
+            "candidate_id": "group_beta",
+            "name": "body_mass_index",
+        },
+        {
+            "candidate_id": "group_gamma",
+            "name": "heart_rate",
+        },
+    ]
+
+    result = stage2_workflow._validate_group_selection(
+        {
+            "retained_group_ids": [
+                "group_alpha",
+                "group_alpha",
+                "group_not_supplied",
+                "group_beta",
+                "group_gamma",
+            ],
+            # A legacy or noncompliant model-authored complement is ignored.
+            "excluded_group_ids": ["group_alpha"],
+        },
+        groups=groups,
+        max_groups=2,
+    )
+
+    assert result == {
+        "retained_group_ids": ["group_alpha", "group_beta"],
+        "excluded_group_ids": ["group_gamma"],
+    }
+    assert "group_alpha (serum_sodium)" in caplog.text
+    assert "ignored 1 unknown retained group ID" in caplog.text
+    assert "group_gamma (heart_rate)" in caplog.text
+
+
+def test_group_selection_rejects_response_without_any_supplied_retained_id():
+    with pytest.raises(ValueError, match="no supplied retained group IDs"):
+        stage2_workflow._validate_group_selection(
+            {"retained_group_ids": ["group_not_supplied"]},
+            groups=[{"candidate_id": "group_alpha", "name": "serum_sodium"}],
+            max_groups=1,
+        )
+
+
 def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in_python(
     tmp_path: Path,
 ):
@@ -2235,16 +2343,7 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
             )
         if body["job"] == "select_stage2_candidate_groups":
             retained = [group["group_id"] for group in body["groups"][:2]]
-            return json.dumps(
-                {
-                    "retained_group_ids": retained,
-                    "excluded_group_ids": [
-                        group["group_id"]
-                        for group in body["groups"]
-                        if group["group_id"] not in retained
-                    ],
-                }
-            )
+            return json.dumps({"retained_group_ids": retained})
         assert body["job"] == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
