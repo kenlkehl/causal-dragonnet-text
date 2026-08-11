@@ -16,7 +16,6 @@ _LAZY_EXPORTS = {
     "AppliedInferenceConfig": ("oci.config", "AppliedInferenceConfig"),
     "ModelArchitectureConfig": ("oci.config", "ModelArchitectureConfig"),
     "TrainingConfig": ("oci.config", "TrainingConfig"),
-    "MatchingAnalysisConfig": ("oci.config", "MatchingAnalysisConfig"),
     "create_default_config": ("oci.config", "create_default_config"),
     "ExperimentRunner": ("oci.experiments", "ExperimentRunner"),
 }

@@ -21,9 +21,9 @@ layer, or content-hash protocol.
 
 The former `MultiModelForestRunner` and its TF-IDF-topic agentic Stage 2 were
 retired. `multi_model_forest` remains the name of the Stage 1 scientific
-configuration, not a second runnable workflow. Generic `oci run` configurations
-using that model type now stop with a migration message; use this workflow
-instead.
+configuration, not a second runnable workflow. The `oci run` command is
+reserved for the retained explicit-feature workflows; configurations using
+`multi_model_forest` stop with a migration message and must use this workflow.
 
 ## Configuration
 

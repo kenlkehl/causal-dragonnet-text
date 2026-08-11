@@ -1,4 +1,4 @@
-"""Utilities for concept-initialized sentence-chunk extractors."""
+"""Lossless sentence-chunk utilities used by Stage 1 embedding evidence."""
 
 from __future__ import annotations
 

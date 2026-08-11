@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=None, help="Optional NCBI API key.")
     parser.add_argument(
         "--tool",
-        default="causal-dragonnet-text-pubmed-downloader",
+        default="onc-causal-inference-pubmed-downloader",
         help="NCBI E-utilities tool name.",
     )
     parser.add_argument(

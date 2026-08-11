@@ -1,5 +1,5 @@
 # oci/extraction/__init__.py
-"""Extraction module for CDT.
+"""Clinical-text extraction tools.
 
 This module provides LLM-based extraction of explicit features from clinical text.
 """

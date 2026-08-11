@@ -5,8 +5,8 @@ import os
 import tempfile
 from pathlib import Path
 
-# Some optional standalone components import plotting support. Give Matplotlib
-# a writable cache location when those components are selected on a cluster.
+# Some modeling dependencies import plotting support. Give Matplotlib a
+# writable cache location when the workflow runs on a cluster.
 os.environ.setdefault(
     "MPLCONFIGDIR",
     str(Path(tempfile.gettempdir()) / "oci-matplotlib"),

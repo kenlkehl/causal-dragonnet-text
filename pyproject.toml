@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Causal inference from clinical text using frozen LLM feature extraction"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Ken Kehl", email = "kenneth_kehl@dfci.harvard.edu"}
 ]
@@ -17,7 +17,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
 ]
 

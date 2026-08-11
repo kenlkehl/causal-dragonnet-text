@@ -17,11 +17,44 @@ import numpy as np
 import torch
 
 from .concept_embedding_utils import chunk_text_words, split_text_to_token_chunks
-from .hidden_state_cache import VariableLengthArray, VariableLengthMaskArray
 from .lossless_tokenization import SemanticTruncationError
 
 
 logger = logging.getLogger(__name__)
+
+
+class _VariableLengthArray:
+    """Index variable-length rows stored in one flat embedding array."""
+
+    def __init__(self, flat_array: np.ndarray, offsets: np.ndarray) -> None:
+        self.flat = flat_array
+        self.offsets = offsets
+
+    def __getitem__(self, index: int) -> np.ndarray:
+        start = int(self.offsets[index])
+        end = int(self.offsets[index + 1])
+        return self.flat[start:end]
+
+    def __len__(self) -> int:
+        return len(self.offsets) - 1
+
+    @property
+    def shape(self) -> tuple[int, str, int]:
+        return (len(self), "variable", int(self.flat.shape[-1]))
+
+
+class _VariableLengthMaskArray:
+    """Generate all-valid masks for variable-length cached embedding rows."""
+
+    def __init__(self, offsets: np.ndarray) -> None:
+        self.offsets = offsets
+
+    def __getitem__(self, index: int) -> np.ndarray:
+        length = int(self.offsets[index + 1] - self.offsets[index])
+        return np.ones(length, dtype=np.uint8)
+
+    def __len__(self) -> int:
+        return len(self.offsets) - 1
 
 _SENTENCE_TRANSFORMER_CACHE = {}
 _CHUNK_TEXTS_FILENAME = "chunk_texts.jsonl"
@@ -81,7 +114,7 @@ def load_sentence_transformer(
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
         raise ImportError(
-            "sentence-transformers is required for concept_embedding_cnn. "
+            "sentence-transformers is required for embedding-contrast evidence. "
             "Install the project dependency or run: pip install sentence-transformers"
         ) from exc
     model_device = str(device) if device is not None else None
@@ -837,8 +870,8 @@ class ConceptEmbeddingCache:
         offsets = np.load(str(offsets_path))
         self._flat_mmap = flat
         self._offsets = offsets
-        self._hs_array = VariableLengthArray(flat, offsets)
-        self._mask_array = VariableLengthMaskArray(offsets)
+        self._hs_array = _VariableLengthArray(flat, offsets)
+        self._mask_array = _VariableLengthMaskArray(offsets)
 
     def preload_to_ram(self) -> None:
         """Load memmaps into RAM for DataLoader workers."""
@@ -850,11 +883,11 @@ class ConceptEmbeddingCache:
         offsets = np.load(str(offsets_path))
         self._flat_mmap = flat
         self._offsets = offsets
-        self._hs_array = VariableLengthArray(flat, offsets)
-        self._mask_array = VariableLengthMaskArray(offsets)
+        self._hs_array = _VariableLengthArray(flat, offsets)
+        self._mask_array = _VariableLengthMaskArray(offsets)
 
     def load_batch(self, indices: List[int], device: torch.device):
-        """Load and pad a batch, matching HiddenStateCache.load_batch."""
+        """Load and pad a batch of variable-length chunk embeddings."""
         self.open()
         arrays = [self._hs_array[int(i)] for i in indices]
         max_len = max(arr.shape[0] for arr in arrays)

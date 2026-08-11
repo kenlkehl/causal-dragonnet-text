@@ -20,6 +20,7 @@ from oci.extraction.explicit_features import (
     build_extraction_repair_prompt,
 )
 from oci.models.explicit_feature_featurizer import (
+    ExplicitFeatureFeaturizer,
     filter_specs_by_role,
     get_raw_explicit_features,
 )
@@ -990,3 +991,43 @@ def test_experiment_config_rejects_old_explicit_confounder_keys():
                 }
             }
         )
+
+
+def test_explicit_confounder_imports_are_role_aware_feature_aliases():
+    from oci.extraction.explicit_confounders import (
+        ExplicitConfounderValue,
+        VLLMConfounderExtractor,
+    )
+    from oci.models.explicit_confounder_featurizer import (
+        ExplicitConfounderFeaturizer,
+        get_raw_confounder_features,
+    )
+
+    assert ExplicitConfounderValue is ExplicitFeatureValue
+    assert VLLMConfounderExtractor is VLLMFeatureExtractor
+    assert ExplicitConfounderFeaturizer is ExplicitFeatureFeaturizer
+    assert get_raw_confounder_features is get_raw_explicit_features
+
+
+def test_legacy_htr_and_training_keys_migrate_without_reactivating_old_models():
+    config = ExperimentConfig.from_dict(
+        {
+            "applied_inference": {
+                "dataset_path": "dataset.parquet",
+                "architecture": {
+                    "model_type": "multi_model_forest",
+                    "causal_head_hidden_outcome_dim": 73,
+                },
+                "training": {
+                    "learning_rate": 0.002,
+                    "gamma_rlearner": 99,
+                    "beta_targreg": 88,
+                    "stop_grad_propensity": True,
+                },
+            }
+        }
+    )
+
+    assert config.applied_inference.architecture.htr_prediction_head_hidden_dim == 73
+    assert config.applied_inference.training.learning_rate == pytest.approx(0.002)
+    assert not hasattr(config.applied_inference.training, "gamma_rlearner")

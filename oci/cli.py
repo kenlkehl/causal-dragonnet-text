@@ -113,11 +113,6 @@ Examples:
         help='Enable verbose logging'
     )
     run_parser.add_argument(
-        '--skip-pretraining',
-        action='store_true',
-        help='Skip pretraining even if enabled in config'
-    )
-    run_parser.add_argument(
         '--r-stage-min-propensity',
         type=float,
         help=(
@@ -137,7 +132,7 @@ Examples:
         '--inner-fold-parallelism',
         help=(
             "Override inner cross-fit fold parallelism for "
-            "agentic_attention_variable_forest or causal_forest R-learner runs. "
+            "agentic_attention_variable_forest runs. "
             "Use 'auto' or a positive integer."
         )
     )
@@ -310,8 +305,6 @@ Examples:
             except (OSError, json.JSONDecodeError, ValueError) as e:
                 print(f"Error loading multi-model pre-specified features: {e}")
                 return 1
-        if args.skip_pretraining:
-            config.pretraining.enabled = False
         if args.r_stage_min_propensity is not None or args.r_stage_max_propensity is not None:
             model_type = getattr(config.applied_inference.architecture, 'model_type', None)
             if model_type != "agentic_attention_variable_forest":
@@ -346,14 +339,10 @@ Examples:
                     .agentic_attention_variable_forest
                 )
                 avf_config.fold_parallelism = str(args.inner_fold_parallelism)
-            elif model_type == "causal_forest":
-                cf_config = config.applied_inference.architecture.causal_forest
-                cf_config.rlearner_inner_fold_parallelism = str(args.inner_fold_parallelism)
             else:
                 print(
                     "--inner-fold-parallelism only applies to "
-                    "model_type='agentic_attention_variable_forest' or "
-                    "model_type='causal_forest'"
+                    "model_type='agentic_attention_variable_forest'"
                 )
                 return 1
         if args.outer_fold_parallelism is not None:

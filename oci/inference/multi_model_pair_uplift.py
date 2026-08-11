@@ -886,7 +886,7 @@ def _train_htr_pair_model(
     if pairs.empty or len(np.unique(pairs["label"].to_numpy(dtype=int))) < 2:
         return None
     extractor = runner._create_extractor()
-    hidden_dim = int(getattr(runner.config.architecture, "causal_head_hidden_outcome_dim", 64))
+    hidden_dim = int(getattr(runner.config.architecture, "htr_prediction_head_hidden_dim", 64))
     model = HTRPairUpliftNet(extractor=extractor, hidden_dim=hidden_dim).to(runner.device)
     model.extractor.fit_tokenizer(
         pairs["control_text"].astype(str).tolist() + pairs["treated_text"].astype(str).tolist()

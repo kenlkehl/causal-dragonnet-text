@@ -1,6 +1,6 @@
 # oci/utils/__init__.py
 
-"""Utility functions for CDT - CNN-based approach."""
+"""Shared I/O, reproducibility, device, and logging utilities."""
 
 from .system import (
     limit_threads,

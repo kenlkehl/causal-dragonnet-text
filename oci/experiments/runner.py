@@ -117,8 +117,6 @@ class ExperimentRunner:
             device=self.device,
             gpu_ids=self.config.gpu_ids,
             num_workers=self.config.num_workers,
-            save_confounder_interpretations=self.config.save_confounder_interpretations,
-            confounder_interpretation_top_k=self.config.confounder_interpretation_top_k
         )
 
         logger.info(f"Applied inference complete: {predictions_path}")

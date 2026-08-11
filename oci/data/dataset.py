@@ -1,208 +1,56 @@
-# oci/data/dataset.py
-"""Dataset classes for OCI causal inference."""
+"""Tabular dataset loading and validation for OCI workflows."""
+
+from __future__ import annotations
 
 import logging
-from typing import List, Dict, Any, Optional
-import torch
-from torch.utils.data import Dataset
-import pandas as pd
+from pathlib import Path
+from typing import Optional
 
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 
-class ClinicalTextDataset(Dataset):
-    """
-    Dataset that returns raw text for CNN processing.
-
-    Returns raw text strings that are tokenized by the model during forward pass.
-    This is memory-efficient and allows end-to-end training.
-
-    Optionally includes explicit feature columns if they are present in the data.
-    """
-
-    def __init__(
-        self,
-        data: pd.DataFrame,
-        text_column: str,
-        outcome_column: str,
-        treatment_column: str,
-        explicit_feature_columns: Optional[List[str]] = None,
-        explicit_confounder_columns: Optional[List[str]] = None,
-    ):
-        """
-        Initialize dataset.
-
-        Args:
-            data: DataFrame with text, outcomes, and treatments
-            text_column: Name of text column
-            outcome_column: Name of outcome column
-            treatment_column: Name of treatment column
-            explicit_feature_columns: Optional list of explicit feature column names
-                (e.g., ["explicit_feat_performance_status", "explicit_feat_age_at_diagnosis"]).
-                If provided, corresponding "_missing" columns are also read.
-        """
-        self.data = data.reset_index(drop=True)
-        self.text_column = text_column
-        self.explicit_feature_columns = explicit_feature_columns or explicit_confounder_columns or []
-
-        self.texts = data[text_column].tolist()
-        self.outcomes = torch.tensor(
-            data[outcome_column].values,
-            dtype=torch.float32
-        )
-        self.treatments = torch.tensor(
-            data[treatment_column].values,
-            dtype=torch.float32
-        )
-
-        # Extract explicit feature values if columns provided.
-        # The featurizer expects keys to match spec.name (e.g., "age"),
-        # not the column name (e.g., "explicit_feat_age").
-        self.explicit_feature_values = None
-        if self.explicit_feature_columns:
-            self.explicit_feature_values = []
-            for idx in range(len(data)):
-                row_values = {}
-                for col in self.explicit_feature_columns:
-                    # Extract spec name by stripping prefix
-                    if col.startswith("explicit_feat_"):
-                        spec_name = col[len("explicit_feat_"):]
-                    elif col.startswith("explicit_conf_"):
-                        spec_name = col[len("explicit_conf_"):]
-                    else:
-                        spec_name = col
-                    # Get value using spec_name as key
-                    row_values[spec_name] = data[col].iloc[idx]
-                    # Get missing flag (look for corresponding "_missing" column)
-                    missing_col = f"{col}_missing"
-                    if missing_col in data.columns:
-                        row_values[f"{spec_name}_missing"] = data[missing_col].iloc[idx]
-                    else:
-                        # Infer missing from value
-                        row_values[f"{spec_name}_missing"] = pd.isna(row_values[spec_name])
-                self.explicit_feature_values.append(row_values)
-            logger.info(f"Loaded {len(self.explicit_feature_columns)} explicit feature columns")
-
-        logger.info(f"ClinicalTextDataset created: {len(self)} samples")
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        item = {
-            'text': self.texts[idx],
-            'outcome': self.outcomes[idx],
-            'treatment': self.treatments[idx],
-            'text_id': idx
-        }
-
-        if self.explicit_feature_values is not None:
-            item['explicit_feature_values'] = self.explicit_feature_values[idx]
-
-        return item
-
-
-def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Collate batch for CNN dataset.
-
-    Args:
-        batch: List of samples from dataset
-
-    Returns:
-        Batched data with texts as list of strings
-    """
-    texts = [item['text'] for item in batch]
-    outcomes = torch.stack([item['outcome'] for item in batch])
-    treatments = torch.stack([item['treatment'] for item in batch])
-    text_ids = [item['text_id'] for item in batch]
-
-    result = {
-        'texts': texts,
-        'outcome': outcomes,
-        'treatment': treatments,
-        'text_id': text_ids
-    }
-
-    # Include explicit feature values if present
-    if 'explicit_feature_values' in batch[0]:
-        result['explicit_feature_values'] = [
-            item['explicit_feature_values'] for item in batch
-        ]
-
-    return result
-
-
 def load_dataset(
-    path: str,
+    path: str | Path,
     split: Optional[str] = None,
-    split_column: str = 'split'
+    split_column: str = "split",
 ) -> pd.DataFrame:
-    """
-    Load dataset from file.
+    """Load a CSV or Parquet cohort, optionally selecting one named split."""
 
-    Args:
-        path: Path to dataset file (.csv or .parquet)
-        split: Optional split to filter (e.g., 'train', 'val', 'test')
-        split_column: Name of split column
-
-    Returns:
-        DataFrame
-    """
-    logger.info(f"Loading dataset from {path}")
-
-    if path.endswith('.parquet'):
-        df = pd.read_parquet(path)
-    elif path.endswith('.csv'):
-        df = pd.read_csv(path)
+    source = Path(path)
+    if source.suffix == ".parquet":
+        frame = pd.read_parquet(source)
+    elif source.suffix == ".csv":
+        frame = pd.read_csv(source)
     else:
-        raise ValueError(f"Unsupported file format: {path}")
-
+        raise ValueError(f"Unsupported dataset format: {source.suffix or '<none>'}")
     if split is not None:
-        if split_column not in df.columns:
-            raise ValueError(f"Split column '{split_column}' not found")
-        df = df[df[split_column] == split].copy()
-        logger.info(f"Filtered to {split} split: {len(df)} samples")
-
-    return df
+        if split_column not in frame.columns:
+            raise ValueError(f"Split column {split_column!r} not found")
+        frame = frame.loc[frame[split_column] == split].copy()
+    logger.info("Loaded %d rows from %s", len(frame), source)
+    return frame
 
 
 def validate_dataset(
-    df: pd.DataFrame,
+    frame: pd.DataFrame,
     text_column: str,
     outcome_column: str,
     treatment_column: str,
-    split_column: Optional[str] = None
+    split_column: Optional[str] = None,
 ) -> None:
-    """
-    Validate dataset has required columns and correct format.
+    """Validate the columns and non-null values required by causal workflows."""
 
-    Args:
-        df: DataFrame to validate
-        text_column: Expected text column name
-        outcome_column: Expected outcome column name
-        treatment_column: Expected treatment column name
-        split_column: Optional split column name
-
-    Raises:
-        ValueError: If validation fails
-    """
     required = {text_column, outcome_column, treatment_column}
     if split_column:
         required.add(split_column)
-
-    missing = required - set(df.columns)
+    missing = required.difference(frame.columns)
     if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+    null_columns = [column for column in required if frame[column].isna().any()]
+    if null_columns:
+        raise ValueError(f"Null values in required columns: {sorted(null_columns)}")
 
-    if df[text_column].isnull().any():
-        raise ValueError(f"Null values in {text_column}")
 
-    if df[outcome_column].isnull().any():
-        raise ValueError(f"Null values in {outcome_column}")
-
-    if df[treatment_column].isnull().any():
-        raise ValueError(f"Null values in {treatment_column}")
-
-    logger.info(f"Dataset validation passed: {len(df)} samples")
+__all__ = ["load_dataset", "validate_dataset"]

@@ -80,7 +80,7 @@ class CausalForestHead:
     """
     Causal Forest head for ITE estimation from neural features.
 
-    Unlike neural causal heads (DragonNet, RLearner), this uses
+    Unlike end-to-end neural causal heads, this uses
     econml's CausalForestDML to estimate treatment effects.
 
     The causal forest provides:

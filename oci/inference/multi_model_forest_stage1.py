@@ -589,7 +589,7 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
                     extractor=runner._create_extractor(),
                     hidden_dim=getattr(
                         runner.config.architecture,
-                        "causal_head_hidden_outcome_dim",
+                        "htr_prediction_head_hidden_dim",
                         64,
                     ),
                     outcome_type=runner.config.outcome_type,
@@ -824,7 +824,7 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
                         extractor=runner._create_extractor(),
                         hidden_dim=getattr(
                             runner.config.architecture,
-                            "causal_head_hidden_outcome_dim",
+                            "htr_prediction_head_hidden_dim",
                             64,
                         ),
                     ).to(runner.device)
@@ -1003,7 +1003,7 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
                 extractor=runner._create_extractor(),
                 hidden_dim=getattr(
                     runner.config.architecture,
-                    "causal_head_hidden_outcome_dim",
+                    "htr_prediction_head_hidden_dim",
                     64,
                 ),
                 outcome_type=runner.config.outcome_type,
@@ -1063,7 +1063,7 @@ class MultiModelForestStage1HTRProvider(MultiModelHTREvidenceProvider):
                 extractor=runner._create_extractor(),
                 hidden_dim=getattr(
                     runner.config.architecture,
-                    "causal_head_hidden_outcome_dim",
+                    "htr_prediction_head_hidden_dim",
                     64,
                 ),
             ).to(runner.device)

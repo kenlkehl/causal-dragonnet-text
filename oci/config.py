@@ -483,186 +483,6 @@ ExplicitConfounderExtractionConfig = ExplicitFeatureExtractionConfig
 
 
 # =============================================================================
-# MATCHING ANALYSIS CONFIGURATION (used as post-hoc analysis with DragonNet)
-# =============================================================================
-
-
-@dataclass
-class MatchingAnalysisConfig:
-    """Configuration for propensity score matching analysis (post-hoc)."""
-
-    # Whether to run PSM analysis using DragonNet's propensity scores
-    enabled: bool = True
-
-    # Matching method: 'nearest', 'optimal', 'caliper'
-    method: str = "nearest"
-
-    # Caliper (maximum allowed distance for a match)
-    # None = no caliper
-    caliper: Optional[float] = 0.2
-
-    # Scale for caliper: 'propensity', 'logit', 'std'
-    # 'std' means caliper is in standard deviations of logit propensity
-    caliper_scale: str = "std"
-
-    # Matching ratio (1:k matching)
-    ratio: int = 1
-
-    # Whether to match with replacement
-    replacement: bool = False
-
-    # Number of bootstrap iterations for confidence intervals
-    n_bootstrap: int = 1000
-
-    # Confidence level for intervals
-    ci_level: float = 0.95
-
-
-# =============================================================================
-# CAUSAL FOREST CONFIGURATION
-# =============================================================================
-
-
-@dataclass
-class ContrastiveEffectConfig:
-    """Configuration for matched contrastive effect-modifier representation learning.
-
-    This stage uses cross-fitted nuisance predictions from W to create
-    propensity-neighborhood treatment/control contrasts, then trains the X
-    representation to explain within-neighborhood outcome differences.
-    """
-
-    enabled: bool = False
-
-    # X representation bottleneck
-    bottleneck_dim: int = 8
-    hidden_dim: int = 64
-
-    # Propensity-neighborhood batching
-    batch_size: int = 16
-    n_propensity_bins: int = 10
-    overlap_min: float = 0.05
-    overlap_max: float = 0.95
-    min_arm_per_bin: int = 2
-
-    # Loss weights
-    lambda_factual: float = 1.0
-    lambda_contrast: float = 2.0
-    lambda_adversary: float = 0.05
-    lambda_z_l2: float = 1e-4
-
-    # Residual contrast target stabilization
-    target_clip: float = 1.0
-
-    # Causal forest X feature export mode:
-    # "bottleneck", "tau", or "bottleneck_plus_tau"
-    forest_x_mode: str = "bottleneck_plus_tau"
-
-    def __post_init__(self):
-        valid_modes = {"bottleneck", "tau", "bottleneck_plus_tau"}
-        if self.forest_x_mode not in valid_modes:
-            raise ValueError(
-                f"forest_x_mode must be one of {sorted(valid_modes)}, "
-                f"got '{self.forest_x_mode}'"
-            )
-        if self.bottleneck_dim < 1:
-            raise ValueError("bottleneck_dim must be >= 1")
-        if self.batch_size < 2:
-            raise ValueError("batch_size must be >= 2")
-        if self.n_propensity_bins < 1:
-            raise ValueError("n_propensity_bins must be >= 1")
-        if not (0.0 <= self.overlap_min < self.overlap_max <= 1.0):
-            raise ValueError("overlap_min/overlap_max must satisfy 0 <= min < max <= 1")
-        if self.min_arm_per_bin < 1:
-            raise ValueError("min_arm_per_bin must be >= 1")
-
-
-@dataclass
-class CausalForestConfig:
-    """Configuration for causal forest head (used with model_type="causal_forest").
-
-    Note: Nuisance functions (propensity, outcome) are estimated using sklearn
-    random forests on the neural network's learned features. The neural network's
-    key contribution is the learned text representation that captures confounders.
-    """
-
-    # Number of trees in the causal forest (must be divisible by 4 for econml)
-    n_estimators: int = 100
-
-    # Maximum depth of trees (None = unlimited)
-    max_depth: Optional[int] = None
-
-    # Minimum samples per leaf
-    min_samples_leaf: int = 5
-
-    # Feature subset strategy for splitting
-    max_features: str = "sqrt"
-
-    # Use honest estimation (sample splitting within trees)
-    honest: bool = True
-
-    # Enable inference for confidence intervals
-    inference: bool = True
-
-    # R-learner representation training for causal forest. When True, staged
-    # training learns nuisance W features and effect-modifier X features.
-    use_rlearner_representation: bool = False
-
-    # Weight for R-learner loss during representation training
-    gamma_rlearner: float = 1.0
-
-    # Inner folds used for out-of-fold nuisance predictions in staged R-learning.
-    rlearner_nuisance_folds: int = 5
-    rlearner_inner_fold_parallelism: str = "auto"
-
-    # Matched contrastive X-stage alternative to per-patient R-loss training.
-    contrastive_effect: ContrastiveEffectConfig = field(default_factory=ContrastiveEffectConfig)
-
-    def __post_init__(self):
-        if isinstance(self.contrastive_effect, dict):
-            self.contrastive_effect = ContrastiveEffectConfig(**self.contrastive_effect)
-        if str(self.rlearner_inner_fold_parallelism).strip().lower() != "auto":
-            try:
-                if int(self.rlearner_inner_fold_parallelism) < 1:
-                    raise ValueError
-            except ValueError as exc:
-                raise ValueError(
-                    "causal_forest.rlearner_inner_fold_parallelism must be 'auto' "
-                    "or a positive integer"
-                ) from exc
-
-
-# =============================================================================
-# TF-IDF + CAUSAL FOREST CONFIGURATION
-# =============================================================================
-
-
-@dataclass
-class TfidfForestConfig:
-    """Configuration for TF-IDF + Causal Forest baseline (model_type="tfidf_forest").
-
-    A non-neural baseline that uses TF-IDF features directly with CausalForestDML.
-    No GPU, no training epochs, no neural network.
-    """
-
-    # TF-IDF vectorizer parameters
-    max_features: int = 10000  # Maximum number of TF-IDF features
-    ngram_range_min: int = 1  # Minimum n-gram size
-    ngram_range_max: int = 2  # Maximum n-gram size
-    min_df: int = 5  # Minimum document frequency (absolute count)
-    max_df: float = 0.95  # Maximum document frequency (proportion)
-    sublinear_tf: bool = True  # Use sublinear TF scaling (1 + log(tf))
-
-    # Causal forest parameters
-    n_estimators: int = 200  # Number of trees (must be divisible by 4 for econml)
-    max_depth: Optional[int] = None  # Maximum tree depth (None = unlimited)
-    min_samples_leaf: int = 10  # Minimum samples per leaf
-    max_features_forest: str = "sqrt"  # Feature subset strategy for splitting
-    honest: bool = True  # Honest estimation (sample splitting within trees)
-    inference: bool = True  # Enable confidence intervals
-
-
-# =============================================================================
 # EXPLICIT-FEATURE-ONLY CAUSAL FOREST CONFIGURATION
 # =============================================================================
 
@@ -2947,98 +2767,6 @@ class MultiModelForestConfig(MultiModelAgenticForestConfig):
 
 
 @dataclass
-class DragonNetDRLearnerConfig:
-    """Configuration for a DragonNet nuisance stage plus DR pseudo-outcome learner."""
-
-    nuisance_folds: int = 5
-    effect_folds: int = 5
-    nuisance_epochs: Optional[int] = None
-    effect_epochs: Optional[int] = None
-    nuisance_calibration: str = "temperature_isotonic"
-    e_clip: float = 0.01
-    effect_loss: str = "huber"
-    huber_beta: float = 0.05
-    attention_top_k_chunks: int = 5
-
-    def __post_init__(self):
-        if self.nuisance_folds < 2:
-            raise ValueError("dragonnet_drlearner.nuisance_folds must be >= 2")
-        if self.effect_folds < 2:
-            raise ValueError("dragonnet_drlearner.effect_folds must be >= 2")
-        if self.nuisance_epochs is not None and self.nuisance_epochs < 1:
-            raise ValueError("dragonnet_drlearner.nuisance_epochs must be >= 1 when set")
-        if self.effect_epochs is not None and self.effect_epochs < 1:
-            raise ValueError("dragonnet_drlearner.effect_epochs must be >= 1 when set")
-        nuisance_calibration = str(self.nuisance_calibration).strip().lower()
-        if nuisance_calibration not in {"none", "temperature", "isotonic", "temperature_isotonic"}:
-            raise ValueError(
-                "dragonnet_drlearner.nuisance_calibration must be one of "
-                "'none', 'temperature', 'isotonic', or 'temperature_isotonic'"
-            )
-        self.nuisance_calibration = nuisance_calibration
-        if not 0.0 < float(self.e_clip) < 0.5:
-            raise ValueError("dragonnet_drlearner.e_clip must be in (0, 0.5)")
-        effect_loss = str(self.effect_loss).strip().lower()
-        if effect_loss not in {"huber", "mse"}:
-            raise ValueError("dragonnet_drlearner.effect_loss must be 'huber' or 'mse'")
-        self.effect_loss = effect_loss
-        if float(self.huber_beta) <= 0.0:
-            raise ValueError("dragonnet_drlearner.huber_beta must be > 0")
-        if self.attention_top_k_chunks < 1:
-            raise ValueError("dragonnet_drlearner.attention_top_k_chunks must be >= 1")
-
-
-EXTRACTOR_ALIASES = {
-    "frozen_llm_pooler": {"frozen_llm_pooler", "frozen_llm", "llm_pooler", "llm_pool", "flp"},
-    "hierarchical_llm": {"hierarchical_llm", "hier_llm", "hlm"},
-    "hierarchical_transformer": {
-        "hierarchical_transformer",
-        "hier_transformer",
-        "htr",
-        "short_chunk_transformer",
-    },
-    "hierarchical_cnn": {"hierarchical_cnn", "hier_cnn", "hcnn"},
-    "hierarchical_gru": {"hierarchical_gru", "hier_gru", "hgru"},
-    "simple_cnn": {"simple_cnn", "scnn"},
-    "concept_embedding_cnn": {
-        "concept_embedding_cnn",
-        "concept_cnn",
-        "cecnn",
-        "concept_embeddings",
-    },
-    "concept_token_cnn": {
-        "concept_token_cnn",
-        "concept_token_embeddings",
-        "token_concept_cnn",
-        "ctcnn",
-    },
-    "slot_value_discovery": {
-        "slot_value_discovery",
-        "slot_value",
-        "slot_discovery",
-        "svx",
-    },
-}
-
-VALID_EXTRACTOR_TYPES = set(EXTRACTOR_ALIASES.keys())
-
-# Extractors that require fit_tokenizer() before training or optimizer setup.
-TRAINABLE_EXTRACTOR_TYPES = {
-    "hierarchical_cnn",
-    "hierarchical_gru",
-    "hierarchical_transformer",
-    "simple_cnn",
-}
-
-# Extractors that support hidden state caching
-CACHEABLE_EXTRACTOR_TYPES = {
-    "frozen_llm_pooler",
-    "hierarchical_llm",
-    "concept_token_cnn",
-}
-
-
-@dataclass
 class AgenticAttentionVariableForestConfig:
     """Configuration for attention-evidence agentic variable discovery.
 
@@ -3170,12 +2898,11 @@ class AgenticAttentionVariableForestConfig:
             "joint_rlearner",
             "interaction_outcome",
             "tarnet_offset",
-            "dragonnet_dr",
         }:
             raise ValueError(
                 "agentic_attention_variable_forest.neural_stage_mode must be "
                 "one of 'staged', 'joint_rlearner', 'interaction_outcome', "
-                "'tarnet_offset', or 'dragonnet_dr'"
+                "or 'tarnet_offset'"
             )
         self.neural_stage_mode = neural_stage_mode
         self.joint_rlearner_gamma = float(self.joint_rlearner_gamma)
@@ -3285,88 +3012,14 @@ class AgenticAttentionVariableForestConfig:
             )
 
 
-def normalize_feature_extractor_type(feature_type: str) -> str:
-    """
-    Normalize feature extractor type string to its canonical name.
-
-    Args:
-        feature_type: The raw feature extractor type string
-
-    Returns:
-        Normalized type string
-
-    Raises:
-        ValueError: If the feature extractor type is not recognized
-    """
-    if feature_type is None:
-        return "frozen_llm_pooler"
-
-    feature_type_lower = feature_type.lower().strip()
-
-    for canonical, aliases in EXTRACTOR_ALIASES.items():
-        if feature_type_lower in aliases:
-            return canonical
-
-    raise ValueError(
-        f"Unsupported feature_extractor_type: '{feature_type}'. "
-        f"Supported types: {sorted(VALID_EXTRACTOR_TYPES)}"
-    )
-
-
 @dataclass
 class ModelArchitectureConfig:
-    """Configuration for model architecture."""
+    """Configuration shared by retained Stage 1 and explicit-feature workflows."""
 
-    model_type: str = (
-        "dragonnet"  # "dragonnet", "dragonnet_drlearner", "rlearner", "causal_forest", "tfidf_forest", "explicit_feature_forest", "agentic_explicit_feature_forest", "agentic_attention_variable_forest", "multi_model_agentic_forest", or "multi_model_forest"
-    )
+    model_type: str = "multi_model_forest"
+    feature_extractor_type: str = "hierarchical_transformer"
 
-    # Feature extractor type: "frozen_llm_pooler"
-    feature_extractor_type: str = "frozen_llm_pooler"
-
-    # Frozen LLM Pooler extractor (pretrained LLM + gated attention pooling)
-    # Uses all token hidden states + GatedAttentionPooling instead of last-token embedding
-    # Always loads pretrained weights; frozen by default for efficient training
-    flp_model_name: str = "Qwen/Qwen3-0.6B-Base"  # HuggingFace model name
-    flp_max_length: int = 8192  # Max sequence length
-    flp_freeze_llm: bool = True  # Freeze LLM backbone (only train pooling + projection)
-    flp_gated_attention_dim: int = 128  # Hidden dim for gated attention pooling
-    flp_projection_dim: int = 128  # Final output dimension
-    flp_dropout: float = 0.1  # Dropout rate for projection layers
-    flp_gradient_checkpointing: bool = True  # Gradient checkpointing (when not frozen)
-    flp_downprojection_dim: Optional[int] = (
-        None  # Trainable linear downprojection dim applied to LLM hidden states before pooling (None = no downprojection, pool on full hidden_size)
-    )
-    flp_cache_hidden_states: bool = (
-        False  # Pre-compute and cache LLM hidden states to disk (when frozen). Default False = live LLM forward per batch.
-    )
-    flp_gpu_cache: bool = (
-        False  # Keep hidden states on GPU VRAM instead of disk (auto-fallback to disk if insufficient VRAM)
-    )
-    flp_random_projection_dim: Optional[int] = (
-        None  # Random linear projection dimension for cached hidden states (None = no projection, keeps original hidden_size)
-    )
-    flp_chat_template_prompt: Optional[str] = (
-        None  # Chat template prompt for instruct models. When set, wraps each text in the model's chat template with this prompt preceding the clinical text. None = disabled (raw text). Recommended for instruct models: "You are an expert clinical cancer researcher. Read this patient history, and then extract a set of features that will predict the patient's next treatment and their outcome on that treatment. The history is: "
-    )
-
-    # Hierarchical LLM extractor (frozen LLM on overlapping chunks + two-level pooling)
-    hlm_model_name: str = "Qwen/Qwen3-0.6B-Base"
-    hlm_chunk_size: int = 2048  # tokens per chunk
-    hlm_chunk_overlap: int = 256  # overlapping tokens between chunks
-    hlm_max_chunks: int = 16  # maximum chunks per document
-    hlm_freeze_llm: bool = True
-    hlm_gated_attention_dim: int = 128
-    hlm_projection_dim: int = 128
-    hlm_dropout: float = 0.1
-    hlm_gradient_checkpointing: bool = True
-    hlm_downprojection_dim: Optional[int] = None
-    hlm_cache_hidden_states: bool = False
-    hlm_gpu_cache: bool = False
-    hlm_chat_template_prompt: Optional[str] = None
-
-    # Historical hierarchical transformer extractor, revived as short chunks.
-    # Used by model_type="agentic_attention_variable_forest" by default.
+    # Hierarchical short-chunk transformer used by the HTR Stage 1 lane.
     htr_sentence_model: str = "prajjwal1/bert-tiny"
     htr_freeze_sentence_encoder: bool = False
     htr_chunk_size_words: int = 96
@@ -3423,93 +3076,7 @@ class ModelArchitectureConfig:
     htr_effect_head_dropout: float = 0.1
     htr_effect_head_layer_norm: bool = False
     htr_effect_head_bias: bool = True
-
-    # Hierarchical CNN extractor (dilated CNN on chunks + two-level pooling, trains from scratch)
-    hcnn_embedding_dim: int = 256
-    hcnn_conv_dim: int = 256
-    hcnn_kernel_size: int = 5
-    hcnn_num_conv_blocks: int = 4
-    hcnn_chunk_size: int = 512
-    hcnn_chunk_overlap: int = 64
-    hcnn_max_chunks: int = 32
-    hcnn_vocab_size: int = 50000
-    hcnn_gated_attention_dim: int = 128
-    hcnn_projection_dim: int = 128
-    hcnn_dropout: float = 0.1
-
-    # Hierarchical GRU extractor (BiGRU on chunks + two-level pooling, trains from scratch)
-    hgru_embedding_dim: int = 256
-    hgru_gru_hidden_dim: int = 256
-    hgru_num_gru_layers: int = 2
-    hgru_chunk_size: int = 512
-    hgru_chunk_overlap: int = 64
-    hgru_max_chunks: int = 32
-    hgru_vocab_size: int = 50000
-    hgru_gated_attention_dim: int = 128
-    hgru_projection_dim: int = 128
-    hgru_dropout: float = 0.1
-
-    # Simple CNN extractor (dilated CNN on whole text, trains from scratch)
-    scnn_embedding_dim: int = 256
-    scnn_conv_dim: int = 256
-    scnn_kernel_size: int = 5
-    scnn_num_conv_blocks: int = 4
-    scnn_max_length: int = 10000
-    scnn_vocab_size: int = 50000
-    scnn_gated_attention_dim: int = 128
-    scnn_projection_dim: int = 128
-    scnn_dropout: float = 0.1
-
-    # Concept token CNN extractor (cached token-level LLM hidden states + concept kernels)
-    ctcnn_model_name: str = "Qwen/Qwen3-0.6B-Base"
-    ctcnn_chunk_size: int = 2048
-    ctcnn_chunk_overlap: int = 256
-    ctcnn_max_chunks: int = 16
-    ctcnn_confounder_concepts: List[str] = field(default_factory=list)
-    ctcnn_effect_modifier_concepts: List[str] = field(default_factory=list)
-    ctcnn_random_features: int = 0
-    ctcnn_random_confounder_features: Optional[int] = None
-    ctcnn_random_modifier_features: Optional[int] = None
-    ctcnn_projection_dim: int = 128
-    ctcnn_dropout: float = 0.1
-    ctcnn_anchor_weight: float = 0.01
-    ctcnn_cache_hidden_states: bool = False
-    ctcnn_cached_hidden_size: int = 0
-    ctcnn_downprojection_dim: Optional[int] = None
-    ctcnn_normalize_embeddings: bool = True
-    ctcnn_random_state: int = 42
-
-    # Slot-value discovery extractor (cached sentence chunks + seeded/free slots)
-    svx_sentence_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
-    svx_chunk_size_words: int = 64
-    svx_chunk_overlap_words: int = 16
-    svx_max_chunks: int = 128
-    svx_confounder_concepts: List[str] = field(default_factory=list)
-    svx_effect_modifier_concepts: List[str] = field(default_factory=list)
-    svx_num_free_slots: int = 16
-    svx_slot_dim: int = 128
-    svx_num_value_prototypes: int = 4
-    svx_dropout: float = 0.1
-    svx_anchor_weight: float = 0.01
-    svx_cache_chunk_embeddings: bool = False
-    svx_cached_embedding_dim: int = 0
-    svx_normalize_embeddings: bool = True
-    svx_attention_temperature: float = 0.1
-    svx_attention_entropy_weight: float = 0.0
-    svx_query_diversity_weight: float = 0.0
-    svx_gate_l1_weight: float = 0.0
-    svx_random_state: int = 42
-
-    # Causal head dimensions (applies to all causal heads: DragonNet, RLearner, etc.)
-    causal_head_representation_dim: int = 128
-    causal_head_hidden_outcome_dim: int = 64
-    causal_head_dropout: float = 0.2  # Dropout in causal head representation and outcome layers
-
-    # Causal Forest config (used when model_type="causal_forest")
-    causal_forest: CausalForestConfig = field(default_factory=CausalForestConfig)
-
-    # TF-IDF + Causal Forest config (used when model_type="tfidf_forest")
-    tfidf_forest: TfidfForestConfig = field(default_factory=TfidfForestConfig)
+    htr_prediction_head_hidden_dim: int = 64
 
     # Explicit-Feature-Only Causal Forest config (used when model_type="explicit_feature_forest")
     explicit_feature_forest: ExplicitFeatureForestConfig = field(
@@ -3526,9 +3093,6 @@ class ModelArchitectureConfig:
         default_factory=AgenticAttentionVariableForestConfig
     )
 
-    # DragonNet nuisance model + independent DR pseudo-outcome effect learner
-    dragonnet_drlearner: DragonNetDRLearnerConfig = field(default_factory=DragonNetDRLearnerConfig)
-
     # Multi-model BoW-guided variable discovery + explicit-feature causal forest
     multi_model_agentic_forest: MultiModelAgenticForestConfig = field(
         default_factory=MultiModelAgenticForestConfig
@@ -3540,78 +3104,17 @@ class ModelArchitectureConfig:
 
 @dataclass
 class TrainingConfig:
-    """Configuration for model training."""
+    """Shared optimization settings used by the retained HTR workflows."""
 
     learning_rate: float = 1e-4
-    optimizer: str = "adamw"
     lr_schedule: str = "linear"
     epochs: int = 50
     batch_size: int = 8
     effect_batch_size: Optional[int] = 32
     dataloader_workers: Optional[int] = None  # None = 0 on CPU, 2 on accelerator devices
     alpha_propensity: float = 1.0
-    beta_targreg: float = 0.1
-    gamma_rlearner: float = 1.0  # Weight for R-learner loss (when model_type="rlearner")
-    # Regularization options
     weight_decay: float = 0.01  # L2 regularization (AdamW decoupled weight decay)
     gradient_clip_norm: float = 1.0  # Max gradient norm (0 to disable)
-    adamw_beta1: float = 0.9
-    adamw_beta2: float = 0.999
-    adamw_eps: float = 1e-8
-    adamw_amsgrad: bool = False
-    adamw_maximize: bool = False
-    adamw_foreach: bool = False
-    adamw_capturable: bool = False
-    adamw_differentiable: bool = False
-    adamw_fused: bool = False
-    optimizer_zero_grad_set_to_none: bool = True
-    gradient_clip_norm_type: float = 2.0
-    gradient_clip_error_if_nonfinite: bool = False
-    gradient_clip_foreach: bool = False
-    label_smoothing: float = 0.0  # Label smoothing for BCE (0 to disable)
-    # Advanced training options for improving tau learning
-    stop_grad_propensity: bool = (
-        False  # Detach features before propensity loss (prevents propensity from dominating representation)
-    )
-    attention_entropy_weight: float = (
-        0.0  # Weight for attention entropy regularization (encourages focused attention)
-    )
-
-
-@dataclass
-class PropensityTrimmingConfig:
-    """Configuration for propensity score trimming before causal inference.
-
-    When enabled, trains a propensity-only model using k-fold cross-validation
-    to generate out-of-sample propensity scores, then trims the dataset by
-    removing patients with propensity scores outside the specified bounds.
-    This helps enforce positivity assumption for causal inference.
-    """
-
-    enabled: bool = False  # Whether to trim by propensity before DragonNet training
-    min_propensity: float = 0.1  # Remove patients with P(T=1|X) below this
-    max_propensity: float = 0.9  # Remove patients with P(T=1|X) above this
-    cv_folds: int = 5  # Number of CV folds for propensity model training
-    propensity_epochs: int = 20  # Training epochs for propensity model
-    propensity_learning_rate: float = 1e-4  # Learning rate for propensity model
-    propensity_batch_size: int = 8  # Batch size for propensity model
-
-
-@dataclass
-class OutcomeModelConfig:
-    """Configuration for standalone outcome model training.
-
-    When enabled, trains an outcome-only model using k-fold cross-validation
-    to generate out-of-sample outcome predictions. This helps assess the
-    prognostic signal in the data before DragonNet training.
-    Unlike propensity trimming, this does NOT trim the dataset.
-    """
-
-    enabled: bool = False  # Whether to train outcome model before DragonNet
-    cv_folds: int = 5  # Number of CV folds for outcome model training
-    outcome_epochs: int = 20  # Training epochs for outcome model
-    outcome_learning_rate: float = 1e-4  # Learning rate for outcome model
-    outcome_batch_size: int = 8  # Batch size for outcome model
 
 
 @dataclass
@@ -3632,11 +3135,6 @@ class AppliedInferenceConfig:
     cv_folds: int = 5  # Number of CV folds (0 or 1 = fixed split)
     architecture: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
-    propensity_trimming: PropensityTrimmingConfig = field(default_factory=PropensityTrimmingConfig)
-    outcome_model: OutcomeModelConfig = field(default_factory=OutcomeModelConfig)
-    # PSM analysis configuration (uses DragonNet's propensity scores)
-    matching_analysis: MatchingAnalysisConfig = field(default_factory=MatchingAnalysisConfig)
-
     # Explicit feature extraction configuration (LLM-based)
     explicit_features: ExplicitFeatureExtractionConfig = field(
         default_factory=ExplicitFeatureExtractionConfig
@@ -3652,14 +3150,6 @@ class ExperimentConfig:
     device: Optional[str] = None
     num_workers: int = 1
     gpu_ids: Optional[List[int]] = None
-
-    # Confounder interpretation settings
-    save_confounder_interpretations: bool = (
-        False  # Save confounder attention interpretations after training
-    )
-    confounder_interpretation_top_k: int = (
-        5  # Number of top-attended sentences per confounder to save
-    )
 
     applied_inference: AppliedInferenceConfig = field(default_factory=AppliedInferenceConfig)
 
@@ -3691,43 +3181,49 @@ class ExperimentConfig:
             )
 
         def parse_architecture_config(arch_data: Dict[str, Any]) -> ModelArchitectureConfig:
-            """Parse architecture config, handling nested causal_forest and tfidf_forest."""
+            """Parse retained architectures while tolerating inert legacy fields."""
             arch_data = arch_data.copy()
-            if arch_data.get("model_type") == "confounder_forest":
+            retired_model_types = {
+                "causal_forest",
+                "confounder_forest",
+                "dragonnet",
+                "dragonnet_drlearner",
+                "non_neural_agentic_forest",
+                "rlearner",
+                "tfidf_forest",
+            }
+            if arch_data.get("model_type") in retired_model_types:
                 raise ValueError(
-                    "model_type='confounder_forest' has been removed. "
-                    "Use model_type='explicit_feature_forest' with role-tagged explicit_features."
+                    f"model_type={arch_data.get('model_type')!r} has been removed; "
+                    "use the all-evidence workflow or a retained explicit-feature model"
                 )
-            if "causal_forest" in arch_data and isinstance(arch_data["causal_forest"], dict):
-                cf_data = arch_data["causal_forest"].copy()
-                if (
-                    "inner_fold_parallelism" in cf_data
-                    and "rlearner_inner_fold_parallelism" not in cf_data
-                ):
-                    cf_data["rlearner_inner_fold_parallelism"] = cf_data.pop(
-                        "inner_fold_parallelism"
-                    )
-                else:
-                    cf_data.pop("inner_fold_parallelism", None)
-                if "contrastive_effect" in cf_data and isinstance(
-                    cf_data["contrastive_effect"], dict
-                ):
-                    cf_data["contrastive_effect"] = ContrastiveEffectConfig(
-                        **cf_data["contrastive_effect"]
-                    )
-                arch_data["causal_forest"] = CausalForestConfig(**cf_data)
-            if "tfidf_forest" in arch_data and isinstance(arch_data["tfidf_forest"], dict):
-                arch_data["tfidf_forest"] = TfidfForestConfig(**arch_data["tfidf_forest"])
-            if "confounder_forest" in arch_data:
-                raise ValueError(
-                    "architecture.confounder_forest has been removed. "
-                    "Use architecture.explicit_feature_forest."
-                )
-            if "non_neural_agentic_forest" in arch_data:
-                raise ValueError(
-                    "architecture.non_neural_agentic_forest has been removed. "
-                    "Use architecture.multi_model_agentic_forest."
-                )
+            retired_keys = {
+                "causal_forest",
+                "dragonnet_drlearner",
+                "tfidf_forest",
+            }
+            retired_prefixes = (
+                "causal_head_",
+                "ctcnn_",
+                "flp_",
+                "hcnn_",
+                "hgru_",
+                "hlm_",
+                "scnn_",
+                "svx_",
+            )
+            legacy_head_hidden_dim = arch_data.pop(
+                "causal_head_hidden_outcome_dim",
+                None,
+            )
+            if (
+                legacy_head_hidden_dim is not None
+                and "htr_prediction_head_hidden_dim" not in arch_data
+            ):
+                arch_data["htr_prediction_head_hidden_dim"] = legacy_head_hidden_dim
+            for key in tuple(arch_data):
+                if key in retired_keys or key.startswith(retired_prefixes):
+                    arch_data.pop(key)
             if "explicit_feature_forest" in arch_data and isinstance(
                 arch_data["explicit_feature_forest"], dict
             ):
@@ -3751,12 +3247,6 @@ class ExperimentConfig:
                 arch_data["agentic_attention_variable_forest"] = (
                     AgenticAttentionVariableForestConfig(**avf_data)
                 )
-            if "dragonnet_drlearner" in arch_data and isinstance(
-                arch_data["dragonnet_drlearner"], dict
-            ):
-                arch_data["dragonnet_drlearner"] = DragonNetDRLearnerConfig(
-                    **arch_data["dragonnet_drlearner"]
-                )
             if "multi_model_agentic_forest" in arch_data and isinstance(
                 arch_data["multi_model_agentic_forest"], dict
             ):
@@ -3770,6 +3260,35 @@ class ExperimentConfig:
                     **arch_data["multi_model_forest"]
                 )
             return ModelArchitectureConfig(**arch_data)
+
+        def parse_training_config(training_data: Dict[str, Any]) -> TrainingConfig:
+            """Drop retired neural-model settings while preserving active HTR knobs."""
+
+            training_data = training_data.copy()
+            retired_training_keys = {
+                "adamw_amsgrad",
+                "adamw_beta1",
+                "adamw_beta2",
+                "adamw_capturable",
+                "adamw_differentiable",
+                "adamw_eps",
+                "adamw_foreach",
+                "adamw_fused",
+                "adamw_maximize",
+                "attention_entropy_weight",
+                "beta_targreg",
+                "gamma_rlearner",
+                "gradient_clip_error_if_nonfinite",
+                "gradient_clip_foreach",
+                "gradient_clip_norm_type",
+                "label_smoothing",
+                "optimizer_zero_grad_set_to_none",
+                "optimizer",
+                "stop_grad_propensity",
+            }
+            for key in retired_training_keys:
+                training_data.pop(key, None)
+            return TrainingConfig(**training_data)
 
         def parse_explicit_features_config(
             feat_data: Dict[str, Any],
@@ -3790,36 +3309,19 @@ class ExperimentConfig:
                 ]
             return ExplicitFeatureExtractionConfig(**feat_data)
 
-        applied = AppliedInferenceConfig(
-            **{
-                k: (
-                    parse_architecture_config(v)
-                    if k == "architecture"
-                    else (
-                        TrainingConfig(**v)
-                        if k == "training"
-                        else (
-                            PropensityTrimmingConfig(**v)
-                            if k == "propensity_trimming"
-                            else (
-                                OutcomeModelConfig(**v)
-                                if k == "outcome_model"
-                                else (
-                                    MatchingAnalysisConfig(**v)
-                                    if k == "matching_analysis"
-                                    else (
-                                        parse_explicit_features_config(v)
-                                        if k == "explicit_features"
-                                        else v
-                                    )
-                                )
-                            )
-                        )
-                    )
-                )
-                for k, v in applied_data.items()
-            }
-        )
+        parsed_applied: Dict[str, Any] = {}
+        for key, value in applied_data.items():
+            if key in {"matching_analysis", "outcome_model", "propensity_trimming"}:
+                continue
+            if key == "architecture":
+                parsed_applied[key] = parse_architecture_config(value)
+            elif key == "training":
+                parsed_applied[key] = parse_training_config(value)
+            elif key == "explicit_features":
+                parsed_applied[key] = parse_explicit_features_config(value)
+            else:
+                parsed_applied[key] = value
+        applied = AppliedInferenceConfig(**parsed_applied)
 
         return cls(
             output_dir=data.get("output_dir", "./oci_results"),
@@ -3827,8 +3329,6 @@ class ExperimentConfig:
             device=data.get("device"),
             num_workers=data.get("num_workers", 1),
             gpu_ids=data.get("gpu_ids"),
-            save_confounder_interpretations=data.get("save_confounder_interpretations", False),
-            confounder_interpretation_top_k=data.get("confounder_interpretation_top_k", 5),
             applied_inference=applied,
         )
 
@@ -3853,17 +3353,20 @@ class ExperimentConfig:
                 f"got '{self.applied_inference.outcome_type}'"
             )
 
-        if self.applied_inference.architecture.model_type == "confounder_forest":
+        model_type = self.applied_inference.architecture.model_type
+        retained_model_types = {
+            "agentic_attention_variable_forest",
+            "agentic_explicit_feature_forest",
+            "explicit_feature_forest",
+            "multi_model_agentic_forest",
+            "multi_model_forest",
+        }
+        if model_type not in retained_model_types:
             raise ValueError(
-                "model_type='confounder_forest' has been removed. "
-                "Use model_type='explicit_feature_forest'."
+                f"Unsupported or retired model_type={model_type!r}; retained types are "
+                + ", ".join(sorted(retained_model_types))
             )
-        if self.applied_inference.architecture.model_type == "non_neural_agentic_forest":
-            raise ValueError(
-                "model_type='non_neural_agentic_forest' has been removed. "
-                "Use model_type='multi_model_agentic_forest'."
-            )
-        if self.applied_inference.architecture.model_type == "agentic_attention_variable_forest":
+        if model_type == "agentic_attention_variable_forest":
             avf_config = self.applied_inference.architecture.agentic_attention_variable_forest
             if not (
                 0.0 <= avf_config.r_stage_min_propensity < avf_config.r_stage_max_propensity <= 1.0
@@ -3881,7 +3384,7 @@ class ExperimentConfig:
                         "agentic_attention_variable_forest.fold_parallelism must "
                         "be 'auto' or a positive integer"
                     ) from exc
-        if self.applied_inference.architecture.model_type == "multi_model_agentic_forest":
+        if model_type == "multi_model_agentic_forest":
             mm_config = self.applied_inference.architecture.multi_model_agentic_forest
             methods = normalize_multi_model_feature_discovery_methods(
                 getattr(mm_config, "feature_discovery_methods", None),
@@ -3911,18 +3414,6 @@ class ExperimentConfig:
                     "multi_model_agentic_forest.htr_evidence_enabled=False "
                     "requires htr_evidence_disable_reason"
                 )
-        if self.applied_inference.architecture.model_type == "causal_forest":
-            cf_config = self.applied_inference.architecture.causal_forest
-            if str(cf_config.rlearner_inner_fold_parallelism).strip().lower() != "auto":
-                try:
-                    if int(cf_config.rlearner_inner_fold_parallelism) < 1:
-                        raise ValueError
-                except ValueError as exc:
-                    raise ValueError(
-                        "causal_forest.rlearner_inner_fold_parallelism must be "
-                        "'auto' or a positive integer"
-                    ) from exc
-
         if (
             self.applied_inference.explicit_features.enabled
             and not self.applied_inference.explicit_features.features
@@ -3939,13 +3430,6 @@ class ExperimentConfig:
                 "role-tagged explicit feature in explicit_features.features"
             )
 
-        # Validate matching config
-        if self.applied_inference.matching_analysis.enabled:
-            valid_methods = {"nearest", "optimal", "caliper"}
-            if self.applied_inference.matching_analysis.method not in valid_methods:
-                raise ValueError(f"matching_analysis.method must be one of {valid_methods}")
-
-
 def create_default_config(output_path: str) -> None:
     """Create a default configuration file."""
     config = ExperimentConfig(
@@ -3961,7 +3445,8 @@ def create_default_config(output_path: str) -> None:
             dataset_path="./dataset.parquet",
             cv_folds=5,
             architecture=ModelArchitectureConfig(
-                feature_extractor_type="frozen_llm_pooler",
+                model_type="agentic_explicit_feature_forest",
+                feature_extractor_type="hierarchical_transformer",
             ),
             training=TrainingConfig(epochs=50, batch_size=8),
         ),

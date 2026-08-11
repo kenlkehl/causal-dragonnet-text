@@ -47,7 +47,6 @@ from ..config import (
     ExplicitFeatureSpec,
 )
 from ..models.causal_forest_head import CausalForestHead
-from ..models.extractor_factory import create_feature_extractor
 from ..models.hierarchical_transformer_extractor import (
     HTR_SENTENCE_ENCODER_TRAINING_AUDIT_SCHEMA,
     HierarchicalTransformerExtractor,
@@ -938,28 +937,7 @@ class AgenticAttentionVariableForestRunner:
     ) -> pd.DataFrame:
         discovery_df = self.dataset.iloc[train_idx].reset_index(drop=True)
         r_stage = None
-        if self._dragonnet_dr_enabled():
-            from .dragonnet_drlearner import DragonNetDRLearnerRunner
-
-            dr_runner = DragonNetDRLearnerRunner(
-                dataset=discovery_df,
-                config=self.config,
-                output_path=self.artifact_dir / f"dragonnet_dr_outer_{outer_fold}.parquet",
-                device=self.device,
-                num_workers=self.num_workers,
-                gpu_ids=None,
-            )
-            nuisance = dr_runner.crossfit_nuisance(discovery_df, outer_fold)
-            r_stage = dr_runner.crossfit_effect(
-                discovery_df,
-                nuisance["predictions"],
-                outer_fold,
-            )
-            self.nuisance_rows.append(nuisance["predictions"])
-            self.r_stage_rows.append(r_stage["predictions"])
-            self.nuisance_attention_rows.extend(nuisance["attention"])
-            self.effect_attention_rows.extend(r_stage["attention"])
-        elif self._interaction_outcome_enabled():
+        if self._interaction_outcome_enabled():
             interaction = self._crossfit_interaction_outcome(discovery_df, outer_fold)
             nuisance = {
                 "predictions": interaction["nuisance_predictions"],
@@ -1214,12 +1192,6 @@ class AgenticAttentionVariableForestRunner:
             == "joint_rlearner"
         )
 
-    def _dragonnet_dr_enabled(self) -> bool:
-        return (
-            str(getattr(self.avf_config, "neural_stage_mode", "staged")).strip().lower()
-            == "dragonnet_dr"
-        )
-
     def _interaction_outcome_enabled(self) -> bool:
         return (
             str(getattr(self.avf_config, "neural_stage_mode", "staged")).strip().lower()
@@ -1280,41 +1252,53 @@ class AgenticAttentionVariableForestRunner:
 
     def _create_extractor(self) -> nn.Module:
         arch = self.config.architecture
-        extractor_type = getattr(arch, "feature_extractor_type", "hierarchical_transformer")
-        if extractor_type == "frozen_llm_pooler":
-            extractor_type = "hierarchical_transformer"
-        return create_feature_extractor(
-            extractor_type=extractor_type,
+        extractor_type = str(
+            getattr(arch, "feature_extractor_type", "hierarchical_transformer")
+        ).strip().lower()
+        if extractor_type not in {
+            "hierarchical_transformer",
+            "hier_transformer",
+            "htr",
+            "short_chunk_transformer",
+            # Legacy all-evidence configurations used this value before the
+            # HTR-only Stage 1 boundary was made explicit.
+            "frozen_llm_pooler",
+        }:
+            raise ValueError(
+                "Stage 1 HTR evidence requires feature_extractor_type="
+                "'hierarchical_transformer'"
+            )
+        return HierarchicalTransformerExtractor(
             device=self.device,
-            htr_sentence_model=getattr(arch, "htr_sentence_model", "prajjwal1/bert-tiny"),
-            htr_freeze_sentence_encoder=getattr(arch, "htr_freeze_sentence_encoder", False),
-            htr_chunk_size_words=getattr(arch, "htr_chunk_size_words", 96),
-            htr_chunk_overlap_words=getattr(arch, "htr_chunk_overlap_words", 24),
-            htr_max_chunks=getattr(arch, "htr_max_chunks", 512),
-            htr_max_chunk_length=getattr(arch, "htr_max_chunk_length", 128),
-            htr_num_layers=getattr(arch, "htr_num_layers", 2),
-            htr_num_heads=getattr(arch, "htr_num_heads", 4),
-            htr_transformer_dim=getattr(arch, "htr_transformer_dim", 256),
-            htr_dropout=getattr(arch, "htr_dropout", 0.05),
-            htr_projection_dim=getattr(arch, "htr_projection_dim", 128),
-            htr_hash_embedding_dim=getattr(arch, "htr_hash_embedding_dim", 256),
-            htr_sentence_encoder_batch_size=getattr(
+            sentence_encoder_model=getattr(arch, "htr_sentence_model", "prajjwal1/bert-tiny"),
+            freeze_sentence_encoder=getattr(arch, "htr_freeze_sentence_encoder", False),
+            chunk_size_words=getattr(arch, "htr_chunk_size_words", 96),
+            chunk_overlap_words=getattr(arch, "htr_chunk_overlap_words", 24),
+            max_chunks=getattr(arch, "htr_max_chunks", 512),
+            max_chunk_length=getattr(arch, "htr_max_chunk_length", 128),
+            num_transformer_layers=getattr(arch, "htr_num_layers", 2),
+            num_attention_heads=getattr(arch, "htr_num_heads", 4),
+            transformer_dim=getattr(arch, "htr_transformer_dim", 256),
+            transformer_dropout=getattr(arch, "htr_dropout", 0.05),
+            projection_dim=getattr(arch, "htr_projection_dim", 128),
+            hash_embedding_dim=getattr(arch, "htr_hash_embedding_dim", 256),
+            sentence_encoder_batch_size=getattr(
                 arch,
                 "htr_sentence_encoder_batch_size",
                 128,
             ),
-            htr_sentence_encoder_backend=getattr(
+            sentence_encoder_backend=getattr(
                 arch,
                 "htr_sentence_encoder_backend",
                 "auto",
             ),
-            htr_sentence_pooling=getattr(arch, "htr_sentence_pooling", "auto"),
-            htr_normalize_sentence_embeddings=getattr(
+            sentence_pooling=getattr(arch, "htr_sentence_pooling", "auto"),
+            normalize_sentence_embeddings=getattr(
                 arch,
                 "htr_normalize_sentence_embeddings",
                 True,
             ),
-            htr_trainable_sentence_encoder_layers=getattr(
+            trainable_sentence_encoder_layers=getattr(
                 arch,
                 "htr_trainable_sentence_encoder_layers",
                 0,
@@ -1518,7 +1502,7 @@ class AgenticAttentionVariableForestRunner:
                     extractor=self._create_extractor(),
                     hidden_dim=getattr(
                         self.config.architecture,
-                        "causal_head_hidden_outcome_dim",
+                        "htr_prediction_head_hidden_dim",
                         64,
                     ),
                     outcome_type=self.config.outcome_type,
@@ -1809,7 +1793,7 @@ class AgenticAttentionVariableForestRunner:
                     extractor=self._create_extractor(),
                     hidden_dim=getattr(
                         self.config.architecture,
-                        "causal_head_hidden_outcome_dim",
+                        "htr_prediction_head_hidden_dim",
                         64,
                     ),
                 ).to(self.device)
@@ -2111,7 +2095,7 @@ class AgenticAttentionVariableForestRunner:
                     extractor=self._create_extractor(),
                     hidden_dim=getattr(
                         self.config.architecture,
-                        "causal_head_hidden_outcome_dim",
+                        "htr_prediction_head_hidden_dim",
                         64,
                     ),
                     outcome_type=self.config.outcome_type,
@@ -2384,7 +2368,7 @@ class AgenticAttentionVariableForestRunner:
                     extractor=self._create_extractor(),
                     hidden_dim=getattr(
                         self.config.architecture,
-                        "causal_head_hidden_outcome_dim",
+                        "htr_prediction_head_hidden_dim",
                         64,
                     ),
                     outcome_type=self.config.outcome_type,
@@ -2753,7 +2737,7 @@ class AgenticAttentionVariableForestRunner:
                     extractor=self._create_extractor(),
                     hidden_dim=getattr(
                         self.config.architecture,
-                        "causal_head_hidden_outcome_dim",
+                        "htr_prediction_head_hidden_dim",
                         64,
                     ),
                     outcome_type=self.config.outcome_type,
@@ -3118,7 +3102,7 @@ class AgenticAttentionVariableForestRunner:
             hidden_dim = int(
                 getattr(
                     self.config.architecture,
-                    "causal_head_hidden_outcome_dim",
+                    "htr_prediction_head_hidden_dim",
                     64,
                 )
             )
@@ -5967,7 +5951,7 @@ class AgenticAttentionVariableForestRunner:
             "htr_sentence_pooling",
             "htr_normalize_sentence_embeddings",
             "htr_trainable_sentence_encoder_layers",
-            "causal_head_hidden_outcome_dim",
+            "htr_prediction_head_hidden_dim",
         ]
         train_keys = [
             "epochs",

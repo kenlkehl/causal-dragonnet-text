@@ -87,20 +87,6 @@ def _inputs(tmp_path: Path, *, components=COMPONENT_ORDER):
     return raw, compile_config(raw, config_dir=tmp_path)
 
 
-def test_stage1_era_module_and_class_names_remain_compatible():
-    import oci.inference.research_all_evidence_stage1 as legacy_workflow
-
-    assert (
-        legacy_workflow.ResearchAllEvidenceWorkflow
-        is ResearchAllEvidenceWorkflow
-    )
-    assert (
-        legacy_workflow.ResearchAllEvidenceStage1
-        is ResearchAllEvidenceWorkflow
-    )
-    assert legacy_workflow.main is all_evidence_workflow.main
-
-
 def test_multi_model_forest_defaults_to_the_full_stage1_architecture_set():
     from oci.config import MultiModelForestConfig
 
@@ -127,20 +113,6 @@ def test_generic_applied_dispatch_rejects_retired_multi_model_orchestration(tmp_
             config=config,
             output_path=tmp_path / "predictions.parquet",
             device=multi_model_stage1.torch.device("cpu"),
-        )
-
-
-def test_legacy_tfidf_topic_stage2_entry_point_is_retired():
-    from oci.inference.tfidf_topic_agentic_forest import (
-        run_tfidf_topic_agentic_forest,
-    )
-
-    with pytest.raises(RuntimeError, match="plain_handoff_stage2"):
-        run_tfidf_topic_agentic_forest(
-            dataset=pd.DataFrame(),
-            config=None,
-            output_path=Path("unused"),
-            handoff_path=Path("unused"),
         )
 
 

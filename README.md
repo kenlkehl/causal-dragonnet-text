@@ -842,119 +842,32 @@ The complete operational reference is
 and the abbreviated command reference is
 [`docs/all_evidence_quickstart.md`](docs/all_evidence_quickstart.md).
 
-## Standalone treatment-effect models
+## Standalone explicit-feature workflows
 
-The all-evidence workflow is not the only way to use OCI. The `oci run` command
-supports conventional experiments in which one text representation is connected
-directly to one causal head.
+Explicit-feature functionality remains available for investigator-specified
+measurements and adaptive feature discovery. These workflows share the same
+role-aware feature contracts used by the all-evidence pipeline.
 
-```mermaid
-flowchart LR
-    A["Clinical text"] --> B["Feature extractor"]
-    C["Optional structured variables"] --> D["Patient representation"]
-    B --> D
-    D --> E["DragonNet, R-learner, or causal forest"]
-    E --> F["Potential outcomes, propensity, and treatment-effect estimates"]
-```
-
-### Text feature extractors
-
-| Extractor | Scientific intuition |
+| Model type | Purpose |
 |---|---|
-| `frozen_llm_pooler` | A pretrained language model produces token representations, and a trainable gated-attention pooler learns which parts of the record are useful for the causal head. The language model itself remains frozen. |
-| `hierarchical_llm` | A frozen language model encodes overlapping sections of a long record, after which a second pooling level combines the sections. This preserves more long-document structure than a single truncated sequence. |
-| `hierarchical_transformer` | A pretrained short-chunk encoder represents successive parts of the record, and a small document-level transformer learns how the chunks relate. Pool-token attention can be exported as readable chunk-level evidence. |
-| `hierarchical_cnn` | A trainable convolutional network learns local lexical patterns within chunks and then aggregates the chunk representations. It does not rely on pretrained language-model semantics. |
-| `hierarchical_gru` | A bidirectional recurrent network represents token order within chunks and then combines information across the document. It provides a trainable sequence-model baseline. |
-| `simple_cnn` | A dilated convolutional network processes the available text as one sequence. It is computationally simpler but less explicit about document hierarchy. |
-| `concept_embedding_cnn` | Investigator-supplied concepts initialize semantic detectors over sentence-level chunk embeddings. The detectors can adapt during training while an anchoring penalty discourages them from losing their original clinical meaning. |
-| `concept_token_cnn` | Investigator-supplied concepts initialize detectors over contextual token representations from a frozen language model. This provides finer lexical localization than the sentence-level concept extractor. |
-| `slot_value_discovery` | Seeded and freely learned slots attend to sentence chunks and model recurring value patterns, including categories and numerical expressions. It is intended for representations in which a clinical variable and its recorded value must both be retained. |
+| `explicit_feature_forest` | Extract a fixed set of investigator-defined variables, route confounders to `W` and effect modifiers to `X`, and fit the retained causal-forest estimator. |
+| `agentic_explicit_feature_forest` | Propose and evaluate explicit variables within nested cross-validation. |
+| `agentic_attention_variable_forest` | Use retained HTR evidence to support explicit-variable discovery and adequacy review. |
+| `multi_model_agentic_forest` | Combine sparse, HTR, and embedding evidence before explicit-variable extraction. |
 
-The trainable CNN and GRU extractors learn their vocabularies from the study
-data. The frozen language-model extractors use the pretrained tokenizer and do
-not require `fit_tokenizer()`.
-
-### Causal heads and integrated estimators
-
-| Model type | Interpretation |
-|---|---|
-| `dragonnet` | DragonNet jointly estimates treatment propensity and the two potential-outcome regressions from a shared representation. Targeted regularization can couple the outcome and propensity estimates. |
-| `dragonnet_drlearner` | Cross-fitted DragonNet models estimate the nuisance functions, after which an independent learner models a doubly robust pseudo-outcome. This separates nuisance representation learning from the final heterogeneous-effect regression. |
-| `rlearner` | The R-learner estimates treatment-effect heterogeneity from residualized treatment and outcome. It is useful when the scientific emphasis is `tau(X)` rather than separate potential-outcome surfaces. |
-| `causal_forest` | A neural extractor first produces patient representations, after which `CausalForestDML` estimates heterogeneous effects with orthogonalized nuisance adjustment and forest-based intervals. |
-| `tfidf_forest` | A TF-IDF representation is passed directly to `CausalForestDML`. This is a transparent CPU-capable baseline for determining whether neural text representations add value. |
-| `explicit_feature_forest` | Investigator-defined variables are extracted from text and assigned to adjustment covariates `W`, effect-modifier covariates `X`, or both before fitting `CausalForestDML`. |
-| `agentic_explicit_feature_forest` | A nested-cross-validation search proposes and evaluates additional explicit variables. The outer folds evaluate the adaptive search procedure rather than a feature set chosen on all rows. |
-| `agentic_attention_variable_forest` | Hierarchical attention evidence supports an adaptive variable-discovery process before the explicit-feature forest is fit. This model emphasizes readable spans and post-extraction adequacy review. |
-| `multi_model_agentic_forest` | Sparse, hierarchical, and embedding evidence are combined to propose explicit variables, which are extracted and passed to a causal forest for effect estimation. |
-
-The feature extractor and causal head are separate choices for the basic neural
-models. Each forest model type owns its complete pipeline and consumes its
-model-specific options.
-
-A minimal standalone run can be created with `oci init` and then edited:
+A standalone explicit-feature configuration can be initialized and run with:
 
 ```bash
 oci init --output config.json
 oci run --config config.json --device cuda:0 --workers 4
 ```
 
-Complete examples for frozen language models, hierarchical models, causal
-forests, R-learners, DragonNet, and TF-IDF forests are available in
-[`example_configs/`](example_configs/).
-
-### Explicit variables
-
-An explicit variable has a name, measurement type, clinical description, and
-one or more causal roles. For example, performance status may be both an
-adjustment variable and an effect modifier, whereas age may be used only for
-adjustment in a particular analysis.
-
-```json
-{
-  "applied_inference": {
-    "explicit_features": {
-      "enabled": true,
-      "features": [
-        {
-          "name": "performance_status",
-          "type": "categorical",
-          "categories": ["0", "1", "2", "3", "4"],
-          "description": "The pretreatment ECOG performance status.",
-          "roles": ["confounder", "effect_modifier"]
-        },
-        {
-          "name": "age_at_treatment",
-          "type": "continuous",
-          "description": "The patient's age in years at treatment initiation.",
-          "roles": ["confounder"]
-        }
-      ]
-    }
-  }
-}
-```
-
-For neural heads, encoded explicit variables can be concatenated with the text
-representation. For causal forests, confounder-role variables enter `W` and
-effect-modifier-role variables enter `X`. Extraction can use local vLLM or an
-OpenAI-compatible endpoint. The extraction definition and model output should
-be reviewed as measurements, particularly when absence of documentation may not
-mean absence of the characteristic.
-
-### Hidden-state caching and contrastive objectives
-
-When a language model is frozen, token hidden states can be computed once and
-reused across folds and causal heads by setting
-`architecture.flp_cache_hidden_states=true`. Disk caching reduces repeated model
-inference; GPU caching exchanges additional memory for faster access.
-
-The standalone neural models also support an optional supervised contrastive
-objective within similarity clusters. This objective encourages separation of
-treatment-outcome groups among clinically similar patients. It is an experimental
-representation-learning term, not a substitute for nuisance adjustment or a
-causal identification assumption.
+See
+[`example_configs/agentic_explicit_feature_forest_config.json`](example_configs/agentic_explicit_feature_forest_config.json)
+for the complete role-aware extraction contract. The retired DragonNet,
+single-representation neural heads, experimental CNN/GRU/slot extractors, and
+standalone TF-IDF wrapper are no longer shipped; their scientific counterparts
+are represented by the ten independently evaluable Stage 1 architectures.
 
 ## Synthetic data and Stage 1 architecture evaluation
 
