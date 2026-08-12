@@ -903,6 +903,9 @@ def test_interpretation_prompt_inverts_noisy_text_evidence_without_temporal_filt
     assert "underlying or explicit patient features" in body["task"]
     assert "work backward from the evidence patterns" in body["task"].lower()
     assert "one value per patient" in rules
+    assert "prefer defining it as continuous" in rules
+    assert "realistically be extracted as a numeric measurement" in rules
+    assert "would misrepresent the feature" in rules
     assert "separate alternatives" in rules
     assert "longitudinal information as clinical context" in rules
     assert "do not perform temporal eligibility filtering" in rules
@@ -946,6 +949,9 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
     assert "clinical_question" not in body
     assert "one clear item is sufficient" in rules
     assert "one value per patient" in rules
+    assert "prefer defining it as continuous" in rules
+    assert "realistically be extracted as a numeric measurement" in rules
+    assert "would misrepresent the feature" in rules
     assert "separate alternatives" in rules
     assert "longitudinal information as clinical context" in rules
     assert "pretreatment" not in instructions
@@ -954,6 +960,30 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
     assert "stage 1" not in instructions
     assert "evidence_axes" not in instructions
     assert "packet_dispositions" not in instructions
+
+
+def test_operationalization_prompt_prefers_realistic_continuous_measurements():
+    messages = stage2_workflow._operationalization_prompt(
+        clinical_question="What is the treatment effect?",
+        outer_fold=1,
+        group={
+            "candidate_id": "group-1",
+            "name": "pd_l1_expression_level",
+            "description": "Pretreatment PD-L1 tumor proportion score.",
+            "value_type": "ambiguous",
+            "evidence_axes": ["residual_effect"],
+            "member_measurements": [
+                {"name": "pd_l1_expression_level", "value_type": "continuous"},
+                {"name": "pd_l1_expression_level", "value_type": "categorical"},
+            ],
+        },
+    )
+    body = json.loads(messages[1]["content"])
+    rules = " ".join(body["rules"]).lower()
+
+    assert "prefer value_type continuous" in rules
+    assert "realistically be extracted as a numeric measurement" in rules
+    assert "would misrepresent the feature" in rules
 
 
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():

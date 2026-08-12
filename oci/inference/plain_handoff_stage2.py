@@ -47,9 +47,9 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
-CONSOLIDATION_SCHEMA_VERSION = "candidate_pair_alias_v5_python_groups"
+CONSOLIDATION_SCHEMA_VERSION = "candidate_pair_alias_v6_python_groups"
 GROUP_SELECTION_CONTRACT_VERSION = "retained_group_ids_v2_python_complement"
-INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v4"
+INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v5"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v2_scalar"
 PAIRWISE_ALIAS_MIN_FUZZY_SCORE = 0.44
 PAIRWISE_ALIAS_MAX_NEIGHBORS = 4
@@ -1399,6 +1399,7 @@ def _interpretation_prompt(
         "rules": [
             "Identify explicitly documented clinical features and narrower latent features reasonably implied by the readable evidence.",
             "Each candidate must represent one patient-level clinical variable with one value per patient.",
+            "When a clinical feature can realistically be extracted as a numeric measurement, prefer defining it as continuous rather than converting it into categorical or ordinal bins. Use categorical or ordinal values when continuous measurement is infeasible or would misrepresent the feature.",
             "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
             "When multiple underlying features could plausibly explain the same evidence, return them as separate alternatives and describe the ambiguity.",
             "Use readable words, phrases, and clinical context to identify features. Statistical scores and support counts describe the evidence pattern but cannot identify a clinical feature by themselves.",
@@ -1443,6 +1444,7 @@ def _rejected_packet_audit_prompt(
             "Review every evidence item independently. One clear item is sufficient to support a candidate; a clue does not need to recur.",
             "Identify explicitly documented clinical features and narrower latent features reasonably implied by the readable evidence.",
             "Each candidate must represent one patient-level clinical variable with one value per patient.",
+            "When a clinical feature can realistically be extracted as a numeric measurement, prefer defining it as continuous rather than converting it into categorical or ordinal bins. Use categorical or ordinal values when continuous measurement is infeasible or would misrepresent the feature.",
             "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
             "When multiple underlying features could plausibly explain the same evidence, return them as separate alternatives and describe the ambiguity.",
             "Use readable words, phrases, and clinical context to identify features. Statistical scores and support counts describe the evidence pattern but cannot identify a clinical feature by themselves.",
@@ -2755,6 +2757,7 @@ def _operationalization_prompt(
             "Define exactly the named scalar pretreatment measurement; do not rename, merge, or split it in this step.",
             "Specify a reproducible extraction target from a complete patient record.",
             "Do not invent an ad hoc score, formula, or index to force multiple distinct measurements into one scalar.",
+            "Prefer value_type continuous, with a clinically meaningful unit when applicable, when the named feature can realistically be extracted as a numeric measurement. Use categorical or ordinal only when continuous measurement is infeasible or would misrepresent the feature.",
             "For categorical or ordinal variables, enumerate the extraction ontology; for continuous variables, provide the unit when applicable.",
             "For a binary variable, categories_or_unit must contain exactly two distinct extractable scalar values as separate array items.",
             "For a categorical or ordinal variable, categories_or_unit must contain at least two distinct extractable scalar values as separate array items.",
