@@ -164,7 +164,13 @@ overlapping inputs, unions provenance for each accepted directive, and passes
 all groups absent from `inputs` through unchanged.
 
 All groups remaining after this residual semantic deduplication are
-operationalized. There is no diversity-ranking prompt or feature-count pruning
-step. The legacy `max_candidates_per_fold` and
+operationalized one at a time. The ontology model sees the canonical feature
+name and original compiled evidence content, not fold metadata, internal IDs,
+causal axes, architecture names, support counts, candidate summaries, or an
+earlier proposed value type. It chooses the value type and supplies allowed
+values or a unit based on that evidence. Python keeps provenance and causal-role
+routing outside the prompt and validates ontology shape without encoding
+domain-specific clinical answers. There is no diversity-ranking prompt or
+feature-count pruning step. The legacy `max_candidates_per_fold` and
 `consolidation_oversample_factor` configuration fields remain readable only so
 existing run files continue to parse.

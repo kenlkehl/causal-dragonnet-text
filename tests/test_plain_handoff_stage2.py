@@ -21,6 +21,21 @@ from oci.inference.plain_handoff_stage2 import (
 from oci.inference.plain_handoff_stage2_analysis import extract_rows, run_fold_analysis
 
 
+def _original_evidence_packets(packet_ids):
+    return [
+        {
+            "packet_id": packet_id,
+            "content": {
+                "evidence_kind": "clinical_text",
+                "representative_evidence": [
+                    {"text": "Original clinical evidence for the candidate feature."}
+                ],
+            },
+        }
+        for packet_id in packet_ids
+    ]
+
+
 def test_stage2_config_allows_endpoint_without_model():
     config = plain_stage2_config_from_mapping(
         {"endpoint": "http://stage2.test/v1"},
@@ -978,27 +993,49 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
 
 
 def test_operationalization_prompt_prefers_realistic_continuous_measurements():
-    messages = stage2_workflow._operationalization_prompt(
-        clinical_question="What is the treatment effect?",
-        outer_fold=1,
-        group={
-            "candidate_id": "group-1",
-            "name": "pd_l1_expression_level",
-            "description": "Pretreatment PD-L1 tumor proportion score.",
-            "value_type": "ambiguous",
-            "evidence_axes": ["residual_effect"],
-            "member_measurements": [
-                {"name": "pd_l1_expression_level", "value_type": "continuous"},
-                {"name": "pd_l1_expression_level", "value_type": "categorical"},
+    evidence_packets = [
+        {
+            "evidence_kind": "clinical_text",
+            "representative_evidence": [
+                {"text": "PD-L1 tumor proportion score was 80 percent."}
             ],
-        },
+        }
+    ]
+    messages = stage2_workflow._operationalization_prompt(
+        feature_name="pd_l1_expression_level",
+        evidence_packets=evidence_packets,
     )
     body = json.loads(messages[1]["content"])
     rules = " ".join(body["rules"]).lower()
 
+    assert set(body) == {
+        "job",
+        "task",
+        "candidate_feature_name",
+        "original_evidence_packets",
+        "rules",
+        "response",
+    }
+    assert body["candidate_feature_name"] == "pd_l1_expression_level"
+    assert body["original_evidence_packets"] == evidence_packets
+    assert "determine value_type yourself" in rules
+    assert "no value type from an earlier discovery step" in rules
     assert "prefer value_type continuous" in rules
     assert "realistically be extracted as a numeric measurement" in rules
     assert "would misrepresent the feature" in rules
+    rendered = messages[1]["content"]
+    for irrelevant_key in (
+        "outer_fold",
+        "clinical_question",
+        "group_id",
+        "candidate_value_type",
+        "evidence_axes",
+        "supporting_architectures",
+        "origin_candidate_count",
+        "packet_support_count",
+        "member_measurements",
+    ):
+        assert irrelevant_key not in rendered
 
 
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
@@ -2136,6 +2173,7 @@ def test_stage2_pairwise_consolidation_does_not_lose_candidates():
         if body["job"] == "decide_stage2_candidate_alias_pair":
             return json.dumps({"same_scalar_measurement": True})
         assert body["job"] == "operationalize_stage2_candidate_group"
+        assert len(body["original_evidence_packets"]) == 1
         return json.dumps(
             {
                 "description": "Baseline ECOG performance status.",
@@ -2173,7 +2211,13 @@ def test_stage2_pairwise_consolidation_does_not_lose_candidates():
         for index in range(1, 7)
     ]
 
-    result = runner._consolidate_candidates(outer_fold=1, candidates=candidates)
+    result = runner._consolidate_candidates(
+        outer_fold=1,
+        candidates=candidates,
+        evidence_packets=_original_evidence_packets(
+            [candidate["supporting_packet_ids"][0] for candidate in candidates]
+        ),
+    )
 
     assert len(prompt_sizes) > 1
     assert all(size <= config.max_prompt_chars for size in prompt_sizes)
@@ -2466,7 +2510,7 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
         assert body["job"] == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
-                "description": body["group"]["canonical_description"],
+                "description": body["candidate_feature_name"].replace("_", " "),
                 "value_type": "continuous",
                 "categories_or_unit": ["standard unit"],
                 "measurement_definition": "Extract the last pretreatment scalar value.",
@@ -2532,6 +2576,7 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     result = runner._consolidate_candidates(
         outer_fold=1,
         candidates=candidates,
+        evidence_packets=_original_evidence_packets(packet_ids),
         output_dir=checkpoint_dir,
     )
 
@@ -2568,6 +2613,7 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     )._consolidate_candidates(
         outer_fold=1,
         candidates=candidates,
+        evidence_packets=_original_evidence_packets(packet_ids),
         output_dir=checkpoint_dir,
     )
     assert resumed == result
@@ -2603,7 +2649,7 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
         assert body["job"] == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
-                "description": body["group"]["canonical_description"],
+                "description": body["candidate_feature_name"].replace("_", " "),
                 "value_type": "continuous",
                 "categories_or_unit": ["standard unit"],
                 "measurement_definition": "Extract the last pretreatment scalar value.",
@@ -2654,7 +2700,13 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
         },
     ]
 
-    result = runner._consolidate_candidates(outer_fold=1, candidates=candidates)
+    result = runner._consolidate_candidates(
+        outer_fold=1,
+        candidates=candidates,
+        evidence_packets=_original_evidence_packets(
+            [candidate["supporting_packet_ids"][0] for candidate in candidates]
+        ),
+    )
 
     assert [feature["name"] for feature in result["features"]] == [
         "blood_glucose_concentration",
@@ -2674,6 +2726,15 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
     assert [body["job"] for body in prompt_bodies].count(
         "operationalize_stage2_candidate_group"
     ) == 2
+    ontology_bodies = {
+        body["candidate_feature_name"]: body
+        for body in prompt_bodies
+        if body["job"] == "operationalize_stage2_candidate_group"
+    }
+    assert len(
+        ontology_bodies["blood_glucose_concentration"]["original_evidence_packets"]
+    ) == 2
+    assert len(ontology_bodies["heart_rate"]["original_evidence_packets"]) == 1
 
 
 def test_operationalization_ignores_model_authored_provenance_and_uses_aliases():
@@ -2733,6 +2794,23 @@ def test_operationalization_supplies_safe_defaults_for_omitted_leaf_fields():
     )
 
 
+def test_operationalization_requires_model_authored_value_type():
+    with pytest.raises(ValueError, match="requires the model to choose value_type"):
+        stage2_workflow._validate_operationalization(
+            {
+                "description": "A scalar measurement.",
+                "categories_or_unit": ["standard unit"],
+                "measurement_definition": "Extract the documented value.",
+                "missing_value_rule": "Return null when undocumented.",
+            },
+            group={
+                "name": "scalar_measurement",
+                "value_type": "continuous",
+                "supporting_packet_ids": ["packet_1"],
+            },
+        )
+
+
 @pytest.mark.parametrize(
     ("value_type", "categories", "message"),
     [
@@ -2790,7 +2868,6 @@ def test_operationalization_retries_malformed_ontology_then_accepts_repair():
         completion=completion,
     )
     result = runner._operationalize_candidate_group(
-        outer_fold=1,
         group={
             "candidate_id": "group_001",
             "name": "generic_state",
@@ -2799,6 +2876,11 @@ def test_operationalization_retries_malformed_ontology_then_accepts_repair():
             "evidence_axes": ["outcome"],
             "supporting_packet_ids": ["packet_1"],
             "supporting_architectures": ["architecture_1"],
+            "ontology_packet_ids": ["packet_1"],
+        },
+        packet_by_id={
+            packet["packet_id"]: packet
+            for packet in _original_evidence_packets(["packet_1"])
         },
     )
 
@@ -2832,7 +2914,6 @@ def test_operationalization_duplicate_category_repair_names_colliding_values():
         completion=completion,
     )
     result = runner._operationalize_candidate_group(
-        outer_fold=1,
         group={
             "candidate_id": "group_001",
             "name": "generic_state",
@@ -2841,6 +2922,11 @@ def test_operationalization_duplicate_category_repair_names_colliding_values():
             "evidence_axes": ["outcome"],
             "supporting_packet_ids": ["packet_1"],
             "supporting_architectures": ["architecture_1"],
+            "ontology_packet_ids": ["packet_1"],
+        },
+        packet_by_id={
+            packet["packet_id"]: packet
+            for packet in _original_evidence_packets(["packet_1"])
         },
     )
 

@@ -47,7 +47,10 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
-CONSOLIDATION_SCHEMA_VERSION = "candidate_pair_alias_v8_global_name_merge_directives"
+CONSOLIDATION_SCHEMA_VERSION = (
+    "candidate_pair_alias_v9_evidence_grounded_operationalization"
+)
+OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_original_evidence_v2"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v6_patient_only"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = (
     "rejected_packet_measurement_audit_v3_patient_only"
@@ -2496,6 +2499,7 @@ def _materialize_candidate_group(
     members: Sequence[Mapping[str, Any]],
     canonical_name: str,
     canonical_description: str,
+    ontology_packet_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     packets = list(
         dict.fromkeys(
@@ -2552,6 +2556,15 @@ def _materialize_candidate_group(
         )
     )
     description = canonical_description or (descriptions[0] if descriptions else canonical_name)
+    if ontology_packet_ids is None:
+        ontology_packet_ids = [
+            packet_id
+            for member in members
+            for packet_id in (
+                _string_values(member.get("ontology_packet_ids"))
+                or _string_values(member.get("supporting_packet_ids"))[:1]
+            )
+        ]
     return {
         "candidate_id": candidate_id,
         "architecture": "deterministic_candidate_group",
@@ -2564,6 +2577,9 @@ def _materialize_candidate_group(
         "packet_evidence_axes": packet_evidence_axes,
         "caveats": " ".join(caveats),
         "origin_candidate_ids": origins,
+        # Internal routing only. The ontology model receives the corresponding
+        # original packet contents, never these transport identifiers.
+        "ontology_packet_ids": list(dict.fromkeys(map(str, ontology_packet_ids))),
         "member_measurements": [
             {
                 "name": str(member.get("name") or "").strip(),
@@ -2615,6 +2631,9 @@ def _materialize_pairwise_groups(
                     canonical.get("description") or canonical_name,
                     max_chars=2_000,
                 ),
+                ontology_packet_ids=_string_values(
+                    canonical.get("supporting_packet_ids")
+                )[:1],
             )
         )
     return materialized
@@ -2808,28 +2827,25 @@ def _apply_global_group_merge_directives(
 
 def _operationalization_prompt(
     *,
-    clinical_question: str,
-    outer_fold: int,
-    group: Mapping[str, Any],
+    feature_name: str,
+    evidence_packets: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
-    member_measurements = list(group.get("member_measurements") or [])[:8]
+    if not evidence_packets:
+        raise ValueError("operationalization requires at least one original evidence packet")
     body = {
         "job": "operationalize_stage2_candidate_group",
-        "clinical_question": clinical_question,
-        "outer_fold": int(outer_fold),
-        "group": {
-            "group_id": str(group["candidate_id"]),
-            "canonical_name": str(group.get("name") or ""),
-            "canonical_description": _short_text(group.get("description"), max_chars=1_000),
-            "candidate_value_type": str(group.get("value_type") or "ambiguous"),
-            "evidence_axes": _canonical_evidence_axes(group.get("evidence_axes")),
-            "supporting_architectures": _candidate_architectures(group),
-            "member_measurements": member_measurements,
-            "origin_candidate_count": len(_string_values(group.get("origin_candidate_ids"))),
-            "packet_support_count": len(_string_values(group.get("supporting_packet_ids"))),
-        },
+        "task": (
+            "Define the extraction ontology for the named candidate clinical feature. "
+            "Decide its value type, allowed values or unit, and measurement rule from the "
+            "candidate name and the readable clinical evidence in the original evidence "
+            "packet or packets."
+        ),
+        "candidate_feature_name": str(feature_name),
+        "original_evidence_packets": [dict(packet) for packet in evidence_packets],
         "rules": [
             "Define exactly the named scalar pretreatment measurement; do not rename, merge, or split it in this step.",
+            "Determine value_type yourself from what the named feature means and how it is represented in the supplied evidence. No value type from an earlier discovery step is being provided.",
+            "Use the readable clinical evidence rather than analytical metadata inside an evidence packet. A packet may contain unrelated clues; use only material that actually bears on the named feature.",
             "Specify a reproducible extraction target from a complete patient record.",
             "Do not invent an ad hoc score, formula, or index to force multiple distinct measurements into one scalar.",
             "Prefer value_type continuous, with a clinically meaningful unit when applicable, when the named feature can realistically be extracted as a numeric measurement. Use categorical or ordinal only when continuous measurement is infeasible or would misrepresent the feature.",
@@ -2855,7 +2871,10 @@ def _operationalization_prompt(
     return [
         {
             "role": "system",
-            "content": "You operationalize one grounded clinical measurement. Return JSON only.",
+            "content": (
+                "Define one clinical feature ontology from its name and original supporting "
+                "evidence. Return JSON only."
+            ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
     ]
@@ -2897,13 +2916,17 @@ def _validate_operationalization(
             or normalized.get("unit")
         )
     categories = _string_values(raw_categories)
-    value_type = str(
+    raw_value_type = (
         normalized.get("value_type")
         or normalized.get("data_type")
         or normalized.get("type")
-        or group.get("value_type")
-        or "ambiguous"
     )
+    if not str(raw_value_type or "").strip():
+        raise ValueError(
+            "operationalization requires the model to choose value_type from "
+            "binary, categorical, continuous, ordinal, or ambiguous"
+        )
+    value_type = str(raw_value_type)
     value_type = value_type.strip().lower()
     value_type = {
         "bool": "binary",
@@ -2914,7 +2937,10 @@ def _validate_operationalization(
         "unknown": "ambiguous",
     }.get(value_type, value_type)
     if value_type not in ALLOWED_VALUE_TYPES:
-        value_type = "ambiguous"
+        raise ValueError(
+            "operationalization value_type must be binary, categorical, continuous, "
+            f"ordinal, or ambiguous; received {value_type!r}"
+        )
     if value_type in {"binary", "categorical", "ordinal"}:
         from .plain_handoff_stage2_analysis import _validated_closed_category_values
 
@@ -3427,14 +3453,31 @@ class PlainHandoffStage2:
     def _operationalize_candidate_group(
         self,
         *,
-        outer_fold: int,
         group: Mapping[str, Any],
+        packet_by_id: Mapping[str, Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> dict[str, Any]:
+        ontology_packet_ids = _string_values(group.get("ontology_packet_ids"))
+        if not ontology_packet_ids:
+            raise ValueError(
+                f"Stage 2 group {group.get('name')!r} has no original evidence packet "
+                "for ontology definition"
+            )
+        missing_packet_ids = [
+            packet_id for packet_id in ontology_packet_ids if packet_id not in packet_by_id
+        ]
+        if missing_packet_ids:
+            raise ValueError(
+                f"Stage 2 group {group.get('name')!r} cites unknown ontology evidence "
+                f"packet(s): {missing_packet_ids[:8]}"
+            )
+        evidence_packets = [
+            dict(packet_by_id[packet_id].get("content") or {})
+            for packet_id in ontology_packet_ids
+        ]
         messages = _operationalization_prompt(
-            clinical_question=self.clinical_question,
-            outer_fold=outer_fold,
-            group=group,
+            feature_name=str(group.get("name") or ""),
+            evidence_packets=evidence_packets,
         )
         prompt_chars = sum(len(message["content"]) for message in messages)
         if prompt_chars > int(self.config.max_prompt_chars):
@@ -3446,9 +3489,9 @@ class PlainHandoffStage2:
             output_dir=output_dir,
             input_value={
                 "phase": "group_operationalization",
-                "clinical_question": self.clinical_question,
-                "outer_fold": int(outer_fold),
-                "group": dict(group),
+                "operationalization_schema": OPERATIONALIZATION_SCHEMA_VERSION,
+                "candidate_feature_name": str(group.get("name") or ""),
+                "original_evidence_packets": evidence_packets,
             },
             messages=messages,
             config=self.config,
@@ -3557,11 +3600,28 @@ class PlainHandoffStage2:
         *,
         outer_fold: int,
         candidates: Sequence[Mapping[str, Any]],
+        evidence_packets: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> Mapping[str, Any]:
         """Build alias groups and operationalize every causally routable group."""
 
         original_ids = [str(candidate["candidate_id"]) for candidate in candidates]
+        packet_by_id = {
+            str(packet["packet_id"]): packet for packet in evidence_packets
+        }
+        if len(packet_by_id) != len(evidence_packets):
+            raise ValueError("Stage 2 ontology evidence contains duplicate packet IDs")
+        cited_packet_ids = {
+            packet_id
+            for candidate in candidates
+            for packet_id in _string_values(candidate.get("supporting_packet_ids"))
+        }
+        unknown_packet_ids = sorted(cited_packet_ids - set(packet_by_id))
+        if unknown_packet_ids:
+            raise ValueError(
+                "Stage 2 candidates cite ontology evidence outside the supplied packet "
+                f"set: {unknown_packet_ids[:8]}"
+            )
         groups, grouping_exclusions = self._group_candidates(
             outer_fold=outer_fold,
             candidates=candidates,
@@ -3598,8 +3658,8 @@ class PlainHandoffStage2:
                 futures = {
                     executor.submit(
                         self._operationalize_candidate_group,
-                        outer_fold=outer_fold,
                         group=group,
+                        packet_by_id=packet_by_id,
                         output_dir=(
                             output_dir / "operationalization" / f"group_{group_index:03d}"
                             if output_dir is not None
@@ -3804,6 +3864,7 @@ class PlainHandoffStage2:
                 consolidated = self._consolidate_candidates(
                     outer_fold=outer_fold,
                     candidates=candidates,
+                    evidence_packets=packets,
                     output_dir=output_dir / "consolidation",
                 )
                 features = []

@@ -670,15 +670,17 @@ bundle attestation, checkpoint adoption, or deployment gates. The former
 into broad prompt buckets.
 
 Stage 2 then interprets the compiled evidence architectures and consolidates
-the result into operational patient-level definitions. Consolidation first asks
-the language model to group short candidate IDs that denote the same scalar
-measurement. Python deterministically carries the supporting packets,
-architectures, evidence axes, causal roles, and original-candidate dispositions
-through those groups. If the group count exceeds the fold limit, a separate
-selection request operates only on short group summaries. Finally, independent
-one-group requests define value types, units or categories, measurement rules,
-and missingness handling without asking the model to reproduce provenance IDs
-or cross-object references. Grouping, bounded selection, and every one-group
+the result into operational patient-level definitions. Consolidation uses
+generic fuzzy blocking followed by independent LLM alias judgments, then one
+name-only global pass for residual synonym merges. Python deterministically
+carries supporting packets, architectures, evidence axes, causal roles, and
+original-candidate dispositions through those groups. There is no feature-count
+selection step. Finally, independent one-feature requests receive only the
+canonical feature name and original supporting evidence content. The model
+decides the value type, units or allowed categories, measurement rule, and
+missingness handling from that evidence; fold metadata, internal IDs, causal
+axes, architecture names, support counts, candidate summaries, and earlier
+proposed value types stay outside the prompt. Consolidation and every one-group
 operationalization request are input-fingerprinted separately, so a retry skips
 successful leaves instead of repeating the whole fan-out. It then extracts the variables on the outer
 training rows and measures missingness, variation,
