@@ -1416,7 +1416,7 @@ def test_openai_completion_reports_output_token_truncation(monkeypatch):
     assert client.closed is True
 
 
-def test_consolidation_rejects_feature_limit_overflow_for_repair(caplog):
+def test_historical_consolidation_validator_ignores_legacy_feature_limit(caplog):
     candidates = [
         {
             "candidate_id": "candidate_1",
@@ -1449,34 +1449,37 @@ def test_consolidation_rejects_feature_limit_overflow_for_repair(caplog):
             "caveats": "",
         }
 
-    with pytest.raises(ValueError, match="returned 2 features for limit=1"):
-        stage2_workflow._validate_consolidation(
-            {
-                "features": [
-                    feature("performance_status", ["packet_1"]),
-                    feature("age", ["packet_2"]),
-                ],
-                "candidate_dispositions": {
-                    "candidate_1": {
-                        "status": "retained",
-                        "feature_name": "performance_status",
-                        "reason": "Distinct supported measurement.",
-                    },
-                    "candidate_2": {
-                        "status": "retained",
-                        "feature_name": "age",
-                        "reason": "Distinct supported measurement.",
-                    },
-                    "hallucinated_candidate": {
-                        "status": "retained",
-                        "feature_name": "age",
-                    },
+    result = stage2_workflow._validate_consolidation(
+        {
+            "features": [
+                feature("performance_status", ["packet_1"]),
+                feature("age", ["packet_2"]),
+            ],
+            "candidate_dispositions": {
+                "candidate_1": {
+                    "status": "retained",
+                    "feature_name": "performance_status",
+                    "reason": "Distinct supported measurement.",
+                },
+                "candidate_2": {
+                    "status": "retained",
+                    "feature_name": "age",
+                    "reason": "Distinct supported measurement.",
+                },
+                "hallucinated_candidate": {
+                    "status": "retained",
+                    "feature_name": "age",
                 },
             },
-            candidates=candidates,
-            max_candidates=1,
-        )
+        },
+        candidates=candidates,
+        max_candidates=1,
+    )
 
+    assert [feature["name"] for feature in result["features"]] == [
+        "performance_status",
+        "age",
+    ]
     assert "ignored 1 unknown candidate disposition" in caplog.text
 
 
@@ -1776,13 +1779,6 @@ def _fake_completion(calls):
             assert "packet_id" not in messages[1]["content"]
             assert set(body) >= {"left_candidate", "right_candidate"}
             return json.dumps({"same_scalar_measurement": True})
-        if body["job"] == "select_stage2_candidate_groups":
-            assert "packet_id" not in messages[1]["content"]
-            return json.dumps(
-                {
-                    "retained_group_ids": [group["group_id"] for group in body["groups"]],
-                }
-            )
         assert body["job"] == "operationalize_stage2_candidate_group"
         assert "packet_id" not in messages[1]["content"]
         return json.dumps(
@@ -2226,6 +2222,35 @@ def test_fuzzy_candidate_blocking_proposes_generic_similar_names_only():
     assert (2, 4) not in indices
 
 
+def test_fuzzy_candidate_blocking_preserves_large_component_connectivity(monkeypatch):
+    names = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+    left_family = {"alpha", "bravo", "charlie"}
+    right_family = {"delta", "echo", "foxtrot"}
+
+    def score(left, right):
+        pair = {left["compact"], right["compact"]}
+        if pair <= left_family or pair <= right_family:
+            return 0.9
+        if pair == {"charlie", "delta"}:
+            return 0.5
+        return 0.0
+
+    monkeypatch.setattr(stage2_workflow, "_candidate_fuzzy_signature_score", score)
+    pairs = stage2_workflow._candidate_comparison_pairs(
+        [{"name": name, "description": name} for name in names],
+        min_score=0.44,
+        max_neighbors=1,
+    )
+
+    indices = {(row["left_index"], row["right_index"]) for row in pairs}
+    assert (2, 3) in indices
+    clusters = stage2_workflow._candidate_clusters_from_pair_decisions(
+        [{"candidate_id": f"candidate_{index}"} for index in range(len(names))],
+        [{**row, "same_scalar_measurement": True} for row in pairs],
+    )
+    assert clusters == [list(range(len(names)))]
+
+
 def test_pairwise_clustering_preserves_groups_across_transitive_conflict(caplog):
     candidates = [
         {"candidate_id": "candidate_alpha"},
@@ -2261,78 +2286,6 @@ def test_pairwise_clustering_preserves_groups_across_transitive_conflict(caplog)
     assert "transitive conflict" in caplog.text
 
 
-def test_group_selection_prompt_requests_only_ranked_retained_ids():
-    messages = stage2_workflow._group_selection_prompt(
-        clinical_question="Estimate a treatment effect.",
-        outer_fold=1,
-        groups=[
-            {
-                "candidate_id": "group_alpha",
-                "name": "serum_sodium",
-                "description": "Pretreatment serum sodium concentration.",
-                "evidence_axes": ["treatment", "outcome"],
-            }
-        ],
-        max_groups=1,
-    )
-
-    body = json.loads(messages[1]["content"])
-
-    assert list(body["response"]) == ["retained_group_ids"]
-    assert "excluded_group_ids" not in messages[1]["content"]
-    assert "most to least preferred" in body["response"]["retained_group_ids"][0]
-
-
-def test_group_selection_normalizes_ids_and_computes_excluded_complement(caplog):
-    groups = [
-        {
-            "candidate_id": "group_alpha",
-            "name": "serum_sodium",
-        },
-        {
-            "candidate_id": "group_beta",
-            "name": "body_mass_index",
-        },
-        {
-            "candidate_id": "group_gamma",
-            "name": "heart_rate",
-        },
-    ]
-
-    result = stage2_workflow._validate_group_selection(
-        {
-            "retained_group_ids": [
-                "group_alpha",
-                "group_alpha",
-                "group_not_supplied",
-                "group_beta",
-                "group_gamma",
-            ],
-            # A legacy or noncompliant model-authored complement is ignored.
-            "excluded_group_ids": ["group_alpha"],
-        },
-        groups=groups,
-        max_groups=2,
-    )
-
-    assert result == {
-        "retained_group_ids": ["group_alpha", "group_beta"],
-        "excluded_group_ids": ["group_gamma"],
-    }
-    assert "group_alpha (serum_sodium)" in caplog.text
-    assert "ignored 1 unknown retained group ID" in caplog.text
-    assert "group_gamma (heart_rate)" in caplog.text
-
-
-def test_group_selection_rejects_response_without_any_supplied_retained_id():
-    with pytest.raises(ValueError, match="no supplied retained group IDs"):
-        stage2_workflow._validate_group_selection(
-            {"retained_group_ids": ["group_not_supplied"]},
-            groups=[{"candidate_id": "group_alpha", "name": "serum_sodium"}],
-            max_groups=1,
-        )
-
-
 def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in_python(
     tmp_path: Path,
 ):
@@ -2360,9 +2313,6 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
                     == {"serum_sodium", "blood_sodium_concentration"}
                 }
             )
-        if body["job"] == "select_stage2_candidate_groups":
-            retained = [group["group_id"] for group in body["groups"][:2]]
-            return json.dumps({"retained_group_ids": retained})
         assert body["job"] == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
@@ -2438,20 +2388,21 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     assert [feature["supporting_packet_ids"] for feature in result["features"]] == [
         [packet_ids[0], packet_ids[3]],
         [packet_ids[1]],
+        [packet_ids[2]],
     ]
     assert [feature["supporting_architectures"] for feature in result["features"]] == [
         ["architecture_alpha", "architecture_delta"],
         ["architecture_beta"],
+        ["architecture_gamma"],
     ]
     assert result["features"][0]["roles"] == ["confounder"]
     assert result["features"][1]["roles"] == ["prognostic", "effect_modifier"]
     assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0002"]["status"] == "retained"
-    assert result["candidate_dispositions"]["candidate_0003"]["status"] == "excluded"
+    assert result["candidate_dispositions"]["candidate_0003"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0004"]["status"] == "merged"
     assert {body["job"] for body in prompt_bodies} == {
         "decide_stage2_candidate_alias_pair",
-        "select_stage2_candidate_groups",
         "operationalize_stage2_candidate_group",
     }
     assert len(list(checkpoint_dir.rglob("complete.json"))) == 4
@@ -2776,83 +2727,6 @@ def test_stage2_review_partitions_complete_feature_diagnostics_and_resumes(
     assert sorted(feature_id for batch in calls for feature_id in batch) == sorted(
         feature["feature_id"] for feature in definitions
     )
-
-
-def test_stage2_progressive_consolidation_uses_oversampled_beam_across_28_batches():
-    batches = [
-        [
-            {"candidate_id": f"batch_{batch_index:02d}_{candidate_index:02d}"}
-            for candidate_index in range(10)
-        ]
-        for batch_index in range(28)
-    ]
-
-    first_budget = stage2_workflow._progressive_consolidation_budget(
-        candidate_count=280,
-        batch_count=28,
-        final_limit=50,
-        oversample_factor=4,
-        round_index=1,
-    )
-    first_limits = stage2_workflow._allocate_consolidation_batch_limits(
-        batches,
-        total_budget=first_budget,
-        max_per_batch=50,
-    )
-
-    assert first_budget == 200
-    assert sum(first_limits) == 200
-    assert min(first_limits) == 7
-    assert max(first_limits) == 8
-    assert 1 not in first_limits
-    uneven_limits = stage2_workflow._allocate_consolidation_batch_limits(
-        [
-            [{"candidate_id": f"large_{index}"} for index in range(20)],
-            [{"candidate_id": f"small_a_{index}"} for index in range(5)],
-            [{"candidate_id": f"small_b_{index}"} for index in range(5)],
-        ],
-        total_budget=15,
-        max_per_batch=50,
-    )
-    assert uneven_limits == [9, 3, 3]
-    assert (
-        stage2_workflow._progressive_consolidation_budget(
-            candidate_count=200,
-            batch_count=20,
-            final_limit=50,
-            oversample_factor=4,
-            round_index=2,
-        )
-        == 100
-    )
-    assert (
-        stage2_workflow._progressive_consolidation_budget(
-            candidate_count=100,
-            batch_count=10,
-            final_limit=50,
-            oversample_factor=4,
-            round_index=3,
-        )
-        == 50
-    )
-
-
-def test_stage2_interleaves_partial_consolidation_results_between_rounds():
-    interleaved = stage2_workflow._interleave_consolidation_batches(
-        [
-            [{"candidate_id": "a1"}, {"candidate_id": "a2"}],
-            [{"candidate_id": "b1"}, {"candidate_id": "b2"}],
-            [{"candidate_id": "c1"}],
-        ]
-    )
-
-    assert [candidate["candidate_id"] for candidate in interleaved] == [
-        "a1",
-        "b1",
-        "c1",
-        "a2",
-        "b2",
-    ]
 
 
 def test_stage2_posthoc_oracle_ite_evaluation_uses_frozen_predictions(tmp_path: Path):

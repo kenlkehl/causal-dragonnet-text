@@ -149,26 +149,33 @@ IDs, set `stage2.model` explicitly to avoid an ambiguous selection.
 
 Candidate alias consolidation separates fuzzy retrieval from semantic judgment.
 Python uses generic normalized-token, character-similarity, and acronym signals
-to propose a bounded set of nearby candidate pairs. Each proposed pair is sent
-in its own request without candidate or group IDs, and the model returns only
+to propose nearby candidate pairs. The blocker preserves a maximum-similarity
+spanning forest for every plausible-alias component in addition to bounded
+local neighbors, so a large alias family remains connected for semantic
+review. Each proposed pair is sent in its own request without candidate or
+group IDs, and the model returns only
 `{"same_scalar_measurement": true|false}`. Python then constructs the complete
-partition, resolves contradictory transitive decisions conservatively, assigns
+transitive partition, resolves contradictory decisions conservatively, assigns
 all group IDs, and preserves unmatched candidates as singleton groups. The
 fuzzy matcher proposes comparisons only; it never decides that two clinical
 measurements are equivalent.
+
+Every grouped measurement with a Stage 1 evidence-supported confounder,
+prognostic, or effect-modifier role is operationalized for extraction. There is
+no LLM ranking, diversity selection, or feature-count cap between alias grouping
+and operationalization.
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
 `transport_retry_backoff`, `max_prompt_chars`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
-`max_candidates_per_fold`, `max_review_rounds`, `estimation_trees`,
+`max_review_rounds`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
-`temperature`, and `enable_thinking`. The legacy
-`consolidation_oversample_factor` field is still accepted in existing run files,
-but candidate grouping and bounded group selection no longer use a feature
-beam. A configured endpoint makes the default mode `full`. The modes can always
-be made explicit:
+`temperature`, and `enable_thinking`. The legacy `max_candidates_per_fold` and
+`consolidation_oversample_factor` fields are still accepted in existing run
+files but do not affect consolidation. A configured endpoint makes the default
+mode `full`. The modes can always be made explicit:
 
 Patient-variable extraction always sends exactly one patient's text per model
 prompt. `stage2.workers` provides concurrency without combining patients.

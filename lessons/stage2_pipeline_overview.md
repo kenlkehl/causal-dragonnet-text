@@ -132,11 +132,10 @@ Reduction happens independently inside each outer fold:
 
 The default ceiling is `evidence_max_cards_per_fold=400`, with up to four
 representatives per card. This is deliberately an oversampled evidence atlas,
-not the later variable limit. The LLM may recover many concepts from each card,
-and `max_candidates_per_fold` is applied only after interpretation during
-cross-card consolidation. If a sensitivity analysis is warranted, raise the
-card ceiling rather than reverting to raw packetization. `raw_packets_v1`
-remains available as an explicit comparator via `stage2.evidence_compiler`.
+not a variable limit. The LLM may recover many concepts from each card. If a
+sensitivity analysis is warranted, raise the card ceiling rather than reverting
+to raw packetization. `raw_packets_v1` remains available as an explicit
+comparator via `stage2.evidence_compiler`.
 
 Compilation is cached under `stage2/evidence_compilation`. A restart hashes the
 Stage 1 handoff, loads the compact packet cache when its compiler signature
@@ -144,25 +143,17 @@ matches, and avoids reparsing and reclustering the raw evidence. Interpretation
 checkpoints also carry an input fingerprint: completed batches are reused only
 when their exact card inputs and clinical question match.
 
-## Progressive consolidation
+## Candidate consolidation
 
-When interpreted candidates cannot fit into one consolidation prompt, the
-reducer partitions them into prompt-sized batches. Its first pass retains an
-oversampled intermediate beam of up to
+Consolidation first uses generic fuzzy signals to identify candidate pairs that
+may be aliases. It retains bounded local neighbors plus a maximum-similarity
+spanning forest for every plausible-alias component, ensuring that large alias
+families remain connected for semantic review. The LLM judges one pair at a
+time as the same or different scalar measurement. Python constructs transitive
+groups from accepted pairs and prevents a group merge when an explicit negative
+pair judgment would make it contradictory.
 
-```text
-consolidation_oversample_factor * max_candidates_per_fold
-```
-
-features across all shards, bounded by the number of candidates actually
-available. The default oversample factor is 4. The beam slots are allocated
-proportionally to each shard's candidate count using the full available budget,
-and every nonempty shard receives at least one slot. Results are interleaved
-round-robin so subsequent prompts compare candidates originating from different
-shards. Later rounds halve the intermediate pool toward the final fold limit;
-the final patient-level extraction cap remains `max_candidates_per_fold`.
-
-This makes a one-feature shard limit possible only when the shard itself has one
-candidate or the number of prompt shards exhausts the available beam. It is a
-prompt-budget safeguard rather than a scientific conclusion that the evidence
-supports only one feature.
+All resulting groups with evidence-supported causal roles are operationalized.
+There is no diversity-ranking prompt or feature-count pruning step. The legacy
+`max_candidates_per_fold` and `consolidation_oversample_factor` configuration
+fields remain readable only so existing run files continue to parse.

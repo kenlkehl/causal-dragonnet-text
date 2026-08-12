@@ -47,8 +47,7 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
-CONSOLIDATION_SCHEMA_VERSION = "candidate_pair_alias_v6_python_groups"
-GROUP_SELECTION_CONTRACT_VERSION = "retained_group_ids_v2_python_complement"
+CONSOLIDATION_SCHEMA_VERSION = "candidate_pair_alias_v7_all_routable_groups"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v5"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v2_scalar"
 PAIRWISE_ALIAS_MIN_FUZZY_SCORE = 0.44
@@ -411,9 +410,11 @@ class PlainHandoffStage2Config:
     evidence_max_cards_per_fold: int = 400
     evidence_max_exemplars_per_card: int = 4
     evidence_max_exemplar_chars: int = 2_400
+    # Accepted for compatibility with existing run files. Consolidation no
+    # longer caps or ranks semantic groups before extraction.
     max_candidates_per_fold: int = 50
-    # Accepted for compatibility with existing run files. Candidate grouping
-    # and bounded group selection replaced the former progressive feature beam.
+    # Accepted for compatibility with existing run files. Consolidation no
+    # longer uses a progressive or oversampled feature beam.
     consolidation_oversample_factor: int = 4
     workers: int = 4
     max_review_rounds: int = 2
@@ -1777,7 +1778,7 @@ def _consolidation_prompt(
     del clinical_question, outer_fold, candidates, max_candidates
     raise RuntimeError(
         "the monolithic Stage 2 consolidation prompt is retired; use candidate-ID "
-        "grouping, bounded group selection, and per-group operationalization"
+        "alias grouping and per-group operationalization"
     )
 
 
@@ -1787,6 +1788,9 @@ def _validate_consolidation(
     candidates: Sequence[Mapping[str, Any]],
     max_candidates: int,
 ) -> dict[str, Any]:
+    # Retained only for validating historical monolithic-consolidation
+    # responses. The former feature-count limit is intentionally ignored.
+    del max_candidates
     features = value.get("features")
     dispositions = value.get("candidate_dispositions")
     if not isinstance(features, list):
@@ -2037,11 +2041,6 @@ def _validate_consolidation(
             continue
         raise ValueError(f"consolidation returned duplicate feature name {feature['name']!r}")
     clean_features = list(deduplicated_features.values())
-    if len(clean_features) > max_candidates:
-        raise ValueError(
-            f"consolidation returned {len(clean_features)} features for limit="
-            f"{max_candidates}; select within the limit and return consistent dispositions"
-        )
     clean_dispositions: dict[str, dict[str, str]] = {}
     features_by_name = {feature["name"]: feature for feature in clean_features}
     features_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2353,7 +2352,14 @@ def _candidate_comparison_pairs(
     min_score: float = PAIRWISE_ALIAS_MIN_FUZZY_SCORE,
     max_neighbors: int = PAIRWISE_ALIAS_MAX_NEIGHBORS,
 ) -> list[dict[str, Any]]:
-    """Fuzzy-block plausible aliases without making the semantic merge decision."""
+    """Fuzzy-block plausible aliases without making the semantic merge decision.
+
+    The per-candidate neighbor cap controls request volume, but a maximum-score
+    spanning forest is always retained as well. Consequently, every connected
+    component of the full fuzzy-threshold graph remains connected in the set of
+    pairs sent for semantic review. Large alias families therefore cannot split
+    merely because bridge pairs fell below both endpoints' local neighbor cap.
+    """
 
     if max_neighbors < 1:
         raise ValueError("candidate comparison max_neighbors must be positive")
@@ -2373,6 +2379,33 @@ def _candidate_comparison_pairs(
             by_candidate[right_index].append(row)
 
     retained: set[tuple[int, int]] = set()
+
+    # Preserve connectivity of every plausible-alias component without sending
+    # every O(n^2) edge to the model. Kruskal's algorithm over descending fuzzy
+    # scores yields a deterministic maximum spanning forest.
+    parent = list(range(len(candidates)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for _score, left_index, right_index in sorted(
+        scored,
+        key=lambda row: (-row[0], row[1], row[2]),
+    ):
+        left_root = find(left_index)
+        right_root = find(right_index)
+        if left_root == right_root:
+            continue
+        keep_root, merge_root = sorted((left_root, right_root))
+        parent[merge_root] = keep_root
+        retained.add((left_index, right_index))
+
+    # Retain local alternatives too. The LLM, not the fuzzy score, still makes
+    # every equivalence decision, and explicit negative judgments prevent
+    # contradictory transitive merges downstream.
     for rows in by_candidate.values():
         for _score, left_index, right_index in sorted(
             rows,
@@ -2589,148 +2622,6 @@ def _derive_roles(evidence_axes: Sequence[str]) -> list[str]:
     return roles
 
 
-def _group_selection_view(group: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "group_id": str(group["candidate_id"]),
-        "name": str(group.get("name") or ""),
-        "description": _short_text(group.get("description"), max_chars=700),
-        "value_type": str(group.get("value_type") or "ambiguous"),
-        "evidence_axes": _canonical_evidence_axes(group.get("evidence_axes")),
-        "derived_roles": _derive_roles(group.get("evidence_axes") or []),
-        "supporting_architectures": _candidate_architectures(group),
-        "origin_candidate_count": len(_string_values(group.get("origin_candidate_ids"))),
-        "packet_support_count": len(_string_values(group.get("supporting_packet_ids"))),
-    }
-
-
-def _group_selection_prompt(
-    *,
-    clinical_question: str,
-    outer_fold: int,
-    groups: Sequence[Mapping[str, Any]],
-    max_groups: int,
-) -> list[dict[str, str]]:
-    body = {
-        "job": "select_stage2_candidate_groups",
-        "clinical_question": clinical_question,
-        "outer_fold": int(outer_fold),
-        "max_groups": int(max_groups),
-        "rules": [
-            "Select no more than max_groups distinct scalar measurements for downstream extraction.",
-            "Preserve diversity across measurements, derived causal roles, evidence axes, and supporting architectures.",
-            "Prefer replicated support across independent architectures or evidence axes, while retaining uniquely supported measurements when capacity permits.",
-            "Do not merge or rename groups in this step.",
-            "Return only supplied group IDs selected for retention; Python computes the exact excluded complement.",
-            "Order retained_group_ids from most to least preferred and do not repeat an ID.",
-            "Return exactly one response field and do not enumerate groups that are not retained.",
-            "Do not return packet IDs, candidate IDs, feature definitions, or causal-role judgments.",
-        ],
-        "groups": [_group_selection_view(group) for group in groups],
-        "response": {
-            "retained_group_ids": [
-                "at most max_groups supplied group IDs, ordered from most to least preferred"
-            ],
-        },
-    }
-    return [
-        {
-            "role": "system",
-            "content": "You select a diverse bounded set of grounded measurements. Return JSON only.",
-        },
-        {"role": "user", "content": json.dumps(body, sort_keys=True)},
-    ]
-
-
-def _validate_group_selection(
-    value: Mapping[str, Any],
-    *,
-    groups: Sequence[Mapping[str, Any]],
-    max_groups: int,
-) -> dict[str, list[str]]:
-    raw_retained = value.get("retained_group_ids")
-    if not isinstance(raw_retained, Sequence) or isinstance(raw_retained, (str, bytes)):
-        raise ValueError("group selection requires a retained_group_ids list")
-
-    supplied_ids = [str(group["candidate_id"]) for group in groups]
-    if len(supplied_ids) != len(set(supplied_ids)):
-        raise ValueError("group selection received duplicate supplied group IDs")
-    supplied = set(supplied_ids)
-    group_names = {
-        str(group["candidate_id"]): str(group.get("name") or "").strip() for group in groups
-    }
-    returned = [str(item) for item in raw_retained if item is not None]
-    duplicate_ids = [group_id for group_id, count in Counter(returned).items() if count > 1]
-    if duplicate_ids:
-        LOGGER.warning(
-            "Stage 2 group selection deduplicated retained group ID(s): %s",
-            [
-                f"{group_id} ({group_names.get(group_id) or 'unknown name'})"
-                for group_id in duplicate_ids[:8]
-            ],
-        )
-    returned = list(dict.fromkeys(returned))
-    unknown = [group_id for group_id in returned if group_id not in supplied]
-    if unknown:
-        LOGGER.warning(
-            "Stage 2 group selection ignored %s unknown retained group ID(s): %s",
-            len(unknown),
-            unknown[:8],
-        )
-    retained = [group_id for group_id in returned if group_id in supplied]
-    if not retained:
-        raise ValueError(
-            "group selection returned no supplied retained group IDs"
-            + (f" after ignoring unknown IDs: {unknown[:8]}" if unknown else "")
-        )
-    if len(retained) > int(max_groups):
-        dropped = retained[int(max_groups) :]
-        LOGGER.warning(
-            "Stage 2 group selection truncated %s over-budget retained group ID(s) "
-            "for limit=%s: %s",
-            len(dropped),
-            max_groups,
-            [
-                f"{group_id} ({group_names.get(group_id) or 'unknown name'})"
-                for group_id in dropped[:8]
-            ],
-        )
-        retained = retained[: int(max_groups)]
-    retained_set = set(retained)
-    excluded = [group_id for group_id in supplied_ids if group_id not in retained_set]
-    return {"retained_group_ids": retained, "excluded_group_ids": excluded}
-
-
-def _partition_group_selection(
-    groups: Sequence[Mapping[str, Any]],
-    *,
-    clinical_question: str,
-    outer_fold: int,
-    max_groups: int,
-    max_prompt_chars: int,
-) -> list[list[Mapping[str, Any]]]:
-    batches: list[list[Mapping[str, Any]]] = []
-    current: list[Mapping[str, Any]] = []
-    for group in groups:
-        proposed = [*current, group]
-        messages = _group_selection_prompt(
-            clinical_question=clinical_question,
-            outer_fold=outer_fold,
-            groups=proposed,
-            max_groups=min(max_groups, len(proposed)),
-        )
-        chars = sum(len(message["content"]) for message in messages)
-        if not current and chars > int(max_prompt_chars):
-            raise ValueError("one Stage 2 group cannot fit the selection prompt budget")
-        if current and chars > int(max_prompt_chars):
-            batches.append(current)
-            current = [group]
-        else:
-            current = proposed
-    if current:
-        batches.append(current)
-    return batches
-
-
 def _operationalization_prompt(
     *,
     clinical_question: str,
@@ -2912,162 +2803,6 @@ def _validate_operationalization(
             normalized.get("caveats") or normalized.get("limitations") or group.get("caveats") or ""
         ).strip(),
     }
-
-
-def _partition_consolidation_candidates(
-    candidates: Sequence[Mapping[str, Any]],
-    *,
-    clinical_question: str,
-    outer_fold: int,
-    max_candidates: int,
-    max_prompt_chars: int,
-) -> list[list[Mapping[str, Any]]]:
-    batches: list[list[Mapping[str, Any]]] = []
-    current: list[Mapping[str, Any]] = []
-    for candidate in candidates:
-        proposed = [*current, candidate]
-        messages = _consolidation_prompt(
-            clinical_question=clinical_question,
-            outer_fold=outer_fold,
-            candidates=proposed,
-            max_candidates=max_candidates,
-        )
-        chars = sum(len(message["content"]) for message in messages)
-        if not current and chars > int(max_prompt_chars):
-            raise ValueError(
-                "one interpreted Stage 2 candidate cannot fit the rendered prompt budget"
-            )
-        if current and chars > int(max_prompt_chars):
-            batches.append(current)
-            current = [candidate]
-            singleton = _consolidation_prompt(
-                clinical_question=clinical_question,
-                outer_fold=outer_fold,
-                candidates=current,
-                max_candidates=max_candidates,
-            )
-            if sum(len(message["content"]) for message in singleton) > int(max_prompt_chars):
-                raise ValueError(
-                    "one interpreted Stage 2 candidate cannot fit the rendered prompt budget"
-                )
-        else:
-            current = proposed
-    if current:
-        batches.append(current)
-    return batches
-
-
-def _progressive_consolidation_budget(
-    *,
-    candidate_count: int,
-    batch_count: int,
-    final_limit: int,
-    oversample_factor: int,
-    round_index: int,
-) -> int:
-    """Return a convergent intermediate beam budget.
-
-    The first round preserves an oversampled pool so every prompt shard can
-    contribute multiple distinct measurements. Later rounds halve that pool
-    toward the final fold limit after candidates from different shards have
-    been interleaved. A batch always receives at least one slot; if there are
-    more batches than the desired beam, prompt compaction must precede further
-    pruning.
-    """
-
-    if candidate_count < 1 or batch_count < 1:
-        raise ValueError("progressive consolidation requires candidates and batches")
-    if batch_count > candidate_count:
-        raise ValueError("consolidation cannot have more batches than candidates")
-    if final_limit < 1 or oversample_factor < 1 or round_index < 1:
-        raise ValueError("progressive consolidation limits must be positive")
-    if round_index == 1:
-        desired = min(candidate_count, final_limit * oversample_factor)
-    elif candidate_count > final_limit:
-        desired = max(final_limit, math.ceil(candidate_count / 2))
-    else:
-        # This branch is only needed when verbose intermediate definitions do
-        # not fit together despite already numbering no more than the final
-        # feature cap. Continue gradual reduction instead of reverting to an
-        # arbitrary one-feature-per-shard cutoff.
-        desired = math.ceil(candidate_count / 2)
-    return min(candidate_count, max(batch_count, desired))
-
-
-def _allocate_consolidation_batch_limits(
-    batches: Sequence[Sequence[Mapping[str, Any]]],
-    *,
-    total_budget: int,
-    max_per_batch: int,
-) -> list[int]:
-    """Allocate every available beam slot in proportion to shard size.
-
-    Each nonempty shard receives one slot. Remaining slots are apportioned by
-    the number of additional candidates in the shard using largest remainders,
-    subject to the per-request cap. This avoids the old floor-division behavior
-    that assigned 28 one-feature limits from a 50-feature budget and silently
-    left 22 slots unused.
-    """
-
-    if not batches or any(not batch for batch in batches):
-        raise ValueError("consolidation quota allocation requires nonempty batches")
-    if total_budget < 1 or max_per_batch < 1:
-        raise ValueError("consolidation quota limits must be positive")
-    caps = [min(len(batch), int(max_per_batch)) for batch in batches]
-    budget = min(sum(caps), max(len(batches), int(total_budget)))
-    limits = [1 for _batch in batches]
-    remaining = budget - len(limits)
-    capacities = [cap - 1 for cap in caps]
-    if remaining <= 0:
-        return limits
-
-    capacity_total = sum(capacities)
-    raw_additions = [
-        remaining * capacity / capacity_total if capacity_total else 0.0 for capacity in capacities
-    ]
-    additions = [
-        min(capacity, int(math.floor(raw))) for capacity, raw in zip(capacities, raw_additions)
-    ]
-    for index, addition in enumerate(additions):
-        limits[index] += addition
-    leftover = budget - sum(limits)
-    remainder_order = sorted(
-        range(len(batches)),
-        key=lambda index: (
-            raw_additions[index] - additions[index],
-            capacities[index] - additions[index],
-            -index,
-        ),
-        reverse=True,
-    )
-    while leftover:
-        allocated = False
-        for index in remainder_order:
-            if limits[index] >= caps[index]:
-                continue
-            limits[index] += 1
-            leftover -= 1
-            allocated = True
-            if not leftover:
-                break
-        if not allocated:
-            raise RuntimeError("could not allocate the consolidation beam budget")
-    return limits
-
-
-def _interleave_consolidation_batches(
-    batches: Sequence[Sequence[Mapping[str, Any]]],
-) -> list[dict[str, Any]]:
-    """Round-robin shard outputs so the next prompts compare broader evidence."""
-
-    if not batches:
-        return []
-    output: list[dict[str, Any]] = []
-    for item_index in range(max(len(batch) for batch in batches)):
-        for batch in batches:
-            if item_index < len(batch):
-                output.append(dict(batch[item_index]))
-    return output
 
 
 def _load_stage2_splits(
@@ -3505,106 +3240,6 @@ class PlainHandoffStage2:
             {},
         )
 
-    def _select_candidate_groups(
-        self,
-        *,
-        outer_fold: int,
-        groups: Sequence[Mapping[str, Any]],
-        output_dir: Path | None = None,
-    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-        limit = int(self.config.max_candidates_per_fold)
-        current = [dict(group) for group in groups]
-        exclusions: dict[str, str] = {}
-        round_index = 0
-        while len(current) > limit:
-            round_index += 1
-            batches = _partition_group_selection(
-                current,
-                clinical_question=self.clinical_question,
-                outer_fold=outer_fold,
-                max_groups=limit,
-                max_prompt_chars=self.config.max_prompt_chars,
-            )
-            if len(batches) == 1:
-                batch_limits = [limit]
-            else:
-                stage_budget = min(
-                    len(current),
-                    max(limit, len(batches), math.ceil(len(current) / 2)),
-                )
-                batch_limits = _allocate_consolidation_batch_limits(
-                    batches,
-                    total_budget=stage_budget,
-                    max_per_batch=limit,
-                )
-            LOGGER.info(
-                "Stage 2 group selection round=%s groups=%s batches=%s retained_budget=%s",
-                round_index,
-                len(current),
-                len(batches),
-                sum(batch_limits),
-            )
-            retained_batches: list[list[dict[str, Any]]] = []
-            for batch_index, (batch, batch_limit) in enumerate(zip(batches, batch_limits), start=1):
-                by_id = {str(group["candidate_id"]): group for group in batch}
-                if batch_limit >= len(batch):
-                    selection = {
-                        "retained_group_ids": list(by_id),
-                        "excluded_group_ids": [],
-                    }
-                else:
-                    messages = _group_selection_prompt(
-                        clinical_question=self.clinical_question,
-                        outer_fold=outer_fold,
-                        groups=batch,
-                        max_groups=batch_limit,
-                    )
-                    selection = _checkpointed_request_json(
-                        output_dir=(
-                            output_dir
-                            / "selection"
-                            / f"round_{round_index:03d}"
-                            / f"batch_{batch_index:03d}"
-                            if output_dir is not None
-                            else None
-                        ),
-                        input_value={
-                            "phase": "group_selection",
-                            "selection_contract": GROUP_SELECTION_CONTRACT_VERSION,
-                            "clinical_question": self.clinical_question,
-                            "outer_fold": int(outer_fold),
-                            "round_index": round_index,
-                            "batch_index": batch_index,
-                            "max_groups": int(batch_limit),
-                            "groups": list(batch),
-                        },
-                        messages=messages,
-                        config=self.config,
-                        completion=self.completion,
-                        validate=lambda value, batch=batch, batch_limit=batch_limit: (
-                            _validate_group_selection(
-                                value,
-                                groups=batch,
-                                max_groups=batch_limit,
-                            )
-                        ),
-                    )
-                retained_batches.append(
-                    [by_id[group_id] for group_id in selection["retained_group_ids"]]
-                )
-                for group_id in selection["excluded_group_ids"]:
-                    for origin in _string_values(by_id[group_id].get("origin_candidate_ids")):
-                        exclusions[origin] = (
-                            "Excluded by the bounded diversity selection after semantic grouping."
-                        )
-            next_groups = _interleave_consolidation_batches(retained_batches)
-            if len(next_groups) >= len(current):
-                raise ValueError("bounded Stage 2 group selection did not reduce the group set")
-            current = next_groups
-            if round_index >= 12 and len(current) > limit:
-                raise ValueError("bounded Stage 2 group selection exceeded its round limit")
-        return current, exclusions
-
     def _operationalize_candidate_group(
         self,
         *,
@@ -3693,7 +3328,7 @@ class PlainHandoffStage2:
         candidates: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> Mapping[str, Any]:
-        """Build alias groups in Python, select them, and assemble all provenance."""
+        """Build alias groups and operationalize every causally routable group."""
 
         original_ids = [str(candidate["candidate_id"]) for candidate in candidates]
         groups, grouping_exclusions = self._group_candidates(
@@ -3713,18 +3348,12 @@ class PlainHandoffStage2:
                     "confounder, prognostic, or effect-modifier role."
                 )
 
-        selected_groups, selection_exclusions = self._select_candidate_groups(
-            outer_fold=outer_fold,
-            groups=routable_groups,
-            output_dir=output_dir,
-        )
-        exclusions.update(selection_exclusions)
-        selected_groups = self._unique_group_names(selected_groups)
+        retained_groups = self._unique_group_names(routable_groups)
 
         features_by_group_id: dict[str, dict[str, Any]] = {}
-        if selected_groups:
+        if retained_groups:
             with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, min(self.config.workers, len(selected_groups)))
+                max_workers=max(1, min(self.config.workers, len(retained_groups)))
             ) as executor:
                 futures = {
                     executor.submit(
@@ -3737,11 +3366,11 @@ class PlainHandoffStage2:
                             else None
                         ),
                     ): str(group["candidate_id"])
-                    for group_index, group in enumerate(selected_groups, start=1)
+                    for group_index, group in enumerate(retained_groups, start=1)
                 }
                 for future in concurrent.futures.as_completed(futures):
                     features_by_group_id[futures[future]] = future.result()
-        features = [features_by_group_id[str(group["candidate_id"])] for group in selected_groups]
+        features = [features_by_group_id[str(group["candidate_id"])] for group in retained_groups]
 
         dispositions: dict[str, dict[str, str]] = {
             candidate_id: {
@@ -3754,7 +3383,7 @@ class PlainHandoffStage2:
             }
             for candidate_id in original_ids
         }
-        for group, feature in zip(selected_groups, features):
+        for group, feature in zip(retained_groups, features):
             origins = [
                 origin
                 for origin in _string_values(group.get("origin_candidate_ids"))
@@ -3799,7 +3428,6 @@ class PlainHandoffStage2:
                 "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
                 "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                 "clinical_question": self.clinical_question,
-                "max_candidates_per_fold": self.config.max_candidates_per_fold,
                 "packets": list(packets),
             }
         )
