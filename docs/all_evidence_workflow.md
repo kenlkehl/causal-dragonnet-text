@@ -160,10 +160,20 @@ all group IDs, and preserves unmatched candidates as singleton groups. The
 fuzzy matcher proposes comparisons only; it never decides that two clinical
 measurements are equivalent.
 
-Every grouped measurement with a Stage 1 evidence-supported confounder,
-prognostic, or effect-modifier role is operationalized for extraction. There is
-no LLM ranking, diversity selection, or feature-count cap between alias grouping
-and operationalization.
+Python next removes groups without a Stage 1 evidence-supported confounder,
+prognostic, or effect-modifier role and gives the LLM one compact, complete list
+of the remaining unique feature names. This residual global pass returns only
+`merge_directives`, each with an `inputs` list of exact supplied names and one
+canonical `output` name. It sees no candidate or group IDs and does not restate
+unchanged features. Python validates that every input name exists and occurs in
+at most one directive, maps names back to the internal groups, unions their
+provenance, and passes every name absent from all `inputs` through unchanged.
+This catches semantically equivalent names that the lexical pair blocker did
+not propose.
+
+Every group remaining after those merge directives is operationalized for
+extraction. There is no LLM ranking, diversity selection, or feature-count cap
+between alias grouping and operationalization.
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,

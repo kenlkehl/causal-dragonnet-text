@@ -37,7 +37,9 @@ $OUT/stage2/evidence_compilation/
 |       v                                                       |
 |  interpreted_candidates.json                                  |
 |       |                                                       |
-|       | cross-architecture deduplication and consolidation     |
+|       | local pairwise alias judgments                         |
+|       | + causal-role routing                                  |
+|       | + one global name-only merge-directive pass            |
 |       v                                                       |
 |  feature_definitions.json                                     |
 |  operational variables:                                      |
@@ -153,7 +155,16 @@ time as the same or different scalar measurement. Python constructs transitive
 groups from accepted pairs and prevents a group merge when an explicit negative
 pair judgment would make it contradictory.
 
-All resulting groups with evidence-supported causal roles are operationalized.
-There is no diversity-ranking prompt or feature-count pruning step. The legacy
-`max_candidates_per_fold` and `consolidation_oversample_factor` configuration
-fields remain readable only so existing run files continue to parse.
+Python then excludes groups without an evidence-supported causal role and makes
+one global LLM request containing only the complete list of remaining unique
+feature names. The response contains only residual merge directives of the form
+`inputs -> output`; it contains no opaque IDs and does not enumerate unchanged
+features. Python resolves the names back to internal groups, rejects unknown or
+overlapping inputs, unions provenance for each accepted directive, and passes
+all groups absent from `inputs` through unchanged.
+
+All groups remaining after this residual semantic deduplication are
+operationalized. There is no diversity-ranking prompt or feature-count pruning
+step. The legacy `max_candidates_per_fold` and
+`consolidation_oversample_factor` configuration fields remain readable only so
+existing run files continue to parse.

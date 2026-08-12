@@ -47,7 +47,7 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
-CONSOLIDATION_SCHEMA_VERSION = "candidate_pair_alias_v7_all_routable_groups"
+CONSOLIDATION_SCHEMA_VERSION = "candidate_pair_alias_v8_global_name_merge_directives"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v5"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v2_scalar"
 PAIRWISE_ALIAS_MIN_FUZZY_SCORE = 0.44
@@ -2622,6 +2622,180 @@ def _derive_roles(evidence_axes: Sequence[str]) -> list[str]:
     return roles
 
 
+def _global_group_merge_prompt(
+    *,
+    group_names: Sequence[str],
+) -> list[dict[str, str]]:
+    """Ask for only the residual name-level merges, without opaque identifiers."""
+
+    body = {
+        "job": "consolidate_stage2_group_names",
+        "task": (
+            "Review the complete list of candidate feature names after an earlier local "
+            "deduplication pass. Return only the remaining sets of names that denote the "
+            "same underlying patient-level pretreatment measurement."
+        ),
+        "feature_names": list(group_names),
+        "rules": [
+            "Do not restate or make a decision about a feature that does not need to be merged.",
+            "Each merge directive must contain at least two exact names from feature_names.",
+            "Use each input name in at most one merge directive.",
+            "Merge spelling variants, abbreviations, synonymous clinical names, and clearly equivalent representations of the same underlying measurement.",
+            "A thresholded or coarsened representation may be merged with its underlying measurement only when the names clearly denote the same measurement; prefer an information-preserving output name.",
+            "Do not merge merely related variables, a diagnosis with a related laboratory value, a broad concept with one component, different anatomical sites, different biomarkers, or different timepoints.",
+            "The output must be one concise snake_case canonical name for the consolidated measurement. It may reuse the best input name or provide a clearer equivalent name.",
+            "Return no identifiers, descriptions, definitions, provenance, explanations, or unchanged feature names.",
+        ],
+        "response": {
+            "merge_directives": [
+                {
+                    "inputs": ["two or more exact supplied feature names"],
+                    "output": "one snake_case canonical feature name",
+                }
+            ]
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Identify only residual duplicate clinical measurement names. Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+    ]
+
+
+def _validate_global_group_merge_directives(
+    value: Mapping[str, Any],
+    *,
+    group_names: Sequence[str],
+) -> dict[str, Any]:
+    """Validate name-only merge directives and resolve supplied names deterministically."""
+
+    available = [str(name) for name in group_names]
+    if len(available) != len(set(available)):
+        raise ValueError("global group merge requires unique supplied feature names")
+    normalized_available: dict[str, list[str]] = defaultdict(list)
+    for name in available:
+        normalized_available[_snake_case_name(name, fallback="")].append(name)
+
+    def resolve_input_name(raw_name: Any) -> str:
+        rendered = str(raw_name or "").strip()
+        if rendered in available:
+            return rendered
+        matches = normalized_available.get(_snake_case_name(rendered, fallback=""), [])
+        if len(matches) == 1:
+            return matches[0]
+        raise ValueError(
+            f"global group merge named unknown or ambiguous feature {rendered!r}"
+        )
+
+    payload = value
+    if not isinstance(payload.get("merge_directives"), list):
+        for key in ("result", "response", "consolidation"):
+            nested = payload.get(key)
+            if isinstance(nested, Mapping):
+                payload = nested
+                break
+    raw_directives = payload.get("merge_directives")
+    if raw_directives is None:
+        raw_directives = payload.get("merges")
+    if not isinstance(raw_directives, list):
+        raise ValueError("global group merge requires a merge_directives array")
+
+    directives: list[dict[str, Any]] = []
+    used_inputs: set[str] = set()
+    for index, raw_directive in enumerate(raw_directives, start=1):
+        if not isinstance(raw_directive, Mapping):
+            raise ValueError(f"global merge directive {index} must be an object")
+        raw_inputs = raw_directive.get("inputs")
+        if not isinstance(raw_inputs, list):
+            raise ValueError(f"global merge directive {index} requires an inputs array")
+        inputs = list(dict.fromkeys(resolve_input_name(name) for name in raw_inputs))
+        if len(inputs) < 2:
+            raise ValueError(
+                f"global merge directive {index} requires at least two distinct inputs"
+            )
+        repeated = sorted(set(inputs).intersection(used_inputs))
+        if repeated:
+            raise ValueError(
+                "global merge input names may appear in only one directive: "
+                f"{repeated[:8]}"
+            )
+        output = _snake_case_name(raw_directive.get("output"), fallback="")
+        if not output:
+            raise ValueError(f"global merge directive {index} requires an output name")
+        used_inputs.update(inputs)
+        directives.append({"inputs": inputs, "output": output})
+
+    outputs: set[str] = set()
+    pass_through_names = set(available) - used_inputs
+    for directive in directives:
+        output = str(directive["output"])
+        if output in outputs:
+            raise ValueError(f"global merge output name {output!r} is duplicated")
+        if output in available and output not in set(directive["inputs"]):
+            raise ValueError(
+                f"global merge output name {output!r} collides with another directive's input"
+            )
+        if output in pass_through_names:
+            raise ValueError(
+                f"global merge output name {output!r} collides with an unchanged feature"
+            )
+        outputs.add(output)
+    return {"merge_directives": directives}
+
+
+def _apply_global_group_merge_directives(
+    groups: Sequence[Mapping[str, Any]],
+    directives: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply name directives while passing every unmentioned group through unchanged."""
+
+    group_by_name = {str(group["name"]): group for group in groups}
+    position_by_name = {str(group["name"]): index for index, group in enumerate(groups)}
+    directive_by_first_position: dict[int, Mapping[str, Any]] = {}
+    consumed: set[str] = set()
+    for directive in directives:
+        inputs = [str(name) for name in directive["inputs"]]
+        missing = [name for name in inputs if name not in group_by_name]
+        if missing:  # pragma: no cover - validator invariant
+            raise ValueError(f"global merge directive contains unknown input(s): {missing[:8]}")
+        first_position = min(position_by_name[name] for name in inputs)
+        directive_by_first_position[first_position] = directive
+        consumed.update(inputs)
+
+    merged: list[dict[str, Any]] = []
+    for position, raw_group in enumerate(groups):
+        group_name = str(raw_group["name"])
+        directive = directive_by_first_position.get(position)
+        if directive is not None:
+            inputs = [str(name) for name in directive["inputs"]]
+            members = [group_by_name[name] for name in inputs]
+            output_name = str(directive["output"])
+            canonical = next(
+                (member for member in members if str(member["name"]) == output_name),
+                _canonical_cluster_member(members),
+            )
+            first = groups[position]
+            merged.append(
+                _materialize_candidate_group(
+                    candidate_id=str(first["candidate_id"]),
+                    members=members,
+                    canonical_name=output_name,
+                    canonical_description=_short_text(
+                        canonical.get("description") or output_name,
+                        max_chars=2_000,
+                    ),
+                )
+            )
+            continue
+        if group_name not in consumed:
+            merged.append(dict(raw_group))
+    return merged
+
+
 def _operationalization_prompt(
     *,
     clinical_question: str,
@@ -3284,6 +3458,53 @@ class PlainHandoffStage2:
             "supporting_architectures": _string_values(group.get("supporting_architectures")),
         }
 
+    def _globally_merge_candidate_groups(
+        self,
+        *,
+        outer_fold: int,
+        groups: Sequence[Mapping[str, Any]],
+        output_dir: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run one name-only residual deduplication pass over all routable groups."""
+
+        current = [dict(group) for group in groups]
+        if len(current) < 2:
+            return current
+        group_names = [str(group["name"]) for group in current]
+        messages = _global_group_merge_prompt(group_names=group_names)
+        prompt_chars = sum(len(message["content"]) for message in messages)
+        if prompt_chars > int(self.config.max_prompt_chars):
+            raise ValueError(
+                "all Stage 2 routable feature names cannot fit the global consolidation "
+                f"prompt budget ({prompt_chars} > {self.config.max_prompt_chars})"
+            )
+        response = _checkpointed_request_json(
+            output_dir=output_dir,
+            input_value={
+                "phase": "global_group_name_merge",
+                "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+                "outer_fold": int(outer_fold),
+                "feature_names": group_names,
+            },
+            messages=messages,
+            config=self.config,
+            completion=self.completion,
+            validate=lambda value: _validate_global_group_merge_directives(
+                value,
+                group_names=group_names,
+            ),
+        )
+        directives = list(response["merge_directives"])
+        merged = _apply_global_group_merge_directives(current, directives)
+        LOGGER.info(
+            "Stage 2 global name consolidation input_groups=%s directives=%s "
+            "output_groups=%s",
+            len(current),
+            len(directives),
+            len(merged),
+        )
+        return merged
+
     @staticmethod
     def _unique_group_names(
         groups: Sequence[Mapping[str, Any]],
@@ -3348,7 +3569,16 @@ class PlainHandoffStage2:
                     "confounder, prognostic, or effect-modifier role."
                 )
 
-        retained_groups = self._unique_group_names(routable_groups)
+        uniquely_named_groups = self._unique_group_names(routable_groups)
+        retained_groups = self._globally_merge_candidate_groups(
+            outer_fold=outer_fold,
+            groups=uniquely_named_groups,
+            output_dir=(
+                output_dir / "global_name_consolidation"
+                if output_dir is not None
+                else None
+            ),
+        )
 
         features_by_group_id: dict[str, dict[str, Any]] = {}
         if retained_groups:

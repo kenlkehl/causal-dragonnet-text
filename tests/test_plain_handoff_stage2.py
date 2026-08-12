@@ -1779,6 +1779,9 @@ def _fake_completion(calls):
             assert "packet_id" not in messages[1]["content"]
             assert set(body) >= {"left_candidate", "right_candidate"}
             return json.dumps({"same_scalar_measurement": True})
+        if body["job"] == "consolidate_stage2_group_names":
+            assert "candidate_id" not in messages[1]["content"]
+            return json.dumps({"merge_directives": []})
         assert body["job"] == "operationalize_stage2_candidate_group"
         assert "packet_id" not in messages[1]["content"]
         return json.dumps(
@@ -2201,6 +2204,134 @@ def test_candidate_pair_validator_requires_one_boolean_decision():
         )
 
 
+def test_global_group_merge_prompt_exposes_only_unique_feature_names():
+    messages = stage2_workflow._global_group_merge_prompt(
+        group_names=["patient_age", "age_2", "serum_sodium"],
+    )
+
+    body = json.loads(messages[1]["content"])
+
+    assert body["job"] == "consolidate_stage2_group_names"
+    assert body["feature_names"] == ["patient_age", "age_2", "serum_sodium"]
+    assert body["response"] == {
+        "merge_directives": [
+            {
+                "inputs": ["two or more exact supplied feature names"],
+                "output": "one snake_case canonical feature name",
+            }
+        ]
+    }
+    assert "candidate_id" not in messages[1]["content"]
+    assert "group_id" not in messages[1]["content"]
+
+
+def test_global_group_merge_validator_maps_names_and_rejects_ambiguous_routes():
+    result = stage2_workflow._validate_global_group_merge_directives(
+        {
+            "merge_directives": [
+                {
+                    "inputs": ["Patient Age", "age_2"],
+                    "output": "age_at_baseline",
+                }
+            ]
+        },
+        group_names=["patient_age", "age_2", "serum_sodium"],
+    )
+
+    assert result == {
+        "merge_directives": [
+            {
+                "inputs": ["patient_age", "age_2"],
+                "output": "age_at_baseline",
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="unknown or ambiguous feature"):
+        stage2_workflow._validate_global_group_merge_directives(
+            {
+                "merge_directives": [
+                    {"inputs": ["patient_age", "missing_name"], "output": "age"}
+                ]
+            },
+            group_names=["patient_age", "age_2", "serum_sodium"],
+        )
+
+    with pytest.raises(ValueError, match="only one directive"):
+        stage2_workflow._validate_global_group_merge_directives(
+            {
+                "merge_directives": [
+                    {"inputs": ["patient_age", "age_2"], "output": "age"},
+                    {
+                        "inputs": ["age_2", "serum_sodium"],
+                        "output": "other",
+                    },
+                ]
+            },
+            group_names=["patient_age", "age_2", "serum_sodium"],
+        )
+
+
+def test_global_group_merge_directives_merge_inputs_and_pass_through_others():
+    groups = [
+        {
+            "candidate_id": "pairwise_group_0001",
+            "architecture": "deterministic_candidate_group",
+            "supporting_architectures": ["architecture_alpha"],
+            "name": "blood_glucose_concentration",
+            "description": "Pretreatment blood glucose concentration.",
+            "value_type": "continuous",
+            "supporting_packet_ids": ["packet_alpha"],
+            "evidence_axes": ["outcome", "treatment"],
+            "origin_candidate_ids": ["candidate_0001"],
+            "member_measurements": [],
+        },
+        {
+            "candidate_id": "pairwise_group_0002",
+            "architecture": "deterministic_candidate_group",
+            "supporting_architectures": ["architecture_beta"],
+            "name": "glycemia",
+            "description": "Pretreatment glycemia.",
+            "value_type": "continuous",
+            "supporting_packet_ids": ["packet_beta"],
+            "evidence_axes": ["residual_effect"],
+            "origin_candidate_ids": ["candidate_0002"],
+            "member_measurements": [],
+        },
+        {
+            "candidate_id": "pairwise_group_0003",
+            "architecture": "deterministic_candidate_group",
+            "supporting_architectures": ["architecture_gamma"],
+            "name": "heart_rate",
+            "description": "Pretreatment heart rate.",
+            "value_type": "continuous",
+            "supporting_packet_ids": ["packet_gamma"],
+            "evidence_axes": ["outcome"],
+            "origin_candidate_ids": ["candidate_0003"],
+            "member_measurements": [],
+        },
+    ]
+
+    merged = stage2_workflow._apply_global_group_merge_directives(
+        groups,
+        [
+            {
+                "inputs": ["blood_glucose_concentration", "glycemia"],
+                "output": "blood_glucose_concentration",
+            }
+        ],
+    )
+
+    assert [group["name"] for group in merged] == [
+        "blood_glucose_concentration",
+        "heart_rate",
+    ]
+    assert merged[0]["origin_candidate_ids"] == ["candidate_0001", "candidate_0002"]
+    assert merged[0]["supporting_packet_ids"] == ["packet_alpha", "packet_beta"]
+    assert merged[0]["evidence_axes"] == ["outcome", "residual_effect", "treatment"]
+    assert merged[1] == groups[2]
+
+
 def test_fuzzy_candidate_blocking_proposes_generic_similar_names_only():
     candidates = [
         {"name": "resting_pulse_rate", "description": "Pulse measured at rest."},
@@ -2313,6 +2444,10 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
                     == {"serum_sodium", "blood_sodium_concentration"}
                 }
             )
+        if body["job"] == "consolidate_stage2_group_names":
+            assert set(body) == {"job", "task", "feature_names", "rules", "response"}
+            assert all("candidate" not in name for name in body["feature_names"])
+            return json.dumps({"merge_directives": []})
         assert body["job"] == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
@@ -2403,9 +2538,10 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     assert result["candidate_dispositions"]["candidate_0004"]["status"] == "merged"
     assert {body["job"] for body in prompt_bodies} == {
         "decide_stage2_candidate_alias_pair",
+        "consolidate_stage2_group_names",
         "operationalize_stage2_candidate_group",
     }
-    assert len(list(checkpoint_dir.rglob("complete.json"))) == 4
+    assert len(list(checkpoint_dir.rglob("complete.json"))) == 5
 
     def unexpected_completion(_messages, _config):
         raise AssertionError("completed consolidation leaves must resume from checkpoints")
@@ -2420,6 +2556,109 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
         output_dir=checkpoint_dir,
     )
     assert resumed == result
+
+
+def test_global_name_consolidation_merges_residual_aliases_before_operationalization():
+    prompt_bodies = []
+
+    def completion(messages, _config):
+        rendered = messages[1]["content"]
+        body = json.loads(rendered)
+        prompt_bodies.append(body)
+        if body["job"] == "decide_stage2_candidate_alias_pair":
+            return json.dumps({"same_scalar_measurement": False})
+        if body["job"] == "consolidate_stage2_group_names":
+            assert body["feature_names"] == [
+                "blood_glucose_concentration",
+                "glycemia",
+                "heart_rate",
+            ]
+            assert "candidate_id" not in rendered
+            assert "group_id" not in rendered
+            return json.dumps(
+                {
+                    "merge_directives": [
+                        {
+                            "inputs": ["blood_glucose_concentration", "glycemia"],
+                            "output": "blood_glucose_concentration",
+                        }
+                    ]
+                }
+            )
+        assert body["job"] == "operationalize_stage2_candidate_group"
+        return json.dumps(
+            {
+                "description": body["group"]["canonical_description"],
+                "value_type": "continuous",
+                "categories_or_unit": ["standard unit"],
+                "measurement_definition": "Extract the last pretreatment scalar value.",
+                "missing_value_rule": "Return null when undocumented.",
+                "stability_summary": "Supported by candidate evidence.",
+                "caveats": "",
+            }
+        )
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+        clinical_question="Estimate a treatment effect.",
+        completion=completion,
+    )
+    candidates = [
+        {
+            "candidate_id": "candidate_0001",
+            "architecture": "architecture_alpha",
+            "name": "blood_glucose_concentration",
+            "description": "Laboratory analyte A.",
+            "value_type": "continuous",
+            "supporting_packet_ids": ["packet_alpha"],
+            "evidence_axes": ["treatment", "outcome"],
+            "caveats": "",
+        },
+        {
+            "candidate_id": "candidate_0002",
+            "architecture": "architecture_beta",
+            "name": "glycemia",
+            "description": "Metabolic measurement B.",
+            "value_type": "continuous",
+            "supporting_packet_ids": ["packet_beta"],
+            "evidence_axes": ["residual_effect"],
+            "caveats": "",
+        },
+        {
+            "candidate_id": "candidate_0003",
+            "architecture": "architecture_gamma",
+            "name": "heart_rate",
+            "description": "Pretreatment heart rate.",
+            "value_type": "continuous",
+            "supporting_packet_ids": ["packet_gamma"],
+            "evidence_axes": ["outcome"],
+            "caveats": "",
+        },
+    ]
+
+    result = runner._consolidate_candidates(outer_fold=1, candidates=candidates)
+
+    assert [feature["name"] for feature in result["features"]] == [
+        "blood_glucose_concentration",
+        "heart_rate",
+    ]
+    assert result["features"][0]["supporting_packet_ids"] == [
+        "packet_alpha",
+        "packet_beta",
+    ]
+    assert result["features"][0]["roles"] == ["confounder", "effect_modifier"]
+    assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
+    assert result["candidate_dispositions"]["candidate_0002"]["status"] == "merged"
+    assert result["candidate_dispositions"]["candidate_0003"]["status"] == "retained"
+    assert [body["job"] for body in prompt_bodies].count(
+        "consolidate_stage2_group_names"
+    ) == 1
+    assert [body["job"] for body in prompt_bodies].count(
+        "operationalize_stage2_candidate_group"
+    ) == 2
 
 
 def test_operationalization_ignores_model_authored_provenance_and_uses_aliases():
