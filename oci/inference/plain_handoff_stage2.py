@@ -48,8 +48,10 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 CONSOLIDATION_SCHEMA_VERSION = "candidate_pair_alias_v8_global_name_merge_directives"
-INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v5"
-INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_measurement_audit_v2_scalar"
+INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v6_patient_only"
+INTERPRETATION_AUDIT_SCHEMA_VERSION = (
+    "rejected_packet_measurement_audit_v3_patient_only"
+)
 PAIRWISE_ALIAS_MIN_FUZZY_SCORE = 0.44
 PAIRWISE_ALIAS_MAX_NEIGHBORS = 4
 
@@ -1393,13 +1395,17 @@ def _interpretation_prompt(
         "job": "infer_clinical_features_from_text_evidence",
         "task": (
             "The supplied evidence items are noisy summaries of text patterns found by "
-            "prediction models. These patterns arose because underlying or explicit patient "
-            "features were documented in clinical text. Work backward from the evidence "
-            "patterns to identify the clinical features that could have produced them."
+            "prediction models. Some patterns may reflect underlying or explicit patient "
+            "features documented in clinical text; others may reflect evidence aggregation, "
+            "analytical structure, or no coherent clinical feature. Work backward from each "
+            "evidence pattern and return only supported patient-level clinical features."
         ),
         "rules": [
             "Identify explicitly documented clinical features and narrower latent features reasonably implied by the readable evidence.",
-            "Each candidate must represent one patient-level clinical variable with one value per patient.",
+            "Each candidate must represent one patient-level clinical variable with one value per patient. It must be assignable by examining one patient's record without comparing or aggregating across patients.",
+            "Never return concepts about cohorts, collections of patients, cross-patient heterogeneity, clusters, semantic themes, evidence axes, model behavior, analysis methods, or document structure. These describe the evidence or analysis, not an individual patient's clinical state.",
+            "If an evidence item supports no valid patient-level clinical variable, omit it. Returning an empty candidates list is correct and preferred when none of the supplied evidence supports a valid candidate.",
+            "A statement that no common patient feature exists is a rejection reason, never a binary, categorical, or other candidate.",
             "When a clinical feature can realistically be extracted as a numeric measurement, prefer defining it as continuous rather than converting it into categorical or ordinal bins. Use categorical or ordinal values when continuous measurement is infeasible or would misrepresent the feature.",
             "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
             "When multiple underlying features could plausibly explain the same evidence, return them as separate alternatives and describe the ambiguity.",
@@ -1444,7 +1450,10 @@ def _rejected_packet_audit_prompt(
         "rules": [
             "Review every evidence item independently. One clear item is sufficient to support a candidate; a clue does not need to recur.",
             "Identify explicitly documented clinical features and narrower latent features reasonably implied by the readable evidence.",
-            "Each candidate must represent one patient-level clinical variable with one value per patient.",
+            "Each candidate must represent one patient-level clinical variable with one value per patient. It must be assignable by examining one patient's record without comparing or aggregating across patients.",
+            "Never return concepts about cohorts, collections of patients, cross-patient heterogeneity, clusters, semantic themes, evidence axes, model behavior, analysis methods, or document structure. These describe the evidence or analysis, not an individual patient's clinical state.",
+            "If an evidence item supports no valid patient-level clinical variable, omit it. Returning an empty candidates list is correct and preferred when none of the supplied evidence supports a valid candidate.",
+            "A statement that no common patient feature exists is a rejection reason, never a binary, categorical, or other candidate.",
             "When a clinical feature can realistically be extracted as a numeric measurement, prefer defining it as continuous rather than converting it into categorical or ordinal bins. Use categorical or ordinal values when continuous measurement is infeasible or would misrepresent the feature.",
             "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
             "When multiple underlying features could plausibly explain the same evidence, return them as separate alternatives and describe the ambiguity.",
@@ -1463,7 +1472,8 @@ def _rejected_packet_audit_prompt(
             "content": (
                 "You re-examine unmapped evidence about predictive patterns in clinical text "
                 "for missed underlying or explicitly documented patient-level clinical "
-                "features. Favor recall while remaining grounded. Return JSON only."
+                "features. Favor recall among valid individual-patient clinical variables, "
+                "but return no candidate for evidence or analysis artifacts. Return JSON only."
             ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},

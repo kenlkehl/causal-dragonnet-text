@@ -901,8 +901,15 @@ def test_interpretation_prompt_inverts_noisy_text_evidence_without_temporal_filt
 
     assert body["job"] == "infer_clinical_features_from_text_evidence"
     assert "underlying or explicit patient features" in body["task"]
-    assert "work backward from the evidence patterns" in body["task"].lower()
+    assert "work backward from each evidence pattern" in body["task"].lower()
     assert "one value per patient" in rules
+    assert "one patient's record" in rules
+    assert "without comparing or aggregating across patients" in rules
+    assert "cohorts, collections of patients" in rules
+    assert "clusters, semantic themes, evidence axes" in rules
+    assert "model behavior, analysis methods, or document structure" in rules
+    assert "empty candidates list is correct and preferred" in rules
+    assert "rejection reason, never a binary" in rules
     assert "prefer defining it as continuous" in rules
     assert "realistically be extracted as a numeric measurement" in rules
     assert "would misrepresent the feature" in rules
@@ -949,6 +956,14 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
     assert "clinical_question" not in body
     assert "one clear item is sufficient" in rules
     assert "one value per patient" in rules
+    assert "one patient's record" in rules
+    assert "without comparing or aggregating across patients" in rules
+    assert "cohorts, collections of patients" in rules
+    assert "clusters, semantic themes, evidence axes" in rules
+    assert "model behavior, analysis methods, or document structure" in rules
+    assert "empty candidates list is correct and preferred" in rules
+    assert "rejection reason, never a binary" in rules
+    assert "evidence or analysis artifacts" in messages[0]["content"].lower()
     assert "prefer defining it as continuous" in rules
     assert "realistically be extracted as a numeric measurement" in rules
     assert "would misrepresent the feature" in rules
