@@ -2446,7 +2446,9 @@ def test_global_candidate_pool_prompt_exposes_all_unique_names_and_descriptions(
     assert body["response"] == {
         "merge_directives": [
             {
-                "inputs": ["two or more exact supplied feature names"],
+                "inputs": [
+                    "all exact supplied names in one alias family, including a reused output name"
+                ],
                 "output": "one snake_case canonical feature name",
             }
         ],
@@ -2455,6 +2457,9 @@ def test_global_candidate_pool_prompt_exposes_all_unique_names_and_descriptions(
     assert "candidate_id" not in messages[1]["content"]
     assert "group_id" not in messages[1]["content"]
     instructions = " ".join([messages[0]["content"], body["task"], *body["rules"]]).lower()
+    assert "including the selected canonical name" in instructions
+    assert "never chain or split one family" in instructions
+    assert "only when that exact name appears in the same directive's inputs" in instructions
     assert "pretreatment" not in instructions
     assert "post-treatment" not in instructions
     assert "treatment" not in instructions
@@ -2506,6 +2511,148 @@ def test_global_group_merge_validator_maps_names_and_rejects_ambiguous_routes():
                 "exclude_feature_names": [],
             },
             group_names=["patient_age", "age_2", "serum_sodium"],
+        )
+
+
+def test_global_group_merge_validator_accepts_reused_output_in_its_complete_input_family():
+    result = stage2_workflow._validate_global_candidate_pool_directives(
+        {
+            "merge_directives": [
+                {
+                    "inputs": [
+                        "pd_l1_expression",
+                        "pdl1_expression_level",
+                        "pd_l1_expression_level",
+                        "pd_l1_expression_status",
+                        "tps_score",
+                    ],
+                    "output": "pd_l1_expression_level",
+                }
+            ],
+            "exclude_feature_names": [],
+        },
+        group_names=[
+            "pd_l1_expression",
+            "pdl1_expression_level",
+            "pd_l1_expression_level",
+            "pd_l1_expression_status",
+            "tps_score",
+            "serum_sodium",
+        ],
+    )
+
+    assert result["merge_directives"] == [
+        {
+            "inputs": [
+                "pd_l1_expression",
+                "pdl1_expression_level",
+                "pd_l1_expression_level",
+                "pd_l1_expression_status",
+                "tps_score",
+            ],
+            "output": "pd_l1_expression_level",
+        }
+    ]
+
+
+def test_global_group_merge_validator_explains_supplied_output_collision_routes():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "output name 'pd_l1_expression_level' names an unchanged supplied feature; "
+            "include it in this directive's inputs"
+        ),
+    ):
+        stage2_workflow._validate_global_candidate_pool_directives(
+            {
+                "merge_directives": [
+                    {
+                        "inputs": ["pd_l1_expression", "pdl1_expression_level"],
+                        "output": "pd_l1_expression_level",
+                    }
+                ],
+                "exclude_feature_names": [],
+            },
+            group_names=[
+                "pd_l1_expression",
+                "pdl1_expression_level",
+                "pd_l1_expression_level",
+            ],
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "directive 1 output name 'pd_l1_expression_level' is an input of global "
+            "merge directive 2; do not chain directives"
+        ),
+    ):
+        stage2_workflow._validate_global_candidate_pool_directives(
+            {
+                "merge_directives": [
+                    {
+                        "inputs": ["pd_l1_expression", "pdl1_expression_level"],
+                        "output": "pd_l1_expression_level",
+                    },
+                    {
+                        "inputs": ["pd_l1_expression_level", "pd_l1_expression_status"],
+                        "output": "pd_l1_expression_status",
+                    },
+                ],
+                "exclude_feature_names": [],
+            },
+            group_names=[
+                "pd_l1_expression",
+                "pdl1_expression_level",
+                "pd_l1_expression_level",
+                "pd_l1_expression_status",
+            ],
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "output name 'pd_l1_expression_level' is also an excluded feature; remove it "
+            "from exclude_feature_names"
+        ),
+    ):
+        stage2_workflow._validate_global_candidate_pool_directives(
+            {
+                "merge_directives": [
+                    {
+                        "inputs": ["pd_l1_expression", "pdl1_expression_level"],
+                        "output": "pd_l1_expression_level",
+                    }
+                ],
+                "exclude_feature_names": ["pd_l1_expression_level"],
+            },
+            group_names=[
+                "pd_l1_expression",
+                "pdl1_expression_level",
+                "pd_l1_expression_level",
+            ],
+        )
+
+
+def test_global_group_merge_validator_explains_single_input_partition_error():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "requires at least two distinct inputs; list every supplied member of the alias "
+            "family and include the output name"
+        ),
+    ):
+        stage2_workflow._validate_global_candidate_pool_directives(
+            {
+                "merge_directives": [
+                    {
+                        "inputs": ["pd_l1_expression"],
+                        "output": "pd_l1_expression_level",
+                    }
+                ],
+                "exclude_feature_names": [],
+            },
+            group_names=["pd_l1_expression", "pd_l1_expression_level"],
         )
 
 

@@ -50,7 +50,7 @@ DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
 CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v12_configured_explicit_features"
 GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
-    "global_candidate_pool_merge_and_quality_v4_question_agnostic"
+    "global_candidate_pool_merge_and_quality_v5_disjoint_alias_partitions"
 )
 PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION = (
     "candidate_pair_alias_v11_configured_explicit_features"
@@ -2666,6 +2666,9 @@ def _global_candidate_pool_prompt(
         "rules": [
             "Every name absent from both response lists will be retained unchanged; do not restate valid unchanged features.",
             "Each merge directive must contain at least two exact names from features.",
+            "Treat merge_directives as a disjoint partition of alias families, not as sequential rename operations: return exactly one directive for each complete alias family and never chain or split one family across directives.",
+            "Each directive's inputs must list every exact supplied feature name in that alias family, including the selected canonical name when output reuses a supplied feature name.",
+            "An output that equals a supplied feature name is valid only when that exact name appears in the same directive's inputs; it must not be an input of another directive, an exclusion, or an unchanged feature.",
             "Use each feature name at most once across all merge inputs and exclusions.",
             "Merge spelling variants, abbreviations, synonymous clinical names, and all clearly equivalent representations of the same underlying measurement.",
             "A general measurement name, its quantitative score, a thresholded or coarsened status, a named category, and a name containing one observed value belong together when they can all be represented by one underlying patient variable.",
@@ -2686,7 +2689,9 @@ def _global_candidate_pool_prompt(
         "response": {
             "merge_directives": [
                 {
-                    "inputs": ["two or more exact supplied feature names"],
+                    "inputs": [
+                        "all exact supplied names in one alias family, including a reused output name"
+                    ],
                     "output": "one snake_case canonical feature name",
                 }
             ],
@@ -2769,6 +2774,7 @@ def _validate_global_candidate_pool_directives(
 
     directives: list[dict[str, Any]] = []
     used_inputs: set[str] = set()
+    input_directive_by_name: dict[str, int] = {}
     for index, raw_directive in enumerate(raw_directives, start=1):
         if not isinstance(raw_directive, Mapping):
             raise ValueError(f"global merge directive {index} must be an object")
@@ -2778,12 +2784,18 @@ def _validate_global_candidate_pool_directives(
         inputs = list(dict.fromkeys(resolve_input_name(name) for name in raw_inputs))
         if len(inputs) < 2:
             raise ValueError(
-                f"global merge directive {index} requires at least two distinct inputs"
+                f"global merge directive {index} requires at least two distinct inputs; "
+                "list every supplied member of the alias family and include the output "
+                "name when it reuses a supplied feature name"
             )
         repeated = sorted(set(inputs).intersection(used_inputs))
         if repeated:
+            owners = {name: input_directive_by_name[name] for name in repeated}
             raise ValueError(
-                "global merge input names may appear in only one directive: " f"{repeated[:8]}"
+                "global merge input names may appear in only one directive; "
+                f"directive {index} repeats inputs already used by earlier directives: "
+                f"{dict(list(owners.items())[:8])}. Combine the complete alias family "
+                "into one directive instead of chaining or splitting directives"
             )
         output = _snake_case_name(raw_directive.get("output"), fallback="")
         if not output:
@@ -2799,6 +2811,8 @@ def _validate_global_candidate_pool_directives(
                 "a global merge containing an investigator-configured feature must use "
                 f"that exact configured name as output: {configured_inputs[0]!r}"
             )
+        for name in inputs:
+            input_directive_by_name[name] = index
         used_inputs.update(inputs)
         directives.append({"inputs": inputs, "output": output})
 
@@ -2815,21 +2829,43 @@ def _validate_global_candidate_pool_directives(
         seen_exclusions.add(name)
         excluded_names.append(name)
 
-    outputs: set[str] = set()
+    output_directive_by_name: dict[str, int] = {}
     pass_through_names = set(available) - used_inputs - seen_exclusions
-    for directive in directives:
+    for index, directive in enumerate(directives, start=1):
         output = str(directive["output"])
-        if output in outputs:
-            raise ValueError(f"global merge output name {output!r} is duplicated")
-        if output in available and output not in set(directive["inputs"]):
+        previous_output_index = output_directive_by_name.get(output)
+        if previous_output_index is not None:
             raise ValueError(
-                f"global merge output name {output!r} collides with another directive's input"
+                f"global merge directive {index} duplicates output name {output!r} from "
+                f"directive {previous_output_index}; each directive requires a unique output"
             )
-        if output in pass_through_names:
-            raise ValueError(
-                f"global merge output name {output!r} collides with an unchanged feature"
+        own_inputs = set(map(str, directive["inputs"]))
+        if output in available and output not in own_inputs:
+            input_owner = input_directive_by_name.get(output)
+            if input_owner is not None:
+                raise ValueError(
+                    f"global merge directive {index} output name {output!r} is an input "
+                    f"of global merge directive {input_owner}; do not chain directives. "
+                    "Combine the complete alias family into one directive, or choose an "
+                    "output name that is not a supplied feature"
+                )
+            if output in seen_exclusions:
+                raise ValueError(
+                    f"global merge directive {index} output name {output!r} is also an "
+                    "excluded feature; remove it from exclude_feature_names and include it "
+                    "in this directive's inputs, or choose an output name that is not a "
+                    "supplied feature"
+                )
+            if output in pass_through_names:
+                raise ValueError(
+                    f"global merge directive {index} output name {output!r} names an "
+                    "unchanged supplied feature; include it in this directive's inputs, "
+                    "or choose an output name that is not a supplied feature"
+                )
+            raise RuntimeError(  # pragma: no cover - exhaustive partition invariant
+                f"unclassified global merge output collision for {output!r}"
             )
-        outputs.add(output)
+        output_directive_by_name[output] = index
     return {
         "merge_directives": directives,
         "exclude_feature_names": excluded_names,
