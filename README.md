@@ -686,16 +686,19 @@ bundle attestation, checkpoint adoption, or deployment gates. The former
 into broad prompt buckets.
 
 Stage 2 then interprets the compiled evidence architectures and consolidates
-the result into operational patient-level definitions. Consolidation uses
-generic fuzzy blocking followed by independent LLM alias judgments, then one
-global pass over names and short descriptions for residual synonym merges and
-clear invalid-feature exclusions. That pass can remove patient-specific,
-value-encoded, composite, treatment/post-treatment, and nonclinical artifacts;
-it conservatively retains uncertain baseline variables and cannot exclude
-investigator-configured features. Python deterministically carries supporting
-packets, architectures, evidence axes, causal roles, and original-candidate
-dispositions through those groups. There is no feature-count selection step.
-Finally, independent one-feature requests receive only the
+the result into operational patient-level definitions. After exact-name
+coalescing, consolidation uses one LLM request over the complete distinct-name
+candidate pool and all candidate descriptions. It jointly merges synonymous,
+thresholded, categorical, quantitative-score, and value-encoded representations
+of one underlying measurement while preserving independently varying variables.
+There are no fuzzy-blocked or pairwise alias requests. The same pass can remove patient-specific,
+value-encoded, composite, and nonclinical artifacts. It receives no clinical
+question, conservatively retains uncertain clinical variables, and cannot
+exclude investigator-configured features. Python deterministically carries
+supporting packets, architectures, evidence axes, causal roles, and
+original-candidate dispositions through those groups. There is no feature-count
+selection step, and causal roles are derived after full-pool grouping so
+complementary evidence can combine. Finally, independent one-feature requests receive only the
 canonical feature name and a deduplicated flat list of readable supporting-text
 strings. The model decides the value type, units or allowed categories,
 measurement rule, and missingness handling from that evidence; packet structure,

@@ -20,7 +20,6 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
@@ -48,19 +47,17 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
-CONSOLIDATION_SCHEMA_VERSION = (
-    "candidate_pair_alias_v11_configured_explicit_features"
+DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
+CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v12_configured_explicit_features"
+GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
+    "global_candidate_pool_merge_and_quality_v4_question_agnostic"
 )
-GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION = (
-    "global_name_merge_and_quality_exclusion_v2"
+PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION = (
+    "candidate_pair_alias_v11_configured_explicit_features"
 )
 OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_supporting_text_v3"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v7"
-INTERPRETATION_AUDIT_SCHEMA_VERSION = (
-    "rejected_packet_text_only_ordinals_v4"
-)
-PAIRWISE_ALIAS_MIN_FUZZY_SCORE = 0.44
-PAIRWISE_ALIAS_MAX_NEIGHBORS = 4
+INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v4"
 CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE = "configured_explicit_feature"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
@@ -601,6 +598,11 @@ class PlainHandoffStage2Config:
     transport_max_attempts: int = 3
     transport_retry_backoff: float = 2.0
     max_prompt_chars: int = 100_000
+    # The full candidate pool is deliberately reviewed in one request so the
+    # model can reconcile alias families jointly rather than through local
+    # pair judgments. Keep that larger context allowance independent from
+    # interpretation and empirical-review batching.
+    consolidation_max_prompt_chars: int = DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS
     # Extraction repeats a complete frozen feature ontology for one patient.
     # Keep its larger context allowance separate so discovery batching and its
     # evidence-compilation fingerprints remain stable.
@@ -641,10 +643,10 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.transport_retry_backoff must be nonnegative")
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
+        if self.consolidation_max_prompt_chars < 4_000:
+            raise ValueError("stage2.consolidation_max_prompt_chars must be at least 4000")
         if self.extraction_max_prompt_chars < 4_000:
-            raise ValueError(
-                "stage2.extraction_max_prompt_chars must be at least 4000"
-            )
+            raise ValueError("stage2.extraction_max_prompt_chars must be at least 4000")
         if self.evidence_compiler != EVIDENCE_COMPILER_VERSION:
             raise ValueError(
                 f"stage2.evidence_compiler must be {EVIDENCE_COMPILER_VERSION}; "
@@ -660,16 +662,12 @@ class PlainHandoffStage2Config:
                 f"stage2.required_architectures contains unsupported values: {unsupported}"
             )
         included = (
-            tuple(self.included_architectures)
-            if self.included_architectures is not None
-            else None
+            tuple(self.included_architectures) if self.included_architectures is not None else None
         )
         if included is not None:
             if len(included) != len(set(included)):
                 raise ValueError("stage2.included_architectures must not contain duplicates")
-            unsupported_included = sorted(
-                set(included) - set(SUPPORTED_STAGE2_ARCHITECTURES)
-            )
+            unsupported_included = sorted(set(included) - set(SUPPORTED_STAGE2_ARCHITECTURES))
             if unsupported_included:
                 raise ValueError(
                     "stage2.included_architectures contains unsupported values: "
@@ -754,6 +752,7 @@ def plain_stage2_config_from_mapping(
         )
     if raw.get("max_tokens") is not None:
         LOGGER.warning("stage2.max_tokens is ignored; Stage 2 does not send an output-token limit")
+
     def architecture_names(value: Any) -> tuple[str, ...]:
         if isinstance(value, str):
             if value.strip().lower() == "all":
@@ -769,6 +768,12 @@ def plain_stage2_config_from_mapping(
         transport_max_attempts=int(raw.get("transport_max_attempts", 3)),
         transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
+        consolidation_max_prompt_chars=int(
+            raw.get(
+                "consolidation_max_prompt_chars",
+                DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS,
+            )
+        ),
         extraction_max_prompt_chars=int(
             raw.get(
                 "extraction_max_prompt_chars",
@@ -1623,9 +1628,7 @@ def _interpretation_evidence_items(
     for item_number, packet in enumerate(packets, start=1):
         texts = _readable_supporting_text([packet])
         if not texts:
-            raise ValueError(
-                f"interpretation evidence item {item_number} has no readable text"
-            )
+            raise ValueError(f"interpretation evidence item {item_number} has no readable text")
         items.append({"item": item_number, "text": texts})
     return items
 
@@ -1720,8 +1723,7 @@ def _validate_interpretation(
     if len(ordered_packet_ids) != len(set(ordered_packet_ids)):
         raise ValueError("interpretation input contains duplicate packet IDs")
     packet_id_by_item = {
-        item_number: packet_id
-        for item_number, packet_id in enumerate(ordered_packet_ids, start=1)
+        item_number: packet_id for item_number, packet_id in enumerate(ordered_packet_ids, start=1)
     }
     payload = value
     if not isinstance(payload.get("concepts"), list):
@@ -2393,7 +2395,7 @@ def _snake_case_name(value: Any, *, fallback: str) -> str:
 def _candidate_architectures(candidate: Mapping[str, Any]) -> list[str]:
     primary = str(candidate.get("architecture") or "").strip()
     inherited = _string_values(candidate.get("supporting_architectures"))
-    if inherited and primary in {
+    if primary in {
         "deterministic_candidate_group",
         "bounded_multi_architecture_consolidation",
     }:
@@ -2447,306 +2449,6 @@ def _group_roles(group: Mapping[str, Any]) -> list[str]:
             role for role in _string_values(configured[0].get("roles")) if role in ALLOWED_ROLES
         ]
     return _derive_roles(group.get("evidence_axes") or [])
-
-
-def _candidate_pair_view(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    """Return semantic candidate text without IDs or provenance bookkeeping."""
-
-    return {
-        "name": _short_text(candidate.get("name"), max_chars=200),
-        "description": _short_text(candidate.get("description"), max_chars=400),
-        "evidence_rationale": _short_text(candidate.get("evidence_rationale"), max_chars=300),
-        "caveats": _short_text(candidate.get("caveats"), max_chars=100),
-    }
-
-
-def _candidate_pair_prompt(
-    *,
-    left: Mapping[str, Any],
-    right: Mapping[str, Any],
-) -> list[dict[str, str]]:
-    body = {
-        "job": "decide_stage2_candidate_alias_pair",
-        "question": (
-            "Do these two candidates denote the same single patient-level pretreatment "
-            "measurement?"
-        ),
-        "rules": [
-            "Return true only for aliases of the same scalar measurement.",
-            "Return false for related but independently varying measurements.",
-            "Return false for a broad concept versus one of its components or states.",
-            "Return false for different biomarkers, diagnoses, anatomical sites, scales, "
-            "laboratory quantities, or treatment variables.",
-            "Spelling variants, abbreviations, and equivalent clinical names may be true.",
-            "Respond with exactly one JSON boolean field and no explanation.",
-        ],
-        "left_candidate": _candidate_pair_view(left),
-        "right_candidate": _candidate_pair_view(right),
-        "response": {"same_scalar_measurement": "boolean"},
-    }
-    return [
-        {
-            "role": "system",
-            "content": "Judge one clinical measurement alias pair. Return JSON only.",
-        },
-        {"role": "user", "content": json.dumps(body, sort_keys=True)},
-    ]
-
-
-def _validate_candidate_pair_decision(value: Mapping[str, Any]) -> dict[str, bool]:
-    decision = value.get("same_scalar_measurement")
-    if not isinstance(decision, bool):
-        raise ValueError("candidate pair requires boolean same_scalar_measurement")
-    return {"same_scalar_measurement": decision}
-
-
-def _normalized_fuzzy_text(value: Any) -> str:
-    return " ".join(sorted(_concept_identity_tokens(value)))
-
-
-def _fuzzy_token_similarity(left: str, right: str) -> float:
-    if left == right:
-        return 1.0
-    ratio = SequenceMatcher(None, left, right).ratio()
-    common_prefix = len(os.path.commonprefix((left, right)))
-    if ratio >= 0.78 or (common_prefix >= 4 and ratio >= 0.68):
-        return ratio
-    return 0.0
-
-
-def _fuzzy_token_containment(left: set[str], right: set[str]) -> float:
-    """Return fuzzy token coverage of the smaller nonempty token set."""
-
-    if not left or not right:
-        return 0.0
-    similarities = sorted(
-        (
-            _fuzzy_token_similarity(left_token, right_token),
-            left_token,
-            right_token,
-        )
-        for left_token in left
-        for right_token in right
-    )
-    used_left: set[str] = set()
-    used_right: set[str] = set()
-    matched = 0.0
-    for similarity, left_token, right_token in reversed(similarities):
-        if similarity <= 0 or left_token in used_left or right_token in used_right:
-            continue
-        used_left.add(left_token)
-        used_right.add(right_token)
-        matched += similarity
-    return matched / min(len(left), len(right))
-
-
-def _name_acronyms(value: Any) -> set[str]:
-    words = [
-        word
-        for word in re.findall(r"[a-z]+[a-z0-9]*", str(value or "").lower())
-        if word not in _CONCEPT_IDENTITY_STOPWORDS
-    ]
-    if len(words) < 2:
-        return set()
-    acronym = "".join(word[0] for word in words)
-    if not 2 <= len(acronym) <= 12:
-        return set()
-    return {acronym[:stop] for stop in range(2, len(acronym) + 1)}
-
-
-def _character_ngram_similarity(left: str, right: str, *, width: int = 3) -> float:
-    if not left or not right:
-        return 0.0
-    if left == right:
-        return 1.0
-    if len(left) < width or len(right) < width:
-        return SequenceMatcher(None, left, right).ratio()
-    left_ngrams = {left[index : index + width] for index in range(len(left) - width + 1)}
-    right_ngrams = {right[index : index + width] for index in range(len(right) - width + 1)}
-    return 2.0 * len(left_ngrams.intersection(right_ngrams)) / (
-        len(left_ngrams) + len(right_ngrams)
-    )
-
-
-def _candidate_fuzzy_signature(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    name = str(candidate.get("name") or "")
-    return {
-        "name_tokens": _concept_identity_tokens(name),
-        "all_tokens": _concept_identity_tokens(name, candidate.get("description")),
-        "compact": _normalized_fuzzy_text(name),
-        "acronyms": _name_acronyms(name),
-    }
-
-
-def _candidate_fuzzy_signature_score(
-    left: Mapping[str, Any], right: Mapping[str, Any]
-) -> float:
-    left_name_tokens = left["name_tokens"]
-    right_name_tokens = right["name_tokens"]
-    left_all_tokens = left["all_tokens"]
-    right_all_tokens = right["all_tokens"]
-    left_compact = str(left["compact"])
-    right_compact = str(right["compact"])
-
-    scores = [
-        0.90 * _fuzzy_token_containment(left_name_tokens, right_name_tokens),
-        0.78 * _fuzzy_token_containment(left_name_tokens, right_all_tokens),
-        0.78 * _fuzzy_token_containment(right_name_tokens, left_all_tokens),
-        0.82 * SequenceMatcher(None, left_compact, right_compact).ratio()
-        if left_compact and right_compact
-        else 0.0,
-        0.85 * _character_ngram_similarity(left_compact, right_compact),
-    ]
-    if left_compact and right_compact and left_compact == right_compact:
-        scores.append(1.0)
-    if left_compact in right["acronyms"] or right_compact in left["acronyms"]:
-        scores.append(0.96)
-    return max(scores)
-
-
-def _candidate_pair_fuzzy_score(
-    left: Mapping[str, Any], right: Mapping[str, Any]
-) -> float:
-    """Score generic string similarity for deciding which pairs deserve LLM review."""
-
-    return _candidate_fuzzy_signature_score(
-        _candidate_fuzzy_signature(left),
-        _candidate_fuzzy_signature(right),
-    )
-
-
-def _candidate_comparison_pairs(
-    candidates: Sequence[Mapping[str, Any]],
-    *,
-    min_score: float = PAIRWISE_ALIAS_MIN_FUZZY_SCORE,
-    max_neighbors: int = PAIRWISE_ALIAS_MAX_NEIGHBORS,
-) -> list[dict[str, Any]]:
-    """Fuzzy-block plausible aliases without making the semantic merge decision.
-
-    The per-candidate neighbor cap controls request volume, but a maximum-score
-    spanning forest is always retained as well. Consequently, every connected
-    component of the full fuzzy-threshold graph remains connected in the set of
-    pairs sent for semantic review. Large alias families therefore cannot split
-    merely because bridge pairs fell below both endpoints' local neighbor cap.
-    """
-
-    if max_neighbors < 1:
-        raise ValueError("candidate comparison max_neighbors must be positive")
-    signatures = [_candidate_fuzzy_signature(candidate) for candidate in candidates]
-    scored: list[tuple[float, int, int]] = []
-    by_candidate: dict[int, list[tuple[float, int, int]]] = defaultdict(list)
-    for left_index in range(len(candidates)):
-        for right_index in range(left_index + 1, len(candidates)):
-            score = _candidate_fuzzy_signature_score(
-                signatures[left_index], signatures[right_index]
-            )
-            if score < float(min_score):
-                continue
-            row = (score, left_index, right_index)
-            scored.append(row)
-            by_candidate[left_index].append(row)
-            by_candidate[right_index].append(row)
-
-    retained: set[tuple[int, int]] = set()
-
-    # Preserve connectivity of every plausible-alias component without sending
-    # every O(n^2) edge to the model. Kruskal's algorithm over descending fuzzy
-    # scores yields a deterministic maximum spanning forest.
-    parent = list(range(len(candidates)))
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    for _score, left_index, right_index in sorted(
-        scored,
-        key=lambda row: (-row[0], row[1], row[2]),
-    ):
-        left_root = find(left_index)
-        right_root = find(right_index)
-        if left_root == right_root:
-            continue
-        keep_root, merge_root = sorted((left_root, right_root))
-        parent[merge_root] = keep_root
-        retained.add((left_index, right_index))
-
-    # Retain local alternatives too. The LLM, not the fuzzy score, still makes
-    # every equivalence decision, and explicit negative judgments prevent
-    # contradictory transitive merges downstream.
-    for rows in by_candidate.values():
-        for _score, left_index, right_index in sorted(
-            rows,
-            key=lambda row: (-row[0], row[1], row[2]),
-        )[:max_neighbors]:
-            retained.add((left_index, right_index))
-    score_by_pair = {
-        (left_index, right_index): score for score, left_index, right_index in scored
-    }
-    return [
-        {
-            "left_index": left_index,
-            "right_index": right_index,
-            "fuzzy_score": score_by_pair[(left_index, right_index)],
-        }
-        for left_index, right_index in sorted(retained)
-    ]
-
-
-def _candidate_clusters_from_pair_decisions(
-    candidates: Sequence[Mapping[str, Any]],
-    decisions: Sequence[Mapping[str, Any]],
-) -> list[list[int]]:
-    """Build a conservative partition in Python from independent pair judgments."""
-
-    parent = list(range(len(candidates)))
-    members = {index: {index} for index in range(len(candidates))}
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    rejected = {
-        tuple(sorted((int(row["left_index"]), int(row["right_index"]))))
-        for row in decisions
-        if row.get("same_scalar_measurement") is False
-    }
-    accepted = sorted(
-        (row for row in decisions if row.get("same_scalar_measurement") is True),
-        key=lambda row: (
-            -float(row.get("fuzzy_score") or 0.0),
-            int(row["left_index"]),
-            int(row["right_index"]),
-        ),
-    )
-    for row in accepted:
-        left_index = int(row["left_index"])
-        right_index = int(row["right_index"])
-        left_root = find(left_index)
-        right_root = find(right_index)
-        if left_root == right_root:
-            continue
-        conflicts = [
-            (left_member, right_member)
-            for left_member in members[left_root]
-            for right_member in members[right_root]
-            if tuple(sorted((left_member, right_member))) in rejected
-        ]
-        if conflicts:
-            LOGGER.warning(
-                "Stage 2 pairwise alias decisions contained a transitive conflict; "
-                "preserving separate groups for candidate index pair(s): %s",
-                conflicts[:8],
-            )
-            continue
-        keep_root, merge_root = sorted((left_root, right_root))
-        parent[merge_root] = keep_root
-        members[keep_root].update(members.pop(merge_root))
-
-    return [sorted(component) for _root, component in sorted(members.items())]
 
 
 def _materialize_candidate_group(
@@ -2853,7 +2555,7 @@ def _materialize_candidate_group(
                 "evidence_rationale": _short_text(member.get("evidence_rationale"), max_chars=700),
                 "value_type": str(member.get("value_type") or "ambiguous"),
             }
-            for member in members[:12]
+            for member in members
         ],
     }
 
@@ -2861,9 +2563,7 @@ def _materialize_candidate_group(
 def _canonical_cluster_member(
     members: Sequence[Mapping[str, Any]],
 ) -> Mapping[str, Any]:
-    name_counts = Counter(
-        _snake_case_name(member.get("name"), fallback="") for member in members
-    )
+    name_counts = Counter(_snake_case_name(member.get("name"), fallback="") for member in members)
     return max(
         enumerate(members),
         key=lambda item: (
@@ -2877,33 +2577,60 @@ def _canonical_cluster_member(
     )[1]
 
 
-def _materialize_pairwise_groups(
-    *,
+def _materialize_exact_name_groups(
     candidates: Sequence[Mapping[str, Any]],
-    clusters: Sequence[Sequence[int]],
 ) -> list[dict[str, Any]]:
+    """Coalesce exact normalized names before one full-pool semantic request.
+
+    This is identity bookkeeping, not semantic consolidation: distinct names
+    are never compared or merged here. Combining exact names keeps the global
+    response contract unambiguous while preserving every candidate's evidence
+    and provenance.
+    """
+
+    members_by_name: dict[str, list[Mapping[str, Any]]] = {}
+    for index, candidate in enumerate(candidates, start=1):
+        name = _snake_case_name(candidate.get("name"), fallback=f"measurement_{index:03d}")
+        members_by_name.setdefault(name, []).append(candidate)
+
     materialized: list[dict[str, Any]] = []
-    for group_index, cluster in enumerate(clusters, start=1):
-        members = [candidates[index] for index in cluster]
+    for group_index, (name, members) in enumerate(members_by_name.items(), start=1):
         canonical = _canonical_cluster_member(members)
-        canonical_name = _snake_case_name(
-            canonical.get("name"), fallback=f"measurement_{group_index:03d}"
-        )
         materialized.append(
             _materialize_candidate_group(
-                candidate_id=f"pairwise_group_{group_index:04d}",
+                candidate_id=f"candidate_pool_group_{group_index:04d}",
                 members=members,
-                canonical_name=canonical_name,
+                canonical_name=name,
                 canonical_description=_short_text(
-                    canonical.get("description") or canonical_name,
+                    canonical.get("description") or name,
                     max_chars=2_000,
                 ),
-                ontology_packet_ids=_string_values(
-                    canonical.get("supporting_packet_ids")
-                )[:1],
+                ontology_packet_ids=_string_values(canonical.get("supporting_packet_ids"))[:1],
             )
         )
     return materialized
+
+
+def _candidate_pool_feature_view(group: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose all distinct candidate descriptions without internal provenance."""
+
+    descriptions = list(
+        dict.fromkeys(
+            description
+            for description in [
+                _short_text(group.get("description"), max_chars=400),
+                *(
+                    _short_text(member.get("description"), max_chars=400)
+                    for member in list(group.get("member_measurements") or [])
+                ),
+            ]
+            if description
+        )
+    )
+    return {
+        "name": str(group.get("name") or ""),
+        "descriptions": descriptions,
+    }
 
 
 def _derive_roles(evidence_axes: Sequence[str]) -> list[str]:
@@ -2918,49 +2645,41 @@ def _derive_roles(evidence_axes: Sequence[str]) -> list[str]:
     return roles
 
 
-def _global_group_merge_prompt(
+def _global_candidate_pool_prompt(
     *,
-    clinical_question: str,
     groups: Sequence[Mapping[str, Any]],
     configured_feature_names: Sequence[str] = (),
 ) -> list[dict[str, str]]:
-    """Ask for residual merges and clearly invalid feature exclusions."""
+    """Ask once for a complete candidate-pool partition and exclusions."""
 
-    features = [
-        {
-            "name": str(group.get("name") or ""),
-            "description": _short_text(group.get("description"), max_chars=240),
-        }
-        for group in groups
-    ]
+    features = [_candidate_pool_feature_view(group) for group in groups]
 
-    body = {
-        "job": "consolidate_stage2_group_names",
-        "clinical_question": str(clinical_question),
+    body: dict[str, Any] = {
+        "job": "consolidate_stage2_candidate_pool",
         "task": (
-            "Review the complete candidate feature set after an earlier local "
-            "deduplication pass. Identify residual aliases and exclude only features that "
-            "clearly cannot serve as reusable patient-level pretreatment scalar variables "
-            "for the supplied clinical question."
+            "Review the complete pool of interpreted candidate features together. "
+            "Partition all semantic aliases and equivalent representations of each "
+            "underlying patient-level scalar measurement, and exclude only candidates "
+            "that clearly cannot define such a variable."
         ),
         "features": features,
         "rules": [
             "Every name absent from both response lists will be retained unchanged; do not restate valid unchanged features.",
             "Each merge directive must contain at least two exact names from features.",
             "Use each feature name at most once across all merge inputs and exclusions.",
-            "Merge spelling variants, abbreviations, synonymous clinical names, and clearly equivalent representations of the same underlying measurement.",
-            "A thresholded or coarsened representation may be merged with its underlying measurement only when the names clearly denote the same measurement; prefer an information-preserving output name.",
-            "When a value-encoded or awkward alias has a clear valid underlying measurement in the list, merge it into that measurement instead of excluding it.",
-            "Do not merge merely related variables, a diagnosis with a related laboratory value, a broad concept with one component, different anatomical sites, different biomarkers, or different timepoints.",
+            "Merge spelling variants, abbreviations, synonymous clinical names, and all clearly equivalent representations of the same underlying measurement.",
+            "A general measurement name, its quantitative score, a thresholded or coarsened status, a named category, and a name containing one observed value belong together when they can all be represented by one underlying patient variable.",
+            "Prefer an information-preserving underlying measurement name over a threshold, category, or observed value encoded in one candidate name.",
+            "When a value-encoded or awkward alias has a clear underlying measurement anywhere in the pool, merge it into that measurement instead of excluding it.",
+            "Judge alias families jointly across the entire pool; do not require a direct lexical match between every pair of members in one family.",
+            "Do not merge merely related but independently varying variables, a diagnosis with a related laboratory value, a broad concept with one independently varying component, different anatomical sites, different biomarkers, or different timepoints.",
             "The output must be one concise snake_case canonical name for the consolidated measurement. It may reuse the best input name or provide a clearer equivalent name.",
-            "Exclude a feature only when its name and description clearly show that it is not one reusable patient-level pretreatment scalar variable.",
+            "Exclude a feature only when its name and descriptions clearly show that it is not one reusable patient-level scalar variable.",
             "Exclude patient names or identifiers, named-patient or numbered-patient profiles, and record-specific vignettes.",
             "Exclude profiles, composites, combined findings, and other concepts that require multiple independently varying values rather than one scalar value per patient.",
             "Exclude names that merely encode one observed patient value or one record-specific finding when no valid underlying measurement in the list can absorb them.",
-            "Exclude the study treatment, exposure assignment, treatment regimen, treatment received, dose or cycle count, and response, outcome, toxicity, or complication ascertainable only after that treatment assignment.",
-            "Do not exclude a genuinely pretreatment history merely because it describes an earlier treatment, response, or toxicity.",
             "Exclude administrative, documentation, cohort, grouping, analysis, model, or other nonclinical artifacts.",
-            "Do not exclude a valid baseline demographic, diagnosis, comorbidity, symptom, examination, laboratory value, biomarker, prior history, or other scalar measurement merely because it is rare, weakly supported, redundant, or of uncertain causal importance.",
+            "Do not exclude a valid demographic, diagnosis, comorbidity, symptom, examination, laboratory value, biomarker, clinical history, or other scalar measurement merely because it is rare, weakly supported, redundant, or of uncertain usefulness.",
             "When validity is uncertain, retain the feature. This pass is not a relevance ranking or feature-count selection step.",
             "Return only exact supplied feature names in merge inputs and exclude_feature_names. Return no internal IDs, provenance, definitions, explanations, or unchanged feature names.",
         ],
@@ -2971,9 +2690,7 @@ def _global_group_merge_prompt(
                     "output": "one snake_case canonical feature name",
                 }
             ],
-            "exclude_feature_names": [
-                "exact supplied name of one clearly invalid feature"
-            ],
+            "exclude_feature_names": ["exact supplied name of one clearly invalid feature"],
         },
     }
     configured_names = list(map(str, configured_feature_names))
@@ -2990,8 +2707,8 @@ def _global_group_merge_prompt(
         {
             "role": "system",
             "content": (
-                "Consolidate aliases and remove only clearly invalid pretreatment clinical "
-                "features. Return JSON only."
+                "Consolidate aliases and remove only clearly invalid clinical features. "
+                "Return JSON only."
             ),
         },
         {
@@ -3001,7 +2718,7 @@ def _global_group_merge_prompt(
     ]
 
 
-def _validate_global_group_merge_directives(
+def _validate_global_candidate_pool_directives(
     value: Mapping[str, Any],
     *,
     group_names: Sequence[str],
@@ -3011,7 +2728,7 @@ def _validate_global_group_merge_directives(
 
     available = [str(name) for name in group_names]
     if len(available) != len(set(available)):
-        raise ValueError("global group merge requires unique supplied feature names")
+        raise ValueError("global candidate pool requires unique supplied feature names")
     normalized_available: dict[str, list[str]] = defaultdict(list)
     for name in available:
         normalized_available[_snake_case_name(name, fallback="")].append(name)
@@ -3019,7 +2736,7 @@ def _validate_global_group_merge_directives(
     unknown_configured_names = sorted(configured_names - set(available))
     if unknown_configured_names:
         raise ValueError(
-            "global group merge received unknown configured feature names: "
+            "global candidate pool received unknown configured feature names: "
             f"{unknown_configured_names}"
         )
 
@@ -3030,9 +2747,7 @@ def _validate_global_group_merge_directives(
         matches = normalized_available.get(_snake_case_name(rendered, fallback=""), [])
         if len(matches) == 1:
             return matches[0]
-        raise ValueError(
-            f"global group merge named unknown or ambiguous feature {rendered!r}"
-        )
+        raise ValueError(f"global candidate pool named unknown or ambiguous feature {rendered!r}")
 
     payload = value
     if not isinstance(payload.get("merge_directives"), list) or not isinstance(
@@ -3047,7 +2762,7 @@ def _validate_global_group_merge_directives(
     if raw_directives is None:
         raw_directives = payload.get("merges")
     if not isinstance(raw_directives, list):
-        raise ValueError("global group merge requires a merge_directives array")
+        raise ValueError("global candidate pool requires a merge_directives array")
     raw_exclusions = payload.get("exclude_feature_names")
     if not isinstance(raw_exclusions, list):
         raise ValueError("global group consolidation requires an exclude_feature_names array")
@@ -3068,8 +2783,7 @@ def _validate_global_group_merge_directives(
         repeated = sorted(set(inputs).intersection(used_inputs))
         if repeated:
             raise ValueError(
-                "global merge input names may appear in only one directive: "
-                f"{repeated[:8]}"
+                "global merge input names may appear in only one directive: " f"{repeated[:8]}"
             )
         output = _snake_case_name(raw_directive.get("output"), fallback="")
         if not output:
@@ -3093,17 +2807,11 @@ def _validate_global_group_merge_directives(
     for raw_name in raw_exclusions:
         name = resolve_input_name(raw_name)
         if name in seen_exclusions:
-            raise ValueError(
-                f"global exclusion named feature {name!r} more than once"
-            )
+            raise ValueError(f"global exclusion named feature {name!r} more than once")
         if name in used_inputs:
-            raise ValueError(
-                f"global feature {name!r} cannot be both merged and excluded"
-            )
+            raise ValueError(f"global feature {name!r} cannot be both merged and excluded")
         if name in configured_names:
-            raise ValueError(
-                f"investigator-configured feature {name!r} cannot be excluded"
-            )
+            raise ValueError(f"investigator-configured feature {name!r} cannot be excluded")
         seen_exclusions.add(name)
         excluded_names.append(name)
 
@@ -3128,7 +2836,7 @@ def _validate_global_group_merge_directives(
     }
 
 
-def _apply_global_group_merge_directives(
+def _apply_global_candidate_pool_directives(
     groups: Sequence[Mapping[str, Any]],
     directives: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -3150,11 +2858,11 @@ def _apply_global_group_merge_directives(
     merged: list[dict[str, Any]] = []
     for position, raw_group in enumerate(groups):
         group_name = str(raw_group["name"])
-        directive = directive_by_first_position.get(position)
-        if directive is not None:
-            inputs = [str(name) for name in directive["inputs"]]
+        position_directive = directive_by_first_position.get(position)
+        if position_directive is not None:
+            inputs = [str(name) for name in position_directive["inputs"]]
             members = [group_by_name[name] for name in inputs]
-            output_name = str(directive["output"])
+            output_name = str(position_directive["output"])
             canonical = next(
                 (member for member in members if str(member["name"]) == output_name),
                 _canonical_cluster_member(members),
@@ -3183,9 +2891,7 @@ def _operationalization_prompt(
     supporting_evidence: Sequence[str],
 ) -> list[dict[str, str]]:
     evidence = list(
-        dict.fromkeys(
-            str(item).strip() for item in supporting_evidence if str(item).strip()
-        )
+        dict.fromkeys(str(item).strip() for item in supporting_evidence if str(item).strip())
     )
     if not evidence:
         raise ValueError("operationalization requires readable supporting evidence")
@@ -3302,9 +3008,7 @@ def _validate_operationalization(
         )
     categories = _string_values(raw_categories)
     raw_value_type = (
-        normalized.get("value_type")
-        or normalized.get("data_type")
-        or normalized.get("type")
+        normalized.get("value_type") or normalized.get("data_type") or normalized.get("type")
     )
     if not str(raw_value_type or "").strip():
         raise ValueError(
@@ -3759,127 +3463,6 @@ class PlainHandoffStage2:
         )
         return result
 
-    def _group_candidates(
-        self,
-        *,
-        outer_fold: int,
-        candidates: Sequence[Mapping[str, Any]],
-        output_dir: Path | None = None,
-    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-        candidate_ids = [str(candidate["candidate_id"]) for candidate in candidates]
-        if len(candidate_ids) != len(set(candidate_ids)):
-            raise ValueError("candidate pairing received duplicate supplied candidate IDs")
-        current = [
-            {**dict(candidate), "origin_candidate_ids": [str(candidate["candidate_id"])]}
-            for candidate in candidates
-        ]
-        protected_pairs = {
-            (left_index, right_index)
-            for left_index in range(len(current))
-            for right_index in range(left_index + 1, len(current))
-            if _configured_feature_definitions(current[left_index])
-            and _configured_feature_definitions(current[right_index])
-        }
-        exact_configured_matches = {
-            (left_index, right_index)
-            for left_index in range(len(current))
-            for right_index in range(left_index + 1, len(current))
-            if (left_index, right_index) not in protected_pairs
-            and bool(_configured_feature_definitions(current[left_index]))
-            != bool(_configured_feature_definitions(current[right_index]))
-            and _snake_case_name(current[left_index].get("name"), fallback="")
-            == _snake_case_name(current[right_index].get("name"), fallback="")
-        }
-        comparisons = [
-            comparison
-            for comparison in _candidate_comparison_pairs(current)
-            if (int(comparison["left_index"]), int(comparison["right_index"]))
-            not in protected_pairs | exact_configured_matches
-        ]
-        LOGGER.info(
-            "Stage 2 candidate alias pairing candidates=%s fuzzy_comparisons=%s workers=%s",
-            len(current),
-            len(comparisons),
-            min(self.config.workers, len(comparisons)),
-        )
-
-        decisions_by_index: dict[int, dict[str, Any]] = {}
-
-        def compare_pair(
-            comparison_index: int,
-            comparison: Mapping[str, Any],
-        ) -> dict[str, Any]:
-            left_index = int(comparison["left_index"])
-            right_index = int(comparison["right_index"])
-            left = current[left_index]
-            right = current[right_index]
-            decision = _checkpointed_request_json(
-                output_dir=(
-                    output_dir / "grouping" / "pairs" / f"pair_{comparison_index:06d}"
-                    if output_dir is not None
-                    else None
-                ),
-                input_value={
-                    "phase": "candidate_alias_pair",
-                    "clinical_question": self.clinical_question,
-                    "outer_fold": int(outer_fold),
-                    "left_candidate": left,
-                    "right_candidate": right,
-                    "fuzzy_score": float(comparison["fuzzy_score"]),
-                },
-                messages=_candidate_pair_prompt(
-                    left=left,
-                    right=right,
-                ),
-                config=self.config,
-                completion=self.completion,
-                validate=_validate_candidate_pair_decision,
-            )
-            return {**dict(comparison), **decision}
-
-        if comparisons:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, min(self.config.workers, len(comparisons)))
-            ) as executor:
-                futures = {
-                    executor.submit(compare_pair, comparison_index, comparison): comparison_index
-                    for comparison_index, comparison in enumerate(comparisons, start=1)
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    decisions_by_index[futures[future]] = future.result()
-
-        decisions = [decisions_by_index[index] for index in sorted(decisions_by_index)]
-        decisions.extend(
-            {
-                "left_index": left_index,
-                "right_index": right_index,
-                "fuzzy_score": 1.0,
-                "same_scalar_measurement": True,
-                "reason": "exact normalized configured feature name",
-            }
-            for left_index, right_index in sorted(exact_configured_matches)
-        )
-        decisions.extend(
-            {
-                "left_index": left_index,
-                "right_index": right_index,
-                "fuzzy_score": 1.0,
-                "same_scalar_measurement": False,
-                "reason": "investigator-configured features remain distinct",
-            }
-            for left_index, right_index in sorted(protected_pairs)
-        )
-        clusters = _candidate_clusters_from_pair_decisions(current, decisions)
-        LOGGER.info(
-            "Stage 2 candidate alias pairing accepted=%s groups=%s",
-            sum(bool(row["same_scalar_measurement"]) for row in decisions),
-            len(clusters),
-        )
-        return (
-            _materialize_pairwise_groups(candidates=current, clusters=clusters),
-            {},
-        )
-
     def _operationalize_candidate_group(
         self,
         *,
@@ -3948,10 +3531,7 @@ class PlainHandoffStage2:
                 f"Stage 2 group {group.get('name')!r} cites unknown ontology evidence "
                 f"packet(s): {missing_packet_ids[:8]}"
             )
-        evidence_packets = [
-            packet_by_id[packet_id]
-            for packet_id in ontology_packet_ids
-        ]
+        evidence_packets = [packet_by_id[packet_id] for packet_id in ontology_packet_ids]
         supporting_evidence = _readable_supporting_text(evidence_packets)
         if not supporting_evidence:
             raise ValueError(
@@ -3995,14 +3575,14 @@ class PlainHandoffStage2:
             "supporting_architectures": _string_values(group.get("supporting_architectures")),
         }
 
-    def _globally_merge_candidate_groups(
+    def _consolidate_candidate_pool(
         self,
         *,
         outer_fold: int,
         groups: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-        """Run one global residual merge and feature-quality pass."""
+        """Run the sole semantic consolidation over the complete candidate pool."""
 
         current = [dict(group) for group in groups]
         if not current or all(_configured_feature_definitions(group) for group in current):
@@ -4011,43 +3591,37 @@ class PlainHandoffStage2:
         configured_feature_names = [
             str(group["name"]) for group in current if _configured_feature_definitions(group)
         ]
-        messages = _global_group_merge_prompt(
-            clinical_question=self.clinical_question,
+        messages = _global_candidate_pool_prompt(
             groups=current,
             configured_feature_names=configured_feature_names,
         )
         prompt_chars = sum(len(message["content"]) for message in messages)
-        if prompt_chars > int(self.config.max_prompt_chars):
+        prompt_limit = int(self.config.consolidation_max_prompt_chars)
+        if prompt_chars > prompt_limit:
             raise ValueError(
-                "all Stage 2 routable feature names cannot fit the global consolidation "
-                f"prompt budget ({prompt_chars} > {self.config.max_prompt_chars})"
+                "the complete Stage 2 candidate pool cannot fit the consolidation "
+                f"prompt budget ({prompt_chars} > {prompt_limit}); increase "
+                "stage2.consolidation_max_prompt_chars"
             )
+        request_config = replace(self.config, max_prompt_chars=prompt_limit)
+        feature_views = [_candidate_pool_feature_view(group) for group in current]
         response = _checkpointed_request_json(
             output_dir=output_dir,
             input_value={
-                "phase": "global_group_name_merge_and_quality_review",
+                "phase": "global_candidate_pool_consolidation_and_quality_review",
                 "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
-                "global_group_consolidation_schema": (
-                    GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION
-                ),
+                "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
                 "outer_fold": int(outer_fold),
-                "clinical_question": self.clinical_question,
-                "features": [
-                    {
-                        "name": str(group["name"]),
-                        "description": _short_text(
-                            group.get("description"),
-                            max_chars=240,
-                        ),
-                    }
-                    for group in current
-                ],
+                "source_candidates": sum(
+                    len(_string_values(group.get("origin_candidate_ids"))) for group in current
+                ),
+                "features": feature_views,
                 "configured_feature_names": configured_feature_names,
             },
             messages=messages,
-            config=self.config,
+            config=request_config,
             completion=self.completion,
-            validate=lambda value: _validate_global_group_merge_directives(
+            validate=lambda value: _validate_global_candidate_pool_directives(
                 value,
                 group_names=group_names,
                 configured_feature_names=configured_feature_names,
@@ -4063,59 +3637,23 @@ class PlainHandoffStage2:
                 continue
             for origin in _string_values(group.get("origin_candidate_ids")):
                 excluded_origins[origin] = (
-                    "Excluded by the global feature-quality pass because the candidate "
-                    "is not a valid reusable patient-level pretreatment scalar measurement."
+                    "Excluded by the global candidate-pool quality pass because the candidate "
+                    "is not a valid reusable patient-level scalar measurement."
                 )
-        merged = _apply_global_group_merge_directives(
+        merged = _apply_global_candidate_pool_directives(
             retained_before_merge,
             directives,
         )
         LOGGER.info(
-            "Stage 2 global consolidation input_groups=%s merge_directives=%s "
-            "excluded_groups=%s output_groups=%s",
+            "Stage 2 full-pool consolidation input_candidates=%s distinct_names=%s "
+            "merge_directives=%s excluded_names=%s output_groups=%s",
+            sum(len(_string_values(group.get("origin_candidate_ids"))) for group in current),
             len(current),
             len(directives),
             len(excluded_names),
             len(merged),
         )
         return merged, excluded_origins
-
-    @staticmethod
-    def _unique_group_names(
-        groups: Sequence[Mapping[str, Any]],
-    ) -> list[dict[str, Any]]:
-        used: set[str] = set()
-        counters: Counter[str] = Counter()
-        output: list[dict[str, Any]] = []
-        for index, raw_group in enumerate(groups, start=1):
-            group = dict(raw_group)
-            base = _snake_case_name(group.get("name"), fallback=f"measurement_{index:03d}")
-            name = base
-            if name in used:
-                alternatives = [
-                    _snake_case_name(member.get("name"), fallback="")
-                    for member in list(group.get("member_measurements") or [])
-                ]
-                name = next(
-                    (
-                        alternative
-                        for alternative in alternatives
-                        if alternative and alternative not in used
-                    ),
-                    "",
-                )
-            if not name or name in used:
-                counters[base] += 1
-                suffix = max(2, counters[base] + 1)
-                name = f"{base}_{suffix}"
-                while name in used:
-                    suffix += 1
-                    name = f"{base}_{suffix}"
-                counters[base] = suffix - 1
-            used.add(name)
-            group["name"] = name
-            output.append(group)
-        return output
 
     def _consolidate_candidates(
         self,
@@ -4125,7 +3663,7 @@ class PlainHandoffStage2:
         evidence_packets: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> Mapping[str, Any]:
-        """Build alias groups and operationalize every causally routable group."""
+        """Consolidate the complete candidate pool, then operationalize routed groups."""
 
         configured_candidates = [
             {
@@ -4160,14 +3698,22 @@ class PlainHandoffStage2:
                 "Stage 2 candidates cite ontology evidence outside the supplied packet "
                 f"set: {unknown_packet_ids[:8]}"
             )
-        groups, grouping_exclusions = self._group_candidates(
-            outer_fold=outer_fold,
-            candidates=all_candidates,
-            output_dir=output_dir,
+        groups = _materialize_exact_name_groups(all_candidates)
+        LOGGER.info(
+            "Stage 2 candidate pool candidates=%s distinct_names=%s",
+            len(all_candidates),
+            len(groups),
         )
-        exclusions = dict(grouping_exclusions)
+        retained_before_role_filter, pool_exclusions = self._consolidate_candidate_pool(
+            outer_fold=outer_fold,
+            groups=groups,
+            output_dir=(
+                output_dir / "candidate_pool_consolidation" if output_dir is not None else None
+            ),
+        )
+        exclusions = dict(pool_exclusions)
         routable_groups: list[dict[str, Any]] = []
-        for group in groups:
+        for group in retained_before_role_filter:
             if _group_roles(group):
                 routable_groups.append(dict(group))
                 continue
@@ -4176,18 +3722,7 @@ class PlainHandoffStage2:
                     "Excluded because its Stage 1 evidence does not support a Stage 2 "
                     "confounder, prognostic, or effect-modifier role."
                 )
-
-        uniquely_named_groups = self._unique_group_names(routable_groups)
-        retained_groups, global_exclusions = self._globally_merge_candidate_groups(
-            outer_fold=outer_fold,
-            groups=uniquely_named_groups,
-            output_dir=(
-                output_dir / "global_name_consolidation"
-                if output_dir is not None
-                else None
-            ),
-        )
-        exclusions.update(global_exclusions)
+        retained_groups = routable_groups
 
         features_by_group_id: dict[str, dict[str, Any]] = {}
         if retained_groups:
@@ -4261,7 +3796,7 @@ class PlainHandoffStage2:
         final_features_path = output_dir / "final_definitions.json"
         definitions_complete_path = output_dir / "definitions_complete.json"
         interpreted_candidates_path = output_dir / "interpreted_candidates.json"
-        legacy_definition_inputs = {
+        definition_inputs = {
             "outer_fold": int(outer_fold),
             "compiler": self.config.evidence_compiler,
             "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
@@ -4272,17 +3807,31 @@ class PlainHandoffStage2:
             ],
             "packets": list(packets),
         }
-        legacy_evidence_input_fingerprint = _value_fingerprint(
-            legacy_definition_inputs
-        )
         evidence_input_fingerprint = _value_fingerprint(
             {
-                **legacy_definition_inputs,
-                "global_group_consolidation_schema": (
-                    GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION
-                ),
+                **definition_inputs,
+                "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
             }
         )
+        previous_pairwise_inputs = {
+            **definition_inputs,
+            "consolidation_schema": PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION,
+        }
+        upgradeable_pairwise_fingerprints = {
+            _value_fingerprint(previous_pairwise_inputs),
+            *(
+                _value_fingerprint(
+                    {
+                        **previous_pairwise_inputs,
+                        "global_group_consolidation_schema": schema,
+                    }
+                )
+                for schema in (
+                    "global_name_merge_and_quality_exclusion_v2",
+                    "global_name_merge_and_quality_exclusion_v3_question_agnostic",
+                )
+            ),
+        }
         definitions_state = (
             json.loads(definitions_complete_path.read_text(encoding="utf-8"))
             if definitions_complete_path.is_file()
@@ -4291,19 +3840,17 @@ class PlainHandoffStage2:
         completion = (
             json.loads(complete_path.read_text(encoding="utf-8")) if complete_path.is_file() else {}
         )
-        legacy_global_upgrade = (
-            definitions_state.get("evidence_input_fingerprint")
-            == legacy_evidence_input_fingerprint
+        legacy_consolidation_upgrade = (
+            definitions_state.get("evidence_input_fingerprint") in upgradeable_pairwise_fingerprints
             and definitions_state.get("consolidation_schema")
-            == CONSOLIDATION_SCHEMA_VERSION
+            == PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION
             and interpreted_candidates_path.is_file()
         )
         downstream_analysis_complete = (
-            (output_dir / "estimation" / "complete.json").is_file()
-            or any((output_dir / "review").glob("round_*/complete.json"))
-        )
-        can_upgrade_global_consolidation = (
-            legacy_global_upgrade and not downstream_analysis_complete
+            output_dir / "estimation" / "complete.json"
+        ).is_file() or any((output_dir / "review").glob("round_*/complete.json"))
+        can_upgrade_consolidation = (
+            legacy_consolidation_upgrade and not downstream_analysis_complete
         )
         if (
             completion.get("phase") == "causal_estimation"
@@ -4344,10 +3891,8 @@ class PlainHandoffStage2:
         if features_path.is_file():
             if definitions_state.get("evidence_input_fingerprint") == evidence_input_fingerprint:
                 final = json.loads(features_path.read_text(encoding="utf-8"))
-            elif can_upgrade_global_consolidation:
-                raw_candidates = json.loads(
-                    interpreted_candidates_path.read_text(encoding="utf-8")
-                )
+            elif can_upgrade_consolidation:
+                raw_candidates = json.loads(interpreted_candidates_path.read_text(encoding="utf-8"))
                 if not isinstance(raw_candidates, list) or any(
                     not isinstance(candidate, Mapping) for candidate in raw_candidates
                 ):
@@ -4358,9 +3903,9 @@ class PlainHandoffStage2:
                 candidates = [dict(candidate) for candidate in raw_candidates]
                 LOGGER.info(
                     "upgrade Stage 2 outer_fold=%s from cached interpretations using "
-                    "global consolidation schema=%s",
+                    "full candidate-pool consolidation schema=%s",
                     outer_fold,
-                    GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION,
+                    GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
                 )
             else:
                 raise RuntimeError(
@@ -4478,9 +4023,7 @@ class PlainHandoffStage2:
                     "completed_at": _now(),
                     "evidence_input_fingerprint": evidence_input_fingerprint,
                     "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
-                    "global_group_consolidation_schema": (
-                        GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION
-                    ),
+                    "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
                     "architectures": len(by_architecture),
                     "packets": len(packets),
                     "features": len(final["features"]),
