@@ -48,7 +48,7 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 CONSOLIDATION_SCHEMA_VERSION = (
-    "candidate_pair_alias_v10_minimal_ontology_evidence"
+    "candidate_pair_alias_v11_configured_explicit_features"
 )
 OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_supporting_text_v3"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v7"
@@ -57,6 +57,7 @@ INTERPRETATION_AUDIT_SCHEMA_VERSION = (
 )
 PAIRWISE_ALIAS_MIN_FUZZY_SCORE = 0.44
 PAIRWISE_ALIAS_MAX_NEIGHBORS = 4
+CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE = "configured_explicit_feature"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
     "a",
@@ -401,6 +402,193 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 @dataclass(frozen=True)
+class Stage2ExplicitFeature:
+    """Investigator-specified feature and complete extraction ontology."""
+
+    name: str
+    description: str
+    value_type: str
+    categories_or_unit: tuple[str, ...]
+    measurement_definition: str
+    missing_value_rule: str
+    roles: tuple[str, ...]
+    stability_summary: str = ""
+    caveats: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise ValueError("stage2 explicit feature name must be a string")
+        name = re.sub(r"[^a-z0-9]+", "_", str(self.name).strip().lower()).strip("_")
+        if not name:
+            raise ValueError("stage2 explicit feature name must contain letters or numbers")
+        description = str(self.description or "").strip()
+        if not description:
+            raise ValueError(f"stage2 explicit feature {name!r} requires a nonempty description")
+        value_type = str(self.value_type or "").strip().lower()
+        value_type = {
+            "bool": "binary",
+            "boolean": "binary",
+            "category": "categorical",
+            "numeric": "continuous",
+            "number": "continuous",
+            "unknown": "ambiguous",
+        }.get(value_type, value_type)
+        if value_type not in ALLOWED_VALUE_TYPES:
+            raise ValueError(
+                f"stage2 explicit feature {name!r} value_type must be one of "
+                f"{sorted(ALLOWED_VALUE_TYPES)}"
+            )
+        raw_categories: Any = self.categories_or_unit
+        if isinstance(raw_categories, str):
+            raw_categories = [raw_categories]
+        if not isinstance(raw_categories, Sequence) or isinstance(
+            raw_categories, (bytes, bytearray)
+        ):
+            raise ValueError(f"stage2 explicit feature {name!r} categories_or_unit must be a list")
+        categories = [str(item).strip() for item in raw_categories if str(item).strip()]
+        if value_type in {"binary", "categorical", "ordinal"}:
+            from .plain_handoff_stage2_analysis import _validated_closed_category_values
+
+            categories = _validated_closed_category_values(
+                value_type=value_type,
+                values=categories,
+                source=f"stage2 explicit feature {name!r}",
+            )
+        measurement_definition = str(self.measurement_definition or "").strip()
+        if not measurement_definition:
+            raise ValueError(f"stage2 explicit feature {name!r} requires measurement_definition")
+        missing_value_rule = str(self.missing_value_rule or "").strip()
+        if not missing_value_rule:
+            raise ValueError(f"stage2 explicit feature {name!r} requires missing_value_rule")
+        raw_roles: Any = self.roles
+        if isinstance(raw_roles, str):
+            raw_roles = [raw_roles]
+        if not isinstance(raw_roles, Sequence) or isinstance(raw_roles, (bytes, bytearray)):
+            raise ValueError(f"stage2 explicit feature {name!r} roles must be a list")
+        roles = list(
+            dict.fromkeys(str(role).strip().lower() for role in raw_roles if str(role).strip())
+        )
+        if not roles:
+            raise ValueError(f"stage2 explicit feature {name!r} requires at least one causal role")
+        unsupported_roles = sorted(set(roles) - ALLOWED_ROLES)
+        if unsupported_roles:
+            raise ValueError(
+                f"stage2 explicit feature {name!r} contains unsupported roles: "
+                f"{unsupported_roles}; allowed roles are {sorted(ALLOWED_ROLES)}"
+            )
+
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "description", description)
+        object.__setattr__(self, "value_type", value_type)
+        object.__setattr__(self, "categories_or_unit", tuple(categories))
+        object.__setattr__(self, "measurement_definition", measurement_definition)
+        object.__setattr__(self, "missing_value_rule", missing_value_rule)
+        object.__setattr__(self, "roles", tuple(roles))
+        object.__setattr__(self, "stability_summary", str(self.stability_summary or "").strip())
+        object.__setattr__(self, "caveats", str(self.caveats or "").strip())
+
+    def as_definition(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "value_type": self.value_type,
+            "categories_or_unit": list(self.categories_or_unit),
+            "measurement_definition": self.measurement_definition,
+            "missing_value_rule": self.missing_value_rule,
+            "roles": list(self.roles),
+            "stability_summary": self.stability_summary,
+            "caveats": self.caveats,
+        }
+
+
+def _stage2_explicit_feature_from_mapping(
+    raw: Any,
+    *,
+    source: str,
+) -> Stage2ExplicitFeature:
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{source} must be an object containing a feature ontology")
+    entry = dict(raw)
+    nested = entry.pop("ontology", None)
+    if nested is not None:
+        if not isinstance(nested, Mapping):
+            raise ValueError(f"{source}.ontology must be an object")
+        combined = dict(nested)
+        combined.update(entry)
+    else:
+        combined = entry
+
+    def required_value(key: str, *aliases: str) -> Any:
+        for candidate in (key, *aliases):
+            if candidate in combined:
+                return combined[candidate]
+        alias_text = f" (or {', '.join(aliases)})" if aliases else ""
+        raise ValueError(f"{source} requires ontology field {key}{alias_text}")
+
+    raw_categories = required_value("categories_or_unit", "categories", "unit")
+    if raw_categories is None:
+        raw_categories = []
+    elif isinstance(raw_categories, (str, int, float, bool)):
+        raw_categories = [raw_categories]
+    elif not isinstance(raw_categories, Sequence):
+        raise ValueError(f"{source}.categories_or_unit must be a list or unit string")
+    raw_roles = required_value("roles")
+    if isinstance(raw_roles, str):
+        raw_roles = [raw_roles]
+    elif not isinstance(raw_roles, Sequence):
+        raise ValueError(f"{source}.roles must be a list")
+
+    return Stage2ExplicitFeature(
+        name=required_value("name"),
+        description=required_value("description"),
+        value_type=required_value("value_type", "type"),
+        categories_or_unit=tuple(item for item in raw_categories if item is not None),
+        measurement_definition=required_value("measurement_definition"),
+        missing_value_rule=required_value("missing_value_rule"),
+        roles=tuple(role for role in raw_roles if role is not None),
+        stability_summary=str(combined.get("stability_summary") or ""),
+        caveats=str(combined.get("caveats") or ""),
+    )
+
+
+def _stage2_explicit_features_from_value(raw: Any) -> tuple[Stage2ExplicitFeature, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, Mapping):
+        enabled = raw.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("stage2.explicit_features.enabled must be true or false")
+        entries = raw.get("features")
+        if entries is None:
+            raise ValueError("stage2.explicit_features must contain a features list")
+        if not enabled:
+            if entries:
+                raise ValueError(
+                    "stage2.explicit_features cannot contain features when enabled=false"
+                )
+            return ()
+    else:
+        entries = raw
+    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes, bytearray)):
+        raise ValueError("stage2.explicit_features must be a list of feature ontologies")
+    features = tuple(
+        _stage2_explicit_feature_from_mapping(
+            entry,
+            source=f"stage2.explicit_features[{index}]",
+        )
+        for index, entry in enumerate(entries)
+    )
+    names = [feature.name for feature in features]
+    duplicate_names = sorted(name for name, count in Counter(names).items() if count > 1)
+    if duplicate_names:
+        raise ValueError(
+            "stage2.explicit_features contains duplicate normalized feature names: "
+            f"{duplicate_names}"
+        )
+    return features
+
+
+@dataclass(frozen=True)
 class PlainHandoffStage2Config:
     endpoint: str
     model: str = ""
@@ -429,6 +617,7 @@ class PlainHandoffStage2Config:
     max_dominant_fraction: float = 0.98
     temperature: float = 0.0
     enable_thinking: bool = False
+    explicit_features: tuple[Stage2ExplicitFeature, ...] = ()
 
     def validate(self, *, require_model: bool = True) -> None:
         parsed = urlparse(self.endpoint)
@@ -503,10 +692,27 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.max_dominant_fraction must be between 0 and 1")
         if not 0.0 <= self.temperature <= 2.0:
             raise ValueError("stage2.temperature must be between 0 and 2")
+        names: list[str] = []
+        for index, feature in enumerate(self.explicit_features):
+            if not isinstance(feature, Stage2ExplicitFeature):
+                raise ValueError(
+                    "stage2.explicit_features entries must be Stage2ExplicitFeature "
+                    f"objects; invalid entry at index {index}"
+                )
+            names.append(feature.name)
+        duplicate_names = sorted(name for name, count in Counter(names).items() if count > 1)
+        if duplicate_names:
+            raise ValueError(
+                "stage2.explicit_features contains duplicate normalized feature names: "
+                f"{duplicate_names}"
+            )
 
     def public_dict(self) -> dict[str, Any]:
         values = asdict(self)
         values["api_key"] = "<redacted>"
+        values["explicit_features"] = [
+            feature.as_definition() for feature in self.explicit_features
+        ]
         return values
 
 
@@ -521,6 +727,7 @@ def plain_stage2_config_from_mapping(
         )
     endpoint = str(raw.get("endpoint") or "").strip()
     model = str(raw.get("model") or "").strip()
+    explicit_features = _stage2_explicit_features_from_value(raw.get("explicit_features"))
     if not endpoint and not model:
         return None
     if not endpoint:
@@ -572,6 +779,7 @@ def plain_stage2_config_from_mapping(
         max_dominant_fraction=float(raw.get("max_dominant_fraction", 0.98)),
         temperature=float(raw.get("temperature", 0.0)),
         enable_thinking=bool(raw.get("enable_thinking", False)),
+        explicit_features=explicit_features,
     )
     config.validate(require_model=False)
     return config
@@ -1028,6 +1236,10 @@ class _RetryableStage2ResponseError(RuntimeError):
     """A completed transport that did not yield any response content."""
 
 
+class _Stage2OutputLengthError(ValueError):
+    """The server exhausted the available completion length."""
+
+
 def _openai_completion(
     messages: Sequence[Mapping[str, str]],
     config: PlainHandoffStage2Config,
@@ -1069,7 +1281,9 @@ def _openai_completion(
     choice = response.choices[0]
     finish_reason = str(getattr(choice, "finish_reason", "") or "")
     if finish_reason == "length":
-        raise ValueError("Stage 2 server stopped the response with finish_reason=length")
+        raise _Stage2OutputLengthError(
+            "Stage 2 server stopped the response with finish_reason=length"
+        )
     content = choice.message.content
     if not content:
         raise _RetryableStage2ResponseError("Stage 2 model returned an empty response")
@@ -1158,12 +1372,21 @@ def _compact_json_messages(
 
 
 def _repair_message(exc: Exception) -> dict[str, str]:
-    return {
-        "role": "user",
-        "content": (
+    if isinstance(exc, _Stage2OutputLengthError):
+        content = (
+            "The previous JSON exceeded the available response length. Return one materially "
+            "shorter corrected JSON object using the same required schema. Remove redundancy, "
+            "merge duplicate entries, and keep descriptions and rationales concise. Do not omit "
+            "required records or fields. Return JSON only."
+        )
+    else:
+        content = (
             "The previous JSON failed validation. Correct this exact error: "
             f"{type(exc).__name__}: {exc}. Return one corrected JSON object only."
-        ),
+        )
+    return {
+        "role": "user",
+        "content": content,
     }
 
 
@@ -1408,6 +1631,7 @@ def _interpretation_prompt(
             "Use longitudinal information as clinical context when it appears in the evidence. Do not perform temporal eligibility filtering.",
             "Do not return patient names, administrative identifiers, documentation artifacts, descriptions of the input collection, multiple-patient heterogeneity, grouping methods, or analysis methods as clinical features.",
             "If no valid feature is supported, return an empty candidates list. Never turn the absence of a common feature into a candidate.",
+            "Every returned candidate must have a nonempty snake_case name. Omit any candidate you cannot name; never return a blank or null name.",
             "For each candidate, cite one or more supplied item numbers in supporting_items and explain how its text supports the feature.",
             "Do not choose a value type, unit, categories, or extraction ontology in this step.",
         ],
@@ -1448,6 +1672,7 @@ def _rejected_packet_audit_prompt(
             "Use longitudinal information as clinical context when it appears in the evidence. Do not perform temporal eligibility filtering.",
             "Do not return patient names, administrative identifiers, documentation artifacts, descriptions of the input collection, multiple-patient heterogeneity, grouping methods, or analysis methods as clinical features.",
             "If no valid feature is supported, return an empty candidates list. Never turn the absence of a common feature into a candidate.",
+            "Every returned candidate must have a nonempty snake_case name. Omit any candidate you cannot name; never return a blank or null name.",
             "For each candidate, cite one or more supplied item numbers in supporting_items and explain how its text supports the feature.",
             "Do not choose a value type, unit, categories, or extraction ontology in this step.",
         ],
@@ -1498,12 +1723,17 @@ def _validate_interpretation(
     if not isinstance(concepts, list):
         raise ValueError("interpretation requires a concepts list")
     clean_concepts: list[dict[str, Any]] = []
-    for concept in concepts:
+    for concept_index, concept in enumerate(concepts, start=1):
         if not isinstance(concept, Mapping):
             raise ValueError("each interpreted concept must be an object")
         name = str(concept.get("name") or concept.get("feature_name") or "").strip()
         if not name:
-            raise ValueError("interpreted concept has no name")
+            LOGGER.warning(
+                "Stage 2 interpretation ignored unnamed candidate at position=%s; "
+                "its citations were not used",
+                concept_index,
+            )
+            continue
         raw_supports = concept.get("supporting_items") or []
         if isinstance(raw_supports, (str, int)):
             raw_supports = [raw_supports]
@@ -2150,6 +2380,8 @@ def _candidate_architectures(candidate: Mapping[str, Any]) -> list[str]:
         "bounded_multi_architecture_consolidation",
     }:
         primary = ""
+    if primary == CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE:
+        primary = ""
     return list(
         dict.fromkeys(
             architecture
@@ -2160,6 +2392,43 @@ def _candidate_architectures(candidate: Mapping[str, Any]) -> list[str]:
             if architecture
         )
     )
+
+
+def _configured_feature_definitions(
+    candidate: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    raw = candidate.get("configured_feature_definitions") or []
+    if isinstance(raw, Mapping):
+        raw = [raw]
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
+        return []
+    definitions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in raw:
+        if not isinstance(value, Mapping):
+            continue
+        definition = dict(value)
+        name = _snake_case_name(definition.get("name"), fallback="")
+        if not name or name in seen:
+            continue
+        definition["name"] = name
+        definitions.append(definition)
+        seen.add(name)
+    return definitions
+
+
+def _group_roles(group: Mapping[str, Any]) -> list[str]:
+    configured = _configured_feature_definitions(group)
+    if configured:
+        if len(configured) != 1:
+            raise ValueError(
+                "Stage 2 consolidation attempted to merge multiple investigator-configured "
+                f"features: {[feature['name'] for feature in configured]}"
+            )
+        return [
+            role for role in _string_values(configured[0].get("roles")) if role in ALLOWED_ROLES
+        ]
+    return _derive_roles(group.get("evidence_axes") or [])
 
 
 def _candidate_pair_view(candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -2524,6 +2793,15 @@ def _materialize_candidate_group(
             if str(member.get("caveats") or "").strip()
         )
     )
+    configured_definitions: list[dict[str, Any]] = []
+    configured_names: set[str] = set()
+    for member in members:
+        for definition in _configured_feature_definitions(member):
+            configured_name = str(definition["name"])
+            if configured_name in configured_names:
+                continue
+            configured_definitions.append(definition)
+            configured_names.add(configured_name)
     description = canonical_description or (descriptions[0] if descriptions else canonical_name)
     if ontology_packet_ids is None:
         ontology_packet_ids = [
@@ -2546,6 +2824,7 @@ def _materialize_candidate_group(
         "packet_evidence_axes": packet_evidence_axes,
         "caveats": " ".join(caveats),
         "origin_candidate_ids": origins,
+        "configured_feature_definitions": configured_definitions,
         # Internal routing only. Python resolves these to readable supporting
         # text; the ontology model never receives packet structure or IDs.
         "ontology_packet_ids": list(dict.fromkeys(map(str, ontology_packet_ids))),
@@ -2570,6 +2849,7 @@ def _canonical_cluster_member(
     return max(
         enumerate(members),
         key=lambda item: (
+            bool(_configured_feature_definitions(item[1])),
             name_counts[_snake_case_name(item[1].get("name"), fallback="")],
             len(_string_values(item[1].get("origin_candidate_ids"))),
             len(_string_values(item[1].get("supporting_packet_ids"))),
@@ -2623,6 +2903,7 @@ def _derive_roles(evidence_axes: Sequence[str]) -> list[str]:
 def _global_group_merge_prompt(
     *,
     group_names: Sequence[str],
+    configured_feature_names: Sequence[str] = (),
 ) -> list[dict[str, str]]:
     """Ask for only the residual name-level merges, without opaque identifiers."""
 
@@ -2653,6 +2934,15 @@ def _global_group_merge_prompt(
             ]
         },
     }
+    configured_names = list(map(str, configured_feature_names))
+    if configured_names:
+        body["configured_feature_names"] = configured_names
+        body["rules"].extend(
+            [
+                "Never merge two names listed in configured_feature_names; the investigator specified them as distinct features.",
+                "When one merge input is listed in configured_feature_names, output that exact configured name so its investigator-supplied ontology remains authoritative.",
+            ]
+        )
     return [
         {
             "role": "system",
@@ -2668,6 +2958,7 @@ def _validate_global_group_merge_directives(
     value: Mapping[str, Any],
     *,
     group_names: Sequence[str],
+    configured_feature_names: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Validate name-only merge directives and resolve supplied names deterministically."""
 
@@ -2677,6 +2968,13 @@ def _validate_global_group_merge_directives(
     normalized_available: dict[str, list[str]] = defaultdict(list)
     for name in available:
         normalized_available[_snake_case_name(name, fallback="")].append(name)
+    configured_names = set(map(str, configured_feature_names))
+    unknown_configured_names = sorted(configured_names - set(available))
+    if unknown_configured_names:
+        raise ValueError(
+            "global group merge received unknown configured feature names: "
+            f"{unknown_configured_names}"
+        )
 
     def resolve_input_name(raw_name: Any) -> str:
         rendered = str(raw_name or "").strip()
@@ -2724,6 +3022,17 @@ def _validate_global_group_merge_directives(
         output = _snake_case_name(raw_directive.get("output"), fallback="")
         if not output:
             raise ValueError(f"global merge directive {index} requires an output name")
+        configured_inputs = [name for name in inputs if name in configured_names]
+        if len(configured_inputs) > 1:
+            raise ValueError(
+                "global merge directives must not combine distinct investigator-configured "
+                f"features: {configured_inputs}"
+            )
+        if configured_inputs and output != configured_inputs[0]:
+            raise ValueError(
+                "a global merge containing an investigator-configured feature must use "
+                f"that exact configured name as output: {configured_inputs[0]!r}"
+            )
         used_inputs.update(inputs)
         directives.append({"inputs": inputs, "output": output})
 
@@ -3390,7 +3699,29 @@ class PlainHandoffStage2:
             {**dict(candidate), "origin_candidate_ids": [str(candidate["candidate_id"])]}
             for candidate in candidates
         ]
-        comparisons = _candidate_comparison_pairs(current)
+        protected_pairs = {
+            (left_index, right_index)
+            for left_index in range(len(current))
+            for right_index in range(left_index + 1, len(current))
+            if _configured_feature_definitions(current[left_index])
+            and _configured_feature_definitions(current[right_index])
+        }
+        exact_configured_matches = {
+            (left_index, right_index)
+            for left_index in range(len(current))
+            for right_index in range(left_index + 1, len(current))
+            if (left_index, right_index) not in protected_pairs
+            and bool(_configured_feature_definitions(current[left_index]))
+            != bool(_configured_feature_definitions(current[right_index]))
+            and _snake_case_name(current[left_index].get("name"), fallback="")
+            == _snake_case_name(current[right_index].get("name"), fallback="")
+        }
+        comparisons = [
+            comparison
+            for comparison in _candidate_comparison_pairs(current)
+            if (int(comparison["left_index"]), int(comparison["right_index"]))
+            not in protected_pairs | exact_configured_matches
+        ]
         LOGGER.info(
             "Stage 2 candidate alias pairing candidates=%s fuzzy_comparisons=%s workers=%s",
             len(current),
@@ -3444,6 +3775,26 @@ class PlainHandoffStage2:
                     decisions_by_index[futures[future]] = future.result()
 
         decisions = [decisions_by_index[index] for index in sorted(decisions_by_index)]
+        decisions.extend(
+            {
+                "left_index": left_index,
+                "right_index": right_index,
+                "fuzzy_score": 1.0,
+                "same_scalar_measurement": True,
+                "reason": "exact normalized configured feature name",
+            }
+            for left_index, right_index in sorted(exact_configured_matches)
+        )
+        decisions.extend(
+            {
+                "left_index": left_index,
+                "right_index": right_index,
+                "fuzzy_score": 1.0,
+                "same_scalar_measurement": False,
+                "reason": "investigator-configured features remain distinct",
+            }
+            for left_index, right_index in sorted(protected_pairs)
+        )
         clusters = _candidate_clusters_from_pair_decisions(current, decisions)
         LOGGER.info(
             "Stage 2 candidate alias pairing accepted=%s groups=%s",
@@ -3462,6 +3813,53 @@ class PlainHandoffStage2:
         packet_by_id: Mapping[str, Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> dict[str, Any]:
+        configured = _configured_feature_definitions(group)
+        if configured:
+            if len(configured) != 1:
+                raise ValueError(
+                    "Stage 2 consolidation attempted to assign more than one supplied "
+                    "ontology to one feature group"
+                )
+            definition = dict(configured[0])
+            configured_name = str(definition.pop("name"))
+            group_name = _snake_case_name(group.get("name"), fallback="")
+            if group_name != configured_name:
+                raise ValueError(
+                    "Stage 2 consolidation renamed an investigator-configured feature; "
+                    f"expected {configured_name!r}, received {group_name!r}"
+                )
+            roles = [
+                role
+                for role in _string_values(definition.pop("roles", []))
+                if role in ALLOWED_ROLES
+            ]
+            if not roles:  # pragma: no cover - config validation invariant
+                raise ValueError(
+                    f"Stage 2 configured feature {configured_name!r} has no causal role"
+                )
+            if output_dir is not None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                _write_json(
+                    output_dir / "provided_ontology.json",
+                    {
+                        "status": "used_without_model_operationalization",
+                        "source": "stage2.explicit_features",
+                        "feature": {
+                            "name": configured_name,
+                            **definition,
+                            "roles": roles,
+                        },
+                    },
+                )
+            return {
+                "name": configured_name,
+                **definition,
+                "roles": roles,
+                "supporting_packet_ids": _string_values(group.get("supporting_packet_ids")),
+                "supporting_architectures": _string_values(group.get("supporting_architectures")),
+                "configured_explicit_feature": True,
+            }
+
         ontology_packet_ids = _string_values(group.get("ontology_packet_ids"))
         if not ontology_packet_ids:
             raise ValueError(
@@ -3510,7 +3908,7 @@ class PlainHandoffStage2:
             completion=self.completion,
             validate=lambda value: _validate_operationalization(value, group=group),
         )
-        roles = _derive_roles(group.get("evidence_axes") or [])
+        roles = _group_roles(group)
         if not roles:
             raise ValueError(
                 f"Stage 2 group {group.get('name')!r} has no evidence-supported causal role"
@@ -3536,7 +3934,13 @@ class PlainHandoffStage2:
         if len(current) < 2:
             return current
         group_names = [str(group["name"]) for group in current]
-        messages = _global_group_merge_prompt(group_names=group_names)
+        configured_feature_names = [
+            str(group["name"]) for group in current if _configured_feature_definitions(group)
+        ]
+        messages = _global_group_merge_prompt(
+            group_names=group_names,
+            configured_feature_names=configured_feature_names,
+        )
         prompt_chars = sum(len(message["content"]) for message in messages)
         if prompt_chars > int(self.config.max_prompt_chars):
             raise ValueError(
@@ -3550,6 +3954,7 @@ class PlainHandoffStage2:
                 "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                 "outer_fold": int(outer_fold),
                 "feature_names": group_names,
+                "configured_feature_names": configured_feature_names,
             },
             messages=messages,
             config=self.config,
@@ -3557,6 +3962,7 @@ class PlainHandoffStage2:
             validate=lambda value: _validate_global_group_merge_directives(
                 value,
                 group_names=group_names,
+                configured_feature_names=configured_feature_names,
             ),
         )
         directives = list(response["merge_directives"])
@@ -3617,15 +4023,31 @@ class PlainHandoffStage2:
     ) -> Mapping[str, Any]:
         """Build alias groups and operationalize every causally routable group."""
 
-        original_ids = [str(candidate["candidate_id"]) for candidate in candidates]
-        packet_by_id = {
-            str(packet["packet_id"]): packet for packet in evidence_packets
-        }
+        configured_candidates = [
+            {
+                "candidate_id": f"configured_explicit_feature_{index:04d}",
+                "architecture": CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE,
+                "name": feature.name,
+                "description": feature.description,
+                "value_type": feature.value_type,
+                "supporting_packet_ids": [],
+                "evidence_axes": [],
+                "evidence_rationale": "Investigator-specified feature for this analysis.",
+                "caveats": feature.caveats,
+                "configured_feature_definitions": [feature.as_definition()],
+            }
+            for index, feature in enumerate(self.config.explicit_features, start=1)
+        ]
+        all_candidates = [*configured_candidates, *(dict(candidate) for candidate in candidates)]
+        original_ids = [str(candidate["candidate_id"]) for candidate in all_candidates]
+        if len(original_ids) != len(set(original_ids)):
+            raise ValueError("Stage 2 consolidation received duplicate candidate IDs")
+        packet_by_id = {str(packet["packet_id"]): packet for packet in evidence_packets}
         if len(packet_by_id) != len(evidence_packets):
             raise ValueError("Stage 2 ontology evidence contains duplicate packet IDs")
         cited_packet_ids = {
             packet_id
-            for candidate in candidates
+            for candidate in all_candidates
             for packet_id in _string_values(candidate.get("supporting_packet_ids"))
         }
         unknown_packet_ids = sorted(cited_packet_ids - set(packet_by_id))
@@ -3636,13 +4058,13 @@ class PlainHandoffStage2:
             )
         groups, grouping_exclusions = self._group_candidates(
             outer_fold=outer_fold,
-            candidates=candidates,
+            candidates=all_candidates,
             output_dir=output_dir,
         )
         exclusions = dict(grouping_exclusions)
         routable_groups: list[dict[str, Any]] = []
         for group in groups:
-            if _derive_roles(group.get("evidence_axes") or []):
+            if _group_roles(group):
                 routable_groups.append(dict(group))
                 continue
             for origin in _string_values(group.get("origin_candidate_ids")):
@@ -3740,6 +4162,9 @@ class PlainHandoffStage2:
                 "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
                 "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                 "clinical_question": self.clinical_question,
+                "explicit_features": [
+                    feature.as_definition() for feature in self.config.explicit_features
+                ],
                 "packets": list(packets),
             }
         )
@@ -3759,8 +4184,8 @@ class PlainHandoffStage2:
             if definitions_state.get("evidence_input_fingerprint") != evidence_input_fingerprint:
                 raise RuntimeError(
                     f"Stage 2 outer fold {outer_fold} was completed from a different "
-                    "evidence plan. Use a fresh Stage 2 output directory before rerunning "
-                    "with the new evidence compiler."
+                    "evidence plan or explicit-feature configuration. Use a fresh Stage 2 "
+                    "output directory before rerunning with the new definition inputs."
                 )
             LOGGER.info("skip completed Stage 2 outer fold=%s", outer_fold)
             final = json.loads(final_features_path.read_text(encoding="utf-8"))
@@ -3789,8 +4214,8 @@ class PlainHandoffStage2:
             if definitions_state.get("evidence_input_fingerprint") != evidence_input_fingerprint:
                 raise RuntimeError(
                     f"Stage 2 outer fold {outer_fold} has feature definitions from a "
-                    "different evidence plan. Preserve the old output for audit and run "
-                    "the new evidence compiler in a fresh Stage 2 output directory."
+                    "different evidence plan or explicit-feature configuration. Preserve "
+                    "the old output for audit and use a fresh Stage 2 output directory."
                 )
             final = json.loads(features_path.read_text(encoding="utf-8"))
         else:
@@ -3866,7 +4291,7 @@ class PlainHandoffStage2:
                         }
                     )
             _write_json(output_dir / "interpreted_candidates.json", candidates)
-            if not candidates:
+            if not candidates and not self.config.explicit_features:
                 final = {
                     "outer_fold": outer_fold,
                     "features": [],
@@ -4183,6 +4608,7 @@ def run_plain_handoff_stage2(
 __all__ = [
     "PlainHandoffStage2",
     "PlainHandoffStage2Config",
+    "Stage2ExplicitFeature",
     "packetize_handoff",
     "plain_stage2_config_from_mapping",
     "run_plain_handoff_stage2",

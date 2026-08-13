@@ -149,10 +149,45 @@ makes those decisions from the retained feature name and supporting text.
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
     "max_review_rounds": 2,
-    "estimation_trees": 200
+    "estimation_trees": 200,
+    "explicit_features": [
+      {
+        "name": "age_at_treatment_decision",
+        "description": "Age at the pretreatment decision point.",
+        "value_type": "continuous",
+        "categories_or_unit": ["years"],
+        "measurement_definition": "Extract age in years at the treatment-decision point.",
+        "missing_value_rule": "Return null when age cannot be determined from the pretreatment record.",
+        "roles": ["confounder"]
+      }
+    ]
   }
 }
 ```
+
+`stage2.explicit_features` is optional. Each entry is a complete, investigator-
+specified variable definition, not merely a requested name. It requires
+`name`, `description`, `value_type`, `categories_or_unit`,
+`measurement_definition`, `missing_value_rule`, and one or more `roles` from
+`confounder`, `prognostic`, and `effect_modifier`. Closed ontologies are
+validated just like model-authored definitions: binary variables need exactly
+two values, and categorical or ordinal variables need at least two. A
+continuous feature may use an empty list when it has no meaningful unit.
+`stability_summary` and `caveats` are optional. For compatibility with the
+standalone explicit-feature vocabulary, `type`, `categories`, and `unit` are
+accepted aliases; the ontology fields may also be placed inside an `ontology`
+object while `name` and `roles` remain alongside it.
+
+Configured features enter both alias-consolidation passes in every outer fold.
+When Stage 1 discovers an alias, Python retains one consolidated feature,
+attaches the discovered packet and architecture provenance, keeps the
+configured name and roles, and uses the supplied ontology without making the
+one-feature ontology request. Distinct configured feature names are never
+merged with each other. They still undergo training-fold extraction and
+empirical diagnostics, but review must keep them without revising the supplied
+ontology. If a required feature cannot be extracted well enough for the
+workflow's health checks, the run fails visibly rather than silently dropping
+or redefining it.
 
 `stage2.model` is optional. If it is empty or omitted, Stage 2 queries the
 OpenAI-compatible `/models` endpoint once at startup and uses the result when
@@ -170,7 +205,10 @@ group IDs, and the model returns only
 transitive partition, resolves contradictory decisions conservatively, assigns
 all group IDs, and preserves unmatched candidates as singleton groups. The
 fuzzy matcher proposes comparisons only; it never decides that two clinical
-measurements are equivalent.
+measurements are equivalent. The sole deterministic identity case is an
+automatically discovered candidate whose normalized name exactly equals one
+configured explicit-feature name; it is routed directly into that configured
+group. Nonidentical possible aliases still require semantic judgment.
 
 Python next removes groups without a Stage 1 evidence-supported confounder,
 prognostic, or effect-modifier role and gives the LLM one compact, complete list
@@ -196,7 +234,9 @@ at this point from the feature name and readable evidence, then supplies allowed
 values or a unit and the extraction and missingness rules. Python validates the
 closed-ontology shape but does not hard-code domain-specific features,
 categories, or units. There is no LLM ranking, diversity selection, or
-feature-count cap between alias grouping and operationalization.
+feature-count cap between alias grouping and operationalization. A group that
+contains a configured explicit feature skips this request and uses its supplied
+ontology instead.
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
@@ -444,9 +484,10 @@ been assembled.
 Raw-packet interpretation checkpoints do not match semantic-card inputs and are
 therefore rerun automatically. If a prior run already produced
 `feature_definitions.json`, the runner fails closed instead of silently mixing
-those definitions with a new evidence plan; preserve that directory for audit
-and select a fresh Stage 2 output directory for the compiler sensitivity run.
-The Stage 1 handoff itself does not need to be regenerated.
+those definitions with a new evidence plan or a changed explicit-feature
+configuration; preserve that directory for audit and select a fresh Stage 2
+output directory for the new definition inputs. The Stage 1 handoff itself does
+not need to be regenerated when only `stage2.explicit_features` changes.
 
 The review boundary is deliberately fold-honest. Extraction summaries and
 performance metrics in `review/round_NNN/` contain outer-training rows only.

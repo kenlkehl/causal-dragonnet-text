@@ -60,6 +60,61 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.consolidation_oversample_factor == 4
 
 
+def test_stage2_config_parses_explicit_feature_with_supplied_ontology():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "explicit_features": [
+                {
+                    "name": "ECOG performance status",
+                    "roles": ["confounder", "effect_modifier"],
+                    "ontology": {
+                        "description": "Pretreatment ECOG performance status.",
+                        "value_type": "ordinal",
+                        "categories_or_unit": ["0-4"],
+                        "measurement_definition": (
+                            "Extract the last explicitly documented pretreatment ECOG score."
+                        ),
+                        "missing_value_rule": "Return null when no score is documented.",
+                    },
+                }
+            ],
+        },
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert len(config.explicit_features) == 1
+    feature = config.explicit_features[0]
+    assert feature.name == "ecog_performance_status"
+    assert feature.value_type == "ordinal"
+    assert feature.categories_or_unit == ("0", "1", "2", "3", "4")
+    assert feature.roles == ("confounder", "effect_modifier")
+    assert config.public_dict()["explicit_features"][0]["categories_or_unit"] == [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+    ]
+
+
+def test_stage2_explicit_feature_requires_complete_ontology():
+    with pytest.raises(ValueError, match="requires ontology field"):
+        plain_stage2_config_from_mapping(
+            {
+                "endpoint": "http://stage2.test/v1",
+                "explicit_features": [
+                    {
+                        "name": "ecog_performance_status",
+                        "roles": ["confounder"],
+                    }
+                ],
+            },
+            default_workers=1,
+        )
+
+
 def test_stage2_rejects_retired_raw_packet_compiler():
     with pytest.raises(ValueError, match="raw_packets_v1 was retired"):
         plain_stage2_config_from_mapping(
@@ -212,6 +267,19 @@ def test_json_repair_stops_after_five_repairs():
         )
 
     assert len(calls) == 6
+
+
+def test_output_length_repair_explicitly_requests_a_shorter_complete_object():
+    message = stage2_workflow._repair_message(
+        stage2_workflow._Stage2OutputLengthError(
+            "Stage 2 server stopped the response with finish_reason=length"
+        )
+    )
+
+    assert message["role"] == "user"
+    assert "materially shorter" in message["content"]
+    assert "Remove redundancy" in message["content"]
+    assert "Do not omit required records or fields" in message["content"]
 
 
 def test_json_repair_losslessly_compacts_json_to_include_the_validation_error():
@@ -938,6 +1006,8 @@ def test_interpretation_prompt_inverts_noisy_text_evidence_without_temporal_filt
     assert "descriptions of the input collection" in rules
     assert "absence of a common feature" in rules
     assert "supporting_items" in rules
+    assert "nonempty snake_case name" in rules
+    assert "blank or null name" in rules
     assert "do not choose a value type" in rules
     assert "longitudinal information as clinical context" in rules
     assert "do not perform temporal eligibility filtering" in rules
@@ -1001,6 +1071,8 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
     assert "descriptions of the input collection" in rules
     assert "absence of a common feature" in rules
     assert "supporting_items" in rules
+    assert "nonempty snake_case name" in rules
+    assert "blank or null name" in rules
     assert "do not choose a value type" in rules
     assert "input or analysis artifacts" in messages[0]["content"].lower()
     assert "longitudinal information as clinical context" in rules
@@ -1134,6 +1206,35 @@ def test_interpretation_requires_a_latent_feature_evidence_rationale():
             },
             packet_ids=["packet-a"],
         )
+
+
+def test_interpretation_ignores_unnamed_candidate_and_preserves_valid_candidates(caplog):
+    result = stage2_workflow._validate_interpretation(
+        {
+            "candidates": [
+                {
+                    "name": "",
+                    "description": "An ambiguous fragment with no defensible feature name.",
+                    "supporting_items": [1],
+                    "evidence_rationale": "The fragment was reviewed but is not identifiable.",
+                },
+                {
+                    "name": "thrombocytopenia",
+                    "supporting_items": [2],
+                    "evidence_rationale": "The cited text explicitly names thrombocytopenia.",
+                },
+            ]
+        },
+        packet_ids=["packet-ambiguous", "packet-thrombocytopenia"],
+    )
+
+    assert [concept["name"] for concept in result["concepts"]] == ["thrombocytopenia"]
+    assert (
+        result["packet_dispositions"]["packet-ambiguous"]["status"]
+        == "reviewed_no_specific_concept"
+    )
+    assert result["packet_dispositions"]["packet-thrombocytopenia"]["status"] == "supports_concept"
+    assert "ignored unnamed candidate at position=1" in caplog.text
 
 
 def test_interpretation_drops_only_concepts_without_grounded_packet_citations(caplog):
@@ -2647,6 +2748,152 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     assert resumed == result
 
 
+def test_configured_feature_is_consolidated_with_discovery_and_keeps_supplied_ontology(
+    tmp_path: Path,
+):
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "model": "test-model",
+            "explicit_features": [
+                {
+                    "name": "ecog_performance_status",
+                    "description": "Pretreatment ECOG performance status.",
+                    "value_type": "ordinal",
+                    "categories_or_unit": ["0", "1", "2", "3", "4"],
+                    "measurement_definition": (
+                        "Extract the last explicitly documented pretreatment ECOG score."
+                    ),
+                    "missing_value_rule": "Return null when no score is documented.",
+                    "roles": ["effect_modifier"],
+                    "stability_summary": "Specified before Stage 2 discovery.",
+                    "caveats": "Do not infer ECOG from symptoms.",
+                }
+            ],
+        },
+        default_workers=1,
+    )
+    assert config is not None
+    jobs = []
+
+    def completion(messages, _config):
+        body = json.loads(messages[1]["content"])
+        job = _prompt_job(body)
+        jobs.append(job)
+        assert job == "decide_stage2_candidate_alias_pair"
+        return json.dumps({"same_scalar_measurement": True})
+
+    runner = PlainHandoffStage2(
+        config=config,
+        clinical_question="Estimate treatment-effect heterogeneity.",
+        completion=completion,
+    )
+    result = runner._consolidate_candidates(
+        outer_fold=1,
+        candidates=[
+            {
+                "candidate_id": "candidate_0001",
+                "architecture": "architecture_alpha",
+                "name": "performance_status",
+                "description": "ECOG score found in Stage 1 evidence.",
+                "value_type": "ambiguous",
+                "supporting_packet_ids": ["packet_ecog"],
+                "evidence_axes": ["treatment", "outcome"],
+                "caveats": "",
+            }
+        ],
+        evidence_packets=_original_evidence_packets(["packet_ecog"]),
+        output_dir=tmp_path / "consolidation",
+    )
+
+    assert jobs == ["decide_stage2_candidate_alias_pair"]
+    assert len(result["features"]) == 1
+    feature = result["features"][0]
+    assert feature["name"] == "ecog_performance_status"
+    assert feature["value_type"] == "ordinal"
+    assert feature["categories_or_unit"] == ["0", "1", "2", "3", "4"]
+    assert feature["measurement_definition"].startswith("Extract the last explicitly")
+    assert feature["missing_value_rule"] == "Return null when no score is documented."
+    # Configured roles and ontology remain authoritative even when the Stage 1
+    # evidence would independently route the alias as a confounder.
+    assert feature["roles"] == ["effect_modifier"]
+    assert feature["supporting_packet_ids"] == ["packet_ecog"]
+    assert feature["supporting_architectures"] == ["architecture_alpha"]
+    assert feature["configured_explicit_feature"] is True
+    assert (
+        result["candidate_dispositions"]["configured_explicit_feature_0001"]["status"] == "retained"
+    )
+    assert result["candidate_dispositions"]["candidate_0001"]["status"] == "merged"
+    provided = json.loads(
+        next((tmp_path / "consolidation").rglob("provided_ontology.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert provided["status"] == "used_without_model_operationalization"
+
+    exact_result = runner._consolidate_candidates(
+        outer_fold=2,
+        candidates=[
+            {
+                "candidate_id": "candidate_exact",
+                "architecture": "architecture_beta",
+                "name": "ecog_performance_status",
+                "description": "The same normalized name returned by discovery.",
+                "value_type": "ambiguous",
+                "supporting_packet_ids": ["packet_exact"],
+                "evidence_axes": ["outcome"],
+                "caveats": "",
+            }
+        ],
+        evidence_packets=_original_evidence_packets(["packet_exact"]),
+    )
+    assert jobs == ["decide_stage2_candidate_alias_pair"]
+    assert [feature["name"] for feature in exact_result["features"]] == ["ecog_performance_status"]
+
+
+def test_configured_feature_is_retained_without_any_discovered_candidate():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "model": "test-model",
+            "explicit_features": {
+                "features": [
+                    {
+                        "name": "age_at_treatment_decision",
+                        "description": "Age at the pretreatment decision point.",
+                        "type": "continuous",
+                        "unit": "years",
+                        "measurement_definition": (
+                            "Extract age in years at the treatment decision point."
+                        ),
+                        "missing_value_rule": "Return null when age cannot be determined.",
+                        "roles": ["confounder"],
+                    }
+                ]
+            },
+        },
+        default_workers=1,
+    )
+    assert config is not None
+
+    runner = PlainHandoffStage2(
+        config=config,
+        clinical_question="Estimate the treatment effect.",
+        completion=lambda _messages, _config: (_ for _ in ()).throw(
+            AssertionError("a configured-only feature must not request ontology definition")
+        ),
+    )
+    result = runner._consolidate_candidates(
+        outer_fold=1,
+        candidates=[],
+        evidence_packets=[],
+    )
+
+    assert [feature["name"] for feature in result["features"]] == ["age_at_treatment_decision"]
+    assert result["features"][0]["categories_or_unit"] == ["years"]
+    assert result["features"][0]["roles"] == ["confounder"]
+
+
 def test_global_name_consolidation_merges_residual_aliases_before_operationalization():
     prompt_bodies = []
     evidence_packets = [
@@ -3017,6 +3264,30 @@ def test_review_rejects_revision_with_malformed_closed_ontology():
                 "overall_assessment": "Retest the revision.",
             },
             definitions=definitions,
+            allow_measurement_revision=True,
+        )
+
+
+@pytest.mark.parametrize("action", ["drop", "revise"])
+def test_review_cannot_drop_or_revise_configured_explicit_feature(action):
+    with pytest.raises(ValueError, match="must be kept without revision"):
+        stage2_analysis._validate_review(
+            {
+                "feature_decisions": [
+                    {
+                        "feature_id": "feature_001",
+                        "action": action,
+                        "reason": "The model attempted to override the configured feature.",
+                    }
+                ]
+            },
+            definitions=[
+                {
+                    "feature_id": "feature_001",
+                    "name": "required_measurement",
+                    "configured_explicit_feature": True,
+                }
+            ],
             allow_measurement_revision=True,
         )
 

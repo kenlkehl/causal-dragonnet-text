@@ -2179,6 +2179,11 @@ def _review_prompt(
     feature_set_index: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
     detailed_feature_ids = [str(feature["feature_id"]) for feature in definitions]
+    configured_feature_ids = [
+        str(feature["feature_id"])
+        for feature in definitions
+        if feature.get("configured_explicit_feature") is True
+    ]
     body = {
         "job": "review_stage2_variables_against_training_fold_performance",
         "clinical_question": clinical_question,
@@ -2193,6 +2198,7 @@ def _review_prompt(
         },
         "review_scope": {
             "detailed_feature_ids": detailed_feature_ids,
+            "configured_explicit_feature_ids": configured_feature_ids,
             "feature_count_in_entire_set": len(feature_set_index or definitions),
         },
         "rules": [
@@ -2206,6 +2212,7 @@ def _review_prompt(
             "For a revised binary variable, provide exactly two distinct scalar ontology values as separate categories_or_unit array items.",
             "For a revised categorical or ordinal variable, provide at least two distinct scalar ontology values as separate categories_or_unit array items.",
             "Do not add a new feature, change a causal role, or change supporting evidence.",
+            "A feature listed in configured_explicit_feature_ids was required by the investigator with a supplied ontology; return keep and do not revise or drop it.",
             "Predictive performance is diagnostic evidence, not permission to use a post-treatment variable.",
             (
                 "Measurement revision is permitted and will be evaluated in another round."
@@ -2401,6 +2408,10 @@ def _validate_review(
         action = str(decision.get("action") or "")
         if action not in {"keep", "drop", "revise"}:
             raise ValueError("review action must be keep, drop, or revise")
+        if by_id[feature_id].get("configured_explicit_feature") is True and action != "keep":
+            raise ValueError(
+                f"investigator-configured feature {feature_id!r} must be kept without revision"
+            )
         if action == "revise" and not allow_measurement_revision:
             raise ValueError("measurement revision is not permitted in the final review round")
         row: dict[str, Any] = {

@@ -634,7 +634,8 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
     "max_review_rounds": 2,
-    "estimation_trees": 200
+    "estimation_trees": 200,
+    "explicit_features": []
   },
   "run": {
     "mode": "full"
@@ -646,6 +647,18 @@ run. The API key may be stored in `stage2.api_key` or supplied through
 endpoint's OpenAI-compatible `/models` API and uses the advertised model if
 exactly one model ID is returned. Configure `stage2.model` explicitly when the
 endpoint advertises multiple IDs.
+
+To guarantee inclusion of an investigator-specified variable, populate
+`stage2.explicit_features` with complete definitions containing `name`,
+`description`, `value_type`, `categories_or_unit`, `measurement_definition`,
+`missing_value_rule`, and causal `roles`. These definitions participate in the
+same per-fold alias consolidation as discovered candidates. A discovered alias
+is merged into the configured feature and contributes provenance, but the
+configured name, roles, and ontology remain authoritative and no ontology-
+definition request is made for that group. Later empirical review diagnoses
+the feature but cannot drop it or revise its ontology. See
+[`docs/all_evidence_workflow.md`](docs/all_evidence_workflow.md) for a complete
+example and validation rules.
 
 Stage 2 extraction is permanently isolated to one patient per model prompt.
 Concurrency is controlled by `stage2.workers`; patient batching is not configurable.

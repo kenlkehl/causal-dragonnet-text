@@ -37,6 +37,7 @@ $OUT/stage2/evidence_compilation/
 |       v                                                       |
 |  interpreted_candidates.json                                  |
 |       |                                                       |
+|       +---- configured explicit features + supplied ontologies|
 |       | local pairwise alias judgments                         |
 |       | + causal-role routing                                  |
 |       | + one global name-only merge-directive pass            |
@@ -89,7 +90,7 @@ summary.json
 | Evidence compilation | Stage 1 handoff rows plus the existing memory-mapped Stage 1 chunk-embedding cache, when available | Fold-local semantic cards, exact-member and raw-path lineage manifests, a reduction audit, and bounded prompt packets |
 | Interpretation | One architecture-specific batch projected to prompt-local item numbers and readable text only | Candidate clinical concepts and citations to supplied item numbers; Python maps these back to packet provenance |
 | Candidate assembly | Concepts from all interpretation batches | `interpreted_candidates.json`; evidence axes are recomputed from citations and mapped to possible causal roles |
-| Consolidation | Candidates from all Stage 1 architectures | Deduplicated operational definitions in `feature_definitions.json` |
+| Consolidation | Candidates from all Stage 1 architectures plus optional `stage2.explicit_features` | Deduplicated operational definitions in `feature_definitions.json`; configured groups use their supplied ontology |
 | Training extraction | Operational definitions plus outer-training patient text | A patient-by-feature matrix for the training patients |
 | Review | Training-only extraction summaries and inner-fold treatment/outcome performance | Keep, drop, or measurement-revision decisions; a revision may trigger another extraction round |
 | Freeze and heldout extraction | Final reviewed definitions plus outer-heldout text | `final_definitions.json` and heldout feature measurements |
@@ -156,13 +157,23 @@ when their exact card inputs and clinical question match.
 
 ## Candidate consolidation
 
+Optional investigator-specified features enter consolidation here rather than
+bypassing it. This lets pairwise and global alias review merge a discovered
+synonym into one configured feature. The configured feature's name, causal
+roles, and complete extraction ontology remain authoritative, so its group
+skips model-authored ontology definition while retaining any Stage 1 provenance
+carried by the merged candidates. Training-fold diagnostics are still computed,
+but review must keep the feature without revising its supplied ontology.
+
 Consolidation first uses generic fuzzy signals to identify candidate pairs that
 may be aliases. It retains bounded local neighbors plus a maximum-similarity
 spanning forest for every plausible-alias component, ensuring that large alias
 families remain connected for semantic review. The LLM judges one pair at a
 time as the same or different scalar measurement. Python constructs transitive
 groups from accepted pairs and prevents a group merge when an explicit negative
-pair judgment would make it contradictory.
+pair judgment would make it contradictory. A discovered candidate with exactly
+the same normalized name as one configured feature is the one deterministic
+identity case and joins that configured group directly.
 
 Python then excludes groups without an evidence-supported causal role and makes
 one global LLM request containing only the complete list of remaining unique

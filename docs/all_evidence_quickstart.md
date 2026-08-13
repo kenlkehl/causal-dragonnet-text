@@ -52,10 +52,18 @@ effect estimates. The common controls are:
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "max_review_rounds": 2,
-    "estimation_trees": 200
+    "estimation_trees": 200,
+    "explicit_features": []
   }
 }
 ```
+
+`stage2.explicit_features` may contain investigator-specified feature
+definitions. Each entry must include its complete extraction ontology and
+causal roles; see the complete workflow guide for the schema. Configured
+features join Stage 2 alias consolidation in every outer fold, so an
+automatically discovered alias does not create a second variable. They remain
+fixed, required definitions during empirical review.
 
 Interpretation and extraction requests are concurrent up to `stage2.workers`.
 Each extraction request contains exactly one patient's text; this isolation is
