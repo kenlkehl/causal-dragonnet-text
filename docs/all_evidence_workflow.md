@@ -212,16 +212,23 @@ group. Nonidentical possible aliases still require semantic judgment.
 
 Python next removes groups without a Stage 1 evidence-supported confounder,
 prognostic, or effect-modifier role and gives the LLM one compact, complete list
-of the remaining unique feature names. This residual global pass returns only
-`merge_directives`, each with an `inputs` list of exact supplied names and one
-canonical `output` name. It sees no candidate or group IDs and does not restate
-unchanged features. Python validates that every input name exists and occurs in
-at most one directive, maps names back to the internal groups, unions their
-provenance, and passes every name absent from all `inputs` through unchanged.
-This catches semantically equivalent names that the lexical pair blocker did
-not propose.
+of the remaining unique feature names and short descriptions, together with the
+clinical question. This residual global pass returns `merge_directives`, each
+with an `inputs` list of exact supplied names and one canonical `output` name,
+plus `exclude_feature_names`. Exclusion is restricted to clear failures of the
+patient-level pretreatment scalar contract: patient-specific or value-encoded
+artifacts, profiles and composites, study-treatment or post-treatment leakage,
+and nonclinical analysis or documentation artifacts. Borderline but valid
+baseline variables pass through, and investigator-configured features cannot be
+excluded. The pass sees no candidate or group IDs and does not restate unchanged
+features. Python validates that every supplied name exists, prevents a name from
+being both merged and excluded, maps names back to the internal groups, unions
+merged provenance, records excluded-candidate dispositions, and passes every
+unmentioned name through unchanged. This catches semantically equivalent names
+that the lexical pair blocker did not propose and removes clear discovery
+artifacts before ontology generation and extraction.
 
-Every group remaining after those merge directives is operationalized for
+Every group remaining after those merge and exclusion directives is operationalized for
 extraction. Each ontology request contains only the canonical feature name,
 a deduplicated flat list of readable supporting text, the ontology instructions,
 and the response contract. Python extracts only `representative_evidence.text`
@@ -241,6 +248,7 @@ ontology instead.
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
 `transport_retry_backoff`, `max_prompt_chars`,
+`extraction_max_prompt_chars`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
 `max_review_rounds`, `estimation_trees`,
@@ -251,7 +259,14 @@ files but do not affect consolidation. A configured endpoint makes the default
 mode `full`. The modes can always be made explicit:
 
 Patient-variable extraction always sends exactly one patient's text per model
-prompt. `stage2.workers` provides concurrency without combining patients.
+prompt. It uses the independent `extraction_max_prompt_chars` limit (640,000
+characters by default) because every request includes the complete frozen
+feature ontology; `max_prompt_chars` continues to bound discovery and review
+planning. The extraction limit remains a character-based safety/planning guard,
+not a claim about the model's token context. Oversized notes are split into
+lossless contiguous pages. Clinical text remains Unicode instead of expanding
+into token-heavy ASCII escape sequences. `stage2.workers` provides concurrency
+without combining patients.
 
 ```bash
 # Run/resume Stage 1 and stop after the handoff.

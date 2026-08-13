@@ -55,9 +55,27 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.model == ""
     assert config.request_timeout == 7_200.0
     assert config.transport_max_attempts == 3
+    assert config.max_prompt_chars == 100_000
+    assert config.extraction_max_prompt_chars == 640_000
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
     assert config.evidence_max_cards_per_fold == 400
     assert config.consolidation_oversample_factor == 4
+
+
+def test_stage2_config_parses_independent_extraction_prompt_budget():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "max_prompt_chars": 90_000,
+            "extraction_max_prompt_chars": 500_000,
+        },
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert config.max_prompt_chars == 90_000
+    assert config.extraction_max_prompt_chars == 500_000
+    assert config.public_dict()["extraction_max_prompt_chars"] == 500_000
 
 
 def test_stage2_config_parses_explicit_feature_with_supplied_ontology():
@@ -460,6 +478,24 @@ def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Pat
 
     assert sorted(prompt_row_ids) == [0, 1, 2]
     assert extracted["_oci_row_id"].tolist() == [0, 1, 2]
+
+
+def test_stage2_extraction_prompt_does_not_ascii_escape_clinical_text():
+    note = "患者は治療前に息切れを報告した。"
+    definition = {
+        "name": "dyspnea",
+        "value_type": "binary",
+        "categories_or_unit": ["present", "absent"],
+    }
+
+    messages = stage2_analysis._extraction_prompt(
+        definitions=[definition],
+        rows=[{"row_id": 0, "text": note}],
+    )
+
+    assert note in messages[1]["content"]
+    assert "\\u60a3" not in messages[1]["content"]
+    assert json.loads(messages[1]["content"])["patients"][0]["text"] == note
 
 
 def test_ordinal_integer_range_is_expanded_in_prompt_and_validation():
@@ -1957,7 +1993,9 @@ def _fake_completion(calls):
             return json.dumps({"same_scalar_measurement": True})
         if job == "consolidate_stage2_group_names":
             assert "candidate_id" not in messages[1]["content"]
-            return json.dumps({"merge_directives": []})
+            return json.dumps(
+                {"merge_directives": [], "exclude_feature_names": []}
+            )
         assert job == "operationalize_stage2_candidate_group"
         assert "packet_id" not in messages[1]["content"]
         return json.dumps(
@@ -2138,7 +2176,9 @@ def test_packetizer_splits_large_flat_lists_without_changing_items():
 
 
 def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Path):
-    note = "start " + ("漢" * 1_800) + " pretreatment ECOG 2 end"
+    # Oversize the source itself; Unicode serialization must not be what forces
+    # an otherwise fitting note into pages.
+    note = "start " + ("漢" * 8_000) + " pretreatment ECOG 2 end"
     dataset = pd.DataFrame({"clinical_text": [note]})
     definition = {
         "feature_id": "outer_001_feature_001",
@@ -2297,6 +2337,10 @@ def test_stage2_pairwise_consolidation_does_not_lose_candidates():
         job = _prompt_job(body)
         if job == "decide_stage2_candidate_alias_pair":
             return json.dumps({"same_scalar_measurement": True})
+        if job == "consolidate_stage2_group_names":
+            return json.dumps(
+                {"merge_directives": [], "exclude_feature_names": []}
+            )
         assert job == "operationalize_stage2_candidate_group"
         assert body["supporting_evidence"] == [
             "Original clinical evidence for the candidate feature."
@@ -2393,20 +2437,33 @@ def test_candidate_pair_validator_requires_one_boolean_decision():
 
 def test_global_group_merge_prompt_exposes_only_unique_feature_names():
     messages = stage2_workflow._global_group_merge_prompt(
-        group_names=["patient_age", "age_2", "serum_sodium"],
+        clinical_question="Compare treatment A with treatment B.",
+        groups=[
+            {"name": "patient_age", "description": "Age before treatment."},
+            {"name": "age_2", "description": "A value-encoded age alias."},
+            {"name": "serum_sodium", "description": "Pretreatment sodium."},
+        ],
     )
 
     body = json.loads(messages[1]["content"])
 
     assert body["job"] == "consolidate_stage2_group_names"
-    assert body["feature_names"] == ["patient_age", "age_2", "serum_sodium"]
+    assert body["clinical_question"] == "Compare treatment A with treatment B."
+    assert [feature["name"] for feature in body["features"]] == [
+        "patient_age",
+        "age_2",
+        "serum_sodium",
+    ]
     assert body["response"] == {
         "merge_directives": [
             {
                 "inputs": ["two or more exact supplied feature names"],
                 "output": "one snake_case canonical feature name",
             }
-        ]
+        ],
+        "exclude_feature_names": [
+            "exact supplied name of one clearly invalid feature"
+        ],
     }
     assert "candidate_id" not in messages[1]["content"]
     assert "group_id" not in messages[1]["content"]
@@ -2420,7 +2477,8 @@ def test_global_group_merge_validator_maps_names_and_rejects_ambiguous_routes():
                     "inputs": ["Patient Age", "age_2"],
                     "output": "age_at_baseline",
                 }
-            ]
+            ],
+            "exclude_feature_names": ["serum_sodium"],
         },
         group_names=["patient_age", "age_2", "serum_sodium"],
     )
@@ -2431,7 +2489,8 @@ def test_global_group_merge_validator_maps_names_and_rejects_ambiguous_routes():
                 "inputs": ["patient_age", "age_2"],
                 "output": "age_at_baseline",
             }
-        ]
+        ],
+        "exclude_feature_names": ["serum_sodium"],
     }
 
     with pytest.raises(ValueError, match="unknown or ambiguous feature"):
@@ -2439,7 +2498,8 @@ def test_global_group_merge_validator_maps_names_and_rejects_ambiguous_routes():
             {
                 "merge_directives": [
                     {"inputs": ["patient_age", "missing_name"], "output": "age"}
-                ]
+                ],
+                "exclude_feature_names": [],
             },
             group_names=["patient_age", "age_2", "serum_sodium"],
         )
@@ -2453,9 +2513,33 @@ def test_global_group_merge_validator_maps_names_and_rejects_ambiguous_routes():
                         "inputs": ["age_2", "serum_sodium"],
                         "output": "other",
                     },
-                ]
+                ],
+                "exclude_feature_names": [],
             },
             group_names=["patient_age", "age_2", "serum_sodium"],
+        )
+
+
+def test_global_group_merge_validator_protects_merge_inputs_and_configured_features():
+    with pytest.raises(ValueError, match="both merged and excluded"):
+        stage2_workflow._validate_global_group_merge_directives(
+            {
+                "merge_directives": [
+                    {"inputs": ["patient_age", "age_2"], "output": "patient_age"}
+                ],
+                "exclude_feature_names": ["age_2"],
+            },
+            group_names=["patient_age", "age_2", "serum_sodium"],
+        )
+
+    with pytest.raises(ValueError, match="investigator-configured feature"):
+        stage2_workflow._validate_global_group_merge_directives(
+            {
+                "merge_directives": [],
+                "exclude_feature_names": ["patient_age"],
+            },
+            group_names=["patient_age", "serum_sodium"],
+            configured_feature_names=["patient_age"],
         )
 
 
@@ -2633,9 +2717,18 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
                 }
             )
         if job == "consolidate_stage2_group_names":
-            assert set(body) == {"job", "task", "feature_names", "rules", "response"}
-            assert all("candidate" not in name for name in body["feature_names"])
-            return json.dumps({"merge_directives": []})
+            assert set(body) == {
+                "job",
+                "clinical_question",
+                "task",
+                "features",
+                "rules",
+                "response",
+            }
+            assert all("candidate" not in feature["name"] for feature in body["features"])
+            return json.dumps(
+                {"merge_directives": [], "exclude_feature_names": []}
+            )
         assert job == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
@@ -2894,7 +2987,7 @@ def test_configured_feature_is_retained_without_any_discovered_candidate():
     assert result["features"][0]["roles"] == ["confounder"]
 
 
-def test_global_name_consolidation_merges_residual_aliases_before_operationalization():
+def test_global_consolidation_merges_aliases_and_excludes_bad_features():
     prompt_bodies = []
     evidence_packets = [
         {
@@ -2919,6 +3012,14 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
                 "representative_evidence": [{"text": "Resting pulse was 72 bpm."}]
             },
         },
+        {
+            "packet_id": "packet_delta",
+            "content": {
+                "representative_evidence": [
+                    {"text": "James Lee had several unrelated chart findings."}
+                ]
+            },
+        },
     ]
 
     def completion(messages, _config):
@@ -2929,11 +3030,16 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
         if job == "decide_stage2_candidate_alias_pair":
             return json.dumps({"same_scalar_measurement": False})
         if job == "consolidate_stage2_group_names":
-            assert body["feature_names"] == [
+            assert [feature["name"] for feature in body["features"]] == [
                 "blood_glucose_concentration",
                 "glycemia",
                 "heart_rate",
+                "james_lee_clinical_profile",
             ]
+            assert body["clinical_question"] == "Estimate a treatment effect."
+            assert body["features"][-1]["description"] == (
+                "A named patient's multi-variable clinical profile."
+            )
             assert "candidate_id" not in rendered
             assert "group_id" not in rendered
             return json.dumps(
@@ -2943,7 +3049,8 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
                             "inputs": ["blood_glucose_concentration", "glycemia"],
                             "output": "blood_glucose_concentration",
                         }
-                    ]
+                    ],
+                    "exclude_feature_names": ["james_lee_clinical_profile"],
                 }
             )
         assert job == "operationalize_stage2_candidate_group"
@@ -2998,6 +3105,16 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
             "evidence_axes": ["outcome"],
             "caveats": "",
         },
+        {
+            "candidate_id": "candidate_0004",
+            "architecture": "architecture_delta",
+            "name": "james_lee_clinical_profile",
+            "description": "A named patient's multi-variable clinical profile.",
+            "value_type": "ambiguous",
+            "supporting_packet_ids": ["packet_delta"],
+            "evidence_axes": ["treatment", "outcome"],
+            "caveats": "",
+        },
     ]
 
     result = runner._consolidate_candidates(
@@ -3018,6 +3135,10 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
     assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0002"]["status"] == "merged"
     assert result["candidate_dispositions"]["candidate_0003"]["status"] == "retained"
+    assert result["candidate_dispositions"]["candidate_0004"]["status"] == "excluded"
+    assert "global feature-quality pass" in result["candidate_dispositions"][
+        "candidate_0004"
+    ]["reason"]
     assert [_prompt_job(body) for body in prompt_bodies].count(
         "consolidate_stage2_group_names"
     ) == 1
@@ -3036,6 +3157,103 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
     assert ontology_bodies["heart_rate"]["supporting_evidence"] == [
         "Resting pulse was 72 bpm."
     ]
+
+
+def test_unfinished_fold_upgrades_cached_definitions_through_new_global_pass(
+    tmp_path: Path,
+):
+    output = tmp_path / "outer_001"
+    output.mkdir()
+    packet = {
+        "packet_id": "packet_profile",
+        "architecture": "architecture_alpha",
+        "observable_axes": ["treatment", "outcome"],
+        "content": {
+            "representative_evidence": [
+                {"text": "James Lee had several unrelated chart findings."}
+            ]
+        },
+    }
+    candidate = {
+        "candidate_id": "candidate_0001",
+        "architecture": "architecture_alpha",
+        "name": "james_lee_clinical_profile",
+        "description": "A named patient's multi-variable clinical profile.",
+        "supporting_packet_ids": ["packet_profile"],
+        "evidence_axes": ["outcome", "treatment"],
+        "evidence_rationale": "A record-specific profile, not one measurement.",
+        "caveats": "",
+    }
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+    )
+    clinical_question = "Estimate a treatment effect."
+    legacy_fingerprint = stage2_workflow._value_fingerprint(
+        {
+            "outer_fold": 1,
+            "compiler": config.evidence_compiler,
+            "interpretation_schema": stage2_workflow.INTERPRETATION_SCHEMA_VERSION,
+            "consolidation_schema": stage2_workflow.CONSOLIDATION_SCHEMA_VERSION,
+            "clinical_question": clinical_question,
+            "explicit_features": [],
+            "packets": [packet],
+        }
+    )
+    (output / "interpreted_candidates.json").write_text(
+        json.dumps([candidate]),
+        encoding="utf-8",
+    )
+    (output / "feature_definitions.json").write_text(
+        json.dumps(
+            {
+                "outer_fold": 1,
+                "features": [{"feature_id": "old_feature", "name": candidate["name"]}],
+                "candidate_dispositions": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output / "definitions_complete.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "evidence_input_fingerprint": legacy_fingerprint,
+                "consolidation_schema": stage2_workflow.CONSOLIDATION_SCHEMA_VERSION,
+            }
+        ),
+        encoding="utf-8",
+    )
+    jobs = []
+
+    def completion(messages, _config):
+        body = json.loads(messages[1]["content"])
+        jobs.append(_prompt_job(body))
+        return json.dumps(
+            {
+                "merge_directives": [],
+                "exclude_feature_names": ["james_lee_clinical_profile"],
+            }
+        )
+
+    result = PlainHandoffStage2(
+        config=config,
+        clinical_question=clinical_question,
+        completion=completion,
+    )._run_outer_fold(
+        outer_fold=1,
+        packets=[packet],
+        output_dir=output,
+    )
+
+    assert jobs == ["consolidate_stage2_group_names"]
+    assert result["features"] == []
+    assert result["candidate_dispositions"]["candidate_0001"]["status"] == "excluded"
+    state = json.loads((output / "definitions_complete.json").read_text(encoding="utf-8"))
+    assert state["global_group_consolidation_schema"] == (
+        stage2_workflow.GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION
+    )
+    assert state["evidence_input_fingerprint"] != legacy_fingerprint
 
 
 def test_operationalization_ignores_model_authored_provenance_and_uses_aliases():
@@ -3505,6 +3723,7 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
     # independently, then consolidates their candidates.
     assert calls.count("infer_clinical_features_from_text_evidence") == 2
     assert calls.count("decide_stage2_candidate_alias_pair") == 1
+    assert calls.count("consolidate_stage2_group_names") == 1
     assert calls.count("operationalize_stage2_candidate_group") == 1
 
     second = run_plain_handoff_stage2(
@@ -3516,7 +3735,7 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
     )
 
     assert second["features_by_fold"] == {"1": 1}
-    assert len(calls) == 4
+    assert len(calls) == 5
 
     rows[0]["evidence"]["terms"].append("newly compiled evidence")
     handoff.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
@@ -3648,7 +3867,10 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(tmp_path:
     assert len(calls) == calls_after_first
 
 
-def test_training_fold_review_can_revise_then_retest_a_definition(tmp_path: Path):
+def test_training_fold_review_can_revise_then_retest_a_definition(
+    tmp_path: Path,
+    monkeypatch,
+):
     dataset = pd.DataFrame(
         {
             "patient_id": [f"p{index:02d}" for index in range(12)],
@@ -3683,6 +3905,14 @@ def test_training_fold_review_can_revise_then_retest_a_definition(tmp_path: Path
         ],
     }
     jobs = []
+    extraction_prompt_limits = []
+    original_extract_rows = stage2_analysis.extract_rows
+
+    def tracked_extract_rows(**kwargs):
+        extraction_prompt_limits.append(kwargs["max_prompt_chars"])
+        return original_extract_rows(**kwargs)
+
+    monkeypatch.setattr(stage2_analysis, "extract_rows", tracked_extract_rows)
 
     def request_json(messages, validate):
         body = json.loads(messages[1]["content"])
@@ -3748,6 +3978,8 @@ def test_training_fold_review_can_revise_then_retest_a_definition(tmp_path: Path
         config=PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
             model="test-model",
+            max_prompt_chars=12_000,
+            extraction_max_prompt_chars=20_000,
             max_review_rounds=2,
             estimation_trees=10,
         ),
@@ -3755,6 +3987,7 @@ def test_training_fold_review_can_revise_then_retest_a_definition(tmp_path: Path
 
     assert result["review_rounds"] == 2
     assert result["features"][0]["measurement_definition"].startswith("Extract the last")
+    assert extraction_prompt_limits == [20_000, 20_000, 20_000]
     assert jobs.count("review_stage2_variables_against_training_fold_performance") == 2
     assert jobs.count("extract_stage2_patient_variables") == 18
     assert (tmp_path / "outer_001" / "review" / "round_002" / "performance.json").is_file()

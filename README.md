@@ -688,10 +688,14 @@ into broad prompt buckets.
 Stage 2 then interprets the compiled evidence architectures and consolidates
 the result into operational patient-level definitions. Consolidation uses
 generic fuzzy blocking followed by independent LLM alias judgments, then one
-name-only global pass for residual synonym merges. Python deterministically
-carries supporting packets, architectures, evidence axes, causal roles, and
-original-candidate dispositions through those groups. There is no feature-count
-selection step. Finally, independent one-feature requests receive only the
+global pass over names and short descriptions for residual synonym merges and
+clear invalid-feature exclusions. That pass can remove patient-specific,
+value-encoded, composite, treatment/post-treatment, and nonclinical artifacts;
+it conservatively retains uncertain baseline variables and cannot exclude
+investigator-configured features. Python deterministically carries supporting
+packets, architectures, evidence axes, causal roles, and original-candidate
+dispositions through those groups. There is no feature-count selection step.
+Finally, independent one-feature requests receive only the
 canonical feature name and a deduplicated flat list of readable supporting-text
 strings. The model decides the value type, units or allowed categories,
 measurement rule, and missingness handling from that evidence; packet structure,

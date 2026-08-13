@@ -47,8 +47,12 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
+DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
 CONSOLIDATION_SCHEMA_VERSION = (
     "candidate_pair_alias_v11_configured_explicit_features"
+)
+GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION = (
+    "global_name_merge_and_quality_exclusion_v2"
 )
 OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_supporting_text_v3"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v7"
@@ -597,6 +601,10 @@ class PlainHandoffStage2Config:
     transport_max_attempts: int = 3
     transport_retry_backoff: float = 2.0
     max_prompt_chars: int = 100_000
+    # Extraction repeats a complete frozen feature ontology for one patient.
+    # Keep its larger context allowance separate so discovery batching and its
+    # evidence-compilation fingerprints remain stable.
+    extraction_max_prompt_chars: int = DEFAULT_EXTRACTION_MAX_PROMPT_CHARS
     evidence_compiler: str = EVIDENCE_COMPILER_VERSION
     required_architectures: tuple[str, ...] = SUPPORTED_STAGE2_ARCHITECTURES
     included_architectures: tuple[str, ...] | None = None
@@ -633,6 +641,10 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.transport_retry_backoff must be nonnegative")
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
+        if self.extraction_max_prompt_chars < 4_000:
+            raise ValueError(
+                "stage2.extraction_max_prompt_chars must be at least 4000"
+            )
         if self.evidence_compiler != EVIDENCE_COMPILER_VERSION:
             raise ValueError(
                 f"stage2.evidence_compiler must be {EVIDENCE_COMPILER_VERSION}; "
@@ -757,6 +769,12 @@ def plain_stage2_config_from_mapping(
         transport_max_attempts=int(raw.get("transport_max_attempts", 3)),
         transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
+        extraction_max_prompt_chars=int(
+            raw.get(
+                "extraction_max_prompt_chars",
+                DEFAULT_EXTRACTION_MAX_PROMPT_CHARS,
+            )
+        ),
         evidence_compiler=str(raw.get("evidence_compiler", EVIDENCE_COMPILER_VERSION)).strip(),
         required_architectures=architecture_names(
             raw.get("required_architectures", SUPPORTED_STAGE2_ARCHITECTURES)
@@ -2902,28 +2920,49 @@ def _derive_roles(evidence_axes: Sequence[str]) -> list[str]:
 
 def _global_group_merge_prompt(
     *,
-    group_names: Sequence[str],
+    clinical_question: str,
+    groups: Sequence[Mapping[str, Any]],
     configured_feature_names: Sequence[str] = (),
 ) -> list[dict[str, str]]:
-    """Ask for only the residual name-level merges, without opaque identifiers."""
+    """Ask for residual merges and clearly invalid feature exclusions."""
+
+    features = [
+        {
+            "name": str(group.get("name") or ""),
+            "description": _short_text(group.get("description"), max_chars=240),
+        }
+        for group in groups
+    ]
 
     body = {
         "job": "consolidate_stage2_group_names",
+        "clinical_question": str(clinical_question),
         "task": (
-            "Review the complete list of candidate feature names after an earlier local "
-            "deduplication pass. Return only the remaining sets of names that denote the "
-            "same underlying patient-level pretreatment measurement."
+            "Review the complete candidate feature set after an earlier local "
+            "deduplication pass. Identify residual aliases and exclude only features that "
+            "clearly cannot serve as reusable patient-level pretreatment scalar variables "
+            "for the supplied clinical question."
         ),
-        "feature_names": list(group_names),
+        "features": features,
         "rules": [
-            "Do not restate or make a decision about a feature that does not need to be merged.",
-            "Each merge directive must contain at least two exact names from feature_names.",
-            "Use each input name in at most one merge directive.",
+            "Every name absent from both response lists will be retained unchanged; do not restate valid unchanged features.",
+            "Each merge directive must contain at least two exact names from features.",
+            "Use each feature name at most once across all merge inputs and exclusions.",
             "Merge spelling variants, abbreviations, synonymous clinical names, and clearly equivalent representations of the same underlying measurement.",
             "A thresholded or coarsened representation may be merged with its underlying measurement only when the names clearly denote the same measurement; prefer an information-preserving output name.",
+            "When a value-encoded or awkward alias has a clear valid underlying measurement in the list, merge it into that measurement instead of excluding it.",
             "Do not merge merely related variables, a diagnosis with a related laboratory value, a broad concept with one component, different anatomical sites, different biomarkers, or different timepoints.",
             "The output must be one concise snake_case canonical name for the consolidated measurement. It may reuse the best input name or provide a clearer equivalent name.",
-            "Return no identifiers, descriptions, definitions, provenance, explanations, or unchanged feature names.",
+            "Exclude a feature only when its name and description clearly show that it is not one reusable patient-level pretreatment scalar variable.",
+            "Exclude patient names or identifiers, named-patient or numbered-patient profiles, and record-specific vignettes.",
+            "Exclude profiles, composites, combined findings, and other concepts that require multiple independently varying values rather than one scalar value per patient.",
+            "Exclude names that merely encode one observed patient value or one record-specific finding when no valid underlying measurement in the list can absorb them.",
+            "Exclude the study treatment, exposure assignment, treatment regimen, treatment received, dose or cycle count, and response, outcome, toxicity, or complication ascertainable only after that treatment assignment.",
+            "Do not exclude a genuinely pretreatment history merely because it describes an earlier treatment, response, or toxicity.",
+            "Exclude administrative, documentation, cohort, grouping, analysis, model, or other nonclinical artifacts.",
+            "Do not exclude a valid baseline demographic, diagnosis, comorbidity, symptom, examination, laboratory value, biomarker, prior history, or other scalar measurement merely because it is rare, weakly supported, redundant, or of uncertain causal importance.",
+            "When validity is uncertain, retain the feature. This pass is not a relevance ranking or feature-count selection step.",
+            "Return only exact supplied feature names in merge inputs and exclude_feature_names. Return no internal IDs, provenance, definitions, explanations, or unchanged feature names.",
         ],
         "response": {
             "merge_directives": [
@@ -2931,7 +2970,10 @@ def _global_group_merge_prompt(
                     "inputs": ["two or more exact supplied feature names"],
                     "output": "one snake_case canonical feature name",
                 }
-            ]
+            ],
+            "exclude_feature_names": [
+                "exact supplied name of one clearly invalid feature"
+            ],
         },
     }
     configured_names = list(map(str, configured_feature_names))
@@ -2941,16 +2983,21 @@ def _global_group_merge_prompt(
             [
                 "Never merge two names listed in configured_feature_names; the investigator specified them as distinct features.",
                 "When one merge input is listed in configured_feature_names, output that exact configured name so its investigator-supplied ontology remains authoritative.",
+                "Never exclude a name listed in configured_feature_names.",
             ]
         )
     return [
         {
             "role": "system",
             "content": (
-                "Identify only residual duplicate clinical measurement names. Return JSON only."
+                "Consolidate aliases and remove only clearly invalid pretreatment clinical "
+                "features. Return JSON only."
             ),
         },
-        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+        {
+            "role": "user",
+            "content": json.dumps(body, sort_keys=True, ensure_ascii=False),
+        },
     ]
 
 
@@ -2960,7 +3007,7 @@ def _validate_global_group_merge_directives(
     group_names: Sequence[str],
     configured_feature_names: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Validate name-only merge directives and resolve supplied names deterministically."""
+    """Validate global merge and exclusion directives by exact supplied name."""
 
     available = [str(name) for name in group_names]
     if len(available) != len(set(available)):
@@ -2988,7 +3035,9 @@ def _validate_global_group_merge_directives(
         )
 
     payload = value
-    if not isinstance(payload.get("merge_directives"), list):
+    if not isinstance(payload.get("merge_directives"), list) or not isinstance(
+        payload.get("exclude_feature_names"), list
+    ):
         for key in ("result", "response", "consolidation"):
             nested = payload.get(key)
             if isinstance(nested, Mapping):
@@ -2999,6 +3048,9 @@ def _validate_global_group_merge_directives(
         raw_directives = payload.get("merges")
     if not isinstance(raw_directives, list):
         raise ValueError("global group merge requires a merge_directives array")
+    raw_exclusions = payload.get("exclude_feature_names")
+    if not isinstance(raw_exclusions, list):
+        raise ValueError("global group consolidation requires an exclude_feature_names array")
 
     directives: list[dict[str, Any]] = []
     used_inputs: set[str] = set()
@@ -3036,8 +3088,27 @@ def _validate_global_group_merge_directives(
         used_inputs.update(inputs)
         directives.append({"inputs": inputs, "output": output})
 
+    excluded_names: list[str] = []
+    seen_exclusions: set[str] = set()
+    for raw_name in raw_exclusions:
+        name = resolve_input_name(raw_name)
+        if name in seen_exclusions:
+            raise ValueError(
+                f"global exclusion named feature {name!r} more than once"
+            )
+        if name in used_inputs:
+            raise ValueError(
+                f"global feature {name!r} cannot be both merged and excluded"
+            )
+        if name in configured_names:
+            raise ValueError(
+                f"investigator-configured feature {name!r} cannot be excluded"
+            )
+        seen_exclusions.add(name)
+        excluded_names.append(name)
+
     outputs: set[str] = set()
-    pass_through_names = set(available) - used_inputs
+    pass_through_names = set(available) - used_inputs - seen_exclusions
     for directive in directives:
         output = str(directive["output"])
         if output in outputs:
@@ -3051,7 +3122,10 @@ def _validate_global_group_merge_directives(
                 f"global merge output name {output!r} collides with an unchanged feature"
             )
         outputs.add(output)
-    return {"merge_directives": directives}
+    return {
+        "merge_directives": directives,
+        "exclude_feature_names": excluded_names,
+    }
 
 
 def _apply_global_group_merge_directives(
@@ -3927,18 +4001,19 @@ class PlainHandoffStage2:
         outer_fold: int,
         groups: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
-    ) -> list[dict[str, Any]]:
-        """Run one name-only residual deduplication pass over all routable groups."""
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Run one global residual merge and feature-quality pass."""
 
         current = [dict(group) for group in groups]
-        if len(current) < 2:
-            return current
+        if not current or all(_configured_feature_definitions(group) for group in current):
+            return current, {}
         group_names = [str(group["name"]) for group in current]
         configured_feature_names = [
             str(group["name"]) for group in current if _configured_feature_definitions(group)
         ]
         messages = _global_group_merge_prompt(
-            group_names=group_names,
+            clinical_question=self.clinical_question,
+            groups=current,
             configured_feature_names=configured_feature_names,
         )
         prompt_chars = sum(len(message["content"]) for message in messages)
@@ -3950,10 +4025,23 @@ class PlainHandoffStage2:
         response = _checkpointed_request_json(
             output_dir=output_dir,
             input_value={
-                "phase": "global_group_name_merge",
+                "phase": "global_group_name_merge_and_quality_review",
                 "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+                "global_group_consolidation_schema": (
+                    GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION
+                ),
                 "outer_fold": int(outer_fold),
-                "feature_names": group_names,
+                "clinical_question": self.clinical_question,
+                "features": [
+                    {
+                        "name": str(group["name"]),
+                        "description": _short_text(
+                            group.get("description"),
+                            max_chars=240,
+                        ),
+                    }
+                    for group in current
+                ],
                 "configured_feature_names": configured_feature_names,
             },
             messages=messages,
@@ -3966,15 +4054,31 @@ class PlainHandoffStage2:
             ),
         )
         directives = list(response["merge_directives"])
-        merged = _apply_global_group_merge_directives(current, directives)
+        excluded_names = set(map(str, response["exclude_feature_names"]))
+        excluded_origins: dict[str, str] = {}
+        retained_before_merge: list[dict[str, Any]] = []
+        for group in current:
+            if str(group["name"]) not in excluded_names:
+                retained_before_merge.append(group)
+                continue
+            for origin in _string_values(group.get("origin_candidate_ids")):
+                excluded_origins[origin] = (
+                    "Excluded by the global feature-quality pass because the candidate "
+                    "is not a valid reusable patient-level pretreatment scalar measurement."
+                )
+        merged = _apply_global_group_merge_directives(
+            retained_before_merge,
+            directives,
+        )
         LOGGER.info(
-            "Stage 2 global name consolidation input_groups=%s directives=%s "
-            "output_groups=%s",
+            "Stage 2 global consolidation input_groups=%s merge_directives=%s "
+            "excluded_groups=%s output_groups=%s",
             len(current),
             len(directives),
+            len(excluded_names),
             len(merged),
         )
-        return merged
+        return merged, excluded_origins
 
     @staticmethod
     def _unique_group_names(
@@ -4074,7 +4178,7 @@ class PlainHandoffStage2:
                 )
 
         uniquely_named_groups = self._unique_group_names(routable_groups)
-        retained_groups = self._globally_merge_candidate_groups(
+        retained_groups, global_exclusions = self._globally_merge_candidate_groups(
             outer_fold=outer_fold,
             groups=uniquely_named_groups,
             output_dir=(
@@ -4083,6 +4187,7 @@ class PlainHandoffStage2:
                 else None
             ),
         )
+        exclusions.update(global_exclusions)
 
         features_by_group_id: dict[str, dict[str, Any]] = {}
         if retained_groups:
@@ -4155,17 +4260,27 @@ class PlainHandoffStage2:
         features_path = output_dir / "feature_definitions.json"
         final_features_path = output_dir / "final_definitions.json"
         definitions_complete_path = output_dir / "definitions_complete.json"
+        interpreted_candidates_path = output_dir / "interpreted_candidates.json"
+        legacy_definition_inputs = {
+            "outer_fold": int(outer_fold),
+            "compiler": self.config.evidence_compiler,
+            "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
+            "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+            "clinical_question": self.clinical_question,
+            "explicit_features": [
+                feature.as_definition() for feature in self.config.explicit_features
+            ],
+            "packets": list(packets),
+        }
+        legacy_evidence_input_fingerprint = _value_fingerprint(
+            legacy_definition_inputs
+        )
         evidence_input_fingerprint = _value_fingerprint(
             {
-                "outer_fold": int(outer_fold),
-                "compiler": self.config.evidence_compiler,
-                "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
-                "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
-                "clinical_question": self.clinical_question,
-                "explicit_features": [
-                    feature.as_definition() for feature in self.config.explicit_features
-                ],
-                "packets": list(packets),
+                **legacy_definition_inputs,
+                "global_group_consolidation_schema": (
+                    GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION
+                ),
             }
         )
         definitions_state = (
@@ -4176,6 +4291,20 @@ class PlainHandoffStage2:
         completion = (
             json.loads(complete_path.read_text(encoding="utf-8")) if complete_path.is_file() else {}
         )
+        legacy_global_upgrade = (
+            definitions_state.get("evidence_input_fingerprint")
+            == legacy_evidence_input_fingerprint
+            and definitions_state.get("consolidation_schema")
+            == CONSOLIDATION_SCHEMA_VERSION
+            and interpreted_candidates_path.is_file()
+        )
+        downstream_analysis_complete = (
+            (output_dir / "estimation" / "complete.json").is_file()
+            or any((output_dir / "review").glob("round_*/complete.json"))
+        )
+        can_upgrade_global_consolidation = (
+            legacy_global_upgrade and not downstream_analysis_complete
+        )
         if (
             completion.get("phase") == "causal_estimation"
             and final_features_path.is_file()
@@ -4184,8 +4313,9 @@ class PlainHandoffStage2:
             if definitions_state.get("evidence_input_fingerprint") != evidence_input_fingerprint:
                 raise RuntimeError(
                     f"Stage 2 outer fold {outer_fold} was completed from a different "
-                    "evidence plan or explicit-feature configuration. Use a fresh Stage 2 "
-                    "output directory before rerunning with the new definition inputs."
+                    "evidence plan, feature-definition policy, or explicit-feature "
+                    "configuration. Preserve it for audit and use a fresh Stage 2 output "
+                    "directory before rerunning."
                 )
             LOGGER.info("skip completed Stage 2 outer fold=%s", outer_fold)
             final = json.loads(final_features_path.read_text(encoding="utf-8"))
@@ -4210,14 +4340,35 @@ class PlainHandoffStage2:
         by_architecture: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
         for packet in packets:
             by_architecture[str(packet["architecture"])].append(packet)
+        candidates: list[dict[str, Any]] | None = None
         if features_path.is_file():
-            if definitions_state.get("evidence_input_fingerprint") != evidence_input_fingerprint:
+            if definitions_state.get("evidence_input_fingerprint") == evidence_input_fingerprint:
+                final = json.loads(features_path.read_text(encoding="utf-8"))
+            elif can_upgrade_global_consolidation:
+                raw_candidates = json.loads(
+                    interpreted_candidates_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(raw_candidates, list) or any(
+                    not isinstance(candidate, Mapping) for candidate in raw_candidates
+                ):
+                    raise ValueError(
+                        "cached Stage 2 interpreted_candidates.json must contain an array "
+                        "of candidate objects"
+                    )
+                candidates = [dict(candidate) for candidate in raw_candidates]
+                LOGGER.info(
+                    "upgrade Stage 2 outer_fold=%s from cached interpretations using "
+                    "global consolidation schema=%s",
+                    outer_fold,
+                    GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION,
+                )
+            else:
                 raise RuntimeError(
                     f"Stage 2 outer fold {outer_fold} has feature definitions from a "
-                    "different evidence plan or explicit-feature configuration. Preserve "
-                    "the old output for audit and use a fresh Stage 2 output directory."
+                    "different evidence plan, feature-definition policy, or explicit-feature "
+                    "configuration. Preserve the old output for audit and use a fresh "
+                    "Stage 2 output directory."
                 )
-            final = json.loads(features_path.read_text(encoding="utf-8"))
         else:
             jobs: list[tuple[str, int, list[Mapping[str, Any]], Path]] = []
             for architecture_index, architecture in enumerate(sorted(by_architecture), start=1):
@@ -4262,7 +4413,7 @@ class PlainHandoffStage2:
                     results.append((futures[future], future.result()))
 
             packet_by_id = {str(packet["packet_id"]): packet for packet in packets}
-            candidates: list[dict[str, Any]] = []
+            candidates = []
             for architecture, result in sorted(results, key=lambda item: item[0]):
                 for concept in result["concepts"]:
                     supporting_packet_ids = [
@@ -4290,7 +4441,9 @@ class PlainHandoffStage2:
                             "evidence_axes": evidence_axes,
                         }
                     )
-            _write_json(output_dir / "interpreted_candidates.json", candidates)
+            _write_json(interpreted_candidates_path, candidates)
+
+        if candidates is not None:
             if not candidates and not self.config.explicit_features:
                 final = {
                     "outer_fold": outer_fold,
@@ -4325,6 +4478,9 @@ class PlainHandoffStage2:
                     "completed_at": _now(),
                     "evidence_input_fingerprint": evidence_input_fingerprint,
                     "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+                    "global_group_consolidation_schema": (
+                        GLOBAL_GROUP_CONSOLIDATION_SCHEMA_VERSION
+                    ),
                     "architectures": len(by_architecture),
                     "packets": len(packets),
                     "features": len(final["features"]),
@@ -4348,6 +4504,16 @@ class PlainHandoffStage2:
 
         from .plain_handoff_stage2_analysis import run_fold_analysis
 
+        # Analysis contains the high-context, one-patient extraction calls. Its
+        # review planner still uses max_prompt_chars, but transport must accept
+        # extraction prompts up to their independent limit.
+        analysis_request_config = replace(
+            self.config,
+            max_prompt_chars=max(
+                self.config.max_prompt_chars,
+                self.config.extraction_max_prompt_chars,
+            ),
+        )
         analysis = run_fold_analysis(
             dataset=dataset,
             definitions=final["features"],
@@ -4363,7 +4529,7 @@ class PlainHandoffStage2:
             output_dir=output_dir,
             request_json=lambda messages, validate: _request_json(
                 messages=messages,
-                config=self.config,
+                config=analysis_request_config,
                 completion=self.completion,
                 validate=validate,
             ),

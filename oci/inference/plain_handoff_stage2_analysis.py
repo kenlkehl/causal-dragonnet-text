@@ -765,12 +765,18 @@ def _extraction_prompt(
             ]
         },
     }
+    # Keep clinical text as Unicode. ASCII escaping can expand multilingual
+    # notes several-fold and consumes model tokens on literal ``\\uXXXX``
+    # sequences without adding information.
     return [
         {
             "role": "system",
             "content": "You extract prespecified variables from supplied clinical text. Return JSON only.",
         },
-        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+        {
+            "role": "user",
+            "content": json.dumps(body, sort_keys=True, ensure_ascii=False),
+        },
     ]
 
 
@@ -820,7 +826,10 @@ def _page_reconciliation_prompt(
                 "Return JSON only."
             ),
         },
-        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+        {
+            "role": "user",
+            "content": json.dumps(body, sort_keys=True, ensure_ascii=False),
+        },
     ]
 
 
@@ -1016,7 +1025,7 @@ def _lossless_extraction_pages(
     if not source:
         raise ValueError(
             "an empty Stage 2 row exceeded the prompt budget before note text was added; "
-            "increase max_prompt_chars or shorten the feature definitions"
+            "increase stage2.extraction_max_prompt_chars or shorten the feature definitions"
         )
     pages: list[dict[str, Any]] = []
     cursor = 0
@@ -1048,8 +1057,8 @@ def _lossless_extraction_pages(
         if best is None:
             raise ValueError(
                 "Stage 2 feature definitions and prompt envelope leave no room for even "
-                "one source character; increase max_prompt_chars or reduce the number of "
-                "features per analysis"
+                "one source character; increase stage2.extraction_max_prompt_chars or "
+                "reduce the number of features per analysis"
             )
         pages.append(best)
         cursor = int(best["page"]["char_end"])
@@ -2855,7 +2864,7 @@ def run_fold_analysis(
             output_dir=round_dir / "extraction",
             request_json=request_json,
             workers=config.workers,
-            max_prompt_chars=config.max_prompt_chars,
+            max_prompt_chars=config.extraction_max_prompt_chars,
         )
         summaries = feature_summaries(extracted, current)
         performance = evaluate_definitions(
@@ -2930,7 +2939,7 @@ def run_fold_analysis(
             output_dir=output_dir / "extraction" / "fit",
             request_json=request_json,
             workers=config.workers,
-            max_prompt_chars=config.max_prompt_chars,
+            max_prompt_chars=config.extraction_max_prompt_chars,
         )
     _assert_extraction_health(
         fit_selected,
@@ -2947,7 +2956,7 @@ def run_fold_analysis(
         output_dir=output_dir / "extraction" / "heldout",
         request_json=request_json,
         workers=config.workers,
-        max_prompt_chars=config.max_prompt_chars,
+        max_prompt_chars=config.extraction_max_prompt_chars,
     )
     _assert_extraction_health(
         heldout_extraction,
