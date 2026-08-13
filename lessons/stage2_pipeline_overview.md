@@ -87,7 +87,7 @@ summary.json
 | Stage | Main inputs | Main outputs |
 |---|---|---|
 | Evidence compilation | Stage 1 handoff rows plus the existing memory-mapped Stage 1 chunk-embedding cache, when available | Fold-local semantic cards, exact-member and raw-path lineage manifests, a reduction audit, and bounded prompt packets |
-| Interpretation | One architecture-specific packet batch plus the clinical question | Candidate clinical concepts, packet dispositions, and citations to supplied packet IDs |
+| Interpretation | One architecture-specific batch projected to prompt-local item numbers and readable text only | Candidate clinical concepts and citations to supplied item numbers; Python maps these back to packet provenance |
 | Candidate assembly | Concepts from all interpretation batches | `interpreted_candidates.json`; evidence axes are recomputed from citations and mapped to possible causal roles |
 | Consolidation | Candidates from all Stage 1 architectures | Deduplicated operational definitions in `feature_definitions.json` |
 | Training extraction | Operational definitions plus outer-training patient text | A patient-by-feature matrix for the training patients |
@@ -138,6 +138,15 @@ not a variable limit. The LLM may recover many concepts from each card. If a
 sensitivity analysis is warranted, raise the card ceiling rather than reverting
 to raw packetization. `raw_packets_v1` remains available as an explicit
 comparator via `stage2.evidence_compiler`.
+
+Before interpretation, Python strips each card to
+`{"item": N, "text": ["..."]}`. The integer is local to that request and is
+mapped back to the original packet immediately after validation. The LLM does
+not see packet or card IDs, evidence kind, detail objects, truncation flags,
+axes, polarity, semantic grouping, architectures, scores, support counts,
+folds, or other compiler metadata. It returns feature names, descriptions,
+rationales, and `supporting_items`; it does not choose value types or any other
+part of the extraction ontology during discovery.
 
 Compilation is cached under `stage2/evidence_compilation`. A restart hashes the
 Stage 1 handoff, loads the compact packet cache when its compiler signature

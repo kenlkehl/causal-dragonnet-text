@@ -176,7 +176,10 @@ alone are not allowed to invent a feature name.
 A complete Stage 2 analysis ordinarily performs the following sequence:
 
 1. It interprets each architecture independently so that a large or familiar
-   evidence family cannot erase a smaller one.
+   evidence family cannot erase a smaller one. Each compiled card is projected
+   to a prompt-local integer and its readable text strings only. The model cites
+   those simple integers, which Python maps back to full provenance; discovery
+   does not choose value types or extraction ontologies.
 2. It consolidates spelling variants and genuine aliases while preserving
    clinically distinct measurements.
 3. It compares the resulting architecture-level dossiers and reviews the exact

@@ -125,6 +125,18 @@ not an artifact-authentication, byte-attestation, or deployment-gate system.
 The former `raw_packets_v1` compatibility option is intentionally unsupported
 because it combined scientifically distinct architectures.
 
+For feature discovery, Python projects every compiled card to a prompt-local
+integer `item` and a list containing only its deduplicated
+`representative_evidence.text` strings. Card and packet IDs, evidence kind,
+detail objects, truncation flags, axes, polarity, semantic grouping,
+architectures, scores, support counts, folds, and other provenance stay outside
+the model prompt. The model returns feature names, descriptions, rationales,
+and `supporting_items` such as `[1, 3]`; Python immediately maps those ordinal
+labels back to the original packets and derives evidence axes and causal roles
+without model-authored IDs. Discovery does not choose value types, units,
+categories, or extraction ontologies; the later one-feature ontology request
+makes those decisions from the retained feature name and supporting text.
+
 ```json
 {
   "stage2": {

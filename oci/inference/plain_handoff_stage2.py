@@ -51,9 +51,9 @@ CONSOLIDATION_SCHEMA_VERSION = (
     "candidate_pair_alias_v10_minimal_ontology_evidence"
 )
 OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_supporting_text_v3"
-INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v6_patient_only"
+INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v7"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = (
-    "rejected_packet_measurement_audit_v3_patient_only"
+    "rejected_packet_text_only_ordinals_v4"
 )
 PAIRWISE_ALIAS_MIN_FUZZY_SCORE = 0.44
 PAIRWISE_ALIAS_MAX_NEIGHBORS = 4
@@ -1362,8 +1362,7 @@ def _interpretation_response_contract() -> dict[str, Any]:
                     "exactly one underlying or explicitly documented patient-level clinical "
                     "feature that could produce the observed text evidence pattern"
                 ),
-                "value_type": "binary|categorical|continuous|ordinal|ambiguous",
-                "supporting_evidence_item_ids": ["one or more supplied evidence-item IDs"],
+                "supporting_items": [1],
                 "evidence_rationale": (
                     "how the cited words, phrases, or clinical context could arise from this "
                     "feature, including whether the feature is explicit or inferred"
@@ -1377,15 +1376,17 @@ def _interpretation_response_contract() -> dict[str, Any]:
 def _interpretation_evidence_items(
     packets: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Expose evidence under task-facing IDs without transport provenance jargon."""
+    """Expose only readable text under prompt-local ordinal labels."""
 
-    return [
-        {
-            "evidence_item_id": str(packet["packet_id"]),
-            "evidence": packet.get("content"),
-        }
-        for packet in packets
-    ]
+    items: list[dict[str, Any]] = []
+    for item_number, packet in enumerate(packets, start=1):
+        texts = _readable_supporting_text([packet])
+        if not texts:
+            raise ValueError(
+                f"interpretation evidence item {item_number} has no readable text"
+            )
+        items.append({"item": item_number, "text": texts})
+    return items
 
 
 def _interpretation_prompt(
@@ -1397,26 +1398,18 @@ def _interpretation_prompt(
     body = {
         "job": "infer_clinical_features_from_text_evidence",
         "task": (
-            "The supplied evidence items are noisy summaries of text patterns found by "
-            "prediction models. Some patterns may reflect underlying or explicit patient "
-            "features documented in clinical text; others may reflect evidence aggregation, "
-            "analytical structure, or no coherent clinical feature. Work backward from each "
-            "evidence pattern and return only supported patient-level clinical features."
+            "Identify patient-level clinical features supported by the supplied text. Some "
+            "items may support multiple features or no valid feature."
         ),
         "rules": [
-            "Identify explicitly documented clinical features and narrower latent features reasonably implied by the readable evidence.",
             "Each candidate must represent one patient-level clinical variable with one value per patient. It must be assignable by examining one patient's record without comparing or aggregating across patients.",
-            "Never return concepts about cohorts, collections of patients, cross-patient heterogeneity, clusters, semantic themes, evidence axes, model behavior, analysis methods, or document structure. These describe the evidence or analysis, not an individual patient's clinical state.",
-            "If an evidence item supports no valid patient-level clinical variable, omit it. Returning an empty candidates list is correct and preferred when none of the supplied evidence supports a valid candidate.",
-            "A statement that no common patient feature exists is a rejection reason, never a binary, categorical, or other candidate.",
-            "When a clinical feature can realistically be extracted as a numeric measurement, prefer defining it as continuous rather than converting it into categorical or ordinal bins. Use categorical or ordinal values when continuous measurement is infeasible or would misrepresent the feature.",
+            "Return explicitly documented clinical features and narrower latent clinical features reasonably implied by the text.",
             "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
-            "When multiple underlying features could plausibly explain the same evidence, return them as separate alternatives and describe the ambiguity.",
-            "Use readable words, phrases, and clinical context to identify features. Statistical scores and support counts describe the evidence pattern but cannot identify a clinical feature by themselves.",
             "Use longitudinal information as clinical context when it appears in the evidence. Do not perform temporal eligibility filtering.",
-            "Do not turn patient names, administrative identifiers, or documentation artifacts into clinical features.",
-            "For each candidate, cite the evidence-item IDs supporting it and explain how the observed text pattern could arise from that feature.",
-            "Do not invent a candidate when the evidence does not support a plausible underlying or explicitly documented clinical feature.",
+            "Do not return patient names, administrative identifiers, documentation artifacts, descriptions of the input collection, multiple-patient heterogeneity, grouping methods, or analysis methods as clinical features.",
+            "If no valid feature is supported, return an empty candidates list. Never turn the absence of a common feature into a candidate.",
+            "For each candidate, cite one or more supplied item numbers in supporting_items and explain how its text supports the feature.",
+            "Do not choose a value type, unit, categories, or extraction ontology in this step.",
         ],
         "evidence_items": _interpretation_evidence_items(packets),
         "response": _interpretation_response_contract(),
@@ -1425,8 +1418,7 @@ def _interpretation_prompt(
         {
             "role": "system",
             "content": (
-                "You infer underlying or explicitly documented patient-level clinical "
-                "features from noisy evidence about predictive patterns in clinical text. "
+                "Identify patient-level clinical features supported by the supplied text. "
                 "Return JSON only."
             ),
         },
@@ -1445,26 +1437,19 @@ def _rejected_packet_audit_prompt(
     body = {
         "job": "audit_unmapped_text_evidence_for_missed_clinical_features",
         "task": (
-            "The supplied evidence items were not cited by an initial review. Re-examine "
-            "each item for an underlying or explicitly documented patient feature that could "
-            "have produced its text pattern. Recover supported features without ranking them "
-            "or limiting the result to the most prominent patterns."
+            "The supplied text was not cited by an initial review. Re-examine every item for "
+            "patient-level clinical features that may have been missed."
         ),
         "rules": [
             "Review every evidence item independently. One clear item is sufficient to support a candidate; a clue does not need to recur.",
-            "Identify explicitly documented clinical features and narrower latent features reasonably implied by the readable evidence.",
             "Each candidate must represent one patient-level clinical variable with one value per patient. It must be assignable by examining one patient's record without comparing or aggregating across patients.",
-            "Never return concepts about cohorts, collections of patients, cross-patient heterogeneity, clusters, semantic themes, evidence axes, model behavior, analysis methods, or document structure. These describe the evidence or analysis, not an individual patient's clinical state.",
-            "If an evidence item supports no valid patient-level clinical variable, omit it. Returning an empty candidates list is correct and preferred when none of the supplied evidence supports a valid candidate.",
-            "A statement that no common patient feature exists is a rejection reason, never a binary, categorical, or other candidate.",
-            "When a clinical feature can realistically be extracted as a numeric measurement, prefer defining it as continuous rather than converting it into categorical or ordinal bins. Use categorical or ordinal values when continuous measurement is infeasible or would misrepresent the feature.",
+            "Return explicitly documented clinical features and narrower latent clinical features reasonably implied by the text.",
             "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
-            "When multiple underlying features could plausibly explain the same evidence, return them as separate alternatives and describe the ambiguity.",
-            "Use readable words, phrases, and clinical context to identify features. Statistical scores and support counts describe the evidence pattern but cannot identify a clinical feature by themselves.",
             "Use longitudinal information as clinical context when it appears in the evidence. Do not perform temporal eligibility filtering.",
-            "Do not turn patient names, administrative identifiers, or documentation artifacts into clinical features.",
-            "For each candidate, cite the evidence-item IDs supporting it and explain how the observed text pattern could arise from that feature.",
-            "Do not invent a candidate when the evidence does not support a plausible underlying or explicitly documented clinical feature.",
+            "Do not return patient names, administrative identifiers, documentation artifacts, descriptions of the input collection, multiple-patient heterogeneity, grouping methods, or analysis methods as clinical features.",
+            "If no valid feature is supported, return an empty candidates list. Never turn the absence of a common feature into a candidate.",
+            "For each candidate, cite one or more supplied item numbers in supporting_items and explain how its text supports the feature.",
+            "Do not choose a value type, unit, categories, or extraction ontology in this step.",
         ],
         "evidence_items": _interpretation_evidence_items(packets),
         "response": _interpretation_response_contract(),
@@ -1473,10 +1458,9 @@ def _rejected_packet_audit_prompt(
         {
             "role": "system",
             "content": (
-                "You re-examine unmapped evidence about predictive patterns in clinical text "
-                "for missed underlying or explicitly documented patient-level clinical "
-                "features. Favor recall among valid individual-patient clinical variables, "
-                "but return no candidate for evidence or analysis artifacts. Return JSON only."
+                "Re-examine the supplied text for missed patient-level clinical features. "
+                "Favor recall among valid individual-patient variables, but return no "
+                "candidate for input or analysis artifacts. Return JSON only."
             ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
@@ -1486,9 +1470,16 @@ def _rejected_packet_audit_prompt(
 def _validate_interpretation(
     value: Mapping[str, Any],
     *,
-    packet_ids: set[str],
+    packet_ids: Sequence[str],
     packet_evidence_axes: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
+    ordered_packet_ids = list(map(str, packet_ids))
+    if len(ordered_packet_ids) != len(set(ordered_packet_ids)):
+        raise ValueError("interpretation input contains duplicate packet IDs")
+    packet_id_by_item = {
+        item_number: packet_id
+        for item_number, packet_id in enumerate(ordered_packet_ids, start=1)
+    }
     payload = value
     if not isinstance(payload.get("concepts"), list):
         for key in ("result", "response", "interpretation"):
@@ -1506,10 +1497,6 @@ def _validate_interpretation(
     )
     if not isinstance(concepts, list):
         raise ValueError("interpretation requires a concepts list")
-    dispositions = payload.get("packet_dispositions")
-    if not isinstance(dispositions, Mapping):
-        dispositions = {}
-    dispositions = {str(key): item for key, item in dispositions.items()}
     clean_concepts: list[dict[str, Any]] = []
     for concept in concepts:
         if not isinstance(concept, Mapping):
@@ -1517,39 +1504,37 @@ def _validate_interpretation(
         name = str(concept.get("name") or concept.get("feature_name") or "").strip()
         if not name:
             raise ValueError("interpreted concept has no name")
-        raw_supports = (
-            concept.get("supporting_evidence_item_ids")
-            or concept.get("supporting_packet_ids")
-            or concept.get("packet_ids")
-            or []
-        )
+        raw_supports = concept.get("supporting_items") or []
         if isinstance(raw_supports, (str, int)):
             raw_supports = [raw_supports]
         elif not isinstance(raw_supports, Sequence):
             raw_supports = []
-        cited_ids = list(dict.fromkeys(str(item) for item in raw_supports))
-        supports = [packet_id for packet_id in cited_ids if packet_id in packet_ids]
-        if not supports:
-            concept_key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-            for packet_id in sorted(packet_ids):
-                disposition = dispositions.get(packet_id)
-                if not isinstance(disposition, Mapping):
-                    continue
-                raw_names = disposition.get("concept_names") or []
-                if isinstance(raw_names, str):
-                    raw_names = [raw_names]
-                disposition_names = {
-                    re.sub(r"[^a-z0-9]+", "_", str(item).lower()).strip("_") for item in raw_names
-                }
-                if concept_key in disposition_names:
-                    supports.append(packet_id)
-        unknown_ids = [packet_id for packet_id in cited_ids if packet_id not in packet_ids]
-        if unknown_ids:
+        cited_items: list[int] = []
+        invalid_items: list[Any] = []
+        for raw_item in raw_supports:
+            if isinstance(raw_item, bool):
+                invalid_items.append(raw_item)
+                continue
+            try:
+                item_number = int(raw_item)
+            except (TypeError, ValueError):
+                invalid_items.append(raw_item)
+                continue
+            if str(raw_item).strip() not in {str(item_number), f"{item_number}.0"}:
+                invalid_items.append(raw_item)
+                continue
+            if item_number not in packet_id_by_item:
+                invalid_items.append(raw_item)
+                continue
+            cited_items.append(item_number)
+        cited_items = list(dict.fromkeys(cited_items))
+        supports = [packet_id_by_item[item_number] for item_number in cited_items]
+        if invalid_items:
             LOGGER.warning(
-                "Stage 2 interpretation concept=%s ignored %s unknown evidence item ID(s): %s",
+                "Stage 2 interpretation concept=%s ignored %s invalid supporting item(s): %s",
                 name,
-                len(unknown_ids),
-                unknown_ids[:8],
+                len(invalid_items),
+                invalid_items[:8],
             )
         if not supports:
             LOGGER.warning(
@@ -1558,9 +1543,7 @@ def _validate_interpretation(
                 name,
             )
             continue
-        if packet_evidence_axes is None:
-            axes = _canonical_evidence_axes(concept.get("evidence_axes") or concept.get("axes"))
-        else:
+        if packet_evidence_axes is not None:
             axes = sorted(
                 {
                     axis
@@ -1568,17 +1551,8 @@ def _validate_interpretation(
                     for axis in _canonical_evidence_axes(packet_evidence_axes.get(packet_id))
                 }
             )
-        value_type = str(concept.get("value_type") or "ambiguous").strip().lower()
-        value_type = {
-            "bool": "binary",
-            "boolean": "binary",
-            "category": "categorical",
-            "numeric": "continuous",
-            "number": "continuous",
-            "unknown": "ambiguous",
-        }.get(value_type, value_type)
-        if value_type not in ALLOWED_VALUE_TYPES:
-            value_type = "ambiguous"
+        else:
+            axes = []
         evidence_rationale = str(
             concept.get("evidence_rationale")
             or concept.get("pattern_rationale")
@@ -1594,7 +1568,6 @@ def _validate_interpretation(
             {
                 "name": name,
                 "description": str(concept.get("description") or name),
-                "value_type": value_type,
                 "supporting_packet_ids": supports,
                 "evidence_axes": axes,
                 "evidence_rationale": evidence_rationale,
@@ -1602,19 +1575,16 @@ def _validate_interpretation(
             }
         )
     clean_dispositions: dict[str, Any] = {}
-    for packet_id in sorted(packet_ids):
+    for packet_id in ordered_packet_ids:
         names = sorted(
             concept["name"]
             for concept in clean_concepts
             if packet_id in concept["supporting_packet_ids"]
         )
-        disposition = dispositions.get(packet_id)
-        reason = str(disposition.get("reason") or "") if isinstance(disposition, Mapping) else ""
         clean_dispositions[packet_id] = {
             "status": "supports_concept" if names else "reviewed_no_specific_concept",
             "concept_names": names,
-            "reason": reason
-            or (
+            "reason": (
                 "Derived from the candidates' evidence-item citations."
                 if names
                 else "No returned candidate cited this evidence item."
@@ -2199,7 +2169,6 @@ def _candidate_pair_view(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "name": _short_text(candidate.get("name"), max_chars=200),
         "description": _short_text(candidate.get("description"), max_chars=400),
         "evidence_rationale": _short_text(candidate.get("evidence_rationale"), max_chars=300),
-        "value_type": str(candidate.get("value_type") or "ambiguous"),
         "caveats": _short_text(candidate.get("caveats"), max_chars=100),
     }
 
@@ -2890,7 +2859,7 @@ def _operationalization_prompt(
     ]
 
 
-def _ontology_supporting_text(
+def _readable_supporting_text(
     packets: Sequence[Mapping[str, Any]],
 ) -> list[str]:
     """Project compiled evidence packets to unique readable text only."""
@@ -3275,7 +3244,10 @@ class PlainHandoffStage2:
             "packets": list(packets),
         }
         input_fingerprint = _value_fingerprint(input_value)
-        packet_ids = {str(packet["packet_id"]) for packet in packets}
+        packet_ids = [str(packet["packet_id"]) for packet in packets]
+        packet_id_set = set(packet_ids)
+        if len(packet_ids) != len(packet_id_set):
+            raise ValueError("Stage 2 interpretation batch contains duplicate packet IDs")
         complete_path = output_dir / "complete.json"
         result_path = output_dir / "result.json"
         input_path = output_dir / "input.json"
@@ -3301,7 +3273,7 @@ class PlainHandoffStage2:
                     cached_result = None
                 if _cached_interpretation_matches_packets(
                     cached_result,
-                    packet_ids=packet_ids,
+                    packet_ids=packet_id_set,
                 ) and (
                     cached_result.get("rejected_packet_audit", {}).get("schema_version")
                     == INTERPRETATION_AUDIT_SCHEMA_VERSION
@@ -3358,7 +3330,7 @@ class PlainHandoffStage2:
                 len(audit_batches),
             )
             for batch_index, batch in enumerate(audit_batches, start=1):
-                batch_ids = {str(packet["packet_id"]) for packet in batch}
+                batch_ids = [str(packet["packet_id"]) for packet in batch]
                 audit_results.append(
                     _checkpointed_request_json(
                         output_dir=(
@@ -3386,7 +3358,7 @@ class PlainHandoffStage2:
                 )
 
         result = _merge_interpretation_audit(
-            packet_ids=packet_ids,
+            packet_ids=packet_id_set,
             initial=initial,
             audits=audit_results,
         )
@@ -3508,7 +3480,7 @@ class PlainHandoffStage2:
             packet_by_id[packet_id]
             for packet_id in ontology_packet_ids
         ]
-        supporting_evidence = _ontology_supporting_text(evidence_packets)
+        supporting_evidence = _readable_supporting_text(evidence_packets)
         if not supporting_evidence:
             raise ValueError(
                 f"Stage 2 group {group.get('name')!r} has no readable supporting "
