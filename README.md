@@ -676,11 +676,13 @@ name-only global pass for residual synonym merges. Python deterministically
 carries supporting packets, architectures, evidence axes, causal roles, and
 original-candidate dispositions through those groups. There is no feature-count
 selection step. Finally, independent one-feature requests receive only the
-canonical feature name and original supporting evidence content. The model
-decides the value type, units or allowed categories, measurement rule, and
-missingness handling from that evidence; fold metadata, internal IDs, causal
-axes, architecture names, support counts, candidate summaries, and earlier
-proposed value types stay outside the prompt. Consolidation and every one-group
+canonical feature name and a deduplicated flat list of readable supporting-text
+strings. The model decides the value type, units or allowed categories,
+measurement rule, and missingness handling from that evidence; packet structure,
+evidence kind, detail objects, truncation flags, fold metadata, internal IDs,
+causal axes, semantic grouping, architecture names, scores, support counts,
+candidate summaries, and earlier proposed value types stay outside the prompt.
+Consolidation and every one-group
 operationalization request are input-fingerprinted separately, so a retry skips
 successful leaves instead of repeating the whole fan-out. It then extracts the variables on the outer
 training rows and measures missingness, variation,

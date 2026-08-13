@@ -48,9 +48,9 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 CONSOLIDATION_SCHEMA_VERSION = (
-    "candidate_pair_alias_v9_evidence_grounded_operationalization"
+    "candidate_pair_alias_v10_minimal_ontology_evidence"
 )
-OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_original_evidence_v2"
+OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_supporting_text_v3"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_inverse_text_evidence_v6_patient_only"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = (
     "rejected_packet_measurement_audit_v3_patient_only"
@@ -2577,8 +2577,8 @@ def _materialize_candidate_group(
         "packet_evidence_axes": packet_evidence_axes,
         "caveats": " ".join(caveats),
         "origin_candidate_ids": origins,
-        # Internal routing only. The ontology model receives the corresponding
-        # original packet contents, never these transport identifiers.
+        # Internal routing only. Python resolves these to readable supporting
+        # text; the ontology model never receives packet structure or IDs.
         "ontology_packet_ids": list(dict.fromkeys(map(str, ontology_packet_ids))),
         "member_measurements": [
             {
@@ -2828,24 +2828,25 @@ def _apply_global_group_merge_directives(
 def _operationalization_prompt(
     *,
     feature_name: str,
-    evidence_packets: Sequence[Mapping[str, Any]],
+    supporting_evidence: Sequence[str],
 ) -> list[dict[str, str]]:
-    if not evidence_packets:
-        raise ValueError("operationalization requires at least one original evidence packet")
-    body = {
-        "job": "operationalize_stage2_candidate_group",
+    evidence = list(
+        dict.fromkeys(
+            str(item).strip() for item in supporting_evidence if str(item).strip()
+        )
+    )
+    if not evidence:
+        raise ValueError("operationalization requires readable supporting evidence")
+    instructions = {
         "task": (
             "Define the extraction ontology for the named candidate clinical feature. "
             "Decide its value type, allowed values or unit, and measurement rule from the "
-            "candidate name and the readable clinical evidence in the original evidence "
-            "packet or packets."
+            "candidate name and readable supporting clinical evidence."
         ),
-        "candidate_feature_name": str(feature_name),
-        "original_evidence_packets": [dict(packet) for packet in evidence_packets],
         "rules": [
             "Define exactly the named scalar pretreatment measurement; do not rename, merge, or split it in this step.",
             "Determine value_type yourself from what the named feature means and how it is represented in the supplied evidence. No value type from an earlier discovery step is being provided.",
-            "Use the readable clinical evidence rather than analytical metadata inside an evidence packet. A packet may contain unrelated clues; use only material that actually bears on the named feature.",
+            "The evidence may contain unrelated clues; use only text that actually bears on the named feature.",
             "Specify a reproducible extraction target from a complete patient record.",
             "Do not invent an ad hoc score, formula, or index to force multiple distinct measurements into one scalar.",
             "Prefer value_type continuous, with a clinically meaningful unit when applicable, when the named feature can realistically be extracted as a numeric measurement. Use categorical or ordinal only when continuous measurement is infeasible or would misrepresent the feature.",
@@ -2855,7 +2856,6 @@ def _operationalization_prompt(
             "List each category exactly once. Categories that differ only by capitalization, punctuation, underscores, or spacing are duplicates and must not both appear.",
             "Never use a type label such as binary or categorical, or a combined phrase such as present-or-absent, as one ontology value.",
             "Define how absent, ambiguous, and conflicting documentation is represented.",
-            "Do not return packet IDs, candidate IDs, group IDs, architectures, causal roles, or dispositions.",
             "Return one flat JSON object with every response field shown below; measurement_definition and missing_value_rule are required nonempty strings.",
         ],
         "response": {
@@ -2868,16 +2868,49 @@ def _operationalization_prompt(
             "caveats": "remaining scientific limitations",
         },
     }
+    body = {
+        "candidate_feature_name": str(feature_name),
+        "supporting_evidence": evidence,
+    }
     return [
         {
             "role": "system",
-            "content": (
-                "Define one clinical feature ontology from its name and original supporting "
-                "evidence. Return JSON only."
+            "content": json.dumps(
+                {
+                    "instruction": (
+                        "Define one clinical feature ontology from its name and supporting "
+                        "clinical text. Return JSON only."
+                    ),
+                    **instructions,
+                },
+                sort_keys=True,
             ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
     ]
+
+
+def _ontology_supporting_text(
+    packets: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Project compiled evidence packets to unique readable text only."""
+
+    texts: list[str] = []
+    for packet in packets:
+        content = packet.get("content")
+        if not isinstance(content, Mapping):
+            continue
+        representative_evidence = content.get("representative_evidence") or []
+        if isinstance(representative_evidence, (str, Mapping)):
+            representative_evidence = [representative_evidence]
+        if not isinstance(representative_evidence, Sequence):
+            continue
+        for item in representative_evidence:
+            raw_text = item.get("text") if isinstance(item, Mapping) else item
+            text = str(raw_text or "").strip()
+            if text:
+                texts.append(text)
+    return list(dict.fromkeys(texts))
 
 
 def _validate_operationalization(
@@ -3472,12 +3505,18 @@ class PlainHandoffStage2:
                 f"packet(s): {missing_packet_ids[:8]}"
             )
         evidence_packets = [
-            dict(packet_by_id[packet_id].get("content") or {})
+            packet_by_id[packet_id]
             for packet_id in ontology_packet_ids
         ]
+        supporting_evidence = _ontology_supporting_text(evidence_packets)
+        if not supporting_evidence:
+            raise ValueError(
+                f"Stage 2 group {group.get('name')!r} has no readable supporting "
+                "evidence for ontology definition"
+            )
         messages = _operationalization_prompt(
             feature_name=str(group.get("name") or ""),
-            evidence_packets=evidence_packets,
+            supporting_evidence=supporting_evidence,
         )
         prompt_chars = sum(len(message["content"]) for message in messages)
         if prompt_chars > int(self.config.max_prompt_chars):
@@ -3491,7 +3530,8 @@ class PlainHandoffStage2:
                 "phase": "group_operationalization",
                 "operationalization_schema": OPERATIONALIZATION_SCHEMA_VERSION,
                 "candidate_feature_name": str(group.get("name") or ""),
-                "original_evidence_packets": evidence_packets,
+                "ontology_packet_ids": ontology_packet_ids,
+                "supporting_evidence": supporting_evidence,
             },
             messages=messages,
             config=self.config,

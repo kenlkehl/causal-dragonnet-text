@@ -173,17 +173,18 @@ not propose.
 
 Every group remaining after those merge directives is operationalized for
 extraction. Each ontology request contains only the canonical feature name,
-the original compiled evidence content cited by its representative discovery
-candidate, the ontology instructions, and the response contract. It does not
-send the outer-fold number, clinical question, candidate or group IDs,
-discovery value type, evidence axes, architecture names, support counts, or
-candidate summaries. The model chooses binary, categorical, continuous,
-ordinal, or ambiguous at this point from the feature name and readable original
-evidence, then supplies allowed values or a unit and the extraction and
-missingness rules. Python validates the closed-ontology shape but does not
-hard-code domain-specific features, categories, or units. There is no LLM
-ranking, diversity selection, or feature-count cap between alias grouping and
-operationalization.
+a deduplicated flat list of readable supporting text, the ontology instructions,
+and the response contract. Python extracts only `representative_evidence.text`
+from the internally selected compiled packets. Packet boundaries, evidence
+kind, truncation flags, details, the outer-fold number, clinical question,
+candidate or group IDs, discovery value type, evidence axes, semantic grouping,
+architecture names, scores, support counts, and candidate summaries are not
+sent. The model chooses binary, categorical, continuous, ordinal, or ambiguous
+at this point from the feature name and readable evidence, then supplies allowed
+values or a unit and the extraction and missingness rules. Python validates the
+closed-ontology shape but does not hard-code domain-specific features,
+categories, or units. There is no LLM ranking, diversity selection, or
+feature-count cap between alias grouping and operationalization.
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,

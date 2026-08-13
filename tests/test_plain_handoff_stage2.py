@@ -36,6 +36,14 @@ def _original_evidence_packets(packet_ids):
     ]
 
 
+def _prompt_job(body):
+    if "job" in body:
+        return body["job"]
+    if set(body) == {"candidate_feature_name", "supporting_evidence"}:
+        return "operationalize_stage2_candidate_group"
+    raise AssertionError(f"unrecognized prompt body keys: {sorted(body)}")
+
+
 def test_stage2_config_allows_endpoint_without_model():
     config = plain_stage2_config_from_mapping(
         {"endpoint": "http://stage2.test/v1"},
@@ -993,31 +1001,18 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
 
 
 def test_operationalization_prompt_prefers_realistic_continuous_measurements():
-    evidence_packets = [
-        {
-            "evidence_kind": "clinical_text",
-            "representative_evidence": [
-                {"text": "PD-L1 tumor proportion score was 80 percent."}
-            ],
-        }
-    ]
+    evidence = ["PD-L1 tumor proportion score was 80 percent."]
     messages = stage2_workflow._operationalization_prompt(
         feature_name="pd_l1_expression_level",
-        evidence_packets=evidence_packets,
+        supporting_evidence=evidence,
     )
     body = json.loads(messages[1]["content"])
-    rules = " ".join(body["rules"]).lower()
+    instructions = json.loads(messages[0]["content"])
+    rules = " ".join(instructions["rules"]).lower()
 
-    assert set(body) == {
-        "job",
-        "task",
-        "candidate_feature_name",
-        "original_evidence_packets",
-        "rules",
-        "response",
-    }
+    assert set(body) == {"candidate_feature_name", "supporting_evidence"}
     assert body["candidate_feature_name"] == "pd_l1_expression_level"
-    assert body["original_evidence_packets"] == evidence_packets
+    assert body["supporting_evidence"] == evidence
     assert "determine value_type yourself" in rules
     assert "no value type from an earlier discovery step" in rules
     assert "prefer value_type continuous" in rules
@@ -1034,8 +1029,45 @@ def test_operationalization_prompt_prefers_realistic_continuous_measurements():
         "origin_candidate_count",
         "packet_support_count",
         "member_measurements",
+        "evidence_kind",
+        "representative_evidence",
+        "semantic_grouping",
+        "source_architectures",
+        "source_families",
+        "score_summary",
+        "supporting_context_count",
+        "text_truncated",
     ):
         assert irrelevant_key not in rendered
+
+
+def test_ontology_supporting_text_strips_packet_structure_and_deduplicates():
+    packets = [
+        {
+            "packet_id": "opaque_packet_id",
+            "architecture": "opaque_architecture",
+            "content": {
+                "evidence_kind": "clinical_text",
+                "semantic_grouping": "opaque_grouping",
+                "score_summary": {"score": {"maximum": 9.0}},
+                "source_architectures": ["opaque_architecture"],
+                "representative_evidence": [
+                    {
+                        "text": "Readable clinical evidence.",
+                        "text_truncated": True,
+                        "details": {"opaque": "metadata"},
+                    },
+                    {"text": "Readable clinical evidence."},
+                    {"text": "Second clinical clue."},
+                ],
+            },
+        }
+    ]
+
+    assert stage2_workflow._ontology_supporting_text(packets) == [
+        "Readable clinical evidence.",
+        "Second clinical clue.",
+    ]
 
 
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
@@ -1784,8 +1816,9 @@ def test_consolidation_expands_ordinal_integer_range_categories():
 def _fake_completion(calls):
     def complete(messages, _config):
         body = json.loads(messages[1]["content"])
-        calls.append(body["job"])
-        if body["job"] == "extract_stage2_patient_variables":
+        job = _prompt_job(body)
+        calls.append(job)
+        if job == "extract_stage2_patient_variables":
             rows = []
             for patient in body["patients"]:
                 match = re.search(r"ECOG\s*([0-4])", patient["text"])
@@ -1794,7 +1827,7 @@ def _fake_completion(calls):
                     values[feature["name"]] = match.group(1) if match is not None else None
                 rows.append({"row_id": patient["row_id"], "values": values})
             return json.dumps({"rows": rows})
-        if body["job"] == "review_stage2_variables_against_training_fold_performance":
+        if job == "review_stage2_variables_against_training_fold_performance":
             return json.dumps(
                 {
                     "feature_decisions": [
@@ -1808,7 +1841,7 @@ def _fake_completion(calls):
                     "overall_assessment": "Keep the operational definitions.",
                 }
             )
-        if body["job"] == "infer_clinical_features_from_text_evidence":
+        if job == "infer_clinical_features_from_text_evidence":
             packet_ids = [row["evidence_item_id"] for row in body["evidence_items"]]
             return json.dumps(
                 {
@@ -1827,14 +1860,14 @@ def _fake_completion(calls):
                     ],
                 }
             )
-        if body["job"] == "decide_stage2_candidate_alias_pair":
+        if job == "decide_stage2_candidate_alias_pair":
             assert "packet_id" not in messages[1]["content"]
             assert set(body) >= {"left_candidate", "right_candidate"}
             return json.dumps({"same_scalar_measurement": True})
-        if body["job"] == "consolidate_stage2_group_names":
+        if job == "consolidate_stage2_group_names":
             assert "candidate_id" not in messages[1]["content"]
             return json.dumps({"merge_directives": []})
-        assert body["job"] == "operationalize_stage2_candidate_group"
+        assert job == "operationalize_stage2_candidate_group"
         assert "packet_id" not in messages[1]["content"]
         return json.dumps(
             {
@@ -2170,10 +2203,13 @@ def test_stage2_pairwise_consolidation_does_not_lose_candidates():
         prompt_sizes.append(sum(len(message["content"]) for message in messages))
         body = json.loads(messages[1]["content"])
         assert "packet_1" not in messages[1]["content"]
-        if body["job"] == "decide_stage2_candidate_alias_pair":
+        job = _prompt_job(body)
+        if job == "decide_stage2_candidate_alias_pair":
             return json.dumps({"same_scalar_measurement": True})
-        assert body["job"] == "operationalize_stage2_candidate_group"
-        assert len(body["original_evidence_packets"]) == 1
+        assert job == "operationalize_stage2_candidate_group"
+        assert body["supporting_evidence"] == [
+            "Original clinical evidence for the candidate feature."
+        ]
         return json.dumps(
             {
                 "description": "Baseline ECOG performance status.",
@@ -2492,7 +2528,8 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
         assert all(packet_id not in rendered for packet_id in packet_ids)
         body = json.loads(rendered)
         prompt_bodies.append(body)
-        if body["job"] == "decide_stage2_candidate_alias_pair":
+        job = _prompt_job(body)
+        if job == "decide_stage2_candidate_alias_pair":
             names = {
                 body["left_candidate"]["name"],
                 body["right_candidate"]["name"],
@@ -2503,11 +2540,11 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
                     == {"serum_sodium", "blood_sodium_concentration"}
                 }
             )
-        if body["job"] == "consolidate_stage2_group_names":
+        if job == "consolidate_stage2_group_names":
             assert set(body) == {"job", "task", "feature_names", "rules", "response"}
             assert all("candidate" not in name for name in body["feature_names"])
             return json.dumps({"merge_directives": []})
-        assert body["job"] == "operationalize_stage2_candidate_group"
+        assert job == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
                 "description": body["candidate_feature_name"].replace("_", " "),
@@ -2596,7 +2633,7 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     assert result["candidate_dispositions"]["candidate_0002"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0003"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0004"]["status"] == "merged"
-    assert {body["job"] for body in prompt_bodies} == {
+    assert {_prompt_job(body) for body in prompt_bodies} == {
         "decide_stage2_candidate_alias_pair",
         "consolidate_stage2_group_names",
         "operationalize_stage2_candidate_group",
@@ -2621,14 +2658,39 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
 
 def test_global_name_consolidation_merges_residual_aliases_before_operationalization():
     prompt_bodies = []
+    evidence_packets = [
+        {
+            "packet_id": "packet_alpha",
+            "content": {
+                "representative_evidence": [
+                    {"text": "Blood glucose measured 105 mg/dL."}
+                ]
+            },
+        },
+        {
+            "packet_id": "packet_beta",
+            "content": {
+                "representative_evidence": [
+                    {"text": "Glycemia was documented numerically."}
+                ]
+            },
+        },
+        {
+            "packet_id": "packet_gamma",
+            "content": {
+                "representative_evidence": [{"text": "Resting pulse was 72 bpm."}]
+            },
+        },
+    ]
 
     def completion(messages, _config):
         rendered = messages[1]["content"]
         body = json.loads(rendered)
         prompt_bodies.append(body)
-        if body["job"] == "decide_stage2_candidate_alias_pair":
+        job = _prompt_job(body)
+        if job == "decide_stage2_candidate_alias_pair":
             return json.dumps({"same_scalar_measurement": False})
-        if body["job"] == "consolidate_stage2_group_names":
+        if job == "consolidate_stage2_group_names":
             assert body["feature_names"] == [
                 "blood_glucose_concentration",
                 "glycemia",
@@ -2646,7 +2708,7 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
                     ]
                 }
             )
-        assert body["job"] == "operationalize_stage2_candidate_group"
+        assert job == "operationalize_stage2_candidate_group"
         return json.dumps(
             {
                 "description": body["candidate_feature_name"].replace("_", " "),
@@ -2703,9 +2765,7 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
     result = runner._consolidate_candidates(
         outer_fold=1,
         candidates=candidates,
-        evidence_packets=_original_evidence_packets(
-            [candidate["supporting_packet_ids"][0] for candidate in candidates]
-        ),
+        evidence_packets=evidence_packets,
     )
 
     assert [feature["name"] for feature in result["features"]] == [
@@ -2720,21 +2780,24 @@ def test_global_name_consolidation_merges_residual_aliases_before_operationaliza
     assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0002"]["status"] == "merged"
     assert result["candidate_dispositions"]["candidate_0003"]["status"] == "retained"
-    assert [body["job"] for body in prompt_bodies].count(
+    assert [_prompt_job(body) for body in prompt_bodies].count(
         "consolidate_stage2_group_names"
     ) == 1
-    assert [body["job"] for body in prompt_bodies].count(
+    assert [_prompt_job(body) for body in prompt_bodies].count(
         "operationalize_stage2_candidate_group"
     ) == 2
     ontology_bodies = {
         body["candidate_feature_name"]: body
         for body in prompt_bodies
-        if body["job"] == "operationalize_stage2_candidate_group"
+        if _prompt_job(body) == "operationalize_stage2_candidate_group"
     }
-    assert len(
-        ontology_bodies["blood_glucose_concentration"]["original_evidence_packets"]
-    ) == 2
-    assert len(ontology_bodies["heart_rate"]["original_evidence_packets"]) == 1
+    assert ontology_bodies["blood_glucose_concentration"]["supporting_evidence"] == [
+        "Blood glucose measured 105 mg/dL.",
+        "Glycemia was documented numerically.",
+    ]
+    assert ontology_bodies["heart_rate"]["supporting_evidence"] == [
+        "Resting pulse was 72 bpm."
+    ]
 
 
 def test_operationalization_ignores_model_authored_provenance_and_uses_aliases():
