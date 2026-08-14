@@ -81,8 +81,9 @@ example uses the identical hardware and endpoint behavior:
 ```
 
 Both launchers preset Stage 2 to batches of 20, five shifted-alphabetical plus
-five seeded-shuffle consolidation rounds, a three-training-patient ontology
-feedback threshold, and at most two refinement rounds. Override these with
+up to twenty seeded-shuffle consolidation rounds, a three-training-patient
+ontology feedback threshold, and at most two refinement rounds. Override these
+with
 `STAGE2_CONSOLIDATION_BATCH_SIZE`,
 `STAGE2_CONSOLIDATION_ALPHABETICAL_ROUNDS`,
 `STAGE2_CONSOLIDATION_MAX_ROUNDS`,

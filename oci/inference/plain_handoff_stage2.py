@@ -60,13 +60,6 @@ GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
 EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
     "training_failure_ontology_refinement_v1_explicit_feature_invariants"
 )
-PREVIOUS_ITERATIVE_GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
-    "iterative_alphabetical_candidate_batches_v6_explicit_feature_invariants"
-)
-PREVIOUS_ITERATIVE_CONSOLIDATION_MAX_ROUNDS = 5
-PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION = (
-    "candidate_pair_alias_v11_configured_explicit_features"
-)
 OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_supporting_text_v3"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v7"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v4"
@@ -4396,93 +4389,14 @@ class PlainHandoffStage2:
                 "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
             }
         )
-        previous_pairwise_inputs = {
-            **{
-                key: value
-                for key, value in definition_inputs.items()
-                if key
-                not in {
-                    "consolidation_batch_size",
-                    "consolidation_alphabetical_rounds",
-                    "consolidation_max_rounds",
-                    "consolidation_seed",
-                    "extraction_ontology_feedback_schema",
-                    "ontology_refinement_min_failure_patients",
-                    "max_ontology_refinement_rounds",
-                }
-            },
-            "consolidation_schema": PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION,
-        }
-        upgradeable_pairwise_fingerprints = {
-            _value_fingerprint(previous_pairwise_inputs),
-            *(
-                _value_fingerprint(
-                    {
-                        **previous_pairwise_inputs,
-                        "global_group_consolidation_schema": schema,
-                    }
-                )
-                for schema in (
-                    "global_name_merge_and_quality_exclusion_v2",
-                    "global_name_merge_and_quality_exclusion_v3_question_agnostic",
-                )
-            ),
-        }
         definitions_state = (
             json.loads(definitions_complete_path.read_text(encoding="utf-8"))
             if definitions_complete_path.is_file()
             else {}
         )
-        previous_iterative_inputs = {
-            key: value
-            for key, value in definition_inputs.items()
-            if key
-            not in {
-                "consolidation_alphabetical_rounds",
-                "consolidation_seed",
-                "extraction_ontology_feedback_schema",
-                "ontology_refinement_min_failure_patients",
-                "max_ontology_refinement_rounds",
-            }
-        }
-        previous_iterative_inputs["consolidation_batch_size"] = int(
-            definitions_state.get("consolidation_batch_size")
-            or self.config.consolidation_batch_size
-        )
-        previous_iterative_inputs["consolidation_max_rounds"] = int(
-            definitions_state.get("consolidation_max_rounds")
-            or PREVIOUS_ITERATIVE_CONSOLIDATION_MAX_ROUNDS
-        )
-        previous_iterative_fingerprint = _value_fingerprint(
-            {
-                **previous_iterative_inputs,
-                "global_candidate_pool_schema": (
-                    PREVIOUS_ITERATIVE_GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION
-                ),
-            }
-        )
         completion = (
             json.loads(complete_path.read_text(encoding="utf-8")) if complete_path.is_file() else {}
         )
-        legacy_consolidation_upgrade = (
-            definitions_state.get("evidence_input_fingerprint") in upgradeable_pairwise_fingerprints
-            and definitions_state.get("consolidation_schema")
-            == PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION
-            and interpreted_candidates_path.is_file()
-        )
-        legacy_iterative_upgrade = (
-            definitions_state.get("evidence_input_fingerprint") == previous_iterative_fingerprint
-            and definitions_state.get("consolidation_schema") == CONSOLIDATION_SCHEMA_VERSION
-            and definitions_state.get("global_candidate_pool_schema")
-            == PREVIOUS_ITERATIVE_GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION
-            and interpreted_candidates_path.is_file()
-        )
-        downstream_analysis_complete = (
-            output_dir / "estimation" / "complete.json"
-        ).is_file() or any((output_dir / "review").glob("round_*/complete.json"))
-        can_upgrade_consolidation = (
-            legacy_consolidation_upgrade or legacy_iterative_upgrade
-        ) and not downstream_analysis_complete
         if (
             completion.get("phase") == "causal_estimation"
             and final_features_path.is_file()
@@ -4523,22 +4437,6 @@ class PlainHandoffStage2:
         if features_path.is_file():
             if definitions_state.get("evidence_input_fingerprint") == evidence_input_fingerprint:
                 final = json.loads(features_path.read_text(encoding="utf-8"))
-            elif can_upgrade_consolidation:
-                raw_candidates = json.loads(interpreted_candidates_path.read_text(encoding="utf-8"))
-                if not isinstance(raw_candidates, list) or any(
-                    not isinstance(candidate, Mapping) for candidate in raw_candidates
-                ):
-                    raise ValueError(
-                        "cached Stage 2 interpreted_candidates.json must contain an array "
-                        "of candidate objects"
-                    )
-                candidates = [dict(candidate) for candidate in raw_candidates]
-                LOGGER.info(
-                    "upgrade Stage 2 outer_fold=%s from cached interpretations using "
-                    "iterative candidate-batch consolidation schema=%s",
-                    outer_fold,
-                    GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
-                )
             else:
                 raise RuntimeError(
                     f"Stage 2 outer fold {outer_fold} has feature definitions from a "
