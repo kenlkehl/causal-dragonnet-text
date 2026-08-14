@@ -7,6 +7,7 @@
 #   ./run_one_conf_one_mod.sh
 #   GPU_COUNT=2 ./run_one_conf_one_mod.sh
 #   PHYSICAL_GPUS=1,3 STAGE2_ENDPOINT=http://127.0.0.1:8010/v1 ./run_one_conf_one_mod.sh
+#   GPU_COUNT=8 STAGE2_VLLM_SERVERS=8 STAGE2_MODEL=google/gemma-4-31B-it ./run_one_conf_one_mod.sh
 #   STAGE1_ARCHITECTURES=bow_nuisance,tfidf_topics ./run_one_conf_one_mod.sh
 #   STAGE2_CONSOLIDATION_MAX_ROUNDS=12 ./run_one_conf_one_mod.sh
 #   ./run_one_conf_one_mod.sh /persistent/results/my_run

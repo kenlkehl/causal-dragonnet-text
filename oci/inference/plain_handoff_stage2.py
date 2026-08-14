@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, replace
@@ -33,6 +34,11 @@ from .plain_handoff_stage2_evidence import (
     compile_stage2_handoff_evidence,
 )
 from .plain_handoff_stage2_analysis import run_fold_analysis
+from .vllm_server_pool import (
+    ManagedVLLMConfig,
+    launch_managed_vllm_servers,
+    managed_vllm_config_from_mapping,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -646,13 +652,28 @@ class PlainHandoffStage2Config:
     temperature: float = 0.0
     enable_thinking: bool = False
     explicit_features: tuple[Stage2ExplicitFeature, ...] = ()
+    vllm: ManagedVLLMConfig | None = None
+    # Populated only while pipeline-owned servers are alive. It is deliberately
+    # excluded from the persisted scientific configuration; the server-pool
+    # manifest records the concrete endpoints and process/GPU assignments.
+    runtime_endpoints: tuple[str, ...] = ()
 
-    def validate(self, *, require_model: bool = True) -> None:
-        parsed = urlparse(self.endpoint)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    def validate(
+        self,
+        *,
+        require_model: bool = True,
+        require_endpoint: bool = True,
+    ) -> None:
+        if self.endpoint:
+            parsed = urlparse(self.endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("stage2.endpoint must be one HTTP(S) OpenAI-compatible base URL")
+        elif require_endpoint:
             raise ValueError("stage2.endpoint must be one HTTP(S) OpenAI-compatible base URL")
         if require_model and not self.model.strip():
             raise ValueError("stage2.model must be nonempty")
+        if self.vllm is not None:
+            self.vllm.validate()
         if self.request_timeout <= 0:
             raise ValueError("stage2.request_timeout must be positive")
         if self.transport_max_attempts < 1:
@@ -750,6 +771,7 @@ class PlainHandoffStage2Config:
     def public_dict(self) -> dict[str, Any]:
         values = asdict(self)
         values["api_key"] = "<redacted>"
+        values.pop("runtime_endpoints", None)
         values["explicit_features"] = [
             feature.as_definition() for feature in self.explicit_features
         ]
@@ -767,10 +789,17 @@ def plain_stage2_config_from_mapping(
         )
     endpoint = str(raw.get("endpoint") or "").strip()
     model = str(raw.get("model") or "").strip()
+    managed_vllm = managed_vllm_config_from_mapping(raw.get("vllm"), model=model)
     explicit_features = _stage2_explicit_features_from_value(raw.get("explicit_features"))
-    if not endpoint and not model:
+    if not endpoint and not model and managed_vllm is None:
         return None
-    if not endpoint:
+    if endpoint and managed_vllm is not None:
+        raise ValueError(
+            "configure either stage2.endpoint or stage2.vllm, not both"
+        )
+    if managed_vllm is not None and not model:
+        raise ValueError("stage2.model is required when stage2.vllm is configured")
+    if not endpoint and managed_vllm is None:
         raise ValueError("stage2.endpoint is required when stage2.model is specified")
     api_key = str(raw.get("api_key") or os.environ.get("OCI_STAGE2_API_KEY") or "EMPTY")
     legacy_extraction_batch_size = raw.get("extraction_batch_size")
@@ -789,6 +818,19 @@ def plain_stage2_config_from_mapping(
                 return SUPPORTED_STAGE2_ARCHITECTURES
             return tuple(part.strip() for part in value.split(",") if part.strip())
         return tuple(value)
+
+    if "enable_thinking" in raw:
+        enable_thinking = bool(raw["enable_thinking"])
+    else:
+        managed_chat_kwargs = (
+            managed_vllm.default_chat_template_kwargs
+            if managed_vllm is not None
+            else None
+        )
+        enable_thinking = bool(
+            isinstance(managed_chat_kwargs, Mapping)
+            and managed_chat_kwargs.get("enable_thinking") is True
+        )
 
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
@@ -861,10 +903,14 @@ def plain_stage2_config_from_mapping(
         min_nonmissing_fraction=float(raw.get("min_nonmissing_fraction", 0.05)),
         max_dominant_fraction=float(raw.get("max_dominant_fraction", 0.98)),
         temperature=float(raw.get("temperature", 0.0)),
-        enable_thinking=bool(raw.get("enable_thinking", False)),
+        enable_thinking=enable_thinking,
         explicit_features=explicit_features,
+        vllm=managed_vllm,
     )
-    config.validate(require_model=False)
+    config.validate(
+        require_model=False,
+        require_endpoint=managed_vllm is None,
+    )
     return config
 
 
@@ -1375,6 +1421,27 @@ def _openai_completion(
     if not content:
         raise _RetryableStage2ResponseError("Stage 2 model returned an empty response")
     return str(content)
+
+
+class _RoundRobinOpenAICompletion:
+    """Thread-safe request distribution over equivalent vLLM replicas."""
+
+    def __init__(self, endpoints: Sequence[str]) -> None:
+        self.endpoints = tuple(str(endpoint).rstrip("/") for endpoint in endpoints)
+        if not self.endpoints:
+            raise ValueError("Stage 2 completion routing requires at least one endpoint")
+        self._next_index = 0
+        self._lock = threading.Lock()
+
+    def __call__(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        config: PlainHandoffStage2Config,
+    ) -> str:
+        with self._lock:
+            endpoint = self.endpoints[self._next_index % len(self.endpoints)]
+            self._next_index += 1
+        return _openai_completion(messages, replace(config, endpoint=endpoint))
 
 
 def _is_retryable_transport_error(exc: Exception) -> bool:
@@ -3716,7 +3783,8 @@ class PlainHandoffStage2:
         config.validate()
         self.config = config
         self.clinical_question = str(clinical_question)
-        self.completion = completion or _openai_completion
+        endpoints = config.runtime_endpoints or (config.endpoint,)
+        self.completion = completion or _RoundRobinOpenAICompletion(endpoints)
 
     def _load_or_compile_evidence(
         self,
@@ -5048,28 +5116,46 @@ def run_plain_handoff_stage2(
     inner_folds: int = 5,
     seed: int = 42,
 ) -> Mapping[str, Any]:
-    return PlainHandoffStage2(
-        config=config,
-        clinical_question=clinical_question,
-        completion=completion,
-    ).run(
-        handoff_path=handoff_path,
-        output_dir=output_dir,
-        dataset=dataset,
-        split_provenance_path=split_provenance_path,
-        unit_id_column=unit_id_column,
-        text_column=text_column,
-        treatment_column=treatment_column,
-        outcome_column=outcome_column,
-        outcome_type=outcome_type,
-        inner_folds=inner_folds,
-        seed=seed,
-    )
+    def run_with_config(runtime_config: PlainHandoffStage2Config) -> Mapping[str, Any]:
+        return PlainHandoffStage2(
+            config=runtime_config,
+            clinical_question=clinical_question,
+            completion=completion,
+        ).run(
+            handoff_path=handoff_path,
+            output_dir=output_dir,
+            dataset=dataset,
+            split_provenance_path=split_provenance_path,
+            unit_id_column=unit_id_column,
+            text_column=text_column,
+            treatment_column=treatment_column,
+            outcome_column=outcome_column,
+            outcome_type=outcome_type,
+            inner_folds=inner_folds,
+            seed=seed,
+        )
+
+    if config.vllm is None:
+        return run_with_config(config)
+
+    with launch_managed_vllm_servers(
+        config=config.vllm,
+        model=config.model,
+        api_key=config.api_key,
+        output_dir=Path(output_dir) / "vllm_servers",
+    ) as endpoints:
+        runtime_config = replace(
+            config,
+            endpoint=endpoints[0],
+            runtime_endpoints=tuple(endpoints),
+        )
+        return run_with_config(runtime_config)
 
 
 __all__ = [
     "PlainHandoffStage2",
     "PlainHandoffStage2Config",
+    "ManagedVLLMConfig",
     "Stage2ExplicitFeature",
     "packetize_handoff",
     "plain_stage2_config_from_mapping",

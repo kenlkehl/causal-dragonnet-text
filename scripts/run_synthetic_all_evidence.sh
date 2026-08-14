@@ -20,8 +20,11 @@ gpu_limit="${GPU_COUNT:-auto}"
 physical_gpus="${PHYSICAL_GPUS:-}"
 stage1_workers="${STAGE1_WORKERS:-auto}"
 stage2_workers="${STAGE2_WORKERS:-auto}"
-stage2_endpoint="${STAGE2_ENDPOINT-http://127.0.0.1:8010/v1}"
 stage2_model="${STAGE2_MODEL:-}"
+stage2_vllm_servers="${STAGE2_VLLM_SERVERS:-0}"
+stage2_vllm_gpus="${STAGE2_VLLM_GPUS:-}"
+stage2_vllm_download_dir="${STAGE2_VLLM_DOWNLOAD_DIR:-}"
+stage2_vllm_extra_args_json="${STAGE2_VLLM_EXTRA_ARGS_JSON:-}"
 stage2_operationalization_max_prompt_chars="${STAGE2_OPERATIONALIZATION_MAX_PROMPT_CHARS:-}"
 stage2_consolidation_batch_size="${STAGE2_CONSOLIDATION_BATCH_SIZE:-}"
 stage2_consolidation_alphabetical_rounds="${STAGE2_CONSOLIDATION_ALPHABETICAL_ROUNDS:-}"
@@ -36,6 +39,24 @@ inner_folds=5
 
 if [[ "${disable_htr}" != "0" && "${disable_htr}" != "1" ]]; then
     echo "DISABLE_HTR must be 0 or 1." >&2
+    exit 1
+fi
+if [[ ! "${stage2_vllm_servers}" =~ ^[0-9]+$ ]]; then
+    echo "STAGE2_VLLM_SERVERS must be a nonnegative integer." >&2
+    exit 1
+fi
+stage2_vllm_servers=$((10#${stage2_vllm_servers}))
+if (( stage2_vllm_servers > 0 )); then
+    stage2_endpoint="${STAGE2_ENDPOINT:-}"
+else
+    stage2_endpoint="${STAGE2_ENDPOINT-http://127.0.0.1:8010/v1}"
+fi
+if (( stage2_vllm_servers > 0 )) && [[ -n "${stage2_endpoint}" ]]; then
+    echo "Set either STAGE2_ENDPOINT or STAGE2_VLLM_SERVERS, not both." >&2
+    exit 1
+fi
+if (( stage2_vllm_servers > 0 )) && [[ -z "${stage2_model}" ]]; then
+    echo "STAGE2_MODEL is required when STAGE2_VLLM_SERVERS is positive." >&2
     exit 1
 fi
 if [[ -n "${physical_gpus}" && "${gpu_limit}" != "auto" ]]; then
@@ -82,7 +103,11 @@ if [[ -z "${python_bin}" ]]; then
         exit 1
     fi
     echo "Synchronizing ${repo_root}/.venv from the lockfile..."
-    uv sync --frozen
+    if (( stage2_vllm_servers > 0 )); then
+        uv sync --frozen --extra local-llm
+    else
+        uv sync --frozen
+    fi
     python_bin="${repo_root}/.venv/bin/python"
 else
     echo "Using OCI_PYTHON=${python_bin}; dependency synchronization is skipped."
@@ -92,6 +117,12 @@ if [[ ! -x "${python_bin}" ]]; then
     exit 1
 fi
 "${python_bin}" -c 'from sentence_transformers import SentenceTransformer'
+if (( stage2_vllm_servers > 0 )); then
+    if ! "${python_bin}" -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
+        echo "Managed Stage 2 requires vLLM in OCI_PYTHON (install .[local-llm])." >&2
+        exit 1
+    fi
+fi
 
 hardware_line="$(
     "${python_bin}" "${repo_root}/scripts/detect_all_evidence_hardware.py" \
@@ -108,41 +139,58 @@ if [[ -z "${gpu_count}" || -z "${devices}" || -z "${worker_count}" ]]; then
     exit 1
 fi
 
-if [[ -z "${stage2_endpoint}" ]]; then
+stage2_policy_args=()
+if [[ -n "${stage2_operationalization_max_prompt_chars}" ]]; then
+    stage2_policy_args+=(
+        --set "stage2.operationalization_max_prompt_chars=${stage2_operationalization_max_prompt_chars}"
+    )
+fi
+if [[ -n "${stage2_consolidation_batch_size}" ]]; then
+    stage2_policy_args+=(
+        --set "stage2.consolidation_batch_size=${stage2_consolidation_batch_size}"
+    )
+fi
+if [[ -n "${stage2_consolidation_alphabetical_rounds}" ]]; then
+    stage2_policy_args+=(
+        --set "stage2.consolidation_alphabetical_rounds=${stage2_consolidation_alphabetical_rounds}"
+    )
+fi
+if [[ -n "${stage2_consolidation_max_rounds}" ]]; then
+    stage2_policy_args+=(
+        --set "stage2.consolidation_max_rounds=${stage2_consolidation_max_rounds}"
+    )
+fi
+if [[ -n "${stage2_ontology_refinement_min_failure_patients}" ]]; then
+    stage2_policy_args+=(
+        --set "stage2.ontology_refinement_min_failure_patients=${stage2_ontology_refinement_min_failure_patients}"
+    )
+fi
+if [[ -n "${stage2_max_ontology_refinement_rounds}" ]]; then
+    stage2_policy_args+=(
+        --set "stage2.max_ontology_refinement_rounds=${stage2_max_ontology_refinement_rounds}"
+    )
+fi
+
+if (( stage2_vllm_servers > 0 )); then
+    resolved_stage2_vllm_gpus="${stage2_vllm_gpus:-${devices}}"
+    stage_mode_args=(
+        --stage2-model "${stage2_model}"
+        --stage2-vllm-servers "${stage2_vllm_servers}"
+        --stage2-vllm-gpus "${resolved_stage2_vllm_gpus}"
+        --set "stage2.workers=${resolved_stage2_workers}"
+        "${stage2_policy_args[@]}"
+    )
+    if [[ -n "${stage2_vllm_download_dir}" ]]; then
+        stage_mode_args+=(--stage2-vllm-download-dir "${stage2_vllm_download_dir}")
+    fi
+    if [[ -n "${stage2_vllm_extra_args_json}" ]]; then
+        stage_mode_args+=(--set "stage2.vllm.extra_args=${stage2_vllm_extra_args_json}")
+    fi
+    stage2_description="managed vLLM: ${stage2_vllm_servers} servers on ${resolved_stage2_vllm_gpus} (${resolved_stage2_workers} concurrent requests)"
+elif [[ -z "${stage2_endpoint}" ]]; then
     stage_mode_args=(--stage1-only)
     stage2_description="disabled (STAGE2_ENDPOINT is empty)"
 else
-    stage2_policy_args=()
-    if [[ -n "${stage2_operationalization_max_prompt_chars}" ]]; then
-        stage2_policy_args+=(
-            --set "stage2.operationalization_max_prompt_chars=${stage2_operationalization_max_prompt_chars}"
-        )
-    fi
-    if [[ -n "${stage2_consolidation_batch_size}" ]]; then
-        stage2_policy_args+=(
-            --set "stage2.consolidation_batch_size=${stage2_consolidation_batch_size}"
-        )
-    fi
-    if [[ -n "${stage2_consolidation_alphabetical_rounds}" ]]; then
-        stage2_policy_args+=(
-            --set "stage2.consolidation_alphabetical_rounds=${stage2_consolidation_alphabetical_rounds}"
-        )
-    fi
-    if [[ -n "${stage2_consolidation_max_rounds}" ]]; then
-        stage2_policy_args+=(
-            --set "stage2.consolidation_max_rounds=${stage2_consolidation_max_rounds}"
-        )
-    fi
-    if [[ -n "${stage2_ontology_refinement_min_failure_patients}" ]]; then
-        stage2_policy_args+=(
-            --set "stage2.ontology_refinement_min_failure_patients=${stage2_ontology_refinement_min_failure_patients}"
-        )
-    fi
-    if [[ -n "${stage2_max_ontology_refinement_rounds}" ]]; then
-        stage2_policy_args+=(
-            --set "stage2.max_ontology_refinement_rounds=${stage2_max_ontology_refinement_rounds}"
-        )
-    fi
     stage_mode_args=(
         --stage2-endpoint "${stage2_endpoint}"
         --set "stage2.workers=${resolved_stage2_workers}"

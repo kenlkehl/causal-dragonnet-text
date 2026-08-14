@@ -8,11 +8,11 @@ uv run python scripts/run_all_evidence.py \
 ```
 
 It reads one cohort and writes everything to one output directory. With no
-Stage 2 endpoint configured it runs Stage 1 through the plain handoff. With an
-endpoint it continues through fold-scoped feature definitions,
-patient-level extraction, training-fold empirical review, and cross-fitted
-causal estimation. Interruption and resume are automatic: run the same command
-again.
+Stage 2 transport configured it runs Stage 1 through the plain handoff. With an
+external endpoint or a pipeline-managed vLLM pool it continues through
+fold-scoped feature definitions, patient-level extraction, training-fold
+empirical review, and cross-fitted causal estimation. Interruption and resume
+are automatic: run the same command again.
 
 This is the repository's only all-evidence orchestration path. It uses ordinary
 files and completion markers rather than a separate source snapshot, immutable
@@ -115,7 +115,8 @@ model-assisted review may clarify a measurement definition and repeat the
 training-row extraction. The definition is then frozen before it is applied to
 the outer held-out rows. Finally, Stage 2 fits nuisance and effect-modification
 models on the training rows and writes held-out AIPW scores and conditional
-effect estimates. It is enabled by specifying `stage2.endpoint`. For example:
+effect estimates. It is enabled by specifying `stage2.endpoint` or
+`stage2.vllm`.
 
 The only supported compiler is `semantic_cluster_cards_v2`. It checks each
 outer fold for every architecture in the frozen Stage 1 selection (or the
@@ -136,6 +137,8 @@ labels back to the original packets and derives evidence axes and causal roles
 without model-authored IDs. Discovery does not choose value types, units,
 categories, or extraction ontologies; the later one-feature ontology request
 makes those decisions from the retained feature name and supporting text.
+
+An external endpoint configuration is:
 
 ```json
 {
@@ -200,6 +203,76 @@ visibly rather than silently dropping or redefining it.
 OpenAI-compatible `/models` endpoint once at startup and uses the result when
 exactly one model ID is advertised. If the server advertises multiple model
 IDs, set `stage2.model` explicitly to avoid an ambiguous selection.
+
+### Pipeline-managed vLLM replicas
+
+`stage2.vllm` tells the same pipeline process to own the local vLLM server
+lifecycle. In this mode `stage2.model` is required and `stage2.endpoint` must be
+empty or omitted, and the workflow environment must include the `local-llm`
+optional dependency group. For example:
+
+```json
+{
+  "stage2": {
+    "model": "google/gemma-4-31B-it",
+    "workers": 32,
+    "vllm": {
+      "server_count": 8,
+      "gpus": [
+        "cuda:0", "cuda:1", "cuda:2", "cuda:3",
+        "cuda:4", "cuda:5", "cuda:6", "cuda:7"
+      ],
+      "base_port": 8010,
+      "download_dir": "/models/huggingface",
+      "startup_timeout": 7200,
+      "extra_args": [
+        "--gpu-memory-utilization", "0.90",
+        "--max-model-len", "65536"
+      ]
+    }
+  }
+}
+```
+
+The pipeline interprets the GPU values as logical CUDA indices. When its parent
+environment has `CUDA_VISIBLE_DEVICES=4,6`, for example, managed logical GPUs 0
+and 1 are mapped to physical selections 4 and 6 for the child processes. The
+list is divided into equal, nonoverlapping groups in its supplied order and the
+tensor-parallel size of each server is set to its group size. Thus eight
+servers over eight GPUs produces eight one-GPU replicas; four servers over
+eight GPUs produces four two-GPU replicas. Uneven division, duplicate devices,
+or more servers than GPUs is rejected before launch.
+
+The runner checks every requested port before launch, starts all replicas with
+separate `CUDA_VISIBLE_DEVICES` values, and waits for each `/v1/models` API to
+advertise a model. `stage2.workers` remains the total request concurrency; a
+thread-safe round-robin router spreads those requests over the ready endpoints.
+A retry advances to the next endpoint, so one transiently unhealthy replica
+does not receive every retry of the same request. Server logs and a redacted
+manifest containing commands, PIDs, endpoints, GPU assignments, and exit codes
+are stored in `stage2/vllm_servers/`. All managed process groups are terminated
+when Stage 2 succeeds, fails, or is interrupted.
+
+The managed vLLM fields are:
+
+- `server_count`: number of server replicas. If omitted, it defaults to one per
+  supplied GPU.
+- `gpus`: required list or comma-separated string of logical CUDA indices.
+- `host`, `base_port`, or `ports`: bind address and either consecutive or exact
+  ports. Defaults are `127.0.0.1` and ports beginning at 8010.
+- `startup_timeout`, `startup_poll_interval`, and `shutdown_timeout`: lifecycle
+  timing controls in seconds.
+- `download_dir`, `reasoning_parser`, `language_model_only`, and
+  `default_chat_template_kwargs`: named vLLM serve options.
+- `extra_args`: a list of remaining raw vLLM CLI tokens, such as
+  `["--gpu-memory-utilization", "0.90"]`. Orchestration-owned and named options
+  cannot be duplicated here.
+
+Unless explicitly overridden, any model name containing `gemma` uses
+`reasoning_parser: "gemma4"`, `language_model_only: true`, and
+`default_chat_template_kwargs: {"enable_thinking": true}`; Stage 2 request-side
+thinking also defaults on. Any model name containing `qwen` uses
+`reasoning_parser: "qwen3"` and `language_model_only: true`.
 
 Python first coalesces only exact normalized-name duplicates; this is identity
 bookkeeping and makes no semantic decision between distinct names. It then
@@ -292,8 +365,8 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
 `temperature`, and `enable_thinking`. The legacy `max_candidates_per_fold` and
 `consolidation_oversample_factor` fields are still accepted in existing run
-files but do not affect consolidation. A configured endpoint makes the default
-mode `full`. The modes can always be made explicit:
+files but do not affect consolidation. A configured endpoint or managed vLLM
+pool makes the default mode `full`. The modes can always be made explicit:
 
 Each candidate-consolidation batch uses the independent
 `consolidation_max_prompt_chars` limit (640,000 characters by default), each
@@ -324,6 +397,12 @@ uv run python scripts/run_all_evidence.py \
 The same choice can be stored as `run.mode: "full"`, `"stage1"`, or
 `"stage2"`. `--stage1-only` and `--stage2-only` override it. Endpoint and model
 values can also be supplied as `--stage2-endpoint` and `--stage2-model`.
+Managed mode additionally has `--stage2-vllm-servers`,
+`--stage2-vllm-gpus`, `--stage2-vllm-base-port`,
+`--stage2-vllm-download-dir`, `--stage2-vllm-reasoning-parser`,
+`--stage2-vllm-language-model-only` (and its `--no-` form),
+`--stage2-vllm-default-chat-template-kwargs`, and repeatable
+`--stage2-vllm-extra-arg` options.
 
 ## Arguments instead of a config
 

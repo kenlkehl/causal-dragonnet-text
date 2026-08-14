@@ -13,9 +13,9 @@ fold boundaries, and estimate causal effects with diagnostics.
 OCI supports Python 3.12 and 3.13 and uses
 [`uv`](https://docs.astral.sh/uv/) for reproducible environments. The complete
 multi-model workflow requires NVIDIA CUDA GPUs; the default embedding model
-needs approximately 20 GiB of free VRAM on each selected GPU. A local vLLM
-server is an optional installation rather than part of the Stage 1/Stage 2
-client environment.
+needs approximately 20 GiB of free VRAM on each selected GPU. vLLM is optional:
+an external server can use a separate environment, while pipeline-managed
+servers require the `local-llm` extra in the workflow environment.
 
 Create the project environment with:
 
@@ -38,9 +38,10 @@ libraries required by the chosen vLLM/Torch build.
 
 ## Try the complete Stage 1 → 2 workflow
 
-Start an OpenAI-compatible language-model server for Stage 2. The example
-launcher expects it at `http://127.0.0.1:8010/v1` and automatically uses the
-only model advertised by its `/models` endpoint. Then run the bundled
+Stage 2 can use an already-running OpenAI-compatible server or launch its own
+pool of local vLLM servers. The example launcher retains the external-server
+default and expects it at `http://127.0.0.1:8010/v1`; it automatically uses the
+only model advertised by that server's `/models` endpoint. Then run the bundled
 one-confounder, one-effect-modifier NSCLC experiment:
 
 ```bash
@@ -66,12 +67,21 @@ PHYSICAL_GPUS=1,3 ./run_one_conf_one_mod.sh
 STAGE2_ENDPOINT=http://127.0.0.1:8010/v1 \
 STAGE2_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4 \
 ./run_one_conf_one_mod.sh
+
+# Or let the launcher run one vLLM replica on each of eight selected GPUs.
+STAGE2_VLLM_SERVERS=8 \
+STAGE2_MODEL=google/gemma-4-31B-it \
+GPU_COUNT=8 \
+./run_one_conf_one_mod.sh
 ```
 
 `GPU_COUNT` and `PHYSICAL_GPUS` are mutually exclusive. Advanced overrides are
 `MIN_FREE_GPU_GB`, `STAGE1_WORKERS`, `STAGE2_WORKERS`, `DISABLE_HTR`,
 `STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (set it to an empty string for a
-Stage-1-only run). Set
+Stage-1-only run). Managed mode accepts `STAGE2_VLLM_SERVERS`, optional
+`STAGE2_VLLM_GPUS` (the detected logical devices are the default),
+`STAGE2_VLLM_DOWNLOAD_DIR`, and a JSON token list in
+`STAGE2_VLLM_EXTRA_ARGS_JSON`. Set
 `OCI_PYTHON` to an existing environment's interpreter to skip `uv sync`. An
 optional positional argument changes the output directory. The larger synthetic
 example uses the identical hardware and endpoint behavior:
@@ -594,15 +604,17 @@ text-model lanes. If fewer workers than CUDA devices are requested, each active
 device still requires one controller worker. Stage 2 uses its own
 `stage2.workers` setting for concurrent interpretation requests and
 patient-extraction batches. Review rounds and outer folds remain ordered so that
-a single endpoint is never multiplied by two independent concurrency limits.
+the configured endpoint pool is never multiplied by two independent
+concurrency limits.
 Every Stage 1 context and every expensive Stage 2 batch writes its own
 `complete.json`, so the same scheduling remains resumable after interruption.
 
 ### Stage-specific execution
 
-An empty Stage 2 endpoint means that the workflow stops after Stage 1. This is
-useful when a researcher wishes to inspect the discovery evidence before
-permitting any variables to enter the causal analysis.
+When neither a Stage 2 endpoint nor a managed vLLM pool is configured, the
+workflow stops after Stage 1. This is useful when a researcher wishes to inspect
+the discovery evidence before permitting any variables to enter the causal
+analysis.
 
 ```bash
 uv run python scripts/run_all_evidence.py --config run.json --stage1-only
@@ -629,9 +641,9 @@ concurrent task can exhaust OpenBLAS's thread metadata or memory regions and
 terminate the process. A configured `stage2.model` is reused; otherwise the
 runner discovers the sole model advertised by the endpoint.
 
-A configured endpoint makes the unflagged default a full Stage 1 and Stage 2
-run. The API key may be stored in `stage2.api_key` or supplied through
-`OCI_STAGE2_API_KEY`. For example:
+A configured endpoint or managed vLLM pool makes the unflagged default a full
+Stage 1 and Stage 2 run. The API key may be stored in `stage2.api_key` or
+supplied through `OCI_STAGE2_API_KEY`. For example:
 
 ```json
 {
@@ -664,6 +676,84 @@ run. The API key may be stored in `stage2.api_key` or supplied through
 endpoint's OpenAI-compatible `/models` API and uses the advertised model if
 exactly one model ID is returned. Configure `stage2.model` explicitly when the
 endpoint advertises multiple IDs.
+
+### Pipeline-managed vLLM server pools
+
+To let the pipeline start and stop vLLM itself, omit `stage2.endpoint`, provide
+`stage2.model`, and add `stage2.vllm`. This example launches eight independent
+model replicas, one on each of eight logical GPUs, then distributes all
+concurrent Stage 2 requests round-robin across them:
+
+```json
+{
+  "stage2": {
+    "model": "google/gemma-4-31B-it",
+    "workers": 32,
+    "vllm": {
+      "server_count": 8,
+      "gpus": [
+        "cuda:0", "cuda:1", "cuda:2", "cuda:3",
+        "cuda:4", "cuda:5", "cuda:6", "cuda:7"
+      ],
+      "base_port": 8010,
+      "download_dir": "/models/huggingface",
+      "extra_args": [
+        "--gpu-memory-utilization", "0.90",
+        "--max-model-len", "65536"
+      ]
+    }
+  },
+  "run": {
+    "mode": "stage2"
+  }
+}
+```
+
+The GPU list contains indices in the pipeline's current logical CUDA namespace.
+If the parent was started with `CUDA_VISIBLE_DEVICES`, each child assignment is
+mapped through that setting. GPUs are split into equal, nonoverlapping groups:
+eight servers over eight GPUs gives tensor parallel size 1, while four servers
+over eight GPUs gives tensor parallel size 2. Uneven divisions, duplicate GPUs,
+and more servers than GPUs are rejected before any process starts.
+
+The managed settings `host`, `base_port` (or an exact `ports` list),
+`startup_timeout`, `startup_poll_interval`, and `shutdown_timeout` control the
+server lifecycle. `download_dir`, `reasoning_parser`, `language_model_only`, and
+`default_chat_template_kwargs` map directly to their vLLM options. Any remaining
+vLLM options can be supplied as individual command tokens in `extra_args`.
+Model, host, port, tensor-parallel size, API key, and the named options above are
+owned by the pipeline and cannot also be overridden in `extra_args`.
+
+Recognized model families get these defaults unless the corresponding setting
+is explicitly overridden:
+
+- Gemma model names: `reasoning_parser: "gemma4"`,
+  `language_model_only: true`, and
+  `default_chat_template_kwargs: {"enable_thinking": true}`. Stage 2 requests
+  also default to `enable_thinking: true`.
+- Qwen model names: `reasoning_parser: "qwen3"` and
+  `language_model_only: true`.
+
+The equivalent direct CLI invocation is:
+
+```bash
+uv run python scripts/run_all_evidence.py \
+  --config run.json \
+  --stage2-only \
+  --stage2-model google/gemma-4-31B-it \
+  --stage2-vllm-servers 8 \
+  --stage2-vllm-gpus cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7 \
+  --stage2-vllm-download-dir /models/huggingface \
+  --stage2-vllm-extra-arg=--gpu-memory-utilization \
+  --stage2-vllm-extra-arg=0.90
+```
+
+The runner waits until every server advertises a model at `/v1/models` before
+starting inference. Logs and the redacted process/GPU/endpoint manifest are
+written under `stage2/vllm_servers/`. On normal completion, interruption, or a
+Stage 2 error, it terminates every managed vLLM process group. The existing
+single external endpoint mode is unchanged, and `stage2.endpoint` and
+`stage2.vllm` are mutually exclusive.
 
 To guarantee inclusion of an investigator-specified variable, populate
 `stage2.explicit_features` with complete definitions containing `name`,

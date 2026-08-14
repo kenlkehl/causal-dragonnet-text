@@ -27,9 +27,10 @@
    reported as `already_complete`.
 
 Use `--stage1-only` to stop at the handoff or `--stage2-only` to consume an
-existing handoff. Setting `stage2.endpoint` in the config makes an unflagged
-invocation run both phases. `stage2.model` may be omitted when the endpoint's
-`/models` API advertises exactly one model ID.
+existing handoff. Setting `stage2.endpoint` or `stage2.vllm` in the config makes
+an unflagged invocation run both phases. `stage2.model` may be omitted when an
+external endpoint's `/models` API advertises exactly one model ID; it is required
+when the pipeline launches vLLM itself.
 
 To run a scientific subset of Stage 1, add (for example)
 `--architectures bow_nuisance,tfidf_topics`. Private prerequisites are resolved
@@ -68,6 +69,31 @@ fixed, required definitions during empirical review.
 Interpretation and extraction requests are concurrent up to `stage2.workers`.
 Each extraction request contains exactly one patient's text; this isolation is
 an invariant rather than a configurable batch-size choice.
+
+For eight independent vLLM replicas on eight GPUs, replace `endpoint` in the
+example above with:
+
+```json
+{
+  "stage2": {
+    "model": "google/gemma-4-31B-it",
+    "workers": 32,
+    "vllm": {
+      "server_count": 8,
+      "gpus": [0, 1, 2, 3, 4, 5, 6, 7],
+      "download_dir": "/models/huggingface",
+      "extra_args": ["--gpu-memory-utilization", "0.90"]
+    }
+  }
+}
+```
+
+Stage 2 starts the servers, waits for all eight model endpoints, round-robins
+work across them, and stops them on exit. Gemma defaults to the `gemma4`
+reasoning parser, language-model-only mode, and thinking enabled. Qwen defaults
+to the `qwen3` reasoning parser and language-model-only mode. See the complete
+workflow guide for GPU partition rules and all managed-server settings.
+
 Before interpretation, Stage 2 compiles the raw handoff into fold-local,
 provenance-preserving semantic cards under `stage2/evidence_compilation/`.
 Each completed request is saved beneath the relevant outer-fold directory, so

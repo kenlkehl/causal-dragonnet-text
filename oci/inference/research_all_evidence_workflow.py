@@ -416,7 +416,7 @@ def compile_config(
     if mode not in {"full", "stage1", "stage2"}:
         raise ValueError("run.mode must be 'full', 'stage1', or 'stage2'")
     if mode in {"full", "stage2"} and stage2 is None:
-        raise ValueError(f"run.mode={mode!r} requires stage2.endpoint")
+        raise ValueError(f"run.mode={mode!r} requires stage2.endpoint or stage2.vllm")
     selected_components = tuple(str(value) for value in raw_components)
     if mode == "full":
         if "handoff" not in selected_components:
@@ -1399,7 +1399,7 @@ def _stage2_component(
     if not handoff_path.is_file() or not handoff_complete.is_file():
         raise FileNotFoundError(f"Stage 2 requires the completed Stage 1 handoff: {handoff_path}")
     if context.config.stage2 is None:
-        raise ValueError("Stage 2 requires stage2.endpoint")
+        raise ValueError("Stage 2 requires stage2.endpoint or stage2.vllm")
     stage2_config = replace(
         context.config.stage2,
         required_architectures=_required_stage2_architectures(context),
@@ -1881,9 +1881,54 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage2-endpoint", help="OpenAI-compatible Stage 2 base URL")
     parser.add_argument(
         "--stage2-model",
-        help="model served by the Stage 2 endpoint; auto-discovered when omitted",
+        help=(
+            "Stage 2 model; auto-discovered for a single external endpoint, "
+            "required for managed vLLM"
+        ),
     )
     parser.add_argument("--stage2-api-key", help="endpoint key; defaults to OCI_STAGE2_API_KEY")
+    parser.add_argument(
+        "--stage2-vllm-servers",
+        type=int,
+        help="launch this many pipeline-owned vLLM servers for Stage 2",
+    )
+    parser.add_argument(
+        "--stage2-vllm-gpus",
+        help="comma-separated logical GPUs assigned across managed vLLM servers",
+    )
+    parser.add_argument(
+        "--stage2-vllm-base-port",
+        type=int,
+        help="first port for pipeline-owned vLLM servers (default: 8010)",
+    )
+    parser.add_argument(
+        "--stage2-vllm-download-dir",
+        help="Hugging Face model download/cache directory passed to vLLM",
+    )
+    parser.add_argument(
+        "--stage2-vllm-reasoning-parser",
+        help="vLLM reasoning parser; family-specific when omitted",
+    )
+    parser.add_argument(
+        "--stage2-vllm-language-model-only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="enable or disable vLLM's language-model-only mode",
+    )
+    parser.add_argument(
+        "--stage2-vllm-default-chat-template-kwargs",
+        help="JSON object passed to vLLM --default-chat-template-kwargs",
+    )
+    parser.add_argument(
+        "--stage2-vllm-extra-arg",
+        action="append",
+        default=None,
+        metavar="TOKEN",
+        help=(
+            "one additional vLLM CLI token; repeat for flags and values, "
+            "using --stage2-vllm-extra-arg=--flag for tokens beginning with --"
+        ),
+    )
     parser.add_argument(
         "--stage2-review-rounds",
         type=int,
@@ -1974,6 +2019,43 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
         value = getattr(args, f"stage2_{key}")
         if value is not None:
             stage2[key] = value
+    managed_vllm_overrides = {
+        "server_count": args.stage2_vllm_servers,
+        "gpus": args.stage2_vllm_gpus,
+        "base_port": args.stage2_vllm_base_port,
+        "download_dir": args.stage2_vllm_download_dir,
+        "reasoning_parser": args.stage2_vllm_reasoning_parser,
+        "language_model_only": args.stage2_vllm_language_model_only,
+        "extra_args": args.stage2_vllm_extra_arg,
+    }
+    if args.stage2_vllm_default_chat_template_kwargs is not None:
+        try:
+            default_chat_template_kwargs = json.loads(
+                args.stage2_vllm_default_chat_template_kwargs
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "--stage2-vllm-default-chat-template-kwargs must be valid JSON"
+            ) from exc
+        if not isinstance(default_chat_template_kwargs, Mapping):
+            raise ValueError(
+                "--stage2-vllm-default-chat-template-kwargs must contain one JSON object"
+            )
+        managed_vllm_overrides["default_chat_template_kwargs"] = (
+            default_chat_template_kwargs
+        )
+    if any(value is not None for value in managed_vllm_overrides.values()):
+        vllm_value = stage2.get("vllm")
+        if vllm_value is None:
+            vllm: MutableMapping[str, Any] = {}
+            stage2["vllm"] = vllm
+        elif isinstance(vllm_value, MutableMapping):
+            vllm = vllm_value
+        else:
+            raise ValueError("stage2.vllm must be a configuration object or null")
+        for key, value in managed_vllm_overrides.items():
+            if value is not None:
+                vllm[key] = value
     stage2_numeric_overrides = {
         "max_review_rounds": args.stage2_review_rounds,
         "estimation_trees": args.stage2_estimation_trees,
