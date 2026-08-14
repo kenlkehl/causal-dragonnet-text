@@ -58,16 +58,18 @@ DEFAULT_CONSOLIDATION_MAX_ROUNDS = (
 )
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
-CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v13_merge_only_then_role_filter"
+CONSOLIDATION_SCHEMA_VERSION = (
+    "global_candidate_pool_v14_atomic_merge_only_then_role_filter"
+)
 GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
-    "alphabetical_then_seeded_shuffle_candidate_batches_v8_merge_only"
+    "alphabetical_then_seeded_shuffle_candidate_batches_v9_atomic_merge_only"
 )
 EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
     "training_failure_ontology_refinement_v1_explicit_feature_invariants"
 )
 OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_bounded_supporting_text_v4"
-INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v7"
-INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v4"
+INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v8_atomic"
+INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v5_atomic"
 CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE = "configured_explicit_feature"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
@@ -1696,8 +1698,8 @@ def _interpretation_response_contract() -> dict[str, Any]:
             {
                 "name": "snake_case_clinical_feature_name",
                 "description": (
-                    "exactly one underlying or explicitly documented patient-level clinical "
-                    "feature that could produce the observed text evidence pattern"
+                    "exactly one atomic, reusable patient-level clinical measurement or "
+                    "attribute with one coherent value domain"
                 ),
                 "supporting_items": [1],
                 "evidence_rationale": (
@@ -1708,6 +1710,22 @@ def _interpretation_response_contract() -> dict[str, Any]:
             }
         ],
     }
+
+
+def _atomic_feature_interpretation_rules() -> list[str]:
+    """Return shared rules that keep discovered variables specific and scalar."""
+
+    return [
+        "Prefer atomic clinical variables.",
+        "A candidate is atomic only when a downstream extractor could assign exactly one patient-level value under one coherent ontology. It must not require returning a list, set, tuple, mapping, concatenated code, profile, inventory, or ad hoc aggregation of independently varying values.",
+        "Use the narrowest stable and reusable clinical construct directly supported by the cited evidence. Do not use a parent domain, umbrella label, or catch-all concept when the evidence supports separately measurable attributes.",
+        "When evidence explicitly states or unambiguously encodes multiple independently meaningful components, return those components as separate candidates. Do not also return their umbrella or composite representation.",
+        "Do not split a variable merely because its evidence contains different values, categories, thresholds, units, synonyms, or reporting formats. Those may be representations of one underlying measurement rather than distinct variables.",
+        "An established construct that is conventionally reported as one value remains one candidate even if that value summarizes multiple inputs.",
+        "Specificity concerns the measured clinical dimension, not a particular patient, observed value, document, or wording. Do not encode instance-specific details in a candidate name.",
+        "Do not invent components that are not directly stated or unambiguously encoded in the evidence. If an atomic reusable variable cannot be identified, return no candidate rather than a vague catch-all.",
+        "Each candidate name must identify its exact extraction target. A broad name cannot be repaired by placing a more specific target only in its description.",
+    ]
 
 
 def _interpretation_evidence_items(
@@ -1739,7 +1757,7 @@ def _interpretation_prompt(
         "rules": [
             "Each candidate must represent one patient-level clinical variable with one value per patient. It must be assignable by examining one patient's record without comparing or aggregating across patients.",
             "Return explicitly documented clinical features and narrower latent clinical features reasonably implied by the text.",
-            "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
+            *_atomic_feature_interpretation_rules(),
             "Use longitudinal information as clinical context when it appears in the evidence. Do not perform temporal eligibility filtering.",
             "Do not return patient names, administrative identifiers, documentation artifacts, descriptions of the input collection, multiple-patient heterogeneity, grouping methods, or analysis methods as clinical features.",
             "If no valid feature is supported, return an empty candidates list. Never turn the absence of a common feature into a candidate.",
@@ -1780,7 +1798,7 @@ def _rejected_packet_audit_prompt(
             "Review every evidence item independently. One clear item is sufficient to support a candidate; a clue does not need to recur.",
             "Each candidate must represent one patient-level clinical variable with one value per patient. It must be assignable by examining one patient's record without comparing or aggregating across patients.",
             "Return explicitly documented clinical features and narrower latent clinical features reasonably implied by the text.",
-            "Return distinct measurements or attributes as separate candidates. Do not combine them into a profile, burden, syndrome, or general patient state.",
+            *_atomic_feature_interpretation_rules(),
             "Use longitudinal information as clinical context when it appears in the evidence. Do not perform temporal eligibility filtering.",
             "Do not return patient names, administrative identifiers, documentation artifacts, descriptions of the input collection, multiple-patient heterogeneity, grouping methods, or analysis methods as clinical features.",
             "If no valid feature is supported, return an empty candidates list. Never turn the absence of a common feature into a candidate.",
@@ -1796,7 +1814,8 @@ def _rejected_packet_audit_prompt(
             "role": "system",
             "content": (
                 "Re-examine the supplied text for missed patient-level clinical features. "
-                "Favor recall among valid individual-patient variables, but return no "
+                "Favor recall by exhaustively identifying supported atomic variables, not "
+                "by creating umbrella, inventory, or composite candidates. Return no "
                 "candidate for input or analysis artifacts. Return JSON only."
             ),
         },
@@ -2991,7 +3010,13 @@ def _global_candidate_pool_prompt(
             "When a value-encoded or awkward alias has a clear underlying measurement in this batch, merge it into that measurement; otherwise retain it unchanged.",
             "Judge alias families jointly across this entire batch; do not require a direct lexical match between every pair of members in one family.",
             "Do not merge merely related but independently varying variables, a diagnosis with a related laboratory value, a broad concept with one independently varying component, different anatomical sites, different biomarkers, or different timepoints.",
-            "The output must be one concise snake_case canonical name for the consolidated measurement. It may reuse the best input name or provide a clearer equivalent name.",
+            "Merge only true semantic aliases of the same atomic clinical variable. Inputs are aliases only when they identify the same measured dimension and can share one extraction ontology without discarding an independently varying component.",
+            "Every merge output must itself be atomic: one patient-level value under one coherent ontology.",
+            "The canonical output name must identify the exact clinical dimension shared by every merge input. It must not broaden them into a parent domain, umbrella, inventory, profile, or composite construct.",
+            "Never introduce a broader name merely to make related candidates appear mergeable. Clinical relatedness, correlation, shared anatomy, shared domain, or membership in the same assessment does not establish semantic equivalence.",
+            "Do not merge constituent variables that can vary independently. If no precise atomic target is common to every input, retain the inputs unchanged.",
+            "Differences that encode only values, categories, thresholds, units, spelling, abbreviations, or reporting formats may still represent aliases of one underlying variable. Preserve the measured dimension without encoding a particular observed value in the canonical name.",
+            "The output must be one concise snake_case canonical name for the exact consolidated measurement. It may reuse the best input name or provide a clearer equivalent name.",
             "When semantic equivalence is uncertain, do not merge the features.",
             "Return only exact supplied feature names in merge inputs. Return no internal IDs, provenance, definitions, explanations, unchanged feature names, or exclusion list.",
         ],

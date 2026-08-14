@@ -1210,6 +1210,13 @@ def test_interpretation_prompt_inverts_noisy_text_evidence_without_temporal_filt
     assert "do not choose a value type" in rules
     assert "longitudinal information as clinical context" in rules
     assert "do not perform temporal eligibility filtering" in rules
+    assert "prefer atomic clinical variables" in rules
+    assert "one coherent ontology" in rules
+    assert "list, set, tuple, mapping, concatenated code" in rules
+    assert "parent domain, umbrella label, or catch-all concept" in rules
+    assert "do not also return their umbrella or composite representation" in rules
+    assert "do not split a variable merely because" in rules
+    assert "each candidate name must identify its exact extraction target" in rules
     assert "clinical_question" not in body
     assert "architecture" not in body
     assert body["evidence_items"] == [
@@ -1224,6 +1231,9 @@ def test_interpretation_prompt_inverts_noisy_text_evidence_without_temporal_filt
     assert "stage 1" not in instructions
     assert "value_type" not in json.dumps(body["response"])
     assert "supporting_items" in body["response"]["candidates"][0]
+    assert "atomic, reusable patient-level clinical measurement" in (
+        body["response"]["candidates"][0]["description"]
+    )
     assert "packet_dispositions" not in instructions
     assert "evidence_rationale" in body["response"]["candidates"][0]
     rendered_items = json.dumps(body["evidence_items"])
@@ -1272,6 +1282,12 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
     assert "blank or null name" in rules
     assert "do not choose a value type" in rules
     assert "input or analysis artifacts" in messages[0]["content"].lower()
+    assert "supported atomic variables" in messages[0]["content"].lower()
+    assert "not by creating umbrella, inventory, or composite candidates" in (
+        messages[0]["content"].lower()
+    )
+    assert "prefer atomic clinical variables" in rules
+    assert "return no candidate rather than a vague catch-all" in rules
     assert "longitudinal information as clinical context" in rules
     assert "pretreatment" not in instructions
     assert "posttreatment" not in instructions
@@ -2624,6 +2640,12 @@ def test_global_candidate_pool_prompt_exposes_all_unique_names_and_descriptions(
     assert "only when that exact name appears in the same directive's inputs" in instructions
     assert "merge-only ontology consolidation" in instructions
     assert "never exclude or drop" in instructions
+    assert "true semantic aliases of the same atomic clinical variable" in instructions
+    assert "every merge output must itself be atomic" in instructions
+    assert "must not broaden them into a parent domain" in instructions
+    assert "does not establish semantic equivalence" in instructions
+    assert "constituent variables that can vary independently" in instructions
+    assert "no precise atomic target is common to every input" in instructions
     assert "exclude_feature_names" not in messages[1]["content"]
     assert "pretreatment" not in instructions
     assert "post-treatment" not in instructions
