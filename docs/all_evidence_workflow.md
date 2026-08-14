@@ -148,6 +148,7 @@ makes those decisions from the retained feature name and supporting text.
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
+    "operationalization_max_prompt_chars": 640000,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
     "consolidation_max_rounds": 55,
@@ -265,10 +266,22 @@ feature-count cap between alias grouping and operationalization. A group that
 contains a configured explicit feature skips this request and uses its supplied
 ontology instead.
 
+Operationalization requests have an independent
+`operationalization_max_prompt_chars` allowance (640,000 characters by
+default). Python reserves repair headroom and deterministically packs whole
+supporting excerpts under the remaining initial-prompt budget. The checkpoint
+records counts and character totals for available, included, omitted, and
+truncated evidence together with a fingerprint of the full available evidence
+list, while the final feature retains complete packet provenance. If the model
+still returns an invalid ontology after all bounded repairs, Stage 2 writes
+`fallback.json` and uses a conservative `ambiguous` ontology for training-fold
+extraction and review rather than aborting the fold.
+
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
 `transport_retry_backoff`, `max_prompt_chars`,
 `consolidation_max_prompt_chars`,
+`operationalization_max_prompt_chars`,
 `consolidation_batch_size`, `consolidation_alphabetical_rounds`,
 `consolidation_max_rounds`,
 `extraction_max_prompt_chars`,
@@ -283,12 +296,14 @@ files but do not affect consolidation. A configured endpoint makes the default
 mode `full`. The modes can always be made explicit:
 
 Each candidate-consolidation batch uses the independent
-`consolidation_max_prompt_chars` limit (640,000 characters by default), while
-patient-variable extraction uses `extraction_max_prompt_chars` (also 640,000 by
-default) because every extraction request includes the complete frozen feature
-ontology. `max_prompt_chars` continues to bound interpretation and review
-planning. These character limits are safety/planning guards, not claims about
-the model's token context. Extraction always sends exactly one patient's text
+`consolidation_max_prompt_chars` limit (640,000 characters by default), each
+one-feature ontology request uses `operationalization_max_prompt_chars`
+(640,000 by default), and patient-variable extraction uses
+`extraction_max_prompt_chars` (also 640,000 by default) because every extraction
+request includes the complete frozen feature ontology. `max_prompt_chars`
+continues to bound interpretation and review planning. These character limits
+are safety/planning guards, not claims about the model's token context.
+Extraction always sends exactly one patient's text
 per request; oversized notes are split into lossless contiguous pages. Clinical
 text remains Unicode instead of expanding into token-heavy ASCII escape
 sequences. `stage2.workers` controls independent consolidation-batch concurrency

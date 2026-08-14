@@ -87,6 +87,7 @@ with
 `STAGE2_CONSOLIDATION_BATCH_SIZE`,
 `STAGE2_CONSOLIDATION_ALPHABETICAL_ROUNDS`,
 `STAGE2_CONSOLIDATION_MAX_ROUNDS`,
+`STAGE2_OPERATIONALIZATION_MAX_PROMPT_CHARS`,
 `STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS`, and
 `STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS`.
 
@@ -643,6 +644,7 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
+    "operationalization_max_prompt_chars": 640000,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
     "consolidation_max_rounds": 55,
@@ -727,6 +729,14 @@ measurement rule, and missingness handling from that evidence; packet structure,
 evidence kind, detail objects, truncation flags, fold metadata, internal IDs,
 causal axes, semantic grouping, architecture names, scores, support counts,
 candidate summaries, and earlier proposed value types stay outside the prompt.
+Operationalization has an independent 640,000-character prompt allowance. If a
+large merged alias family has more readable evidence than fits with repair
+headroom, Python deterministically packs whole excerpts under the limit and
+records the available, included, omitted, and truncated evidence counts plus a
+fingerprint of all available evidence. A malformed ontology still receives the
+bounded repair attempts; if it remains invalid, Python records an explicit
+fallback artifact and uses a conservative `ambiguous` ontology for training-fold
+extraction and review instead of aborting the outer fold.
 Every consolidation round/batch and one-group operationalization request is
 input-fingerprinted separately, so a retry skips successful leaves instead of
 repeating the whole fan-out. Batch size and maximum rounds are configurable as

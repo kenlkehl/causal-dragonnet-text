@@ -57,6 +57,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.transport_max_attempts == 3
     assert config.max_prompt_chars == 100_000
     assert config.consolidation_max_prompt_chars == 640_000
+    assert config.operationalization_max_prompt_chars == 640_000
     assert config.consolidation_batch_size == 20
     assert config.consolidation_alphabetical_rounds == 5
     assert config.consolidation_max_rounds == 55
@@ -79,6 +80,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "endpoint": "http://stage2.test/v1",
             "max_prompt_chars": 90_000,
             "consolidation_max_prompt_chars": 450_000,
+            "operationalization_max_prompt_chars": 475_000,
             "consolidation_batch_size": 18,
             "consolidation_alphabetical_rounds": 4,
             "consolidation_max_rounds": 7,
@@ -92,6 +94,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config is not None
     assert config.max_prompt_chars == 90_000
     assert config.consolidation_max_prompt_chars == 450_000
+    assert config.operationalization_max_prompt_chars == 475_000
     assert config.consolidation_batch_size == 18
     assert config.consolidation_alphabetical_rounds == 4
     assert config.consolidation_max_rounds == 7
@@ -99,6 +102,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
     assert config.public_dict()["consolidation_max_prompt_chars"] == 450_000
+    assert config.public_dict()["operationalization_max_prompt_chars"] == 475_000
     assert config.public_dict()["consolidation_batch_size"] == 18
     assert config.public_dict()["consolidation_alphabetical_rounds"] == 4
     assert config.public_dict()["consolidation_max_rounds"] == 7
@@ -108,6 +112,13 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
 
 
 def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
+    with pytest.raises(ValueError, match="operationalization_max_prompt_chars"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            operationalization_max_prompt_chars=3_999,
+        ).validate()
+
     with pytest.raises(ValueError, match="consolidation_batch_size must be at least 2"):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
@@ -2546,7 +2557,7 @@ def test_stage2_iterative_consolidation_does_not_lose_candidates():
     assert all(size <= limit for _job, size, limit in prompts)
     assert prompts[0][2] == config.consolidation_max_prompt_chars
     assert prompts[1][2] == config.consolidation_max_prompt_chars
-    assert prompts[2][2] == config.max_prompt_chars
+    assert prompts[2][2] == config.operationalization_max_prompt_chars
     assert set(result["candidate_dispositions"]) == {
         candidate["candidate_id"] for candidate in candidates
     }
@@ -4220,6 +4231,146 @@ def test_operationalization_duplicate_category_repair_names_colliding_values():
     assert "return each category once" in repair
     assert "Disabled" in repair
     assert "disabled" in repair
+
+
+def test_operationalization_packs_oversized_supporting_evidence_under_independent_budget(
+    tmp_path: Path,
+):
+    packet_ids = [f"packet_{index:03d}" for index in range(12)]
+    packet_by_id = {
+        packet_id: {
+            "packet_id": packet_id,
+            "content": {
+                "representative_evidence": [
+                    {
+                        "text": (
+                            f"Distinct clinical evidence excerpt {index}. "
+                            + (chr(ord("a") + index) * 2_500)
+                        )
+                    }
+                ]
+            },
+        }
+        for index, packet_id in enumerate(packet_ids)
+    }
+    observed: dict[str, object] = {}
+
+    def completion(messages, request_config):
+        observed["prompt_chars"] = sum(len(message["content"]) for message in messages)
+        observed["prompt_limit"] = request_config.max_prompt_chars
+        observed["body"] = json.loads(messages[1]["content"])
+        return json.dumps(
+            {
+                "description": "A generic quantitative clinical measurement.",
+                "value_type": "continuous",
+                "categories_or_unit": ["standard unit"],
+                "measurement_definition": "Extract the documented pretreatment value.",
+                "missing_value_rule": "Return null when undocumented.",
+            }
+        )
+
+    output_dir = tmp_path / "operationalization"
+    result = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            max_prompt_chars=4_000,
+            operationalization_max_prompt_chars=8_000,
+        ),
+        clinical_question="Estimate a treatment effect.",
+        completion=completion,
+    )._operationalize_candidate_group(
+        group={
+            "candidate_id": "group_001",
+            "name": "generic_quantitative_measurement",
+            "description": "A generic quantitative clinical measurement.",
+            "evidence_axes": ["outcome"],
+            "supporting_packet_ids": packet_ids,
+            "supporting_architectures": ["architecture_1"],
+            "ontology_packet_ids": packet_ids,
+        },
+        packet_by_id=packet_by_id,
+        output_dir=output_dir,
+    )
+
+    assert result["value_type"] == "continuous"
+    assert observed["prompt_limit"] == 8_000
+    assert int(observed["prompt_chars"]) <= 8_000
+    body = observed["body"]
+    assert isinstance(body, dict)
+    assert 0 < len(body["supporting_evidence"]) < len(packet_ids)
+    checkpoint_input = json.loads((output_dir / "input.json").read_text(encoding="utf-8"))
+    packing = checkpoint_input["evidence_packing"]
+    assert packing["available_evidence_items"] == len(packet_ids)
+    assert packing["included_evidence_items"] == len(body["supporting_evidence"])
+    assert packing["omitted_evidence_items"] > 0
+    assert packing["prompt_chars"] == observed["prompt_chars"]
+    assert packing["initial_prompt_budget_chars"] < packing["request_prompt_limit_chars"]
+
+
+def test_operationalization_uses_audited_ambiguous_fallback_after_exhausted_repairs(
+    tmp_path: Path,
+):
+    calls = 0
+
+    def completion(_messages, _config):
+        nonlocal calls
+        calls += 1
+        return json.dumps(
+            {
+                "description": "A generic clinical state.",
+                "value_type": "binary",
+                "categories_or_unit": ["low-intermediate"],
+                "measurement_definition": "Extract the documented pretreatment state.",
+                "missing_value_rule": "Return null when undocumented.",
+            }
+        )
+
+    packet_by_id = {
+        packet["packet_id"]: packet for packet in _original_evidence_packets(["packet_1"])
+    }
+    group = {
+        "candidate_id": "group_001",
+        "name": "generic_clinical_state",
+        "description": "A generic clinical state.",
+        "evidence_axes": ["outcome"],
+        "supporting_packet_ids": ["packet_1"],
+        "supporting_architectures": ["architecture_1"],
+        "ontology_packet_ids": ["packet_1"],
+    }
+    output_dir = tmp_path / "operationalization"
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            operationalization_max_prompt_chars=20_000,
+        ),
+        clinical_question="Estimate a treatment effect.",
+        completion=completion,
+    )
+
+    first = runner._operationalize_candidate_group(
+        group=group,
+        packet_by_id=packet_by_id,
+        output_dir=output_dir,
+    )
+    second = runner._operationalize_candidate_group(
+        group=group,
+        packet_by_id=packet_by_id,
+        output_dir=output_dir,
+    )
+
+    assert calls == 6
+    assert first == second
+    assert first["value_type"] == "ambiguous"
+    assert first["categories_or_unit"] == []
+    assert "conservatively marked ambiguous" in first["caveats"]
+    fallback = json.loads((output_dir / "fallback.json").read_text(encoding="utf-8"))
+    assert fallback["status"] == "conservative_validation_fallback"
+    assert "exactly two distinct" in fallback["validation_error"]
+    complete = json.loads((output_dir / "complete.json").read_text(encoding="utf-8"))
+    assert complete["status"] == "complete_with_validation_fallback"
+    assert complete["validation_fallback"] is True
 
 
 def test_review_rejects_revision_with_malformed_closed_ontology():

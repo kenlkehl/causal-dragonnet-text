@@ -22,6 +22,7 @@ stage1_workers="${STAGE1_WORKERS:-auto}"
 stage2_workers="${STAGE2_WORKERS:-auto}"
 stage2_endpoint="${STAGE2_ENDPOINT-http://127.0.0.1:8010/v1}"
 stage2_model="${STAGE2_MODEL:-}"
+stage2_operationalization_max_prompt_chars="${STAGE2_OPERATIONALIZATION_MAX_PROMPT_CHARS:-}"
 stage2_consolidation_batch_size="${STAGE2_CONSOLIDATION_BATCH_SIZE:-}"
 stage2_consolidation_alphabetical_rounds="${STAGE2_CONSOLIDATION_ALPHABETICAL_ROUNDS:-}"
 stage2_consolidation_max_rounds="${STAGE2_CONSOLIDATION_MAX_ROUNDS:-}"
@@ -112,6 +113,11 @@ if [[ -z "${stage2_endpoint}" ]]; then
     stage2_description="disabled (STAGE2_ENDPOINT is empty)"
 else
     stage2_policy_args=()
+    if [[ -n "${stage2_operationalization_max_prompt_chars}" ]]; then
+        stage2_policy_args+=(
+            --set "stage2.operationalization_max_prompt_chars=${stage2_operationalization_max_prompt_chars}"
+        )
+    fi
     if [[ -n "${stage2_consolidation_batch_size}" ]]; then
         stage2_policy_args+=(
             --set "stage2.consolidation_batch_size=${stage2_consolidation_batch_size}"

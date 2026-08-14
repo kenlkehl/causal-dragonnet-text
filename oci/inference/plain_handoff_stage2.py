@@ -48,6 +48,7 @@ ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
+DEFAULT_OPERATIONALIZATION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 20
 DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS = 5
 DEFAULT_CONSOLIDATION_SHUFFLE_ROUNDS = 50
@@ -63,7 +64,7 @@ GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
 EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
     "training_failure_ontology_refinement_v1_explicit_feature_invariants"
 )
-OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_supporting_text_v3"
+OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_bounded_supporting_text_v4"
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v7"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v4"
 CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE = "configured_explicit_feature"
@@ -609,6 +610,9 @@ class PlainHandoffStage2Config:
     # Candidate consolidation has its own prompt allowance even though each
     # request sees only one bounded deterministic batch.
     consolidation_max_prompt_chars: int = DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS
+    # A merged alias family can cite substantially more evidence than one
+    # interpretation batch. Pack that evidence under an independent allowance.
+    operationalization_max_prompt_chars: int = DEFAULT_OPERATIONALIZATION_MAX_PROMPT_CHARS
     consolidation_batch_size: int = DEFAULT_CONSOLIDATION_BATCH_SIZE
     consolidation_alphabetical_rounds: int = DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS
     consolidation_max_rounds: int = DEFAULT_CONSOLIDATION_MAX_ROUNDS
@@ -656,6 +660,8 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.consolidation_max_prompt_chars < 4_000:
             raise ValueError("stage2.consolidation_max_prompt_chars must be at least 4000")
+        if self.operationalization_max_prompt_chars < 4_000:
+            raise ValueError("stage2.operationalization_max_prompt_chars must be at least 4000")
         if self.consolidation_batch_size < 2:
             raise ValueError("stage2.consolidation_batch_size must be at least 2")
         if self.consolidation_alphabetical_rounds < 0:
@@ -793,6 +799,12 @@ def plain_stage2_config_from_mapping(
             raw.get(
                 "consolidation_max_prompt_chars",
                 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS,
+            )
+        ),
+        operationalization_max_prompt_chars=int(
+            raw.get(
+                "operationalization_max_prompt_chars",
+                DEFAULT_OPERATIONALIZATION_MAX_PROMPT_CHARS,
             )
         ),
         consolidation_batch_size=int(
@@ -1586,16 +1598,36 @@ def _checkpointed_request_json(
     config: PlainHandoffStage2Config,
     completion: CompletionFunction,
     validate: Callable[[Mapping[str, Any]], dict[str, Any]],
+    validation_fallback: (
+        Callable[[_Stage2ResponseValidationError], Mapping[str, Any]] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Cache one validated LLM leaf by its complete deterministic input."""
 
+    def request_with_fallback() -> tuple[dict[str, Any], _Stage2ResponseValidationError | None]:
+        try:
+            return (
+                _request_json(
+                    messages=messages,
+                    config=config,
+                    completion=completion,
+                    validate=validate,
+                ),
+                None,
+            )
+        except _Stage2ResponseValidationError as exc:
+            if validation_fallback is None:
+                raise
+            result = validate(validation_fallback(exc))
+            LOGGER.warning(
+                "Stage 2 response remained invalid; using conservative validated fallback (%s)",
+                exc,
+            )
+            return result, exc
+
     if output_dir is None:
-        return _request_json(
-            messages=messages,
-            config=config,
-            completion=completion,
-            validate=validate,
-        )
+        result, _fallback_error = request_with_fallback()
+        return result
     output_dir = Path(output_dir)
     checkpoint_input = {
         "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
@@ -1628,19 +1660,28 @@ def _checkpointed_request_json(
             "input_fingerprint": input_fingerprint,
         },
     )
-    result = _request_json(
-        messages=messages,
-        config=config,
-        completion=completion,
-        validate=validate,
-    )
+    result, fallback_error = request_with_fallback()
     _write_json(result_path, result)
+    if fallback_error is not None:
+        _write_json(
+            output_dir / "fallback.json",
+            {
+                "status": "conservative_validation_fallback",
+                "completed_at": _now(),
+                "validation_error": str(fallback_error),
+            },
+        )
     _write_json(
         complete_path,
         {
-            "status": "complete",
+            "status": (
+                "complete_with_validation_fallback"
+                if fallback_error is not None
+                else "complete"
+            ),
             "completed_at": _now(),
             "input_fingerprint": input_fingerprint,
+            "validation_fallback": fallback_error is not None,
         },
     )
     return result
@@ -3285,6 +3326,135 @@ def _readable_supporting_text(
     return list(dict.fromkeys(texts))
 
 
+def _pack_operationalization_supporting_evidence(
+    *,
+    feature_name: str,
+    supporting_evidence: Sequence[str],
+    max_prompt_chars: int,
+) -> tuple[list[str], dict[str, Any]]:
+    """Pack whole evidence excerpts under a prompt limit with repair headroom."""
+
+    evidence = list(
+        dict.fromkeys(str(item).strip() for item in supporting_evidence if str(item).strip())
+    )
+    if not evidence:
+        raise ValueError("operationalization requires readable supporting evidence")
+    prompt_limit = int(max_prompt_chars)
+    repair_headroom = min(16_000, max(512, prompt_limit // 20))
+    initial_prompt_budget = prompt_limit - repair_headroom
+
+    # The system message is independent of the evidence values. Compute the
+    # exact JSON-list contribution without repeatedly rendering a growing body.
+    template = _operationalization_prompt(
+        feature_name=feature_name,
+        supporting_evidence=[evidence[0]],
+    )
+    system_chars = len(template[0]["content"])
+    empty_body_chars = len(
+        json.dumps(
+            {
+                "candidate_feature_name": str(feature_name),
+                "supporting_evidence": [],
+            },
+            sort_keys=True,
+        )
+    )
+    fixed_chars_without_list = system_chars + empty_body_chars - 2
+    list_chars = 2
+    packed: list[str] = []
+    for text_value in evidence:
+        separator_chars = 2 if packed else 0
+        candidate_list_chars = (
+            list_chars + separator_chars + len(json.dumps(text_value))
+        )
+        if fixed_chars_without_list + candidate_list_chars > initial_prompt_budget:
+            continue
+        packed.append(text_value)
+        list_chars = candidate_list_chars
+
+    truncated_items = 0
+    if not packed:
+        available_encoded_chars = initial_prompt_budget - fixed_chars_without_list - 2
+        first = evidence[0]
+        best = ""
+        low, high = 1, len(first)
+        while low <= high:
+            midpoint = (low + high) // 2
+            candidate = first[:midpoint].rstrip()
+            if midpoint < len(first):
+                candidate = candidate.rstrip(" .") + "..."
+            if candidate and len(json.dumps(candidate)) <= available_encoded_chars:
+                best = candidate
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+        if not best:
+            raise ValueError(
+                "stage2.operationalization_max_prompt_chars is too small for the "
+                "operationalization instructions and one evidence excerpt"
+            )
+        packed = [best]
+        truncated_items = 1
+
+    messages = _operationalization_prompt(
+        feature_name=feature_name,
+        supporting_evidence=packed,
+    )
+    prompt_chars = sum(len(message["content"]) for message in messages)
+    if prompt_chars > initial_prompt_budget:  # pragma: no cover - exact accounting invariant
+        raise RuntimeError(
+            "operationalization evidence packing exceeded its calculated prompt budget"
+        )
+    metadata = {
+        "available_evidence_items": len(evidence),
+        "included_evidence_items": len(packed),
+        "omitted_evidence_items": len(evidence) - len(packed),
+        "truncated_evidence_items": truncated_items,
+        "available_evidence_chars": sum(len(item) for item in evidence),
+        "included_evidence_chars": sum(len(item) for item in packed),
+        "available_evidence_fingerprint": _value_fingerprint(evidence),
+        "prompt_chars": prompt_chars,
+        "initial_prompt_budget_chars": initial_prompt_budget,
+        "repair_headroom_chars": repair_headroom,
+        "request_prompt_limit_chars": prompt_limit,
+    }
+    return packed, metadata
+
+
+def _ambiguous_operationalization_fallback(
+    *,
+    group: Mapping[str, Any],
+    validation_error: _Stage2ResponseValidationError,
+) -> dict[str, Any]:
+    """Return a conservative extraction-ready ontology after exhausted repairs."""
+
+    name = str(group.get("name") or "measurement")
+    readable_name = name.replace("_", " ")
+    description = str(group.get("description") or readable_name).strip()
+    existing_caveats = str(group.get("caveats") or "").strip()
+    fallback_caveat = (
+        "The ontology response remained structurally invalid after bounded repairs; "
+        "the value type is conservatively marked ambiguous for training-fold extraction "
+        "and review."
+    )
+    return {
+        "description": description,
+        "value_type": "ambiguous",
+        "categories_or_unit": [],
+        "measurement_definition": (
+            f"Extract one explicitly documented pretreatment scalar for {readable_name}; "
+            "preserve the documented scalar representation without inventing categories."
+        ),
+        "missing_value_rule": (
+            "Return null when the pretreatment record does not explicitly document one "
+            "unambiguous scalar value."
+        ),
+        "stability_summary": "Model-authored ontology required a conservative fallback.",
+        "caveats": " ".join(value for value in (existing_caveats, fallback_caveat) if value),
+        "validation_fallback_error": str(validation_error),
+    }
+
+
 def _validate_operationalization(
     value: Mapping[str, Any],
     *,
@@ -3846,35 +4016,61 @@ class PlainHandoffStage2:
                 f"packet(s): {missing_packet_ids[:8]}"
             )
         evidence_packets = [packet_by_id[packet_id] for packet_id in ontology_packet_ids]
-        supporting_evidence = _readable_supporting_text(evidence_packets)
-        if not supporting_evidence:
+        available_supporting_evidence = _readable_supporting_text(evidence_packets)
+        if not available_supporting_evidence:
             raise ValueError(
                 f"Stage 2 group {group.get('name')!r} has no readable supporting "
                 "evidence for ontology definition"
             )
+        feature_name = str(group.get("name") or "")
+        operationalization_prompt_limit = int(
+            self.config.operationalization_max_prompt_chars
+        )
+        supporting_evidence, evidence_packing = (
+            _pack_operationalization_supporting_evidence(
+                feature_name=feature_name,
+                supporting_evidence=available_supporting_evidence,
+                max_prompt_chars=operationalization_prompt_limit,
+            )
+        )
+        if evidence_packing["omitted_evidence_items"] or evidence_packing[
+            "truncated_evidence_items"
+        ]:
+            LOGGER.warning(
+                "Stage 2 operationalization packed supporting evidence feature=%s "
+                "included=%s available=%s prompt_chars=%s prompt_limit=%s",
+                feature_name,
+                evidence_packing["included_evidence_items"],
+                evidence_packing["available_evidence_items"],
+                evidence_packing["prompt_chars"],
+                operationalization_prompt_limit,
+            )
         messages = _operationalization_prompt(
-            feature_name=str(group.get("name") or ""),
+            feature_name=feature_name,
             supporting_evidence=supporting_evidence,
         )
-        prompt_chars = sum(len(message["content"]) for message in messages)
-        if prompt_chars > int(self.config.max_prompt_chars):
-            raise ValueError(
-                "one Stage 2 group cannot fit the operationalization prompt budget "
-                f"({prompt_chars} > {self.config.max_prompt_chars})"
-            )
+        request_config = replace(
+            self.config,
+            max_prompt_chars=operationalization_prompt_limit,
+        )
         operational = _checkpointed_request_json(
             output_dir=output_dir,
             input_value={
                 "phase": "group_operationalization",
                 "operationalization_schema": OPERATIONALIZATION_SCHEMA_VERSION,
-                "candidate_feature_name": str(group.get("name") or ""),
+                "candidate_feature_name": feature_name,
                 "ontology_packet_ids": ontology_packet_ids,
                 "supporting_evidence": supporting_evidence,
+                "evidence_packing": evidence_packing,
             },
             messages=messages,
-            config=self.config,
+            config=request_config,
             completion=self.completion,
             validate=lambda value: _validate_operationalization(value, group=group),
+            validation_fallback=lambda exc: _ambiguous_operationalization_fallback(
+                group=group,
+                validation_error=exc,
+            ),
         )
         roles = _group_roles(group)
         if not roles:
