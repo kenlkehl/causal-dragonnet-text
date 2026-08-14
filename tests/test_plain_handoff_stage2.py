@@ -1213,6 +1213,7 @@ def test_interpretation_prompt_inverts_noisy_text_evidence_without_temporal_filt
     assert "prefer atomic clinical variables" in rules
     assert "one coherent ontology" in rules
     assert "list, set, tuple, mapping, concatenated code" in rules
+    assert "open-ended family is present" in rules
     assert "parent domain, umbrella label, or catch-all concept" in rules
     assert "do not also return their umbrella or composite representation" in rules
     assert "do not split a variable merely because" in rules

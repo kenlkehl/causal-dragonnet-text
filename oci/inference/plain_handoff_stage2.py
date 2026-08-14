@@ -1717,11 +1717,11 @@ def _atomic_feature_interpretation_rules() -> list[str]:
 
     return [
         "Prefer atomic clinical variables.",
-        "A candidate is atomic only when a downstream extractor could assign exactly one patient-level value under one coherent ontology. It must not require returning a list, set, tuple, mapping, concatenated code, profile, inventory, or ad hoc aggregation of independently varying values.",
+        "A candidate is atomic only when a downstream extractor could assign exactly one patient-level value under one coherent ontology. It must not require returning a list, set, tuple, mapping, concatenated code, profile, inventory, or ad hoc aggregation of independently varying values. Collapsing whether any member of an open-ended family is present into one indicator does not make that family atomic.",
         "Use the narrowest stable and reusable clinical construct directly supported by the cited evidence. Do not use a parent domain, umbrella label, or catch-all concept when the evidence supports separately measurable attributes.",
         "When evidence explicitly states or unambiguously encodes multiple independently meaningful components, return those components as separate candidates. Do not also return their umbrella or composite representation.",
         "Do not split a variable merely because its evidence contains different values, categories, thresholds, units, synonyms, or reporting formats. Those may be representations of one underlying measurement rather than distinct variables.",
-        "An established construct that is conventionally reported as one value remains one candidate even if that value summarizes multiple inputs.",
+        "An established construct that is conventionally reported as one scalar or category under one ontology remains one candidate even if that value is derived from multiple inputs. This exception does not apply to concatenated or multi-field encodings that preserve separately varying component values.",
         "Specificity concerns the measured clinical dimension, not a particular patient, observed value, document, or wording. Do not encode instance-specific details in a candidate name.",
         "Do not invent components that are not directly stated or unambiguously encoded in the evidence. If an atomic reusable variable cannot be identified, return no candidate rather than a vague catch-all.",
         "Each candidate name must identify its exact extraction target. A broad name cannot be repaired by placing a more specific target only in its description.",
