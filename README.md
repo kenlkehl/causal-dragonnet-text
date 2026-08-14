@@ -90,6 +90,13 @@ example uses the identical hardware and endpoint behavior:
 ./run_five_conf_five_mod.sh
 ```
 
+After a run has a completed `handoff/evidence.jsonl` checkpoint, either launcher
+automatically resumes in Stage 2-only mode when `STAGE2_ENDPOINT` is nonempty.
+That path does not inspect or reserve local GPUs: it passes `--devices cpu` for
+workflow bookkeeping and sizes endpoint request concurrency from the CPU budget
+(up to eight workers by default, or `STAGE2_WORKERS` when set). Local GPU
+eligibility and `MIN_FREE_GPU_GB` apply only while Stage 1 still needs to run.
+
 Both launchers preset Stage 2 to batches of 20, five shifted-alphabetical plus
 up to fifty seeded-shuffle consolidation rounds, a three-training-patient
 ontology feedback threshold, and at most two refinement rounds. Override these

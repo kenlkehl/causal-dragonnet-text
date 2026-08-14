@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 # Shared implementation for the researcher-facing synthetic Stage 1 -> 2 examples.
+# A completed handoff automatically selects endpoint-backed Stage 2-only mode,
+# which requires no local GPU inspection or allocation.
 
 set -euo pipefail
 
@@ -59,10 +61,6 @@ if (( stage2_vllm_servers > 0 )) && [[ -z "${stage2_model}" ]]; then
     echo "STAGE2_MODEL is required when STAGE2_VLLM_SERVERS is positive." >&2
     exit 1
 fi
-if [[ -n "${physical_gpus}" && "${gpu_limit}" != "auto" ]]; then
-    echo "Set either PHYSICAL_GPUS or GPU_COUNT, not both." >&2
-    exit 1
-fi
 if [[ "${disable_htr}" == "1" ]]; then
     default_output_dir="${repo_root}/artifacts/research_all_evidence/${output_name}_no_htr"
     htr_args=(--disable-htr)
@@ -71,12 +69,24 @@ else
     htr_args=()
 fi
 output_dir="${requested_output_dir:-${default_output_dir}}"
+stage2_only=0
+if [[
+    -n "${stage2_endpoint}"
+    && -f "${output_dir}/handoff/evidence.jsonl"
+    && -f "${output_dir}/handoff/complete.json"
+]]; then
+    stage2_only=1
+fi
+if (( ! stage2_only )) && [[ -n "${physical_gpus}" && "${gpu_limit}" != "auto" ]]; then
+    echo "Set either PHYSICAL_GPUS or GPU_COUNT, not both." >&2
+    exit 1
+fi
 
 if [[ ! -f "${dataset}" ]]; then
     echo "Dataset not found: ${dataset}" >&2
     exit 1
 fi
-if [[ -n "${physical_gpus}" ]]; then
+if (( ! stage2_only )) && [[ -n "${physical_gpus}" ]]; then
     IFS=',' read -r -a physical_gpu_ids <<< "${physical_gpus}"
     if (( ${#physical_gpu_ids[@]} < 1 )); then
         echo "PHYSICAL_GPUS must contain at least one GPU index." >&2
@@ -116,7 +126,9 @@ if [[ ! -x "${python_bin}" ]]; then
     echo "Python interpreter is not executable: ${python_bin}" >&2
     exit 1
 fi
-"${python_bin}" -c 'from sentence_transformers import SentenceTransformer'
+if (( ! stage2_only )); then
+    "${python_bin}" -c 'from sentence_transformers import SentenceTransformer'
+fi
 if (( stage2_vllm_servers > 0 )); then
     if ! "${python_bin}" -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
         echo "Managed Stage 2 requires vLLM in OCI_PYTHON (install .[local-llm])." >&2
@@ -124,14 +136,23 @@ if (( stage2_vllm_servers > 0 )); then
     fi
 fi
 
+hardware_args=(
+    --workers "${stage1_workers}"
+    --stage2-workers "${stage2_workers}"
+    --outer-folds "${outer_folds}"
+    --inner-folds "${inner_folds}"
+)
+if (( stage2_only )); then
+    hardware_args+=(--stage2-only)
+else
+    hardware_args+=(
+        --gpu-count "${gpu_limit}"
+        --min-free-vram-gib "${min_free_gpu_gib}"
+    )
+fi
 hardware_line="$(
     "${python_bin}" "${repo_root}/scripts/detect_all_evidence_hardware.py" \
-        --gpu-count "${gpu_limit}" \
-        --workers "${stage1_workers}" \
-        --stage2-workers "${stage2_workers}" \
-        --outer-folds "${outer_folds}" \
-        --inner-folds "${inner_folds}" \
-        --min-free-vram-gib "${min_free_gpu_gib}"
+        "${hardware_args[@]}"
 )" || exit 1
 IFS=$'\t' read -r gpu_count devices worker_count resolved_stage2_workers cpu_count gpu_summary <<< "${hardware_line}"
 if [[ -z "${gpu_count}" || -z "${devices}" || -z "${worker_count}" ]]; then
@@ -191,7 +212,11 @@ elif [[ -z "${stage2_endpoint}" ]]; then
     stage_mode_args=(--stage1-only)
     stage2_description="disabled (STAGE2_ENDPOINT is empty)"
 else
-    stage_mode_args=(
+    stage_mode_args=()
+    if (( stage2_only )); then
+        stage_mode_args+=(--stage2-only)
+    fi
+    stage_mode_args+=(
         --stage2-endpoint "${stage2_endpoint}"
         --set "stage2.workers=${resolved_stage2_workers}"
         "${stage2_policy_args[@]}"
@@ -199,7 +224,11 @@ else
     if [[ -n "${stage2_model}" ]]; then
         stage_mode_args+=(--stage2-model "${stage2_model}")
     fi
-    stage2_description="${stage2_endpoint} (${resolved_stage2_workers} concurrent requests)"
+    if (( stage2_only )); then
+        stage2_description="${stage2_endpoint} (${resolved_stage2_workers} concurrent requests; Stage 2-only resume)"
+    else
+        stage2_description="${stage2_endpoint} (${resolved_stage2_workers} concurrent requests)"
+    fi
 fi
 
 if [[ -n "${stage1_architectures}" ]]; then
@@ -214,12 +243,21 @@ echo "Dataset:        ${dataset}"
 echo "Output:         ${output_dir}"
 echo "Progress:       ${output_dir}/progress.json"
 echo "Log:            ${output_dir}/logs/workflow.log"
-echo "CUDA devices:   ${devices}"
-echo "GPU memory:     ${gpu_summary}"
+if (( stage2_only )); then
+    echo "CUDA devices:   not required for endpoint-backed Stage 2"
+    echo "GPU memory:     ${gpu_summary}"
+else
+    echo "CUDA devices:   ${devices}"
+    echo "GPU memory:     ${gpu_summary}"
+fi
 echo "CPU budget:     ${worker_count} workers (${cpu_count} available)"
 echo "Stage 2:        ${stage2_description}"
 echo "Architectures:  ${architecture_description}"
-echo "HTR modeling:   $([[ "${disable_htr}" == "1" ]] && echo disabled || echo enabled)"
+if (( stage2_only )); then
+    echo "HTR modeling:   not run during Stage 2-only resume"
+else
+    echo "HTR modeling:   $([[ "${disable_htr}" == "1" ]] && echo disabled || echo enabled)"
+fi
 
 export PYTHONUNBUFFERED=1
 

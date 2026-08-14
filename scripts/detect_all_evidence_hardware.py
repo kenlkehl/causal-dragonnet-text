@@ -7,8 +7,6 @@ import argparse
 import os
 from dataclasses import dataclass
 
-import torch
-
 
 @dataclass(frozen=True)
 class GPU:
@@ -40,6 +38,8 @@ def _available_cpu_count() -> int:
 
 
 def _visible_gpus() -> list[GPU]:
+    import torch
+
     output: list[GPU] = []
     for index in range(torch.cuda.device_count()):
         free_bytes, total_bytes = torch.cuda.mem_get_info(index)
@@ -57,6 +57,11 @@ def _visible_gpus() -> list[GPU]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--stage2-only",
+        action="store_true",
+        help="size an endpoint-backed Stage 2 resume without inspecting local GPUs",
+    )
     parser.add_argument("--gpu-count", type=_positive_int_or_auto, default="auto")
     parser.add_argument("--workers", type=_positive_int_or_auto, default="auto")
     parser.add_argument("--stage2-workers", type=_positive_int_or_auto, default="auto")
@@ -76,6 +81,31 @@ def main() -> int:
         raise SystemExit("--min-free-vram-gib must be nonnegative")
     if args.stage1_vram_gib_per_worker <= 0 or args.stage2_vram_gib_per_worker <= 0:
         raise SystemExit("VRAM-per-worker estimates must be positive")
+
+    cpu_count = _available_cpu_count()
+    context_capacity = args.outer_folds * (args.inner_folds + 1)
+    if args.stage2_only:
+        automatic_workers = min(cpu_count, context_capacity)
+        worker_count = automatic_workers if args.workers == "auto" else int(args.workers)
+        automatic_stage2_workers = min(cpu_count, 8)
+        stage2_workers = (
+            automatic_stage2_workers
+            if args.stage2_workers == "auto"
+            else int(args.stage2_workers)
+        )
+        print(
+            "\t".join(
+                [
+                    "0",
+                    "cpu",
+                    str(worker_count),
+                    str(stage2_workers),
+                    str(cpu_count),
+                    "not inspected (endpoint-backed Stage 2 only)",
+                ]
+            )
+        )
+        return 0
 
     visible = _visible_gpus()
     if not visible:
@@ -101,8 +131,6 @@ def main() -> int:
         selected = sorted(eligible, key=lambda gpu: (-gpu.free_gib, gpu.index))[:requested]
         selected.sort(key=lambda gpu: gpu.index)
 
-    cpu_count = _available_cpu_count()
-    context_capacity = args.outer_folds * (args.inner_folds + 1)
     gpu_worker_capacity = sum(
         max(1, min(args.inner_folds, int(gpu.free_gib // args.stage1_vram_gib_per_worker)))
         for gpu in selected
