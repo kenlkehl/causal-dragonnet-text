@@ -34,6 +34,8 @@ PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_lossless_feature_partition_reconciliation_v2_minimal_prompt"
 )
 REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v1"
+EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
+ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = "stage2_training_failure_ontology_refinement_v1"
 
 RequestJSON = Callable[
     [Sequence[Mapping[str, str]], Callable[[Mapping[str, Any]], dict[str, Any]]],
@@ -107,9 +109,7 @@ def _normalized_category_values(*, value_type: Any, values: Sequence[Any]) -> li
         if len(separated) > 1:
             normalized = separated
     if normalized_type == "binary" and len(normalized) == 1:
-        slash_separated = [
-            part.strip() for part in normalized[0].split("/") if part.strip()
-        ]
+        slash_separated = [part.strip() for part in normalized[0].split("/") if part.strip()]
         if len(slash_separated) == 2:
             normalized = slash_separated
 
@@ -393,14 +393,9 @@ class _ExtractionValueError(ValueError):
         self.response = copy.deepcopy(dict(response))
         first = self.issues[0]
         suffix = (
-            f"; {len(self.issues) - 1} additional invalid value(s)"
-            if len(self.issues) > 1
-            else ""
+            f"; {len(self.issues) - 1} additional invalid value(s)" if len(self.issues) > 1 else ""
         )
-        super().__init__(
-            f"feature {first['feature_name']!r} {first['reason']}"
-            f"{suffix}"
-        )
+        super().__init__(f"feature {first['feature_name']!r} {first['reason']}" f"{suffix}")
 
 
 def _extraction_error_from_exception(
@@ -462,9 +457,7 @@ def _category_ontology_plan(
                 "feature_name": str(issue["feature_name"]),
                 "value_type": str(definition.get("value_type") or "categorical"),
                 "description": str(definition.get("description") or ""),
-                "measurement_definition": str(
-                    definition.get("measurement_definition") or ""
-                ),
+                "measurement_definition": str(definition.get("measurement_definition") or ""),
                 "missing_value_rule": str(definition.get("missing_value_rule") or ""),
                 "allowed_categories": list(issue["allowed_categories"]),
                 "prior_extracted_value": issue["prior_extracted_value"],
@@ -597,8 +590,10 @@ def _request_validated_extraction(
 ) -> dict[str, Any]:
     """Extract rows, then recover closed-category failures without resending notes."""
 
+    issue_audit_path = ontology_audit_path.with_name("extraction_issues.json")
+    issue_events: list[dict[str, Any]] = []
     try:
-        return request_json(
+        validated = request_json(
             messages,
             lambda value: _validate_extraction(
                 value,
@@ -606,11 +601,30 @@ def _request_validated_extraction(
                 definitions=definitions,
             ),
         )
+        _write_json(
+            issue_audit_path,
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [],
+            },
+        )
+        return validated
     except ValueError as exc:
         value_error = _value_error_from_exception(exc)
         value_repair_audit: dict[str, Any] | None = None
         category_error = _category_error_from_exception(exc)
         if value_error is not None:
+            issue_events.extend(
+                {
+                    "failure_kind": "invalid_scalar_or_value_type",
+                    "row_id": int(issue["row_id"]),
+                    "feature_name": str(issue["feature_name"]),
+                    "reason": str(issue["reason"]),
+                    "prior_extracted_value": copy.deepcopy(issue.get("prior_extracted_value")),
+                }
+                for issue in value_error.issues
+            )
             patched = _null_invalid_extraction_values(value_error)
             value_repair_audit = {
                 "schema_version": "stage2_invalid_feature_value_repair_v1",
@@ -635,6 +649,14 @@ def _request_validated_extraction(
                     "Stage 2 extraction retained the valid fields and replaced %s "
                     "invalid feature value(s) with null",
                     len(value_error.issues),
+                )
+                _write_json(
+                    issue_audit_path,
+                    {
+                        "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                        "completed_at": _now(),
+                        "events": issue_events,
+                    },
                 )
                 return validated
         if category_error is None:
@@ -665,6 +687,23 @@ def _request_validated_extraction(
                     "validation_error": f"{type(exc).__name__}: {exc}",
                 },
             )
+            issue_events.extend(
+                {
+                    "failure_kind": "structural_response_failure",
+                    "row_id": int(row_id),
+                    "feature_name": None,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+                for row_id in row_ids
+            )
+            _write_json(
+                issue_audit_path,
+                {
+                    "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                    "completed_at": _now(),
+                    "events": issue_events,
+                },
+            )
             LOGGER.warning(
                 "Stage 2 extraction remained structurally invalid after repairs; "
                 "replacing %s extracted value(s) for %s patient(s) with null (%s: %s)",
@@ -675,6 +714,17 @@ def _request_validated_extraction(
             )
             return validated
 
+    issue_events.extend(
+        {
+            "failure_kind": "out_of_ontology_category",
+            "row_id": int(issue["row_id"]),
+            "feature_name": str(issue["feature_name"]),
+            "reason": "extracted value is outside the declared closed ontology",
+            "prior_extracted_value": copy.deepcopy(issue.get("prior_extracted_value")),
+            "allowed_categories": list(issue.get("allowed_categories") or []),
+        }
+        for issue in category_error.issues
+    )
     items, targets = _category_ontology_plan(category_error)
     LOGGER.warning(
         "Stage 2 extraction exhausted ordinary repairs for %s invalid categorical "
@@ -730,7 +780,124 @@ def _request_validated_extraction(
             "corrections": corrections["corrections"],
         },
     )
+    _write_json(
+        issue_audit_path,
+        {
+            "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+            "completed_at": _now(),
+            "events": issue_events,
+        },
+    )
     return validated
+
+
+def _legacy_extraction_issue_audit(directory: Path) -> dict[str, Any]:
+    """Reconstruct the issue ledger from pre-ledger extraction audit files."""
+
+    events: list[dict[str, Any]] = []
+
+    def read_mapping(filename: str) -> Mapping[str, Any] | None:
+        path = directory / filename
+        if not path.is_file():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, Mapping) else None
+
+    value_audit = read_mapping("invalid_feature_value_repair.json")
+    if value_audit is not None:
+        for issue in value_audit.get("issues") or []:
+            if not isinstance(issue, Mapping):
+                continue
+            try:
+                row_id = int(issue["row_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            events.append(
+                {
+                    "failure_kind": "invalid_scalar_or_value_type",
+                    "row_id": row_id,
+                    "feature_name": str(issue.get("feature_name") or ""),
+                    "reason": str(issue.get("reason") or ""),
+                    "prior_extracted_value": copy.deepcopy(issue.get("prior_extracted_value")),
+                }
+            )
+
+    category_audit = read_mapping("category_ontology_repair.json")
+    if category_audit is not None:
+        items_by_id = {
+            str(item.get("mapping_id") or ""): item
+            for item in category_audit.get("items") or []
+            if isinstance(item, Mapping) and str(item.get("mapping_id") or "")
+        }
+        targets_by_id = category_audit.get("targets") or {}
+        if isinstance(targets_by_id, Mapping):
+            for mapping_id, raw_targets in targets_by_id.items():
+                item = items_by_id.get(str(mapping_id))
+                if item is None or not isinstance(raw_targets, list):
+                    continue
+                for target in raw_targets:
+                    if not isinstance(target, Mapping):
+                        continue
+                    try:
+                        row_id = int(target["row_id"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    events.append(
+                        {
+                            "failure_kind": "out_of_ontology_category",
+                            "row_id": row_id,
+                            "feature_name": str(
+                                target.get("feature_name") or item.get("feature_name") or ""
+                            ),
+                            "reason": ("extracted value is outside the declared closed ontology"),
+                            "prior_extracted_value": copy.deepcopy(
+                                item.get("prior_extracted_value")
+                            ),
+                            "allowed_categories": list(item.get("allowed_categories") or []),
+                        }
+                    )
+
+    structural_audit = read_mapping("extraction_failure.json")
+    if structural_audit is not None:
+        for raw_row_id in structural_audit.get("row_ids") or []:
+            try:
+                row_id = int(raw_row_id)
+            except (TypeError, ValueError):
+                continue
+            events.append(
+                {
+                    "failure_kind": "structural_response_failure",
+                    "row_id": row_id,
+                    "feature_name": None,
+                    "reason": str(structural_audit.get("validation_error") or ""),
+                }
+            )
+
+    return {
+        "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+        "completed_at": _now(),
+        "reconstructed_from_legacy_audits": True,
+        "events": events,
+    }
+
+
+def _ensure_extraction_issue_audit(directory: Path) -> dict[str, Any]:
+    """Return an issue ledger, reconstructing it for a compatible old checkpoint."""
+
+    path = directory / "extraction_issues.json"
+    if path.is_file():
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, Mapping) and isinstance(value.get("events"), list):
+                return dict(value)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    reconstructed = _legacy_extraction_issue_audit(directory)
+    _write_json(path, reconstructed)
+    return reconstructed
 
 
 def _extraction_prompt(
@@ -739,9 +906,7 @@ def _extraction_prompt(
     rows: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
     if len(rows) != 1:
-        raise ValueError(
-            "Stage 2 extraction prompts must contain exactly one patient's record"
-        )
+        raise ValueError("Stage 2 extraction prompts must contain exactly one patient's record")
     body = {
         "job": "extract_stage2_patient_variables",
         "rules": [
@@ -843,9 +1008,7 @@ def _page_results_for_definitions(
     return [
         {
             **{key: value for key, value in page.items() if key != "values"},
-            "values": {
-                name: dict(page.get("values") or {}).get(name) for name in feature_names
-            },
+            "values": {name: dict(page.get("values") or {}).get(name) for name in feature_names},
         }
         for page in page_results
     ]
@@ -1067,6 +1230,105 @@ def _lossless_extraction_pages(
     return pages
 
 
+def _summarize_extraction_failures(
+    *,
+    output_dir: Path,
+    definitions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate feature-attributable failures across distinct patients."""
+
+    definition_names = {str(definition["name"]) for definition in definitions}
+    patterns: dict[tuple[str, str, str], dict[str, Any]] = {}
+    structural_rows: set[int] = set()
+    issue_files = sorted(output_dir.rglob("extraction_issues.json"))
+    for path in issue_files:
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            audit = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(audit, Mapping):
+            continue
+        for raw_event in audit.get("events") or []:
+            if not isinstance(raw_event, Mapping):
+                continue
+            try:
+                row_id = int(raw_event["row_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            feature_name = str(raw_event.get("feature_name") or "")
+            failure_kind = str(raw_event.get("failure_kind") or "unknown")
+            reason = str(raw_event.get("reason") or "")
+            if not feature_name:
+                structural_rows.add(row_id)
+                continue
+            if feature_name not in definition_names:
+                continue
+            signature_reason = reason if failure_kind == "invalid_scalar_or_value_type" else ""
+            key = (feature_name, failure_kind, signature_reason)
+            pattern = patterns.setdefault(
+                key,
+                {
+                    "feature_name": feature_name,
+                    "failure_kind": failure_kind,
+                    "reason": reason,
+                    "patient_row_ids": set(),
+                    "example_values": [],
+                    "allowed_categories": list(raw_event.get("allowed_categories") or []),
+                },
+            )
+            pattern["patient_row_ids"].add(row_id)
+            if "prior_extracted_value" in raw_event:
+                example = copy.deepcopy(raw_event.get("prior_extracted_value"))
+                example_key = json.dumps(
+                    example,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                existing_keys = {
+                    json.dumps(
+                        value,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                    for value in pattern["example_values"]
+                }
+                if example_key not in existing_keys and len(pattern["example_values"]) < 12:
+                    pattern["example_values"].append(example)
+
+    rendered_patterns = []
+    for pattern in patterns.values():
+        row_ids = sorted(pattern.pop("patient_row_ids"))
+        rendered_patterns.append(
+            {
+                **pattern,
+                "patient_count": len(row_ids),
+                "patient_row_ids": row_ids,
+            }
+        )
+    rendered_patterns.sort(
+        key=lambda pattern: (
+            -int(pattern["patient_count"]),
+            str(pattern["feature_name"]),
+            str(pattern["failure_kind"]),
+            str(pattern["reason"]),
+        )
+    )
+    summary = {
+        "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+        "completed_at": _now(),
+        "issue_files": len(issue_files),
+        "feature_failure_patterns": rendered_patterns,
+        "structural_failure_patient_count": len(structural_rows),
+        "structural_failure_patient_row_ids": sorted(structural_rows),
+    }
+    _write_json(output_dir / "failure_summary.json", summary)
+    return summary
+
+
 def extract_rows(
     *,
     dataset: pd.DataFrame,
@@ -1085,7 +1347,19 @@ def extract_rows(
     if not definitions:
         frame = pd.DataFrame({"_oci_row_id": [int(value) for value in row_ids]})
         _write_frame(output_dir / "extracted.csv", frame)
-        _write_json(output_dir / "complete.json", {"status": "complete", "rows": len(frame)})
+        failure_summary = _summarize_extraction_failures(
+            output_dir=output_dir,
+            definitions=definitions,
+        )
+        _write_json(
+            output_dir / "complete.json",
+            {
+                "status": "complete",
+                "rows": len(frame),
+                "feature_failure_patterns": len(failure_summary["feature_failure_patterns"]),
+                "structural_failure_patients": failure_summary["structural_failure_patient_count"],
+            },
+        )
         return frame
 
     request_rows = [
@@ -1128,6 +1402,7 @@ def extract_rows(
         saved_result_path = saved_dir / "result.json"
         saved_manifest_path = saved_dir / "row_ids.json"
         saved_audit_path = saved_dir / "category_ontology_repair.json"
+        saved_issue_path = saved_dir / "extraction_issues.json"
         if not (
             saved_complete_path.is_file()
             and saved_result_path.is_file()
@@ -1144,6 +1419,11 @@ def extract_rows(
                 json.loads(saved_audit_path.read_text(encoding="utf-8"))
                 if saved_audit_path.is_file()
                 else None
+            )
+            saved_issues = (
+                json.loads(saved_issue_path.read_text(encoding="utf-8"))
+                if saved_issue_path.is_file()
+                else _legacy_extraction_issue_audit(saved_dir)
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             continue
@@ -1165,6 +1445,7 @@ def extract_rows(
                 "completion": dict(saved_completion),
                 "result": dict(saved_result),
                 "category_ontology_audit": saved_audit,
+                "extraction_issues": saved_issues,
             }
         )
 
@@ -1187,14 +1468,15 @@ def extract_rows(
         candidates = list(singleton_checkpoints.get(row_ids[0], []))
         candidates.sort(
             key=lambda candidate: (
-                0
-                if (
-                    candidate["completion"].get("schema_version")
-                    == EXTRACTION_CHECKPOINT_SCHEMA_VERSION
-                    and candidate["completion"].get("input_fingerprint")
-                    == input_fingerprint
-                )
-                else 1,
+                (
+                    0
+                    if (
+                        candidate["completion"].get("schema_version")
+                        == EXTRACTION_CHECKPOINT_SCHEMA_VERSION
+                        and candidate["completion"].get("input_fingerprint") == input_fingerprint
+                    )
+                    else 1
+                ),
                 str(candidate["source_dir"]),
             )
         )
@@ -1218,6 +1500,11 @@ def extract_rows(
             legacy = schema_version is None
             relocated = source_dir != batch_dir
             if not legacy and not relocated and stale_audit is None:
+                if isinstance(candidate.get("extraction_issues"), Mapping):
+                    _write_json(
+                        batch_dir / "extraction_issues.json",
+                        candidate["extraction_issues"],
+                    )
                 return list(validated["rows"])
 
             batch_dir.mkdir(parents=True, exist_ok=True)
@@ -1228,9 +1515,7 @@ def extract_rows(
                 _write_json(ontology_audit_path, source_audit)
             elif ontology_audit_path.is_file():
                 try:
-                    previous_audit = json.loads(
-                        ontology_audit_path.read_text(encoding="utf-8")
-                    )
+                    previous_audit = json.loads(ontology_audit_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     previous_audit = None
                 _write_json(
@@ -1242,6 +1527,9 @@ def extract_rows(
                         "previous_audit": previous_audit,
                     },
                 )
+            source_issues = candidate.get("extraction_issues")
+            if isinstance(source_issues, Mapping):
+                _write_json(batch_dir / "extraction_issues.json", source_issues)
             _write_json(
                 complete_path,
                 {
@@ -1321,8 +1609,7 @@ def extract_rows(
                 completion = json.loads(complete_path.read_text(encoding="utf-8"))
                 stored = json.loads(result_path.read_text(encoding="utf-8"))
                 if (
-                    completion.get("schema_version")
-                    == PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION
+                    completion.get("schema_version") == PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION
                     and completion.get("input_fingerprint") == input_fingerprint
                 ):
                     validated = _validate_extraction(
@@ -1330,6 +1617,7 @@ def extract_rows(
                         row_ids=[row_id],
                         definitions=definitions,
                     )
+                    _ensure_extraction_issue_audit(page_dir)
                     return page_meta, dict(validated["rows"][0])
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
                 pass
@@ -1379,8 +1667,7 @@ def extract_rows(
             for index, batch in enumerate(batches, start=1)
         }
         page_futures = {
-            executor.submit(run_page, page): int(page["row_id"])
-            for page in page_requests
+            executor.submit(run_page, page): int(page["row_id"]) for page in page_requests
         }
         for future in concurrent.futures.as_completed([*batch_futures, *page_futures]):
             if future in batch_futures:
@@ -1429,6 +1716,7 @@ def extract_rows(
                         row_ids=[row_id],
                         definitions=definitions,
                     )
+                    _ensure_extraction_issue_audit(reconciliation_dir)
                     return dict(validated["rows"][0]["values"])
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
                 pass
@@ -1471,8 +1759,7 @@ def extract_rows(
             prompt_chars = _prompt_chars(messages)
             if prompt_chars > int(max_prompt_chars):  # pragma: no cover - planner invariant
                 raise RuntimeError(
-                    "Stage 2 feature-partitioned page reconciliation exceeded "
-                    "max_prompt_chars"
+                    "Stage 2 feature-partitioned page reconciliation exceeded " "max_prompt_chars"
                 )
             if len(definition_batches) == 1:
                 batch_dir = reconciliation_dir
@@ -1482,9 +1769,7 @@ def extract_rows(
                 batch_ontology_audit_path = batch_dir / "category_ontology_repair.json"
             batch_result_path = batch_dir / "result.json"
             batch_complete_path = batch_dir / "complete.json"
-            batch_stale_audit = _stale_category_ontology_audit(
-                batch_ontology_audit_path
-            )
+            batch_stale_audit = _stale_category_ontology_audit(batch_ontology_audit_path)
             batch_input = {
                 "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
                 "row_id": int(row_id),
@@ -1499,9 +1784,7 @@ def extract_rows(
                 and batch_stale_audit is None
             ):
                 try:
-                    completion = json.loads(
-                        batch_complete_path.read_text(encoding="utf-8")
-                    )
+                    completion = json.loads(batch_complete_path.read_text(encoding="utf-8"))
                     cached = json.loads(batch_result_path.read_text(encoding="utf-8"))
                     if completion.get("input_fingerprint") == batch_fingerprint:
                         batch_result = _validate_extraction(
@@ -1509,6 +1792,7 @@ def extract_rows(
                             row_ids=[row_id],
                             definitions=batch_definitions,
                         )
+                        _ensure_extraction_issue_audit(batch_dir)
                 except (
                     KeyError,
                     OSError,
@@ -1596,6 +1880,10 @@ def extract_rows(
         records.append(record)
     frame = pd.DataFrame(records, columns=["_oci_row_id", *feature_names])
     _write_frame(output_dir / "extracted.csv", frame)
+    failure_summary = _summarize_extraction_failures(
+        output_dir=output_dir,
+        definitions=definitions,
+    )
     _write_json(
         output_dir / "complete.json",
         {
@@ -1606,6 +1894,8 @@ def extract_rows(
             "batches": len(batches),
             "paged_rows": len(oversized_rows),
             "pages": len(page_requests),
+            "feature_failure_patterns": len(failure_summary["feature_failure_patterns"]),
+            "structural_failure_patients": failure_summary["structural_failure_patient_count"],
         },
     )
     return frame
@@ -1665,8 +1955,7 @@ def _assert_extraction_health(
     missing_columns = sorted(set(feature_names) - set(frame.columns))
     if missing_columns:
         raise ValueError(
-            f"Stage 2 final {scope} extraction is missing feature columns: "
-            f"{missing_columns}"
+            f"Stage 2 final {scope} extraction is missing feature columns: " f"{missing_columns}"
         )
     values = frame[feature_names]
     rows_with_any = values.notna().any(axis=1)
@@ -1675,11 +1964,7 @@ def _assert_extraction_health(
     total_cells = int(values.shape[0] * values.shape[1])
     audit = {
         "schema_version": "stage2_final_extraction_health_v1",
-        "status": (
-            "ok"
-            if row_fraction >= float(minimum_row_nonmissing_fraction)
-            else "failed"
-        ),
+        "status": ("ok" if row_fraction >= float(minimum_row_nonmissing_fraction) else "failed"),
         "scope": scope,
         "rows": int(len(values)),
         "features": int(len(feature_names)),
@@ -1688,9 +1973,7 @@ def _assert_extraction_health(
         "row_nonmissing_fraction": row_fraction,
         "minimum_row_nonmissing_fraction": float(minimum_row_nonmissing_fraction),
         "nonmissing_cells": nonmissing_cells,
-        "nonmissing_cell_fraction": (
-            float(nonmissing_cells / total_cells) if total_cells else 0.0
-        ),
+        "nonmissing_cell_fraction": (float(nonmissing_cells / total_cells) if total_cells else 0.0),
         "definitions_fingerprint": _value_fingerprint(list(definitions)),
     }
     _write_json(audit_path, audit)
@@ -2309,9 +2592,7 @@ def _review_prompt_for_features(
     return _review_prompt(
         clinical_question=clinical_question,
         definitions=definitions,
-        summaries=[
-            summaries_by_id[str(feature["feature_id"])] for feature in definitions
-        ],
+        summaries=[summaries_by_id[str(feature["feature_id"])] for feature in definitions],
         performance=_review_performance_for_features(
             performance,
             feature_ids=feature_ids,
@@ -2514,14 +2795,11 @@ def _request_partitioned_review(
             "feature_set_index": feature_set_index,
             "definitions": list(batch_definitions),
             "summaries": [
-                summaries_by_id[str(feature["feature_id"])]
-                for feature in batch_definitions
+                summaries_by_id[str(feature["feature_id"])] for feature in batch_definitions
             ],
             "performance": _review_performance_for_features(
                 performance,
-                feature_ids={
-                    str(feature["feature_id"]) for feature in batch_definitions
-                },
+                feature_ids={str(feature["feature_id"]) for feature in batch_definitions},
             ),
             "quality_guides": {
                 "minimum_nonmissing_fraction": min_nonmissing_fraction,
@@ -2537,8 +2815,7 @@ def _request_partitioned_review(
                 completion = json.loads(complete_path.read_text(encoding="utf-8"))
                 cached = json.loads(result_path.read_text(encoding="utf-8"))
                 if (
-                    completion.get("schema_version")
-                    == REVIEW_CHECKPOINT_SCHEMA_VERSION
+                    completion.get("schema_version") == REVIEW_CHECKPOINT_SCHEMA_VERSION
                     and completion.get("input_fingerprint") == input_fingerprint
                 ):
                     batch_review = _validate_review(
@@ -2625,6 +2902,423 @@ def _apply_review(
                 updated[key] = decision[key]
         revised.append(updated)
     return revised, measurement_changed
+
+
+def _ontology_refinement_prompt(
+    *,
+    feature: Mapping[str, Any],
+    failure_patterns: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Request a same-feature ontology repair from repeated training failures."""
+
+    body = {
+        "job": "refine_stage2_feature_ontology_from_repeated_extraction_failures",
+        "information_boundary": (
+            "These aggregate diagnostics come only from outer-training patients. "
+            "No held-out patient text, treatment, or outcome is supplied."
+        ),
+        "feature": {
+            key: copy.deepcopy(feature.get(key))
+            for key in (
+                "feature_id",
+                "name",
+                "description",
+                "value_type",
+                "categories_or_unit",
+                "measurement_definition",
+                "missing_value_rule",
+                "roles",
+            )
+        },
+        "repeated_failure_patterns": [
+            {
+                key: copy.deepcopy(pattern.get(key))
+                for key in (
+                    "failure_kind",
+                    "reason",
+                    "patient_count",
+                    "example_values",
+                    "allowed_categories",
+                )
+            }
+            for pattern in failure_patterns
+        ],
+        "rules": [
+            "Refine only the supplied feature's extraction ontology; do not rename, merge, split, add, or drop a feature and do not change its causal roles.",
+            "The example values are prior model outputs that failed validation, not verified patient facts.",
+            "Use revise only when the repeated failures identify a correctable mismatch in value type, closed categories or unit, measurement definition, or missing-value rule.",
+            "Use keep when the current ontology is already appropriate and the failures do not justify a change.",
+            "A revised ontology must still define exactly one reusable patient-level scalar measurement.",
+            "Prefer a numeric continuous ontology when the named measurement is realistically extractable as one number; include one unit when applicable.",
+            "For binary variables return exactly two distinct extractable scalar categories; for categorical or ordinal variables return at least two.",
+            "Do not blindly add every failed output as a category; choose a stable, reproducible ontology and clarify how source documentation maps to it.",
+            "Return JSON only.",
+        ],
+        "response": {
+            "action": "keep|revise",
+            "reason": "why the ontology is retained or changed",
+            "description": "required for revise",
+            "value_type": "binary|categorical|continuous|ordinal; required for revise",
+            "categories_or_unit": ["required for revise; empty only for unitless continuous"],
+            "measurement_definition": "required for revise",
+            "missing_value_rule": "required for revise",
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You refine one clinical extraction ontology from repeated validation "
+                "failures on training patients. Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True, ensure_ascii=False)},
+    ]
+
+
+def _validate_ontology_refinement(
+    value: Mapping[str, Any],
+    *,
+    feature: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a bounded same-feature ontology decision."""
+
+    if feature.get("configured_explicit_feature") is True:
+        raise ValueError("investigator-configured feature ontology cannot be revised")
+    action = str(value.get("action") or "").strip().lower()
+    if action not in {"keep", "revise"}:
+        raise ValueError("ontology refinement action must be keep or revise")
+    decision: dict[str, Any] = {
+        "feature_id": str(feature["feature_id"]),
+        "feature_name": str(feature["name"]),
+        "action": action,
+        "reason": str(value.get("reason") or "").strip(),
+    }
+    if action == "keep":
+        return decision
+
+    description = str(value.get("description") or "").strip()
+    value_type = str(value.get("value_type") or "").strip().lower()
+    categories = value.get("categories_or_unit")
+    measurement_definition = str(value.get("measurement_definition") or "").strip()
+    missing_value_rule = str(value.get("missing_value_rule") or "").strip()
+    if not description:
+        raise ValueError("a revised ontology requires description")
+    if value_type not in {"binary", "categorical", "continuous", "ordinal"}:
+        raise ValueError("a revised ontology requires an operational value_type")
+    if not isinstance(categories, list):
+        raise ValueError("a revised ontology requires a categories_or_unit array")
+    clean_categories = [str(item).strip() for item in categories if str(item).strip()]
+    if value_type in {"binary", "categorical", "ordinal"}:
+        clean_categories = _validated_closed_category_values(
+            value_type=value_type,
+            values=clean_categories,
+            source=f"refined feature {feature['feature_id']!r}",
+        )
+    elif len(clean_categories) > 1:
+        raise ValueError("a revised continuous ontology may name at most one unit")
+    if not measurement_definition:
+        raise ValueError("a revised ontology requires measurement_definition")
+    if not missing_value_rule:
+        raise ValueError("a revised ontology requires missing_value_rule")
+    decision.update(
+        {
+            "description": description,
+            "value_type": value_type,
+            "categories_or_unit": clean_categories,
+            "measurement_definition": measurement_definition,
+            "missing_value_rule": missing_value_rule,
+        }
+    )
+    return decision
+
+
+def _repeated_ontology_failure_patterns(
+    summary: Mapping[str, Any],
+    *,
+    minimum_patients: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Select feature-specific patterns repeated across enough distinct patients."""
+
+    selected: dict[str, list[dict[str, Any]]] = {}
+    for raw_pattern in summary.get("feature_failure_patterns") or []:
+        if not isinstance(raw_pattern, Mapping):
+            continue
+        if int(raw_pattern.get("patient_count") or 0) < int(minimum_patients):
+            continue
+        feature_name = str(raw_pattern.get("feature_name") or "")
+        if feature_name:
+            selected.setdefault(feature_name, []).append(dict(raw_pattern))
+    return selected
+
+
+def _request_ontology_refinements(
+    *,
+    definitions: Sequence[Mapping[str, Any]],
+    repeated_patterns: Mapping[str, Sequence[Mapping[str, Any]]],
+    output_dir: Path,
+    request_json: RequestJSON,
+    workers: int,
+) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
+    """Checkpoint independent ontology decisions and preserve explicit definitions."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    features_by_name = {str(feature["name"]): dict(feature) for feature in definitions}
+    unknown_names = sorted(set(repeated_patterns) - set(features_by_name))
+    if unknown_names:
+        raise ValueError(
+            "ontology refinement received failure patterns for unknown feature names: "
+            f"{unknown_names}"
+        )
+    input_value = {
+        "schema_version": ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION,
+        "definitions": list(definitions),
+        "repeated_failure_patterns": {
+            name: list(patterns) for name, patterns in repeated_patterns.items()
+        },
+    }
+    input_fingerprint = _value_fingerprint(input_value)
+    _write_json(
+        output_dir / "input.json",
+        {**input_value, "input_fingerprint": input_fingerprint},
+    )
+
+    decisions_by_name: dict[str, dict[str, Any]] = {}
+    jobs: list[tuple[int, str, dict[str, Any], list[dict[str, str]]]] = []
+    for index, feature in enumerate(definitions, start=1):
+        name = str(feature["name"])
+        if name not in repeated_patterns:
+            continue
+        if feature.get("configured_explicit_feature") is True:
+            decisions_by_name[name] = {
+                "feature_id": str(feature["feature_id"]),
+                "feature_name": name,
+                "action": "keep",
+                "reason": (
+                    "Repeated failures were recorded, but the investigator-configured "
+                    "ontology is immutable."
+                ),
+                "configured_explicit_feature": True,
+            }
+            continue
+        jobs.append(
+            (
+                index,
+                name,
+                dict(feature),
+                _ontology_refinement_prompt(
+                    feature=feature,
+                    failure_patterns=repeated_patterns[name],
+                ),
+            )
+        )
+
+    def request_one(
+        job: tuple[int, str, dict[str, Any], list[dict[str, str]]],
+    ) -> tuple[str, dict[str, Any]]:
+        index, name, feature, messages = job
+        feature_dir = output_dir / f"feature_{index:03d}"
+        feature_input = {
+            "schema_version": ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION,
+            "feature": feature,
+            "failure_patterns": list(repeated_patterns[name]),
+        }
+        feature_fingerprint = _value_fingerprint(feature_input)
+        result_path = feature_dir / "result.json"
+        complete_path = feature_dir / "complete.json"
+        if result_path.is_file() and complete_path.is_file():
+            try:
+                completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                cached = json.loads(result_path.read_text(encoding="utf-8"))
+                if completion.get("input_fingerprint") == feature_fingerprint:
+                    return name, _validate_ontology_refinement(cached, feature=feature)
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            feature_dir / "input.json",
+            {**feature_input, "input_fingerprint": feature_fingerprint},
+        )
+        try:
+            decision = request_json(
+                messages,
+                lambda value: _validate_ontology_refinement(value, feature=feature),
+            )
+        except ValueError as exc:
+            decision = {
+                "feature_id": str(feature["feature_id"]),
+                "feature_name": name,
+                "action": "keep",
+                "reason": (
+                    "Ontology refinement response remained invalid; retained the prior "
+                    f"ontology: {type(exc).__name__}: {exc}"
+                ),
+                "validation_fallback": True,
+            }
+            _write_json(
+                feature_dir / "fallback.json",
+                {
+                    "status": "conservative_keep",
+                    "completed_at": _now(),
+                    "validation_error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        _write_json(result_path, decision)
+        _write_json(
+            complete_path,
+            {
+                "status": "complete",
+                "schema_version": ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION,
+                "input_fingerprint": feature_fingerprint,
+                "completed_at": _now(),
+                "action": decision["action"],
+            },
+        )
+        return name, decision
+
+    if jobs:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(int(workers), len(jobs)))
+        ) as executor:
+            futures = {executor.submit(request_one, job): job[1] for job in jobs}
+            for future in concurrent.futures.as_completed(futures):
+                name, decision = future.result()
+                decisions_by_name[name] = decision
+
+    updated: list[dict[str, Any]] = []
+    changed_names: list[str] = []
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        name = str(feature["name"])
+        decision = decisions_by_name.get(name)
+        if decision is not None and decision["action"] == "revise":
+            before = {
+                key: copy.deepcopy(feature.get(key))
+                for key in (
+                    "description",
+                    "value_type",
+                    "categories_or_unit",
+                    "measurement_definition",
+                    "missing_value_rule",
+                )
+            }
+            for key in (
+                "description",
+                "value_type",
+                "categories_or_unit",
+                "measurement_definition",
+                "missing_value_rule",
+            ):
+                feature[key] = copy.deepcopy(decision[key])
+            after = {key: copy.deepcopy(feature.get(key)) for key in before}
+            if _value_fingerprint(before) != _value_fingerprint(after):
+                changed_names.append(name)
+        updated.append(feature)
+
+    ordered_decisions = [
+        decisions_by_name[str(feature["name"])]
+        for feature in definitions
+        if str(feature["name"]) in decisions_by_name
+    ]
+    report = {
+        "schema_version": ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION,
+        "input_fingerprint": input_fingerprint,
+        "completed_at": _now(),
+        "triggered_features": len(repeated_patterns),
+        "model_requested_features": len(jobs),
+        "immutable_explicit_features": sum(
+            decision.get("configured_explicit_feature") is True for decision in ordered_decisions
+        ),
+        "changed_feature_names": changed_names,
+        "decisions": ordered_decisions,
+    }
+    _write_json(output_dir / "result.json", {"definitions": updated, **report})
+    _write_json(output_dir / "complete.json", {"status": "complete", **report})
+    return updated, bool(changed_names), report
+
+
+def _extract_training_with_ontology_feedback(
+    *,
+    dataset: pd.DataFrame,
+    row_ids: Sequence[int],
+    text_column: str,
+    definitions: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    feedback_dir: Path,
+    request_json: RequestJSON,
+    workers: int,
+    max_prompt_chars: int,
+    minimum_failure_patients: int,
+    max_refinement_rounds: int,
+) -> tuple[pd.DataFrame, list[dict[str, Any]], int]:
+    """Extract training rows and re-extract after repeated-failure ontology repairs."""
+
+    current = [dict(feature) for feature in definitions]
+    extraction_dir = output_dir
+    rounds: list[dict[str, Any]] = []
+    stopped_reason = "maximum_refinement_rounds_reached"
+    extracted: pd.DataFrame | None = None
+    for pass_index in range(0, int(max_refinement_rounds) + 1):
+        extracted = extract_rows(
+            dataset=dataset,
+            row_ids=row_ids,
+            text_column=text_column,
+            definitions=current,
+            output_dir=extraction_dir,
+            request_json=request_json,
+            workers=workers,
+            max_prompt_chars=max_prompt_chars,
+        )
+        summary = json.loads((extraction_dir / "failure_summary.json").read_text(encoding="utf-8"))
+        repeated = _repeated_ontology_failure_patterns(
+            summary,
+            minimum_patients=minimum_failure_patients,
+        )
+        if not repeated:
+            stopped_reason = "no_repeated_feature_failures"
+            break
+        if pass_index >= int(max_refinement_rounds):
+            break
+        round_number = pass_index + 1
+        round_dir = feedback_dir / f"round_{round_number:03d}"
+        updated, changed, report = _request_ontology_refinements(
+            definitions=current,
+            repeated_patterns=repeated,
+            output_dir=round_dir,
+            request_json=request_json,
+            workers=workers,
+        )
+        rounds.append(
+            {
+                "round": round_number,
+                "source_extraction_dir": str(extraction_dir),
+                "repeated_failure_features": sorted(repeated),
+                "changed_feature_names": list(report["changed_feature_names"]),
+                "immutable_explicit_features": int(report["immutable_explicit_features"]),
+            }
+        )
+        if not changed:
+            stopped_reason = "no_ontology_changes"
+            break
+        current = updated
+        extraction_dir = round_dir / "extraction"
+
+    if extracted is None:  # pragma: no cover - loop always runs once
+        raise RuntimeError("ontology feedback loop did not perform extraction")
+    feedback_dir.mkdir(parents=True, exist_ok=True)
+    feedback_result = {
+        "schema_version": ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION,
+        "completed_at": _now(),
+        "minimum_failure_patients": int(minimum_failure_patients),
+        "maximum_refinement_rounds": int(max_refinement_rounds),
+        "rounds_executed": len(rounds),
+        "stopped_reason": stopped_reason,
+        "rounds": rounds,
+        "definitions": current,
+    }
+    _write_json(feedback_dir / "result.json", feedback_result)
+    _write_json(feedback_dir / "complete.json", {"status": "complete", **feedback_result})
+    return extracted, current, len(rounds)
 
 
 def _cross_fitted_nuisance(
@@ -2851,20 +3545,29 @@ def run_fold_analysis(
     final_fit_extraction: pd.DataFrame | None = None
     final_fit_definitions: list[dict[str, Any]] | None = None
     review_rounds = 0
+    ontology_refinement_rounds = 0
     for round_index in range(1, int(config.max_review_rounds) + 1):
         review_rounds = round_index
         round_dir = output_dir / "review" / f"round_{round_index:03d}"
-        extraction_definitions = [dict(feature) for feature in current]
         _write_json(round_dir / "definitions.json", {"features": current})
-        extracted = extract_rows(
+        extracted, current, feedback_rounds = _extract_training_with_ontology_feedback(
             dataset=dataset,
             row_ids=fit_ids,
             text_column=text_column,
             definitions=current,
             output_dir=round_dir / "extraction",
+            feedback_dir=round_dir / "ontology_refinement",
             request_json=request_json,
             workers=config.workers,
             max_prompt_chars=config.extraction_max_prompt_chars,
+            minimum_failure_patients=config.ontology_refinement_min_failure_patients,
+            max_refinement_rounds=config.max_ontology_refinement_rounds,
+        )
+        ontology_refinement_rounds += feedback_rounds
+        extraction_definitions = [dict(feature) for feature in current]
+        _write_json(
+            round_dir / "definitions_after_ontology_refinement.json",
+            {"features": current, "ontology_refinement_rounds": feedback_rounds},
         )
         summaries = feature_summaries(extracted, current)
         performance = evaluate_definitions(
@@ -2917,10 +3620,6 @@ def run_fold_analysis(
 
     if final_fit_extraction is None or final_fit_definitions is None:
         raise RuntimeError("Stage 2 review did not produce a training-fold extraction")
-    _write_json(
-        output_dir / "final_definitions.json",
-        {"features": current, "review_rounds": review_rounds},
-    )
     names = [str(feature["name"]) for feature in current]
     if _value_fingerprint(final_fit_definitions) == _value_fingerprint(current):
         fit_selected = final_fit_extraction[["_oci_row_id", *names]].copy()
@@ -2931,16 +3630,29 @@ def run_fold_analysis(
             len(fit_ids),
             len(current),
         )
-        fit_selected = extract_rows(
+        fit_selected, current, feedback_rounds = _extract_training_with_ontology_feedback(
             dataset=dataset,
             row_ids=fit_ids,
             text_column=text_column,
             definitions=current,
             output_dir=output_dir / "extraction" / "fit",
+            feedback_dir=output_dir / "extraction" / "fit_ontology_refinement",
             request_json=request_json,
             workers=config.workers,
             max_prompt_chars=config.extraction_max_prompt_chars,
+            minimum_failure_patients=config.ontology_refinement_min_failure_patients,
+            max_refinement_rounds=config.max_ontology_refinement_rounds,
         )
+        ontology_refinement_rounds += feedback_rounds
+        names = [str(feature["name"]) for feature in current]
+    _write_json(
+        output_dir / "final_definitions.json",
+        {
+            "features": current,
+            "review_rounds": review_rounds,
+            "ontology_refinement_rounds": ontology_refinement_rounds,
+        },
+    )
     _assert_extraction_health(
         fit_selected,
         current,
@@ -2988,6 +3700,7 @@ def run_fold_analysis(
     return {
         "features": current,
         "review_rounds": review_rounds,
+        "ontology_refinement_rounds": ontology_refinement_rounds,
         "estimation": diagnostics,
     }
 

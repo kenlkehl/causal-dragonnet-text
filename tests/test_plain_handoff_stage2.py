@@ -58,8 +58,11 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.max_prompt_chars == 100_000
     assert config.consolidation_max_prompt_chars == 640_000
     assert config.consolidation_batch_size == 20
-    assert config.consolidation_max_rounds == 5
+    assert config.consolidation_alphabetical_rounds == 5
+    assert config.consolidation_max_rounds == 10
     assert config.extraction_max_prompt_chars == 640_000
+    assert config.ontology_refinement_min_failure_patients == 3
+    assert config.max_ontology_refinement_rounds == 2
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
     assert config.evidence_max_cards_per_fold == 400
     assert config.consolidation_oversample_factor == 4
@@ -72,8 +75,11 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "max_prompt_chars": 90_000,
             "consolidation_max_prompt_chars": 450_000,
             "consolidation_batch_size": 18,
+            "consolidation_alphabetical_rounds": 4,
             "consolidation_max_rounds": 7,
             "extraction_max_prompt_chars": 500_000,
+            "ontology_refinement_min_failure_patients": 4,
+            "max_ontology_refinement_rounds": 3,
         },
         default_workers=1,
     )
@@ -82,12 +88,18 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.max_prompt_chars == 90_000
     assert config.consolidation_max_prompt_chars == 450_000
     assert config.consolidation_batch_size == 18
+    assert config.consolidation_alphabetical_rounds == 4
     assert config.consolidation_max_rounds == 7
     assert config.extraction_max_prompt_chars == 500_000
+    assert config.ontology_refinement_min_failure_patients == 4
+    assert config.max_ontology_refinement_rounds == 3
     assert config.public_dict()["consolidation_max_prompt_chars"] == 450_000
     assert config.public_dict()["consolidation_batch_size"] == 18
+    assert config.public_dict()["consolidation_alphabetical_rounds"] == 4
     assert config.public_dict()["consolidation_max_rounds"] == 7
     assert config.public_dict()["extraction_max_prompt_chars"] == 500_000
+    assert config.public_dict()["ontology_refinement_min_failure_patients"] == 4
+    assert config.public_dict()["max_ontology_refinement_rounds"] == 3
 
 
 def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
@@ -103,6 +115,27 @@ def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
             endpoint="http://stage2.test/v1",
             model="test-model",
             consolidation_max_rounds=0,
+        ).validate()
+
+    with pytest.raises(ValueError, match="consolidation_alphabetical_rounds"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            consolidation_alphabetical_rounds=-1,
+        ).validate()
+
+    with pytest.raises(ValueError, match="ontology_refinement_min_failure_patients"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            ontology_refinement_min_failure_patients=1,
+        ).validate()
+
+    with pytest.raises(ValueError, match="max_ontology_refinement_rounds"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            max_ontology_refinement_rounds=-1,
         ).validate()
 
 
@@ -719,6 +752,79 @@ def test_resume_relocates_legacy_singleton_by_row_id_after_batch_numbers_shift(
     assert "relocate single-patient" in caplog.text
 
 
+def test_resume_reconstructs_failure_ledger_from_legacy_category_audit(
+    tmp_path: Path,
+):
+    output = tmp_path / "extraction"
+    batch = output / "batches" / "batch_00001"
+    batch.mkdir(parents=True)
+    (batch / "row_ids.json").write_text("[0]\n", encoding="utf-8")
+    (batch / "result.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {"marker_status": None},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (batch / "complete.json").write_text(
+        json.dumps({"status": "complete", "rows": 1}),
+        encoding="utf-8",
+    )
+    (batch / "category_ontology_repair.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage2_category_ontology_repair_v1",
+                "resolution": "conservative_null",
+                "items": [
+                    {
+                        "mapping_id": "category_mapping_0001",
+                        "feature_name": "marker_status",
+                        "value_type": "categorical",
+                        "allowed_categories": ["negative", "positive"],
+                        "prior_extracted_value": "equivocal",
+                    }
+                ],
+                "targets": {
+                    "category_mapping_0001": [{"row_id": 0, "feature_name": "marker_status"}]
+                },
+                "corrections": [{"mapping_id": "category_mapping_0001", "value": None}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    definition = {
+        "name": "marker_status",
+        "value_type": "categorical",
+        "categories_or_unit": ["negative", "positive"],
+    }
+
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": ["Marker was equivocal."]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        output_dir=output,
+        request_json=lambda _messages, _validate: (_ for _ in ()).throw(
+            AssertionError("legacy checkpoint should be adopted")
+        ),
+        workers=1,
+        max_prompt_chars=10_000,
+    )
+
+    assert pd.isna(frame.loc[0, "marker_status"])
+    ledger = json.loads((batch / "extraction_issues.json").read_text(encoding="utf-8"))
+    assert ledger["reconstructed_from_legacy_audits"] is True
+    assert ledger["events"][0]["failure_kind"] == "out_of_ontology_category"
+    summary = json.loads((output / "failure_summary.json").read_text(encoding="utf-8"))
+    assert summary["feature_failure_patterns"][0]["patient_count"] == 1
+
+
 def test_resume_retries_only_checkpoints_with_stale_range_ontology_repairs(tmp_path: Path):
     output = tmp_path / "extraction"
     batch = output / "batches" / "batch_00001"
@@ -970,6 +1076,9 @@ def test_extraction_defaults_structurally_invalid_response_to_audited_null(
     assert audit["feature_names"] == ["performance_status"]
     assert "Unterminated string" in audit["validation_error"]
     assert "remained structurally invalid" in caplog.text
+    failure_summary = json.loads((output / "failure_summary.json").read_text(encoding="utf-8"))
+    assert failure_summary["feature_failure_patterns"] == []
+    assert failure_summary["structural_failure_patient_count"] == 1
 
 
 def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
@@ -2485,7 +2594,7 @@ def test_global_candidate_pool_prompt_exposes_all_unique_names_and_descriptions(
     assert "group_id" not in messages[1]["content"]
     instructions = " ".join([messages[0]["content"], body["task"], *body["rules"]]).lower()
     assert "alphabetically adjacent batch" in instructions
-    assert "shift batch boundaries" in instructions
+    assert "new deterministic partitions" in instructions
     assert "including the selected canonical name" in instructions
     assert "never chain or split one family" in instructions
     assert "only when that exact name appears in the same directive's inputs" in instructions
@@ -2518,6 +2627,52 @@ def test_alphabetical_candidate_batches_shift_boundaries_between_rounds():
         (0, [["alpha", "bravo", "charlie"], ["delta", "echo", "foxtrot"], ["golf"]]),
         (1, [["alpha"], ["bravo", "charlie", "delta"], ["echo", "foxtrot", "golf"]]),
         (2, [["alpha", "bravo"], ["charlie", "delta", "echo"], ["foxtrot", "golf"]]),
+    ]
+
+
+def test_candidate_consolidation_batches_switch_to_reproducible_seeded_shuffles():
+    groups = [
+        {"candidate_id": f"candidate_{index}", "name": name}
+        for index, name in enumerate(
+            ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"],
+            start=1,
+        )
+    ]
+
+    alphabetical = stage2_workflow._candidate_consolidation_batches(
+        groups,
+        batch_size=3,
+        round_number=2,
+        alphabetical_rounds=2,
+        seed=91,
+    )
+    shuffled = stage2_workflow._candidate_consolidation_batches(
+        groups,
+        batch_size=3,
+        round_number=3,
+        alphabetical_rounds=2,
+        seed=91,
+    )
+    repeated = stage2_workflow._candidate_consolidation_batches(
+        list(reversed(groups)),
+        batch_size=3,
+        round_number=3,
+        alphabetical_rounds=2,
+        seed=91,
+    )
+
+    assert alphabetical[:3] == ("alphabetical_shift", 1, None)
+    assert shuffled[:3] == ("seeded_shuffle", None, 1)
+    shuffled_names = [[group["name"] for group in batch] for batch in shuffled[3]]
+    repeated_names = [[group["name"] for group in batch] for batch in repeated[3]]
+    assert shuffled_names == repeated_names
+    assert sorted(name for batch in shuffled_names for name in batch) == sorted(
+        group["name"] for group in groups
+    )
+    assert shuffled_names != [
+        ["alpha", "bravo", "charlie"],
+        ["delta", "echo", "foxtrot"],
+        ["golf"],
     ]
 
 
@@ -2607,6 +2762,102 @@ def test_iterative_consolidation_finds_aliases_across_a_shifted_batch_boundary(
     ]
     assert [summary["boundary_offset"] for summary in summaries] == [0, 1, 2]
     assert [summary["changed"] for summary in summaries] == [False, True, False]
+
+
+def test_seeded_shuffle_round_can_merge_candidates_from_distant_alphabetical_batches(
+    tmp_path: Path,
+):
+    names = [
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "foxtrot",
+        "golf",
+        "hotel",
+        "india",
+    ]
+    groups = stage2_workflow._materialize_exact_name_groups(
+        [
+            {
+                "candidate_id": f"candidate_{index:04d}",
+                "architecture": "architecture_alpha",
+                "name": name,
+                "description": f"Description for {name}.",
+                "supporting_packet_ids": [f"packet_{index:04d}"],
+                "evidence_axes": ["outcome"],
+            }
+            for index, name in enumerate(names, start=1)
+        ]
+    )
+    seed = 17
+    _, alphabetical_batches = stage2_workflow._alphabetical_candidate_batches(
+        groups,
+        batch_size=3,
+        round_number=1,
+    )
+    alphabetical_owner = {
+        str(group["name"]): batch_index
+        for batch_index, batch in enumerate(alphabetical_batches)
+        for group in batch
+    }
+    shuffled_batches = stage2_workflow._seeded_shuffle_candidate_batches(
+        groups,
+        batch_size=3,
+        seed=seed + 1_000_003,
+        shuffle_round=1,
+    )
+    alias_pair = next(
+        (str(left["name"]), str(right["name"]))
+        for batch in shuffled_batches
+        for left_index, left in enumerate(batch)
+        for right in batch[left_index + 1 :]
+        if alphabetical_owner[str(left["name"])] != alphabetical_owner[str(right["name"])]
+    )
+
+    def completion(messages, _config):
+        body = json.loads(messages[1]["content"])
+        batch_names = {feature["name"] for feature in body["features"]}
+        if set(alias_pair) <= batch_names:
+            return json.dumps(
+                {
+                    "merge_directives": [{"inputs": list(alias_pair), "output": alias_pair[0]}],
+                    "exclude_feature_names": [],
+                }
+            )
+        return json.dumps({"merge_directives": [], "exclude_feature_names": []})
+
+    output_dir = tmp_path / "candidate_pool_consolidation"
+    consolidated, exclusions = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            workers=1,
+            consolidation_batch_size=3,
+            consolidation_alphabetical_rounds=1,
+            consolidation_max_rounds=2,
+        ),
+        clinical_question="Not supplied to consolidation.",
+        completion=completion,
+    )._consolidate_candidate_pool(
+        outer_fold=1,
+        groups=groups,
+        output_dir=output_dir,
+        seed=seed,
+    )
+
+    assert exclusions == {}
+    assert len(consolidated) == len(groups) - 1
+    summaries = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(output_dir.glob("round_*/complete.json"))
+    ]
+    assert [summary["ordering"] for summary in summaries] == [
+        "alphabetical_shift",
+        "seeded_shuffle",
+    ]
+    assert [summary["changed"] for summary in summaries] == [False, True]
 
 
 def test_iterative_consolidation_retains_batch_and_explicit_feature_after_invalid_responses(
@@ -3712,8 +3963,10 @@ def test_iterative_batch_jointly_merges_general_threshold_value_and_score_repres
     ] == ["retained", "merged", "merged", "merged"]
 
 
+@pytest.mark.parametrize("legacy_generation", ["pairwise", "alphabetical_batches_v6"])
 def test_unfinished_fold_upgrades_cached_definitions_through_new_global_pass(
     tmp_path: Path,
+    legacy_generation: str,
 ):
     output = tmp_path / "outer_001"
     output.mkdir()
@@ -3740,19 +3993,49 @@ def test_unfinished_fold_upgrades_cached_definitions_through_new_global_pass(
         model="test-model",
     )
     clinical_question = "Estimate a treatment effect."
-    legacy_fingerprint = stage2_workflow._value_fingerprint(
-        {
-            "outer_fold": 1,
-            "compiler": config.evidence_compiler,
-            "interpretation_schema": stage2_workflow.INTERPRETATION_SCHEMA_VERSION,
-            "consolidation_schema": (
-                stage2_workflow.PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION
-            ),
-            "clinical_question": clinical_question,
-            "explicit_features": [],
-            "packets": [packet],
-        }
-    )
+    legacy_inputs = {
+        "outer_fold": 1,
+        "compiler": config.evidence_compiler,
+        "interpretation_schema": stage2_workflow.INTERPRETATION_SCHEMA_VERSION,
+        "consolidation_schema": (
+            stage2_workflow.PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION
+            if legacy_generation == "pairwise"
+            else stage2_workflow.CONSOLIDATION_SCHEMA_VERSION
+        ),
+        "clinical_question": clinical_question,
+        "explicit_features": [],
+        "packets": [packet],
+    }
+    if legacy_generation == "alphabetical_batches_v6":
+        legacy_inputs.update(
+            {
+                "consolidation_batch_size": config.consolidation_batch_size,
+                "consolidation_max_rounds": (
+                    stage2_workflow.PREVIOUS_ITERATIVE_CONSOLIDATION_MAX_ROUNDS
+                ),
+                "global_candidate_pool_schema": (
+                    stage2_workflow.PREVIOUS_ITERATIVE_GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION
+                ),
+            }
+        )
+    legacy_fingerprint = stage2_workflow._value_fingerprint(legacy_inputs)
+    legacy_state = {
+        "status": "complete",
+        "evidence_input_fingerprint": legacy_fingerprint,
+        "consolidation_schema": legacy_inputs["consolidation_schema"],
+    }
+    if legacy_generation == "alphabetical_batches_v6":
+        legacy_state.update(
+            {
+                "consolidation_batch_size": config.consolidation_batch_size,
+                "consolidation_max_rounds": (
+                    stage2_workflow.PREVIOUS_ITERATIVE_CONSOLIDATION_MAX_ROUNDS
+                ),
+                "global_candidate_pool_schema": (
+                    stage2_workflow.PREVIOUS_ITERATIVE_GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION
+                ),
+            }
+        )
     (output / "interpreted_candidates.json").write_text(
         json.dumps([candidate]),
         encoding="utf-8",
@@ -3768,15 +4051,7 @@ def test_unfinished_fold_upgrades_cached_definitions_through_new_global_pass(
         encoding="utf-8",
     )
     (output / "definitions_complete.json").write_text(
-        json.dumps(
-            {
-                "status": "complete",
-                "evidence_input_fingerprint": legacy_fingerprint,
-                "consolidation_schema": (
-                    stage2_workflow.PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION
-                ),
-            }
-        ),
+        json.dumps(legacy_state),
         encoding="utf-8",
     )
     jobs = []
@@ -4544,6 +4819,200 @@ def test_training_fold_review_can_revise_then_retest_a_definition(
     assert jobs.count("review_stage2_variables_against_training_fold_performance") == 2
     assert jobs.count("extract_stage2_patient_variables") == 18
     assert (tmp_path / "outer_001" / "review" / "round_002" / "performance.json").is_file()
+
+
+def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "patient_id": [f"p{index:02d}" for index in range(12)],
+            "clinical_text": [
+                f"Pretreatment overall stage {'III' if index % 2 == 0 else 'IV'}."
+                for index in range(12)
+            ],
+            "treatment_indicator": [index % 2 for index in range(12)],
+            "outcome_indicator": [(index // 2) % 2 for index in range(12)],
+        }
+    )
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "disease_stage",
+        "description": "Pretreatment overall disease stage.",
+        "value_type": "ordinal",
+        "categories_or_unit": ["stage_i", "stage_ii"],
+        "roles": ["confounder"],
+        "measurement_definition": "Extract the documented overall stage.",
+        "missing_value_rule": "Use null when no overall stage is documented.",
+    }
+    fit_ids = list(range(6))
+    split = {
+        "outer_fold": 1,
+        "fit_row_ids": fit_ids,
+        "heldout_row_ids": list(range(6, 12)),
+        "inner_splits": [
+            {"inner_fold": 1, "fit_row_ids": fit_ids[:3], "heldout_row_ids": fit_ids[3:]},
+            {"inner_fold": 2, "fit_row_ids": fit_ids[3:], "heldout_row_ids": fit_ids[:3]},
+        ],
+    }
+    jobs = []
+
+    def request_json(messages, validate):
+        body = json.loads(messages[1]["content"])
+        jobs.append(body["job"])
+        if body["job"] == "extract_stage2_patient_variables":
+            categories = body["features"][0]["categories_or_unit"]
+            rows = []
+            for patient in body["patients"]:
+                raw_stage = "stage_iii" if "stage III" in patient["text"] else "stage_iv"
+                rows.append(
+                    {
+                        "row_id": patient["row_id"],
+                        "values": {
+                            "disease_stage": (
+                                raw_stage
+                                if raw_stage in categories
+                                else raw_stage.replace("stage_", "TNM stage ").upper()
+                            )
+                        },
+                    }
+                )
+            return validate({"rows": rows})
+        if body["job"] == "map_extracted_values_to_declared_category_ontology":
+            return validate(
+                {
+                    "corrections": [
+                        {"mapping_id": item["mapping_id"], "value": None} for item in body["items"]
+                    ]
+                }
+            )
+        if body["job"] == "refine_stage2_feature_ontology_from_repeated_extraction_failures":
+            assert body["feature"]["name"] == "disease_stage"
+            assert body["repeated_failure_patterns"][0]["patient_count"] == 6
+            assert "patients" not in body
+            return validate(
+                {
+                    "action": "revise",
+                    "reason": "The initial closed ontology omitted supported stage groups.",
+                    "description": "Pretreatment overall disease stage group.",
+                    "value_type": "ordinal",
+                    "categories_or_unit": ["stage_iii", "stage_iv"],
+                    "measurement_definition": (
+                        "Extract the explicitly documented pretreatment overall stage group."
+                    ),
+                    "missing_value_rule": (
+                        "Use null when no pretreatment overall stage group is documented."
+                    ),
+                }
+            )
+        return validate(
+            {
+                "feature_decisions": [
+                    {
+                        "feature_id": "outer_001_feature_001",
+                        "action": "keep",
+                        "reason": "The refined ontology extracted consistently.",
+                    }
+                ],
+                "overall_assessment": "Keep the refined feature.",
+            }
+        )
+
+    output = tmp_path / "outer_001"
+    result = run_fold_analysis(
+        dataset=dataset,
+        definitions=[definition],
+        split=split,
+        clinical_question="Estimate treatment effect.",
+        unit_id_column="patient_id",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        inner_folds=2,
+        seed=23,
+        output_dir=output,
+        request_json=request_json,
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            workers=1,
+            max_review_rounds=1,
+            ontology_refinement_min_failure_patients=3,
+            max_ontology_refinement_rounds=2,
+            estimation_trees=10,
+        ),
+    )
+
+    assert result["ontology_refinement_rounds"] == 1
+    assert result["features"][0]["categories_or_unit"] == ["stage_iii", "stage_iv"]
+    assert jobs.count("refine_stage2_feature_ontology_from_repeated_extraction_failures") == 1
+    initial_summary = json.loads(
+        (output / "review" / "round_001" / "extraction" / "failure_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert initial_summary["feature_failure_patterns"][0]["patient_count"] == 6
+    feedback = json.loads(
+        (output / "review" / "round_001" / "ontology_refinement" / "complete.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert feedback["stopped_reason"] == "no_repeated_feature_failures"
+    refined = pd.read_csv(
+        output
+        / "review"
+        / "round_001"
+        / "ontology_refinement"
+        / "round_001"
+        / "extraction"
+        / "extracted.csv"
+    )
+    assert refined["disease_stage"].notna().all()
+
+
+def test_failure_driven_ontology_refinement_never_rewrites_explicit_feature(
+    tmp_path: Path,
+):
+    feature = {
+        "feature_id": "outer_001_feature_001",
+        "name": "investigator_marker",
+        "description": "Investigator-specified marker.",
+        "value_type": "binary",
+        "categories_or_unit": ["absent", "present"],
+        "measurement_definition": "Extract the documented marker status.",
+        "missing_value_rule": "Use null when undocumented.",
+        "roles": ["effect_modifier"],
+        "configured_explicit_feature": True,
+    }
+
+    def unexpected_request(_messages, _validate):
+        raise AssertionError("explicit ontology must not be sent for refinement")
+
+    updated, changed, report = stage2_analysis._request_ontology_refinements(
+        definitions=[feature],
+        repeated_patterns={
+            "investigator_marker": [
+                {
+                    "feature_name": "investigator_marker",
+                    "failure_kind": "out_of_ontology_category",
+                    "reason": "outside ontology",
+                    "patient_count": 5,
+                    "patient_row_ids": [1, 2, 3, 4, 5],
+                    "example_values": ["equivocal"],
+                    "allowed_categories": ["absent", "present"],
+                }
+            ]
+        },
+        output_dir=tmp_path / "ontology_refinement",
+        request_json=unexpected_request,
+        workers=4,
+    )
+
+    assert changed is False
+    assert updated == [feature]
+    assert report["model_requested_features"] == 0
+    assert report["immutable_explicit_features"] == 1
 
 
 def test_final_training_extraction_is_rerun_after_review_drops_a_feature(

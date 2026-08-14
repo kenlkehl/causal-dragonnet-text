@@ -148,7 +148,12 @@ makes those decisions from the retained feature name and supporting text.
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
+    "consolidation_batch_size": 20,
+    "consolidation_alphabetical_rounds": 5,
+    "consolidation_max_rounds": 10,
     "max_review_rounds": 2,
+    "ontology_refinement_min_failure_patients": 3,
+    "max_ontology_refinement_rounds": 2,
     "estimation_trees": 200,
     "explicit_features": [
       {
@@ -201,14 +206,17 @@ sorts the distinct candidates by normalized feature name and sends
 nonoverlapping batches of `consolidation_batch_size` candidates (20 by default).
 Batches within a round are independent and may run concurrently. After applying
 their directives, Python re-sorts the consolidated versions and repeats for up
-to `consolidation_max_rounds` rounds (5 by default). Batch boundaries shift on
-each round so alphabetically adjacent candidates split at one boundary can meet
-in another. A no-change round does not stop the process until its complete
-partition repeats; this prevents the first boundary layout from declaring
-false convergence. The process also stops when the pool is empty or only
-configured features remain. Identical canonical output names produced by
-independent batches are coalesced exactly while retaining all provenance and
-candidate descriptions.
+to `consolidation_max_rounds` rounds (10 by default). The first
+`consolidation_alphabetical_rounds` rounds (5 by default) shift alphabetical
+boundaries so adjacent candidates split at one boundary can meet in another.
+The remaining rounds assign the re-sorted pool to new pseudorandom batches using
+the run seed and outer-fold number. These seeded shuffles are exactly
+reproducible but allow lexically distant aliases to be considered together. A
+no-change round does not stop the process until its complete partition repeats;
+this prevents one boundary layout from declaring false convergence. The process
+also stops when the pool is empty or only configured features remain. Identical
+canonical output names produced by independent batches are coalesced exactly
+while retaining all provenance and candidate descriptions.
 
 The clinical question is deliberately absent from every consolidation batch.
 The model returns `merge_directives`, each with an `inputs` list of exact names
@@ -257,11 +265,13 @@ The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
 `transport_retry_backoff`, `max_prompt_chars`,
 `consolidation_max_prompt_chars`,
-`consolidation_batch_size`, `consolidation_max_rounds`,
+`consolidation_batch_size`, `consolidation_alphabetical_rounds`,
+`consolidation_max_rounds`,
 `extraction_max_prompt_chars`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
-`max_review_rounds`, `estimation_trees`,
+`max_review_rounds`, `ontology_refinement_min_failure_patients`,
+`max_ontology_refinement_rounds`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
 `temperature`, and `enable_thinking`. The legacy `max_candidates_per_fold` and
 `consolidation_oversample_factor` fields are still accepted in existing run
@@ -446,8 +456,18 @@ my_stage1_run/
           definitions.json
           extraction/
             batches/...
+            failure_summary.json
             extracted.csv
             complete.json
+          ontology_refinement/
+            round_001/
+              feature_.../
+              extraction/...
+              result.json
+              complete.json
+            result.json
+            complete.json
+          definitions_after_ontology_refinement.json
           extraction_summary.json
           performance.json
           review.json
@@ -522,7 +542,25 @@ Outer-held-out outcomes are not made available to definition revision or
 feature retention. The performance file includes baseline, complete-feature,
 and leave-one-feature-out measurements so that retention decisions can be tied
 to an individual extracted variable rather than to the feature set in the
-aggregate. The held-out extraction begins only after
+aggregate.
+
+Every single-patient extraction writes `extraction_issues.json`, including
+feature-attributable invalid scalar/type values and values outside a declared
+closed ontology. The extraction directory aggregates those events by feature,
+failure kind, and distinct patient in `failure_summary.json`. A generic malformed
+response is counted separately as a structural transport/format failure and
+cannot trigger an ontology change. When the same attributable pattern occurs in
+at least `ontology_refinement_min_failure_patients` outer-training patients (3
+by default), a one-feature ontology-refinement component receives the frozen
+definition, aggregate count, and a bounded list of failed model outputs—but no
+patient text, treatment, outcome, or held-out information. It may keep the
+definition or revise only its description, value type, categories or unit,
+measurement rule, and missingness rule. The feature name, identity, roles, and
+support remain fixed. The training patients are then re-extracted and monitored
+again, for at most `max_ontology_refinement_rounds` revisions (2 by default),
+before empirical review proceeds. Investigator-configured explicit ontologies
+are immutable: their repeated failures are audited, but no refinement request is
+made. The held-out extraction begins only after
 `final_definitions.json` has been written. The reported average treatment effect
 is the mean of the held-out AIPW scores across outer folds; its standard error
 is the empirical standard error of those scores. `estimated_cate` in the

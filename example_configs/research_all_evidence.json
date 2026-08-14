@@ -26,9 +26,12 @@
     "api_key": "EMPTY",
     "workers": 4,
     "consolidation_batch_size": 20,
-    "consolidation_max_rounds": 5,
+    "consolidation_alphabetical_rounds": 5,
+    "consolidation_max_rounds": 10,
     "extraction_max_prompt_chars": 640000,
     "max_review_rounds": 2,
+    "ontology_refinement_min_failure_patients": 3,
+    "max_ontology_refinement_rounds": 2,
     "estimation_trees": 200,
     "propensity_clip": 0.02,
     "explicit_features": []

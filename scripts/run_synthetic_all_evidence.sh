@@ -22,6 +22,11 @@ stage1_workers="${STAGE1_WORKERS:-auto}"
 stage2_workers="${STAGE2_WORKERS:-auto}"
 stage2_endpoint="${STAGE2_ENDPOINT-http://127.0.0.1:8010/v1}"
 stage2_model="${STAGE2_MODEL:-}"
+stage2_consolidation_batch_size="${STAGE2_CONSOLIDATION_BATCH_SIZE:-}"
+stage2_consolidation_alphabetical_rounds="${STAGE2_CONSOLIDATION_ALPHABETICAL_ROUNDS:-}"
+stage2_consolidation_max_rounds="${STAGE2_CONSOLIDATION_MAX_ROUNDS:-}"
+stage2_ontology_refinement_min_failure_patients="${STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS:-}"
+stage2_max_ontology_refinement_rounds="${STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS:-}"
 stage1_architectures="${STAGE1_ARCHITECTURES:-}"
 min_free_gpu_gib="${MIN_FREE_GPU_GB:-20}"
 python_bin="${OCI_PYTHON:-}"
@@ -106,9 +111,36 @@ if [[ -z "${stage2_endpoint}" ]]; then
     stage_mode_args=(--stage1-only)
     stage2_description="disabled (STAGE2_ENDPOINT is empty)"
 else
+    stage2_policy_args=()
+    if [[ -n "${stage2_consolidation_batch_size}" ]]; then
+        stage2_policy_args+=(
+            --set "stage2.consolidation_batch_size=${stage2_consolidation_batch_size}"
+        )
+    fi
+    if [[ -n "${stage2_consolidation_alphabetical_rounds}" ]]; then
+        stage2_policy_args+=(
+            --set "stage2.consolidation_alphabetical_rounds=${stage2_consolidation_alphabetical_rounds}"
+        )
+    fi
+    if [[ -n "${stage2_consolidation_max_rounds}" ]]; then
+        stage2_policy_args+=(
+            --set "stage2.consolidation_max_rounds=${stage2_consolidation_max_rounds}"
+        )
+    fi
+    if [[ -n "${stage2_ontology_refinement_min_failure_patients}" ]]; then
+        stage2_policy_args+=(
+            --set "stage2.ontology_refinement_min_failure_patients=${stage2_ontology_refinement_min_failure_patients}"
+        )
+    fi
+    if [[ -n "${stage2_max_ontology_refinement_rounds}" ]]; then
+        stage2_policy_args+=(
+            --set "stage2.max_ontology_refinement_rounds=${stage2_max_ontology_refinement_rounds}"
+        )
+    fi
     stage_mode_args=(
         --stage2-endpoint "${stage2_endpoint}"
         --set "stage2.workers=${resolved_stage2_workers}"
+        "${stage2_policy_args[@]}"
     )
     if [[ -n "${stage2_model}" ]]; then
         stage_mode_args+=(--stage2-model "${stage2_model}")

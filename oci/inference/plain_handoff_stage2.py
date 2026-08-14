@@ -49,11 +49,21 @@ MAX_RESPONSE_REPAIRS = 5
 DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 20
-DEFAULT_CONSOLIDATION_MAX_ROUNDS = 5
+DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS = 5
+DEFAULT_CONSOLIDATION_MAX_ROUNDS = 10
+DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
+DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v12_configured_explicit_features"
 GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
+    "alphabetical_then_seeded_shuffle_candidate_batches_v7_explicit_feature_invariants"
+)
+EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
+    "training_failure_ontology_refinement_v1_explicit_feature_invariants"
+)
+PREVIOUS_ITERATIVE_GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
     "iterative_alphabetical_candidate_batches_v6_explicit_feature_invariants"
 )
+PREVIOUS_ITERATIVE_CONSOLIDATION_MAX_ROUNDS = 5
 PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION = (
     "candidate_pair_alias_v11_configured_explicit_features"
 )
@@ -601,9 +611,10 @@ class PlainHandoffStage2Config:
     transport_retry_backoff: float = 2.0
     max_prompt_chars: int = 100_000
     # Candidate consolidation has its own prompt allowance even though each
-    # request sees only one bounded alphabetical batch.
+    # request sees only one bounded deterministic batch.
     consolidation_max_prompt_chars: int = DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS
     consolidation_batch_size: int = DEFAULT_CONSOLIDATION_BATCH_SIZE
+    consolidation_alphabetical_rounds: int = DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS
     consolidation_max_rounds: int = DEFAULT_CONSOLIDATION_MAX_ROUNDS
     # Extraction repeats a complete frozen feature ontology for one patient.
     # Keep its larger context allowance separate so discovery batching and its
@@ -623,6 +634,8 @@ class PlainHandoffStage2Config:
     consolidation_oversample_factor: int = 4
     workers: int = 4
     max_review_rounds: int = 2
+    ontology_refinement_min_failure_patients: int = DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS
+    max_ontology_refinement_rounds: int = DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS
     estimation_trees: int = 200
     propensity_clip: float = 0.02
     min_nonmissing_fraction: float = 0.05
@@ -649,6 +662,8 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.consolidation_max_prompt_chars must be at least 4000")
         if self.consolidation_batch_size < 2:
             raise ValueError("stage2.consolidation_batch_size must be at least 2")
+        if self.consolidation_alphabetical_rounds < 0:
+            raise ValueError("stage2.consolidation_alphabetical_rounds must be nonnegative")
         if self.consolidation_max_rounds < 1:
             raise ValueError("stage2.consolidation_max_rounds must be positive")
         if self.extraction_max_prompt_chars < 4_000:
@@ -698,6 +713,10 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.workers must be positive")
         if self.max_review_rounds < 1:
             raise ValueError("stage2.max_review_rounds must be positive")
+        if self.ontology_refinement_min_failure_patients < 2:
+            raise ValueError("stage2.ontology_refinement_min_failure_patients must be at least 2")
+        if self.max_ontology_refinement_rounds < 0:
+            raise ValueError("stage2.max_ontology_refinement_rounds must be nonnegative")
         if self.estimation_trees < 10:
             raise ValueError("stage2.estimation_trees must be at least 10")
         if not 0.0 < self.propensity_clip < 0.5:
@@ -783,6 +802,12 @@ def plain_stage2_config_from_mapping(
         consolidation_batch_size=int(
             raw.get("consolidation_batch_size", DEFAULT_CONSOLIDATION_BATCH_SIZE)
         ),
+        consolidation_alphabetical_rounds=int(
+            raw.get(
+                "consolidation_alphabetical_rounds",
+                DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS,
+            )
+        ),
         consolidation_max_rounds=int(
             raw.get("consolidation_max_rounds", DEFAULT_CONSOLIDATION_MAX_ROUNDS)
         ),
@@ -808,6 +833,18 @@ def plain_stage2_config_from_mapping(
         consolidation_oversample_factor=int(raw.get("consolidation_oversample_factor", 4)),
         workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
         max_review_rounds=int(raw.get("max_review_rounds", 2)),
+        ontology_refinement_min_failure_patients=int(
+            raw.get(
+                "ontology_refinement_min_failure_patients",
+                DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS,
+            )
+        ),
+        max_ontology_refinement_rounds=int(
+            raw.get(
+                "max_ontology_refinement_rounds",
+                DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS,
+            )
+        ),
         estimation_trees=int(raw.get("estimation_trees", 200)),
         propensity_clip=float(raw.get("propensity_clip", 0.02)),
         min_nonmissing_fraction=float(raw.get("min_nonmissing_fraction", 0.05)),
@@ -2702,6 +2739,71 @@ def _alphabetical_candidate_batches(
     return boundary_offset, batches
 
 
+def _seeded_shuffle_candidate_batches(
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    batch_size: int,
+    seed: int,
+    shuffle_round: int,
+) -> list[list[dict[str, Any]]]:
+    """Deterministically shuffle a sorted pool before forming bounded batches."""
+
+    if batch_size < 2:
+        raise ValueError("candidate consolidation batch_size must be at least 2")
+    if shuffle_round < 1:
+        raise ValueError("candidate consolidation shuffle_round must be positive")
+    ordered = [dict(group) for group in sorted(groups, key=_candidate_group_sort_key)]
+
+    def shuffled_key(group: Mapping[str, Any]) -> tuple[str, tuple[str, str, str]]:
+        identity = "\0".join(
+            (
+                str(int(seed)),
+                str(int(shuffle_round)),
+                str(group.get("name") or ""),
+                str(group.get("candidate_id") or ""),
+            )
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest(), _candidate_group_sort_key(
+            group
+        )
+
+    shuffled = sorted(ordered, key=shuffled_key)
+    return [shuffled[start : start + batch_size] for start in range(0, len(shuffled), batch_size)]
+
+
+def _candidate_consolidation_batches(
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    batch_size: int,
+    round_number: int,
+    alphabetical_rounds: int,
+    seed: int,
+) -> tuple[str, int | None, int | None, list[list[dict[str, Any]]]]:
+    """Use shifted alphabetical partitions, then seeded shuffled partitions."""
+
+    if alphabetical_rounds < 0:
+        raise ValueError("candidate consolidation alphabetical_rounds must be nonnegative")
+    if round_number <= alphabetical_rounds:
+        boundary_offset, batches = _alphabetical_candidate_batches(
+            groups,
+            batch_size=batch_size,
+            round_number=round_number,
+        )
+        return "alphabetical_shift", boundary_offset, None, batches
+    shuffle_round = round_number - alphabetical_rounds
+    return (
+        "seeded_shuffle",
+        None,
+        shuffle_round,
+        _seeded_shuffle_candidate_batches(
+            groups,
+            batch_size=batch_size,
+            seed=seed,
+            shuffle_round=shuffle_round,
+        ),
+    )
+
+
 def _coalesce_exact_candidate_group_names(
     groups: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
@@ -2772,8 +2874,9 @@ def _global_candidate_pool_prompt(
     *,
     groups: Sequence[Mapping[str, Any]],
     configured_feature_names: Sequence[str] = (),
+    batch_ordering: str = "alphabetical_shift",
 ) -> list[dict[str, str]]:
-    """Review one alphabetically adjacent candidate-pool batch."""
+    """Review one bounded candidate-pool batch."""
 
     features = [
         _candidate_pool_feature_view(group)
@@ -2783,11 +2886,17 @@ def _global_candidate_pool_prompt(
     body: dict[str, Any] = {
         "job": "consolidate_stage2_candidate_pool",
         "task": (
-            "Review this alphabetically adjacent batch of interpreted candidate features. "
+            "Review this "
+            + (
+                "alphabetically adjacent"
+                if batch_ordering == "alphabetical_shift"
+                else "deterministically shuffled"
+            )
+            + " batch of interpreted candidate features. "
             "Partition semantic aliases and equivalent representations of each underlying "
             "patient-level scalar measurement within the supplied batch, and exclude only "
-            "candidates that clearly cannot define such a variable. Later rounds will "
-            "re-sort the consolidated candidates and shift batch boundaries."
+            "candidates that clearly cannot define such a variable. Later rounds will use "
+            "new deterministic partitions of the remaining candidates."
         ),
         "features": features,
         "rules": [
@@ -3784,8 +3893,9 @@ class PlainHandoffStage2:
         outer_fold: int,
         groups: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
+        seed: int = 42,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-        """Iteratively consolidate sorted batches with shifted round boundaries."""
+        """Consolidate shifted alphabetical, then seeded shuffled batches."""
 
         current = [dict(group) for group in sorted(groups, key=_candidate_group_sort_key)]
         if not current or all(_configured_feature_definitions(group) for group in current):
@@ -3802,7 +3912,9 @@ class PlainHandoffStage2:
             "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
             "outer_fold": int(outer_fold),
             "consolidation_batch_size": int(self.config.consolidation_batch_size),
+            "consolidation_alphabetical_rounds": int(self.config.consolidation_alphabetical_rounds),
             "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
+            "consolidation_seed": int(seed),
             "features": [_candidate_pool_feature_view(group) for group in current],
             "configured_feature_names": [
                 str(group["name"]) for group in current if _configured_feature_definitions(group)
@@ -3823,10 +3935,12 @@ class PlainHandoffStage2:
             if all(_configured_feature_definitions(group) for group in current):
                 stopped_reason = "only_explicit_features_remain"
                 break
-            boundary_offset, batches = _alphabetical_candidate_batches(
+            ordering, boundary_offset, shuffle_round, batches = _candidate_consolidation_batches(
                 current,
                 batch_size=int(self.config.consolidation_batch_size),
                 round_number=round_number,
+                alphabetical_rounds=int(self.config.consolidation_alphabetical_rounds),
+                seed=int(seed) + 1_000_003 * int(outer_fold),
             )
             partition_signature = tuple(
                 tuple(str(group["name"]) for group in batch) for batch in batches
@@ -3857,6 +3971,7 @@ class PlainHandoffStage2:
                 messages = _global_candidate_pool_prompt(
                     groups=batch,
                     configured_feature_names=configured_feature_names,
+                    batch_ordering=ordering,
                 )
                 prompt_chars = sum(len(message["content"]) for message in messages)
                 if prompt_chars > prompt_limit:
@@ -3886,9 +4001,15 @@ class PlainHandoffStage2:
                             "outer_fold": int(outer_fold),
                             "round": round_number,
                             "batch": batch_number,
+                            "ordering": ordering,
                             "boundary_offset": boundary_offset,
+                            "shuffle_round": shuffle_round,
                             "consolidation_batch_size": int(self.config.consolidation_batch_size),
+                            "consolidation_alphabetical_rounds": int(
+                                self.config.consolidation_alphabetical_rounds
+                            ),
                             "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
+                            "consolidation_seed": int(seed),
                             "features": feature_views,
                             "configured_feature_names": configured_feature_names,
                         },
@@ -4019,7 +4140,9 @@ class PlainHandoffStage2:
             changed = bool(merged_input_count or excluded_name_count or cross_batch_exact_merges)
             round_summary = {
                 "round": round_number,
+                "ordering": ordering,
                 "boundary_offset": boundary_offset,
+                "shuffle_round": shuffle_round,
                 "input_groups": len(current),
                 "batches": len(batches),
                 "model_requested_batches": len(jobs),
@@ -4046,11 +4169,12 @@ class PlainHandoffStage2:
                 )
             LOGGER.info(
                 "Stage 2 iterative consolidation round=%s offset=%s input_groups=%s "
-                "batches=%s merge_directives=%s excluded_names=%s "
+                "ordering=%s batches=%s merge_directives=%s excluded_names=%s "
                 "cross_batch_exact_merges=%s output_groups=%s changed=%s",
                 round_number,
                 boundary_offset,
                 len(current),
+                ordering,
                 len(batches),
                 directive_count,
                 excluded_name_count,
@@ -4110,6 +4234,7 @@ class PlainHandoffStage2:
         candidates: Sequence[Mapping[str, Any]],
         evidence_packets: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
+        seed: int = 42,
     ) -> Mapping[str, Any]:
         """Iteratively consolidate candidate batches, then operationalize routed groups."""
 
@@ -4158,6 +4283,7 @@ class PlainHandoffStage2:
             output_dir=(
                 output_dir / "candidate_pool_consolidation" if output_dir is not None else None
             ),
+            seed=seed,
         )
         exclusions = dict(pool_exclusions)
         routable_groups: list[dict[str, Any]] = []
@@ -4250,7 +4376,14 @@ class PlainHandoffStage2:
             "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
             "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
             "consolidation_batch_size": int(self.config.consolidation_batch_size),
+            "consolidation_alphabetical_rounds": int(self.config.consolidation_alphabetical_rounds),
             "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
+            "consolidation_seed": int(seed),
+            "extraction_ontology_feedback_schema": (EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION),
+            "ontology_refinement_min_failure_patients": int(
+                self.config.ontology_refinement_min_failure_patients
+            ),
+            "max_ontology_refinement_rounds": int(self.config.max_ontology_refinement_rounds),
             "clinical_question": self.clinical_question,
             "explicit_features": [
                 feature.as_definition() for feature in self.config.explicit_features
@@ -4267,7 +4400,16 @@ class PlainHandoffStage2:
             **{
                 key: value
                 for key, value in definition_inputs.items()
-                if key not in {"consolidation_batch_size", "consolidation_max_rounds"}
+                if key
+                not in {
+                    "consolidation_batch_size",
+                    "consolidation_alphabetical_rounds",
+                    "consolidation_max_rounds",
+                    "consolidation_seed",
+                    "extraction_ontology_feedback_schema",
+                    "ontology_refinement_min_failure_patients",
+                    "max_ontology_refinement_rounds",
+                }
             },
             "consolidation_schema": PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION,
         }
@@ -4291,6 +4433,34 @@ class PlainHandoffStage2:
             if definitions_complete_path.is_file()
             else {}
         )
+        previous_iterative_inputs = {
+            key: value
+            for key, value in definition_inputs.items()
+            if key
+            not in {
+                "consolidation_alphabetical_rounds",
+                "consolidation_seed",
+                "extraction_ontology_feedback_schema",
+                "ontology_refinement_min_failure_patients",
+                "max_ontology_refinement_rounds",
+            }
+        }
+        previous_iterative_inputs["consolidation_batch_size"] = int(
+            definitions_state.get("consolidation_batch_size")
+            or self.config.consolidation_batch_size
+        )
+        previous_iterative_inputs["consolidation_max_rounds"] = int(
+            definitions_state.get("consolidation_max_rounds")
+            or PREVIOUS_ITERATIVE_CONSOLIDATION_MAX_ROUNDS
+        )
+        previous_iterative_fingerprint = _value_fingerprint(
+            {
+                **previous_iterative_inputs,
+                "global_candidate_pool_schema": (
+                    PREVIOUS_ITERATIVE_GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION
+                ),
+            }
+        )
         completion = (
             json.loads(complete_path.read_text(encoding="utf-8")) if complete_path.is_file() else {}
         )
@@ -4300,12 +4470,19 @@ class PlainHandoffStage2:
             == PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION
             and interpreted_candidates_path.is_file()
         )
+        legacy_iterative_upgrade = (
+            definitions_state.get("evidence_input_fingerprint") == previous_iterative_fingerprint
+            and definitions_state.get("consolidation_schema") == CONSOLIDATION_SCHEMA_VERSION
+            and definitions_state.get("global_candidate_pool_schema")
+            == PREVIOUS_ITERATIVE_GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION
+            and interpreted_candidates_path.is_file()
+        )
         downstream_analysis_complete = (
             output_dir / "estimation" / "complete.json"
         ).is_file() or any((output_dir / "review").glob("round_*/complete.json"))
         can_upgrade_consolidation = (
-            legacy_consolidation_upgrade and not downstream_analysis_complete
-        )
+            legacy_consolidation_upgrade or legacy_iterative_upgrade
+        ) and not downstream_analysis_complete
         if (
             completion.get("phase") == "causal_estimation"
             and final_features_path.is_file()
@@ -4331,6 +4508,7 @@ class PlainHandoffStage2:
                     else {}
                 ),
                 "review_rounds": int(final.get("review_rounds") or 0),
+                "ontology_refinement_rounds": int(final.get("ontology_refinement_rounds") or 0),
                 "estimation": json.loads(
                     (output_dir / "estimation" / "diagnostics.json").read_text(encoding="utf-8")
                 ),
@@ -4455,6 +4633,7 @@ class PlainHandoffStage2:
                     candidates=candidates,
                     evidence_packets=packets,
                     output_dir=output_dir / "consolidation",
+                    seed=seed,
                 )
                 features = []
                 for index, feature in enumerate(consolidated["features"], start=1):
@@ -4479,7 +4658,19 @@ class PlainHandoffStage2:
                     "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                     "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
                     "consolidation_batch_size": int(self.config.consolidation_batch_size),
+                    "consolidation_alphabetical_rounds": int(
+                        self.config.consolidation_alphabetical_rounds
+                    ),
                     "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
+                    "extraction_ontology_feedback_schema": (
+                        EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION
+                    ),
+                    "ontology_refinement_min_failure_patients": int(
+                        self.config.ontology_refinement_min_failure_patients
+                    ),
+                    "max_ontology_refinement_rounds": int(
+                        self.config.max_ontology_refinement_rounds
+                    ),
                     "architectures": len(by_architecture),
                     "packets": len(packets),
                     "features": len(final["features"]),
@@ -4539,6 +4730,7 @@ class PlainHandoffStage2:
             "features": analysis["features"],
             "candidate_dispositions": final.get("candidate_dispositions", {}),
             "review_rounds": analysis["review_rounds"],
+            "ontology_refinement_rounds": analysis["ontology_refinement_rounds"],
             "estimation": analysis["estimation"],
         }
         _write_json(
@@ -4550,6 +4742,7 @@ class PlainHandoffStage2:
                 "evidence_input_fingerprint": evidence_input_fingerprint,
                 "features": len(completed["features"]),
                 "review_rounds": completed["review_rounds"],
+                "ontology_refinement_rounds": completed["ontology_refinement_rounds"],
                 "estimation": completed["estimation"],
             },
         )

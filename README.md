@@ -80,6 +80,15 @@ example uses the identical hardware and endpoint behavior:
 ./run_five_conf_five_mod.sh
 ```
 
+Both launchers preset Stage 2 to batches of 20, five shifted-alphabetical plus
+five seeded-shuffle consolidation rounds, a three-training-patient ontology
+feedback threshold, and at most two refinement rounds. Override these with
+`STAGE2_CONSOLIDATION_BATCH_SIZE`,
+`STAGE2_CONSOLIDATION_ALPHABETICAL_ROUNDS`,
+`STAGE2_CONSOLIDATION_MAX_ROUNDS`,
+`STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS`, and
+`STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS`.
+
 ## Scientific setting
 
 For each patient or treatment decision, OCI expects a pretreatment clinical
@@ -633,7 +642,12 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
+    "consolidation_batch_size": 20,
+    "consolidation_alphabetical_rounds": 5,
+    "consolidation_max_rounds": 10,
     "max_review_rounds": 2,
+    "ontology_refinement_min_failure_patients": 3,
+    "max_ontology_refinement_rounds": 2,
     "estimation_trees": 200,
     "explicit_features": []
   },
@@ -689,9 +703,10 @@ Stage 2 then interprets the compiled evidence architectures and consolidates
 the result into operational patient-level definitions. After exact-name
 coalescing, consolidation alphabetically sorts candidates into batches of 20
 by default, applies each batch's merge and quality directives, re-sorts the
-consolidated versions, shifts batch boundaries, and repeats for up to five
-rounds. This brings boundary-adjacent aliases together without requiring one
-large response. There are no fuzzy-blocked or pairwise alias requests. The
+consolidated versions, and repeats for up to ten rounds. The first five rounds
+shift alphabetical boundaries. Later rounds use reproducible seeded shuffles of
+the remaining pool so lexically distant aliases can be considered together
+without requiring one large response. There are no fuzzy-blocked or pairwise alias requests. The
 batches can merge synonymous, thresholded, categorical, quantitative-score,
 and value-encoded representations and remove patient-specific, composite, and
 nonclinical artifacts. They receive no clinical question and conservatively
@@ -712,7 +727,8 @@ candidate summaries, and earlier proposed value types stay outside the prompt.
 Every consolidation round/batch and one-group operationalization request is
 input-fingerprinted separately, so a retry skips successful leaves instead of
 repeating the whole fan-out. Batch size and maximum rounds are configurable as
-`stage2.consolidation_batch_size` and `stage2.consolidation_max_rounds`. When a
+`stage2.consolidation_batch_size`, `stage2.consolidation_alphabetical_rounds`,
+and `stage2.consolidation_max_rounds`. When a
 model copies a uniquely supplied candidate description where an exact name was
 requested, Python maps that description back to its name; it also restores a
 reused output omitted from its own merge inputs. Degenerate one-feature merges
@@ -729,6 +745,18 @@ training-fold evaluation for at most `max_review_rounds`. In the last round it
 may retain or drop a variable but may not introduce an unevaluated measurement
 definition.
 
+Each patient extraction also records feature-attributable validation failures.
+After the training patients finish, Stage 2 aggregates repeated failures across
+distinct patients. By default, three patients with the same feature-level
+failure trigger a bounded ontology-refinement request followed by re-extraction;
+up to two such refinement rounds are allowed. The request sees the current
+definition, aggregate failure counts, and failed model outputs, but no patient
+text or held-out data. It can refine only the same feature's description, value
+type, categories or unit, measurement rule, and missingness rule. Malformed JSON
+or response-envelope failures are reported separately and never treated as
+ontology evidence. Explicit investigator-supplied ontologies remain immutable
+and are only audited when they repeatedly fail.
+
 Only after this review has ended is the final definition applied to the outer
 held-out records. Nuisance models for treatment and potential outcomes are fit
 without using those held-out outcomes. The fold result contains held-out
@@ -740,7 +768,9 @@ average treatment effect and its confidence interval.
 flowchart LR
     A["Stage 1 evidence<br/>for one outer fold"] --> B["Operational variable definitions"]
     B --> C["Extract outer-training records"]
-    C --> D["Inner-fold predictive and R-loss review"]
+    C --> H["Aggregate repeated<br/>feature-level failures"]
+    H -->|"ontology revised"| C
+    H -->|"stable"| D["Inner-fold predictive and R-loss review"]
     D -->|"revise, if another round remains"| B
     D -->|"freeze"| E["Extract outer-held-out records"]
     E --> F["Held-out nuisance predictions and AIPW score"]
