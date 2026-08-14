@@ -712,9 +712,15 @@ candidate summaries, and earlier proposed value types stay outside the prompt.
 Every consolidation round/batch and one-group operationalization request is
 input-fingerprinted separately, so a retry skips successful leaves instead of
 repeating the whole fan-out. Batch size and maximum rounds are configurable as
-`stage2.consolidation_batch_size` and `stage2.consolidation_max_rounds`. It then
-extracts the variables on the outer
-training rows and measures missingness, variation,
+`stage2.consolidation_batch_size` and `stage2.consolidation_max_rounds`. When a
+model copies a uniquely supplied candidate description where an exact name was
+requested, Python maps that description back to its name; it also restores a
+reused output omitted from its own merge inputs. Degenerate one-feature merges
+are ignored. If one batch remains structurally invalid after bounded repairs,
+that batch is recorded as a conservative passthrough and all its candidates are
+retained, so a malformed optional consolidation response cannot discard an
+explicit feature or abort the fold. Stage 2 then extracts the variables on the
+outer training rows and measures missingness, variation,
 treatment prediction, outcome prediction, and residual-effect performance by
 inner validation. Leave-one-feature-out measurements show whether each variable
 improves or degrades those metrics relative to the complete extracted feature

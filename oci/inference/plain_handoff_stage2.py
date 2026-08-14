@@ -1275,6 +1275,10 @@ class _Stage2OutputLengthError(ValueError):
     """The server exhausted the available completion length."""
 
 
+class _Stage2ResponseValidationError(ValueError):
+    """A response remained structurally invalid after bounded repairs."""
+
+
 def _openai_completion(
     messages: Sequence[Mapping[str, str]],
     config: PlainHandoffStage2Config,
@@ -1467,7 +1471,7 @@ def _request_json(
             return validate(_parse_json_object(response))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             if attempt == max_attempts - 1:
-                raise ValueError(
+                raise _Stage2ResponseValidationError(
                     f"Stage 2 response remained invalid after {max_attempts - 1} repairs: {exc}"
                 ) from exc
             first_error = exc
@@ -2851,17 +2855,39 @@ def _validate_global_candidate_pool_directives(
     *,
     group_names: Sequence[str],
     configured_feature_names: Sequence[str] = (),
+    group_descriptions: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
-    """Validate global merge and exclusion directives by exact supplied name."""
+    """Validate directives using only names and descriptions supplied in the batch."""
 
     available = [str(name) for name in group_names]
     if len(available) != len(set(available)):
         raise ValueError("global candidate pool requires unique supplied feature names")
-    normalized_available: dict[str, list[str]] = defaultdict(list)
+    available_set = set(available)
+    exact_alias_owners: dict[str, set[str]] = defaultdict(set)
+    normalized_alias_owners: dict[str, set[str]] = defaultdict(set)
+
+    def register_alias(alias: Any, owner: str) -> None:
+        rendered = str(alias or "").strip()
+        if not rendered:
+            return
+        exact_alias_owners[rendered.casefold()].add(owner)
+        normalized = _snake_case_name(rendered, fallback="")
+        if normalized:
+            normalized_alias_owners[normalized].add(owner)
+
+    supplied_descriptions = group_descriptions or {}
+    unknown_description_names = sorted(set(map(str, supplied_descriptions)) - available_set)
+    if unknown_description_names:
+        raise ValueError(
+            "global candidate pool received descriptions for unknown feature names: "
+            f"{unknown_description_names}"
+        )
     for name in available:
-        normalized_available[_snake_case_name(name, fallback="")].append(name)
+        register_alias(name, name)
+        for description in supplied_descriptions.get(name, ()):
+            register_alias(description, name)
     configured_names = set(map(str, configured_feature_names))
-    unknown_configured_names = sorted(configured_names - set(available))
+    unknown_configured_names = sorted(configured_names - available_set)
     if unknown_configured_names:
         raise ValueError(
             "global candidate pool received unknown configured feature names: "
@@ -2870,12 +2896,26 @@ def _validate_global_candidate_pool_directives(
 
     def resolve_input_name(raw_name: Any) -> str:
         rendered = str(raw_name or "").strip()
-        if rendered in available:
+        if rendered in available_set:
             return rendered
-        matches = normalized_available.get(_snake_case_name(rendered, fallback=""), [])
+        matches = exact_alias_owners.get(rendered.casefold(), set())
         if len(matches) == 1:
-            return matches[0]
+            return next(iter(matches))
+        normalized = _snake_case_name(rendered, fallback="")
+        matches = normalized_alias_owners.get(normalized, set())
+        if len(matches) == 1:
+            return next(iter(matches))
         raise ValueError(f"global candidate pool named unknown or ambiguous feature {rendered!r}")
+
+    def resolve_output_name(raw_name: Any) -> tuple[str, str | None]:
+        rendered = str(raw_name or "").strip()
+        if not rendered:
+            return "", None
+        try:
+            known_name = resolve_input_name(rendered)
+        except ValueError:
+            return _snake_case_name(rendered, fallback=""), None
+        return known_name, known_name
 
     payload = value
     if not isinstance(payload.get("merge_directives"), list) or not isinstance(
@@ -2905,12 +2945,19 @@ def _validate_global_candidate_pool_directives(
         if not isinstance(raw_inputs, list):
             raise ValueError(f"global merge directive {index} requires an inputs array")
         inputs = list(dict.fromkeys(resolve_input_name(name) for name in raw_inputs))
+        output, known_output_name = resolve_output_name(raw_directive.get("output"))
+        if not output:
+            raise ValueError(f"global merge directive {index} requires an output name")
+        # Models sometimes omit a reused canonical feature from ``inputs`` even
+        # though they select it as ``output``. The intended complete family is
+        # unambiguous when that output resolves to one supplied feature.
+        if known_output_name is not None and known_output_name not in inputs:
+            inputs.append(known_output_name)
         if len(inputs) < 2:
-            raise ValueError(
-                f"global merge directive {index} requires at least two distinct inputs; "
-                "list every supplied member of the alias family and include the output "
-                "name when it reuses a supplied feature name"
-            )
+            # A name and its own supplied prose description can be emitted as
+            # two apparent aliases. Once both resolve to the same feature this
+            # is a harmless no-op, not a reason to reject the whole batch.
+            continue
         repeated = sorted(set(inputs).intersection(used_inputs))
         if repeated:
             owners = {name: input_directive_by_name[name] for name in repeated}
@@ -2920,9 +2967,6 @@ def _validate_global_candidate_pool_directives(
                 f"{dict(list(owners.items())[:8])}. Combine the complete alias family "
                 "into one directive instead of chaining or splitting directives"
             )
-        output = _snake_case_name(raw_directive.get("output"), fallback="")
-        if not output:
-            raise ValueError(f"global merge directive {index} requires an output name")
         configured_inputs = [name for name in inputs if name in configured_names]
         if len(configured_inputs) > 1:
             raise ValueError(
@@ -3824,6 +3868,10 @@ class PlainHandoffStage2:
                         "stage2.consolidation_max_prompt_chars"
                     )
                 feature_views = [_candidate_pool_feature_view(group) for group in batch]
+                group_descriptions = {
+                    str(feature["name"]): tuple(_string_values(feature.get("descriptions")))
+                    for feature in feature_views
+                }
                 jobs.append(
                     {
                         "batch_number": batch_number,
@@ -3848,18 +3896,21 @@ class PlainHandoffStage2:
                         "validate": (
                             lambda value, names=tuple(group_names), configured=tuple(
                                 configured_feature_names
-                            ): (
+                            ), descriptions=group_descriptions: (
                                 _validate_global_candidate_pool_directives(
                                     value,
                                     group_names=names,
                                     configured_feature_names=configured,
+                                    group_descriptions=descriptions,
                                 )
                             )
                         ),
                     }
                 )
 
+            validation_fallbacks: dict[int, str] = {}
             if jobs:
+                job_by_batch = {int(job["batch_number"]): job for job in jobs}
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=max(1, min(self.config.workers, len(jobs)))
                 ) as executor:
@@ -3876,7 +3927,44 @@ class PlainHandoffStage2:
                         for job in jobs
                     }
                     for future in concurrent.futures.as_completed(futures):
-                        batch_responses[futures[future]] = future.result()
+                        batch_number = futures[future]
+                        try:
+                            batch_responses[batch_number] = future.result()
+                        except _Stage2ResponseValidationError as exc:
+                            # Consolidation is an optional semantic reduction.
+                            # Retaining every member of an invalid batch is the
+                            # conservative, lossless fallback and necessarily
+                            # preserves investigator-configured features.
+                            validation_fallbacks[batch_number] = str(exc)
+                            batch_responses[batch_number] = {
+                                "merge_directives": [],
+                                "exclude_feature_names": [],
+                            }
+                            job = job_by_batch[batch_number]
+                            batch_output_dir = job["output_dir"]
+                            if batch_output_dir is not None:
+                                _write_json(
+                                    Path(batch_output_dir) / "fallback.json",
+                                    {
+                                        "status": "conservative_passthrough",
+                                        "completed_at": _now(),
+                                        "round": round_number,
+                                        "batch": batch_number,
+                                        "retained_feature_names": [
+                                            str(feature["name"])
+                                            for feature in job["input_value"]["features"]
+                                        ],
+                                        "validation_error": str(exc),
+                                    },
+                                )
+                            LOGGER.warning(
+                                "Stage 2 consolidation round=%s batch=%s remained invalid; "
+                                "retaining all %s supplied features unchanged (%s)",
+                                round_number,
+                                batch_number,
+                                len(job["input_value"]["features"]),
+                                exc,
+                            )
 
             next_groups: list[dict[str, Any]] = []
             directive_count = 0
@@ -3940,6 +4028,8 @@ class PlainHandoffStage2:
                 "merged_inputs_removed": merged_input_count,
                 "excluded_names": excluded_name_count,
                 "cross_batch_exact_name_merges": cross_batch_exact_merges,
+                "validation_fallback_batches": len(validation_fallbacks),
+                "validation_fallback_batch_numbers": sorted(validation_fallbacks),
                 "output_groups": len(next_groups),
                 "changed": changed,
             }
@@ -3977,11 +4067,14 @@ class PlainHandoffStage2:
                 break
             if changed:
                 no_change_partitions.clear()
-            else:
+            elif not validation_fallbacks:
                 no_change_partitions.add(partition_signature)
                 if len(batches) == 1:
                     stopped_reason = "single_batch_no_change"
                     break
+            elif len(batches) == 1:
+                stopped_reason = "single_batch_validation_fallback"
+                break
 
         if output_dir is not None:
             _write_json(
@@ -4003,6 +4096,9 @@ class PlainHandoffStage2:
                     "stopped_reason": stopped_reason,
                     "output_groups": len(current),
                     "excluded_origins": len(excluded_origins),
+                    "validation_fallback_batches": sum(
+                        int(summary["validation_fallback_batches"]) for summary in round_summaries
+                    ),
                 },
             )
         return current, excluded_origins

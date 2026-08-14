@@ -2609,6 +2609,106 @@ def test_iterative_consolidation_finds_aliases_across_a_shifted_batch_boundary(
     assert [summary["changed"] for summary in summaries] == [False, True, False]
 
 
+def test_iterative_consolidation_retains_batch_and_explicit_feature_after_invalid_responses(
+    tmp_path: Path,
+    caplog,
+):
+    caplog.set_level("WARNING", logger=stage2_workflow.__name__)
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "model": "test-model",
+            "workers": 1,
+            "consolidation_batch_size": 20,
+            "consolidation_max_rounds": 1,
+            "explicit_features": [
+                {
+                    "name": "investigator_marker",
+                    "description": "Investigator-specified marker.",
+                    "value_type": "binary",
+                    "categories_or_unit": ["absent", "present"],
+                    "measurement_definition": "Extract the documented marker status.",
+                    "missing_value_rule": "Return null when undocumented.",
+                    "roles": ["effect_modifier"],
+                }
+            ],
+        },
+        default_workers=1,
+    )
+    assert config is not None
+    explicit = config.explicit_features[0]
+    groups = stage2_workflow._materialize_exact_name_groups(
+        [
+            {
+                "candidate_id": "candidate_alpha",
+                "architecture": "architecture_alpha",
+                "name": "alpha_measurement",
+                "description": "An ordinary candidate measurement.",
+                "supporting_packet_ids": ["packet_alpha"],
+                "evidence_axes": ["outcome"],
+            },
+            {
+                "candidate_id": "configured_explicit_feature_0001",
+                "architecture": stage2_workflow.CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE,
+                "name": explicit.name,
+                "description": explicit.description,
+                "value_type": explicit.value_type,
+                "supporting_packet_ids": [],
+                "evidence_axes": [],
+                "configured_feature_definitions": [explicit.as_definition()],
+            },
+        ]
+    )
+    calls = 0
+
+    def completion(_messages, _config):
+        nonlocal calls
+        calls += 1
+        return json.dumps(
+            {
+                "merge_directives": [
+                    {
+                        "inputs": ["alpha_measurement", "not_a_supplied_feature"],
+                        "output": "alpha_measurement",
+                    }
+                ],
+                "exclude_feature_names": [],
+            }
+        )
+
+    output_dir = tmp_path / "candidate_pool_consolidation"
+    consolidated, exclusions = PlainHandoffStage2(
+        config=config,
+        clinical_question="Not supplied to consolidation.",
+        completion=completion,
+    )._consolidate_candidate_pool(
+        outer_fold=1,
+        groups=groups,
+        output_dir=output_dir,
+    )
+
+    assert calls == 6
+    assert exclusions == {}
+    assert [group["name"] for group in consolidated] == [
+        "alpha_measurement",
+        "investigator_marker",
+    ]
+    retained_explicit = consolidated[1]
+    assert retained_explicit["configured_feature_definitions"] == [explicit.as_definition()]
+    fallback = json.loads(
+        (output_dir / "round_001" / "batch_001" / "fallback.json").read_text(encoding="utf-8")
+    )
+    assert fallback["status"] == "conservative_passthrough"
+    assert fallback["retained_feature_names"] == [
+        "alpha_measurement",
+        "investigator_marker",
+    ]
+    complete = json.loads((output_dir / "complete.json").read_text(encoding="utf-8"))
+    assert complete["stopped_reason"] == "single_batch_validation_fallback"
+    assert complete["validation_fallback_batches"] == 1
+    assert "retaining all 2 supplied features unchanged" in caplog.text
+
+
 def test_global_group_merge_validator_maps_names_and_rejects_ambiguous_routes():
     result = stage2_workflow._validate_global_candidate_pool_directives(
         {
@@ -2699,36 +2799,40 @@ def test_global_group_merge_validator_accepts_reused_output_in_its_complete_inpu
     ]
 
 
-def test_global_group_merge_validator_explains_supplied_output_collision_routes():
-    with pytest.raises(
-        ValueError,
-        match=(
-            "output name 'pd_l1_expression_level' names an unchanged supplied feature; "
-            "include it in this directive's inputs"
-        ),
-    ):
-        stage2_workflow._validate_global_candidate_pool_directives(
-            {
-                "merge_directives": [
-                    {
-                        "inputs": ["pd_l1_expression", "pdl1_expression_level"],
-                        "output": "pd_l1_expression_level",
-                    }
-                ],
-                "exclude_feature_names": [],
-            },
-            group_names=[
+def test_global_group_merge_validator_completes_supplied_output_collision_routes():
+    result = stage2_workflow._validate_global_candidate_pool_directives(
+        {
+            "merge_directives": [
+                {
+                    "inputs": ["pd_l1_expression", "pdl1_expression_level"],
+                    "output": "pd_l1_expression_level",
+                }
+            ],
+            "exclude_feature_names": [],
+        },
+        group_names=[
+            "pd_l1_expression",
+            "pdl1_expression_level",
+            "pd_l1_expression_level",
+        ],
+    )
+
+    assert result["merge_directives"] == [
+        {
+            "inputs": [
                 "pd_l1_expression",
                 "pdl1_expression_level",
                 "pd_l1_expression_level",
             ],
-        )
+            "output": "pd_l1_expression_level",
+        }
+    ]
 
     with pytest.raises(
         ValueError,
         match=(
-            "directive 1 output name 'pd_l1_expression_level' is an input of global "
-            "merge directive 2; do not chain directives"
+            "global merge input names may appear in only one directive; directive 2 repeats "
+            "inputs already used by earlier directives"
         ),
     ):
         stage2_workflow._validate_global_candidate_pool_directives(
@@ -2755,10 +2859,7 @@ def test_global_group_merge_validator_explains_supplied_output_collision_routes(
 
     with pytest.raises(
         ValueError,
-        match=(
-            "output name 'pd_l1_expression_level' is also an excluded feature; remove it "
-            "from exclude_feature_names"
-        ),
+        match="cannot be both merged and excluded",
     ):
         stage2_workflow._validate_global_candidate_pool_directives(
             {
@@ -2778,26 +2879,53 @@ def test_global_group_merge_validator_explains_supplied_output_collision_routes(
         )
 
 
-def test_global_group_merge_validator_explains_single_input_partition_error():
-    with pytest.raises(
-        ValueError,
-        match=(
-            "requires at least two distinct inputs; list every supplied member of the alias "
-            "family and include the output name"
-        ),
-    ):
-        stage2_workflow._validate_global_candidate_pool_directives(
-            {
-                "merge_directives": [
-                    {
-                        "inputs": ["pd_l1_expression"],
-                        "output": "pd_l1_expression_level",
-                    }
-                ],
-                "exclude_feature_names": [],
-            },
-            group_names=["pd_l1_expression", "pd_l1_expression_level"],
-        )
+def test_global_group_merge_validator_completes_omitted_reused_output_input():
+    result = stage2_workflow._validate_global_candidate_pool_directives(
+        {
+            "merge_directives": [
+                {
+                    "inputs": ["pd_l1_expression"],
+                    "output": "pd_l1_expression_level",
+                }
+            ],
+            "exclude_feature_names": [],
+        },
+        group_names=["pd_l1_expression", "pd_l1_expression_level"],
+    )
+
+    assert result["merge_directives"] == [
+        {
+            "inputs": ["pd_l1_expression", "pd_l1_expression_level"],
+            "output": "pd_l1_expression_level",
+        }
+    ]
+
+
+def test_global_group_merge_validator_resolves_supplied_descriptions_and_drops_noop():
+    result = stage2_workflow._validate_global_candidate_pool_directives(
+        {
+            "merge_directives": [
+                {
+                    "inputs": [
+                        "white blood cell count",
+                        "The white blood cell (WBC) count.",
+                    ],
+                    "output": "white_blood_cell_count",
+                }
+            ],
+            "exclude_feature_names": [],
+        },
+        group_names=["white_blood_cell_count", "worsening_symptoms"],
+        group_descriptions={
+            "white_blood_cell_count": [
+                "white blood cell count",
+                "The white blood cell (WBC) count.",
+            ],
+            "worsening_symptoms": ["worsening symptoms"],
+        },
+    )
+
+    assert result == {"merge_directives": [], "exclude_feature_names": []}
 
 
 def test_global_group_merge_validator_protects_merge_inputs_and_configured_features():

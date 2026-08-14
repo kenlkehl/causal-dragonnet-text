@@ -223,6 +223,14 @@ merged and excluded, maps names back to internal groups, unions merged
 provenance, records excluded-candidate dispositions, and passes every
 unmentioned name through unchanged. Original candidate descriptions are
 carried through every round so later prompts do not lose semantic evidence.
+The response normalizer recognizes only unique names and descriptions actually
+supplied in that batch; this permits a copied description to resolve back to its
+exact feature without fuzzy or domain-specific matching. It restores a reused
+canonical output omitted from its own input family and ignores a degenerate
+one-feature no-op. If a batch is still structurally invalid after bounded
+repairs, Python writes `fallback.json`, passes every member of that batch
+through unchanged, and records the fallback in the round and root completion
+summaries. This lossless fallback also preserves every configured feature.
 There is no fuzzy blocker, neighbor selection, or pairwise LLM request. Python
 derives causal roles only after all rounds, allowing complementary evidence
 axes from different representations to combine before role filtering.
