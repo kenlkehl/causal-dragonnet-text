@@ -32,6 +32,7 @@ from .plain_handoff_stage2_evidence import (
     SUPPORTED_STAGE2_ARCHITECTURES,
     compile_stage2_handoff_evidence,
 )
+from .plain_handoff_stage2_analysis import run_fold_analysis
 
 LOGGER = logging.getLogger(__name__)
 
@@ -4771,8 +4772,6 @@ class PlainHandoffStage2:
             return final
         if split is None:
             raise ValueError(f"Stage 2 outer fold {outer_fold} has no row split")
-
-        from .plain_handoff_stage2_analysis import run_fold_analysis
 
         # Analysis contains the high-context, one-patient extraction calls. Its
         # review planner still uses max_prompt_chars, but transport must accept

@@ -74,6 +74,16 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.consolidation_oversample_factor == 4
 
 
+def test_stage2_analysis_defaults_pre_refinement_config_fields(caplog):
+    class PreRefinementConfig:
+        pass
+
+    limits = stage2_analysis._ontology_refinement_limits(PreRefinementConfig())
+
+    assert limits == (3, 2)
+    assert "pre-ontology-refinement config" in caplog.text
+
+
 def test_stage2_config_parses_independent_large_context_prompt_budgets():
     config = plain_stage2_config_from_mapping(
         {

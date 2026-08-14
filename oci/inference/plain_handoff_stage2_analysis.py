@@ -36,6 +36,11 @@ PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
 REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v1"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
 ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = "stage2_training_failure_ontology_refinement_v1"
+# Compatibility defaults for Stage 2 config objects created before ontology
+# refinement was added.  Keeping this boundary tolerant also protects a
+# long-running workflow if an older caller passes a config object directly.
+DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
+DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 
 RequestJSON = Callable[
     [Sequence[Mapping[str, str]], Callable[[Mapping[str, Any]], dict[str, Any]]],
@@ -69,6 +74,41 @@ def _write_frame(path: Path, frame: pd.DataFrame) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     frame.to_csv(temporary, index=False)
     os.replace(temporary, path)
+
+
+def _ontology_refinement_limits(config: Any) -> tuple[int, int]:
+    """Read refinement limits from current or pre-refinement config objects."""
+
+    missing = [
+        name
+        for name in (
+            "ontology_refinement_min_failure_patients",
+            "max_ontology_refinement_rounds",
+        )
+        if not hasattr(config, name)
+    ]
+    if missing:
+        LOGGER.warning(
+            "Stage 2 received a pre-ontology-refinement config without %s; "
+            "using compatibility defaults",
+            ", ".join(missing),
+        )
+    return (
+        int(
+            getattr(
+                config,
+                "ontology_refinement_min_failure_patients",
+                DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS,
+            )
+        ),
+        int(
+            getattr(
+                config,
+                "max_ontology_refinement_rounds",
+                DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS,
+            )
+        ),
+    )
 
 
 def _value_fingerprint(value: Any) -> str:
@@ -3529,6 +3569,10 @@ def run_fold_analysis(
 ) -> dict[str, Any]:
     """Run bounded training-fold review and held-out causal estimation."""
 
+    (
+        ontology_refinement_min_failure_patients,
+        max_ontology_refinement_rounds,
+    ) = _ontology_refinement_limits(config)
     fit_ids = [int(value) for value in split["fit_row_ids"]]
     heldout_ids = [int(value) for value in split["heldout_row_ids"]]
     current: list[dict[str, Any]] = []
@@ -3560,8 +3604,8 @@ def run_fold_analysis(
             request_json=request_json,
             workers=config.workers,
             max_prompt_chars=config.extraction_max_prompt_chars,
-            minimum_failure_patients=config.ontology_refinement_min_failure_patients,
-            max_refinement_rounds=config.max_ontology_refinement_rounds,
+            minimum_failure_patients=ontology_refinement_min_failure_patients,
+            max_refinement_rounds=max_ontology_refinement_rounds,
         )
         ontology_refinement_rounds += feedback_rounds
         extraction_definitions = [dict(feature) for feature in current]
@@ -3640,8 +3684,8 @@ def run_fold_analysis(
             request_json=request_json,
             workers=config.workers,
             max_prompt_chars=config.extraction_max_prompt_chars,
-            minimum_failure_patients=config.ontology_refinement_min_failure_patients,
-            max_refinement_rounds=config.max_ontology_refinement_rounds,
+            minimum_failure_patients=ontology_refinement_min_failure_patients,
+            max_refinement_rounds=max_ontology_refinement_rounds,
         )
         ontology_refinement_rounds += feedback_rounds
         names = [str(feature["name"]) for feature in current]
