@@ -178,49 +178,54 @@ standalone explicit-feature vocabulary, `type`, `categories`, and `unit` are
 accepted aliases; the ontology fields may also be placed inside an `ontology`
 object while `name` and `roles` remain alongside it.
 
-Configured features enter the full-pool alias-consolidation pass in every outer fold.
-When Stage 1 discovers an alias, Python retains one consolidated feature,
-attaches the discovered packet and architecture provenance, keeps the
-configured name and roles, and uses the supplied ontology without making the
-one-feature ontology request. Distinct configured feature names are never
-merged with each other. They still undergo training-fold extraction and
-empirical diagnostics, but review must keep them without revising the supplied
-ontology. If a required feature cannot be extracted well enough for the
-workflow's health checks, the run fails visibly rather than silently dropping
-or redefining it.
+Configured features enter the iterative alias-consolidation batches in every
+outer fold. In every round they are hard invariants: they cannot be excluded,
+two distinct configured feature names cannot be merged, and a merge containing
+one must use its exact configured name as the output. When Stage 1 discovers an
+alias, Python retains one consolidated feature, attaches the discovered packet
+and architecture provenance, keeps the configured name and roles, and uses the
+supplied ontology without making the one-feature ontology request. They still
+undergo training-fold extraction and empirical diagnostics, but review must
+keep them without revising the supplied ontology. If a required feature cannot
+be extracted well enough for the workflow's health checks, the run fails
+visibly rather than silently dropping or redefining it.
 
 `stage2.model` is optional. If it is empty or omitted, Stage 2 queries the
 OpenAI-compatible `/models` endpoint once at startup and uses the result when
 exactly one model ID is advertised. If the server advertises multiple model
 IDs, set `stage2.model` explicitly to avoid an ambiguous selection.
 
-Candidate alias consolidation is one semantic request over the complete pool.
-Python first coalesces only exact normalized-name duplicates so response routes
-remain unambiguous; this is identity bookkeeping and makes no semantic decision
-between distinct names. It preserves every source candidate and supplies every
-distinct name together with all of its distinct candidate descriptions. There
-is no fuzzy blocker, neighbor selection, pairwise LLM request, or transitive
-assembly from local decisions.
+Python first coalesces only exact normalized-name duplicates; this is identity
+bookkeeping and makes no semantic decision between distinct names. It then
+sorts the distinct candidates by normalized feature name and sends
+nonoverlapping batches of `consolidation_batch_size` candidates (20 by default).
+Batches within a round are independent and may run concurrently. After applying
+their directives, Python re-sorts the consolidated versions and repeats for up
+to `consolidation_max_rounds` rounds (5 by default). Batch boundaries shift on
+each round so alphabetically adjacent candidates split at one boundary can meet
+in another. A no-change round does not stop the process until its complete
+partition repeats; this prevents the first boundary layout from declaring
+false convergence. The process also stops when the pool is empty or only
+configured features remain. Identical canonical output names produced by
+independent batches are coalesced exactly while retaining all provenance and
+candidate descriptions.
 
-The clinical question is deliberately absent from the full-pool request. The
-model sees all distinct candidates at once, including candidates whose evidence
-does not independently establish a causal role. It returns `merge_directives`,
-each with an `inputs` list of exact supplied names and one canonical `output`
-name, plus `exclude_feature_names`. Exclusion is restricted to clear failures of
-the patient-level scalar contract: patient-specific or value-encoded artifacts,
+The clinical question is deliberately absent from every consolidation batch.
+The model returns `merge_directives`, each with an `inputs` list of exact names
+from that batch and one canonical `output` name, plus
+`exclude_feature_names`. Exclusion is restricted to clear failures of the
+patient-level scalar contract: patient-specific or value-encoded artifacts,
 profiles and composites, and nonclinical analysis or documentation artifacts.
-Borderline but valid clinical variables pass through, and
-investigator-configured features cannot be excluded. The pass sees no candidate
-or group IDs and does not restate unchanged features. Python validates that
-every supplied name exists, prevents a name from being both merged and excluded,
-maps names back to the internal groups, unions merged provenance, records
-excluded-candidate dispositions, and passes every unmentioned name through
-unchanged. The instructions explicitly treat a general measurement, quantitative
-score, thresholded or categorical state, and value-encoded name as equivalent
-representations when one underlying patient variable can encode them, while
-keeping independently varying components separate. Python derives causal roles
-only after these groups are formed, allowing complementary evidence axes from
-different representations to combine before role filtering.
+Borderline but valid clinical variables pass through. Each batch sees no
+candidate or group IDs and does not restate unchanged features. Python
+validates that every supplied name exists, prevents a name from being both
+merged and excluded, maps names back to internal groups, unions merged
+provenance, records excluded-candidate dispositions, and passes every
+unmentioned name through unchanged. Original candidate descriptions are
+carried through every round so later prompts do not lose semantic evidence.
+There is no fuzzy blocker, neighbor selection, or pairwise LLM request. Python
+derives causal roles only after all rounds, allowing complementary evidence
+axes from different representations to combine before role filtering.
 
 Every group remaining after those merge and exclusion directives is
 operationalized for extraction. Each ontology request contains only the
@@ -244,6 +249,7 @@ The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
 `transport_retry_backoff`, `max_prompt_chars`,
 `consolidation_max_prompt_chars`,
+`consolidation_batch_size`, `consolidation_max_rounds`,
 `extraction_max_prompt_chars`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
@@ -254,7 +260,7 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 files but do not affect consolidation. A configured endpoint makes the default
 mode `full`. The modes can always be made explicit:
 
-The one-request candidate-pool pass uses the independent
+Each candidate-consolidation batch uses the independent
 `consolidation_max_prompt_chars` limit (640,000 characters by default), while
 patient-variable extraction uses `extraction_max_prompt_chars` (also 640,000 by
 default) because every extraction request includes the complete frozen feature
@@ -263,7 +269,8 @@ planning. These character limits are safety/planning guards, not claims about
 the model's token context. Extraction always sends exactly one patient's text
 per request; oversized notes are split into lossless contiguous pages. Clinical
 text remains Unicode instead of expanding into token-heavy ASCII escape
-sequences. `stage2.workers` provides concurrency without combining patients.
+sequences. `stage2.workers` controls independent consolidation-batch concurrency
+as well as other Stage 2 request fan-outs without combining patients.
 
 ```bash
 # Run/resume Stage 1 and stop after the handoff.

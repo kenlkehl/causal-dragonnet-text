@@ -48,9 +48,11 @@ ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
+DEFAULT_CONSOLIDATION_BATCH_SIZE = 20
+DEFAULT_CONSOLIDATION_MAX_ROUNDS = 5
 CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v12_configured_explicit_features"
 GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
-    "global_candidate_pool_merge_and_quality_v5_disjoint_alias_partitions"
+    "iterative_alphabetical_candidate_batches_v6_explicit_feature_invariants"
 )
 PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION = (
     "candidate_pair_alias_v11_configured_explicit_features"
@@ -598,11 +600,11 @@ class PlainHandoffStage2Config:
     transport_max_attempts: int = 3
     transport_retry_backoff: float = 2.0
     max_prompt_chars: int = 100_000
-    # The full candidate pool is deliberately reviewed in one request so the
-    # model can reconcile alias families jointly rather than through local
-    # pair judgments. Keep that larger context allowance independent from
-    # interpretation and empirical-review batching.
+    # Candidate consolidation has its own prompt allowance even though each
+    # request sees only one bounded alphabetical batch.
     consolidation_max_prompt_chars: int = DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS
+    consolidation_batch_size: int = DEFAULT_CONSOLIDATION_BATCH_SIZE
+    consolidation_max_rounds: int = DEFAULT_CONSOLIDATION_MAX_ROUNDS
     # Extraction repeats a complete frozen feature ontology for one patient.
     # Keep its larger context allowance separate so discovery batching and its
     # evidence-compilation fingerprints remain stable.
@@ -645,6 +647,10 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.consolidation_max_prompt_chars < 4_000:
             raise ValueError("stage2.consolidation_max_prompt_chars must be at least 4000")
+        if self.consolidation_batch_size < 2:
+            raise ValueError("stage2.consolidation_batch_size must be at least 2")
+        if self.consolidation_max_rounds < 1:
+            raise ValueError("stage2.consolidation_max_rounds must be positive")
         if self.extraction_max_prompt_chars < 4_000:
             raise ValueError("stage2.extraction_max_prompt_chars must be at least 4000")
         if self.evidence_compiler != EVIDENCE_COMPILER_VERSION:
@@ -773,6 +779,12 @@ def plain_stage2_config_from_mapping(
                 "consolidation_max_prompt_chars",
                 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS,
             )
+        ),
+        consolidation_batch_size=int(
+            raw.get("consolidation_batch_size", DEFAULT_CONSOLIDATION_BATCH_SIZE)
+        ),
+        consolidation_max_rounds=int(
+            raw.get("consolidation_max_rounds", DEFAULT_CONSOLIDATION_MAX_ROUNDS)
         ),
         extraction_max_prompt_chars=int(
             raw.get(
@@ -2451,6 +2463,47 @@ def _group_roles(group: Mapping[str, Any]) -> list[str]:
     return _derive_roles(group.get("evidence_axes") or [])
 
 
+def _flatten_member_measurements(
+    members: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Preserve original candidate views through repeated consolidation rounds."""
+
+    flattened: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for member in members:
+        inherited = member.get("member_measurements")
+        raw_views = (
+            list(inherited)
+            if isinstance(inherited, Sequence)
+            and not isinstance(inherited, (str, bytes, bytearray))
+            and inherited
+            else [member]
+        )
+        for raw_view in raw_views:
+            if not isinstance(raw_view, Mapping):
+                continue
+            view = {
+                "name": str(raw_view.get("name") or "").strip(),
+                "description": _short_text(raw_view.get("description"), max_chars=500),
+                "evidence_rationale": _short_text(
+                    raw_view.get("evidence_rationale"),
+                    max_chars=700,
+                ),
+                "value_type": str(raw_view.get("value_type") or "ambiguous"),
+            }
+            identity = (
+                view["name"],
+                view["description"],
+                view["evidence_rationale"],
+                view["value_type"],
+            )
+            if identity in seen:
+                continue
+            flattened.append(view)
+            seen.add(identity)
+    return flattened
+
+
 def _materialize_candidate_group(
     *,
     candidate_id: str,
@@ -2548,15 +2601,7 @@ def _materialize_candidate_group(
         # Internal routing only. Python resolves these to readable supporting
         # text; the ontology model never receives packet structure or IDs.
         "ontology_packet_ids": list(dict.fromkeys(map(str, ontology_packet_ids))),
-        "member_measurements": [
-            {
-                "name": str(member.get("name") or "").strip(),
-                "description": _short_text(member.get("description"), max_chars=500),
-                "evidence_rationale": _short_text(member.get("evidence_rationale"), max_chars=700),
-                "value_type": str(member.get("value_type") or "ambiguous"),
-            }
-            for member in members
-        ],
+        "member_measurements": _flatten_member_measurements(members),
     }
 
 
@@ -2580,12 +2625,12 @@ def _canonical_cluster_member(
 def _materialize_exact_name_groups(
     candidates: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Coalesce exact normalized names before one full-pool semantic request.
+    """Coalesce exact normalized names before iterative semantic consolidation.
 
     This is identity bookkeeping, not semantic consolidation: distinct names
-    are never compared or merged here. Combining exact names keeps the global
-    response contract unambiguous while preserving every candidate's evidence
-    and provenance.
+    are never compared or merged here. Combining exact names keeps every batch
+    response contract unambiguous while preserving candidate evidence and
+    provenance.
     """
 
     members_by_name: dict[str, list[Mapping[str, Any]]] = {}
@@ -2609,6 +2654,80 @@ def _materialize_exact_name_groups(
             )
         )
     return materialized
+
+
+def _candidate_group_sort_key(group: Mapping[str, Any]) -> tuple[str, str, str]:
+    name = str(group.get("name") or "")
+    return (
+        _snake_case_name(name, fallback=""),
+        name.casefold(),
+        str(group.get("candidate_id") or ""),
+    )
+
+
+def _alphabetical_candidate_batches(
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    batch_size: int,
+    round_number: int,
+) -> tuple[int, list[list[dict[str, Any]]]]:
+    """Sort groups and shift nonoverlapping batch boundaries between rounds."""
+
+    if batch_size < 2:
+        raise ValueError("candidate consolidation batch_size must be at least 2")
+    if round_number < 1:
+        raise ValueError("candidate consolidation round_number must be positive")
+    ordered = [dict(group) for group in sorted(groups, key=_candidate_group_sort_key)]
+    if not ordered:
+        return 0, []
+    if len(ordered) <= batch_size:
+        return 0, [ordered]
+
+    shift_step = max(1, batch_size // 2)
+    while math.gcd(shift_step, batch_size) != 1:
+        shift_step += 1
+    boundary_offset = ((round_number - 1) * shift_step) % batch_size
+    batches: list[list[dict[str, Any]]] = []
+    cursor = 0
+    if boundary_offset:
+        batches.append(ordered[:boundary_offset])
+        cursor = boundary_offset
+    while cursor < len(ordered):
+        batches.append(ordered[cursor : cursor + batch_size])
+        cursor += batch_size
+    return boundary_offset, batches
+
+
+def _coalesce_exact_candidate_group_names(
+    groups: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Coalesce identical canonical outputs produced by independent batches."""
+
+    members_by_name: dict[str, list[Mapping[str, Any]]] = {}
+    for index, group in enumerate(groups, start=1):
+        name = _snake_case_name(group.get("name"), fallback=f"measurement_{index:03d}")
+        members_by_name.setdefault(name, []).append(group)
+
+    coalesced: list[dict[str, Any]] = []
+    exact_merges = 0
+    for name, members in members_by_name.items():
+        if len(members) == 1:
+            coalesced.append(dict(members[0]))
+            continue
+        exact_merges += len(members) - 1
+        canonical = _canonical_cluster_member(members)
+        coalesced.append(
+            _materialize_candidate_group(
+                candidate_id=str(members[0]["candidate_id"]),
+                members=members,
+                canonical_name=name,
+                canonical_description=_short_text(
+                    canonical.get("description") or name,
+                    max_chars=2_000,
+                ),
+            )
+        )
+    return sorted(coalesced, key=_candidate_group_sort_key), exact_merges
 
 
 def _candidate_pool_feature_view(group: Mapping[str, Any]) -> dict[str, Any]:
@@ -2650,31 +2769,35 @@ def _global_candidate_pool_prompt(
     groups: Sequence[Mapping[str, Any]],
     configured_feature_names: Sequence[str] = (),
 ) -> list[dict[str, str]]:
-    """Ask once for a complete candidate-pool partition and exclusions."""
+    """Review one alphabetically adjacent candidate-pool batch."""
 
-    features = [_candidate_pool_feature_view(group) for group in groups]
+    features = [
+        _candidate_pool_feature_view(group)
+        for group in sorted(groups, key=_candidate_group_sort_key)
+    ]
 
     body: dict[str, Any] = {
         "job": "consolidate_stage2_candidate_pool",
         "task": (
-            "Review the complete pool of interpreted candidate features together. "
-            "Partition all semantic aliases and equivalent representations of each "
-            "underlying patient-level scalar measurement, and exclude only candidates "
-            "that clearly cannot define such a variable."
+            "Review this alphabetically adjacent batch of interpreted candidate features. "
+            "Partition semantic aliases and equivalent representations of each underlying "
+            "patient-level scalar measurement within the supplied batch, and exclude only "
+            "candidates that clearly cannot define such a variable. Later rounds will "
+            "re-sort the consolidated candidates and shift batch boundaries."
         ),
         "features": features,
         "rules": [
             "Every name absent from both response lists will be retained unchanged; do not restate valid unchanged features.",
             "Each merge directive must contain at least two exact names from features.",
-            "Treat merge_directives as a disjoint partition of alias families, not as sequential rename operations: return exactly one directive for each complete alias family and never chain or split one family across directives.",
-            "Each directive's inputs must list every exact supplied feature name in that alias family, including the selected canonical name when output reuses a supplied feature name.",
+            "Treat merge_directives as a disjoint partition of alias families within this batch, not as sequential rename operations: return exactly one directive for each complete supplied alias family and never chain or split one family across directives.",
+            "Each directive's inputs must list every exact supplied feature name in that alias family within this batch, including the selected canonical name when output reuses a supplied feature name.",
             "An output that equals a supplied feature name is valid only when that exact name appears in the same directive's inputs; it must not be an input of another directive, an exclusion, or an unchanged feature.",
             "Use each feature name at most once across all merge inputs and exclusions.",
             "Merge spelling variants, abbreviations, synonymous clinical names, and all clearly equivalent representations of the same underlying measurement.",
             "A general measurement name, its quantitative score, a thresholded or coarsened status, a named category, and a name containing one observed value belong together when they can all be represented by one underlying patient variable.",
             "Prefer an information-preserving underlying measurement name over a threshold, category, or observed value encoded in one candidate name.",
             "When a value-encoded or awkward alias has a clear underlying measurement anywhere in the pool, merge it into that measurement instead of excluding it.",
-            "Judge alias families jointly across the entire pool; do not require a direct lexical match between every pair of members in one family.",
+            "Judge alias families jointly across this entire batch; do not require a direct lexical match between every pair of members in one family.",
             "Do not merge merely related but independently varying variables, a diagnosis with a related laboratory value, a broad concept with one independently varying component, different anatomical sites, different biomarkers, or different timepoints.",
             "The output must be one concise snake_case canonical name for the consolidated measurement. It may reuse the best input name or provide a clearer equivalent name.",
             "Exclude a feature only when its name and descriptions clearly show that it is not one reusable patient-level scalar variable.",
@@ -3618,78 +3741,271 @@ class PlainHandoffStage2:
         groups: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-        """Run the sole semantic consolidation over the complete candidate pool."""
+        """Iteratively consolidate sorted batches with shifted round boundaries."""
 
-        current = [dict(group) for group in groups]
+        current = [dict(group) for group in sorted(groups, key=_candidate_group_sort_key)]
         if not current or all(_configured_feature_definitions(group) for group in current):
             return current, {}
-        group_names = [str(group["name"]) for group in current]
-        configured_feature_names = [
-            str(group["name"]) for group in current if _configured_feature_definitions(group)
-        ]
-        messages = _global_candidate_pool_prompt(
-            groups=current,
-            configured_feature_names=configured_feature_names,
-        )
-        prompt_chars = sum(len(message["content"]) for message in messages)
         prompt_limit = int(self.config.consolidation_max_prompt_chars)
-        if prompt_chars > prompt_limit:
-            raise ValueError(
-                "the complete Stage 2 candidate pool cannot fit the consolidation "
-                f"prompt budget ({prompt_chars} > {prompt_limit}); increase "
-                "stage2.consolidation_max_prompt_chars"
-            )
         request_config = replace(self.config, max_prompt_chars=prompt_limit)
-        feature_views = [_candidate_pool_feature_view(group) for group in current]
-        response = _checkpointed_request_json(
-            output_dir=output_dir,
-            input_value={
-                "phase": "global_candidate_pool_consolidation_and_quality_review",
-                "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
-                "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
-                "outer_fold": int(outer_fold),
-                "source_candidates": sum(
-                    len(_string_values(group.get("origin_candidate_ids"))) for group in current
-                ),
-                "features": feature_views,
-                "configured_feature_names": configured_feature_names,
-            },
-            messages=messages,
-            config=request_config,
-            completion=self.completion,
-            validate=lambda value: _validate_global_candidate_pool_directives(
-                value,
-                group_names=group_names,
-                configured_feature_names=configured_feature_names,
-            ),
-        )
-        directives = list(response["merge_directives"])
-        excluded_names = set(map(str, response["exclude_feature_names"]))
         excluded_origins: dict[str, str] = {}
-        retained_before_merge: list[dict[str, Any]] = []
-        for group in current:
-            if str(group["name"]) not in excluded_names:
-                retained_before_merge.append(group)
-                continue
-            for origin in _string_values(group.get("origin_candidate_ids")):
-                excluded_origins[origin] = (
-                    "Excluded by the global candidate-pool quality pass because the candidate "
-                    "is not a valid reusable patient-level scalar measurement."
+        no_change_partitions: set[tuple[tuple[str, ...], ...]] = set()
+        round_summaries: list[dict[str, Any]] = []
+        stopped_reason = "maximum_rounds_reached"
+        process_input = {
+            "phase": "iterative_candidate_pool_consolidation_and_quality_review",
+            "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+            "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
+            "outer_fold": int(outer_fold),
+            "consolidation_batch_size": int(self.config.consolidation_batch_size),
+            "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
+            "features": [_candidate_pool_feature_view(group) for group in current],
+            "configured_feature_names": [
+                str(group["name"]) for group in current if _configured_feature_definitions(group)
+            ],
+        }
+        process_fingerprint = _value_fingerprint(process_input)
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                output_dir / "input.json",
+                {**process_input, "input_fingerprint": process_fingerprint},
+            )
+
+        for round_number in range(1, int(self.config.consolidation_max_rounds) + 1):
+            if not current:
+                stopped_reason = "candidate_pool_empty"
+                break
+            if all(_configured_feature_definitions(group) for group in current):
+                stopped_reason = "only_explicit_features_remain"
+                break
+            boundary_offset, batches = _alphabetical_candidate_batches(
+                current,
+                batch_size=int(self.config.consolidation_batch_size),
+                round_number=round_number,
+            )
+            partition_signature = tuple(
+                tuple(str(group["name"]) for group in batch) for batch in batches
+            )
+            if partition_signature in no_change_partitions:
+                stopped_reason = "repeated_no_change_partition"
+                LOGGER.info(
+                    "Stage 2 iterative consolidation converged before round=%s; "
+                    "the unchanged candidate pool already used this partition",
+                    round_number,
                 )
-        merged = _apply_global_candidate_pool_directives(
-            retained_before_merge,
-            directives,
-        )
-        LOGGER.info(
-            "Stage 2 full-pool consolidation input_candidates=%s distinct_names=%s "
-            "merge_directives=%s excluded_names=%s output_groups=%s",
-            sum(len(_string_values(group.get("origin_candidate_ids"))) for group in current),
-            len(current),
-            len(directives),
-            len(excluded_names),
-            len(merged),
-        )
-        return merged, excluded_origins
+                break
+
+            round_dir = output_dir / f"round_{round_number:03d}" if output_dir is not None else None
+            batch_responses: dict[int, dict[str, Any]] = {}
+            jobs: list[dict[str, Any]] = []
+            for batch_number, batch in enumerate(batches, start=1):
+                group_names = [str(group["name"]) for group in batch]
+                configured_feature_names = [
+                    str(group["name"]) for group in batch if _configured_feature_definitions(group)
+                ]
+                if len(configured_feature_names) == len(batch):
+                    batch_responses[batch_number] = {
+                        "merge_directives": [],
+                        "exclude_feature_names": [],
+                    }
+                    continue
+                messages = _global_candidate_pool_prompt(
+                    groups=batch,
+                    configured_feature_names=configured_feature_names,
+                )
+                prompt_chars = sum(len(message["content"]) for message in messages)
+                if prompt_chars > prompt_limit:
+                    raise ValueError(
+                        "one Stage 2 candidate consolidation batch cannot fit the prompt "
+                        f"budget in round {round_number}, batch {batch_number} "
+                        f"({prompt_chars} > {prompt_limit}); reduce "
+                        "stage2.consolidation_batch_size or increase "
+                        "stage2.consolidation_max_prompt_chars"
+                    )
+                feature_views = [_candidate_pool_feature_view(group) for group in batch]
+                jobs.append(
+                    {
+                        "batch_number": batch_number,
+                        "output_dir": (
+                            round_dir / f"batch_{batch_number:03d}"
+                            if round_dir is not None
+                            else None
+                        ),
+                        "input_value": {
+                            "phase": "iterative_candidate_pool_batch_consolidation",
+                            "global_candidate_pool_schema": (GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION),
+                            "outer_fold": int(outer_fold),
+                            "round": round_number,
+                            "batch": batch_number,
+                            "boundary_offset": boundary_offset,
+                            "consolidation_batch_size": int(self.config.consolidation_batch_size),
+                            "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
+                            "features": feature_views,
+                            "configured_feature_names": configured_feature_names,
+                        },
+                        "messages": messages,
+                        "validate": (
+                            lambda value, names=tuple(group_names), configured=tuple(
+                                configured_feature_names
+                            ): (
+                                _validate_global_candidate_pool_directives(
+                                    value,
+                                    group_names=names,
+                                    configured_feature_names=configured,
+                                )
+                            )
+                        ),
+                    }
+                )
+
+            if jobs:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max(1, min(self.config.workers, len(jobs)))
+                ) as executor:
+                    futures = {
+                        executor.submit(
+                            _checkpointed_request_json,
+                            output_dir=job["output_dir"],
+                            input_value=job["input_value"],
+                            messages=job["messages"],
+                            config=request_config,
+                            completion=self.completion,
+                            validate=job["validate"],
+                        ): int(job["batch_number"])
+                        for job in jobs
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        batch_responses[futures[future]] = future.result()
+
+            next_groups: list[dict[str, Any]] = []
+            directive_count = 0
+            merged_input_count = 0
+            excluded_name_count = 0
+            for batch_number, batch in enumerate(batches, start=1):
+                response = batch_responses[batch_number]
+                directives = list(response["merge_directives"])
+                excluded_names = set(map(str, response["exclude_feature_names"]))
+                directive_count += len(directives)
+                merged_input_count += sum(
+                    max(0, len(_string_values(directive.get("inputs"))) - 1)
+                    for directive in directives
+                )
+                excluded_name_count += len(excluded_names)
+                retained_before_merge: list[dict[str, Any]] = []
+                for group in batch:
+                    if str(group["name"]) not in excluded_names:
+                        retained_before_merge.append(group)
+                        continue
+                    for origin in _string_values(group.get("origin_candidate_ids")):
+                        excluded_origins[origin] = (
+                            "Excluded by the iterative candidate-pool quality pass because "
+                            "the candidate is not a valid reusable patient-level scalar "
+                            "measurement."
+                        )
+                next_groups.extend(
+                    _apply_global_candidate_pool_directives(
+                        retained_before_merge,
+                        directives,
+                    )
+                )
+
+            next_groups, cross_batch_exact_merges = _coalesce_exact_candidate_group_names(
+                next_groups
+            )
+            for group in next_groups:
+                configured = _configured_feature_definitions(group)
+                if len(configured) > 1:
+                    raise ValueError(
+                        "iterative Stage 2 consolidation attempted to merge distinct "
+                        "investigator-configured features: "
+                        f"{[feature['name'] for feature in configured]}"
+                    )
+                if configured and str(group["name"]) != str(configured[0]["name"]):
+                    raise ValueError(
+                        "iterative Stage 2 consolidation renamed an investigator-configured "
+                        f"feature; expected {configured[0]['name']!r}, received "
+                        f"{group['name']!r}"
+                    )
+
+            changed = bool(merged_input_count or excluded_name_count or cross_batch_exact_merges)
+            round_summary = {
+                "round": round_number,
+                "boundary_offset": boundary_offset,
+                "input_groups": len(current),
+                "batches": len(batches),
+                "model_requested_batches": len(jobs),
+                "explicit_only_batches": len(batches) - len(jobs),
+                "merge_directives": directive_count,
+                "merged_inputs_removed": merged_input_count,
+                "excluded_names": excluded_name_count,
+                "cross_batch_exact_name_merges": cross_batch_exact_merges,
+                "output_groups": len(next_groups),
+                "changed": changed,
+            }
+            round_summaries.append(round_summary)
+            if round_dir is not None:
+                _write_json(
+                    round_dir / "complete.json",
+                    {
+                        "status": "complete",
+                        "completed_at": _now(),
+                        "global_candidate_pool_schema": (GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION),
+                        **round_summary,
+                    },
+                )
+            LOGGER.info(
+                "Stage 2 iterative consolidation round=%s offset=%s input_groups=%s "
+                "batches=%s merge_directives=%s excluded_names=%s "
+                "cross_batch_exact_merges=%s output_groups=%s changed=%s",
+                round_number,
+                boundary_offset,
+                len(current),
+                len(batches),
+                directive_count,
+                excluded_name_count,
+                cross_batch_exact_merges,
+                len(next_groups),
+                changed,
+            )
+            current = next_groups
+            if not current:
+                stopped_reason = "candidate_pool_empty"
+                break
+            if all(_configured_feature_definitions(group) for group in current):
+                stopped_reason = "only_explicit_features_remain"
+                break
+            if changed:
+                no_change_partitions.clear()
+            else:
+                no_change_partitions.add(partition_signature)
+                if len(batches) == 1:
+                    stopped_reason = "single_batch_no_change"
+                    break
+
+        if output_dir is not None:
+            _write_json(
+                output_dir / "result.json",
+                {
+                    "groups": current,
+                    "excluded_origins": excluded_origins,
+                    "rounds": round_summaries,
+                },
+            )
+            _write_json(
+                output_dir / "complete.json",
+                {
+                    "status": "complete",
+                    "completed_at": _now(),
+                    "input_fingerprint": process_fingerprint,
+                    "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
+                    "rounds_executed": len(round_summaries),
+                    "stopped_reason": stopped_reason,
+                    "output_groups": len(current),
+                    "excluded_origins": len(excluded_origins),
+                },
+            )
+        return current, excluded_origins
 
     def _consolidate_candidates(
         self,
@@ -3699,7 +4015,7 @@ class PlainHandoffStage2:
         evidence_packets: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
     ) -> Mapping[str, Any]:
-        """Consolidate the complete candidate pool, then operationalize routed groups."""
+        """Iteratively consolidate candidate batches, then operationalize routed groups."""
 
         configured_candidates = [
             {
@@ -3837,6 +4153,8 @@ class PlainHandoffStage2:
             "compiler": self.config.evidence_compiler,
             "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
             "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+            "consolidation_batch_size": int(self.config.consolidation_batch_size),
+            "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
             "clinical_question": self.clinical_question,
             "explicit_features": [
                 feature.as_definition() for feature in self.config.explicit_features
@@ -3850,7 +4168,11 @@ class PlainHandoffStage2:
             }
         )
         previous_pairwise_inputs = {
-            **definition_inputs,
+            **{
+                key: value
+                for key, value in definition_inputs.items()
+                if key not in {"consolidation_batch_size", "consolidation_max_rounds"}
+            },
             "consolidation_schema": PREVIOUS_PAIRWISE_CONSOLIDATION_SCHEMA_VERSION,
         }
         upgradeable_pairwise_fingerprints = {
@@ -3939,7 +4261,7 @@ class PlainHandoffStage2:
                 candidates = [dict(candidate) for candidate in raw_candidates]
                 LOGGER.info(
                     "upgrade Stage 2 outer_fold=%s from cached interpretations using "
-                    "full candidate-pool consolidation schema=%s",
+                    "iterative candidate-batch consolidation schema=%s",
                     outer_fold,
                     GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
                 )
@@ -4060,6 +4382,8 @@ class PlainHandoffStage2:
                     "evidence_input_fingerprint": evidence_input_fingerprint,
                     "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                     "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
+                    "consolidation_batch_size": int(self.config.consolidation_batch_size),
+                    "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
                     "architectures": len(by_architecture),
                     "packets": len(packets),
                     "features": len(final["features"]),

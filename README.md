@@ -687,27 +687,33 @@ into broad prompt buckets.
 
 Stage 2 then interprets the compiled evidence architectures and consolidates
 the result into operational patient-level definitions. After exact-name
-coalescing, consolidation uses one LLM request over the complete distinct-name
-candidate pool and all candidate descriptions. It jointly merges synonymous,
-thresholded, categorical, quantitative-score, and value-encoded representations
-of one underlying measurement while preserving independently varying variables.
-There are no fuzzy-blocked or pairwise alias requests. The same pass can remove patient-specific,
-value-encoded, composite, and nonclinical artifacts. It receives no clinical
-question, conservatively retains uncertain clinical variables, and cannot
-exclude investigator-configured features. Python deterministically carries
-supporting packets, architectures, evidence axes, causal roles, and
-original-candidate dispositions through those groups. There is no feature-count
-selection step, and causal roles are derived after full-pool grouping so
-complementary evidence can combine. Finally, independent one-feature requests receive only the
+coalescing, consolidation alphabetically sorts candidates into batches of 20
+by default, applies each batch's merge and quality directives, re-sorts the
+consolidated versions, shifts batch boundaries, and repeats for up to five
+rounds. This brings boundary-adjacent aliases together without requiring one
+large response. There are no fuzzy-blocked or pairwise alias requests. The
+batches can merge synonymous, thresholded, categorical, quantitative-score,
+and value-encoded representations and remove patient-specific, composite, and
+nonclinical artifacts. They receive no clinical question and conservatively
+retain uncertain clinical variables. Explicit investigator-configured features
+are hard invariants in every round: they cannot be excluded or renamed, distinct
+configured features cannot be merged, and their supplied ontology and roles
+remain authoritative. Python deterministically carries supporting packets,
+architectures, evidence axes, causal roles, descriptions, and original-candidate
+dispositions through the rounds. There is no feature-count selection step, and
+causal roles are derived after iterative grouping so complementary evidence can
+combine. Finally, independent one-feature requests receive only the
 canonical feature name and a deduplicated flat list of readable supporting-text
 strings. The model decides the value type, units or allowed categories,
 measurement rule, and missingness handling from that evidence; packet structure,
 evidence kind, detail objects, truncation flags, fold metadata, internal IDs,
 causal axes, semantic grouping, architecture names, scores, support counts,
 candidate summaries, and earlier proposed value types stay outside the prompt.
-Consolidation and every one-group
-operationalization request are input-fingerprinted separately, so a retry skips
-successful leaves instead of repeating the whole fan-out. It then extracts the variables on the outer
+Every consolidation round/batch and one-group operationalization request is
+input-fingerprinted separately, so a retry skips successful leaves instead of
+repeating the whole fan-out. Batch size and maximum rounds are configurable as
+`stage2.consolidation_batch_size` and `stage2.consolidation_max_rounds`. It then
+extracts the variables on the outer
 training rows and measures missingness, variation,
 treatment prediction, outcome prediction, and residual-effect performance by
 inner validation. Leave-one-feature-out measurements show whether each variable

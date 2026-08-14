@@ -57,6 +57,8 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.transport_max_attempts == 3
     assert config.max_prompt_chars == 100_000
     assert config.consolidation_max_prompt_chars == 640_000
+    assert config.consolidation_batch_size == 20
+    assert config.consolidation_max_rounds == 5
     assert config.extraction_max_prompt_chars == 640_000
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
     assert config.evidence_max_cards_per_fold == 400
@@ -69,6 +71,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "endpoint": "http://stage2.test/v1",
             "max_prompt_chars": 90_000,
             "consolidation_max_prompt_chars": 450_000,
+            "consolidation_batch_size": 18,
+            "consolidation_max_rounds": 7,
             "extraction_max_prompt_chars": 500_000,
         },
         default_workers=1,
@@ -77,9 +81,29 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config is not None
     assert config.max_prompt_chars == 90_000
     assert config.consolidation_max_prompt_chars == 450_000
+    assert config.consolidation_batch_size == 18
+    assert config.consolidation_max_rounds == 7
     assert config.extraction_max_prompt_chars == 500_000
     assert config.public_dict()["consolidation_max_prompt_chars"] == 450_000
+    assert config.public_dict()["consolidation_batch_size"] == 18
+    assert config.public_dict()["consolidation_max_rounds"] == 7
     assert config.public_dict()["extraction_max_prompt_chars"] == 500_000
+
+
+def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
+    with pytest.raises(ValueError, match="consolidation_batch_size must be at least 2"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            consolidation_batch_size=1,
+        ).validate()
+
+    with pytest.raises(ValueError, match="consolidation_max_rounds must be positive"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            consolidation_max_rounds=0,
+        ).validate()
 
 
 def test_stage2_config_parses_explicit_feature_with_supplied_ontology():
@@ -2321,7 +2345,7 @@ def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
     assert completion["feature_batches"] == 2
 
 
-def test_stage2_full_pool_consolidation_does_not_lose_candidates():
+def test_stage2_iterative_consolidation_does_not_lose_candidates():
     prompts = []
 
     def completion(messages, request_config):
@@ -2336,9 +2360,10 @@ def test_stage2_full_pool_consolidation_does_not_lose_candidates():
         assert "packet_1" not in messages[1]["content"]
         job = _prompt_job(body)
         if job == "consolidate_stage2_candidate_pool":
-            assert [feature["name"] for feature in body["features"]] == [
-                f"performance_status_{index}" for index in range(1, 7)
-            ]
+            names = [feature["name"] for feature in body["features"]]
+            if names == ["performance_status"]:
+                return json.dumps({"merge_directives": [], "exclude_feature_names": []})
+            assert names == [f"performance_status_{index}" for index in range(1, 7)]
             return json.dumps(
                 {
                     "merge_directives": [
@@ -2402,11 +2427,13 @@ def test_stage2_full_pool_consolidation_does_not_lose_candidates():
 
     assert [job for job, _size, _limit in prompts] == [
         "consolidate_stage2_candidate_pool",
+        "consolidate_stage2_candidate_pool",
         "operationalize_stage2_candidate_group",
     ]
     assert all(size <= limit for _job, size, limit in prompts)
     assert prompts[0][2] == config.consolidation_max_prompt_chars
-    assert prompts[1][2] == config.max_prompt_chars
+    assert prompts[1][2] == config.consolidation_max_prompt_chars
+    assert prompts[2][2] == config.max_prompt_chars
     assert set(result["candidate_dispositions"]) == {
         candidate["candidate_id"] for candidate in candidates
     }
@@ -2435,11 +2462,11 @@ def test_global_candidate_pool_prompt_exposes_all_unique_names_and_descriptions(
     assert body["job"] == "consolidate_stage2_candidate_pool"
     assert "clinical_question" not in body
     assert [feature["name"] for feature in body["features"]] == [
-        "patient_age",
         "age_2",
+        "patient_age",
         "serum_sodium",
     ]
-    assert body["features"][0]["descriptions"] == [
+    assert body["features"][1]["descriptions"] == [
         "Patient age.",
         "Age expressed in years.",
     ]
@@ -2457,12 +2484,129 @@ def test_global_candidate_pool_prompt_exposes_all_unique_names_and_descriptions(
     assert "candidate_id" not in messages[1]["content"]
     assert "group_id" not in messages[1]["content"]
     instructions = " ".join([messages[0]["content"], body["task"], *body["rules"]]).lower()
+    assert "alphabetically adjacent batch" in instructions
+    assert "shift batch boundaries" in instructions
     assert "including the selected canonical name" in instructions
     assert "never chain or split one family" in instructions
     assert "only when that exact name appears in the same directive's inputs" in instructions
     assert "pretreatment" not in instructions
     assert "post-treatment" not in instructions
     assert "treatment" not in instructions
+
+
+def test_alphabetical_candidate_batches_shift_boundaries_between_rounds():
+    groups = [
+        {"candidate_id": f"candidate_{name}", "name": name}
+        for name in reversed(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"])
+    ]
+
+    offsets_and_names = []
+    for round_number in range(1, 4):
+        offset, batches = stage2_workflow._alphabetical_candidate_batches(
+            groups,
+            batch_size=3,
+            round_number=round_number,
+        )
+        offsets_and_names.append(
+            (
+                offset,
+                [[str(group["name"]) for group in batch] for batch in batches],
+            )
+        )
+
+    assert offsets_and_names == [
+        (0, [["alpha", "bravo", "charlie"], ["delta", "echo", "foxtrot"], ["golf"]]),
+        (1, [["alpha"], ["bravo", "charlie", "delta"], ["echo", "foxtrot", "golf"]]),
+        (2, [["alpha", "bravo"], ["charlie", "delta", "echo"], ["foxtrot", "golf"]]),
+    ]
+
+
+def test_iterative_consolidation_finds_aliases_across_a_shifted_batch_boundary(
+    tmp_path: Path,
+):
+    names = ["aaa", "bbb", "marker_level", "marker_status", "yyy", "zzz"]
+    groups = stage2_workflow._materialize_exact_name_groups(
+        [
+            {
+                "candidate_id": f"candidate_{index:04d}",
+                "architecture": f"architecture_{index}",
+                "name": name,
+                "description": f"Description for {name}.",
+                "value_type": "ambiguous",
+                "supporting_packet_ids": [f"packet_{index:04d}"],
+                "evidence_axes": ["outcome"],
+                "caveats": "",
+            }
+            for index, name in enumerate(names, start=1)
+        ]
+    )
+    prompt_features = []
+
+    def completion(messages, _config):
+        body = json.loads(messages[1]["content"])
+        batch_names = [feature["name"] for feature in body["features"]]
+        prompt_features.append(body["features"])
+        if {"marker_level", "marker_status"} <= set(batch_names):
+            return json.dumps(
+                {
+                    "merge_directives": [
+                        {
+                            "inputs": ["marker_level", "marker_status"],
+                            "output": "marker_level",
+                        }
+                    ],
+                    "exclude_feature_names": [],
+                }
+            )
+        return json.dumps({"merge_directives": [], "exclude_feature_names": []})
+
+    output_dir = tmp_path / "candidate_pool_consolidation"
+    consolidated, exclusions = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            workers=1,
+            consolidation_batch_size=3,
+            consolidation_max_rounds=3,
+        ),
+        clinical_question="Not supplied to consolidation.",
+        completion=completion,
+    )._consolidate_candidate_pool(
+        outer_fold=1,
+        groups=groups,
+        output_dir=output_dir,
+    )
+
+    assert exclusions == {}
+    assert [group["name"] for group in consolidated] == [
+        "aaa",
+        "bbb",
+        "marker_level",
+        "yyy",
+        "zzz",
+    ]
+    marker = next(group for group in consolidated if group["name"] == "marker_level")
+    assert marker["origin_candidate_ids"] == ["candidate_0003", "candidate_0004"]
+    marker_views = [
+        feature
+        for batch in prompt_features
+        for feature in batch
+        if feature["name"] == "marker_level" and len(feature["descriptions"]) == 2
+    ]
+    assert marker_views[-1]["descriptions"] == [
+        "Description for marker_level.",
+        "Description for marker_status.",
+    ]
+    assert any(
+        [feature["name"] for feature in batch] == ["bbb", "marker_level", "marker_status"]
+        for batch in prompt_features
+    )
+    summaries = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(output_dir.glob("round_*/complete.json"))
+    ]
+    assert [summary["boundary_offset"] for summary in summaries] == [0, 1, 2]
+    assert [summary["changed"] for summary in summaries] == [False, True, False]
 
 
 def test_global_group_merge_validator_maps_names_and_rejects_ambiguous_routes():
@@ -2763,6 +2907,9 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
                 "response",
             }
             assert all("candidate" not in feature["name"] for feature in body["features"])
+            names = {feature["name"] for feature in body["features"]}
+            if not {"serum_sodium", "blood_sodium_concentration"} <= names:
+                return json.dumps({"merge_directives": [], "exclude_feature_names": []})
             return json.dumps(
                 {
                     "merge_directives": [
@@ -2851,17 +2998,18 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
     )
 
     assert [feature["supporting_packet_ids"] for feature in result["features"]] == [
-        [packet_ids[0], packet_ids[3]],
         [packet_ids[1]],
         [packet_ids[2]],
+        [packet_ids[0], packet_ids[3]],
     ]
     assert [feature["supporting_architectures"] for feature in result["features"]] == [
-        ["architecture_alpha", "architecture_delta"],
         ["architecture_beta"],
         ["architecture_gamma"],
+        ["architecture_alpha", "architecture_delta"],
     ]
-    assert result["features"][0]["roles"] == ["confounder"]
-    assert result["features"][1]["roles"] == ["prognostic", "effect_modifier"]
+    assert result["features"][0]["roles"] == ["prognostic", "effect_modifier"]
+    assert result["features"][1]["roles"] == ["prognostic"]
+    assert result["features"][2]["roles"] == ["confounder"]
     assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0002"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0003"]["status"] == "retained"
@@ -2874,7 +3022,7 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
         (checkpoint_dir / "candidate_pool_consolidation" / "input.json").read_text(encoding="utf-8")
     )
     assert "clinical_question" not in global_input
-    assert len(list(checkpoint_dir.rglob("complete.json"))) == 4
+    assert len(list(checkpoint_dir.rglob("complete.json"))) == 8
 
     def unexpected_completion(_messages, _config):
         raise AssertionError("completed consolidation leaves must resume from checkpoints")
@@ -3009,6 +3157,110 @@ def test_configured_feature_is_consolidated_with_discovery_and_keeps_supplied_on
     assert [feature["name"] for feature in exact_result["features"]] == ["ecog_performance_status"]
 
 
+def test_shifted_consolidation_round_preserves_explicit_feature_name_ontology_and_roles():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "model": "test-model",
+            "workers": 1,
+            "consolidation_batch_size": 2,
+            "consolidation_max_rounds": 2,
+            "explicit_features": [
+                {
+                    "name": "ecog_performance_status",
+                    "description": "Investigator-specified ECOG performance status.",
+                    "value_type": "ordinal",
+                    "categories_or_unit": ["0", "1", "2", "3", "4"],
+                    "measurement_definition": "Extract the explicitly documented ECOG score.",
+                    "missing_value_rule": "Return null when ECOG is undocumented.",
+                    "roles": ["effect_modifier"],
+                }
+            ],
+        },
+        default_workers=1,
+    )
+    assert config is not None
+    explicit = config.explicit_features[0]
+    raw_candidates = [
+        {
+            "candidate_id": "candidate_aaa",
+            "architecture": "architecture_alpha",
+            "name": "aaa",
+            "description": "Unrelated scalar A.",
+            "supporting_packet_ids": ["packet_aaa"],
+            "evidence_axes": ["outcome"],
+        },
+        {
+            "candidate_id": "configured_explicit_feature_0001",
+            "architecture": stage2_workflow.CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE,
+            "name": explicit.name,
+            "description": explicit.description,
+            "value_type": explicit.value_type,
+            "supporting_packet_ids": [],
+            "evidence_axes": [],
+            "configured_feature_definitions": [explicit.as_definition()],
+        },
+        {
+            "candidate_id": "candidate_ecog_alias",
+            "architecture": "architecture_beta",
+            "name": "ecog_status",
+            "description": "A discovered alias of ECOG performance status.",
+            "supporting_packet_ids": ["packet_ecog"],
+            "evidence_axes": ["treatment", "outcome"],
+        },
+        {
+            "candidate_id": "candidate_zzz",
+            "architecture": "architecture_gamma",
+            "name": "zzz",
+            "description": "Unrelated scalar Z.",
+            "supporting_packet_ids": ["packet_zzz"],
+            "evidence_axes": ["outcome"],
+        },
+    ]
+    groups = stage2_workflow._materialize_exact_name_groups(raw_candidates)
+    configured_batches = []
+
+    def completion(messages, _config):
+        body = json.loads(messages[1]["content"])
+        names = [feature["name"] for feature in body["features"]]
+        if "ecog_performance_status" in names:
+            configured_batches.append(body["configured_feature_names"])
+        if {"ecog_performance_status", "ecog_status"} <= set(names):
+            return json.dumps(
+                {
+                    "merge_directives": [
+                        {
+                            "inputs": ["ecog_performance_status", "ecog_status"],
+                            "output": "ecog_performance_status",
+                        }
+                    ],
+                    "exclude_feature_names": [],
+                }
+            )
+        return json.dumps({"merge_directives": [], "exclude_feature_names": []})
+
+    consolidated, exclusions = PlainHandoffStage2(
+        config=config,
+        clinical_question="Not supplied to consolidation.",
+        completion=completion,
+    )._consolidate_candidate_pool(outer_fold=1, groups=groups)
+
+    assert exclusions == {}
+    assert configured_batches == [
+        ["ecog_performance_status"],
+        ["ecog_performance_status"],
+    ]
+    explicit_group = next(
+        group for group in consolidated if group["name"] == "ecog_performance_status"
+    )
+    assert explicit_group["origin_candidate_ids"] == [
+        "configured_explicit_feature_0001",
+        "candidate_ecog_alias",
+    ]
+    assert explicit_group["configured_feature_definitions"] == [explicit.as_definition()]
+    assert stage2_workflow._group_roles(explicit_group) == ["effect_modifier"]
+
+
 def test_configured_feature_is_retained_without_any_discovered_candidate():
     config = plain_stage2_config_from_mapping(
         {
@@ -3085,7 +3337,10 @@ def test_global_consolidation_merges_aliases_and_excludes_bad_features():
         prompt_bodies.append(body)
         job = _prompt_job(body)
         if job == "consolidate_stage2_candidate_pool":
-            assert [feature["name"] for feature in body["features"]] == [
+            names = [feature["name"] for feature in body["features"]]
+            if names == ["blood_glucose_concentration", "heart_rate"]:
+                return json.dumps({"merge_directives": [], "exclude_feature_names": []})
+            assert names == [
                 "blood_glucose_concentration",
                 "glycemia",
                 "heart_rate",
@@ -3197,7 +3452,7 @@ def test_global_consolidation_merges_aliases_and_excludes_bad_features():
     )
     assert [_prompt_job(body) for body in prompt_bodies].count(
         "consolidate_stage2_candidate_pool"
-    ) == 1
+    ) == 2
     assert [_prompt_job(body) for body in prompt_bodies].count(
         "operationalize_stage2_candidate_group"
     ) == 2
@@ -3213,7 +3468,7 @@ def test_global_consolidation_merges_aliases_and_excludes_bad_features():
     assert ontology_bodies["heart_rate"]["supporting_evidence"] == ["Resting pulse was 72 bpm."]
 
 
-def test_full_pool_jointly_merges_general_threshold_value_and_score_representations():
+def test_iterative_batch_jointly_merges_general_threshold_value_and_score_representations():
     names = [
         "inflammation_marker_expression",
         "high_inflammation_marker_expression",
@@ -3239,7 +3494,10 @@ def test_full_pool_jointly_merges_general_threshold_value_and_score_representati
         job = _prompt_job(body)
         jobs.append(job)
         if job == "consolidate_stage2_candidate_pool":
-            assert [feature["name"] for feature in body["features"]] == names
+            prompt_names = [feature["name"] for feature in body["features"]]
+            if prompt_names == ["inflammation_marker_expression"]:
+                return json.dumps({"merge_directives": [], "exclude_feature_names": []})
+            assert prompt_names == sorted(names)
             return json.dumps(
                 {
                     "merge_directives": [
@@ -3310,6 +3568,7 @@ def test_full_pool_jointly_merges_general_threshold_value_and_score_representati
     )
 
     assert jobs == [
+        "consolidate_stage2_candidate_pool",
         "consolidate_stage2_candidate_pool",
         "operationalize_stage2_candidate_group",
     ]
@@ -3886,7 +4145,8 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
     )
     assert definitions["features"][0]["roles"] == ["confounder"]
     # Architecture-stratified compilation interprets the two producers
-    # independently, then consolidates their exact shared name in the full pool.
+    # independently, then deterministically coalesces their exact shared name
+    # before iterative semantic batches.
     assert calls.count("infer_clinical_features_from_text_evidence") == 2
     assert calls.count("consolidate_stage2_candidate_pool") == 1
     assert calls.count("operationalize_stage2_candidate_group") == 1
