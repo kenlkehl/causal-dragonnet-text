@@ -150,7 +150,7 @@ makes those decisions from the retained feature name and supporting text.
     "evidence_max_exemplar_chars": 2400,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
-    "consolidation_max_rounds": 10,
+    "consolidation_max_rounds": 55,
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
@@ -206,11 +206,11 @@ sorts the distinct candidates by normalized feature name and sends
 nonoverlapping batches of `consolidation_batch_size` candidates (20 by default).
 Batches within a round are independent and may run concurrently. After applying
 their directives, Python re-sorts the consolidated versions and repeats for up
-to `consolidation_max_rounds` rounds (10 by default). The first
+to `consolidation_max_rounds` rounds (55 by default). The first
 `consolidation_alphabetical_rounds` rounds (5 by default) shift alphabetical
 boundaries so adjacent candidates split at one boundary can meet in another.
-The remaining rounds assign the re-sorted pool to new pseudorandom batches using
-the run seed and outer-fold number. These seeded shuffles are exactly
+The remaining 50 default rounds assign the re-sorted pool to new pseudorandom
+batches using the run seed and outer-fold number. These seeded shuffles are exactly
 reproducible but allow lexically distant aliases to be considered together. A
 no-change round does not stop the process until its complete partition repeats;
 this prevents one boundary layout from declaring false convergence. The process
@@ -220,17 +220,16 @@ while retaining all provenance and candidate descriptions.
 
 The clinical question is deliberately absent from every consolidation batch.
 The model returns `merge_directives`, each with an `inputs` list of exact names
-from that batch and one canonical `output` name, plus
-`exclude_feature_names`. Exclusion is restricted to clear failures of the
-patient-level scalar contract: patient-specific or value-encoded artifacts,
-profiles and composites, and nonclinical analysis or documentation artifacts.
-Borderline but valid clinical variables pass through. Each batch sees no
-candidate or group IDs and does not restate unchanged features. Python
-validates that every supplied name exists, prevents a name from being both
-merged and excluded, maps names back to internal groups, unions merged
-provenance, records excluded-candidate dispositions, and passes every
-unmentioned name through unchanged. Original candidate descriptions are
-carried through every round so later prompts do not lose semantic evidence.
+from that batch and one canonical `output` name. Iterative consolidation is
+strictly merge-only: every supplied feature survives each round either
+unchanged or as a member of one merged alias family. The response contract has
+no exclusion list, and a response that supplies `exclude_feature_names` is
+invalid and falls back losslessly if repairs do not remove it. Each batch sees
+no candidate or group IDs and does not restate unchanged features. Python
+validates that every supplied name exists, maps names back to internal groups,
+unions merged provenance, and passes every unmentioned name through unchanged.
+Original candidate descriptions are carried through every round so later
+prompts do not lose semantic evidence.
 The response normalizer recognizes only unique names and descriptions actually
 supplied in that batch; this permits a copied description to resolve back to its
 exact feature without fuzzy or domain-specific matching. It restores a reused
@@ -241,10 +240,15 @@ through unchanged, and records the fallback in the round and root completion
 summaries. This lossless fallback also preserves every configured feature.
 There is no fuzzy blocker, neighbor selection, or pairwise LLM request. Python
 derives causal roles only after all rounds, allowing complementary evidence
-axes from different representations to combine before role filtering.
+axes from different representations to combine before role filtering. That
+later deterministic filter is a separate phase: groups whose Stage 1 evidence
+supports no confounder, prognostic, or effect-modifier role are excluded there,
+not during alias consolidation. Its group-level decisions are written to
+`consolidation/causal_role_filter.json`; investigator-configured features use
+their supplied roles and remain protected.
 
-Every group remaining after those merge and exclusion directives is
-operationalized for extraction. Each ontology request contains only the
+Every group remaining after consolidation and the subsequent causal-role
+filter is operationalized for extraction. Each ontology request contains only the
 canonical feature name, a deduplicated flat list of readable supporting text,
 the ontology instructions, and the response contract. Python extracts only
 `representative_evidence.text`

@@ -50,12 +50,15 @@ DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 20
 DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS = 5
-DEFAULT_CONSOLIDATION_MAX_ROUNDS = 10
+DEFAULT_CONSOLIDATION_SHUFFLE_ROUNDS = 50
+DEFAULT_CONSOLIDATION_MAX_ROUNDS = (
+    DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS + DEFAULT_CONSOLIDATION_SHUFFLE_ROUNDS
+)
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
-CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v12_configured_explicit_features"
+CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v13_merge_only_then_role_filter"
 GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
-    "alphabetical_then_seeded_shuffle_candidate_batches_v7_explicit_feature_invariants"
+    "alphabetical_then_seeded_shuffle_candidate_batches_v8_merge_only"
 )
 EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
     "training_failure_ontology_refinement_v1_explicit_feature_invariants"
@@ -2497,6 +2500,46 @@ def _group_roles(group: Mapping[str, Any]) -> list[str]:
     return _derive_roles(group.get("evidence_axes") or [])
 
 
+def _filter_candidate_groups_by_causal_role(
+    groups: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, str], list[dict[str, Any]]]:
+    """Apply the auditable causal-role filter after lossless alias consolidation."""
+
+    retained: list[dict[str, Any]] = []
+    exclusions: dict[str, str] = {}
+    decisions: list[dict[str, Any]] = []
+    exclusion_reason = (
+        "Excluded because its Stage 1 evidence does not support a Stage 2 "
+        "confounder, prognostic, or effect-modifier role."
+    )
+    for group in groups:
+        roles = _group_roles(group)
+        origin_candidate_ids = _string_values(group.get("origin_candidate_ids"))
+        if roles:
+            retained.append(dict(group))
+            decisions.append(
+                {
+                    "name": str(group["name"]),
+                    "status": "retained",
+                    "roles": roles,
+                    "origin_candidate_ids": origin_candidate_ids,
+                }
+            )
+            continue
+        for origin in origin_candidate_ids:
+            exclusions[origin] = exclusion_reason
+        decisions.append(
+            {
+                "name": str(group["name"]),
+                "status": "excluded",
+                "roles": [],
+                "origin_candidate_ids": origin_candidate_ids,
+                "reason": exclusion_reason,
+            }
+        )
+    return retained, exclusions, decisions
+
+
 def _flatten_member_measurements(
     members: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
@@ -2869,7 +2912,7 @@ def _global_candidate_pool_prompt(
     configured_feature_names: Sequence[str] = (),
     batch_ordering: str = "alphabetical_shift",
 ) -> list[dict[str, str]]:
-    """Review one bounded candidate-pool batch."""
+    """Consolidate aliases in one bounded candidate-pool batch without filtering."""
 
     features = [
         _candidate_pool_feature_view(group)
@@ -2887,33 +2930,28 @@ def _global_candidate_pool_prompt(
             )
             + " batch of interpreted candidate features. "
             "Partition semantic aliases and equivalent representations of each underlying "
-            "patient-level scalar measurement within the supplied batch, and exclude only "
-            "candidates that clearly cannot define such a variable. Later rounds will use "
-            "new deterministic partitions of the remaining candidates."
+            "patient-level measurement within the supplied batch. Every supplied feature "
+            "must survive this pass either unchanged or as an input to exactly one merge. "
+            "Later rounds will use new deterministic partitions of the consolidated candidates."
         ),
         "features": features,
         "rules": [
-            "Every name absent from both response lists will be retained unchanged; do not restate valid unchanged features.",
+            "Every name absent from merge_directives will be retained unchanged; do not restate unchanged features.",
+            "This is merge-only ontology consolidation, not feature filtering or quality review. Never exclude or drop a supplied feature.",
             "Each merge directive must contain at least two exact names from features.",
             "Treat merge_directives as a disjoint partition of alias families within this batch, not as sequential rename operations: return exactly one directive for each complete supplied alias family and never chain or split one family across directives.",
             "Each directive's inputs must list every exact supplied feature name in that alias family within this batch, including the selected canonical name when output reuses a supplied feature name.",
-            "An output that equals a supplied feature name is valid only when that exact name appears in the same directive's inputs; it must not be an input of another directive, an exclusion, or an unchanged feature.",
-            "Use each feature name at most once across all merge inputs and exclusions.",
+            "An output that equals a supplied feature name is valid only when that exact name appears in the same directive's inputs; it must not be an input of another directive or an unchanged feature.",
+            "Use each feature name at most once across all merge inputs.",
             "Merge spelling variants, abbreviations, synonymous clinical names, and all clearly equivalent representations of the same underlying measurement.",
             "A general measurement name, its quantitative score, a thresholded or coarsened status, a named category, and a name containing one observed value belong together when they can all be represented by one underlying patient variable.",
             "Prefer an information-preserving underlying measurement name over a threshold, category, or observed value encoded in one candidate name.",
-            "When a value-encoded or awkward alias has a clear underlying measurement anywhere in the pool, merge it into that measurement instead of excluding it.",
+            "When a value-encoded or awkward alias has a clear underlying measurement in this batch, merge it into that measurement; otherwise retain it unchanged.",
             "Judge alias families jointly across this entire batch; do not require a direct lexical match between every pair of members in one family.",
             "Do not merge merely related but independently varying variables, a diagnosis with a related laboratory value, a broad concept with one independently varying component, different anatomical sites, different biomarkers, or different timepoints.",
             "The output must be one concise snake_case canonical name for the consolidated measurement. It may reuse the best input name or provide a clearer equivalent name.",
-            "Exclude a feature only when its name and descriptions clearly show that it is not one reusable patient-level scalar variable.",
-            "Exclude patient names or identifiers, named-patient or numbered-patient profiles, and record-specific vignettes.",
-            "Exclude profiles, composites, combined findings, and other concepts that require multiple independently varying values rather than one scalar value per patient.",
-            "Exclude names that merely encode one observed patient value or one record-specific finding when no valid underlying measurement in the list can absorb them.",
-            "Exclude administrative, documentation, cohort, grouping, analysis, model, or other nonclinical artifacts.",
-            "Do not exclude a valid demographic, diagnosis, comorbidity, symptom, examination, laboratory value, biomarker, clinical history, or other scalar measurement merely because it is rare, weakly supported, redundant, or of uncertain usefulness.",
-            "When validity is uncertain, retain the feature. This pass is not a relevance ranking or feature-count selection step.",
-            "Return only exact supplied feature names in merge inputs and exclude_feature_names. Return no internal IDs, provenance, definitions, explanations, or unchanged feature names.",
+            "When semantic equivalence is uncertain, do not merge the features.",
+            "Return only exact supplied feature names in merge inputs. Return no internal IDs, provenance, definitions, explanations, unchanged feature names, or exclusion list.",
         ],
         "response": {
             "merge_directives": [
@@ -2923,8 +2961,7 @@ def _global_candidate_pool_prompt(
                     ],
                     "output": "one snake_case canonical feature name",
                 }
-            ],
-            "exclude_feature_names": ["exact supplied name of one clearly invalid feature"],
+            ]
         },
     }
     configured_names = list(map(str, configured_feature_names))
@@ -2934,16 +2971,12 @@ def _global_candidate_pool_prompt(
             [
                 "Never merge two names listed in configured_feature_names; the investigator specified them as distinct features.",
                 "When one merge input is listed in configured_feature_names, output that exact configured name so its investigator-supplied ontology remains authoritative.",
-                "Never exclude a name listed in configured_feature_names.",
             ]
         )
     return [
         {
             "role": "system",
-            "content": (
-                "Consolidate aliases and remove only clearly invalid clinical features. "
-                "Return JSON only."
-            ),
+            "content": "Consolidate aliases without filtering any features. Return JSON only.",
         },
         {
             "role": "user",
@@ -3020,22 +3053,21 @@ def _validate_global_candidate_pool_directives(
         return known_name, known_name
 
     payload = value
-    if not isinstance(payload.get("merge_directives"), list) or not isinstance(
-        payload.get("exclude_feature_names"), list
-    ):
+    if not isinstance(payload.get("merge_directives"), list):
         for key in ("result", "response", "consolidation"):
             nested = payload.get(key)
             if isinstance(nested, Mapping):
                 payload = nested
                 break
+    if "exclude_feature_names" in payload:
+        raise ValueError(
+            "iterative candidate consolidation is merge-only; omit exclude_feature_names"
+        )
     raw_directives = payload.get("merge_directives")
     if raw_directives is None:
         raw_directives = payload.get("merges")
     if not isinstance(raw_directives, list):
         raise ValueError("global candidate pool requires a merge_directives array")
-    raw_exclusions = payload.get("exclude_feature_names")
-    if not isinstance(raw_exclusions, list):
-        raise ValueError("global group consolidation requires an exclude_feature_names array")
 
     directives: list[dict[str, Any]] = []
     used_inputs: set[str] = set()
@@ -3085,21 +3117,8 @@ def _validate_global_candidate_pool_directives(
         used_inputs.update(inputs)
         directives.append({"inputs": inputs, "output": output})
 
-    excluded_names: list[str] = []
-    seen_exclusions: set[str] = set()
-    for raw_name in raw_exclusions:
-        name = resolve_input_name(raw_name)
-        if name in seen_exclusions:
-            raise ValueError(f"global exclusion named feature {name!r} more than once")
-        if name in used_inputs:
-            raise ValueError(f"global feature {name!r} cannot be both merged and excluded")
-        if name in configured_names:
-            raise ValueError(f"investigator-configured feature {name!r} cannot be excluded")
-        seen_exclusions.add(name)
-        excluded_names.append(name)
-
     output_directive_by_name: dict[str, int] = {}
-    pass_through_names = set(available) - used_inputs - seen_exclusions
+    pass_through_names = set(available) - used_inputs
     for index, directive in enumerate(directives, start=1):
         output = str(directive["output"])
         previous_output_index = output_directive_by_name.get(output)
@@ -3118,13 +3137,6 @@ def _validate_global_candidate_pool_directives(
                     "Combine the complete alias family into one directive, or choose an "
                     "output name that is not a supplied feature"
                 )
-            if output in seen_exclusions:
-                raise ValueError(
-                    f"global merge directive {index} output name {output!r} is also an "
-                    "excluded feature; remove it from exclude_feature_names and include it "
-                    "in this directive's inputs, or choose an output name that is not a "
-                    "supplied feature"
-                )
             if output in pass_through_names:
                 raise ValueError(
                     f"global merge directive {index} output name {output!r} names an "
@@ -3135,10 +3147,7 @@ def _validate_global_candidate_pool_directives(
                 f"unclassified global merge output collision for {output!r}"
             )
         output_directive_by_name[output] = index
-    return {
-        "merge_directives": directives,
-        "exclude_feature_names": excluded_names,
-    }
+    return {"merge_directives": directives}
 
 
 def _apply_global_candidate_pool_directives(
@@ -3887,20 +3896,19 @@ class PlainHandoffStage2:
         groups: Sequence[Mapping[str, Any]],
         output_dir: Path | None = None,
         seed: int = 42,
-    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-        """Consolidate shifted alphabetical, then seeded shuffled batches."""
+    ) -> list[dict[str, Any]]:
+        """Losslessly merge aliases across shifted and seeded-shuffled batches."""
 
         current = [dict(group) for group in sorted(groups, key=_candidate_group_sort_key)]
         if not current or all(_configured_feature_definitions(group) for group in current):
-            return current, {}
+            return current
         prompt_limit = int(self.config.consolidation_max_prompt_chars)
         request_config = replace(self.config, max_prompt_chars=prompt_limit)
-        excluded_origins: dict[str, str] = {}
         no_change_partitions: set[tuple[tuple[str, ...], ...]] = set()
         round_summaries: list[dict[str, Any]] = []
         stopped_reason = "maximum_rounds_reached"
         process_input = {
-            "phase": "iterative_candidate_pool_consolidation_and_quality_review",
+            "phase": "iterative_candidate_pool_merge_only_consolidation",
             "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
             "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
             "outer_fold": int(outer_fold),
@@ -3956,10 +3964,7 @@ class PlainHandoffStage2:
                     str(group["name"]) for group in batch if _configured_feature_definitions(group)
                 ]
                 if len(configured_feature_names) == len(batch):
-                    batch_responses[batch_number] = {
-                        "merge_directives": [],
-                        "exclude_feature_names": [],
-                    }
+                    batch_responses[batch_number] = {"merge_directives": []}
                     continue
                 messages = _global_candidate_pool_prompt(
                     groups=batch,
@@ -4050,10 +4055,7 @@ class PlainHandoffStage2:
                             # conservative, lossless fallback and necessarily
                             # preserves investigator-configured features.
                             validation_fallbacks[batch_number] = str(exc)
-                            batch_responses[batch_number] = {
-                                "merge_directives": [],
-                                "exclude_feature_names": [],
-                            }
+                            batch_responses[batch_number] = {"merge_directives": []}
                             job = job_by_batch[batch_number]
                             batch_output_dir = job["output_dir"]
                             if batch_output_dir is not None:
@@ -4083,31 +4085,17 @@ class PlainHandoffStage2:
             next_groups: list[dict[str, Any]] = []
             directive_count = 0
             merged_input_count = 0
-            excluded_name_count = 0
             for batch_number, batch in enumerate(batches, start=1):
                 response = batch_responses[batch_number]
                 directives = list(response["merge_directives"])
-                excluded_names = set(map(str, response["exclude_feature_names"]))
                 directive_count += len(directives)
                 merged_input_count += sum(
                     max(0, len(_string_values(directive.get("inputs"))) - 1)
                     for directive in directives
                 )
-                excluded_name_count += len(excluded_names)
-                retained_before_merge: list[dict[str, Any]] = []
-                for group in batch:
-                    if str(group["name"]) not in excluded_names:
-                        retained_before_merge.append(group)
-                        continue
-                    for origin in _string_values(group.get("origin_candidate_ids")):
-                        excluded_origins[origin] = (
-                            "Excluded by the iterative candidate-pool quality pass because "
-                            "the candidate is not a valid reusable patient-level scalar "
-                            "measurement."
-                        )
                 next_groups.extend(
                     _apply_global_candidate_pool_directives(
-                        retained_before_merge,
+                        batch,
                         directives,
                     )
                 )
@@ -4130,7 +4118,7 @@ class PlainHandoffStage2:
                         f"{group['name']!r}"
                     )
 
-            changed = bool(merged_input_count or excluded_name_count or cross_batch_exact_merges)
+            changed = bool(merged_input_count or cross_batch_exact_merges)
             round_summary = {
                 "round": round_number,
                 "ordering": ordering,
@@ -4142,7 +4130,6 @@ class PlainHandoffStage2:
                 "explicit_only_batches": len(batches) - len(jobs),
                 "merge_directives": directive_count,
                 "merged_inputs_removed": merged_input_count,
-                "excluded_names": excluded_name_count,
                 "cross_batch_exact_name_merges": cross_batch_exact_merges,
                 "validation_fallback_batches": len(validation_fallbacks),
                 "validation_fallback_batch_numbers": sorted(validation_fallbacks),
@@ -4162,7 +4149,7 @@ class PlainHandoffStage2:
                 )
             LOGGER.info(
                 "Stage 2 iterative consolidation round=%s offset=%s input_groups=%s "
-                "ordering=%s batches=%s merge_directives=%s excluded_names=%s "
+                "ordering=%s batches=%s merge_directives=%s "
                 "cross_batch_exact_merges=%s output_groups=%s changed=%s",
                 round_number,
                 boundary_offset,
@@ -4170,7 +4157,6 @@ class PlainHandoffStage2:
                 ordering,
                 len(batches),
                 directive_count,
-                excluded_name_count,
                 cross_batch_exact_merges,
                 len(next_groups),
                 changed,
@@ -4198,7 +4184,6 @@ class PlainHandoffStage2:
                 output_dir / "result.json",
                 {
                     "groups": current,
-                    "excluded_origins": excluded_origins,
                     "rounds": round_summaries,
                 },
             )
@@ -4212,13 +4197,12 @@ class PlainHandoffStage2:
                     "rounds_executed": len(round_summaries),
                     "stopped_reason": stopped_reason,
                     "output_groups": len(current),
-                    "excluded_origins": len(excluded_origins),
                     "validation_fallback_batches": sum(
                         int(summary["validation_fallback_batches"]) for summary in round_summaries
                     ),
                 },
             )
-        return current, excluded_origins
+        return current
 
     def _consolidate_candidates(
         self,
@@ -4270,7 +4254,7 @@ class PlainHandoffStage2:
             len(all_candidates),
             len(groups),
         )
-        retained_before_role_filter, pool_exclusions = self._consolidate_candidate_pool(
+        retained_before_role_filter = self._consolidate_candidate_pool(
             outer_fold=outer_fold,
             groups=groups,
             output_dir=(
@@ -4278,18 +4262,20 @@ class PlainHandoffStage2:
             ),
             seed=seed,
         )
-        exclusions = dict(pool_exclusions)
-        routable_groups: list[dict[str, Any]] = []
-        for group in retained_before_role_filter:
-            if _group_roles(group):
-                routable_groups.append(dict(group))
-                continue
-            for origin in _string_values(group.get("origin_candidate_ids")):
-                exclusions[origin] = (
-                    "Excluded because its Stage 1 evidence does not support a Stage 2 "
-                    "confounder, prognostic, or effect-modifier role."
-                )
-        retained_groups = routable_groups
+        retained_groups, exclusions, role_filter_decisions = (
+            _filter_candidate_groups_by_causal_role(retained_before_role_filter)
+        )
+        if output_dir is not None:
+            _write_json(
+                output_dir / "causal_role_filter.json",
+                {
+                    "phase": "post_consolidation_causal_role_filter",
+                    "input_groups": len(retained_before_role_filter),
+                    "retained_groups": len(retained_groups),
+                    "excluded_groups": len(retained_before_role_filter) - len(retained_groups),
+                    "decisions": role_filter_decisions,
+                },
+            )
 
         features_by_group_id: dict[str, dict[str, Any]] = {}
         if retained_groups:

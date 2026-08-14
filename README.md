@@ -81,7 +81,7 @@ example uses the identical hardware and endpoint behavior:
 ```
 
 Both launchers preset Stage 2 to batches of 20, five shifted-alphabetical plus
-up to twenty seeded-shuffle consolidation rounds, a three-training-patient
+up to fifty seeded-shuffle consolidation rounds, a three-training-patient
 ontology feedback threshold, and at most two refinement rounds. Override these
 with
 `STAGE2_CONSOLIDATION_BATCH_SIZE`,
@@ -645,7 +645,7 @@ run. The API key may be stored in `stage2.api_key` or supplied through
     "evidence_max_exemplar_chars": 2400,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
-    "consolidation_max_rounds": 10,
+    "consolidation_max_rounds": 55,
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
@@ -703,22 +703,24 @@ into broad prompt buckets.
 Stage 2 then interprets the compiled evidence architectures and consolidates
 the result into operational patient-level definitions. After exact-name
 coalescing, consolidation alphabetically sorts candidates into batches of 20
-by default, applies each batch's merge and quality directives, re-sorts the
-consolidated versions, and repeats for up to ten rounds. The first five rounds
-shift alphabetical boundaries. Later rounds use reproducible seeded shuffles of
+by default, applies each batch's merge directives, re-sorts the consolidated
+versions, and repeats for up to 55 rounds. The first five rounds shift
+alphabetical boundaries; the remaining 50 use reproducible seeded shuffles of
 the remaining pool so lexically distant aliases can be considered together
-without requiring one large response. There are no fuzzy-blocked or pairwise alias requests. The
-batches can merge synonymous, thresholded, categorical, quantitative-score,
-and value-encoded representations and remove patient-specific, composite, and
-nonclinical artifacts. They receive no clinical question and conservatively
-retain uncertain clinical variables. Explicit investigator-configured features
-are hard invariants in every round: they cannot be excluded or renamed, distinct
-configured features cannot be merged, and their supplied ontology and roles
-remain authoritative. Python deterministically carries supporting packets,
+without requiring one large response. There are no fuzzy-blocked or pairwise
+alias requests. The batches can merge synonymous, thresholded, categorical,
+quantitative-score, and value-encoded representations. They cannot exclude any
+candidate: every unmerged feature passes through unchanged. Explicit
+investigator-configured features are hard invariants in every round: they
+cannot be renamed, distinct configured features cannot be merged, and their
+supplied ontology and roles remain authoritative. Python deterministically carries supporting packets,
 architectures, evidence axes, causal roles, descriptions, and original-candidate
-dispositions through the rounds. There is no feature-count selection step, and
-causal roles are derived after iterative grouping so complementary evidence can
-combine. Finally, independent one-feature requests receive only the
+dispositions through the rounds. Only after iterative consolidation does a
+separate deterministic filter remove groups without an evidence-supported
+causal role, recording its decisions in
+`consolidation/causal_role_filter.json`. There is no feature-count selection
+step, and causal roles are derived after iterative grouping so complementary
+evidence can combine. Finally, independent one-feature requests receive only the
 canonical feature name and a deduplicated flat list of readable supporting-text
 strings. The model decides the value type, units or allowed categories,
 measurement rule, and missingness handling from that evidence; packet structure,

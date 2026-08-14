@@ -158,30 +158,29 @@ when their exact card inputs and clinical question match.
 ## Candidate consolidation
 
 Optional investigator-specified features enter consolidation here rather than
-bypassing it. This lets pairwise and global alias review merge a discovered
-synonym into one configured feature. The configured feature's name, causal
+bypassing it. This lets iterative alias review merge a discovered synonym into
+one configured feature. The configured feature's name, causal
 roles, and complete extraction ontology remain authoritative, so its group
 skips model-authored ontology definition while retaining any Stage 1 provenance
 carried by the merged candidates. Training-fold diagnostics are still computed,
 but review must keep the feature without revising its supplied ontology.
 
-Consolidation first uses generic fuzzy signals to identify candidate pairs that
-may be aliases. It retains bounded local neighbors plus a maximum-similarity
-spanning forest for every plausible-alias component, ensuring that large alias
-families remain connected for semantic review. The LLM judges one pair at a
-time as the same or different scalar measurement. Python constructs transitive
-groups from accepted pairs and prevents a group merge when an explicit negative
-pair judgment would make it contradictory. A discovered candidate with exactly
-the same normalized name as one configured feature is the one deterministic
-identity case and joins that configured group directly.
+Python coalesces exact normalized-name duplicates, then repeatedly presents
+bounded candidate batches to the LLM. Early rounds use shifted alphabetical
+partitions; later rounds use reproducible seeded shuffles so lexically distant
+aliases can meet. Every response contains only merge directives of the form
+`inputs -> output`; it contains no opaque IDs, exclusion list, or enumeration
+of unchanged features. Python resolves names back to internal groups, rejects
+unknown or overlapping inputs, unions provenance for accepted merges, and
+passes every group absent from `inputs` through unchanged. Thus consolidation
+is lossless except for alias merging, and an invalid batch response falls back
+to retaining the complete batch.
 
-Python then excludes groups without an evidence-supported causal role and makes
-one global LLM request containing only the complete list of remaining unique
-feature names. The response contains only residual merge directives of the form
-`inputs -> output`; it contains no opaque IDs and does not enumerate unchanged
-features. Python resolves the names back to internal groups, rejects unknown or
-overlapping inputs, unions provenance for each accepted directive, and passes
-all groups absent from `inputs` through unchanged.
+Only after all iterative rounds does Python apply the deterministic causal-role
+filter. Groups without evidence supporting a confounder, prognostic, or
+effect-modifier role are excluded there, with decisions recorded in
+`consolidation/causal_role_filter.json`. Configured features use their supplied
+roles and remain protected.
 
 All groups remaining after this residual semantic deduplication are
 operationalized one at a time. The ontology model sees the canonical feature
