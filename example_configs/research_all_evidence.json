@@ -24,7 +24,7 @@
     "endpoint": "",
     "model": "",
     "api_key": "EMPTY",
-    "workers": 4,
+    "workers": 32,
     "operationalization_max_prompt_chars": 640000,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,

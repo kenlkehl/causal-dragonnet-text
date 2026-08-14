@@ -7,6 +7,8 @@ import argparse
 import os
 from dataclasses import dataclass
 
+DEFAULT_STAGE2_WORKERS = 32
+
 
 @dataclass(frozen=True)
 class GPU:
@@ -64,7 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--gpu-count", type=_positive_int_or_auto, default="auto")
     parser.add_argument("--workers", type=_positive_int_or_auto, default="auto")
-    parser.add_argument("--stage2-workers", type=_positive_int_or_auto, default="auto")
+    parser.add_argument(
+        "--stage2-workers",
+        type=_positive_int_or_auto,
+        default=str(DEFAULT_STAGE2_WORKERS),
+    )
     parser.add_argument("--outer-folds", type=int, required=True)
     parser.add_argument("--inner-folds", type=int, required=True)
     parser.add_argument("--min-free-vram-gib", type=float, default=20.0)
@@ -87,7 +93,7 @@ def main() -> int:
     if args.stage2_only:
         automatic_workers = min(cpu_count, context_capacity)
         worker_count = automatic_workers if args.workers == "auto" else int(args.workers)
-        automatic_stage2_workers = min(cpu_count, 8)
+        automatic_stage2_workers = min(cpu_count, DEFAULT_STAGE2_WORKERS)
         stage2_workers = (
             automatic_stage2_workers
             if args.stage2_workers == "auto"
@@ -138,10 +144,10 @@ def main() -> int:
     automatic_workers = min(cpu_count, max(context_capacity, gpu_worker_capacity))
     worker_count = automatic_workers if args.workers == "auto" else int(args.workers)
 
-    endpoint_capacity = sum(
-        max(1, min(2, int(gpu.free_gib // args.stage2_vram_gib_per_worker))) for gpu in selected
-    )
-    automatic_stage2_workers = min(cpu_count, 8, max(1, endpoint_capacity))
+    # Stage 2 workers are primarily blocked on endpoint I/O. vLLM performs its
+    # own memory-aware continuous batching, so request concurrency should not
+    # be inferred from a one-process-per-VRAM estimate.
+    automatic_stage2_workers = min(cpu_count, DEFAULT_STAGE2_WORKERS)
     stage2_workers = (
         automatic_stage2_workers if args.stage2_workers == "auto" else int(args.stage2_workers)
     )

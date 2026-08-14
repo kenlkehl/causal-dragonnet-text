@@ -49,7 +49,7 @@ effect estimates. The common controls are:
   "stage2": {
     "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3-32B",
-    "workers": 8,
+    "workers": 32,
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "max_review_rounds": 2,
@@ -66,9 +66,10 @@ features join Stage 2 alias consolidation in every outer fold, so an
 automatically discovered alias does not create a second variable. They remain
 fixed, required definitions during empirical review.
 
-Interpretation and extraction requests are concurrent up to `stage2.workers`.
-Each extraction request contains exactly one patient's text; this isolation is
-an invariant rather than a configurable batch-size choice.
+Independent outer folds run concurrently, and their combined interpretation and
+extraction request concurrency is bounded by `stage2.workers`. Each extraction
+request contains exactly one patient's text; this isolation is an invariant
+rather than a configurable batch-size choice.
 
 For eight independent vLLM replicas on eight GPUs, replace `endpoint` in the
 example above with:

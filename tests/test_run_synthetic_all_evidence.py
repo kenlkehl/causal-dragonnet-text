@@ -21,7 +21,7 @@ set -euo pipefail
 printf '%q ' "$@" >> "${FAKE_PYTHON_INVOCATION_LOG}"
 printf '\n' >> "${FAKE_PYTHON_INVOCATION_LOG}"
 if [[ "${1:-}" == *detect_all_evidence_hardware.py ]]; then
-    printf '0\tcpu\t12\t8\t12\tnot inspected (endpoint-backed Stage 2 only)\n'
+    printf '0\tcpu\t12\t32\t12\tnot inspected (endpoint-backed Stage 2 only)\n'
 fi
 """,
         encoding="utf-8",
@@ -36,6 +36,7 @@ fi
             "OCI_PYTHON": str(fake_python),
             "PHYSICAL_GPUS": "also-not-a-number",
             "STAGE2_ENDPOINT": "http://stage2.test/v1",
+            "STAGE2_WORKERS": "",
             "STAGE2_VLLM_SERVERS": "0",
         }
     )
@@ -62,11 +63,12 @@ fi
     assert len(invocations) == 2
     assert "detect_all_evidence_hardware.py" in invocations[0]
     assert "--stage2-only" in invocations[0]
-    assert "-c" not in invocations[0]
+    assert "--stage2-workers 32" in invocations[0]
+    assert "-c" not in invocations[0].split()
     assert "research_all_evidence_workflow" in invocations[1]
     assert "--stage2-only" in invocations[1]
     assert "--devices cpu" in invocations[1]
-    assert "stage2.workers=8" in invocations[1]
+    assert "stage2.workers=32" in invocations[1]
     assert "CUDA devices:   not required for endpoint-backed Stage 2" in completed.stdout
     assert "HTR modeling:   not run during Stage 2-only resume" in completed.stdout
 
@@ -82,7 +84,7 @@ set -euo pipefail
 printf '%q ' "$@" >> "${FAKE_PYTHON_INVOCATION_LOG}"
 printf '\n' >> "${FAKE_PYTHON_INVOCATION_LOG}"
 if [[ "${1:-}" == *detect_all_evidence_hardware.py ]]; then
-    printf '2\tcuda:0,cuda:1\t12\t4\t12\ttwo eligible GPUs\n'
+    printf '2\tcuda:0,cuda:1\t12\t32\t12\ttwo eligible GPUs\n'
 fi
 """,
         encoding="utf-8",
@@ -102,6 +104,7 @@ fi
             "STAGE2_VLLM_EXTRA_ARGS_JSON": "",
             "STAGE2_VLLM_GPUS": "",
             "STAGE2_VLLM_SERVERS": "2",
+            "STAGE2_WORKERS": "",
         }
     )
     completed = subprocess.run(
@@ -129,10 +132,12 @@ fi
     assert "find_spec" in invocations[1] and "vllm" in invocations[1]
     assert "detect_all_evidence_hardware.py" in invocations[2]
     assert "--gpu-count 2" in invocations[2]
+    assert "--stage2-workers 32" in invocations[2]
     assert "--stage2-only" not in invocations[2]
     assert "research_all_evidence_workflow" in invocations[3]
     assert "--stage2-vllm-servers 2" in invocations[3]
     assert r"--stage2-vllm-gpus cuda:0\,cuda:1" in invocations[3]
     assert "--stage2-model Qwen/Qwen3-32B" in invocations[3]
+    assert "stage2.workers=32" in invocations[3]
     assert "--stage2-only" not in invocations[3]
     assert "Stage 2:        managed vLLM: 2 servers on cuda:0,cuda:1" in completed.stdout

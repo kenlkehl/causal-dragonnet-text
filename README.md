@@ -75,11 +75,12 @@ GPU_COUNT=8 \
 ./run_one_conf_one_mod.sh
 ```
 
-`GPU_COUNT` and `PHYSICAL_GPUS` are mutually exclusive. Advanced overrides are
-`MIN_FREE_GPU_GB`, `STAGE1_WORKERS`, `STAGE2_WORKERS`, `DISABLE_HTR`,
-`STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (set it to an empty string for a
-Stage-1-only run). Managed mode accepts `STAGE2_VLLM_SERVERS`, optional
-`STAGE2_VLLM_GPUS` (the detected logical devices are the default),
+`GPU_COUNT` and `PHYSICAL_GPUS` are mutually exclusive. Stage 2 runs independent
+outer folds concurrently and defaults to 32 globally bounded endpoint workers.
+Advanced overrides are `MIN_FREE_GPU_GB`, `STAGE1_WORKERS`, `STAGE2_WORKERS`,
+`DISABLE_HTR`, `STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (set it to an empty
+string for a Stage-1-only run). Managed mode accepts `STAGE2_VLLM_SERVERS`,
+optional `STAGE2_VLLM_GPUS` (the detected logical devices are the default),
 `STAGE2_VLLM_DOWNLOAD_DIR`, and a JSON token list in
 `STAGE2_VLLM_EXTRA_ARGS_JSON`. Set
 `OCI_PYTHON` to an existing environment's interpreter to skip `uv sync`. An
@@ -93,9 +94,9 @@ example uses the identical hardware and endpoint behavior:
 After a run has a completed `handoff/evidence.jsonl` checkpoint, either launcher
 automatically resumes in Stage 2-only mode when `STAGE2_ENDPOINT` is nonempty.
 That path does not inspect or reserve local GPUs: it passes `--devices cpu` for
-workflow bookkeeping and sizes endpoint request concurrency from the CPU budget
-(up to eight workers by default, or `STAGE2_WORKERS` when set). Local GPU
-eligibility and `MIN_FREE_GPU_GB` apply only while Stage 1 still needs to run.
+workflow bookkeeping and uses 32 endpoint workers by default (or
+`STAGE2_WORKERS` when set). Local GPU eligibility and `MIN_FREE_GPU_GB` apply
+only while Stage 1 still needs to run.
 
 Both launchers preset Stage 2 to batches of 20, five shifted-alphabetical plus
 up to fifty seeded-shuffle consolidation rounds, a three-training-patient
@@ -610,9 +611,9 @@ overall CPU budget used by TF-IDF and divided among the concurrently active
 text-model lanes. If fewer workers than CUDA devices are requested, each active
 device still requires one controller worker. Stage 2 uses its own
 `stage2.workers` setting for concurrent interpretation requests and
-patient-extraction batches. Review rounds and outer folds remain ordered so that
-the configured endpoint pool is never multiplied by two independent
-concurrency limits.
+patient-extraction batches. Independent outer folds run concurrently, while a
+shared request semaphore keeps their combined endpoint concurrency at
+`stage2.workers`. Review rounds within each fold remain ordered.
 Every Stage 1 context and every expensive Stage 2 batch writes its own
 `complete.json`, so the same scheduling remains resumable after interruption.
 
@@ -657,7 +658,7 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
   "stage2": {
     "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3-32B",
-    "workers": 8,
+    "workers": 32,
     "request_timeout": 7200,
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,

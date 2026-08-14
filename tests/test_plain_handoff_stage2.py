@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -4696,6 +4697,65 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
             config=config,
             completion=_fake_completion(calls),
         )
+
+
+def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            workers=3,
+            required_architectures=(),
+        ),
+        clinical_question="Identify confounders.",
+        completion=lambda _messages, _config: "{}",
+    )
+    packets = [{"outer_fold": outer_fold} for outer_fold in (3, 1, 2)]
+    barrier = threading.Barrier(3)
+    third_completed = threading.Event()
+    second_completed = threading.Event()
+    completion_order = []
+
+    monkeypatch.setattr(
+        runner,
+        "_load_or_compile_evidence",
+        lambda **_kwargs: (packets, {"status": "mocked"}),
+    )
+
+    def run_outer_fold(**kwargs):
+        outer_fold = int(kwargs["outer_fold"])
+        barrier.wait(timeout=2.0)
+        if outer_fold == 2:
+            assert third_completed.wait(timeout=2.0)
+        elif outer_fold == 1:
+            assert second_completed.wait(timeout=2.0)
+        completion_order.append(outer_fold)
+        if outer_fold == 3:
+            third_completed.set()
+        elif outer_fold == 2:
+            second_completed.set()
+        return {"outer_fold": outer_fold, "features": []}
+
+    monkeypatch.setattr(runner, "_run_outer_fold", run_outer_fold)
+    output_dir = tmp_path / "stage2"
+
+    result = runner.run(
+        handoff_path=tmp_path / "handoff.jsonl",
+        output_dir=output_dir,
+    )
+
+    persisted = [
+        json.loads(line)
+        for line in (output_dir / "features_by_outer_fold.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert completion_order == [3, 2, 1]
+    assert [row["outer_fold"] for row in persisted] == [1, 2, 3]
+    assert result["outer_folds"] == 3
 
 
 def test_plain_stage2_finishes_extraction_review_and_causal_estimation(tmp_path: Path):

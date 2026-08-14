@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import signal
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -251,6 +253,52 @@ def test_stage2_round_robins_requests_and_transport_retries_across_endpoints(mon
         "http://127.0.0.1:8012/v1",
         "http://127.0.0.1:8010/v1",
     ]
+
+
+def test_stage2_workers_bound_completion_concurrency_globally():
+    lock = threading.Lock()
+    release = threading.Event()
+    saturated = threading.Event()
+    active = 0
+    peak = 0
+
+    def blocking_completion(_messages, _config):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == 2:
+                saturated.set()
+        try:
+            assert release.wait(timeout=2.0)
+            return "{}"
+        finally:
+            with lock:
+                active -= 1
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            workers=2,
+        ),
+        clinical_question="test",
+        completion=blocking_completion,
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [
+            executor.submit(runner.completion, [], runner.config)
+            for _ in range(6)
+        ]
+        try:
+            assert saturated.wait(timeout=2.0)
+            with lock:
+                assert active == 2
+                assert peak == 2
+        finally:
+            release.set()
+        assert [future.result(timeout=2.0) for future in futures] == ["{}"] * 6
 
 
 def test_run_wrapper_keeps_managed_servers_alive_for_stage2_and_cleans_up(

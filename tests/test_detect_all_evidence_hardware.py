@@ -41,7 +41,7 @@ def test_hardware_detection_selects_eligible_gpus_and_sizes_workers(monkeypatch,
     assert hardware.main() == 0
 
     fields = capsys.readouterr().out.strip().split("\t")
-    assert fields[:5] == ["2", "cuda:0,cuda:2", "30", "3", "64"]
+    assert fields[:5] == ["2", "cuda:0,cuda:2", "30", "32", "64"]
     assert "cuda:0 GPU A 48.0/48.0 GiB free" in fields[5]
     assert "cuda:2 GPU C 32.0/48.0 GiB free" in fields[5]
 
@@ -128,5 +128,5 @@ def test_stage2_only_detection_does_not_inspect_local_gpus(monkeypatch, capsys):
     assert hardware.main() == 0
 
     fields = capsys.readouterr().out.strip().split("\t")
-    assert fields[:5] == ["0", "cpu", "12", "8", "12"]
+    assert fields[:5] == ["0", "cpu", "12", "32", "12"]
     assert fields[5] == "not inspected (endpoint-backed Stage 2 only)"

@@ -145,7 +145,7 @@ An external endpoint configuration is:
   "stage2": {
     "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3-32B",
-    "workers": 8,
+    "workers": 32,
     "request_timeout": 7200,
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
@@ -379,8 +379,9 @@ are safety/planning guards, not claims about the model's token context.
 Extraction always sends exactly one patient's text
 per request; oversized notes are split into lossless contiguous pages. Clinical
 text remains Unicode instead of expanding into token-heavy ASCII escape
-sequences. `stage2.workers` controls independent consolidation-batch concurrency
-as well as other Stage 2 request fan-outs without combining patients.
+sequences. Independent outer folds execute concurrently. `stage2.workers`
+controls their combined endpoint concurrency, including consolidation batches
+and other Stage 2 request fan-outs, without combining patients.
 
 ```bash
 # Run/resume Stage 1 and stop after the handoff.
@@ -455,7 +456,7 @@ the available CPUs and GPUs as follows.
 | `text_models` | An outer/full or exact-inner context, with independent BoW folds inside it | One fixed process lane per configured CUDA device; `run.workers` is divided among active lanes and bounds their combined BoW fold threads |
 | `neural_queries` | An outer/full or exact-inner context | One fixed process lane per configured CUDA device; CPU-only runs use at most `run.workers` lanes |
 | `handoff` | None | The completed JSONL files are combined serially |
-| `stage2` | Interpretation batches and patient-extraction batches within the current outer fold | Concurrent endpoint requests bounded by `stage2.workers`; review rounds, outer folds, and fold-level estimation remain ordered |
+| `stage2` | Independent outer folds, with interpretation and patient-extraction batches inside each fold | Outer folds execute concurrently; one shared semaphore bounds their combined endpoint requests at `stage2.workers`, while review rounds within each fold remain ordered |
 
 A fixed CUDA lane processes its assigned contexts serially on one GPU. This
 provides device affinity and prevents a process queue from placing two

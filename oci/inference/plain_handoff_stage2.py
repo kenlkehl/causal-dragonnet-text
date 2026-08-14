@@ -1444,6 +1444,22 @@ class _RoundRobinOpenAICompletion:
         return _openai_completion(messages, replace(config, endpoint=endpoint))
 
 
+class _ConcurrencyLimitedCompletion:
+    """Apply one global request ceiling across nested Stage 2 executors."""
+
+    def __init__(self, completion: CompletionFunction, max_concurrency: int) -> None:
+        self.completion = completion
+        self._semaphore = threading.BoundedSemaphore(max(1, int(max_concurrency)))
+
+    def __call__(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        config: PlainHandoffStage2Config,
+    ) -> str:
+        with self._semaphore:
+            return self.completion(messages, config)
+
+
 def _is_retryable_transport_error(exc: Exception) -> bool:
     """Return whether a failed OpenAI-compatible request is safe to retry."""
 
@@ -3784,7 +3800,11 @@ class PlainHandoffStage2:
         self.config = config
         self.clinical_question = str(clinical_question)
         endpoints = config.runtime_endpoints or (config.endpoint,)
-        self.completion = completion or _RoundRobinOpenAICompletion(endpoints)
+        routed_completion = completion or _RoundRobinOpenAICompletion(endpoints)
+        self.completion = _ConcurrencyLimitedCompletion(
+            routed_completion,
+            max_concurrency=config.workers,
+        )
 
     def _load_or_compile_evidence(
         self,
@@ -4978,23 +4998,44 @@ class PlainHandoffStage2:
                 inner_folds=inner_folds,
                 seed=seed,
             )
-        fold_results = [
-            self._run_outer_fold(
-                outer_fold=outer_fold,
-                packets=packets_by_outer[outer_fold],
-                output_dir=output_dir / f"outer_{outer_fold:03d}",
-                dataset=dataset,
-                split=splits.get(outer_fold),
-                unit_id_column=unit_id_column,
-                text_column=text_column,
-                treatment_column=treatment_column,
-                outcome_column=outcome_column,
-                outcome_type=outcome_type,
-                inner_folds=inner_folds,
-                seed=seed,
+        outer_fold_ids = sorted(packets_by_outer)
+        fold_results_by_id: dict[int, Mapping[str, Any]] = {}
+        if outer_fold_ids:
+            fold_workers = min(len(outer_fold_ids), self.config.workers)
+            LOGGER.info(
+                "Stage 2 outer-fold execution folds=%s fold_workers=%s "
+                "global_request_workers=%s",
+                len(outer_fold_ids),
+                fold_workers,
+                self.config.workers,
             )
-            for outer_fold in sorted(packets_by_outer)
-        ]
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=fold_workers,
+                thread_name_prefix="stage2-outer-fold",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self._run_outer_fold,
+                        outer_fold=outer_fold,
+                        packets=packets_by_outer[outer_fold],
+                        output_dir=output_dir / f"outer_{outer_fold:03d}",
+                        dataset=dataset,
+                        split=splits.get(outer_fold),
+                        unit_id_column=unit_id_column,
+                        text_column=text_column,
+                        treatment_column=treatment_column,
+                        outcome_column=outcome_column,
+                        outcome_type=outcome_type,
+                        inner_folds=inner_folds,
+                        seed=seed,
+                    ): outer_fold
+                    for outer_fold in outer_fold_ids
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    outer_fold = futures[future]
+                    fold_results_by_id[outer_fold] = future.result()
+                    LOGGER.info("Stage 2 completed outer_fold=%s", outer_fold)
+        fold_results = [fold_results_by_id[outer_fold] for outer_fold in outer_fold_ids]
         _write_jsonl(output_dir / "features_by_outer_fold.jsonl", fold_results)
         name_counts: Counter[str] = Counter()
         for result in fold_results:
