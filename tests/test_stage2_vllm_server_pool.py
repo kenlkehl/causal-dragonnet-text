@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 from contextlib import contextmanager
 from pathlib import Path
@@ -332,6 +333,7 @@ def test_managed_pool_launches_one_process_per_gpu_and_writes_a_redacted_manifes
             return self.returncode
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,6")
+    monkeypatch.setenv("VLLM_PORT", "37973")
     monkeypatch.setattr(server_pool, "_assert_port_available", lambda *_args: None)
     monkeypatch.setattr(
         server_pool,
@@ -374,6 +376,15 @@ def test_managed_pool_launches_one_process_per_gpu_and_writes_a_redacted_manifes
         "4",
         "6",
     ]
+    assert [call.kwargs["env"]["VLLM_PORT"] for call in popen_calls] == [
+        "20000",
+        "20128",
+    ]
+    interpreter_bin = str(Path(server_pool.sys.executable).parent)
+    assert all(
+        call.kwargs["env"]["PATH"].split(os.pathsep)[0] == interpreter_bin
+        for call in popen_calls
+    )
     assert all("--tensor-parallel-size" in call.command for call in popen_calls)
     assert all(
         call.command[call.command.index("--tensor-parallel-size") + 1] == "1"
@@ -391,6 +402,10 @@ def test_managed_pool_launches_one_process_per_gpu_and_writes_a_redacted_manifes
     ]
     assert "super-secret" not in manifest_text
     assert "<redacted>" in manifest_text
+    assert [server["vllm_internal_port_base"] for server in manifest["servers"]] == [
+        20_000,
+        20_128,
+    ]
     assert all(call.kwargs["stdout"].closed for call in popen_calls)
 
 

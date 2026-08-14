@@ -35,6 +35,13 @@ _RESERVED_EXTRA_ARGUMENTS = {
     "-tp",
 }
 
+# vLLM briefly probes and releases internal rendezvous ports before its engine
+# subprocess binds them.  Replicas started together can therefore select the
+# same ephemeral port.  Give every managed replica a disjoint starting range;
+# vLLM will scan upward within that range when a port is already occupied.
+_VLLM_INTERNAL_PORT_BASE = 20_000
+_VLLM_INTERNAL_PORT_STRIDE = 128
+
 
 def _now() -> str:
     from datetime import datetime, timezone
@@ -72,6 +79,19 @@ def _model_family_defaults(model: str) -> tuple[str, bool | None, Mapping[str, A
     if "qwen" in normalized:
         return "qwen3", True, None
     return "", None, None
+
+
+def _vllm_internal_port_bases(server_count: int) -> tuple[int, ...]:
+    bases = tuple(
+        _VLLM_INTERNAL_PORT_BASE + index * _VLLM_INTERNAL_PORT_STRIDE
+        for index in range(int(server_count))
+    )
+    if bases and bases[-1] + _VLLM_INTERNAL_PORT_STRIDE - 1 > 65_535:
+        raise ValueError(
+            "stage2.vllm.server_count is too large to allocate disjoint internal "
+            "vLLM port ranges"
+        )
+    return bases
 
 
 @dataclass(frozen=True)
@@ -379,6 +399,7 @@ class _ServerProcess:
     index: int
     endpoint: str
     port: int
+    internal_port_base: int
     logical_gpus: tuple[str, ...]
     visible_gpu_tokens: tuple[str, ...]
     command: list[str]
@@ -427,6 +448,7 @@ class ManagedVLLMServerPool:
                     "pid": server.process.pid,
                     "endpoint": server.endpoint,
                     "port": server.port,
+                    "vllm_internal_port_base": server.internal_port_base,
                     "logical_gpus": list(server.logical_gpus),
                     "cuda_visible_devices": list(server.visible_gpu_tokens),
                     "tensor_parallel_size": len(server.logical_gpus),
@@ -455,12 +477,15 @@ class ManagedVLLMServerPool:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         ports = self.config.effective_ports()
         gpu_groups = self.config.gpu_groups()
+        internal_port_bases = _vllm_internal_port_bases(self.config.server_count)
         parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         for port in ports:
             _assert_port_available(self.config.host, port)
 
         try:
-            for index, (port, logical_gpus) in enumerate(zip(ports, gpu_groups, strict=True)):
+            for index, (port, logical_gpus, internal_port_base) in enumerate(
+                zip(ports, gpu_groups, internal_port_bases, strict=True)
+            ):
                 visible_tokens = _visible_gpu_tokens(
                     logical_gpus,
                     parent_cuda_visible_devices=parent_visible,
@@ -476,6 +501,18 @@ class ManagedVLLMServerPool:
                 log_handle = log_path.open("ab", buffering=0)
                 environment = os.environ.copy()
                 environment["CUDA_VISIBLE_DEVICES"] = ",".join(visible_tokens)
+                # OCI_PYTHON selects the interpreter without activating its
+                # environment.  Prepending its bin directory makes companion
+                # tools installed there (notably ninja for FlashInfer JIT)
+                # available to the vLLM child process.
+                interpreter_bin = str(Path(sys.executable).parent)
+                existing_path = environment.get("PATH", "")
+                environment["PATH"] = (
+                    interpreter_bin
+                    if not existing_path
+                    else os.pathsep.join((interpreter_bin, existing_path))
+                )
+                environment["VLLM_PORT"] = str(internal_port_base)
                 environment.setdefault("PYTHONUNBUFFERED", "1")
                 try:
                     process = subprocess.Popen(
@@ -492,6 +529,7 @@ class ManagedVLLMServerPool:
                     index=index,
                     endpoint=_endpoint(self.config.host, port),
                     port=port,
+                    internal_port_base=internal_port_base,
                     logical_gpus=tuple(logical_gpus),
                     visible_gpu_tokens=visible_tokens,
                     command=command,
