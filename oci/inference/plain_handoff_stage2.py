@@ -55,6 +55,7 @@ ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 DEFAULT_MAX_TOKENS = 50_000
 DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
+DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE = 10
 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_OPERATIONALIZATION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 20
@@ -627,10 +628,11 @@ class PlainHandoffStage2Config:
     consolidation_batch_size: int = DEFAULT_CONSOLIDATION_BATCH_SIZE
     consolidation_alphabetical_rounds: int = DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS
     consolidation_max_rounds: int = DEFAULT_CONSOLIDATION_MAX_ROUNDS
-    # Extraction repeats a complete frozen feature ontology for one patient.
-    # Keep its larger context allowance separate so discovery batching and its
-    # evidence-compilation fingerprints remain stable.
+    # Extraction keeps patients isolated and slices the frozen ontology across
+    # independently checkpointed prompts. Keep its context allowance separate
+    # so discovery batching and its evidence-compilation fingerprints remain stable.
     extraction_max_prompt_chars: int = DEFAULT_EXTRACTION_MAX_PROMPT_CHARS
+    extraction_feature_batch_size: int = DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE
     evidence_compiler: str = EVIDENCE_COMPILER_VERSION
     required_architectures: tuple[str, ...] = SUPPORTED_STAGE2_ARCHITECTURES
     included_architectures: tuple[str, ...] | None = None
@@ -702,6 +704,14 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.consolidation_max_rounds must be positive")
         if self.extraction_max_prompt_chars < 4_000:
             raise ValueError("stage2.extraction_max_prompt_chars must be at least 4000")
+        if (
+            isinstance(self.extraction_feature_batch_size, bool)
+            or not isinstance(self.extraction_feature_batch_size, int)
+            or self.extraction_feature_batch_size < 1
+        ):
+            raise ValueError(
+                "stage2.extraction_feature_batch_size must be a positive integer"
+            )
         if self.evidence_compiler != EVIDENCE_COMPILER_VERSION:
             raise ValueError(
                 f"stage2.evidence_compiler must be {EVIDENCE_COMPILER_VERSION}; "
@@ -874,6 +884,12 @@ def plain_stage2_config_from_mapping(
             raw.get(
                 "extraction_max_prompt_chars",
                 DEFAULT_EXTRACTION_MAX_PROMPT_CHARS,
+            )
+        ),
+        extraction_feature_batch_size=int(
+            raw.get(
+                "extraction_feature_batch_size",
+                DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE,
             )
         ),
         evidence_compiler=str(raw.get("evidence_compiler", EVIDENCE_COMPILER_VERSION)).strip(),

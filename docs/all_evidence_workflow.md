@@ -358,7 +358,7 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `operationalization_max_prompt_chars`,
 `consolidation_batch_size`, `consolidation_alphabetical_rounds`,
 `consolidation_max_rounds`,
-`extraction_max_prompt_chars`,
+`extraction_max_prompt_chars`, `extraction_feature_batch_size`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
 `max_review_rounds`, `ontology_refinement_min_failure_patients`,
@@ -373,15 +373,18 @@ Each candidate-consolidation batch uses the independent
 `consolidation_max_prompt_chars` limit (640,000 characters by default), each
 one-feature ontology request uses `operationalization_max_prompt_chars`
 (640,000 by default), and patient-variable extraction uses
-`extraction_max_prompt_chars` (also 640,000 by default) because every extraction
-request includes the complete frozen feature ontology. `max_prompt_chars`
+`extraction_max_prompt_chars` (also 640,000 by default). Each extraction prompt
+contains one patient and at most `extraction_feature_batch_size` frozen feature
+definitions (10 by default); Stage 2 checkpoints and merges the feature batches.
+`max_prompt_chars`
 continues to bound interpretation and review planning. These character limits
 are safety/planning guards, not claims about the model's token context. Every
 chat completion also sends `max_tokens` (50,000 by default), bounding the
 combined reasoning and answer generated for one request. A response that
 reaches that limit enters Stage 2's bounded repair or fallback path.
-Extraction always sends exactly one patient's text
-per request; oversized notes are split into lossless contiguous pages. Clinical
+Extraction always sends exactly one patient's text per request and never sends
+more than the configured feature batch; oversized notes are split into lossless
+contiguous pages. Clinical
 text remains Unicode instead of expanding into token-heavy ASCII escape
 sequences. Independent outer folds execute concurrently. `stage2.workers`
 controls their combined endpoint concurrency, including consolidation batches

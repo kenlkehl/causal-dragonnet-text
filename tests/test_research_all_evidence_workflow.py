@@ -887,6 +887,8 @@ def test_saved_run_config_can_start_stage2_with_endpoint_only(tmp_path):
             "--stage2-only",
             "--stage2-endpoint",
             "http://stage2.test/v1",
+            "--stage2-extraction-feature-batch-size",
+            "7",
         ]
     )
 
@@ -898,6 +900,7 @@ def test_saved_run_config_can_start_stage2_with_endpoint_only(tmp_path):
     assert resumed.stage2 is not None
     assert resumed.stage2.endpoint == "http://stage2.test/v1"
     assert resumed.stage2.model == ""
+    assert resumed.stage2.extraction_feature_batch_size == 7
     assert resumed.clinical_question == original.clinical_question
     assert resumed.unit_id_column == original.unit_id_column
     assert resumed.htr_enabled == original.htr_enabled

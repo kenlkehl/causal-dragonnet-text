@@ -31,6 +31,7 @@ stage2_operationalization_max_prompt_chars="${STAGE2_OPERATIONALIZATION_MAX_PROM
 stage2_consolidation_batch_size="${STAGE2_CONSOLIDATION_BATCH_SIZE:-}"
 stage2_consolidation_alphabetical_rounds="${STAGE2_CONSOLIDATION_ALPHABETICAL_ROUNDS:-}"
 stage2_consolidation_max_rounds="${STAGE2_CONSOLIDATION_MAX_ROUNDS:-}"
+stage2_extraction_feature_batch_size="${STAGE2_EXTRACTION_FEATURE_BATCH_SIZE:-}"
 stage2_ontology_refinement_min_failure_patients="${STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS:-}"
 stage2_max_ontology_refinement_rounds="${STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS:-}"
 stage1_architectures="${STAGE1_ARCHITECTURES:-}"
@@ -179,6 +180,11 @@ fi
 if [[ -n "${stage2_consolidation_max_rounds}" ]]; then
     stage2_policy_args+=(
         --set "stage2.consolidation_max_rounds=${stage2_consolidation_max_rounds}"
+    )
+fi
+if [[ -n "${stage2_extraction_feature_batch_size}" ]]; then
+    stage2_policy_args+=(
+        --stage2-extraction-feature-batch-size "${stage2_extraction_feature_batch_size}"
     )
 fi
 if [[ -n "${stage2_ontology_refinement_min_failure_patients}" ]]; then

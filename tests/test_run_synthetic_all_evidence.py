@@ -36,6 +36,7 @@ fi
             "OCI_PYTHON": str(fake_python),
             "PHYSICAL_GPUS": "also-not-a-number",
             "STAGE2_ENDPOINT": "http://stage2.test/v1",
+            "STAGE2_EXTRACTION_FEATURE_BATCH_SIZE": "7",
             "STAGE2_WORKERS": "",
             "STAGE2_VLLM_SERVERS": "0",
         }
@@ -69,6 +70,7 @@ fi
     assert "--stage2-only" in invocations[1]
     assert "--devices cpu" in invocations[1]
     assert "stage2.workers=32" in invocations[1]
+    assert "--stage2-extraction-feature-batch-size 7" in invocations[1]
     assert "CUDA devices:   not required for endpoint-backed Stage 2" in completed.stdout
     assert "HTR modeling:   not run during Stage 2-only resume" in completed.stdout
 
@@ -99,6 +101,7 @@ fi
             "OCI_PYTHON": str(fake_python),
             "PHYSICAL_GPUS": "",
             "STAGE2_ENDPOINT": "",
+            "STAGE2_EXTRACTION_FEATURE_BATCH_SIZE": "",
             "STAGE2_MODEL": "Qwen/Qwen3-32B",
             "STAGE2_VLLM_DOWNLOAD_DIR": "",
             "STAGE2_VLLM_EXTRA_ARGS_JSON": "",

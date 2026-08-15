@@ -68,6 +68,7 @@ def test_stage2_config_allows_endpoint_without_model():
         == 50
     )
     assert config.extraction_max_prompt_chars == 640_000
+    assert config.extraction_feature_batch_size == 10
     assert config.ontology_refinement_min_failure_patients == 3
     assert config.max_ontology_refinement_rounds == 2
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
@@ -97,6 +98,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "consolidation_alphabetical_rounds": 4,
             "consolidation_max_rounds": 7,
             "extraction_max_prompt_chars": 500_000,
+            "extraction_feature_batch_size": 7,
             "ontology_refinement_min_failure_patients": 4,
             "max_ontology_refinement_rounds": 3,
         },
@@ -112,6 +114,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.consolidation_alphabetical_rounds == 4
     assert config.consolidation_max_rounds == 7
     assert config.extraction_max_prompt_chars == 500_000
+    assert config.extraction_feature_batch_size == 7
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
     assert config.public_dict()["max_tokens"] == 48_000
@@ -121,6 +124,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.public_dict()["consolidation_alphabetical_rounds"] == 4
     assert config.public_dict()["consolidation_max_rounds"] == 7
     assert config.public_dict()["extraction_max_prompt_chars"] == 500_000
+    assert config.public_dict()["extraction_feature_batch_size"] == 7
     assert config.public_dict()["ontology_refinement_min_failure_patients"] == 4
     assert config.public_dict()["max_ontology_refinement_rounds"] == 3
 
@@ -166,6 +170,13 @@ def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
             endpoint="http://stage2.test/v1",
             model="test-model",
             max_ontology_refinement_rounds=-1,
+        ).validate()
+
+    with pytest.raises(ValueError, match="extraction_feature_batch_size"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_feature_batch_size=0,
         ).validate()
 
 
@@ -579,6 +590,121 @@ def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Pat
 
     assert sorted(prompt_row_ids) == [0, 1, 2]
     assert extracted["_oci_row_id"].tolist() == [0, 1, 2]
+
+
+def test_stage2_extraction_batches_features_by_default_and_accepts_override(
+    tmp_path: Path,
+):
+    definitions = [
+        {
+            "name": f"feature_{index:02d}",
+            "description": f"Feature {index}",
+            "value_type": "continuous",
+            "categories_or_unit": ["score"],
+            "measurement_definition": f"Extract feature {index}.",
+            "missing_value_rule": "Return null when undocumented.",
+        }
+        for index in range(23)
+    ]
+    dataset = pd.DataFrame({"clinical_text": ["All feature values are documented."]})
+
+    def run_extraction(output_dir: Path, **kwargs):
+        prompt_feature_names = []
+
+        def request_json(messages, validate):
+            body = json.loads(messages[1]["content"])
+            names = [feature["name"] for feature in body["features"]]
+            prompt_feature_names.append(names)
+            assert len(body["patients"]) == 1
+            return validate(
+                {
+                    "rows": [
+                        {
+                            "row_id": 0,
+                            "values": {
+                                name: int(name.removeprefix("feature_")) for name in names
+                            },
+                        }
+                    ]
+                }
+            )
+
+        frame = extract_rows(
+            dataset=dataset,
+            row_ids=[0],
+            text_column="clinical_text",
+            definitions=definitions,
+            output_dir=output_dir,
+            request_json=request_json,
+            workers=1,
+            max_prompt_chars=100_000,
+            **kwargs,
+        )
+        return frame, prompt_feature_names
+
+    default_output = tmp_path / "default"
+    frame, default_prompts = run_extraction(default_output)
+
+    assert [len(names) for names in default_prompts] == [10, 10, 3]
+    assert [name for names in default_prompts for name in names] == [
+        definition["name"] for definition in definitions
+    ]
+    assert frame.loc[0, "feature_00"] == 0.0
+    assert frame.loc[0, "feature_22"] == 22.0
+    parent_completion = json.loads(
+        (default_output / "batches" / "batch_00001" / "complete.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert parent_completion["feature_batches"] == 3
+    assert parent_completion["feature_batch_size"] == 10
+    assert len(
+        list(
+            (
+                default_output
+                / "batches"
+                / "batch_00001"
+                / "feature_batches"
+            ).glob("batch_*/complete.json")
+        )
+    ) == 3
+
+    configured_frame, configured_prompts = run_extraction(
+        tmp_path / "configured",
+        feature_batch_size=6,
+    )
+    assert [len(names) for names in configured_prompts] == [6, 6, 6, 5]
+    assert configured_frame.loc[0, "feature_22"] == 22.0
+
+    def unexpected_request(_messages, _validate):
+        raise AssertionError("feature-batch checkpoints should be reused")
+
+    parent_dir = default_output / "batches" / "batch_00001"
+    (parent_dir / "complete.json").unlink()
+    (parent_dir / "result.json").unlink()
+    rebuilt = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=default_output,
+        request_json=unexpected_request,
+        workers=1,
+        max_prompt_chars=100_000,
+    )
+    pd.testing.assert_frame_equal(rebuilt, frame)
+
+    resumed = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=default_output,
+        request_json=unexpected_request,
+        workers=1,
+        max_prompt_chars=100_000,
+    )
+    pd.testing.assert_frame_equal(resumed, frame)
 
 
 def test_stage2_extraction_prompt_does_not_ascii_escape_clinical_text():
@@ -2425,6 +2551,94 @@ def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Pat
     assert "".join(row["text"] for row in ordered_pages) == note
     assert all(size <= 5_000 for size in prompt_sizes)
     assert frame.loc[0, "performance_status"] == "ECOG 2"
+
+
+def test_stage2_feature_batch_limit_is_preserved_across_lossless_pages(tmp_path: Path):
+    note = "n" * 9_000
+    definitions = [
+        {
+            "name": f"page_feature_{index:02d}",
+            "description": "A compact page feature.",
+            "value_type": "continuous",
+            "categories_or_unit": ["score"],
+            "measurement_definition": "Extract the documented score.",
+            "missing_value_rule": "Return null when undocumented.",
+        }
+        for index in range(11)
+    ]
+    extraction_bodies = []
+    reconciliation_bodies = []
+    prompt_sizes = []
+
+    def request_json(messages, validate):
+        prompt_sizes.append(sum(len(message["content"]) for message in messages))
+        body = json.loads(messages[1]["content"])
+        names = [feature["name"] for feature in body["features"]]
+        assert len(names) <= 4
+        if body["job"] == "extract_stage2_patient_variables":
+            extraction_bodies.append(body)
+            row_id = body["patients"][0]["row_id"]
+        else:
+            assert body["job"] == "reconcile_stage2_patient_variable_pages"
+            reconciliation_bodies.append(body)
+            row_id = body["row_id"]
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": row_id,
+                        "values": {
+                            name: int(name.removeprefix("page_feature_")) for name in names
+                        },
+                    }
+                ]
+            }
+        )
+
+    output = tmp_path / "extraction"
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": [note]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=output,
+        request_json=request_json,
+        workers=3,
+        max_prompt_chars=5_000,
+        feature_batch_size=4,
+    )
+
+    pages_by_index = {}
+    for body in extraction_bodies:
+        page = body["patients"][0]
+        pages_by_index[int(page["page"]["page_index"])] = page
+    ordered_pages = [pages_by_index[index] for index in sorted(pages_by_index)]
+    assert len(ordered_pages) >= 2
+    assert "".join(page["text"] for page in ordered_pages) == note
+    assert all(len(body["features"]) <= 4 for body in extraction_bodies)
+    assert all(len(body["features"]) <= 4 for body in reconciliation_bodies)
+    assert all(size <= 5_000 for size in prompt_sizes)
+    assert frame.loc[0, "page_feature_10"] == 10.0
+    page_completion = json.loads(
+        (
+            output
+            / "pages"
+            / "row_00000000"
+            / "page_00001"
+            / "complete.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert page_completion["feature_batches"] == 3
+    reconciliation_completion = json.loads(
+        (
+            output
+            / "pages"
+            / "row_00000000"
+            / "reconciliation"
+            / "complete.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert reconciliation_completion["feature_batches"] == 3
 
 
 def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(

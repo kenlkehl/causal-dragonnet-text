@@ -27,6 +27,9 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 EXTRACTION_CHECKPOINT_SCHEMA_VERSION = "stage2_single_patient_extraction_v2_minimal_prompt"
+EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_single_patient_feature_batch_extraction_v1_minimal_prompt"
+)
 PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_single_patient_page_extraction_v1_minimal_prompt"
 )
@@ -41,6 +44,7 @@ ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = "stage2_training_failure_ontolog
 # long-running workflow if an older caller passes a config object directly.
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
+DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE = 10
 
 RequestJSON = Callable[
     [Sequence[Mapping[str, str]], Callable[[Mapping[str, Any]], dict[str, Any]]],
@@ -108,6 +112,24 @@ def _ontology_refinement_limits(config: Any) -> tuple[int, int]:
                 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS,
             )
         ),
+    )
+
+
+def _configured_extraction_feature_batch_size(config: Any) -> int:
+    """Read the feature prompt cap from current or pre-batching configs."""
+
+    if not hasattr(config, "extraction_feature_batch_size"):
+        LOGGER.warning(
+            "Stage 2 received a pre-feature-batching config; using the default "
+            "extraction feature batch size of %s",
+            DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE,
+        )
+    return int(
+        getattr(
+            config,
+            "extraction_feature_batch_size",
+            DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE,
+        )
     )
 
 
@@ -1054,18 +1076,51 @@ def _page_results_for_definitions(
     ]
 
 
+def _partition_feature_definitions(
+    definitions: Sequence[Mapping[str, Any]],
+    *,
+    feature_batch_size: int,
+) -> list[list[Mapping[str, Any]]]:
+    """Return stable consecutive feature slices for extraction prompts."""
+
+    if (
+        isinstance(feature_batch_size, bool)
+        or not isinstance(feature_batch_size, int)
+        or feature_batch_size < 1
+    ):
+        raise ValueError("feature_batch_size must be a positive integer")
+    return [
+        list(definitions[start : start + feature_batch_size])
+        for start in range(0, len(definitions), feature_batch_size)
+    ]
+
+
 def _partition_page_reconciliation_definitions(
     *,
     definitions: Sequence[Mapping[str, Any]],
     row_id: int,
     page_results: Sequence[Mapping[str, Any]],
     max_prompt_chars: int,
+    feature_batch_size: int,
 ) -> list[list[Mapping[str, Any]]]:
     """Partition only features; every batch continues to see every note page."""
 
     batches: list[list[Mapping[str, Any]]] = []
     current: list[Mapping[str, Any]] = []
     for definition in definitions:
+        singleton_results = _page_results_for_definitions(page_results, [definition])
+        singleton_messages = _page_reconciliation_prompt(
+            definitions=[definition],
+            row_id=row_id,
+            page_results=singleton_results,
+        )
+        singleton_prompt_chars = _prompt_chars(singleton_messages)
+        if singleton_prompt_chars > int(max_prompt_chars):
+            raise ValueError(
+                "Stage 2 cannot reconcile every lossless note page for one feature "
+                f"within max_prompt_chars ({singleton_prompt_chars} > {max_prompt_chars}); "
+                "increase the prompt budget"
+            )
         proposed = [*current, definition]
         proposed_results = _page_results_for_definitions(page_results, proposed)
         messages = _page_reconciliation_prompt(
@@ -1074,13 +1129,10 @@ def _partition_page_reconciliation_definitions(
             page_results=proposed_results,
         )
         prompt_chars = _prompt_chars(messages)
-        if not current and prompt_chars > int(max_prompt_chars):
-            raise ValueError(
-                "Stage 2 cannot reconcile every lossless note page for one feature "
-                f"within max_prompt_chars ({prompt_chars} > {max_prompt_chars}); "
-                "increase the prompt budget"
-            )
-        if current and prompt_chars > int(max_prompt_chars):
+        if current and (
+            len(proposed) > int(feature_batch_size)
+            or prompt_chars > int(max_prompt_chars)
+        ):
             batches.append(current)
             current = [definition]
         else:
@@ -1191,7 +1243,7 @@ def _partition_rows_for_prompt(
     rows: Sequence[Mapping[str, Any]],
     *,
     max_prompt_chars: int,
-    definitions: Sequence[Mapping[str, Any]],
+    definition_batches: Sequence[Sequence[Mapping[str, Any]]],
 ) -> tuple[list[list[Mapping[str, Any]]], list[Mapping[str, Any]]]:
     """Create only singleton extraction requests, measured at exact prompt size.
 
@@ -1204,11 +1256,16 @@ def _partition_rows_for_prompt(
     batches: list[list[Mapping[str, Any]]] = []
     oversized: list[Mapping[str, Any]] = []
     for row in rows:
-        singleton = _extraction_prompt(
-            definitions=definitions,
-            rows=[row],
+        prompt_sizes = (
+            _prompt_chars(
+                _extraction_prompt(
+                    definitions=batch_definitions,
+                    rows=[row],
+                )
+            )
+            for batch_definitions in definition_batches
         )
-        if _prompt_chars(singleton) > int(max_prompt_chars):
+        if any(size > int(max_prompt_chars) for size in prompt_sizes):
             oversized.append(row)
         else:
             batches.append([row])
@@ -1218,7 +1275,7 @@ def _partition_rows_for_prompt(
 def _lossless_extraction_pages(
     row: Mapping[str, Any],
     *,
-    definitions: Sequence[Mapping[str, Any]],
+    definition_batches: Sequence[Sequence[Mapping[str, Any]]],
     max_prompt_chars: int,
 ) -> list[dict[str, Any]]:
     """Split one note into the largest exact prompt-sized contiguous pages."""
@@ -1248,11 +1305,16 @@ def _lossless_extraction_pages(
                     "document_chars": len(source),
                 },
             }
-            prompt = _extraction_prompt(
-                definitions=definitions,
-                rows=[candidate],
+            prompt_sizes = (
+                _prompt_chars(
+                    _extraction_prompt(
+                        definitions=batch_definitions,
+                        rows=[candidate],
+                    )
+                )
+                for batch_definitions in definition_batches
             )
-            if _prompt_chars(prompt) <= int(max_prompt_chars):
+            if all(size <= int(max_prompt_chars) for size in prompt_sizes):
                 best = candidate
                 low = end + 1
             else:
@@ -1261,7 +1323,7 @@ def _lossless_extraction_pages(
             raise ValueError(
                 "Stage 2 feature definitions and prompt envelope leave no room for even "
                 "one source character; increase stage2.extraction_max_prompt_chars or "
-                "reduce the number of features per analysis"
+                "shorten the feature definitions"
             )
         pages.append(best)
         cursor = int(best["page"]["char_end"])
@@ -1379,11 +1441,16 @@ def extract_rows(
     request_json: RequestJSON,
     workers: int,
     max_prompt_chars: int,
+    feature_batch_size: int = DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE,
 ) -> pd.DataFrame:
-    """Extract one frozen definition set with exactly one patient per prompt."""
+    """Extract one patient per prompt in bounded feature slices, then merge them."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
     feature_names = [str(feature["name"]) for feature in definitions]
+    definition_batches = _partition_feature_definitions(
+        definitions,
+        feature_batch_size=feature_batch_size,
+    )
     if not definitions:
         frame = pd.DataFrame({"_oci_row_id": [int(value) for value in row_ids]})
         _write_frame(output_dir / "extracted.csv", frame)
@@ -1417,7 +1484,7 @@ def extract_rows(
     batches, oversized_rows = _partition_rows_for_prompt(
         request_rows,
         max_prompt_chars=int(max_prompt_chars),
-        definitions=definitions,
+        definition_batches=definition_batches,
     )
 
     page_requests: list[dict[str, Any]] = []
@@ -1425,9 +1492,20 @@ def extract_rows(
         page_requests.extend(
             _lossless_extraction_pages(
                 row,
-                definitions=definitions,
+                definition_batches=definition_batches,
                 max_prompt_chars=int(max_prompt_chars),
             )
+        )
+
+    if len(definition_batches) > 1:
+        LOGGER.info(
+            "Stage 2 extraction features=%s feature_batch_size=%s "
+            "feature_batches_per_patient=%s patients=%s pages=%s",
+            len(definitions),
+            feature_batch_size,
+            len(definition_batches),
+            len(batches),
+            len(page_requests),
         )
 
     # Snapshot every saved singleton result before concurrent workers begin
@@ -1488,6 +1566,134 @@ def extract_rows(
                 "extraction_issues": saved_issues,
             }
         )
+
+    def request_feature_batches(
+        *,
+        parent_dir: Path,
+        row: Mapping[str, Any],
+        parent_schema_version: str,
+    ) -> dict[str, Any]:
+        """Extract and checkpoint each feature slice for one patient or page."""
+
+        if len(definition_batches) < 2:  # pragma: no cover - caller invariant
+            raise RuntimeError("feature-batched extraction requires multiple feature batches")
+        row_id = int(row["row_id"])
+        merged_values: dict[str, Any] = {}
+        for feature_batch_index, batch_definitions in enumerate(
+            definition_batches,
+            start=1,
+        ):
+            feature_dir = (
+                parent_dir
+                / "feature_batches"
+                / f"batch_{feature_batch_index:05d}"
+            )
+            result_path = feature_dir / "result.json"
+            complete_path = feature_dir / "complete.json"
+            ontology_audit_path = feature_dir / "category_ontology_repair.json"
+            batch_input = {
+                "schema_version": EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION,
+                "parent_schema_version": parent_schema_version,
+                "definitions": _prompt_feature_definitions(batch_definitions),
+                "row": dict(row),
+            }
+            input_fingerprint = _value_fingerprint(batch_input)
+            stale_audit = _stale_category_ontology_audit(ontology_audit_path)
+            result: dict[str, Any] | None = None
+            if complete_path.is_file() and result_path.is_file() and stale_audit is None:
+                try:
+                    completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                    cached = json.loads(result_path.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(completion, Mapping)
+                        and completion.get("schema_version")
+                        == EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION
+                        and completion.get("input_fingerprint") == input_fingerprint
+                        and isinstance(cached, Mapping)
+                    ):
+                        result = _validate_extraction(
+                            cached,
+                            row_ids=[row_id],
+                            definitions=batch_definitions,
+                        )
+                        _ensure_extraction_issue_audit(feature_dir)
+                except (
+                    KeyError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    result = None
+                if result is None:
+                    LOGGER.info(
+                        "rerun incompatible Stage 2 extraction feature batch: %s",
+                        feature_dir,
+                    )
+            if result is None:
+                if stale_audit is not None:
+                    LOGGER.info(
+                        "retry stale Stage 2 category ontology feature batch: %s",
+                        feature_dir,
+                    )
+                feature_dir.mkdir(parents=True, exist_ok=True)
+                _write_json(
+                    feature_dir / "input.json",
+                    {**batch_input, "input_fingerprint": input_fingerprint},
+                )
+                messages = _extraction_prompt(
+                    definitions=batch_definitions,
+                    rows=[row],
+                )
+                if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+                    raise RuntimeError(
+                        "Stage 2 extraction planner emitted an oversized feature batch"
+                    )
+                result = _request_validated_extraction(
+                    messages=messages,
+                    row_ids=[row_id],
+                    definitions=batch_definitions,
+                    request_json=request_json,
+                    ontology_audit_path=ontology_audit_path,
+                )
+                _write_json(result_path, result)
+                _supersede_stale_category_ontology_audit(
+                    ontology_audit_path,
+                    previous=stale_audit,
+                )
+                _write_json(
+                    complete_path,
+                    {
+                        "status": "complete",
+                        "schema_version": (
+                            EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION
+                        ),
+                        "input_fingerprint": input_fingerprint,
+                        "completed_at": _now(),
+                        "row_id": row_id,
+                        "features": len(batch_definitions),
+                        "feature_batch": feature_batch_index,
+                    },
+                )
+            merged_values.update(dict(result["rows"][0]["values"]))
+
+        merged = _validate_extraction(
+            {"rows": [{"row_id": row_id, "values": merged_values}]},
+            row_ids=[row_id],
+            definitions=definitions,
+        )
+        # Any parent-level issue ledger belongs to an older all-feature request.
+        # Active issue ledgers now live beside the feature-slice checkpoints.
+        _write_json(
+            parent_dir / "extraction_issues.json",
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [],
+                "delegated_to_feature_batches": True,
+            },
+        )
+        return merged
 
     def run_batch(index: int, batch: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         if len(batch) != 1:  # pragma: no cover - enforced by the planner
@@ -1598,19 +1804,26 @@ def extract_rows(
             LOGGER.info("retry stale Stage 2 category ontology batch: %s", batch_dir)
         batch_dir.mkdir(parents=True, exist_ok=True)
         _write_json(batch_dir / "row_ids.json", row_ids)
-        messages = _extraction_prompt(
-            definitions=definitions,
-            rows=batch,
-        )
-        result = _request_validated_extraction(
-            messages=messages,
-            row_ids=row_ids,
-            definitions=definitions,
-            request_json=request_json,
-            ontology_audit_path=ontology_audit_path,
-        )
-        if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
-            raise RuntimeError("Stage 2 extraction planner emitted an oversized batch")
+        if len(definition_batches) == 1:
+            messages = _extraction_prompt(
+                definitions=definitions,
+                rows=batch,
+            )
+            result = _request_validated_extraction(
+                messages=messages,
+                row_ids=row_ids,
+                definitions=definitions,
+                request_json=request_json,
+                ontology_audit_path=ontology_audit_path,
+            )
+            if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+                raise RuntimeError("Stage 2 extraction planner emitted an oversized batch")
+        else:
+            result = request_feature_batches(
+                parent_dir=batch_dir,
+                row=batch[0],
+                parent_schema_version=EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+            )
         _write_json(result_path, result)
         _supersede_stale_category_ontology_audit(
             ontology_audit_path,
@@ -1624,6 +1837,9 @@ def extract_rows(
                 "input_fingerprint": input_fingerprint,
                 "completed_at": _now(),
                 "rows": 1,
+                "features": len(definitions),
+                "feature_batches": len(definition_batches),
+                "feature_batch_size": feature_batch_size,
             },
         )
         return list(result["rows"])
@@ -1666,19 +1882,26 @@ def extract_rows(
             LOGGER.info("retry stale Stage 2 category ontology page: %s", page_dir)
         page_dir.mkdir(parents=True, exist_ok=True)
         _write_json(page_dir / "page.json", page_meta)
-        messages = _extraction_prompt(
-            definitions=definitions,
-            rows=[page],
-        )
-        if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
-            raise RuntimeError("Stage 2 extraction planner emitted an oversized page")
-        result = _request_validated_extraction(
-            messages=messages,
-            row_ids=[row_id],
-            definitions=definitions,
-            request_json=request_json,
-            ontology_audit_path=ontology_audit_path,
-        )
+        if len(definition_batches) == 1:
+            messages = _extraction_prompt(
+                definitions=definitions,
+                rows=[page],
+            )
+            if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+                raise RuntimeError("Stage 2 extraction planner emitted an oversized page")
+            result = _request_validated_extraction(
+                messages=messages,
+                row_ids=[row_id],
+                definitions=definitions,
+                request_json=request_json,
+                ontology_audit_path=ontology_audit_path,
+            )
+        else:
+            result = request_feature_batches(
+                parent_dir=page_dir,
+                row=page,
+                parent_schema_version=PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+            )
         _write_json(result_path, result)
         _supersede_stale_category_ontology_audit(
             ontology_audit_path,
@@ -1691,6 +1914,9 @@ def extract_rows(
                 "schema_version": PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
                 "input_fingerprint": input_fingerprint,
                 "completed_at": _now(),
+                "features": len(definitions),
+                "feature_batches": len(definition_batches),
+                "feature_batch_size": feature_batch_size,
                 **page_meta,
             },
         )
@@ -1774,6 +2000,7 @@ def extract_rows(
             row_id=row_id,
             page_results=page_results,
             max_prompt_chars=int(max_prompt_chars),
+            feature_batch_size=feature_batch_size,
         )
         if len(definition_batches) > 1:
             LOGGER.info(
@@ -1898,6 +2125,7 @@ def extract_rows(
                 "completed_at": _now(),
                 "pages": len(page_results),
                 "feature_batches": len(definition_batches),
+                "feature_batch_size": feature_batch_size,
             },
         )
         return dict(result["rows"][0]["values"])
@@ -1931,6 +2159,8 @@ def extract_rows(
             "completed_at": _now(),
             "rows": len(frame),
             "features": len(feature_names),
+            "feature_batch_size": feature_batch_size,
+            "feature_batches_per_patient": len(definition_batches),
             "batches": len(batches),
             "paged_rows": len(oversized_rows),
             "pages": len(page_requests),
@@ -3288,6 +3518,7 @@ def _extract_training_with_ontology_feedback(
     request_json: RequestJSON,
     workers: int,
     max_prompt_chars: int,
+    feature_batch_size: int,
     minimum_failure_patients: int,
     max_refinement_rounds: int,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], int]:
@@ -3308,6 +3539,7 @@ def _extract_training_with_ontology_feedback(
             request_json=request_json,
             workers=workers,
             max_prompt_chars=max_prompt_chars,
+            feature_batch_size=feature_batch_size,
         )
         summary = json.loads((extraction_dir / "failure_summary.json").read_text(encoding="utf-8"))
         repeated = _repeated_ontology_failure_patterns(
@@ -3573,6 +3805,7 @@ def run_fold_analysis(
         ontology_refinement_min_failure_patients,
         max_ontology_refinement_rounds,
     ) = _ontology_refinement_limits(config)
+    extraction_feature_batch_size = _configured_extraction_feature_batch_size(config)
     fit_ids = [int(value) for value in split["fit_row_ids"]]
     heldout_ids = [int(value) for value in split["heldout_row_ids"]]
     current: list[dict[str, Any]] = []
@@ -3604,6 +3837,7 @@ def run_fold_analysis(
             request_json=request_json,
             workers=config.workers,
             max_prompt_chars=config.extraction_max_prompt_chars,
+            feature_batch_size=extraction_feature_batch_size,
             minimum_failure_patients=ontology_refinement_min_failure_patients,
             max_refinement_rounds=max_ontology_refinement_rounds,
         )
@@ -3684,6 +3918,7 @@ def run_fold_analysis(
             request_json=request_json,
             workers=config.workers,
             max_prompt_chars=config.extraction_max_prompt_chars,
+            feature_batch_size=extraction_feature_batch_size,
             minimum_failure_patients=ontology_refinement_min_failure_patients,
             max_refinement_rounds=max_ontology_refinement_rounds,
         )
@@ -3713,6 +3948,7 @@ def run_fold_analysis(
         request_json=request_json,
         workers=config.workers,
         max_prompt_chars=config.extraction_max_prompt_chars,
+        feature_batch_size=extraction_feature_batch_size,
     )
     _assert_extraction_health(
         heldout_extraction,

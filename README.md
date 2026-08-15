@@ -98,14 +98,15 @@ workflow bookkeeping and uses 32 endpoint workers by default (or
 `STAGE2_WORKERS` when set). Local GPU eligibility and `MIN_FREE_GPU_GB` apply
 only while Stage 1 still needs to run.
 
-Both launchers preset Stage 2 to batches of 20, five shifted-alphabetical plus
-up to fifty seeded-shuffle consolidation rounds, a three-training-patient
-ontology feedback threshold, and at most two refinement rounds. Override these
-with
+Both launchers preset Stage 2 to consolidation batches of 20, extraction
+feature batches of 10, five shifted-alphabetical plus up to fifty seeded-shuffle
+consolidation rounds, a three-training-patient ontology feedback threshold, and
+at most two refinement rounds. Override these with
 `STAGE2_CONSOLIDATION_BATCH_SIZE`,
 `STAGE2_CONSOLIDATION_ALPHABETICAL_ROUNDS`,
 `STAGE2_CONSOLIDATION_MAX_ROUNDS`,
 `STAGE2_OPERATIONALIZATION_MAX_PROMPT_CHARS`,
+`STAGE2_EXTRACTION_FEATURE_BATCH_SIZE`,
 `STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS`, and
 `STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS`.
 
@@ -669,6 +670,7 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
     "consolidation_max_rounds": 55,
+    "extraction_feature_batch_size": 10,
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
@@ -776,7 +778,10 @@ the feature but cannot drop it or revise its ontology. See
 [`docs/all_evidence_workflow.md`](docs/all_evidence_workflow.md) for a complete
 example and validation rules.
 
-Stage 2 extraction is permanently isolated to one patient per model prompt.
+Stage 2 extraction is permanently isolated to one patient per model prompt. It
+queries at most `stage2.extraction_feature_batch_size` definitions per prompt
+(10 by default), checkpoints each feature slice, and merges the slices before
+review. The CLI equivalent is `--stage2-extraction-feature-batch-size`.
 Concurrency is controlled by `stage2.workers`; patient batching is not configurable.
 
 Stage 2 preserves the outer-fold boundary throughout variable construction and

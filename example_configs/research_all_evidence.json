@@ -31,6 +31,7 @@
     "consolidation_alphabetical_rounds": 5,
     "consolidation_max_rounds": 55,
     "extraction_max_prompt_chars": 640000,
+    "extraction_feature_batch_size": 10,
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
