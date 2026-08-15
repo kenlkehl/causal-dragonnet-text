@@ -147,6 +147,7 @@ An external endpoint configuration is:
     "model": "Qwen/Qwen3-32B",
     "workers": 32,
     "request_timeout": 7200,
+    "max_tokens": 50000,
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
@@ -352,7 +353,7 @@ extraction and review rather than aborting the fold.
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
-`transport_retry_backoff`, `max_prompt_chars`,
+`transport_retry_backoff`, `max_tokens`, `max_prompt_chars`,
 `consolidation_max_prompt_chars`,
 `operationalization_max_prompt_chars`,
 `consolidation_batch_size`, `consolidation_alphabetical_rounds`,
@@ -375,7 +376,10 @@ one-feature ontology request uses `operationalization_max_prompt_chars`
 `extraction_max_prompt_chars` (also 640,000 by default) because every extraction
 request includes the complete frozen feature ontology. `max_prompt_chars`
 continues to bound interpretation and review planning. These character limits
-are safety/planning guards, not claims about the model's token context.
+are safety/planning guards, not claims about the model's token context. Every
+chat completion also sends `max_tokens` (50,000 by default), bounding the
+combined reasoning and answer generated for one request. A response that
+reaches that limit enters Stage 2's bounded repair or fallback path.
 Extraction always sends exactly one patient's text
 per request; oversized notes are split into lossless contiguous pages. Clinical
 text remains Unicode instead of expanding into token-heavy ASCII escape

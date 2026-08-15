@@ -89,6 +89,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     config = plain_stage2_config_from_mapping(
         {
             "endpoint": "http://stage2.test/v1",
+            "max_tokens": 48_000,
             "max_prompt_chars": 90_000,
             "consolidation_max_prompt_chars": 450_000,
             "operationalization_max_prompt_chars": 475_000,
@@ -103,6 +104,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     )
 
     assert config is not None
+    assert config.max_tokens == 48_000
     assert config.max_prompt_chars == 90_000
     assert config.consolidation_max_prompt_chars == 450_000
     assert config.operationalization_max_prompt_chars == 475_000
@@ -112,6 +114,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.extraction_max_prompt_chars == 500_000
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
+    assert config.public_dict()["max_tokens"] == 48_000
     assert config.public_dict()["consolidation_max_prompt_chars"] == 450_000
     assert config.public_dict()["operationalization_max_prompt_chars"] == 475_000
     assert config.public_dict()["consolidation_batch_size"] == 18
@@ -163,6 +166,16 @@ def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
             endpoint="http://stage2.test/v1",
             model="test-model",
             max_ontology_refinement_rounds=-1,
+        ).validate()
+
+
+@pytest.mark.parametrize("max_tokens", [0, -1, True, 1.5, "50000"])
+def test_stage2_config_rejects_invalid_max_tokens(max_tokens):
+    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            max_tokens=max_tokens,
         ).validate()
 
 
@@ -232,7 +245,7 @@ def test_stage2_rejects_retired_raw_packet_compiler():
         )
 
 
-def test_stage2_ignores_legacy_extraction_batch_size(caplog):
+def test_stage2_ignores_legacy_extraction_batch_size_and_parses_max_tokens(caplog):
     config = plain_stage2_config_from_mapping(
         {
             "endpoint": "http://stage2.test/v1",
@@ -244,9 +257,9 @@ def test_stage2_ignores_legacy_extraction_batch_size(caplog):
 
     assert config is not None
     assert "extraction_batch_size" not in config.public_dict()
-    assert "max_tokens" not in config.public_dict()
+    assert config.max_tokens == 25_000
+    assert config.public_dict()["max_tokens"] == 25_000
     assert "permanently isolated to one patient per prompt" in caplog.text
-    assert "does not send an output-token limit" in caplog.text
 
 
 def test_stage2_autodiscovers_the_only_served_model(monkeypatch):
@@ -1764,7 +1777,7 @@ def test_openai_completion_closes_client(monkeypatch):
     assert content == '{"ok": true}'
     assert client.closed is True
     assert client_kwargs["max_retries"] == 0
-    assert "max_tokens" not in request_kwargs
+    assert request_kwargs["max_tokens"] == 50_000
     assert "max_completion_tokens" not in request_kwargs
 
 

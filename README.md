@@ -660,6 +660,7 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "model": "Qwen/Qwen3-32B",
     "workers": 32,
     "request_timeout": 7200,
+    "max_tokens": 50000,
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,

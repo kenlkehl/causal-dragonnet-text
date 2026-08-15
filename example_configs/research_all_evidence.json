@@ -25,6 +25,7 @@
     "model": "",
     "api_key": "EMPTY",
     "workers": 32,
+    "max_tokens": 50000,
     "operationalization_max_prompt_chars": 640000,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,

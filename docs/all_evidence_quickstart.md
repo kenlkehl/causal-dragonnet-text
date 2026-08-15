@@ -50,6 +50,7 @@ effect estimates. The common controls are:
     "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3-32B",
     "workers": 32,
+    "max_tokens": 50000,
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "max_review_rounds": 2,

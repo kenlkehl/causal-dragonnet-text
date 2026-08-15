@@ -53,6 +53,7 @@ ALLOWED_EVIDENCE_AXES = {
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
+DEFAULT_MAX_TOKENS = 50_000
 DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_OPERATIONALIZATION_MAX_PROMPT_CHARS = 640_000
@@ -615,6 +616,7 @@ class PlainHandoffStage2Config:
     request_timeout: float = 7_200.0
     transport_max_attempts: int = 3
     transport_retry_backoff: float = 2.0
+    max_tokens: int = DEFAULT_MAX_TOKENS
     max_prompt_chars: int = 100_000
     # Candidate consolidation has its own prompt allowance even though each
     # request sees only one bounded deterministic batch.
@@ -680,6 +682,12 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.transport_max_attempts must be positive")
         if self.transport_retry_backoff < 0:
             raise ValueError("stage2.transport_retry_backoff must be nonnegative")
+        if (
+            isinstance(self.max_tokens, bool)
+            or not isinstance(self.max_tokens, int)
+            or self.max_tokens < 1
+        ):
+            raise ValueError("stage2.max_tokens must be a positive integer")
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.consolidation_max_prompt_chars < 4_000:
@@ -809,9 +817,6 @@ def plain_stage2_config_from_mapping(
             "isolated to one patient per prompt",
             legacy_extraction_batch_size,
         )
-    if raw.get("max_tokens") is not None:
-        LOGGER.warning("stage2.max_tokens is ignored; Stage 2 does not send an output-token limit")
-
     def architecture_names(value: Any) -> tuple[str, ...]:
         if isinstance(value, str):
             if value.strip().lower() == "all":
@@ -839,6 +844,7 @@ def plain_stage2_config_from_mapping(
         request_timeout=float(raw.get("request_timeout", 7_200.0)),
         transport_max_attempts=int(raw.get("transport_max_attempts", 3)),
         transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
+        max_tokens=int(raw.get("max_tokens", DEFAULT_MAX_TOKENS)),
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
         consolidation_max_prompt_chars=int(
             raw.get(
@@ -1391,6 +1397,7 @@ def _openai_completion(
         "model": config.model,
         "messages": list(messages),
         "temperature": config.temperature,
+        "max_tokens": config.max_tokens,
         "response_format": {"type": "json_object"},
     }
     kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": config.enable_thinking}}
@@ -1402,10 +1409,11 @@ def _openai_completion(
             f"{config.max_prompt_chars})"
         )
     LOGGER.info(
-        "Stage 2 request endpoint=%s model=%s prompt_chars=%s",
+        "Stage 2 request endpoint=%s model=%s prompt_chars=%s max_tokens=%s",
         config.endpoint,
         config.model,
         prompt_chars,
+        config.max_tokens,
     )
     try:
         response = client.chat.completions.create(**kwargs)
