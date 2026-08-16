@@ -19,26 +19,30 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
 
-EXTRACTION_CHECKPOINT_SCHEMA_VERSION = "stage2_single_patient_extraction_v2_minimal_prompt"
+EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_single_patient_extraction_v3_nonreasoning_request"
+)
 EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_feature_batch_extraction_v1_minimal_prompt"
+    "stage2_single_patient_feature_batch_extraction_v2_nonreasoning_request"
 )
 PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_page_extraction_v1_minimal_prompt"
+    "stage2_single_patient_page_extraction_v2_nonreasoning_request"
 )
 PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_lossless_feature_partition_reconciliation_v2_minimal_prompt"
+    "stage2_lossless_feature_partition_reconciliation_v3_nonreasoning_request"
 )
-REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v1"
+REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v2_request_policy"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
-ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = "stage2_training_failure_ontology_refinement_v1"
+ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_training_failure_ontology_refinement_v2_request_policy"
+)
 # Compatibility defaults for Stage 2 config objects created before ontology
 # refinement was added.  Keeping this boundary tolerant also protects a
 # long-running workflow if an older caller passes a config object directly.
@@ -46,10 +50,15 @@ DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE = 10
 
-RequestJSON = Callable[
-    [Sequence[Mapping[str, str]], Callable[[Mapping[str, Any]], dict[str, Any]]],
-    dict[str, Any],
-]
+
+class RequestJSON(Protocol):
+    def __call__(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        validate: Callable[[Mapping[str, Any]], dict[str, Any]],
+        *,
+        request_kind: str = "interpretation",
+    ) -> dict[str, Any]: ...
 
 _SCALAR_EXTRACTION_RULES = (
     "Return one scalar value or null per feature; never return an object or array.",
@@ -662,6 +671,7 @@ def _request_validated_extraction(
                 row_ids=row_ids,
                 definitions=definitions,
             ),
+            request_kind="extraction",
         )
         _write_json(
             issue_audit_path,
@@ -798,6 +808,7 @@ def _request_validated_extraction(
         corrections = request_json(
             _category_ontology_prompt(items),
             lambda value: _validate_category_ontology(value, items=items),
+            request_kind="extraction",
         )
         resolution = "llm_category_ontology"
     except ValueError as exc:

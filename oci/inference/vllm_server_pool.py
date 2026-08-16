@@ -75,7 +75,9 @@ def _model_family_defaults(model: str) -> tuple[str, bool | None, Mapping[str, A
 
     normalized = str(model).strip().lower()
     if "gemma" in normalized:
-        return "gemma4", True, {"enable_thinking": True}
+        # Thinking is selected per request through reasoning_effort. A server
+        # default would force extraction and interpretation into one mode.
+        return "gemma4", True, None
     if "qwen" in normalized:
         return "qwen3", True, None
     return "", None, None

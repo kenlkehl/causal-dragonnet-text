@@ -29,7 +29,7 @@ from oci.inference.research_all_evidence_workflow import (
 )
 
 
-def test_managed_gemma_defaults_and_command_are_text_only_and_thinking_enabled():
+def test_managed_gemma_defaults_use_request_scoped_reasoning():
     config = plain_stage2_config_from_mapping(
         {
             "model": "google/gemma-4-31B-it",
@@ -45,11 +45,12 @@ def test_managed_gemma_defaults_and_command_are_text_only_and_thinking_enabled()
 
     assert config is not None
     assert config.endpoint == ""
-    assert config.enable_thinking is True
+    assert config.interpretation_reasoning_effort == "high"
+    assert config.extraction_reasoning_effort == "none"
     assert config.vllm is not None
     assert config.vllm.reasoning_parser == "gemma4"
     assert config.vllm.language_model_only is True
-    assert config.vllm.default_chat_template_kwargs == {"enable_thinking": True}
+    assert config.vllm.default_chat_template_kwargs is None
     assert config.vllm.gpu_groups() == (
         ("cuda:0", "cuda:1"),
         ("cuda:2", "cuda:3"),
@@ -72,9 +73,7 @@ def test_managed_gemma_defaults_and_command_are_text_only_and_thinking_enabled()
     ]
     assert command[command.index("--reasoning-parser") + 1] == "gemma4"
     assert "--language-model-only" in command
-    assert command[command.index("--default-chat-template-kwargs") + 1] == (
-        '{"enable_thinking":true}'
-    )
+    assert "--default-chat-template-kwargs" not in command
     assert command[command.index("--download-dir") + 1] == "/models/cache"
     assert command[-2:] == ["--gpu-memory-utilization", "0.85"]
 
@@ -90,7 +89,7 @@ def test_managed_qwen_defaults_can_be_overridden():
     overridden = plain_stage2_config_from_mapping(
         {
             "model": "Qwen/Qwen3-32B",
-            "enable_thinking": True,
+            "interpretation_reasoning_effort": "low",
             "vllm": {
                 "server_count": 2,
                 "gpus": [0, 1],
@@ -106,11 +105,12 @@ def test_managed_qwen_defaults_can_be_overridden():
     assert default_config.vllm.reasoning_parser == "qwen3"
     assert default_config.vllm.language_model_only is True
     assert default_config.vllm.default_chat_template_kwargs is None
-    assert default_config.enable_thinking is False
+    assert default_config.interpretation_reasoning_effort == "high"
+    assert default_config.extraction_reasoning_effort == "none"
     assert overridden is not None and overridden.vllm is not None
     assert overridden.vllm.reasoning_parser == "custom-parser"
     assert overridden.vllm.language_model_only is False
-    assert overridden.enable_thinking is True
+    assert overridden.interpretation_reasoning_effort == "low"
 
 
 @pytest.mark.parametrize(

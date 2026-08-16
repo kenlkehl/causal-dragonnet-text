@@ -51,6 +51,8 @@ effect estimates. The common controls are:
     "model": "Qwen/Qwen3-32B",
     "workers": 32,
     "max_tokens": 50000,
+    "interpretation_reasoning_effort": "high",
+    "extraction_reasoning_effort": "none",
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "max_review_rounds": 2,
@@ -59,6 +61,12 @@ effect estimates. The common controls are:
   }
 }
 ```
+
+Interpretation, consolidation, operationalization, and review requests send
+`reasoning_effort: "high"` and do not send an output-token cap. Patient
+extraction sends `reasoning_effort: "none"`; `max_tokens` is its response cap.
+Managed Gemma 4 servers therefore use the `gemma4` reasoning parser without a
+server-wide `enable_thinking` default.
 
 `stage2.explicit_features` may contain investigator-specified feature
 definitions. Each entry must include its complete extraction ontology and
@@ -92,8 +100,9 @@ example above with:
 
 Stage 2 starts the servers, waits for all eight model endpoints, round-robins
 work across them, and stops them on exit. Gemma defaults to the `gemma4`
-reasoning parser, language-model-only mode, and thinking enabled. Qwen defaults
-to the `qwen3` reasoning parser and language-model-only mode. See the complete
+reasoning parser and language-model-only mode; thinking is selected per request
+as described above. Qwen defaults to the `qwen3` reasoning parser and
+language-model-only mode. See the complete
 workflow guide for GPU partition rules and all managed-server settings.
 
 Before interpretation, Stage 2 compiles the raw handoff into fold-local,

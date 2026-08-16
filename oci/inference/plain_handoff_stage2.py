@@ -54,6 +54,12 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 DEFAULT_MAX_TOKENS = 50_000
+DEFAULT_INTERPRETATION_REASONING_EFFORT = "high"
+DEFAULT_EXTRACTION_REASONING_EFFORT = "none"
+STAGE2_REQUEST_KINDS = frozenset({"interpretation", "extraction"})
+SUPPORTED_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
 DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE = 10
 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
@@ -67,7 +73,7 @@ DEFAULT_CONSOLIDATION_MAX_ROUNDS = (
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 CONSOLIDATION_SCHEMA_VERSION = (
-    "global_candidate_pool_v14_atomic_merge_only_then_role_filter"
+    "global_candidate_pool_v15_request_scoped_reasoning"
 )
 GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
     "alphabetical_then_seeded_shuffle_candidate_batches_v9_atomic_merge_only"
@@ -75,9 +81,9 @@ GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
 EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
     "training_failure_ontology_refinement_v1_explicit_feature_invariants"
 )
-OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_bounded_supporting_text_v4"
-INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v8_atomic"
-INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v5_atomic"
+OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_bounded_supporting_text_v5_request_policy"
+INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v9_request_policy"
+INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v6_request_policy"
 CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE = "configured_explicit_feature"
 
 _CONCEPT_IDENTITY_STOPWORDS = {
@@ -617,7 +623,12 @@ class PlainHandoffStage2Config:
     request_timeout: float = 7_200.0
     transport_max_attempts: int = 3
     transport_retry_backoff: float = 2.0
+    # Patient-level extraction remains output-bounded. Interpretation-class
+    # requests deliberately omit max_tokens and may use the model's remaining
+    # context window.
     max_tokens: int = DEFAULT_MAX_TOKENS
+    interpretation_reasoning_effort: str = DEFAULT_INTERPRETATION_REASONING_EFFORT
+    extraction_reasoning_effort: str = DEFAULT_EXTRACTION_REASONING_EFFORT
     max_prompt_chars: int = 100_000
     # Candidate consolidation has its own prompt allowance even though each
     # request sees only one bounded deterministic batch.
@@ -654,13 +665,15 @@ class PlainHandoffStage2Config:
     min_nonmissing_fraction: float = 0.05
     max_dominant_fraction: float = 0.98
     temperature: float = 0.0
-    enable_thinking: bool = False
     explicit_features: tuple[Stage2ExplicitFeature, ...] = ()
     vllm: ManagedVLLMConfig | None = None
     # Populated only while pipeline-owned servers are alive. It is deliberately
     # excluded from the persisted scientific configuration; the server-pool
     # manifest records the concrete endpoints and process/GPU assignments.
     runtime_endpoints: tuple[str, ...] = ()
+    # Set only on the immutable config copy passed to one completion. It is not
+    # persisted as scientific configuration because both request policies are.
+    runtime_request_kind: str = "interpretation"
 
     def validate(
         self,
@@ -690,6 +703,19 @@ class PlainHandoffStage2Config:
             or self.max_tokens < 1
         ):
             raise ValueError("stage2.max_tokens must be a positive integer")
+        for field_name, effort in (
+            ("interpretation_reasoning_effort", self.interpretation_reasoning_effort),
+            ("extraction_reasoning_effort", self.extraction_reasoning_effort),
+        ):
+            if not isinstance(effort, str) or effort not in SUPPORTED_REASONING_EFFORTS:
+                raise ValueError(
+                    f"stage2.{field_name} must be one of "
+                    f"{sorted(SUPPORTED_REASONING_EFFORTS)}"
+                )
+        if self.runtime_request_kind not in STAGE2_REQUEST_KINDS:
+            raise ValueError(
+                "stage2.runtime_request_kind must be interpretation or extraction"
+            )
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.consolidation_max_prompt_chars < 4_000:
@@ -790,6 +816,7 @@ class PlainHandoffStage2Config:
         values = asdict(self)
         values["api_key"] = "<redacted>"
         values.pop("runtime_endpoints", None)
+        values.pop("runtime_request_kind", None)
         values["explicit_features"] = [
             feature.as_definition() for feature in self.explicit_features
         ]
@@ -834,18 +861,30 @@ def plain_stage2_config_from_mapping(
             return tuple(part.strip() for part in value.split(",") if part.strip())
         return tuple(value)
 
-    if "enable_thinking" in raw:
-        enable_thinking = bool(raw["enable_thinking"])
+    if "interpretation_reasoning_effort" in raw:
+        interpretation_reasoning_effort = str(
+            raw["interpretation_reasoning_effort"]
+        ).strip().lower()
+    elif "enable_thinking" in raw:
+        legacy_enable_thinking = raw["enable_thinking"]
+        if not isinstance(legacy_enable_thinking, bool):
+            raise ValueError("stage2.enable_thinking must be true or false")
+        interpretation_reasoning_effort = (
+            "high" if legacy_enable_thinking else "none"
+        )
+        LOGGER.warning(
+            "stage2.enable_thinking is deprecated; use "
+            "stage2.interpretation_reasoning_effort. Extraction reasoning is "
+            "controlled independently."
+        )
     else:
-        managed_chat_kwargs = (
-            managed_vllm.default_chat_template_kwargs
-            if managed_vllm is not None
-            else None
+        interpretation_reasoning_effort = DEFAULT_INTERPRETATION_REASONING_EFFORT
+    extraction_reasoning_effort = str(
+        raw.get(
+            "extraction_reasoning_effort",
+            DEFAULT_EXTRACTION_REASONING_EFFORT,
         )
-        enable_thinking = bool(
-            isinstance(managed_chat_kwargs, Mapping)
-            and managed_chat_kwargs.get("enable_thinking") is True
-        )
+    ).strip().lower()
 
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
@@ -855,6 +894,8 @@ def plain_stage2_config_from_mapping(
         transport_max_attempts=int(raw.get("transport_max_attempts", 3)),
         transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
         max_tokens=int(raw.get("max_tokens", DEFAULT_MAX_TOKENS)),
+        interpretation_reasoning_effort=interpretation_reasoning_effort,
+        extraction_reasoning_effort=extraction_reasoning_effort,
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
         consolidation_max_prompt_chars=int(
             raw.get(
@@ -925,7 +966,6 @@ def plain_stage2_config_from_mapping(
         min_nonmissing_fraction=float(raw.get("min_nonmissing_fraction", 0.05)),
         max_dominant_fraction=float(raw.get("max_dominant_fraction", 0.98)),
         temperature=float(raw.get("temperature", 0.0)),
-        enable_thinking=enable_thinking,
         explicit_features=explicit_features,
         vllm=managed_vllm,
     )
@@ -1395,6 +1435,30 @@ class _Stage2ResponseValidationError(ValueError):
     """A response remained structurally invalid after bounded repairs."""
 
 
+def _stage2_request_policy(
+    config: PlainHandoffStage2Config,
+    request_kind: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one request's reasoning mode and optional output cap."""
+
+    kind = str(request_kind or config.runtime_request_kind).strip().lower()
+    if kind not in STAGE2_REQUEST_KINDS:
+        raise ValueError(
+            "Stage 2 request_kind must be interpretation or extraction"
+        )
+    if kind == "extraction":
+        return {
+            "request_kind": kind,
+            "reasoning_effort": config.extraction_reasoning_effort,
+            "max_tokens": int(config.max_tokens),
+        }
+    return {
+        "request_kind": kind,
+        "reasoning_effort": config.interpretation_reasoning_effort,
+        "max_tokens": None,
+    }
+
+
 def _openai_completion(
     messages: Sequence[Mapping[str, str]],
     config: PlainHandoffStage2Config,
@@ -1409,14 +1473,16 @@ def _openai_completion(
         # not multiply invisibly with SDK-level retries.
         max_retries=0,
     )
+    request_policy = _stage2_request_policy(config)
     kwargs: dict[str, Any] = {
         "model": config.model,
         "messages": list(messages),
         "temperature": config.temperature,
-        "max_tokens": config.max_tokens,
+        "reasoning_effort": request_policy["reasoning_effort"],
         "response_format": {"type": "json_object"},
     }
-    kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": config.enable_thinking}}
+    if request_policy["max_tokens"] is not None:
+        kwargs["max_tokens"] = request_policy["max_tokens"]
     prompt_chars = sum(len(str(message.get("content") or "")) for message in messages)
     if prompt_chars > int(config.max_prompt_chars):
         raise ValueError(
@@ -1425,11 +1491,14 @@ def _openai_completion(
             f"{config.max_prompt_chars})"
         )
     LOGGER.info(
-        "Stage 2 request endpoint=%s model=%s prompt_chars=%s max_tokens=%s",
+        "Stage 2 request kind=%s endpoint=%s model=%s prompt_chars=%s "
+        "reasoning_effort=%s max_tokens=%s",
+        request_policy["request_kind"],
         config.endpoint,
         config.model,
         prompt_chars,
-        config.max_tokens,
+        request_policy["reasoning_effort"],
+        request_policy["max_tokens"],
     )
     try:
         response = client.chat.completions.create(**kwargs)
@@ -1604,7 +1673,13 @@ def _request_json(
     config: PlainHandoffStage2Config,
     completion: CompletionFunction,
     validate: Callable[[Mapping[str, Any]], dict[str, Any]],
+    request_kind: str = "interpretation",
 ) -> dict[str, Any]:
+    request_policy = _stage2_request_policy(config, request_kind)
+    request_config = replace(
+        config,
+        runtime_request_kind=str(request_policy["request_kind"]),
+    )
     base_conversation = [dict(message) for message in messages]
     conversation = [dict(message) for message in base_conversation]
     first_error: Exception | None = None
@@ -1620,7 +1695,7 @@ def _request_json(
         try:
             response = _completion_with_transport_retries(
                 conversation,
-                config,
+                request_config,
                 completion,
             )
             return validate(_parse_json_object(response))
@@ -1740,8 +1815,9 @@ def _checkpointed_request_json(
         return result
     output_dir = Path(output_dir)
     checkpoint_input = {
-        "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
         **dict(input_value),
+        "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+        "request_policy": _stage2_request_policy(config, "interpretation"),
     }
     input_fingerprint = _value_fingerprint(checkpoint_input)
     input_path = output_dir / "input.json"
@@ -4687,6 +4763,14 @@ class PlainHandoffStage2:
             "outer_fold": int(outer_fold),
             "compiler": self.config.evidence_compiler,
             "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
+            "interpretation_request_policy": _stage2_request_policy(
+                self.config,
+                "interpretation",
+            ),
+            "extraction_request_policy": _stage2_request_policy(
+                self.config,
+                "extraction",
+            ),
             "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
             "consolidation_batch_size": int(self.config.consolidation_batch_size),
             "consolidation_alphabetical_rounds": int(self.config.consolidation_alphabetical_rounds),
@@ -4920,6 +5004,21 @@ class PlainHandoffStage2:
                 self.config.extraction_max_prompt_chars,
             ),
         )
+
+        def request_analysis_json(
+            messages: Sequence[Mapping[str, str]],
+            validate: Callable[[Mapping[str, Any]], dict[str, Any]],
+            *,
+            request_kind: str = "interpretation",
+        ) -> dict[str, Any]:
+            return _request_json(
+                messages=messages,
+                config=analysis_request_config,
+                completion=self.completion,
+                validate=validate,
+                request_kind=request_kind,
+            )
+
         analysis = run_fold_analysis(
             dataset=dataset,
             definitions=final["features"],
@@ -4933,12 +5032,7 @@ class PlainHandoffStage2:
             inner_folds=inner_folds,
             seed=seed + 100_000 * outer_fold,
             output_dir=output_dir,
-            request_json=lambda messages, validate: _request_json(
-                messages=messages,
-                config=analysis_request_config,
-                completion=self.completion,
-                validate=validate,
-            ),
+            request_json=request_analysis_json,
             config=self.config,
         )
         completed = {

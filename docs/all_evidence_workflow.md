@@ -148,6 +148,8 @@ An external endpoint configuration is:
     "workers": 32,
     "request_timeout": 7200,
     "max_tokens": 50000,
+    "interpretation_reasoning_effort": "high",
+    "extraction_reasoning_effort": "none",
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
@@ -270,10 +272,19 @@ The managed vLLM fields are:
   cannot be duplicated here.
 
 Unless explicitly overridden, any model name containing `gemma` uses
-`reasoning_parser: "gemma4"`, `language_model_only: true`, and
-`default_chat_template_kwargs: {"enable_thinking": true}`; Stage 2 request-side
-thinking also defaults on. Any model name containing `qwen` uses
-`reasoning_parser: "qwen3"` and `language_model_only: true`.
+`reasoning_parser: "gemma4"` and `language_model_only: true`; it does not set a
+server-wide chat-template thinking default. Any model name containing `qwen`
+uses `reasoning_parser: "qwen3"` and `language_model_only: true`.
+
+Stage 2 selects reasoning per Chat Completions request. Evidence
+interpretation and audit, consolidation, operationalization, feature review,
+and ontology refinement send `reasoning_effort: "high"` by default and omit
+`max_tokens`. Patient extraction and its note-free category-repair requests
+send `reasoning_effort: "none"` and retain the configured `max_tokens` cap.
+vLLM maps those request values to Gemma 4's `enable_thinking` chat-template
+switch. The configured fields are `interpretation_reasoning_effort` and
+`extraction_reasoning_effort`; request-scoped values take precedence over a
+server default.
 
 Python first coalesces only exact normalized-name duplicates; this is identity
 bookkeeping and makes no semantic decision between distinct names. It then
@@ -364,7 +375,8 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `max_review_rounds`, `ontology_refinement_min_failure_patients`,
 `max_ontology_refinement_rounds`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
-`temperature`, and `enable_thinking`. The legacy `max_candidates_per_fold` and
+`temperature`, `interpretation_reasoning_effort`, and
+`extraction_reasoning_effort`. The legacy `max_candidates_per_fold` and
 `consolidation_oversample_factor` fields are still accepted in existing run
 files but do not affect consolidation. A configured endpoint or managed vLLM
 pool makes the default mode `full`. The modes can always be made explicit:
@@ -379,9 +391,10 @@ definitions (10 by default); Stage 2 checkpoints and merges the feature batches.
 `max_prompt_chars`
 continues to bound interpretation and review planning. These character limits
 are safety/planning guards, not claims about the model's token context. Every
-chat completion also sends `max_tokens` (50,000 by default), bounding the
-combined reasoning and answer generated for one request. A response that
-reaches that limit enters Stage 2's bounded repair or fallback path.
+interpretation-class completion omits `max_tokens`, allowing the model to use
+the context window available after the prompt. Extraction completions send
+`max_tokens` (50,000 by default), bounding their answer. An extraction response
+that reaches that limit enters Stage 2's bounded repair or fallback path.
 Extraction always sends exactly one patient's text per request and never sends
 more than the configured feature batch; oversized notes are split into lossless
 contiguous pages. Clinical

@@ -56,6 +56,9 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.model == ""
     assert config.request_timeout == 7_200.0
     assert config.transport_max_attempts == 3
+    assert config.max_tokens == 50_000
+    assert config.interpretation_reasoning_effort == "high"
+    assert config.extraction_reasoning_effort == "none"
     assert config.max_prompt_chars == 100_000
     assert config.consolidation_max_prompt_chars == 640_000
     assert config.operationalization_max_prompt_chars == 640_000
@@ -91,6 +94,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
         {
             "endpoint": "http://stage2.test/v1",
             "max_tokens": 48_000,
+            "interpretation_reasoning_effort": "medium",
+            "extraction_reasoning_effort": "none",
             "max_prompt_chars": 90_000,
             "consolidation_max_prompt_chars": 450_000,
             "operationalization_max_prompt_chars": 475_000,
@@ -107,6 +112,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
 
     assert config is not None
     assert config.max_tokens == 48_000
+    assert config.interpretation_reasoning_effort == "medium"
+    assert config.extraction_reasoning_effort == "none"
     assert config.max_prompt_chars == 90_000
     assert config.consolidation_max_prompt_chars == 450_000
     assert config.operationalization_max_prompt_chars == 475_000
@@ -118,6 +125,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
     assert config.public_dict()["max_tokens"] == 48_000
+    assert config.public_dict()["interpretation_reasoning_effort"] == "medium"
+    assert config.public_dict()["extraction_reasoning_effort"] == "none"
     assert config.public_dict()["consolidation_max_prompt_chars"] == 450_000
     assert config.public_dict()["operationalization_max_prompt_chars"] == 475_000
     assert config.public_dict()["consolidation_batch_size"] == 18
@@ -190,6 +199,19 @@ def test_stage2_config_rejects_invalid_max_tokens(max_tokens):
         ).validate()
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    ["interpretation_reasoning_effort", "extraction_reasoning_effort"],
+)
+def test_stage2_config_rejects_invalid_reasoning_effort(field_name):
+    with pytest.raises(ValueError, match=field_name):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            **{field_name: "very-hard"},
+        ).validate()
+
+
 def test_stage2_config_parses_explicit_feature_with_supplied_ontology():
     config = plain_stage2_config_from_mapping(
         {
@@ -256,7 +278,7 @@ def test_stage2_rejects_retired_raw_packet_compiler():
         )
 
 
-def test_stage2_ignores_legacy_extraction_batch_size_and_parses_max_tokens(caplog):
+def test_stage2_ignores_legacy_extraction_batch_size_and_parses_extraction_token_cap(caplog):
     config = plain_stage2_config_from_mapping(
         {
             "endpoint": "http://stage2.test/v1",
@@ -271,6 +293,21 @@ def test_stage2_ignores_legacy_extraction_batch_size_and_parses_max_tokens(caplo
     assert config.max_tokens == 25_000
     assert config.public_dict()["max_tokens"] == 25_000
     assert "permanently isolated to one patient per prompt" in caplog.text
+
+
+def test_stage2_maps_legacy_enable_thinking_to_interpretation_effort(caplog):
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "enable_thinking": False,
+        },
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert config.interpretation_reasoning_effort == "none"
+    assert config.extraction_reasoning_effort == "none"
+    assert "enable_thinking is deprecated" in caplog.text
 
 
 def test_stage2_autodiscovers_the_only_served_model(monkeypatch):
@@ -558,7 +595,8 @@ def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Pat
 
     prompt_row_ids = []
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        assert request_kind == "extraction"
         body = json.loads(messages[1]["content"])
         assert body["job"] == "extract_stage2_patient_variables"
         assert len(body["patients"]) == 1
@@ -611,7 +649,7 @@ def test_stage2_extraction_batches_features_by_default_and_accepts_override(
     def run_extraction(output_dir: Path, **kwargs):
         prompt_feature_names = []
 
-        def request_json(messages, validate):
+        def request_json(messages, validate, *, request_kind="interpretation"):
             body = json.loads(messages[1]["content"])
             names = [feature["name"] for feature in body["features"]]
             prompt_feature_names.append(names)
@@ -676,7 +714,7 @@ def test_stage2_extraction_batches_features_by_default_and_accepts_override(
     assert [len(names) for names in configured_prompts] == [6, 6, 6, 5]
     assert configured_frame.loc[0, "feature_22"] == 22.0
 
-    def unexpected_request(_messages, _validate):
+    def unexpected_request(_messages, _validate, *, request_kind="interpretation"):
         raise AssertionError("feature-batch checkpoints should be reused")
 
     parent_dir = default_output / "batches" / "batch_00001"
@@ -842,7 +880,7 @@ def test_resume_adopts_valid_legacy_single_patient_extraction_checkpoint(
         "categories_or_unit": ["0-4"],
     }
 
-    def unexpected_request(_messages, _validate):
+    def unexpected_request(_messages, _validate, *, request_kind="interpretation"):
         raise AssertionError("valid legacy singleton checkpoint should be adopted")
 
     frame = extract_rows(
@@ -895,7 +933,7 @@ def test_resume_relocates_legacy_singleton_by_row_id_after_batch_numbers_shift(
         "categories_or_unit": ["0-4"],
     }
 
-    def unexpected_request(_messages, _validate):
+    def unexpected_request(_messages, _validate, *, request_kind="interpretation"):
         raise AssertionError("shifted legacy singleton should be relocated")
 
     frame = extract_rows(
@@ -976,8 +1014,10 @@ def test_resume_reconstructs_failure_ledger_from_legacy_category_audit(
         text_column="clinical_text",
         definitions=[definition],
         output_dir=output,
-        request_json=lambda _messages, _validate: (_ for _ in ()).throw(
-            AssertionError("legacy checkpoint should be adopted")
+        request_json=(
+            lambda _messages, _validate, *, request_kind="interpretation": (
+                _ for _ in ()
+            ).throw(AssertionError("legacy checkpoint should be adopted"))
         ),
         workers=1,
         max_prompt_chars=10_000,
@@ -1038,7 +1078,7 @@ def test_resume_retries_only_checkpoints_with_stale_range_ontology_repairs(tmp_p
     }
     calls = []
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         calls.append(json.loads(messages[1]["content"])["job"])
         return validate(
             {
@@ -1126,11 +1166,14 @@ def test_extraction_uses_note_free_category_ontology_after_five_failed_repairs(
         text_column="clinical_text",
         definitions=[definition],
         output_dir=tmp_path / "extraction",
-        request_json=lambda messages, validate: stage2_workflow._request_json(
-            messages=messages,
-            config=config,
-            completion=completion,
-            validate=validate,
+        request_json=lambda messages, validate, *, request_kind="interpretation": (
+            stage2_workflow._request_json(
+                messages=messages,
+                config=config,
+                completion=completion,
+                validate=validate,
+                request_kind=request_kind,
+            )
         ),
         workers=1,
         max_prompt_chars=config.max_prompt_chars,
@@ -1166,7 +1209,7 @@ def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
         "categories_or_unit": ["not documented", "documented"],
     }
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
         if body["job"] == "extract_stage2_patient_variables":
             return validate(
@@ -1216,7 +1259,7 @@ def test_extraction_defaults_structurally_invalid_response_to_audited_null(
         "categories_or_unit": ["0-4"],
     }
 
-    def request_json(_messages, _validate):
+    def request_json(_messages, _validate, *, request_kind="interpretation"):
         raise ValueError(
             "Stage 2 response remained invalid after 5 repairs: "
             "Unterminated string at character 104409"
@@ -1266,7 +1309,7 @@ def test_extraction_nulls_only_invalid_feature_value_and_retains_valid_values(
         },
     ]
 
-    def request_json(_messages, validate):
+    def request_json(_messages, validate, *, request_kind="interpretation"):
         return validate(
             {
                 "rows": [
@@ -1864,7 +1907,19 @@ def test_empty_model_response_is_a_retryable_call_failure():
     assert stage2_workflow._is_retryable_transport_error(error) is True
 
 
-def test_openai_completion_closes_client(monkeypatch):
+@pytest.mark.parametrize(
+    ("request_kind", "reasoning_effort", "max_tokens"),
+    [
+        ("interpretation", "high", None),
+        ("extraction", "none", 50_000),
+    ],
+)
+def test_openai_completion_sends_request_scoped_reasoning_and_token_cap(
+    monkeypatch,
+    request_kind,
+    reasoning_effort,
+    max_tokens,
+):
     request_kwargs = {}
 
     class FakeCompletions:
@@ -1897,14 +1952,20 @@ def test_openai_completion_closes_client(monkeypatch):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
             model="test-model",
+            runtime_request_kind=request_kind,
         ),
     )
 
     assert content == '{"ok": true}'
     assert client.closed is True
     assert client_kwargs["max_retries"] == 0
-    assert request_kwargs["max_tokens"] == 50_000
+    assert request_kwargs["reasoning_effort"] == reasoning_effort
+    if max_tokens is None:
+        assert "max_tokens" not in request_kwargs
+    else:
+        assert request_kwargs["max_tokens"] == max_tokens
     assert "max_completion_tokens" not in request_kwargs
+    assert "extra_body" not in request_kwargs
 
 
 def test_openai_completion_reports_output_token_truncation(monkeypatch):
@@ -2503,7 +2564,7 @@ def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Pat
     page_bodies = []
     prompt_sizes = []
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         prompt_sizes.append(sum(len(message["content"]) for message in messages))
         body = json.loads(messages[1]["content"])
         if body["job"] == "extract_stage2_patient_variables":
@@ -2570,7 +2631,7 @@ def test_stage2_feature_batch_limit_is_preserved_across_lossless_pages(tmp_path:
     reconciliation_bodies = []
     prompt_sizes = []
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         prompt_sizes.append(sum(len(message["content"]) for message in messages))
         body = json.loads(messages[1]["content"])
         names = [feature["name"] for feature in body["features"]]
@@ -2668,7 +2729,7 @@ def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
     reconciliation_bodies = []
     prompt_sizes = []
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         prompt_sizes.append(sum(len(message["content"]) for message in messages))
         body = json.loads(messages[1]["content"])
         if body["job"] == "extract_stage2_patient_variables":
@@ -4738,7 +4799,7 @@ def test_stage2_review_partitions_complete_feature_diagnostics_and_resumes(
     }
     calls: list[list[str]] = []
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         assert stage2_analysis._prompt_chars(messages) <= 12_000
         body = json.loads(messages[1]["content"])
         detailed_ids = list(body["review_scope"]["detailed_feature_ids"])
@@ -5150,7 +5211,7 @@ def test_training_fold_review_can_revise_then_retest_a_definition(
 
     monkeypatch.setattr(stage2_analysis, "extract_rows", tracked_extract_rows)
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
         jobs.append(body["job"])
         if body["job"] == "extract_stage2_patient_variables":
@@ -5265,7 +5326,7 @@ def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
     }
     jobs = []
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
         jobs.append(body["job"])
         if body["job"] == "extract_stage2_patient_variables":
@@ -5394,7 +5455,7 @@ def test_failure_driven_ontology_refinement_never_rewrites_explicit_feature(
         "configured_explicit_feature": True,
     }
 
-    def unexpected_request(_messages, _validate):
+    def unexpected_request(_messages, _validate, *, request_kind="interpretation"):
         raise AssertionError("explicit ontology must not be sent for refinement")
 
     updated, changed, report = stage2_analysis._request_ontology_refinements(
@@ -5471,7 +5532,7 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
     }
     extraction_feature_sets = []
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
         if body["job"] == "extract_stage2_patient_variables":
             names = [feature["name"] for feature in body["features"]]
@@ -5568,7 +5629,7 @@ def test_final_training_extraction_fails_fast_when_effectively_all_null(
         ],
     }
 
-    def request_json(messages, validate):
+    def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
         if body["job"] == "extract_stage2_patient_variables":
             return validate(

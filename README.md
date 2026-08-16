@@ -662,6 +662,8 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "workers": 32,
     "request_timeout": 7200,
     "max_tokens": 50000,
+    "interpretation_reasoning_effort": "high",
+    "extraction_reasoning_effort": "none",
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
@@ -739,11 +741,20 @@ Recognized model families get these defaults unless the corresponding setting
 is explicitly overridden:
 
 - Gemma model names: `reasoning_parser: "gemma4"`,
-  `language_model_only: true`, and
-  `default_chat_template_kwargs: {"enable_thinking": true}`. Stage 2 requests
-  also default to `enable_thinking: true`.
+  `language_model_only: true`, and no server-wide thinking default.
 - Qwen model names: `reasoning_parser: "qwen3"` and
   `language_model_only: true`.
+
+Reasoning is selected in each Chat Completions payload instead of in the vLLM
+server command. Interpretation-class requests send
+`reasoning_effort: "high"` by default and omit `max_tokens`; this includes
+evidence interpretation and audit, consolidation, operationalization, feature
+review, and ontology refinement. Patient extraction and its category-repair
+requests send `reasoning_effort: "none"` and retain the configured
+`max_tokens` cap (50,000 by default). vLLM maps those request values to Gemma
+4's `enable_thinking` chat-template switch. The two efforts are recorded as
+`interpretation_reasoning_effort` and `extraction_reasoning_effort` in the
+Stage 2 configuration.
 
 The equivalent direct CLI invocation is:
 
