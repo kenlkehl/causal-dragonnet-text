@@ -148,6 +148,7 @@ An external endpoint configuration is:
     "workers": 32,
     "request_timeout": 7200,
     "max_tokens": 50000,
+    "repetition_penalty": 1.1,
     "interpretation_reasoning_effort": "high",
     "extraction_reasoning_effort": "none",
     "evidence_compiler": "semantic_cluster_cards_v2",
@@ -281,6 +282,8 @@ interpretation and audit, consolidation, operationalization, feature review,
 and ontology refinement send `reasoning_effort: "high"` by default and omit
 `max_tokens`. Patient extraction and its note-free category-repair requests
 send `reasoning_effort: "none"` and retain the configured `max_tokens` cap.
+Every Stage 2 completion request also sends the configured
+`repetition_penalty` (1.1 by default).
 vLLM maps those request values to Gemma 4's `enable_thinking` chat-template
 switch. The configured fields are `interpretation_reasoning_effort` and
 `extraction_reasoning_effort`; request-scoped values take precedence over a
@@ -375,7 +378,7 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `max_review_rounds`, `ontology_refinement_min_failure_patients`,
 `max_ontology_refinement_rounds`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
-`temperature`, `interpretation_reasoning_effort`, and
+`temperature`, `repetition_penalty`, `interpretation_reasoning_effort`, and
 `extraction_reasoning_effort`. The legacy `max_candidates_per_fold` and
 `consolidation_oversample_factor` fields are still accepted in existing run
 files but do not affect consolidation. A configured endpoint or managed vLLM

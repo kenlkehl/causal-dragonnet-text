@@ -51,6 +51,7 @@ effect estimates. The common controls are:
     "model": "Qwen/Qwen3-32B",
     "workers": 32,
     "max_tokens": 50000,
+    "repetition_penalty": 1.1,
     "interpretation_reasoning_effort": "high",
     "extraction_reasoning_effort": "none",
     "evidence_compiler": "semantic_cluster_cards_v2",
@@ -65,6 +66,7 @@ effect estimates. The common controls are:
 Interpretation, consolidation, operationalization, and review requests send
 `reasoning_effort: "high"` and do not send an output-token cap. Patient
 extraction sends `reasoning_effort: "none"`; `max_tokens` is its response cap.
+All Stage 2 completion requests send `repetition_penalty: 1.1` by default.
 Managed Gemma 4 servers therefore use the `gemma4` reasoning parser without a
 server-wide `enable_thinking` default.
 

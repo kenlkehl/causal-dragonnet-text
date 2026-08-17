@@ -54,6 +54,7 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
 MAX_RESPONSE_REPAIRS = 5
 DEFAULT_MAX_TOKENS = 50_000
+DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_INTERPRETATION_REASONING_EFFORT = "high"
 DEFAULT_EXTRACTION_REASONING_EFFORT = "none"
 STAGE2_REQUEST_KINDS = frozenset({"interpretation", "extraction"})
@@ -665,6 +666,7 @@ class PlainHandoffStage2Config:
     min_nonmissing_fraction: float = 0.05
     max_dominant_fraction: float = 0.98
     temperature: float = 0.0
+    repetition_penalty: float = DEFAULT_REPETITION_PENALTY
     explicit_features: tuple[Stage2ExplicitFeature, ...] = ()
     vllm: ManagedVLLMConfig | None = None
     # Populated only while pipeline-owned servers are alive. It is deliberately
@@ -797,6 +799,15 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.max_dominant_fraction must be between 0 and 1")
         if not 0.0 <= self.temperature <= 2.0:
             raise ValueError("stage2.temperature must be between 0 and 2")
+        if (
+            isinstance(self.repetition_penalty, bool)
+            or not isinstance(self.repetition_penalty, (int, float))
+            or not math.isfinite(float(self.repetition_penalty))
+            or self.repetition_penalty <= 0.0
+        ):
+            raise ValueError(
+                "stage2.repetition_penalty must be a finite number greater than zero"
+            )
         names: list[str] = []
         for index, feature in enumerate(self.explicit_features):
             if not isinstance(feature, Stage2ExplicitFeature):
@@ -966,6 +977,9 @@ def plain_stage2_config_from_mapping(
         min_nonmissing_fraction=float(raw.get("min_nonmissing_fraction", 0.05)),
         max_dominant_fraction=float(raw.get("max_dominant_fraction", 0.98)),
         temperature=float(raw.get("temperature", 0.0)),
+        repetition_penalty=float(
+            raw.get("repetition_penalty", DEFAULT_REPETITION_PENALTY)
+        ),
         explicit_features=explicit_features,
         vllm=managed_vllm,
     )
@@ -1451,11 +1465,13 @@ def _stage2_request_policy(
             "request_kind": kind,
             "reasoning_effort": config.extraction_reasoning_effort,
             "max_tokens": int(config.max_tokens),
+            "repetition_penalty": float(config.repetition_penalty),
         }
     return {
         "request_kind": kind,
         "reasoning_effort": config.interpretation_reasoning_effort,
         "max_tokens": None,
+        "repetition_penalty": float(config.repetition_penalty),
     }
 
 
@@ -1480,6 +1496,9 @@ def _openai_completion(
         "temperature": config.temperature,
         "reasoning_effort": request_policy["reasoning_effort"],
         "response_format": {"type": "json_object"},
+        "extra_body": {
+            "repetition_penalty": request_policy["repetition_penalty"],
+        },
     }
     if request_policy["max_tokens"] is not None:
         kwargs["max_tokens"] = request_policy["max_tokens"]
@@ -1492,13 +1511,14 @@ def _openai_completion(
         )
     LOGGER.info(
         "Stage 2 request kind=%s endpoint=%s model=%s prompt_chars=%s "
-        "reasoning_effort=%s max_tokens=%s",
+        "reasoning_effort=%s max_tokens=%s repetition_penalty=%s",
         request_policy["request_kind"],
         config.endpoint,
         config.model,
         prompt_chars,
         request_policy["reasoning_effort"],
         request_policy["max_tokens"],
+        request_policy["repetition_penalty"],
     )
     try:
         response = client.chat.completions.create(**kwargs)

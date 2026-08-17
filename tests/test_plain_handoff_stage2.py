@@ -57,6 +57,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.request_timeout == 7_200.0
     assert config.transport_max_attempts == 3
     assert config.max_tokens == 50_000
+    assert config.repetition_penalty == 1.1
     assert config.interpretation_reasoning_effort == "high"
     assert config.extraction_reasoning_effort == "none"
     assert config.max_prompt_chars == 100_000
@@ -94,6 +95,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
         {
             "endpoint": "http://stage2.test/v1",
             "max_tokens": 48_000,
+            "repetition_penalty": 1.15,
             "interpretation_reasoning_effort": "medium",
             "extraction_reasoning_effort": "none",
             "max_prompt_chars": 90_000,
@@ -112,6 +114,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
 
     assert config is not None
     assert config.max_tokens == 48_000
+    assert config.repetition_penalty == 1.15
     assert config.interpretation_reasoning_effort == "medium"
     assert config.extraction_reasoning_effort == "none"
     assert config.max_prompt_chars == 90_000
@@ -125,6 +128,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
     assert config.public_dict()["max_tokens"] == 48_000
+    assert config.public_dict()["repetition_penalty"] == 1.15
     assert config.public_dict()["interpretation_reasoning_effort"] == "medium"
     assert config.public_dict()["extraction_reasoning_effort"] == "none"
     assert config.public_dict()["consolidation_max_prompt_chars"] == 450_000
@@ -196,6 +200,19 @@ def test_stage2_config_rejects_invalid_max_tokens(max_tokens):
             endpoint="http://stage2.test/v1",
             model="test-model",
             max_tokens=max_tokens,
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "repetition_penalty",
+    [0, -1, True, float("inf"), float("nan"), "1.1"],
+)
+def test_stage2_config_rejects_invalid_repetition_penalty(repetition_penalty):
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            repetition_penalty=repetition_penalty,
         ).validate()
 
 
@@ -1960,12 +1977,12 @@ def test_openai_completion_sends_request_scoped_reasoning_and_token_cap(
     assert client.closed is True
     assert client_kwargs["max_retries"] == 0
     assert request_kwargs["reasoning_effort"] == reasoning_effort
+    assert request_kwargs["extra_body"] == {"repetition_penalty": 1.1}
     if max_tokens is None:
         assert "max_tokens" not in request_kwargs
     else:
         assert request_kwargs["max_tokens"] == max_tokens
     assert "max_completion_tokens" not in request_kwargs
-    assert "extra_body" not in request_kwargs
 
 
 def test_openai_completion_reports_output_token_truncation(monkeypatch):

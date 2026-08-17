@@ -662,6 +662,7 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "workers": 32,
     "request_timeout": 7200,
     "max_tokens": 50000,
+    "repetition_penalty": 1.1,
     "interpretation_reasoning_effort": "high",
     "extraction_reasoning_effort": "none",
     "evidence_compiler": "semantic_cluster_cards_v2",
@@ -754,7 +755,8 @@ requests send `reasoning_effort: "none"` and retain the configured
 `max_tokens` cap (50,000 by default). vLLM maps those request values to Gemma
 4's `enable_thinking` chat-template switch. The two efforts are recorded as
 `interpretation_reasoning_effort` and `extraction_reasoning_effort` in the
-Stage 2 configuration.
+Stage 2 configuration. Every Stage 2 completion request also sends the
+configured `repetition_penalty` (1.1 by default).
 
 The equivalent direct CLI invocation is:
 
