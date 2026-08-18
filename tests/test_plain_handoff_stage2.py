@@ -595,6 +595,103 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
         assert "rather than a ratio string or aggregate" in composite_rule
 
 
+def test_continuous_extraction_preserves_categorical_fallback_for_modeling_review():
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "pd_l1_tumor_proportion_score",
+        "description": "PD-L1 tumor proportion score.",
+        "value_type": "continuous",
+        "categories_or_unit": ["percent"],
+        "roles": ["effect_modifier"],
+        "measurement_definition": (
+            "Extract the numeric TPS when present, otherwise preserve its documented category."
+        ),
+        "missing_value_rule": "Return null when TPS is undocumented.",
+    }
+    validated = stage2_analysis._validate_extraction(
+        {
+            "rows": [
+                {
+                    "row_id": 7,
+                    "values": {"pd_l1_tumor_proportion_score": "<1%"},
+                }
+            ]
+        },
+        row_ids=[7],
+        definitions=[definition],
+    )
+    prompt = json.loads(
+        stage2_analysis._extraction_prompt(
+            definitions=[definition],
+            rows=[{"row_id": 7, "text": "PD-L1 TPS was reported as <1%."}],
+        )[1]["content"]
+    )
+    frame = pd.DataFrame(
+        {
+            "_oci_row_id": [0, 1, 2, 3],
+            "pd_l1_tumor_proportion_score": [50.0, "<1%", 20.0, None],
+        }
+    )
+    summary = stage2_analysis.feature_summaries(frame, [definition])[0]
+    hybrid = {
+        **definition,
+        "modeling_strategy": "continuous_with_categorical_fallback",
+    }
+    encoded = stage2_analysis._FeatureEncoder([hybrid]).fit(frame).transform(frame)
+
+    assert validated["rows"][0]["values"]["pd_l1_tumor_proportion_score"] == "<1%"
+    assert "categorical/threshold string" in prompt["features"][0][
+        "accepted_representations"
+    ]
+    assert summary["numeric_nonmissing"] == 2
+    assert summary["categorical_fallback_nonmissing"] == 1
+    assert summary["categorical_fallback_values"] == {"<1%": 1}
+    assert summary["recommended_modeling_strategy"] == (
+        "continuous_with_categorical_fallback"
+    )
+    assert encoded.shape == (4, 5)
+    assert np.isfinite(encoded).all()
+    assert encoded[1, 3] == 1.0
+
+
+def test_review_agent_selects_continuous_feature_modeling_strategy():
+    definition = {
+        "feature_id": "feature_001",
+        "name": "biomarker_score",
+        "value_type": "continuous",
+        "modeling_strategy": "continuous",
+    }
+    summary = {
+        "feature_id": "feature_001",
+        "numeric_nonmissing": 70,
+        "categorical_fallback_nonmissing": 20,
+    }
+    review = stage2_analysis._validate_review(
+        {
+            "feature_decisions": [
+                {
+                    "feature_id": "feature_001",
+                    "action": "keep",
+                    "reason": "Both representations carry held-out signal.",
+                    "modeling_strategy": "continuous_with_categorical_fallback",
+                }
+            ]
+        },
+        definitions=[definition],
+        summaries=[summary],
+        allow_measurement_revision=False,
+    )
+    updated, measurement_changed = stage2_analysis._apply_review([definition], review)
+
+    assert updated[0]["modeling_strategy"] == (
+        "continuous_with_categorical_fallback"
+    )
+    assert measurement_changed is False
+    assert stage2_analysis._changed_feature_representation_ids(
+        [definition], updated
+    ) == {"feature_001"}
+
+
 def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Path):
     definition = {
         "name": "performance_status",
@@ -4804,6 +4901,14 @@ def test_stage2_review_partitions_complete_feature_diagnostics_and_resumes(
         "baseline": {"outcome_log_loss": 0.7},
         "with_extracted_features": {"outcome_log_loss": 0.6},
         "improvement_positive_is_better": {"outcome_log_loss": 0.1},
+        "individual_feature_signal": [
+            {
+                "feature_id": feature["feature_id"],
+                "name": feature["name"],
+                "role_signals": {"confounder": {"supported": True}},
+            }
+            for feature in definitions
+        ],
         "leave_one_feature_out": [
             {
                 "feature_id": feature["feature_id"],
@@ -4826,6 +4931,10 @@ def test_stage2_review_partitions_complete_feature_diagnostics_and_resumes(
             row["feature_id"]
             for row in body["inner_validation_performance"]["leave_one_feature_out"]
         } == set(detailed_ids)
+        assert {
+            row["feature_id"]
+            for row in body["inner_validation_performance"]["individual_feature_signal"]
+        } == set(detailed_ids)
         return validate(
             {
                 "feature_decisions": [
@@ -4833,6 +4942,7 @@ def test_stage2_review_partitions_complete_feature_diagnostics_and_resumes(
                         "feature_id": feature_id,
                         "action": "keep",
                         "reason": "Usable training-fold measurement.",
+                        "modeling_strategy": "continuous",
                     }
                     for feature_id in detailed_ids
                 ],
@@ -4865,6 +4975,95 @@ def test_stage2_review_partitions_complete_feature_diagnostics_and_resumes(
     assert sorted(feature_id for batch in calls for feature_id in batch) == sorted(
         feature["feature_id"] for feature in definitions
     )
+
+
+def test_inner_heldout_signal_pruning_keeps_causal_roles_and_drops_noise():
+    rng = np.random.default_rng(7)
+    rows = 600
+    confounder = rng.normal(size=rows)
+    modifier = rng.choice([-1.0, 1.0], size=rows)
+    noise = rng.normal(size=rows)
+    treatment_probability = 1.0 / (1.0 + np.exp(-1.5 * confounder))
+    treatment = rng.binomial(1, treatment_probability)
+    outcome = (
+        2.0 * confounder
+        + treatment * (1.0 + 2.0 * modifier)
+        + rng.normal(scale=0.4, size=rows)
+    )
+    dataset = pd.DataFrame({"treatment": treatment, "outcome": outcome})
+    extracted = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(rows),
+            "confounder": confounder,
+            "modifier": modifier,
+            "noise": noise,
+        }
+    )
+    definitions = [
+        {
+            "feature_id": "feature_confounder",
+            "name": "confounder",
+            "value_type": "continuous",
+            "modeling_strategy": "continuous",
+            "roles": ["confounder"],
+        },
+        {
+            "feature_id": "feature_modifier",
+            "name": "modifier",
+            "value_type": "continuous",
+            "modeling_strategy": "continuous",
+            "roles": ["effect_modifier"],
+        },
+        {
+            "feature_id": "feature_noise",
+            "name": "noise",
+            "value_type": "continuous",
+            "modeling_strategy": "continuous",
+            "roles": ["confounder", "effect_modifier"],
+        },
+    ]
+    row_ids = np.arange(rows)
+    split = {
+        "fit_row_ids": row_ids.tolist(),
+        "heldout_row_ids": [],
+        "inner_splits": [
+            {
+                "inner_fold": fold + 1,
+                "fit_row_ids": np.setdiff1d(row_ids, row_ids[fold::3]).tolist(),
+                "heldout_row_ids": row_ids[fold::3].tolist(),
+            }
+            for fold in range(3)
+        ],
+    }
+
+    performance = stage2_analysis.evaluate_definitions(
+        dataset=dataset,
+        extracted=extracted,
+        definitions=definitions,
+        split=split,
+        treatment_column="treatment",
+        outcome_column="outcome",
+        outcome_type="continuous",
+        inner_folds=3,
+        seed=13,
+        propensity_clip=0.02,
+    )
+    retained, report = stage2_analysis._apply_empirical_signal_pruning(
+        definitions,
+        performance,
+    )
+
+    assert [feature["feature_id"] for feature in retained] == [
+        "feature_confounder",
+        "feature_modifier",
+    ]
+    signals = {
+        row["feature_id"]: row for row in performance["individual_feature_signal"]
+    }
+    assert signals["feature_confounder"]["role_signals"]["confounder"]["supported"]
+    assert signals["feature_modifier"]["role_signals"]["effect_modifier"]["supported"]
+    assert signals["feature_noise"]["has_any_claimed_role_signal"] is False
+    assert report["features_dropped"] == 1
 
 
 def test_stage2_posthoc_oracle_ite_evaluation_uses_frozen_predictions(tmp_path: Path):
@@ -5228,6 +5427,22 @@ def test_training_fold_review_can_revise_then_retest_a_definition(
 
     monkeypatch.setattr(stage2_analysis, "extract_rows", tracked_extract_rows)
 
+    def retain_signal_for_revision_test(definitions, _performance, *, defer_feature_ids=None):
+        return [dict(feature) for feature in definitions], {
+            "features_evaluated": len(definitions),
+            "features_retained": len(definitions),
+            "features_dropped": 0,
+            "features_with_roles_pruned": 0,
+            "features_deferred_for_re_evaluation": len(defer_feature_ids or set()),
+            "decisions": [],
+        }
+
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_apply_empirical_signal_pruning",
+        retain_signal_for_revision_test,
+    )
+
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
         jobs.append(body["job"])
@@ -5309,6 +5524,7 @@ def test_training_fold_review_can_revise_then_retest_a_definition(
 
 def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
     tmp_path: Path,
+    monkeypatch,
 ):
     dataset = pd.DataFrame(
         {
@@ -5342,6 +5558,22 @@ def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
         ],
     }
     jobs = []
+
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_apply_empirical_signal_pruning",
+        lambda definitions, _performance, *, defer_feature_ids=None: (
+            [dict(feature) for feature in definitions],
+            {
+                "features_evaluated": len(definitions),
+                "features_retained": len(definitions),
+                "features_dropped": 0,
+                "features_with_roles_pruned": 0,
+                "features_deferred_for_re_evaluation": len(defer_feature_ids or set()),
+                "decisions": [],
+            },
+        ),
+    )
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
@@ -5524,6 +5756,7 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
             "roles": ["confounder", "effect_modifier"],
             "measurement_definition": "Extract age in years.",
             "missing_value_rule": "Use null when undocumented.",
+            "configured_explicit_feature": True,
         },
         {
             "feature_id": "outer_001_feature_002",
@@ -5569,6 +5802,7 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
                         "feature_id": "outer_001_feature_001",
                         "action": "keep",
                         "reason": "Age remains usable.",
+                        "modeling_strategy": "continuous",
                     },
                     {
                         "feature_id": "outer_001_feature_002",
@@ -5605,6 +5839,16 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
     )
 
     assert [feature["name"] for feature in result["features"]] == ["age"]
+    assert result["evaluation_rounds"] == 2
+    second_performance = json.loads(
+        (output / "review" / "round_002" / "performance.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [
+        row["feature_id"] for row in second_performance["individual_feature_signal"]
+    ] == ["outer_001_feature_001"]
+    assert len(second_performance["leave_one_feature_out"]) == 1
     assert ("age", "blood_pressure") in extraction_feature_sets
     assert extraction_feature_sets.count(("age",)) == 24
     final_fit = pd.read_csv(output / "extraction" / "fit" / "extracted.csv")
@@ -5634,6 +5878,7 @@ def test_final_training_extraction_fails_fast_when_effectively_all_null(
         "roles": ["confounder", "effect_modifier"],
         "measurement_definition": "Extract age in years.",
         "missing_value_rule": "Use null when undocumented.",
+        "configured_explicit_feature": True,
     }
     fit_ids = list(range(6))
     split = {
@@ -5664,6 +5909,7 @@ def test_final_training_extraction_fails_fast_when_effectively_all_null(
                         "feature_id": "outer_001_feature_001",
                         "action": "keep",
                         "reason": "Retain for the final health check.",
+                        "modeling_strategy": "continuous",
                     }
                 ],
                 "overall_assessment": "No measured values.",

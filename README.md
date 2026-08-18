@@ -866,14 +866,30 @@ are ignored. If one batch remains structurally invalid after bounded repairs,
 that batch is recorded as a conservative passthrough and all its candidates are
 retained, so a malformed optional consolidation response cannot discard an
 explicit feature or abort the fold. Stage 2 then extracts the variables on the
-outer training rows and measures missingness, variation,
-treatment prediction, outcome prediction, and residual-effect performance by
-inner validation. Leave-one-feature-out measurements show whether each variable
-improves or degrades those metrics relative to the complete extracted feature
-set. The language model may revise an extraction definition and repeat this
-training-fold evaluation for at most `max_review_rounds`. In the last round it
-may retain or drop a variable but may not introduce an unevaluated measurement
-definition.
+outer training rows and measures missingness, variation, treatment prediction,
+outcome prediction, and residual-effect performance by inner validation. A
+feature defined as continuous may preserve a documented category or threshold
+when the record has no exact number. The training-fold reviewer sees the
+numeric-versus-categorical distribution and chooses a continuous, categorical,
+or hybrid modeling representation; categorical fallbacks are not silently
+discarded or coerced to invented numbers. Leave-one-feature-out measurements
+show whether each variable improves or degrades the complete extracted feature
+set.
+
+Feature retention also has a deterministic inner-held-out signal gate. Each
+feature is entered alone into models trained on every inner-fit split and scored
+only on that split's held-out rows. A proposed confounder must improve both
+treatment and outcome prediction, an effect modifier must improve residual-effect
+R-loss, and a prognostic variable must improve outcome prediction, with positive
+aggregate improvement and support in at least half of the evaluated inner folds.
+Unsupported roles are removed; a non-explicit feature is dropped when no claimed
+role remains supported. Investigator-configured features remain immutable. The
+language model may revise an extraction definition for at most
+`max_review_rounds`. Every definition, modeling-representation, role, or feature
+set change—including an ordinary drop—forces another extraction/evaluation
+round. After the final allowed language-model review, evaluation-only rounds
+continue until the retained feature set is unchanged, so the final set is always
+rescored.
 
 Each patient extraction also records feature-attributable validation failures.
 After the training patients finish, Stage 2 aggregates repeated failures across

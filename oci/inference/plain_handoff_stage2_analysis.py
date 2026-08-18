@@ -27,18 +27,19 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_extraction_v3_nonreasoning_request"
+    "stage2_single_patient_extraction_v4_continuous_category_fallback"
 )
 EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_feature_batch_extraction_v2_nonreasoning_request"
+    "stage2_single_patient_feature_batch_extraction_v3_continuous_category_fallback"
 )
 PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_page_extraction_v2_nonreasoning_request"
+    "stage2_single_patient_page_extraction_v3_continuous_category_fallback"
 )
 PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_lossless_feature_partition_reconciliation_v3_nonreasoning_request"
+    "stage2_lossless_feature_partition_reconciliation_v4_continuous_category_fallback"
 )
-REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v2_request_policy"
+REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v3_signal_pruning"
+ESTIMATION_CHECKPOINT_SCHEMA_VERSION = "stage2_outer_estimation_v2_modeling_strategy"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
 ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_training_failure_ontology_refinement_v2_request_policy"
@@ -62,9 +63,20 @@ class RequestJSON(Protocol):
 
 _SCALAR_EXTRACTION_RULES = (
     "Return one scalar value or null per feature; never return an object or array.",
-    "For a continuous feature return one JSON number: from a composite such as "
-    "147/93, use only a component explicitly named by the feature; if the definition "
-    "requests multiple components, return null rather than a ratio string or aggregate.",
+    "For a continuous feature, return one JSON number whenever the record supplies the "
+    "requested numeric measurement. If the record supplies only a documented categorical "
+    "or threshold representation of that same measurement, return that one concise string "
+    "instead of discarding it or inventing a number. From a composite such as 147/93, use "
+    "only a component explicitly named by the feature; if the definition requests multiple "
+    "components, return null rather than a ratio string or aggregate.",
+)
+
+CONTINUOUS_MODELING_STRATEGIES = frozenset(
+    {
+        "continuous",
+        "categorical",
+        "continuous_with_categorical_fallback",
+    }
 )
 
 
@@ -151,6 +163,24 @@ def _value_fingerprint(value: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _frame_fingerprint(frame: pd.DataFrame) -> str:
+    """Fingerprint ordered modeling values for checkpoint compatibility."""
+
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {
+                "columns": list(map(str, frame.columns)),
+                "dtypes": [str(dtype) for dtype in frame.dtypes],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    digest.update(pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _clean_scalar(value: Any) -> Any:
@@ -305,6 +335,11 @@ def _prompt_feature_definitions(
         }
         if str(row.get("value_type")) in {"binary", "categorical", "ordinal"}:
             row["categories_or_unit"] = _declared_categories(row)
+        if str(row.get("value_type")) == "continuous":
+            row["accepted_representations"] = (
+                "one JSON number, or one documented categorical/threshold string when "
+                "the numeric measurement is unavailable"
+            )
         output.append(row)
     return output
 
@@ -1208,19 +1243,25 @@ def _validate_extraction(
             if _is_missing_scalar(extracted) and _canonical_category(extracted, declared) is None:
                 extracted = None
             if extracted is not None and value_type == "continuous":
-                if isinstance(extracted, bool) or not isinstance(extracted, (int, float)):
+                if isinstance(extracted, bool) or not isinstance(extracted, (int, float, str)):
                     value_issues.append(
                         {
                             "row_id": row_id,
                             "feature_name": name,
                             "value_type": value_type,
-                            "reason": "requires one JSON number or null",
+                            "reason": (
+                                "requires one JSON number, one documented categorical or "
+                                "threshold string, or null"
+                            ),
                             "prior_extracted_value": extracted,
                         }
                     )
                     clean_values[name] = extracted
                     continue
-                extracted = float(extracted)
+                if isinstance(extracted, (int, float)):
+                    extracted = float(extracted)
+                else:
+                    extracted = extracted.strip()
             elif extracted is not None and value_type in {"binary", "categorical", "ordinal"}:
                 canonical = _canonical_category(extracted, declared) if declared else str(extracted)
                 if canonical is None:
@@ -2182,6 +2223,30 @@ def extract_rows(
     return frame
 
 
+def _feature_modeling_strategy(feature: Mapping[str, Any]) -> str:
+    value_type = str(feature.get("value_type") or "ambiguous").strip().lower()
+    if value_type != "continuous":
+        return "categorical"
+    strategy = str(feature.get("modeling_strategy") or "continuous").strip().lower()
+    if strategy not in CONTINUOUS_MODELING_STRATEGIES:
+        raise ValueError(
+            f"continuous feature {feature.get('name')!r} has unsupported "
+            f"modeling_strategy {strategy!r}"
+        )
+    return strategy
+
+
+def _normalized_feature_modeling_definition(
+    feature: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(feature)
+    if str(normalized.get("value_type") or "ambiguous").strip().lower() == "continuous":
+        normalized["modeling_strategy"] = _feature_modeling_strategy(normalized)
+    else:
+        normalized.pop("modeling_strategy", None)
+    return normalized
+
+
 def feature_summaries(
     frame: pd.DataFrame,
     definitions: Sequence[Mapping[str, Any]],
@@ -2204,10 +2269,34 @@ def feature_summaries(
             "dominant_value_fraction": dominant,
             "most_common_values": {str(key): int(count) for key, count in counts.head(8).items()},
         }
-        if str(feature.get("value_type")) == "continuous" and len(nonmissing):
-            numeric = pd.to_numeric(nonmissing, errors="coerce").dropna()
-            summary["numeric_mean"] = float(numeric.mean()) if len(numeric) else None
-            summary["numeric_sd"] = float(numeric.std(ddof=0)) if len(numeric) else None
+        if str(feature.get("value_type")) == "continuous":
+            numeric_values = pd.to_numeric(nonmissing, errors="coerce")
+            numeric = numeric_values.dropna()
+            categorical = nonmissing.loc[numeric_values.isna()].astype(str)
+            categorical_counts = categorical.value_counts()
+            summary.update(
+                {
+                    "numeric_nonmissing": int(len(numeric)),
+                    "numeric_nonmissing_fraction": float(len(numeric) / row_count),
+                    "categorical_fallback_nonmissing": int(len(categorical)),
+                    "categorical_fallback_nonmissing_fraction": float(
+                        len(categorical) / row_count
+                    ),
+                    "categorical_fallback_values": {
+                        str(key): int(count)
+                        for key, count in categorical_counts.head(12).items()
+                    },
+                    "numeric_mean": float(numeric.mean()) if len(numeric) else None,
+                    "numeric_sd": float(numeric.std(ddof=0)) if len(numeric) else None,
+                    "recommended_modeling_strategy": (
+                        "continuous_with_categorical_fallback"
+                        if len(numeric) and len(categorical)
+                        else "categorical"
+                        if len(categorical)
+                        else "continuous"
+                    ),
+                }
+            )
         summaries.append(summary)
     return summaries
 
@@ -2277,18 +2366,33 @@ class _FeatureEncoder:
         self.encodings = []
         for feature in self.definitions:
             name = str(feature["name"])
-            value_type = str(feature.get("value_type") or "ambiguous")
+            modeling_strategy = _feature_modeling_strategy(feature)
             series = frame[name] if name in frame else pd.Series([None] * len(frame))
-            if value_type == "continuous":
+            if modeling_strategy in {
+                "continuous",
+                "continuous_with_categorical_fallback",
+            }:
                 numeric = pd.to_numeric(series, errors="coerce")
                 median = float(numeric.median()) if numeric.notna().any() else 0.0
                 scale = float(numeric.fillna(median).std(ddof=0))
-                self.encodings.append((name, "continuous", (median, scale or 1.0)))
+                if modeling_strategy == "continuous":
+                    parameters: Any = (median, scale or 1.0)
+                else:
+                    fallback_mask = series.notna() & numeric.isna()
+                    fallback_categories = sorted(
+                        str(item) for item in series.loc[fallback_mask].astype(str).unique()
+                    )
+                    parameters = (median, scale or 1.0, fallback_categories)
+                self.encodings.append((name, modeling_strategy, parameters))
             else:
-                declared = _declared_categories(feature)
+                closed_ontology = str(
+                    feature.get("value_type") or "ambiguous"
+                ) in {"binary", "categorical", "ordinal"}
+                declared = _declared_categories(feature) if closed_ontology else []
                 observed = [str(item) for item in series.dropna().astype(str).unique()]
                 categories = list(dict.fromkeys([*declared, *sorted(observed), "__missing__"]))
-                self.encodings.append((name, "categorical", categories))
+                encoding = "categorical" if closed_ontology else "categorical_with_other"
+                self.encodings.append((name, encoding, categories))
         return self
 
     def transform(self, frame: pd.DataFrame) -> np.ndarray:
@@ -2301,10 +2405,36 @@ class _FeatureEncoder:
                 missing = numeric.isna().to_numpy(dtype=float)
                 values = (numeric.fillna(median).to_numpy(dtype=float) - median) / scale
                 columns.extend([values, missing])
+            elif value_type == "continuous_with_categorical_fallback":
+                median, scale, categories = parameters
+                numeric = pd.to_numeric(series, errors="coerce")
+                raw_missing = series.isna()
+                categorical_mask = series.notna() & numeric.isna()
+                normalized = series.where(categorical_mask, "").astype(str)
+                values = (numeric.fillna(median).to_numpy(dtype=float) - median) / scale
+                columns.extend(
+                    [
+                        values,
+                        numeric.notna().to_numpy(dtype=float),
+                        raw_missing.to_numpy(dtype=float),
+                    ]
+                )
+                for category in categories:
+                    columns.append(
+                        (categorical_mask & (normalized == category)).to_numpy(dtype=float)
+                    )
+                columns.append(
+                    (
+                        categorical_mask
+                        & ~normalized.isin(categories)
+                    ).to_numpy(dtype=float)
+                )
             else:
                 normalized = series.where(series.notna(), "__missing__").astype(str)
                 for category in parameters:
                     columns.append((normalized == category).to_numpy(dtype=float))
+                if value_type == "categorical_with_other":
+                    columns.append((~normalized.isin(parameters)).to_numpy(dtype=float))
         if not columns:
             return np.empty((len(frame), 0), dtype=float)
         return np.column_stack(columns).astype(float, copy=False)
@@ -2521,6 +2651,102 @@ def _prediction_metrics(
     return metrics
 
 
+def _metric_improvements(
+    baseline: Mapping[str, Any],
+    enhanced: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Orient every validation metric so positive values mean improvement."""
+
+    improvements: dict[str, Any] = {}
+    for key in sorted(set(baseline).intersection(enhanced)):
+        if baseline[key] is None or enhanced[key] is None:
+            improvements[key] = None
+        elif key.endswith("auc") or key.endswith("r2"):
+            improvements[key] = float(enhanced[key] - baseline[key])
+        else:
+            improvements[key] = float(baseline[key] - enhanced[key])
+    return improvements
+
+
+def _heldout_signal_diagnostic(
+    performance: Mapping[str, Any],
+    *,
+    metric: str,
+    minimum_positive_fold_fraction: float = 0.5,
+) -> dict[str, Any]:
+    fold_values = [
+        row.get("improvement_positive_is_better", {}).get(metric)
+        for row in performance.get("inner_fold_performance") or []
+    ]
+    finite = [
+        float(value)
+        for value in fold_values
+        if value is not None and math.isfinite(value)
+    ]
+    aggregate = performance.get("improvement_positive_is_better", {}).get(metric)
+    aggregate = (
+        float(aggregate)
+        if aggregate is not None and math.isfinite(float(aggregate))
+        else None
+    )
+    positive_folds = sum(value > 0.0 for value in finite)
+    positive_fraction = float(positive_folds / len(finite)) if finite else 0.0
+    return {
+        "metric": metric,
+        "aggregate_improvement": aggregate,
+        "fold_improvements": finite,
+        "positive_folds": int(positive_folds),
+        "evaluated_folds": int(len(finite)),
+        "positive_fold_fraction": positive_fraction,
+        "minimum_positive_fold_fraction": float(minimum_positive_fold_fraction),
+        "supported": bool(
+            aggregate is not None
+            and aggregate > 0.0
+            and positive_fraction >= float(minimum_positive_fold_fraction)
+        ),
+    }
+
+
+def _feature_role_signal_diagnostics(
+    feature: Mapping[str, Any],
+    performance: Mapping[str, Any],
+    *,
+    binary_outcome: bool,
+) -> dict[str, Any]:
+    """Evaluate each claimed causal role using predictions on inner held-out rows."""
+
+    outcome_metric = "outcome_brier" if binary_outcome else "outcome_rmse"
+    treatment = _heldout_signal_diagnostic(performance, metric="treatment_brier")
+    outcome = _heldout_signal_diagnostic(performance, metric=outcome_metric)
+    effect = _heldout_signal_diagnostic(performance, metric="effect_model_r_loss")
+    claimed_roles = list(map(str, feature.get("roles") or []))
+    role_signals: dict[str, Any] = {}
+    if "confounder" in claimed_roles:
+        role_signals["confounder"] = {
+            "supported": bool(treatment["supported"] and outcome["supported"]),
+            "requires_treatment_and_outcome_signal": True,
+            "treatment_signal": treatment,
+            "outcome_signal": outcome,
+        }
+    if "prognostic" in claimed_roles:
+        role_signals["prognostic"] = {
+            "supported": bool(outcome["supported"]),
+            "outcome_signal": outcome,
+        }
+    if "effect_modifier" in claimed_roles:
+        role_signals["effect_modifier"] = {
+            "supported": bool(effect["supported"]),
+            "residual_effect_signal": effect,
+        }
+    return {
+        "claimed_roles": claimed_roles,
+        "role_signals": role_signals,
+        "has_any_claimed_role_signal": any(
+            bool(signal.get("supported")) for signal in role_signals.values()
+        ),
+    }
+
+
 def _fallback_inner_splits(
     row_ids: Sequence[int], *, folds: int, seed: int
 ) -> list[dict[str, Any]]:
@@ -2573,6 +2799,7 @@ def evaluate_definitions(
             "base_y",
             "feature_y",
             "base_r_residual",
+            "feature_null_effect_r_residual",
             "feature_r_residual",
         )
     }
@@ -2580,6 +2807,7 @@ def evaluate_definitions(
     propensity_defs = _definitions_for_roles(all_defs, {"confounder"})
     effect_defs = _definitions_for_roles(all_defs, {"effect_modifier"})
     binary = str(outcome_type) == "binary"
+    fold_performance: list[dict[str, Any]] = []
 
     for fold_index, fold in enumerate(inner, start=1):
         train_ids = [int(value) for value in fold["fit_row_ids"] if int(value) in fit_ids]
@@ -2648,7 +2876,14 @@ def evaluate_definitions(
         feature_effect = _fit_effect_model(
             x_effect_train, feature_pseudo, seed=seed + 200 + fold_index, trees=None
         )
+        feature_null_effect = _fit_effect_model(
+            np.empty((len(train_ids), 0)),
+            feature_pseudo,
+            seed=seed + 200 + fold_index,
+            trees=None,
+        )
         feature_tau = feature_effect.predict(x_effect_valid)
+        feature_null_tau = feature_null_effect.predict(np.empty((len(valid_ids), 0)))
 
         predictions["t"].append(t_valid)
         predictions["y"].append(y_valid)
@@ -2658,11 +2893,50 @@ def evaluate_definitions(
         predictions["feature_y"].append(
             np.where(t_valid == 1, feature_mu1_valid, feature_mu0_valid)
         )
-        predictions["base_r_residual"].append(
-            (y_valid - base_m_valid) - (t_valid - base_e_valid) * base_tau
-        )
-        predictions["feature_r_residual"].append(
+        base_r_residual = (y_valid - base_m_valid) - (t_valid - base_e_valid) * base_tau
+        feature_r_residual = (
             (y_valid - feature_m_valid) - (t_valid - feature_e_valid) * feature_tau
+        )
+        feature_null_effect_r_residual = (
+            (y_valid - feature_m_valid)
+            - (t_valid - feature_e_valid) * feature_null_tau
+        )
+        predictions["base_r_residual"].append(base_r_residual)
+        predictions["feature_null_effect_r_residual"].append(
+            feature_null_effect_r_residual
+        )
+        predictions["feature_r_residual"].append(feature_r_residual)
+        fold_base = _prediction_metrics(
+            treatment=t_valid,
+            outcome=y_valid,
+            propensity=base_e_valid,
+            observed_outcome=np.where(t_valid == 1, base_mu1_valid, base_mu0_valid),
+            binary_outcome=binary,
+            r_loss=float(np.mean(base_r_residual**2)),
+        )
+        fold_enhanced = _prediction_metrics(
+            treatment=t_valid,
+            outcome=y_valid,
+            propensity=feature_e_valid,
+            observed_outcome=np.where(t_valid == 1, feature_mu1_valid, feature_mu0_valid),
+            binary_outcome=binary,
+            r_loss=float(np.mean(feature_r_residual**2)),
+        )
+        fold_base["effect_model_r_loss"] = float(
+            np.mean(feature_null_effect_r_residual**2)
+        )
+        fold_enhanced["effect_model_r_loss"] = float(np.mean(feature_r_residual**2))
+        fold_performance.append(
+            {
+                "inner_fold": int(fold.get("inner_fold") or fold_index),
+                "evaluation_rows": int(len(valid_ids)),
+                "baseline": fold_base,
+                "with_extracted_features": fold_enhanced,
+                "improvement_positive_is_better": _metric_improvements(
+                    fold_base,
+                    fold_enhanced,
+                ),
+            }
         )
     if not predictions["t"]:
         raise ValueError("Stage 2 empirical review has no usable inner validation folds")
@@ -2683,24 +2957,55 @@ def evaluate_definitions(
         binary_outcome=binary,
         r_loss=float(np.mean(joined["feature_r_residual"] ** 2)),
     )
-    improvements: dict[str, Any] = {}
-    for key in sorted(set(base).intersection(enhanced)):
-        if base[key] is None or enhanced[key] is None:
-            improvements[key] = None
-        elif key.endswith("auc") or key.endswith("r2"):
-            improvements[key] = float(enhanced[key] - base[key])
-        else:
-            improvements[key] = float(base[key] - enhanced[key])
+    base["effect_model_r_loss"] = float(
+        np.mean(joined["feature_null_effect_r_residual"] ** 2)
+    )
+    enhanced["effect_model_r_loss"] = float(
+        np.mean(joined["feature_r_residual"] ** 2)
+    )
+    improvements = _metric_improvements(base, enhanced)
     result: dict[str, Any] = {
         "evaluation_rows": int(len(joined["t"])),
-        "inner_folds": int(len(inner)),
+        "inner_folds": int(len(fold_performance)),
+        "inner_fold_performance": fold_performance,
         "baseline": base,
         "with_extracted_features": enhanced,
         "improvement_positive_is_better": improvements,
     }
     if include_ablation and definitions:
         ablations = []
+        individual_signals = []
         for feature in definitions:
+            singleton_result = evaluate_definitions(
+                dataset=dataset,
+                extracted=extracted,
+                definitions=[feature],
+                split=split,
+                treatment_column=treatment_column,
+                outcome_column=outcome_column,
+                outcome_type=outcome_type,
+                inner_folds=inner_folds,
+                seed=seed,
+                propensity_clip=propensity_clip,
+                include_ablation=False,
+            )
+            individual_signals.append(
+                {
+                    "feature_id": str(feature["feature_id"]),
+                    "name": str(feature["name"]),
+                    **_feature_role_signal_diagnostics(
+                        feature,
+                        singleton_result,
+                        binary_outcome=binary,
+                    ),
+                    "baseline": singleton_result["baseline"],
+                    "with_feature": singleton_result["with_extracted_features"],
+                    "improvement_positive_is_better": singleton_result[
+                        "improvement_positive_is_better"
+                    ],
+                    "inner_fold_performance": singleton_result["inner_fold_performance"],
+                }
+            )
             without = [
                 candidate
                 for candidate in definitions
@@ -2720,14 +3025,7 @@ def evaluate_definitions(
                 include_ablation=False,
             )
             without_metrics = without_result["with_extracted_features"]
-            contribution: dict[str, Any] = {}
-            for key in sorted(set(enhanced).intersection(without_metrics)):
-                if enhanced[key] is None or without_metrics[key] is None:
-                    contribution[key] = None
-                elif key.endswith("auc") or key.endswith("r2"):
-                    contribution[key] = float(enhanced[key] - without_metrics[key])
-                else:
-                    contribution[key] = float(without_metrics[key] - enhanced[key])
+            contribution = _metric_improvements(without_metrics, enhanced)
             ablations.append(
                 {
                     "feature_id": str(feature["feature_id"]),
@@ -2736,6 +3034,7 @@ def evaluate_definitions(
                     "feature_contribution_positive_is_better": contribution,
                 }
             )
+        result["individual_feature_signal"] = individual_signals
         result["leave_one_feature_out"] = ablations
     return result
 
@@ -2780,7 +3079,17 @@ def _review_prompt(
             "Use the feature-set index to recognize related or potentially redundant variables.",
             "Keep a feature when extraction is usable and its scientific role remains plausible.",
             "Drop a feature when it is essentially unmeasured, invariant, or unsupported after extraction.",
+            "The individual_feature_signal diagnostics come from models fit on each inner "
+            "training split and scored only on that split's held-out rows. A deterministic "
+            "gate will remove unsupported causal roles and will drop a feature with no "
+            "supported role; do not claim signal that those diagnostics do not show.",
             "Use leave-one-feature-out metrics to distinguish a feature's contribution from overall model performance.",
+            "For every retained continuous feature, inspect numeric_nonmissing and "
+            "categorical_fallback_nonmissing in its extraction summary and choose a "
+            "modeling_strategy. Choose continuous for usable numeric measurements, "
+            "categorical when only stable categories are available, or "
+            "continuous_with_categorical_fallback when both representations carry "
+            "information. Never invent a numeric value for a category or threshold.",
             "Use revise only to clarify how the same evidence-supported measurement is extracted.",
             "For a revised binary variable, provide exactly two distinct scalar ontology values as separate categories_or_unit array items.",
             "For a revised categorical or ordinal variable, provide at least two distinct scalar ontology values as separate categories_or_unit array items.",
@@ -2803,6 +3112,10 @@ def _review_prompt(
                     "feature_id": "one supplied feature_id",
                     "action": "keep|drop|revise",
                     "reason": "scientific and empirical reason",
+                    "modeling_strategy": (
+                        "required for every kept or revised continuous feature: "
+                        "continuous|categorical|continuous_with_categorical_fallback"
+                    ),
                     "value_type": "required only for revise",
                     "categories_or_unit": ["required only for revise"],
                     "measurement_definition": "required only for revise",
@@ -2833,6 +3146,7 @@ def _review_feature_set_index(
             "description": str(feature.get("description") or ""),
             "roles": list(feature.get("roles") or []),
             "value_type": str(feature.get("value_type") or ""),
+            "modeling_strategy": str(feature.get("modeling_strategy") or ""),
         }
         for feature in definitions
     ]
@@ -2845,11 +3159,17 @@ def _review_performance_for_features(
 ) -> dict[str, Any]:
     """Return global metrics plus each detailed feature's own ablation metrics."""
 
+    per_feature_keys = {"individual_feature_signal", "leave_one_feature_out"}
     selected = {
         key: copy.deepcopy(value)
         for key, value in performance.items()
-        if key != "leave_one_feature_out"
+        if key not in per_feature_keys
     }
+    selected["individual_feature_signal"] = [
+        copy.deepcopy(row)
+        for row in performance.get("individual_feature_signal") or []
+        if str(row.get("feature_id") or "") in feature_ids
+    ]
     selected["leave_one_feature_out"] = [
         copy.deepcopy(row)
         for row in performance.get("leave_one_feature_out") or []
@@ -2964,6 +3284,7 @@ def _validate_review(
     *,
     definitions: Sequence[Mapping[str, Any]],
     allow_measurement_revision: bool,
+    summaries: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     decisions = value.get("feature_decisions")
     if not isinstance(decisions, list):
@@ -3014,6 +3335,19 @@ def _validate_review(
                     "missing_value_rule": str(decision["missing_value_rule"]),
                 }
             )
+        resulting_value_type = str(
+            row.get("value_type") or by_id[feature_id].get("value_type") or "ambiguous"
+        )
+        if action != "drop" and resulting_value_type == "continuous":
+            modeling_strategy = str(decision.get("modeling_strategy") or "").strip().lower()
+            if not modeling_strategy and summaries is None:
+                modeling_strategy = _feature_modeling_strategy(by_id[feature_id])
+            if modeling_strategy not in CONTINUOUS_MODELING_STRATEGIES:
+                raise ValueError(
+                    "a retained continuous variable requires modeling_strategy to be "
+                    "continuous, categorical, or continuous_with_categorical_fallback"
+                )
+            row["modeling_strategy"] = modeling_strategy
         clean[feature_id] = row
     if set(clean) != set(by_id):
         raise ValueError("review must decide every supplied feature")
@@ -3103,6 +3437,10 @@ def _request_partitioned_review(
                         cached,
                         definitions=batch_definitions,
                         allow_measurement_revision=allow_measurement_revision,
+                        summaries=[
+                            summaries_by_id[str(feature["feature_id"])]
+                            for feature in batch_definitions
+                        ],
                     )
             except (
                 KeyError,
@@ -3124,6 +3462,10 @@ def _request_partitioned_review(
                     value,
                     definitions=batch_definitions,
                     allow_measurement_revision=allow_measurement_revision,
+                    summaries=[
+                        summaries_by_id[str(feature["feature_id"])]
+                        for feature in batch_definitions
+                    ],
                 ),
             )
             _write_json(result_path, batch_review)
@@ -3157,6 +3499,7 @@ def _request_partitioned_review(
         },
         definitions=definitions,
         allow_measurement_revision=allow_measurement_revision,
+        summaries=summaries,
     )
 
 
@@ -3181,8 +3524,117 @@ def _apply_review(
                 "missing_value_rule",
             ):
                 updated[key] = decision[key]
-        revised.append(updated)
+        if "modeling_strategy" in decision:
+            updated["modeling_strategy"] = decision["modeling_strategy"]
+        revised.append(_normalized_feature_modeling_definition(updated))
     return revised, measurement_changed
+
+
+def _changed_feature_representation_ids(
+    before: Sequence[Mapping[str, Any]],
+    after: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    """Identify retained features that need evaluation under a changed representation."""
+
+    before_by_id = {str(feature["feature_id"]): feature for feature in before}
+    fields = (
+        "value_type",
+        "categories_or_unit",
+        "measurement_definition",
+        "missing_value_rule",
+        "modeling_strategy",
+    )
+    changed: set[str] = set()
+    for feature in after:
+        feature_id = str(feature["feature_id"])
+        previous = before_by_id.get(feature_id)
+        if previous is None:
+            changed.add(feature_id)
+            continue
+        prior_view = {key: copy.deepcopy(previous.get(key)) for key in fields}
+        current_view = {key: copy.deepcopy(feature.get(key)) for key in fields}
+        if _value_fingerprint(prior_view) != _value_fingerprint(current_view):
+            changed.add(feature_id)
+    return changed
+
+
+def _apply_empirical_signal_pruning(
+    definitions: Sequence[Mapping[str, Any]],
+    performance: Mapping[str, Any],
+    *,
+    defer_feature_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Remove unsupported causal roles using inner-held-out singleton models.
+
+    A dual-role feature may remain under the role that validates even when its
+    other proposed role does not. Investigator-configured features are audited
+    but remain immutable.
+    """
+
+    deferred = set(defer_feature_ids or set())
+    signal_by_id = {
+        str(row["feature_id"]): row
+        for row in performance.get("individual_feature_signal") or []
+    }
+    retained: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        feature_id = str(feature["feature_id"])
+        roles = list(map(str, feature.get("roles") or []))
+        signal = signal_by_id.get(feature_id)
+        if signal is None:
+            raise ValueError(
+                f"Stage 2 signal pruning is missing inner-held-out diagnostics for {feature_id!r}"
+            )
+        role_signals = signal.get("role_signals") or {}
+        supported_roles = [
+            role
+            for role in roles
+            if bool((role_signals.get(role) or {}).get("supported"))
+        ]
+        if feature.get("configured_explicit_feature") is True:
+            retained.append(feature)
+            action = "keep_configured"
+            retained_roles = roles
+        elif feature_id in deferred:
+            retained.append(feature)
+            action = "defer_until_re_evaluated"
+            retained_roles = roles
+        elif supported_roles:
+            feature["roles"] = supported_roles
+            retained.append(feature)
+            retained_roles = supported_roles
+            action = "keep" if supported_roles == roles else "prune_unsupported_roles"
+        else:
+            retained_roles = []
+            action = "drop_no_heldout_role_signal"
+        decisions.append(
+            {
+                "feature_id": feature_id,
+                "name": str(feature["name"]),
+                "action": action,
+                "claimed_roles": roles,
+                "retained_roles": retained_roles,
+                "role_signals": copy.deepcopy(role_signals),
+            }
+        )
+    report = {
+        "schema_version": "stage2_inner_heldout_signal_pruning_v1",
+        "features_evaluated": len(definitions),
+        "features_retained": len(retained),
+        "features_dropped": sum(
+            decision["action"] == "drop_no_heldout_role_signal" for decision in decisions
+        ),
+        "features_with_roles_pruned": sum(
+            decision["action"] == "prune_unsupported_roles" for decision in decisions
+        ),
+        "features_deferred_for_re_evaluation": sum(
+            decision["action"] == "defer_until_re_evaluated" for decision in decisions
+        ),
+        "decisions": decisions,
+    }
+    return retained, report
 
 
 def _ontology_refinement_prompt(
@@ -3678,8 +4130,43 @@ def estimate_outer_fold(
 ) -> dict[str, Any]:
     complete_path = output_dir / "complete.json"
     diagnostics_path = output_dir / "diagnostics.json"
+    estimation_input_fingerprint = _value_fingerprint(
+        {
+            "schema_version": ESTIMATION_CHECKPOINT_SCHEMA_VERSION,
+            "definitions": list(definitions),
+            "split": dict(split),
+            "unit_id_column": unit_id_column,
+            "treatment_column": treatment_column,
+            "outcome_column": outcome_column,
+            "outcome_type": outcome_type,
+            "inner_folds": inner_folds,
+            "seed": seed,
+            "propensity_clip": propensity_clip,
+            "estimation_trees": estimation_trees,
+            "dataset_modeling_fingerprint": _frame_fingerprint(
+                dataset[[unit_id_column, treatment_column, outcome_column]]
+            ),
+            "extracted_fit_fingerprint": _frame_fingerprint(extracted_fit),
+            "extracted_heldout_fingerprint": _frame_fingerprint(extracted_heldout),
+        }
+    )
     if complete_path.is_file() and diagnostics_path.is_file():
-        return json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        try:
+            completion = json.loads(complete_path.read_text(encoding="utf-8"))
+            if (
+                completion.get("schema_version") == ESTIMATION_CHECKPOINT_SCHEMA_VERSION
+                and completion.get("input_fingerprint") == estimation_input_fingerprint
+            ):
+                return json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        except (
+            AttributeError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            pass
+        LOGGER.info("rerun incompatible Stage 2 outer-fold estimation: %s", output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     fit_ids = [int(value) for value in split["fit_row_ids"]]
     heldout_ids = [int(value) for value in split["heldout_row_ids"]]
@@ -3788,7 +4275,13 @@ def estimate_outer_fold(
     _write_json(diagnostics_path, diagnostics)
     _write_json(
         complete_path,
-        {"status": "complete", "completed_at": _now(), "rows": len(heldout_ids)},
+        {
+            "status": "complete",
+            "schema_version": ESTIMATION_CHECKPOINT_SCHEMA_VERSION,
+            "input_fingerprint": estimation_input_fingerprint,
+            "completed_at": _now(),
+            "rows": len(heldout_ids),
+        },
     )
     return diagnostics
 
@@ -3829,13 +4322,15 @@ def run_fold_analysis(
                 values=feature.get("categories_or_unit") or [],
                 source=f"feature {feature.get('name')!r}",
             )
-        current.append(feature)
+        current.append(_normalized_feature_modeling_definition(feature))
     final_fit_extraction: pd.DataFrame | None = None
     final_fit_definitions: list[dict[str, Any]] | None = None
-    review_rounds = 0
+    agent_review_rounds = 0
+    evaluation_rounds = 0
     ontology_refinement_rounds = 0
-    for round_index in range(1, int(config.max_review_rounds) + 1):
-        review_rounds = round_index
+    maximum_evaluation_rounds = int(config.max_review_rounds) + 4 * len(current) + 4
+    for round_index in range(1, maximum_evaluation_rounds + 1):
+        evaluation_rounds = round_index
         round_dir = output_dir / "review" / f"round_{round_index:03d}"
         _write_json(round_dir / "definitions.json", {"features": current})
         extracted, current, feedback_rounds = _extract_training_with_ontology_feedback(
@@ -3853,6 +4348,9 @@ def run_fold_analysis(
             max_refinement_rounds=max_ontology_refinement_rounds,
         )
         ontology_refinement_rounds += feedback_rounds
+        current = [
+            _normalized_feature_modeling_definition(feature) for feature in current
+        ]
         extraction_definitions = [dict(feature) for feature in current]
         _write_json(
             round_dir / "definitions_after_ontology_refinement.json",
@@ -3875,43 +4373,124 @@ def run_fold_analysis(
         _write_json(round_dir / "performance.json", performance)
         review_path = round_dir / "review.json"
         complete_path = round_dir / "complete.json"
-        allow_revision = round_index < int(config.max_review_rounds)
-        if complete_path.is_file() and review_path.is_file():
-            review = json.loads(review_path.read_text(encoding="utf-8"))
-        elif current:
-            review = _request_partitioned_review(
-                clinical_question=clinical_question,
-                definitions=current,
-                summaries=summaries,
-                performance=performance,
-                allow_measurement_revision=allow_revision,
-                min_nonmissing_fraction=config.min_nonmissing_fraction,
-                max_dominant_fraction=config.max_dominant_fraction,
-                max_prompt_chars=config.max_prompt_chars,
-                output_dir=round_dir / "review_batches",
-                request_json=request_json,
+        review_performed = bool(current) and agent_review_rounds < int(
+            config.max_review_rounds
+        )
+        review_input_fingerprint: str | None = None
+        if review_performed:
+            agent_review_rounds += 1
+            allow_revision = agent_review_rounds < int(config.max_review_rounds)
+            review_input_fingerprint = _value_fingerprint(
+                {
+                    "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+                    "clinical_question": clinical_question,
+                    "definitions": current,
+                    "summaries": summaries,
+                    "performance": performance,
+                    "allow_measurement_revision": allow_revision,
+                    "minimum_nonmissing_fraction": config.min_nonmissing_fraction,
+                    "maximum_dominant_value_fraction": config.max_dominant_fraction,
+                }
             )
-            _write_json(review_path, review)
-            _write_json(
-                complete_path,
-                {"status": "complete", "completed_at": _now()},
-            )
+            review: dict[str, Any] | None = None
+            if complete_path.is_file() and review_path.is_file():
+                try:
+                    completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                    if (
+                        completion.get("review_schema_version")
+                        == REVIEW_CHECKPOINT_SCHEMA_VERSION
+                        and completion.get("review_input_fingerprint")
+                        == review_input_fingerprint
+                    ):
+                        review = _validate_review(
+                            json.loads(review_path.read_text(encoding="utf-8")),
+                            definitions=current,
+                            allow_measurement_revision=allow_revision,
+                            summaries=summaries,
+                        )
+                except (
+                    AttributeError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    review = None
+            if review is None:
+                review = _request_partitioned_review(
+                    clinical_question=clinical_question,
+                    definitions=current,
+                    summaries=summaries,
+                    performance=performance,
+                    allow_measurement_revision=allow_revision,
+                    min_nonmissing_fraction=config.min_nonmissing_fraction,
+                    max_dominant_fraction=config.max_dominant_fraction,
+                    max_prompt_chars=config.max_prompt_chars,
+                    output_dir=round_dir / "review_batches",
+                    request_json=request_json,
+                )
+                _write_json(review_path, review)
+            reviewed, _measurement_changed = _apply_review(current, review)
         else:
-            review = {"feature_decisions": [], "overall_assessment": "No features to review."}
+            review = {
+                "feature_decisions": [],
+                "overall_assessment": (
+                    "Evaluation-only convergence round after the final allowed agent review."
+                    if current
+                    else "No retained features to review."
+                ),
+                "evaluation_only": True,
+            }
             _write_json(review_path, review)
-            _write_json(complete_path, {"status": "complete", "completed_at": _now()})
-        updated, measurement_changed = _apply_review(current, review)
+            reviewed = [dict(feature) for feature in current]
+        representation_changed_ids = _changed_feature_representation_ids(current, reviewed)
+        updated, signal_pruning = _apply_empirical_signal_pruning(
+            reviewed,
+            performance,
+            defer_feature_ids=representation_changed_ids,
+        )
+        _write_json(round_dir / "signal_pruning.json", signal_pruning)
+        definitions_changed = _value_fingerprint(current) != _value_fingerprint(updated)
         final_fit_extraction = extracted
         final_fit_definitions = extraction_definitions
         current = updated
-        if not measurement_changed:
+        _write_json(
+            complete_path,
+            {
+                "status": "complete",
+                "completed_at": _now(),
+                "evaluation_round": round_index,
+                "agent_review_performed": review_performed,
+                "agent_review_rounds": agent_review_rounds,
+                "review_schema_version": (
+                    REVIEW_CHECKPOINT_SCHEMA_VERSION if review_performed else None
+                ),
+                "review_input_fingerprint": review_input_fingerprint,
+                "definitions_changed": definitions_changed,
+                "features_retained": len(current),
+            },
+        )
+        if not definitions_changed:
             break
+    else:  # pragma: no cover - finite feature/role changes should converge first
+        raise RuntimeError("Stage 2 empirical feature pruning did not converge")
 
     if final_fit_extraction is None or final_fit_definitions is None:
         raise RuntimeError("Stage 2 review did not produce a training-fold extraction")
     names = [str(feature["name"]) for feature in current]
     if _value_fingerprint(final_fit_definitions) == _value_fingerprint(current):
         fit_selected = final_fit_extraction[["_oci_row_id", *names]].copy()
+        _write_frame(output_dir / "extraction" / "fit" / "extracted.csv", fit_selected)
+        _write_json(
+            output_dir / "extraction" / "fit" / "complete.json",
+            {
+                "status": "complete",
+                "completed_at": _now(),
+                "rows": len(fit_selected),
+                "features": len(current),
+                "reused_from_evaluation_round": evaluation_rounds,
+            },
+        )
     else:
         LOGGER.info(
             "Stage 2 final feature set changed during review; re-extracting %s "
@@ -3939,7 +4518,8 @@ def run_fold_analysis(
         output_dir / "final_definitions.json",
         {
             "features": current,
-            "review_rounds": review_rounds,
+            "review_rounds": agent_review_rounds,
+            "evaluation_rounds": evaluation_rounds,
             "ontology_refinement_rounds": ontology_refinement_rounds,
         },
     )
@@ -3990,7 +4570,8 @@ def run_fold_analysis(
     )
     return {
         "features": current,
-        "review_rounds": review_rounds,
+        "review_rounds": agent_review_rounds,
+        "evaluation_rounds": evaluation_rounds,
         "ontology_refinement_rounds": ontology_refinement_rounds,
         "estimation": diagnostics,
     }

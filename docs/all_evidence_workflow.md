@@ -661,10 +661,25 @@ not need to be regenerated when only `stage2.explicit_features` changes.
 The review boundary is deliberately fold-honest. Extraction summaries and
 performance metrics in `review/round_NNN/` contain outer-training rows only.
 Outer-held-out outcomes are not made available to definition revision or
-feature retention. The performance file includes baseline, complete-feature,
-and leave-one-feature-out measurements so that retention decisions can be tied
-to an individual extracted variable rather than to the feature set in the
-aggregate.
+feature retention. Continuous definitions accept either a numeric scalar or a
+documented categorical/threshold scalar when no exact number is reported. The
+summary records numeric and fallback-category distributions, and the reviewer
+chooses `continuous`, `categorical`, or
+`continuous_with_categorical_fallback` modeling before estimation.
+
+The performance file includes baseline, complete-feature, leave-one-feature-out,
+and singleton `individual_feature_signal` measurements. Singleton models are fit
+on inner-fit rows and evaluated on inner-held-out rows. Confounder retention
+requires held-out treatment and outcome signal, effect-modifier retention
+requires held-out R-loss improvement, and prognostic retention requires held-out
+outcome signal. A signal must improve the aggregate metric and be positive in at
+least half of evaluated inner folds. Unsupported roles are removed and a
+non-explicit feature with no supported role is dropped. Any drop, role change,
+measurement revision, or modeling-strategy change starts another evaluation
+round. Evaluation-only convergence rounds may therefore extend beyond
+`max_review_rounds`, which limits language-model reviews rather than final
+empirical certification. Each round records the deterministic decisions and
+per-role evidence in `signal_pruning.json`.
 
 Every single-patient extraction writes `extraction_issues.json`, including
 feature-attributable invalid scalar/type values and values outside a declared

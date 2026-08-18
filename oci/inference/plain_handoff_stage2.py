@@ -82,7 +82,9 @@ GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
 EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
     "training_failure_ontology_refinement_v1_explicit_feature_invariants"
 )
-OPERATIONALIZATION_SCHEMA_VERSION = "feature_name_bounded_supporting_text_v5_request_policy"
+OPERATIONALIZATION_SCHEMA_VERSION = (
+    "feature_name_bounded_supporting_text_v6_continuous_category_fallback"
+)
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v9_request_policy"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v6_request_policy"
 CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE = "configured_explicit_feature"
@@ -658,6 +660,9 @@ class PlainHandoffStage2Config:
     # longer uses a progressive or oversampled feature beam.
     consolidation_oversample_factor: int = 4
     workers: int = 4
+    # Limits language-model reviews. Deterministic evaluation-only convergence
+    # rounds may continue after this many reviews when the last review changes
+    # the retained features, causal roles, or modeling representation.
     max_review_rounds: int = 2
     ontology_refinement_min_failure_patients: int = DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS
     max_ontology_refinement_rounds: int = DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS
@@ -3492,6 +3497,7 @@ def _operationalization_prompt(
             "Specify a reproducible extraction target from a complete patient record.",
             "Do not invent an ad hoc score, formula, or index to force multiple distinct measurements into one scalar.",
             "Prefer value_type continuous, with a clinically meaningful unit when applicable, when the named feature can realistically be extracted as a numeric measurement. Use categorical or ordinal only when continuous measurement is infeasible or would misrepresent the feature.",
+            "A continuous ontology may preserve a categorical or threshold report when a patient record lacks an exact number. Describe those evidence-supported fallback representations in the measurement rule; a later training-fold review will choose continuous, categorical, or hybrid modeling from the observed distribution.",
             "For categorical or ordinal variables, enumerate the extraction ontology; for continuous variables, provide the unit when applicable.",
             "For a binary variable, categories_or_unit must contain exactly two distinct extractable scalar values as separate array items.",
             "For a categorical or ordinal variable, categories_or_unit must contain at least two distinct extractable scalar values as separate array items.",
@@ -4846,6 +4852,9 @@ class PlainHandoffStage2:
                     else {}
                 ),
                 "review_rounds": int(final.get("review_rounds") or 0),
+                "evaluation_rounds": int(
+                    final.get("evaluation_rounds") or final.get("review_rounds") or 0
+                ),
                 "ontology_refinement_rounds": int(final.get("ontology_refinement_rounds") or 0),
                 "estimation": json.loads(
                     (output_dir / "estimation" / "diagnostics.json").read_text(encoding="utf-8")
@@ -5060,6 +5069,7 @@ class PlainHandoffStage2:
             "features": analysis["features"],
             "candidate_dispositions": final.get("candidate_dispositions", {}),
             "review_rounds": analysis["review_rounds"],
+            "evaluation_rounds": analysis["evaluation_rounds"],
             "ontology_refinement_rounds": analysis["ontology_refinement_rounds"],
             "estimation": analysis["estimation"],
         }
@@ -5072,6 +5082,7 @@ class PlainHandoffStage2:
                 "evidence_input_fingerprint": evidence_input_fingerprint,
                 "features": len(completed["features"]),
                 "review_rounds": completed["review_rounds"],
+                "evaluation_rounds": completed["evaluation_rounds"],
                 "ontology_refinement_rounds": completed["ontology_refinement_rounds"],
                 "estimation": completed["estimation"],
             },

@@ -1932,7 +1932,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stage2-review-rounds",
         type=int,
-        help="maximum training-fold extraction and empirical-review rounds",
+        help=(
+            "maximum training-fold language-model review rounds; deterministic "
+            "evaluation-only convergence rounds may follow"
+        ),
     )
     parser.add_argument(
         "--stage2-extraction-feature-batch-size",
