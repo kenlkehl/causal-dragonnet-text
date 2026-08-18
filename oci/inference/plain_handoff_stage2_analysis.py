@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
@@ -38,18 +38,24 @@ PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
 PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_lossless_feature_partition_reconciliation_v4_continuous_category_fallback"
 )
-REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v3_signal_pruning"
-ESTIMATION_CHECKPOINT_SCHEMA_VERSION = "stage2_outer_estimation_v2_modeling_strategy"
+REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v4_stable_forest_pruning"
+ESTIMATION_CHECKPOINT_SCHEMA_VERSION = "stage2_outer_estimation_v3_all_forest_models"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
 ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_training_failure_ontology_refinement_v2_request_policy"
 )
+HARMONIZATION_CHECKPOINT_SCHEMA_VERSION = "stage2_mixed_value_harmonization_v1_llm_training_only"
 # Compatibility defaults for Stage 2 config objects created before ontology
 # refinement was added.  Keeping this boundary tolerant also protects a
 # long-running workflow if an older caller passes a config object directly.
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE = 10
+DEFAULT_SCREENING_TREES = 200
+DEFAULT_STABILITY_SELECTION_ROUNDS = 3
+DEFAULT_STABILITY_SELECTION_FREQUENCY = 2.0 / 3.0
+DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION = 0.01
+DEFAULT_EFFECT_MODIFIER_NEGATIVE_FOLD_FRACTION = 0.6
 
 
 class RequestJSON(Protocol):
@@ -60,6 +66,7 @@ class RequestJSON(Protocol):
         *,
         request_kind: str = "interpretation",
     ) -> dict[str, Any]: ...
+
 
 _SCALAR_EXTRACTION_RULES = (
     "Return one scalar value or null per feature; never return an object or array.",
@@ -1176,8 +1183,7 @@ def _partition_page_reconciliation_definitions(
         )
         prompt_chars = _prompt_chars(messages)
         if current and (
-            len(proposed) > int(feature_batch_size)
-            or prompt_chars > int(max_prompt_chars)
+            len(proposed) > int(feature_batch_size) or prompt_chars > int(max_prompt_chars)
         ):
             batches.append(current)
             current = [definition]
@@ -1635,11 +1641,7 @@ def extract_rows(
             definition_batches,
             start=1,
         ):
-            feature_dir = (
-                parent_dir
-                / "feature_batches"
-                / f"batch_{feature_batch_index:05d}"
-            )
+            feature_dir = parent_dir / "feature_batches" / f"batch_{feature_batch_index:05d}"
             result_path = feature_dir / "result.json"
             complete_path = feature_dir / "complete.json"
             ontology_audit_path = feature_dir / "category_ontology_repair.json"
@@ -1717,9 +1719,7 @@ def extract_rows(
                     complete_path,
                     {
                         "status": "complete",
-                        "schema_version": (
-                            EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION
-                        ),
+                        "schema_version": (EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION),
                         "input_fingerprint": input_fingerprint,
                         "completed_at": _now(),
                         "row_id": row_id,
@@ -2227,6 +2227,14 @@ def _feature_modeling_strategy(feature: Mapping[str, Any]) -> str:
     value_type = str(feature.get("value_type") or "ambiguous").strip().lower()
     if value_type != "continuous":
         return "categorical"
+    harmonization = feature.get("harmonization_plan")
+    if isinstance(harmonization, Mapping):
+        target = str(harmonization.get("target_representation") or "").strip().lower()
+        if target not in {"continuous", "categorical"}:
+            raise ValueError(
+                f"continuous feature {feature.get('name')!r} has an invalid " "harmonization target"
+            )
+        return target
     strategy = str(feature.get("modeling_strategy") or "continuous").strip().lower()
     if strategy not in CONTINUOUS_MODELING_STRATEGIES:
         raise ValueError(
@@ -2279,26 +2287,529 @@ def feature_summaries(
                     "numeric_nonmissing": int(len(numeric)),
                     "numeric_nonmissing_fraction": float(len(numeric) / row_count),
                     "categorical_fallback_nonmissing": int(len(categorical)),
-                    "categorical_fallback_nonmissing_fraction": float(
-                        len(categorical) / row_count
-                    ),
+                    "categorical_fallback_nonmissing_fraction": float(len(categorical) / row_count),
                     "categorical_fallback_values": {
-                        str(key): int(count)
-                        for key, count in categorical_counts.head(12).items()
+                        str(key): int(count) for key, count in categorical_counts.head(12).items()
                     },
                     "numeric_mean": float(numeric.mean()) if len(numeric) else None,
                     "numeric_sd": float(numeric.std(ddof=0)) if len(numeric) else None,
                     "recommended_modeling_strategy": (
                         "continuous_with_categorical_fallback"
                         if len(numeric) and len(categorical)
-                        else "categorical"
-                        if len(categorical)
-                        else "continuous"
+                        else "categorical" if len(categorical) else "continuous"
                     ),
                 }
             )
         summaries.append(summary)
     return summaries
+
+
+def _mixed_value_observations(
+    frame: pd.DataFrame,
+    feature: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Describe a continuous extraction containing numeric and text values."""
+
+    name = str(feature["name"])
+    series = frame[name] if name in frame else pd.Series([None] * len(frame))
+    nonmissing = series.dropna()
+    numeric_values = pd.to_numeric(nonmissing, errors="coerce")
+    numeric = numeric_values.dropna().astype(float)
+    categorical = nonmissing.loc[numeric_values.isna()].astype(str)
+    if not len(numeric) or not len(categorical):
+        return None
+    categorical_counts = categorical.value_counts(dropna=False)
+    quantile_probabilities = np.linspace(0.0, 1.0, min(21, len(numeric)))
+    quantiles = [
+        {
+            "probability": float(probability),
+            "value": float(numeric.quantile(float(probability))),
+        }
+        for probability in quantile_probabilities
+    ]
+    return {
+        "numeric_count": int(len(numeric)),
+        "numeric_min": float(numeric.min()),
+        "numeric_max": float(numeric.max()),
+        "numeric_quantiles": quantiles,
+        "categorical_count": int(len(categorical)),
+        "categorical_values": [
+            {"raw_value": str(raw_value), "count": int(count)}
+            for raw_value, count in categorical_counts.items()
+        ],
+    }
+
+
+def _harmonization_prompt(
+    *,
+    feature: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    prior_plan: Mapping[str, Any] | None,
+) -> list[dict[str, str]]:
+    body = {
+        "job": "harmonize_stage2_mixed_numeric_and_categorical_values",
+        "information_boundary": (
+            "The values and summaries come only from outer-training patients. "
+            "No treatment, outcome, held-out text, or held-out values are supplied."
+        ),
+        "feature": {
+            key: copy.deepcopy(feature.get(key))
+            for key in (
+                "feature_id",
+                "name",
+                "description",
+                "categories_or_unit",
+                "measurement_definition",
+                "missing_value_rule",
+            )
+        },
+        "observed_training_representations": copy.deepcopy(observations),
+        "prior_plan_to_extend_or_replace": copy.deepcopy(prior_plan),
+        "rules": [
+            "Choose one common modeling representation for every observed value.",
+            "Use target_representation=continuous only when every nonnumeric token "
+            "has an unambiguous exact numeric meaning in the feature's stated unit. "
+            "Do not invent midpoints for ranges, inequalities, or qualitative labels.",
+            "Otherwise use target_representation=categorical. Define clinically "
+            "coherent canonical categories, map every exact observed text token, and "
+            "supply ordered, exhaustive, nonoverlapping numeric bins.",
+            "For categorical numeric bins, the first lower_bound and final upper_bound "
+            "must be null. Adjacent bins must share a boundary with exactly one side inclusive.",
+            "Map an unusable text token to null rather than guessing.",
+            "This is generic value harmonization. Base the plan only on the supplied "
+            "feature definition and observed representations.",
+        ],
+        "response_schema": {
+            "target_representation": "continuous or categorical",
+            "reason": "concise scientific rationale",
+            "canonical_categories": ["empty for continuous; at least two strings for categorical"],
+            "categorical_value_map": [
+                {
+                    "raw_value": "one exact observed text token",
+                    "canonical_value": (
+                        "finite number/null for continuous; canonical category/null "
+                        "for categorical"
+                    ),
+                }
+            ],
+            "numeric_bin_rules": [
+                {
+                    "lower_bound": "number or null",
+                    "lower_inclusive": "boolean",
+                    "upper_bound": "number or null",
+                    "upper_inclusive": "boolean",
+                    "canonical_value": "canonical category",
+                }
+            ],
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You harmonize mixed representations of one clinical variable into "
+                "a loss-aware, machine-readable ontology. Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+    ]
+
+
+def _bin_contains(value: float, rule: Mapping[str, Any]) -> bool:
+    lower = rule.get("lower_bound")
+    upper = rule.get("upper_bound")
+    lower_ok = (
+        lower is None
+        or value > float(lower)
+        or (bool(rule.get("lower_inclusive")) and value == float(lower))
+    )
+    upper_ok = (
+        upper is None
+        or value < float(upper)
+        or (bool(rule.get("upper_inclusive")) and value == float(upper))
+    )
+    return bool(lower_ok and upper_ok)
+
+
+def _validate_harmonization_plan(
+    value: Mapping[str, Any],
+    *,
+    feature: Mapping[str, Any],
+    observations: Mapping[str, Any],
+) -> dict[str, Any]:
+    target = str(value.get("target_representation") or "").strip().lower()
+    if target not in {"continuous", "categorical"}:
+        raise ValueError("harmonization target_representation must be continuous or categorical")
+    reason = str(value.get("reason") or "").strip()
+    if not reason:
+        raise ValueError("harmonization requires a reason")
+    expected_raw_values = [
+        str(row["raw_value"]) for row in observations.get("categorical_values") or []
+    ]
+    raw_mapping = value.get("categorical_value_map")
+    if not isinstance(raw_mapping, list):
+        raise ValueError("harmonization requires categorical_value_map")
+    mapping_by_raw: dict[str, Any] = {}
+    for row in raw_mapping:
+        if not isinstance(row, Mapping):
+            raise ValueError("each categorical_value_map entry must be an object")
+        raw_value = str(row.get("raw_value") or "")
+        if not raw_value or raw_value in mapping_by_raw:
+            raise ValueError("categorical_value_map contains an empty or duplicate raw_value")
+        mapping_by_raw[raw_value] = row.get("canonical_value")
+    if set(mapping_by_raw) != set(expected_raw_values):
+        missing = sorted(set(expected_raw_values) - set(mapping_by_raw))
+        extra = sorted(set(mapping_by_raw) - set(expected_raw_values))
+        raise ValueError(
+            "categorical_value_map must map every exact observed text value once; "
+            f"missing={missing[:8]} extra={extra[:8]}"
+        )
+
+    raw_categories = value.get("canonical_categories")
+    raw_bins = value.get("numeric_bin_rules")
+    if not isinstance(raw_categories, list) or not isinstance(raw_bins, list):
+        raise ValueError("harmonization requires canonical_categories and numeric_bin_rules arrays")
+    categories: list[str] = []
+    bins: list[dict[str, Any]] = []
+    clean_mapping: list[dict[str, Any]] = []
+    if target == "continuous":
+        if raw_categories or raw_bins:
+            raise ValueError("continuous harmonization requires empty categories and numeric bins")
+        for raw_value in expected_raw_values:
+            canonical = mapping_by_raw[raw_value]
+            if canonical is not None:
+                if isinstance(canonical, bool) or not isinstance(canonical, (int, float)):
+                    raise ValueError(
+                        "continuous categorical mappings must be finite numbers or null"
+                    )
+                canonical = float(canonical)
+                if not math.isfinite(canonical):
+                    raise ValueError(
+                        "continuous categorical mappings must be finite numbers or null"
+                    )
+            clean_mapping.append({"raw_value": raw_value, "canonical_value": canonical})
+    else:
+        categories = [str(item).strip() for item in raw_categories]
+        if (
+            len(categories) < 2
+            or any(not item for item in categories)
+            or len(set(categories)) != len(categories)
+        ):
+            raise ValueError("categorical harmonization requires at least two distinct categories")
+        for raw_value in expected_raw_values:
+            canonical = mapping_by_raw[raw_value]
+            if canonical is not None:
+                canonical = str(canonical)
+                if canonical not in categories:
+                    raise ValueError(
+                        "categorical_value_map values must be canonical categories or null"
+                    )
+            clean_mapping.append({"raw_value": raw_value, "canonical_value": canonical})
+        if not raw_bins:
+            raise ValueError("categorical harmonization requires numeric_bin_rules")
+        for index, raw_rule in enumerate(raw_bins):
+            if not isinstance(raw_rule, Mapping):
+                raise ValueError("each numeric bin rule must be an object")
+            for label in ("lower_inclusive", "upper_inclusive"):
+                if not isinstance(raw_rule.get(label), bool):
+                    raise ValueError(f"numeric bin {label} must be a boolean")
+            lower = raw_rule.get("lower_bound")
+            upper = raw_rule.get("upper_bound")
+            for label, bound in (("lower_bound", lower), ("upper_bound", upper)):
+                if bound is not None:
+                    if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+                        raise ValueError(f"numeric bin {label} must be a number or null")
+                    if not math.isfinite(float(bound)):
+                        raise ValueError(f"numeric bin {label} must be finite or null")
+            lower = float(lower) if lower is not None else None
+            upper = float(upper) if upper is not None else None
+            if lower is not None and upper is not None and lower >= upper:
+                raise ValueError("numeric bins require lower_bound < upper_bound")
+            canonical = str(raw_rule.get("canonical_value") or "")
+            if canonical not in categories:
+                raise ValueError("numeric bin values must be canonical categories")
+            rule = {
+                "lower_bound": lower,
+                "lower_inclusive": bool(raw_rule.get("lower_inclusive")),
+                "upper_bound": upper,
+                "upper_inclusive": bool(raw_rule.get("upper_inclusive")),
+                "canonical_value": canonical,
+            }
+            if index == 0 and lower is not None:
+                raise ValueError("the first numeric bin lower_bound must be null")
+            if index > 0:
+                prior = bins[-1]
+                prior_upper = prior["upper_bound"]
+                if (
+                    prior_upper is None
+                    or lower is None
+                    or not math.isclose(
+                        float(prior_upper), float(lower), rel_tol=0.0, abs_tol=1e-12
+                    )
+                ):
+                    raise ValueError("numeric bins must be ordered and contiguous")
+                if bool(prior["upper_inclusive"]) == bool(rule["lower_inclusive"]):
+                    raise ValueError("adjacent numeric bins require exactly one inclusive boundary")
+            bins.append(rule)
+        if bins[-1]["upper_bound"] is not None:
+            raise ValueError("the final numeric bin upper_bound must be null")
+        observed_numeric = [
+            float(row["value"]) for row in observations.get("numeric_quantiles") or []
+        ]
+        if any(sum(_bin_contains(item, rule) for rule in bins) != 1 for item in observed_numeric):
+            raise ValueError("numeric bins must assign every observed numeric summary value once")
+
+    clean_mapping.sort(key=lambda row: str(row["raw_value"]))
+    return {
+        "schema_version": HARMONIZATION_CHECKPOINT_SCHEMA_VERSION,
+        "feature_id": str(feature["feature_id"]),
+        "target_representation": target,
+        "reason": reason,
+        "canonical_categories": categories,
+        "categorical_value_map": clean_mapping,
+        "numeric_bin_rules": bins,
+        "unmapped_value_rule": "null",
+        "training_observations_fingerprint": _value_fingerprint(observations),
+    }
+
+
+def _request_harmonization_plan(
+    *,
+    feature: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    prior_plan: Mapping[str, Any] | None,
+    output_dir: Path,
+    request_json: RequestJSON,
+    max_prompt_chars: int,
+) -> dict[str, Any]:
+    input_value = {
+        "schema_version": HARMONIZATION_CHECKPOINT_SCHEMA_VERSION,
+        "feature": {
+            key: copy.deepcopy(feature.get(key))
+            for key in (
+                "feature_id",
+                "name",
+                "description",
+                "categories_or_unit",
+                "measurement_definition",
+                "missing_value_rule",
+            )
+        },
+        "observations": copy.deepcopy(observations),
+        "prior_plan": copy.deepcopy(prior_plan),
+    }
+    input_fingerprint = _value_fingerprint(input_value)
+    result_path = output_dir / "result.json"
+    complete_path = output_dir / "complete.json"
+    if result_path.is_file() and complete_path.is_file():
+        try:
+            completion = json.loads(complete_path.read_text(encoding="utf-8"))
+            if (
+                completion.get("schema_version") == HARMONIZATION_CHECKPOINT_SCHEMA_VERSION
+                and completion.get("input_fingerprint") == input_fingerprint
+            ):
+                return _validate_harmonization_plan(
+                    json.loads(result_path.read_text(encoding="utf-8")),
+                    feature=feature,
+                    observations=observations,
+                )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    messages = _harmonization_prompt(
+        feature=feature,
+        observations=observations,
+        prior_plan=prior_plan,
+    )
+    prompt_chars = _prompt_chars(messages)
+    if prompt_chars > int(max_prompt_chars):
+        raise ValueError(
+            "Stage 2 mixed-value harmonization prompt exceeds max_prompt_chars "
+            f"({prompt_chars} > {max_prompt_chars}) for {feature.get('name')!r}"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        output_dir / "input.json",
+        {**input_value, "input_fingerprint": input_fingerprint},
+    )
+    plan = request_json(
+        messages,
+        lambda response: _validate_harmonization_plan(
+            response,
+            feature=feature,
+            observations=observations,
+        ),
+        request_kind="interpretation",
+    )
+    _write_json(result_path, plan)
+    _write_json(
+        complete_path,
+        {
+            "status": "complete",
+            "schema_version": HARMONIZATION_CHECKPOINT_SCHEMA_VERSION,
+            "input_fingerprint": input_fingerprint,
+            "completed_at": _now(),
+            "prompt_chars": prompt_chars,
+        },
+    )
+    return plan
+
+
+def _apply_one_harmonization_plan(
+    series: pd.Series,
+    plan: Mapping[str, Any],
+) -> tuple[pd.Series, dict[str, Any]]:
+    exact_mapping = {
+        str(row["raw_value"]): row.get("canonical_value")
+        for row in plan.get("categorical_value_map") or []
+    }
+    normalized_targets: dict[str, set[Any]] = {}
+    for raw_value, canonical in exact_mapping.items():
+        normalized_targets.setdefault(raw_value.strip().casefold(), set()).add(canonical)
+    normalized_mapping = {
+        key: next(iter(values)) for key, values in normalized_targets.items() if len(values) == 1
+    }
+    target = str(plan["target_representation"])
+    bins = list(plan.get("numeric_bin_rules") or [])
+    output: list[Any] = []
+    unmapped: list[str] = []
+    mapped_numeric = 0
+    mapped_categorical = 0
+    for raw in series.tolist():
+        if raw is None or bool(pd.isna(raw)):
+            output.append(None)
+            continue
+        numeric = pd.to_numeric(pd.Series([raw]), errors="coerce").iloc[0]
+        if pd.notna(numeric):
+            numeric_value = float(numeric)
+            if target == "continuous":
+                output.append(numeric_value)
+            else:
+                matches = [rule for rule in bins if _bin_contains(numeric_value, rule)]
+                if len(matches) == 1:
+                    output.append(str(matches[0]["canonical_value"]))
+                    mapped_numeric += 1
+                else:  # pragma: no cover - validated plans are exhaustive
+                    output.append(None)
+                    unmapped.append(str(raw))
+            continue
+        raw_value = str(raw)
+        if raw_value in exact_mapping:
+            output.append(exact_mapping[raw_value])
+            mapped_categorical += 1
+        elif raw_value.strip().casefold() in normalized_mapping:
+            output.append(normalized_mapping[raw_value.strip().casefold()])
+            mapped_categorical += 1
+        else:
+            output.append(None)
+            unmapped.append(raw_value)
+    return pd.Series(output, index=series.index, dtype=object), {
+        "target_representation": target,
+        "rows": int(len(series)),
+        "mapped_numeric_rows": int(mapped_numeric),
+        "mapped_categorical_rows": int(mapped_categorical),
+        "unmapped_nonmissing_rows": int(len(unmapped)),
+        "unmapped_value_examples": list(dict.fromkeys(unmapped))[:12],
+    }
+
+
+def _apply_harmonization_plans(
+    frame: pd.DataFrame,
+    definitions: Sequence[Mapping[str, Any]],
+    *,
+    scope: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    harmonized = frame.copy()
+    features: list[dict[str, Any]] = []
+    for feature in definitions:
+        plan = feature.get("harmonization_plan")
+        if not isinstance(plan, Mapping):
+            continue
+        name = str(feature["name"])
+        series = (
+            harmonized[name]
+            if name in harmonized
+            else pd.Series([None] * len(harmonized), index=harmonized.index)
+        )
+        harmonized[name], audit = _apply_one_harmonization_plan(series, plan)
+        features.append(
+            {
+                "feature_id": str(feature["feature_id"]),
+                "name": name,
+                **audit,
+            }
+        )
+    return harmonized, {
+        "schema_version": "stage2_applied_value_harmonization_v1",
+        "scope": scope,
+        "rows": int(len(frame)),
+        "features_harmonized": len(features),
+        "features": features,
+    }
+
+
+def _harmonize_training_extraction(
+    *,
+    extracted: pd.DataFrame,
+    definitions: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    request_json: RequestJSON,
+    max_prompt_chars: int,
+) -> tuple[pd.DataFrame, list[dict[str, Any]], dict[str, Any]]:
+    updated: list[dict[str, Any]] = []
+    newly_requested: list[str] = []
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        if str(feature.get("value_type") or "").strip().lower() == "continuous":
+            observations = _mixed_value_observations(extracted, feature)
+            if observations is not None:
+                prior_plan = feature.get("harmonization_plan")
+                if isinstance(prior_plan, Mapping):
+                    observed_raw = {
+                        str(row["raw_value"]) for row in observations["categorical_values"]
+                    }
+                    for row in prior_plan.get("categorical_value_map") or []:
+                        raw_value = str(row.get("raw_value") or "")
+                        if raw_value and raw_value not in observed_raw:
+                            observations["categorical_values"].append(
+                                {"raw_value": raw_value, "count": 0}
+                            )
+                plan: dict[str, Any] | None = None
+                if isinstance(prior_plan, Mapping):
+                    try:
+                        plan = _validate_harmonization_plan(
+                            prior_plan,
+                            feature=feature,
+                            observations=observations,
+                        )
+                    except ValueError:
+                        plan = None
+                if plan is None:
+                    feature_dir = output_dir / str(feature["feature_id"])
+                    plan = _request_harmonization_plan(
+                        feature=feature,
+                        observations=observations,
+                        prior_plan=(prior_plan if isinstance(prior_plan, Mapping) else None),
+                        output_dir=feature_dir,
+                        request_json=request_json,
+                        max_prompt_chars=max_prompt_chars,
+                    )
+                    newly_requested.append(str(feature["feature_id"]))
+                feature["harmonization_plan"] = plan
+                feature["modeling_strategy"] = str(plan["target_representation"])
+        updated.append(_normalized_feature_modeling_definition(feature))
+    harmonized, application = _apply_harmonization_plans(
+        extracted,
+        updated,
+        scope="outer_training",
+    )
+    report = {
+        **application,
+        "plans_requested_from_llm": len(newly_requested),
+        "features_requested_from_llm": newly_requested,
+    }
+    _write_frame(output_dir / "extracted_harmonized.csv", harmonized)
+    _write_json(output_dir / "harmonization.json", report)
+    return harmonized, updated, report
 
 
 def _assert_extraction_health(
@@ -2385,10 +2896,25 @@ class _FeatureEncoder:
                     parameters = (median, scale or 1.0, fallback_categories)
                 self.encodings.append((name, modeling_strategy, parameters))
             else:
-                closed_ontology = str(
+                harmonization = feature.get("harmonization_plan")
+                harmonized_categories = (
+                    [str(item) for item in harmonization.get("canonical_categories") or []]
+                    if isinstance(harmonization, Mapping)
+                    and str(harmonization.get("target_representation") or "") == "categorical"
+                    else []
+                )
+                closed_ontology = bool(harmonized_categories) or str(
                     feature.get("value_type") or "ambiguous"
-                ) in {"binary", "categorical", "ordinal"}
-                declared = _declared_categories(feature) if closed_ontology else []
+                ) in {
+                    "binary",
+                    "categorical",
+                    "ordinal",
+                }
+                declared = (
+                    harmonized_categories
+                    if harmonized_categories
+                    else _declared_categories(feature) if closed_ontology else []
+                )
                 observed = [str(item) for item in series.dropna().astype(str).unique()]
                 categories = list(dict.fromkeys([*declared, *sorted(observed), "__missing__"]))
                 encoding = "categorical" if closed_ontology else "categorical_with_other"
@@ -2424,10 +2950,7 @@ class _FeatureEncoder:
                         (categorical_mask & (normalized == category)).to_numpy(dtype=float)
                     )
                 columns.append(
-                    (
-                        categorical_mask
-                        & ~normalized.isin(categories)
-                    ).to_numpy(dtype=float)
+                    (categorical_mask & ~normalized.isin(categories)).to_numpy(dtype=float)
                 )
             else:
                 normalized = series.where(series.notna(), "__missing__").astype(str)
@@ -2469,12 +2992,29 @@ class _ConstantRegressor:
         return np.full(len(x), self.mean, dtype=float)
 
 
-def _fit_classifier(x: np.ndarray, y: np.ndarray, *, seed: int) -> Any:
-    from sklearn.linear_model import LogisticRegression
-
+def _fit_classifier(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    seed: int,
+    trees: int | None = None,
+) -> Any:
     if len(np.unique(y)) < 2 or x.shape[1] == 0:
         return _ConstantClassifier(float(np.mean(y)))
-    model = LogisticRegression(max_iter=2_000, C=1.0, random_state=seed)
+    if trees is None:
+        from sklearn.linear_model import LogisticRegression
+
+        model: Any = LogisticRegression(max_iter=2_000, C=1.0, random_state=seed)
+    else:
+        from sklearn.ensemble import RandomForestClassifier
+
+        model = RandomForestClassifier(
+            n_estimators=int(trees),
+            min_samples_leaf=max(2, min(20, len(y) // 10)),
+            max_features="sqrt",
+            n_jobs=1,
+            random_state=seed,
+        )
     model.fit(x, y.astype(int))
     return model
 
@@ -2487,12 +3027,29 @@ def _predict_probability(model: Any, x: np.ndarray) -> np.ndarray:
     return probabilities[:, classes.index(1)].astype(float)
 
 
-def _fit_regressor(x: np.ndarray, y: np.ndarray) -> Any:
-    from sklearn.linear_model import Ridge
-
+def _fit_regressor(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    seed: int,
+    trees: int | None = None,
+) -> Any:
     if x.shape[1] == 0:
         return _ConstantRegressor(float(np.mean(y)))
-    model = Ridge(alpha=1.0)
+    if trees is None:
+        from sklearn.linear_model import Ridge
+
+        model: Any = Ridge(alpha=1.0)
+    else:
+        from sklearn.ensemble import RandomForestRegressor
+
+        model = RandomForestRegressor(
+            n_estimators=int(trees),
+            min_samples_leaf=max(2, min(20, len(y) // 10)),
+            max_features="sqrt",
+            n_jobs=1,
+            random_state=seed,
+        )
     model.fit(x, y)
     return model
 
@@ -2511,6 +3068,7 @@ def _fit_outcome_models(
     *,
     binary: bool,
     seed: int,
+    trees: int | None = None,
 ) -> _OutcomeModels:
     models = []
     for arm in (0, 1):
@@ -2518,9 +3076,23 @@ def _fit_outcome_models(
         if not mask.any():
             mask = np.ones(len(treatment), dtype=bool)
         if binary:
-            models.append(_fit_classifier(x[mask], outcome[mask], seed=seed + arm))
+            models.append(
+                _fit_classifier(
+                    x[mask],
+                    outcome[mask],
+                    seed=seed + arm,
+                    trees=trees,
+                )
+            )
         else:
-            models.append(_fit_regressor(x[mask], outcome[mask]))
+            models.append(
+                _fit_regressor(
+                    x[mask],
+                    outcome[mask],
+                    seed=seed + arm,
+                    trees=trees,
+                )
+            )
     return _OutcomeModels(control=models[0], treated=models[1], binary=binary)
 
 
@@ -2678,16 +3250,10 @@ def _heldout_signal_diagnostic(
         row.get("improvement_positive_is_better", {}).get(metric)
         for row in performance.get("inner_fold_performance") or []
     ]
-    finite = [
-        float(value)
-        for value in fold_values
-        if value is not None and math.isfinite(value)
-    ]
+    finite = [float(value) for value in fold_values if value is not None and math.isfinite(value)]
     aggregate = performance.get("improvement_positive_is_better", {}).get(metric)
     aggregate = (
-        float(aggregate)
-        if aggregate is not None and math.isfinite(float(aggregate))
-        else None
+        float(aggregate) if aggregate is not None and math.isfinite(float(aggregate)) else None
     )
     positive_folds = sum(value > 0.0 for value in finite)
     positive_fraction = float(positive_folds / len(finite)) if finite else 0.0
@@ -2747,6 +3313,232 @@ def _feature_role_signal_diagnostics(
     }
 
 
+def _selection_representation_fingerprint(feature: Mapping[str, Any]) -> str:
+    """Identify the measured representation to which selection votes apply."""
+
+    fields = (
+        "value_type",
+        "categories_or_unit",
+        "measurement_definition",
+        "missing_value_rule",
+        "modeling_strategy",
+        "harmonization_plan",
+    )
+    representation = {field: copy.deepcopy(feature.get(field)) for field in fields}
+    plan = representation.get("harmonization_plan")
+    if isinstance(plan, dict):
+        plan.pop("training_observations_fingerprint", None)
+    return _value_fingerprint(representation)
+
+
+def _stability_selection_policy(config: Any) -> dict[str, Any]:
+    """Read role-stability settings from current or older config objects."""
+
+    return {
+        "minimum_evaluations": int(
+            getattr(
+                config,
+                "stability_selection_rounds",
+                DEFAULT_STABILITY_SELECTION_ROUNDS,
+            )
+        ),
+        "selection_frequency": float(
+            getattr(
+                config,
+                "stability_selection_frequency",
+                DEFAULT_STABILITY_SELECTION_FREQUENCY,
+            )
+        ),
+        "effect_modifier_negative_margin_fraction": float(
+            getattr(
+                config,
+                "effect_modifier_negative_margin_fraction",
+                DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION,
+            )
+        ),
+        "effect_modifier_negative_fold_fraction": float(
+            getattr(
+                config,
+                "effect_modifier_negative_fold_fraction",
+                DEFAULT_EFFECT_MODIFIER_NEGATIVE_FOLD_FRACTION,
+            )
+        ),
+    }
+
+
+def _modifier_negative_vote(
+    signal: Mapping[str, Any],
+    *,
+    margin_fraction: float,
+    minimum_negative_fold_fraction: float,
+) -> dict[str, Any]:
+    role_signal = (signal.get("role_signals") or {}).get("effect_modifier") or {}
+    diagnostic = role_signal.get("residual_effect_signal") or {}
+    aggregate = diagnostic.get("aggregate_improvement")
+    aggregate = (
+        float(aggregate) if aggregate is not None and math.isfinite(float(aggregate)) else None
+    )
+    baseline = (signal.get("baseline") or {}).get("effect_model_r_loss")
+    baseline = (
+        abs(float(baseline)) if baseline is not None and math.isfinite(float(baseline)) else None
+    )
+    fold_values = [
+        float(value)
+        for value in diagnostic.get("fold_improvements") or []
+        if value is not None and math.isfinite(float(value))
+    ]
+    negative_folds = sum(value < 0.0 for value in fold_values)
+    negative_fraction = float(negative_folds / len(fold_values)) if fold_values else 0.0
+    required_margin = (
+        max(1e-12, float(margin_fraction) * baseline) if baseline is not None else None
+    )
+    vote = bool(
+        aggregate is not None
+        and required_margin is not None
+        and aggregate <= -required_margin
+        and negative_fraction >= float(minimum_negative_fold_fraction)
+    )
+    return {
+        "aggregate_improvement": aggregate,
+        "baseline_effect_model_r_loss": baseline,
+        "required_negative_margin": required_margin,
+        "negative_folds": int(negative_folds),
+        "evaluated_folds": int(len(fold_values)),
+        "negative_fold_fraction": negative_fraction,
+        "minimum_negative_fold_fraction": float(minimum_negative_fold_fraction),
+        "meaningfully_negative": vote,
+    }
+
+
+def _update_stability_selection(
+    *,
+    definitions: Sequence[Mapping[str, Any]],
+    performance: Mapping[str, Any],
+    history: MutableMapping[str, list[dict[str, Any]]],
+    evaluation_round: int,
+    config: Any,
+) -> dict[str, Any]:
+    """Accumulate repeated forest-screen votes for each feature representation."""
+
+    policy = _stability_selection_policy(config)
+    signal_by_id = {
+        str(row["feature_id"]): row for row in performance.get("individual_feature_signal") or []
+    }
+    features: list[dict[str, Any]] = []
+    for feature in definitions:
+        feature_id = str(feature["feature_id"])
+        representation = _selection_representation_fingerprint(feature)
+        signal = signal_by_id.get(feature_id)
+        if signal is None:
+            raise ValueError(
+                "Stage 2 stability selection is missing inner-held-out diagnostics "
+                f"for {feature_id!r}"
+            )
+        role_signals = signal.get("role_signals") or {}
+        role_rows: dict[str, Any] = {}
+        for role in map(str, feature.get("roles") or []):
+            role_signal = role_signals.get(role) or {}
+            history_key = f"{feature_id}:{representation}:{role}"
+            observation: dict[str, Any] = {
+                "evaluation_round": int(evaluation_round),
+                "supported": bool(role_signal.get("supported")),
+            }
+            if role == "effect_modifier":
+                observation["negative_margin_diagnostic"] = _modifier_negative_vote(
+                    signal,
+                    margin_fraction=policy["effect_modifier_negative_margin_fraction"],
+                    minimum_negative_fold_fraction=policy["effect_modifier_negative_fold_fraction"],
+                )
+            observations = history.setdefault(history_key, [])
+            if not any(
+                int(row.get("evaluation_round") or -1) == int(evaluation_round)
+                for row in observations
+            ):
+                observations.append(observation)
+            evaluations = len(observations)
+            support_votes = sum(bool(row.get("supported")) for row in observations)
+            support_frequency = float(support_votes / evaluations)
+            negative_votes = sum(
+                bool((row.get("negative_margin_diagnostic") or {}).get("meaningfully_negative"))
+                for row in observations
+            )
+            negative_frequency = float(negative_votes / evaluations)
+            pending = evaluations < int(policy["minimum_evaluations"])
+            stable_positive = bool(
+                not pending and support_frequency >= float(policy["selection_frequency"])
+            )
+            stable_meaningfully_negative = bool(
+                role == "effect_modifier"
+                and not pending
+                and negative_frequency >= float(policy["selection_frequency"])
+            )
+            role_rows[role] = {
+                "evaluations": int(evaluations),
+                "support_votes": int(support_votes),
+                "support_frequency": support_frequency,
+                "meaningfully_negative_votes": int(negative_votes),
+                "meaningfully_negative_frequency": negative_frequency,
+                "pending": pending,
+                "stable_positive": stable_positive,
+                "stable_meaningfully_negative": stable_meaningfully_negative,
+                "observations": copy.deepcopy(observations),
+            }
+        features.append(
+            {
+                "feature_id": feature_id,
+                "name": str(feature["name"]),
+                "representation_fingerprint": representation,
+                "roles": role_rows,
+            }
+        )
+    return {
+        "schema_version": "stage2_role_stability_selection_v1",
+        "model_family": "random_forest",
+        "evaluation_round": int(evaluation_round),
+        "policy": policy,
+        "features": features,
+    }
+
+
+def _stable_roles_for_feature(
+    feature: Mapping[str, Any],
+    stability_selection: Mapping[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Return retained roles and explanations under asymmetric stability rules."""
+
+    feature_id = str(feature["feature_id"])
+    row = next(
+        (
+            item
+            for item in stability_selection.get("features") or []
+            if str(item.get("feature_id") or "") == feature_id
+        ),
+        None,
+    )
+    if row is None:
+        raise ValueError(f"stability selection is missing feature {feature_id!r}")
+    retained: list[str] = []
+    reasons: list[str] = []
+    role_rows = row.get("roles") or {}
+    for role in map(str, feature.get("roles") or []):
+        role_row = role_rows.get(role) or {}
+        if bool(role_row.get("pending")):
+            retained.append(role)
+            reasons.append(f"{role}: pending repeated forest screens")
+        elif role == "effect_modifier":
+            if bool(role_row.get("stable_meaningfully_negative")):
+                reasons.append("effect_modifier: pruned after stable, margin-negative R-loss")
+            else:
+                retained.append(role)
+                reasons.append("effect_modifier: retained without stable, margin-negative R-loss")
+        elif bool(role_row.get("stable_positive")):
+            retained.append(role)
+            reasons.append(f"{role}: retained by stability selection")
+        else:
+            reasons.append(f"{role}: lacked stable positive support")
+    return retained, reasons
+
+
 def _fallback_inner_splits(
     row_ids: Sequence[int], *, folds: int, seed: int
 ) -> list[dict[str, Any]]:
@@ -2779,6 +3571,7 @@ def evaluate_definitions(
     inner_folds: int,
     seed: int,
     propensity_clip: float,
+    forest_trees: int = DEFAULT_SCREENING_TREES,
     include_ablation: bool = True,
 ) -> dict[str, Any]:
     fit_ids = [int(value) for value in split["fit_row_ids"]]
@@ -2825,9 +3618,19 @@ def evaluate_definitions(
 
         base_x_train = np.empty((len(train_ids), 0), dtype=float)
         base_x_valid = np.empty((len(valid_ids), 0), dtype=float)
-        base_t_model = _fit_classifier(base_x_train, t_train, seed=seed + fold_index)
+        base_t_model = _fit_classifier(
+            base_x_train,
+            t_train,
+            seed=seed + fold_index,
+            trees=forest_trees,
+        )
         base_outcome = _fit_outcome_models(
-            base_x_train, t_train, y_train, binary=binary, seed=seed + fold_index
+            base_x_train,
+            t_train,
+            y_train,
+            binary=binary,
+            seed=seed + fold_index,
+            trees=forest_trees,
         )
         base_e_train = _predict_probability(base_t_model, base_x_train)
         base_e_valid = _predict_probability(base_t_model, base_x_valid)
@@ -2841,7 +3644,10 @@ def evaluate_definitions(
             t_train - base_e_train,
         )
         base_effect = _fit_effect_model(
-            np.empty((len(train_ids), 0)), base_pseudo, seed=seed + fold_index, trees=None
+            np.empty((len(train_ids), 0)),
+            base_pseudo,
+            seed=seed + fold_index,
+            trees=forest_trees,
         )
         base_tau = base_effect.predict(np.empty((len(valid_ids), 0)))
 
@@ -2854,9 +3660,19 @@ def evaluate_definitions(
         effect_encoder = _FeatureEncoder(effect_defs).fit(train_features)
         x_effect_train = effect_encoder.transform(train_features)
         x_effect_valid = effect_encoder.transform(valid_features)
-        feature_t_model = _fit_classifier(x_t_train, t_train, seed=seed + 100 + fold_index)
+        feature_t_model = _fit_classifier(
+            x_t_train,
+            t_train,
+            seed=seed + 100 + fold_index,
+            trees=forest_trees,
+        )
         feature_outcome = _fit_outcome_models(
-            x_y_train, t_train, y_train, binary=binary, seed=seed + 100 + fold_index
+            x_y_train,
+            t_train,
+            y_train,
+            binary=binary,
+            seed=seed + 100 + fold_index,
+            trees=forest_trees,
         )
         feature_e_train = _predict_probability(feature_t_model, x_t_train)
         feature_e_valid = _predict_probability(feature_t_model, x_t_valid)
@@ -2874,13 +3690,16 @@ def evaluate_definitions(
             t_train - feature_e_train,
         )
         feature_effect = _fit_effect_model(
-            x_effect_train, feature_pseudo, seed=seed + 200 + fold_index, trees=None
+            x_effect_train,
+            feature_pseudo,
+            seed=seed + 200 + fold_index,
+            trees=forest_trees,
         )
         feature_null_effect = _fit_effect_model(
             np.empty((len(train_ids), 0)),
             feature_pseudo,
             seed=seed + 200 + fold_index,
-            trees=None,
+            trees=forest_trees,
         )
         feature_tau = feature_effect.predict(x_effect_valid)
         feature_null_tau = feature_null_effect.predict(np.empty((len(valid_ids), 0)))
@@ -2894,17 +3713,12 @@ def evaluate_definitions(
             np.where(t_valid == 1, feature_mu1_valid, feature_mu0_valid)
         )
         base_r_residual = (y_valid - base_m_valid) - (t_valid - base_e_valid) * base_tau
-        feature_r_residual = (
-            (y_valid - feature_m_valid) - (t_valid - feature_e_valid) * feature_tau
-        )
-        feature_null_effect_r_residual = (
-            (y_valid - feature_m_valid)
-            - (t_valid - feature_e_valid) * feature_null_tau
-        )
+        feature_r_residual = (y_valid - feature_m_valid) - (t_valid - feature_e_valid) * feature_tau
+        feature_null_effect_r_residual = (y_valid - feature_m_valid) - (
+            t_valid - feature_e_valid
+        ) * feature_null_tau
         predictions["base_r_residual"].append(base_r_residual)
-        predictions["feature_null_effect_r_residual"].append(
-            feature_null_effect_r_residual
-        )
+        predictions["feature_null_effect_r_residual"].append(feature_null_effect_r_residual)
         predictions["feature_r_residual"].append(feature_r_residual)
         fold_base = _prediction_metrics(
             treatment=t_valid,
@@ -2922,9 +3736,7 @@ def evaluate_definitions(
             binary_outcome=binary,
             r_loss=float(np.mean(feature_r_residual**2)),
         )
-        fold_base["effect_model_r_loss"] = float(
-            np.mean(feature_null_effect_r_residual**2)
-        )
+        fold_base["effect_model_r_loss"] = float(np.mean(feature_null_effect_r_residual**2))
         fold_enhanced["effect_model_r_loss"] = float(np.mean(feature_r_residual**2))
         fold_performance.append(
             {
@@ -2957,14 +3769,12 @@ def evaluate_definitions(
         binary_outcome=binary,
         r_loss=float(np.mean(joined["feature_r_residual"] ** 2)),
     )
-    base["effect_model_r_loss"] = float(
-        np.mean(joined["feature_null_effect_r_residual"] ** 2)
-    )
-    enhanced["effect_model_r_loss"] = float(
-        np.mean(joined["feature_r_residual"] ** 2)
-    )
+    base["effect_model_r_loss"] = float(np.mean(joined["feature_null_effect_r_residual"] ** 2))
+    enhanced["effect_model_r_loss"] = float(np.mean(joined["feature_r_residual"] ** 2))
     improvements = _metric_improvements(base, enhanced)
     result: dict[str, Any] = {
+        "model_family": "random_forest",
+        "forest_trees": int(forest_trees),
         "evaluation_rows": int(len(joined["t"])),
         "inner_folds": int(len(fold_performance)),
         "inner_fold_performance": fold_performance,
@@ -2987,6 +3797,7 @@ def evaluate_definitions(
                 inner_folds=inner_folds,
                 seed=seed,
                 propensity_clip=propensity_clip,
+                forest_trees=forest_trees,
                 include_ablation=False,
             )
             individual_signals.append(
@@ -3022,6 +3833,7 @@ def evaluate_definitions(
                 inner_folds=inner_folds,
                 seed=seed,
                 propensity_clip=propensity_clip,
+                forest_trees=forest_trees,
                 include_ablation=False,
             )
             without_metrics = without_result["with_extracted_features"]
@@ -3079,17 +3891,27 @@ def _review_prompt(
             "Use the feature-set index to recognize related or potentially redundant variables.",
             "Keep a feature when extraction is usable and its scientific role remains plausible.",
             "Drop a feature when it is essentially unmeasured, invariant, or unsupported after extraction.",
-            "The individual_feature_signal diagnostics come from models fit on each inner "
-            "training split and scored only on that split's held-out rows. A deterministic "
-            "gate will remove unsupported causal roles and will drop a feature with no "
-            "supported role; do not claim signal that those diagnostics do not show.",
+            "Individual signals use random forests scored on inner-held-out rows.",
+            "Stability selection requires ordinary roles to earn stable positive support; "
+            "effect modifiers are removed only after stable, margin-negative R-loss. "
+            "Do not bypass that asymmetric gate.",
             "Use leave-one-feature-out metrics to distinguish a feature's contribution from overall model performance.",
-            "For every retained continuous feature, inspect numeric_nonmissing and "
-            "categorical_fallback_nonmissing in its extraction summary and choose a "
-            "modeling_strategy. Choose continuous for usable numeric measurements, "
-            "categorical when only stable categories are available, or "
-            "continuous_with_categorical_fallback when both representations carry "
-            "information. Never invent a numeric value for a category or threshold.",
+            "For every retained continuous feature, choose a modeling_strategy. Use "
+            "continuous for numeric measurements and categorical for stable categories. "
+            "Use a hybrid only when both remain and no harmonization_plan exists. Never "
+            "invent a numeric value for a category or threshold.",
+            *(
+                [
+                    "A harmonization_plan was learned from mixed outer-training values. "
+                    "Keep its target_representation as modeling_strategy unless revising "
+                    "the underlying measurement definition."
+                ]
+                if any(
+                    isinstance(feature.get("harmonization_plan"), Mapping)
+                    for feature in definitions
+                )
+                else []
+            ),
             "Use revise only to clarify how the same evidence-supported measurement is extracted.",
             "For a revised binary variable, provide exactly two distinct scalar ontology values as separate categories_or_unit array items.",
             "For a revised categorical or ordinal variable, provide at least two distinct scalar ontology values as separate categories_or_unit array items.",
@@ -3103,7 +3925,26 @@ def _review_prompt(
             ),
         ],
         "feature_set_index": list(feature_set_index or []),
-        "features": list(definitions),
+        "features": [
+            {
+                **dict(feature),
+                **(
+                    {
+                        "harmonization_plan": {
+                            key: copy.deepcopy(feature["harmonization_plan"].get(key))
+                            for key in (
+                                "target_representation",
+                                "reason",
+                                "canonical_categories",
+                            )
+                        }
+                    }
+                    if isinstance(feature.get("harmonization_plan"), Mapping)
+                    else {}
+                ),
+            }
+            for feature in definitions
+        ],
         "extraction_summaries": list(summaries),
         "inner_validation_performance": dict(performance),
         "response": {
@@ -3159,7 +4000,11 @@ def _review_performance_for_features(
 ) -> dict[str, Any]:
     """Return global metrics plus each detailed feature's own ablation metrics."""
 
-    per_feature_keys = {"individual_feature_signal", "leave_one_feature_out"}
+    per_feature_keys = {
+        "individual_feature_signal",
+        "leave_one_feature_out",
+        "stability_selection",
+    }
     selected = {
         key: copy.deepcopy(value)
         for key, value in performance.items()
@@ -3175,6 +4020,36 @@ def _review_performance_for_features(
         for row in performance.get("leave_one_feature_out") or []
         if str(row.get("feature_id") or "") in feature_ids
     ]
+    stability = performance.get("stability_selection")
+    if isinstance(stability, Mapping):
+        compact_features: list[dict[str, Any]] = []
+        for row in stability.get("features") or []:
+            if str(row.get("feature_id") or "") not in feature_ids:
+                continue
+            compact_roles = {
+                str(role): {
+                    key: copy.deepcopy(role_row.get(key))
+                    for key in (
+                        "evaluations",
+                        "support_frequency",
+                        "pending",
+                        "stable_positive",
+                        "meaningfully_negative_frequency",
+                        "stable_meaningfully_negative",
+                    )
+                }
+                for role, role_row in (row.get("roles") or {}).items()
+            }
+            compact_features.append(
+                {
+                    "feature_id": str(row.get("feature_id") or ""),
+                    "name": str(row.get("name") or ""),
+                    "roles": compact_roles,
+                }
+            )
+        selected["stability_selection"] = {
+            "features": compact_features,
+        }
     return selected
 
 
@@ -3463,8 +4338,7 @@ def _request_partitioned_review(
                     definitions=batch_definitions,
                     allow_measurement_revision=allow_measurement_revision,
                     summaries=[
-                        summaries_by_id[str(feature["feature_id"])]
-                        for feature in batch_definitions
+                        summaries_by_id[str(feature["feature_id"])] for feature in batch_definitions
                     ],
                 ),
             )
@@ -3503,20 +4377,65 @@ def _request_partitioned_review(
     )
 
 
+def _review_drop_stability_guards(
+    definitions: Sequence[Mapping[str, Any]],
+    review: Mapping[str, Any],
+    stability_selection: Mapping[str, Any],
+) -> tuple[set[str], dict[str, Any]]:
+    """Prevent one LLM review from bypassing repeated empirical selection."""
+
+    decisions = {str(row["feature_id"]): row for row in review["feature_decisions"]}
+    protected: set[str] = set()
+    audit_rows: list[dict[str, Any]] = []
+    for feature in definitions:
+        feature_id = str(feature["feature_id"])
+        if decisions[feature_id]["action"] != "drop":
+            continue
+        stable_roles, reasons = _stable_roles_for_feature(feature, stability_selection)
+        is_protected = bool(stable_roles)
+        if is_protected:
+            protected.add(feature_id)
+        audit_rows.append(
+            {
+                "feature_id": feature_id,
+                "name": str(feature["name"]),
+                "llm_action": "drop",
+                "action": (
+                    "override_drop_until_stability_rule_allows"
+                    if is_protected
+                    else "allow_drop_after_stability_rule"
+                ),
+                "roles_retained_by_stability_rule": stable_roles,
+                "reasons": reasons,
+            }
+        )
+    return protected, {
+        "schema_version": "stage2_review_drop_stability_guard_v1",
+        "llm_drop_decisions": len(audit_rows),
+        "drop_decisions_overridden": len(protected),
+        "decisions": audit_rows,
+    }
+
+
 def _apply_review(
     definitions: Sequence[Mapping[str, Any]],
     review: Mapping[str, Any],
+    *,
+    protected_drop_feature_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     decisions = {str(row["feature_id"]): row for row in review["feature_decisions"]}
+    protected = set(protected_drop_feature_ids or set())
     revised: list[dict[str, Any]] = []
     measurement_changed = False
     for feature in definitions:
-        decision = decisions[str(feature["feature_id"])]
-        if decision["action"] == "drop":
+        feature_id = str(feature["feature_id"])
+        decision = decisions[feature_id]
+        if decision["action"] == "drop" and feature_id not in protected:
             continue
         updated = dict(feature)
         if decision["action"] == "revise":
             measurement_changed = True
+            updated.pop("harmonization_plan", None)
             for key in (
                 "value_type",
                 "categories_or_unit",
@@ -3543,6 +4462,7 @@ def _changed_feature_representation_ids(
         "measurement_definition",
         "missing_value_rule",
         "modeling_strategy",
+        "harmonization_plan",
     )
     changed: set[str] = set()
     for feature in after:
@@ -3572,9 +4492,10 @@ def _apply_empirical_signal_pruning(
     """
 
     deferred = set(defer_feature_ids or set())
+    stability_selection = performance.get("stability_selection")
+    use_stability_selection = isinstance(stability_selection, Mapping)
     signal_by_id = {
-        str(row["feature_id"]): row
-        for row in performance.get("individual_feature_signal") or []
+        str(row["feature_id"]): row for row in performance.get("individual_feature_signal") or []
     }
     retained: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
@@ -3588,11 +4509,16 @@ def _apply_empirical_signal_pruning(
                 f"Stage 2 signal pruning is missing inner-held-out diagnostics for {feature_id!r}"
             )
         role_signals = signal.get("role_signals") or {}
-        supported_roles = [
-            role
-            for role in roles
-            if bool((role_signals.get(role) or {}).get("supported"))
-        ]
+        stability_reasons: list[str] = []
+        if use_stability_selection:
+            supported_roles, stability_reasons = _stable_roles_for_feature(
+                feature,
+                stability_selection,
+            )
+        else:
+            supported_roles = [
+                role for role in roles if bool((role_signals.get(role) or {}).get("supported"))
+            ]
         if feature.get("configured_explicit_feature") is True:
             retained.append(feature)
             action = "keep_configured"
@@ -3617,10 +4543,41 @@ def _apply_empirical_signal_pruning(
                 "claimed_roles": roles,
                 "retained_roles": retained_roles,
                 "role_signals": copy.deepcopy(role_signals),
+                "stability_reasons": stability_reasons,
             }
         )
+    selection_complete = True
+    if use_stability_selection:
+        for decision in decisions:
+            if decision["action"] == "defer_until_re_evaluated":
+                selection_complete = False
+                break
+            if decision["action"] == "keep_configured":
+                continue
+            feature_row = next(
+                (
+                    row
+                    for row in stability_selection.get("features") or []
+                    if str(row.get("feature_id") or "") == decision["feature_id"]
+                ),
+                None,
+            )
+            if feature_row is not None and any(
+                bool((feature_row.get("roles") or {}).get(role, {}).get("pending"))
+                for role in decision["retained_roles"]
+            ):
+                selection_complete = False
+                break
     report = {
-        "schema_version": "stage2_inner_heldout_signal_pruning_v1",
+        "schema_version": (
+            "stage2_inner_heldout_signal_pruning_v2_stability_selection"
+            if use_stability_selection
+            else "stage2_inner_heldout_signal_pruning_v1"
+        ),
+        "selection_complete": selection_complete,
+        "stability_selection": (
+            copy.deepcopy(stability_selection) if use_stability_selection else None
+        ),
         "features_evaluated": len(definitions),
         "features_retained": len(retained),
         "features_dropped": sum(
@@ -3945,6 +4902,7 @@ def _request_ontology_refinements(
                 feature[key] = copy.deepcopy(decision[key])
             after = {key: copy.deepcopy(feature.get(key)) for key in before}
             if _value_fingerprint(before) != _value_fingerprint(after):
+                feature.pop("harmonization_plan", None)
                 changed_names.append(name)
         updated.append(feature)
 
@@ -4067,6 +5025,7 @@ def _cross_fitted_nuisance(
     outcome_column: str,
     binary: bool,
     seed: int,
+    forest_trees: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     fit_ids = [int(value) for value in fit_ids]
     position = {row_id: index for index, row_id in enumerate(fit_ids)}
@@ -4091,13 +5050,19 @@ def _cross_fitted_nuisance(
         x_t_valid = t_encoder.transform(valid_features)
         x_y_train = y_encoder.transform(train_features)
         x_y_valid = y_encoder.transform(valid_features)
-        treatment_model = _fit_classifier(x_t_train, t_train, seed=seed + fold_index)
+        treatment_model = _fit_classifier(
+            x_t_train,
+            t_train,
+            seed=seed + fold_index,
+            trees=forest_trees,
+        )
         outcome_models = _fit_outcome_models(
             x_y_train,
             t_train,
             y_train,
             binary=binary,
             seed=seed + fold_index,
+            trees=forest_trees,
         )
         fold_mu0, fold_mu1 = _predict_outcomes(outcome_models, x_y_valid)
         valid_positions = [position[row_id] for row_id in valid_ids]
@@ -4184,6 +5149,7 @@ def estimate_outer_fold(
         outcome_column=outcome_column,
         binary=binary,
         seed=seed,
+        forest_trees=estimation_trees,
     )
     fit_data = dataset.iloc[fit_ids]
     heldout_data = dataset.iloc[heldout_ids]
@@ -4203,8 +5169,20 @@ def estimate_outer_fold(
     x_y_heldout = y_encoder.transform(extracted_heldout)
     x_effect_fit = effect_encoder.transform(extracted_fit)
     x_effect_heldout = effect_encoder.transform(extracted_heldout)
-    treatment_model = _fit_classifier(x_t_fit, t_fit, seed=seed + 10_000)
-    outcome_models = _fit_outcome_models(x_y_fit, t_fit, y_fit, binary=binary, seed=seed + 10_000)
+    treatment_model = _fit_classifier(
+        x_t_fit,
+        t_fit,
+        seed=seed + 10_000,
+        trees=estimation_trees,
+    )
+    outcome_models = _fit_outcome_models(
+        x_y_fit,
+        t_fit,
+        y_fit,
+        binary=binary,
+        seed=seed + 10_000,
+        trees=estimation_trees,
+    )
     propensity = _predict_probability(treatment_model, x_t_heldout)
     mu0, mu1 = _predict_outcomes(outcome_models, x_y_heldout)
     pseudo_fit = _dr_score(
@@ -4252,6 +5230,8 @@ def estimate_outer_fold(
         float(np.std(finite, ddof=1) / math.sqrt(len(finite))) if len(finite) > 1 else None
     )
     diagnostics = {
+        "model_family": "random_forest",
+        "forest_trees": int(estimation_trees),
         "rows": len(heldout_ids),
         "fit_rows": len(fit_ids),
         "features": len(definitions),
@@ -4328,7 +5308,17 @@ def run_fold_analysis(
     agent_review_rounds = 0
     evaluation_rounds = 0
     ontology_refinement_rounds = 0
-    maximum_evaluation_rounds = int(config.max_review_rounds) + 4 * len(current) + 4
+    selection_history: dict[str, list[dict[str, Any]]] = {}
+    screening_trees = int(getattr(config, "screening_trees", DEFAULT_SCREENING_TREES))
+    selection_policy = _stability_selection_policy(config)
+    maximum_evaluation_rounds = (
+        max(
+            int(config.max_review_rounds),
+            int(selection_policy["minimum_evaluations"]),
+        )
+        + 4 * len(current)
+        + 4
+    )
     for round_index in range(1, maximum_evaluation_rounds + 1):
         evaluation_rounds = round_index
         round_dir = output_dir / "review" / f"round_{round_index:03d}"
@@ -4348,14 +5338,23 @@ def run_fold_analysis(
             max_refinement_rounds=max_ontology_refinement_rounds,
         )
         ontology_refinement_rounds += feedback_rounds
-        current = [
-            _normalized_feature_modeling_definition(feature) for feature in current
-        ]
-        extraction_definitions = [dict(feature) for feature in current]
+        current = [_normalized_feature_modeling_definition(feature) for feature in current]
         _write_json(
             round_dir / "definitions_after_ontology_refinement.json",
             {"features": current, "ontology_refinement_rounds": feedback_rounds},
         )
+        extracted, current, harmonization = _harmonize_training_extraction(
+            extracted=extracted,
+            definitions=current,
+            output_dir=round_dir / "harmonization",
+            request_json=request_json,
+            max_prompt_chars=config.max_prompt_chars,
+        )
+        _write_json(
+            round_dir / "definitions_after_harmonization.json",
+            {"features": current, "harmonization": harmonization},
+        )
+        extraction_definitions = [dict(feature) for feature in current]
         summaries = feature_summaries(extracted, current)
         performance = evaluate_definitions(
             dataset=dataset,
@@ -4368,14 +5367,20 @@ def run_fold_analysis(
             inner_folds=inner_folds,
             seed=seed + 1_000 * round_index,
             propensity_clip=config.propensity_clip,
+            forest_trees=screening_trees,
+        )
+        performance["stability_selection"] = _update_stability_selection(
+            definitions=current,
+            performance=performance,
+            history=selection_history,
+            evaluation_round=round_index,
+            config=config,
         )
         _write_json(round_dir / "extraction_summary.json", summaries)
         _write_json(round_dir / "performance.json", performance)
         review_path = round_dir / "review.json"
         complete_path = round_dir / "complete.json"
-        review_performed = bool(current) and agent_review_rounds < int(
-            config.max_review_rounds
-        )
+        review_performed = bool(current) and agent_review_rounds < int(config.max_review_rounds)
         review_input_fingerprint: str | None = None
         if review_performed:
             agent_review_rounds += 1
@@ -4397,10 +5402,8 @@ def run_fold_analysis(
                 try:
                     completion = json.loads(complete_path.read_text(encoding="utf-8"))
                     if (
-                        completion.get("review_schema_version")
-                        == REVIEW_CHECKPOINT_SCHEMA_VERSION
-                        and completion.get("review_input_fingerprint")
-                        == review_input_fingerprint
+                        completion.get("review_schema_version") == REVIEW_CHECKPOINT_SCHEMA_VERSION
+                        and completion.get("review_input_fingerprint") == review_input_fingerprint
                     ):
                         review = _validate_review(
                             json.loads(review_path.read_text(encoding="utf-8")),
@@ -4430,7 +5433,20 @@ def run_fold_analysis(
                     request_json=request_json,
                 )
                 _write_json(review_path, review)
-            reviewed, _measurement_changed = _apply_review(current, review)
+            protected_drop_ids, review_drop_guard = _review_drop_stability_guards(
+                current,
+                review,
+                performance["stability_selection"],
+            )
+            _write_json(
+                round_dir / "review_drop_stability_guard.json",
+                review_drop_guard,
+            )
+            reviewed, _measurement_changed = _apply_review(
+                current,
+                review,
+                protected_drop_feature_ids=protected_drop_ids,
+            )
         else:
             review = {
                 "feature_decisions": [],
@@ -4442,6 +5458,15 @@ def run_fold_analysis(
                 "evaluation_only": True,
             }
             _write_json(review_path, review)
+            _write_json(
+                round_dir / "review_drop_stability_guard.json",
+                {
+                    "schema_version": "stage2_review_drop_stability_guard_v1",
+                    "llm_drop_decisions": 0,
+                    "drop_decisions_overridden": 0,
+                    "decisions": [],
+                },
+            )
             reviewed = [dict(feature) for feature in current]
         representation_changed_ids = _changed_feature_representation_ids(current, reviewed)
         updated, signal_pruning = _apply_empirical_signal_pruning(
@@ -4470,7 +5495,7 @@ def run_fold_analysis(
                 "features_retained": len(current),
             },
         )
-        if not definitions_changed:
+        if not definitions_changed and bool(signal_pruning.get("selection_complete", True)):
             break
     else:  # pragma: no cover - finite feature/role changes should converge first
         raise RuntimeError("Stage 2 empirical feature pruning did not converge")
@@ -4481,6 +5506,7 @@ def run_fold_analysis(
     if _value_fingerprint(final_fit_definitions) == _value_fingerprint(current):
         fit_selected = final_fit_extraction[["_oci_row_id", *names]].copy()
         _write_frame(output_dir / "extraction" / "fit" / "extracted.csv", fit_selected)
+        _write_frame(output_dir / "extraction" / "fit" / "harmonized.csv", fit_selected)
         _write_json(
             output_dir / "extraction" / "fit" / "complete.json",
             {
@@ -4490,6 +5516,19 @@ def run_fold_analysis(
                 "features": len(current),
                 "reused_from_evaluation_round": evaluation_rounds,
             },
+        )
+        fit_harmonization = {
+            "schema_version": "stage2_applied_value_harmonization_v1",
+            "scope": "outer_training_final",
+            "rows": int(len(fit_selected)),
+            "features_harmonized": sum(
+                isinstance(feature.get("harmonization_plan"), Mapping) for feature in current
+            ),
+            "reused_already_harmonized_from_evaluation_round": evaluation_rounds,
+        }
+        _write_json(
+            output_dir / "extraction" / "fit" / "harmonization.json",
+            fit_harmonization,
         )
     else:
         LOGGER.info(
@@ -4513,6 +5552,17 @@ def run_fold_analysis(
             max_refinement_rounds=max_ontology_refinement_rounds,
         )
         ontology_refinement_rounds += feedback_rounds
+        fit_selected, current, _ = _harmonize_training_extraction(
+            extracted=fit_selected,
+            definitions=current,
+            output_dir=output_dir / "extraction" / "fit" / "harmonization",
+            request_json=request_json,
+            max_prompt_chars=config.max_prompt_chars,
+        )
+        _write_frame(
+            output_dir / "extraction" / "fit" / "harmonized.csv",
+            fit_selected,
+        )
         names = [str(feature["name"]) for feature in current]
     _write_json(
         output_dir / "final_definitions.json",
@@ -4521,6 +5571,9 @@ def run_fold_analysis(
             "review_rounds": agent_review_rounds,
             "evaluation_rounds": evaluation_rounds,
             "ontology_refinement_rounds": ontology_refinement_rounds,
+            "screening_model_family": "random_forest",
+            "screening_trees": screening_trees,
+            "stability_selection_policy": selection_policy,
         },
     )
     _assert_extraction_health(
@@ -4530,7 +5583,7 @@ def run_fold_analysis(
         minimum_row_nonmissing_fraction=config.min_nonmissing_fraction,
         audit_path=output_dir / "extraction" / "fit_health.json",
     )
-    heldout_extraction = extract_rows(
+    heldout_raw_extraction = extract_rows(
         dataset=dataset,
         row_ids=heldout_ids,
         text_column=text_column,
@@ -4540,6 +5593,19 @@ def run_fold_analysis(
         workers=config.workers,
         max_prompt_chars=config.extraction_max_prompt_chars,
         feature_batch_size=extraction_feature_batch_size,
+    )
+    heldout_extraction, heldout_harmonization = _apply_harmonization_plans(
+        heldout_raw_extraction,
+        current,
+        scope="outer_heldout",
+    )
+    _write_frame(
+        output_dir / "extraction" / "heldout" / "harmonized.csv",
+        heldout_extraction,
+    )
+    _write_json(
+        output_dir / "extraction" / "heldout" / "harmonization.json",
+        heldout_harmonization,
     )
     _assert_extraction_health(
         heldout_extraction,
@@ -4573,6 +5639,9 @@ def run_fold_analysis(
         "review_rounds": agent_review_rounds,
         "evaluation_rounds": evaluation_rounds,
         "ontology_refinement_rounds": ontology_refinement_rounds,
+        "screening_model_family": "random_forest",
+        "screening_trees": screening_trees,
+        "stability_selection_policy": selection_policy,
         "estimation": diagnostics,
     }
 

@@ -677,6 +677,11 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
+    "screening_trees": 200,
+    "stability_selection_rounds": 3,
+    "stability_selection_frequency": 0.6666666667,
+    "effect_modifier_negative_margin_fraction": 0.01,
+    "effect_modifier_negative_fold_fraction": 0.6,
     "estimation_trees": 200,
     "explicit_features": []
   },
@@ -869,27 +874,27 @@ explicit feature or abort the fold. Stage 2 then extracts the variables on the
 outer training rows and measures missingness, variation, treatment prediction,
 outcome prediction, and residual-effect performance by inner validation. A
 feature defined as continuous may preserve a documented category or threshold
-when the record has no exact number. The training-fold reviewer sees the
-numeric-versus-categorical distribution and chooses a continuous, categorical,
-or hybrid modeling representation; categorical fallbacks are not silently
-discarded or coerced to invented numbers. Leave-one-feature-out measurements
-show whether each variable improves or degrades the complete extracted feature
-set.
+when the record has no exact number. When both numeric and categorical values
+appear, a separate LLM harmonization step sees only outer-training values and
+chooses one common continuous or categorical ontology. The validated plan is
+then frozen and applied deterministically to training and held-out rows;
+categorical ranges are not silently coerced to invented numeric midpoints.
+Leave-one-feature-out measurements show whether each variable improves or
+degrades the complete extracted feature set.
 
-Feature retention also has a deterministic inner-held-out signal gate. Each
-feature is entered alone into models trained on every inner-fit split and scored
-only on that split's held-out rows. A proposed confounder must improve both
-treatment and outcome prediction, an effect modifier must improve residual-effect
-R-loss, and a prognostic variable must improve outcome prediction, with positive
-aggregate improvement and support in at least half of the evaluated inner folds.
-Unsupported roles are removed; a non-explicit feature is dropped when no claimed
-role remains supported. Investigator-configured features remain immutable. The
-language model may revise an extraction definition for at most
+Feature retention uses repeated random-forest screens scored only on
+inner-held-out rows. Confounder and prognostic roles must earn stable positive
+support. Because modifiers are harder to detect, an effect modifier is retained
+unless repeated screens show R-loss deterioration beyond the configured
+negative margin with consistent negative folds. An LLM drop cannot bypass this
+stability gate. Propensity, outcome, and treatment-effect models all use forests
+when feature columns exist. Investigator-configured features remain immutable.
+The language model may revise an extraction definition for at most
 `max_review_rounds`. Every definition, modeling-representation, role, or feature
 set change—including an ordinary drop—forces another extraction/evaluation
 round. After the final allowed language-model review, evaluation-only rounds
-continue until the retained feature set is unchanged, so the final set is always
-rescored.
+continue until stability selection is complete and the retained feature set is
+unchanged, so the final set is always rescored.
 
 Each patient extraction also records feature-attributable validation failures.
 After the training patients finish, Stage 2 aggregates repeated failures across

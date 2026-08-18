@@ -57,6 +57,11 @@ effect estimates. The common controls are:
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "max_review_rounds": 2,
+    "screening_trees": 200,
+    "stability_selection_rounds": 3,
+    "stability_selection_frequency": 0.6666666667,
+    "effect_modifier_negative_margin_fraction": 0.01,
+    "effect_modifier_negative_fold_fraction": 0.6,
     "estimation_trees": 200,
     "explicit_features": []
   }

@@ -73,9 +73,12 @@ DEFAULT_CONSOLIDATION_MAX_ROUNDS = (
 )
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
-CONSOLIDATION_SCHEMA_VERSION = (
-    "global_candidate_pool_v15_request_scoped_reasoning"
-)
+DEFAULT_SCREENING_TREES = 200
+DEFAULT_STABILITY_SELECTION_ROUNDS = 3
+DEFAULT_STABILITY_SELECTION_FREQUENCY = 2.0 / 3.0
+DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION = 0.01
+DEFAULT_EFFECT_MODIFIER_NEGATIVE_FOLD_FRACTION = 0.6
+CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v15_request_scoped_reasoning"
 GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
     "alphabetical_then_seeded_shuffle_candidate_batches_v9_atomic_merge_only"
 )
@@ -666,6 +669,19 @@ class PlainHandoffStage2Config:
     max_review_rounds: int = 2
     ontology_refinement_min_failure_patients: int = DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS
     max_ontology_refinement_rounds: int = DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS
+    # Use the same nonlinear model family during training-fold screening that
+    # is used for the frozen outer-fold estimate. This applies to propensity,
+    # outcome, and treatment-effect models whenever feature columns exist.
+    screening_trees: int = DEFAULT_SCREENING_TREES
+    # Repeated forest screens provide stability-selection votes. Ordinary
+    # causal roles must earn stable positive support; effect modifiers use an
+    # asymmetric, conservative removal rule configured below.
+    stability_selection_rounds: int = DEFAULT_STABILITY_SELECTION_ROUNDS
+    stability_selection_frequency: float = DEFAULT_STABILITY_SELECTION_FREQUENCY
+    effect_modifier_negative_margin_fraction: float = (
+        DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION
+    )
+    effect_modifier_negative_fold_fraction: float = DEFAULT_EFFECT_MODIFIER_NEGATIVE_FOLD_FRACTION
     estimation_trees: int = 200
     propensity_clip: float = 0.02
     min_nonmissing_fraction: float = 0.05
@@ -716,13 +732,10 @@ class PlainHandoffStage2Config:
         ):
             if not isinstance(effort, str) or effort not in SUPPORTED_REASONING_EFFORTS:
                 raise ValueError(
-                    f"stage2.{field_name} must be one of "
-                    f"{sorted(SUPPORTED_REASONING_EFFORTS)}"
+                    f"stage2.{field_name} must be one of " f"{sorted(SUPPORTED_REASONING_EFFORTS)}"
                 )
         if self.runtime_request_kind not in STAGE2_REQUEST_KINDS:
-            raise ValueError(
-                "stage2.runtime_request_kind must be interpretation or extraction"
-            )
+            raise ValueError("stage2.runtime_request_kind must be interpretation or extraction")
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.consolidation_max_prompt_chars < 4_000:
@@ -742,9 +755,7 @@ class PlainHandoffStage2Config:
             or not isinstance(self.extraction_feature_batch_size, int)
             or self.extraction_feature_batch_size < 1
         ):
-            raise ValueError(
-                "stage2.extraction_feature_batch_size must be a positive integer"
-            )
+            raise ValueError("stage2.extraction_feature_batch_size must be a positive integer")
         if self.evidence_compiler != EVIDENCE_COMPILER_VERSION:
             raise ValueError(
                 f"stage2.evidence_compiler must be {EVIDENCE_COMPILER_VERSION}; "
@@ -794,6 +805,20 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.ontology_refinement_min_failure_patients must be at least 2")
         if self.max_ontology_refinement_rounds < 0:
             raise ValueError("stage2.max_ontology_refinement_rounds must be nonnegative")
+        if self.screening_trees < 10:
+            raise ValueError("stage2.screening_trees must be at least 10")
+        if self.stability_selection_rounds < 2:
+            raise ValueError("stage2.stability_selection_rounds must be at least 2")
+        if not 0.5 <= self.stability_selection_frequency <= 1.0:
+            raise ValueError("stage2.stability_selection_frequency must be between 0.5 and 1")
+        if not 0.0 < self.effect_modifier_negative_margin_fraction < 1.0:
+            raise ValueError(
+                "stage2.effect_modifier_negative_margin_fraction must be between 0 and 1"
+            )
+        if not 0.5 <= self.effect_modifier_negative_fold_fraction <= 1.0:
+            raise ValueError(
+                "stage2.effect_modifier_negative_fold_fraction must be between 0.5 and 1"
+            )
         if self.estimation_trees < 10:
             raise ValueError("stage2.estimation_trees must be at least 10")
         if not 0.0 < self.propensity_clip < 0.5:
@@ -810,9 +835,7 @@ class PlainHandoffStage2Config:
             or not math.isfinite(float(self.repetition_penalty))
             or self.repetition_penalty <= 0.0
         ):
-            raise ValueError(
-                "stage2.repetition_penalty must be a finite number greater than zero"
-            )
+            raise ValueError("stage2.repetition_penalty must be a finite number greater than zero")
         names: list[str] = []
         for index, feature in enumerate(self.explicit_features):
             if not isinstance(feature, Stage2ExplicitFeature):
@@ -855,9 +878,7 @@ def plain_stage2_config_from_mapping(
     if not endpoint and not model and managed_vllm is None:
         return None
     if endpoint and managed_vllm is not None:
-        raise ValueError(
-            "configure either stage2.endpoint or stage2.vllm, not both"
-        )
+        raise ValueError("configure either stage2.endpoint or stage2.vllm, not both")
     if managed_vllm is not None and not model:
         raise ValueError("stage2.model is required when stage2.vllm is configured")
     if not endpoint and managed_vllm is None:
@@ -870,6 +891,7 @@ def plain_stage2_config_from_mapping(
             "isolated to one patient per prompt",
             legacy_extraction_batch_size,
         )
+
     def architecture_names(value: Any) -> tuple[str, ...]:
         if isinstance(value, str):
             if value.strip().lower() == "all":
@@ -878,16 +900,14 @@ def plain_stage2_config_from_mapping(
         return tuple(value)
 
     if "interpretation_reasoning_effort" in raw:
-        interpretation_reasoning_effort = str(
-            raw["interpretation_reasoning_effort"]
-        ).strip().lower()
+        interpretation_reasoning_effort = (
+            str(raw["interpretation_reasoning_effort"]).strip().lower()
+        )
     elif "enable_thinking" in raw:
         legacy_enable_thinking = raw["enable_thinking"]
         if not isinstance(legacy_enable_thinking, bool):
             raise ValueError("stage2.enable_thinking must be true or false")
-        interpretation_reasoning_effort = (
-            "high" if legacy_enable_thinking else "none"
-        )
+        interpretation_reasoning_effort = "high" if legacy_enable_thinking else "none"
         LOGGER.warning(
             "stage2.enable_thinking is deprecated; use "
             "stage2.interpretation_reasoning_effort. Extraction reasoning is "
@@ -895,12 +915,16 @@ def plain_stage2_config_from_mapping(
         )
     else:
         interpretation_reasoning_effort = DEFAULT_INTERPRETATION_REASONING_EFFORT
-    extraction_reasoning_effort = str(
-        raw.get(
-            "extraction_reasoning_effort",
-            DEFAULT_EXTRACTION_REASONING_EFFORT,
+    extraction_reasoning_effort = (
+        str(
+            raw.get(
+                "extraction_reasoning_effort",
+                DEFAULT_EXTRACTION_REASONING_EFFORT,
+            )
         )
-    ).strip().lower()
+        .strip()
+        .lower()
+    )
 
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
@@ -977,14 +1001,37 @@ def plain_stage2_config_from_mapping(
                 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS,
             )
         ),
+        screening_trees=int(raw.get("screening_trees", DEFAULT_SCREENING_TREES)),
+        stability_selection_rounds=int(
+            raw.get(
+                "stability_selection_rounds",
+                DEFAULT_STABILITY_SELECTION_ROUNDS,
+            )
+        ),
+        stability_selection_frequency=float(
+            raw.get(
+                "stability_selection_frequency",
+                DEFAULT_STABILITY_SELECTION_FREQUENCY,
+            )
+        ),
+        effect_modifier_negative_margin_fraction=float(
+            raw.get(
+                "effect_modifier_negative_margin_fraction",
+                DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION,
+            )
+        ),
+        effect_modifier_negative_fold_fraction=float(
+            raw.get(
+                "effect_modifier_negative_fold_fraction",
+                DEFAULT_EFFECT_MODIFIER_NEGATIVE_FOLD_FRACTION,
+            )
+        ),
         estimation_trees=int(raw.get("estimation_trees", 200)),
         propensity_clip=float(raw.get("propensity_clip", 0.02)),
         min_nonmissing_fraction=float(raw.get("min_nonmissing_fraction", 0.05)),
         max_dominant_fraction=float(raw.get("max_dominant_fraction", 0.98)),
         temperature=float(raw.get("temperature", 0.0)),
-        repetition_penalty=float(
-            raw.get("repetition_penalty", DEFAULT_REPETITION_PENALTY)
-        ),
+        repetition_penalty=float(raw.get("repetition_penalty", DEFAULT_REPETITION_PENALTY)),
         explicit_features=explicit_features,
         vllm=managed_vllm,
     )
@@ -1462,9 +1509,7 @@ def _stage2_request_policy(
 
     kind = str(request_kind or config.runtime_request_kind).strip().lower()
     if kind not in STAGE2_REQUEST_KINDS:
-        raise ValueError(
-            "Stage 2 request_kind must be interpretation or extraction"
-        )
+        raise ValueError("Stage 2 request_kind must be interpretation or extraction")
     if kind == "extraction":
         return {
             "request_kind": kind,
@@ -1886,9 +1931,7 @@ def _checkpointed_request_json(
         complete_path,
         {
             "status": (
-                "complete_with_validation_fallback"
-                if fallback_error is not None
-                else "complete"
+                "complete_with_validation_fallback" if fallback_error is not None else "complete"
             ),
             "completed_at": _now(),
             "input_fingerprint": input_fingerprint,
@@ -3599,9 +3642,7 @@ def _pack_operationalization_supporting_evidence(
     packed: list[str] = []
     for text_value in evidence:
         separator_chars = 2 if packed else 0
-        candidate_list_chars = (
-            list_chars + separator_chars + len(json.dumps(text_value))
-        )
+        candidate_list_chars = list_chars + separator_chars + len(json.dumps(text_value))
         if fixed_chars_without_list + candidate_list_chars > initial_prompt_budget:
             continue
         packed.append(text_value)
@@ -4263,19 +4304,16 @@ class PlainHandoffStage2:
                 "evidence for ontology definition"
             )
         feature_name = str(group.get("name") or "")
-        operationalization_prompt_limit = int(
-            self.config.operationalization_max_prompt_chars
+        operationalization_prompt_limit = int(self.config.operationalization_max_prompt_chars)
+        supporting_evidence, evidence_packing = _pack_operationalization_supporting_evidence(
+            feature_name=feature_name,
+            supporting_evidence=available_supporting_evidence,
+            max_prompt_chars=operationalization_prompt_limit,
         )
-        supporting_evidence, evidence_packing = (
-            _pack_operationalization_supporting_evidence(
-                feature_name=feature_name,
-                supporting_evidence=available_supporting_evidence,
-                max_prompt_chars=operationalization_prompt_limit,
-            )
-        )
-        if evidence_packing["omitted_evidence_items"] or evidence_packing[
-            "truncated_evidence_items"
-        ]:
+        if (
+            evidence_packing["omitted_evidence_items"]
+            or evidence_packing["truncated_evidence_items"]
+        ):
             LOGGER.warning(
                 "Stage 2 operationalization packed supporting evidence feature=%s "
                 "included=%s available=%s prompt_chars=%s prompt_limit=%s",

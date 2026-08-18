@@ -162,6 +162,11 @@ An external endpoint configuration is:
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
+    "screening_trees": 200,
+    "stability_selection_rounds": 3,
+    "stability_selection_frequency": 0.6666666667,
+    "effect_modifier_negative_margin_fraction": 0.01,
+    "effect_modifier_negative_fold_fraction": 0.6,
     "estimation_trees": 200,
     "explicit_features": [
       {
@@ -376,7 +381,10 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
 `max_review_rounds`, `ontology_refinement_min_failure_patients`,
-`max_ontology_refinement_rounds`, `estimation_trees`,
+`max_ontology_refinement_rounds`, `screening_trees`,
+`stability_selection_rounds`, `stability_selection_frequency`,
+`effect_modifier_negative_margin_fraction`,
+`effect_modifier_negative_fold_fraction`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
 `temperature`, `repetition_penalty`, `interpretation_reasoning_effort`, and
 `extraction_reasoning_effort`. The legacy `max_candidates_per_fold` and
@@ -668,18 +676,26 @@ chooses `continuous`, `categorical`, or
 `continuous_with_categorical_fallback` modeling before estimation.
 
 The performance file includes baseline, complete-feature, leave-one-feature-out,
-and singleton `individual_feature_signal` measurements. Singleton models are fit
-on inner-fit rows and evaluated on inner-held-out rows. Confounder retention
-requires held-out treatment and outcome signal, effect-modifier retention
-requires held-out R-loss improvement, and prognostic retention requires held-out
-outcome signal. A signal must improve the aggregate metric and be positive in at
-least half of evaluated inner folds. Unsupported roles are removed and a
-non-explicit feature with no supported role is dropped. Any drop, role change,
-measurement revision, or modeling-strategy change starts another evaluation
-round. Evaluation-only convergence rounds may therefore extend beyond
-`max_review_rounds`, which limits language-model reviews rather than final
-empirical certification. Each round records the deterministic decisions and
-per-role evidence in `signal_pruning.json`.
+and singleton `individual_feature_signal` measurements. Propensity, outcome,
+and treatment-effect models use random forests whenever feature columns exist.
+Repeated screens are fit on inner-fit rows and evaluated on inner-held-out rows.
+Confounder and prognostic roles require stable positive support. Effect
+modifiers use asymmetric pruning: they remain eligible unless a configured
+fraction of repeated screens shows consistent R-loss deterioration larger than
+the configured relative negative margin. LLM drop recommendations pass through
+the same gate. Any drop, role change, measurement revision, or modeling-strategy
+change starts another evaluation round. Evaluation-only convergence rounds may
+therefore extend beyond `max_review_rounds`, which limits language-model reviews
+rather than final empirical certification. Each round records the full votes,
+margins, deterministic decisions, and per-role evidence in
+`signal_pruning.json`.
+
+When a continuous extraction contains both numeric and categorical values, a
+separate LLM request receives only the feature ontology and aggregated
+outer-training values. It chooses one validated continuous mapping or an
+exhaustive categorical binning plan. That plan is frozen in the feature
+definition and applied deterministically to final training and held-out values;
+held-out values and outcomes are never sent back for harmonization.
 
 Every single-patient extraction writes `extraction_issues.json`, including
 feature-attributable invalid scalar/type values and values outside a declared

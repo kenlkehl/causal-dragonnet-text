@@ -108,6 +108,11 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "extraction_feature_batch_size": 7,
             "ontology_refinement_min_failure_patients": 4,
             "max_ontology_refinement_rounds": 3,
+            "screening_trees": 64,
+            "stability_selection_rounds": 4,
+            "stability_selection_frequency": 0.75,
+            "effect_modifier_negative_margin_fraction": 0.01,
+            "effect_modifier_negative_fold_fraction": 0.7,
         },
         default_workers=1,
     )
@@ -127,6 +132,11 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.extraction_feature_batch_size == 7
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
+    assert config.screening_trees == 64
+    assert config.stability_selection_rounds == 4
+    assert config.stability_selection_frequency == 0.75
+    assert config.effect_modifier_negative_margin_fraction == 0.01
+    assert config.effect_modifier_negative_fold_fraction == 0.7
     assert config.public_dict()["max_tokens"] == 48_000
     assert config.public_dict()["repetition_penalty"] == 1.15
     assert config.public_dict()["interpretation_reasoning_effort"] == "medium"
@@ -140,6 +150,11 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.public_dict()["extraction_feature_batch_size"] == 7
     assert config.public_dict()["ontology_refinement_min_failure_patients"] == 4
     assert config.public_dict()["max_ontology_refinement_rounds"] == 3
+    assert config.public_dict()["screening_trees"] == 64
+    assert config.public_dict()["stability_selection_rounds"] == 4
+    assert config.public_dict()["stability_selection_frequency"] == 0.75
+    assert config.public_dict()["effect_modifier_negative_margin_fraction"] == 0.01
+    assert config.public_dict()["effect_modifier_negative_fold_fraction"] == 0.7
 
 
 def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
@@ -640,15 +655,11 @@ def test_continuous_extraction_preserves_categorical_fallback_for_modeling_revie
     encoded = stage2_analysis._FeatureEncoder([hybrid]).fit(frame).transform(frame)
 
     assert validated["rows"][0]["values"]["pd_l1_tumor_proportion_score"] == "<1%"
-    assert "categorical/threshold string" in prompt["features"][0][
-        "accepted_representations"
-    ]
+    assert "categorical/threshold string" in prompt["features"][0]["accepted_representations"]
     assert summary["numeric_nonmissing"] == 2
     assert summary["categorical_fallback_nonmissing"] == 1
     assert summary["categorical_fallback_values"] == {"<1%": 1}
-    assert summary["recommended_modeling_strategy"] == (
-        "continuous_with_categorical_fallback"
-    )
+    assert summary["recommended_modeling_strategy"] == ("continuous_with_categorical_fallback")
     assert encoded.shape == (4, 5)
     assert np.isfinite(encoded).all()
     assert encoded[1, 3] == 1.0
@@ -683,13 +694,11 @@ def test_review_agent_selects_continuous_feature_modeling_strategy():
     )
     updated, measurement_changed = stage2_analysis._apply_review([definition], review)
 
-    assert updated[0]["modeling_strategy"] == (
-        "continuous_with_categorical_fallback"
-    )
+    assert updated[0]["modeling_strategy"] == ("continuous_with_categorical_fallback")
     assert measurement_changed is False
-    assert stage2_analysis._changed_feature_representation_ids(
-        [definition], updated
-    ) == {"feature_001"}
+    assert stage2_analysis._changed_feature_representation_ids([definition], updated) == {
+        "feature_001"
+    }
 
 
 def test_stage2_extraction_forbids_multiple_patients_in_one_prompt(tmp_path: Path):
@@ -773,9 +782,7 @@ def test_stage2_extraction_batches_features_by_default_and_accepts_override(
                     "rows": [
                         {
                             "row_id": 0,
-                            "values": {
-                                name: int(name.removeprefix("feature_")) for name in names
-                            },
+                            "values": {name: int(name.removeprefix("feature_")) for name in names},
                         }
                     ]
                 }
@@ -804,22 +811,20 @@ def test_stage2_extraction_batches_features_by_default_and_accepts_override(
     assert frame.loc[0, "feature_00"] == 0.0
     assert frame.loc[0, "feature_22"] == 22.0
     parent_completion = json.loads(
-        (default_output / "batches" / "batch_00001" / "complete.json").read_text(
-            encoding="utf-8"
-        )
+        (default_output / "batches" / "batch_00001" / "complete.json").read_text(encoding="utf-8")
     )
     assert parent_completion["feature_batches"] == 3
     assert parent_completion["feature_batch_size"] == 10
-    assert len(
-        list(
-            (
-                default_output
-                / "batches"
-                / "batch_00001"
-                / "feature_batches"
-            ).glob("batch_*/complete.json")
+    assert (
+        len(
+            list(
+                (default_output / "batches" / "batch_00001" / "feature_batches").glob(
+                    "batch_*/complete.json"
+                )
+            )
         )
-    ) == 3
+        == 3
+    )
 
     configured_frame, configured_prompts = run_extraction(
         tmp_path / "configured",
@@ -1129,9 +1134,9 @@ def test_resume_reconstructs_failure_ledger_from_legacy_category_audit(
         definitions=[definition],
         output_dir=output,
         request_json=(
-            lambda _messages, _validate, *, request_kind="interpretation": (
-                _ for _ in ()
-            ).throw(AssertionError("legacy checkpoint should be adopted"))
+            lambda _messages, _validate, *, request_kind="interpretation": (_ for _ in ()).throw(
+                AssertionError("legacy checkpoint should be adopted")
+            )
         ),
         workers=1,
         max_prompt_chars=10_000,
@@ -2762,9 +2767,7 @@ def test_stage2_feature_batch_limit_is_preserved_across_lossless_pages(tmp_path:
                 "rows": [
                     {
                         "row_id": row_id,
-                        "values": {
-                            name: int(name.removeprefix("page_feature_")) for name in names
-                        },
+                        "values": {name: int(name.removeprefix("page_feature_")) for name in names},
                     }
                 ]
             }
@@ -2795,23 +2798,15 @@ def test_stage2_feature_batch_limit_is_preserved_across_lossless_pages(tmp_path:
     assert all(size <= 5_000 for size in prompt_sizes)
     assert frame.loc[0, "page_feature_10"] == 10.0
     page_completion = json.loads(
-        (
-            output
-            / "pages"
-            / "row_00000000"
-            / "page_00001"
-            / "complete.json"
-        ).read_text(encoding="utf-8")
+        (output / "pages" / "row_00000000" / "page_00001" / "complete.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert page_completion["feature_batches"] == 3
     reconciliation_completion = json.loads(
-        (
-            output
-            / "pages"
-            / "row_00000000"
-            / "reconciliation"
-            / "complete.json"
-        ).read_text(encoding="utf-8")
+        (output / "pages" / "row_00000000" / "reconciliation" / "complete.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert reconciliation_completion["feature_batches"] == 3
 
@@ -3459,9 +3454,7 @@ def test_iterative_consolidation_cannot_exclude_an_ordinary_candidate(tmp_path: 
     assert calls == 6
     assert [group["name"] for group in consolidated] == ["age", "serum_sodium"]
     fallback = json.loads(
-        (output_dir / "round_001" / "batch_001" / "fallback.json").read_text(
-            encoding="utf-8"
-        )
+        (output_dir / "round_001" / "batch_001" / "fallback.json").read_text(encoding="utf-8")
     )
     assert fallback["status"] == "conservative_passthrough"
     assert "merge-only; omit exclude_feature_names" in fallback["validation_error"]
@@ -4321,9 +4314,10 @@ def test_global_consolidation_merges_aliases_then_filters_unsupported_roles(tmp_
     assert result["candidate_dispositions"]["candidate_0002"]["status"] == "merged"
     assert result["candidate_dispositions"]["candidate_0003"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0004"]["status"] == "excluded"
-    assert "Stage 1 evidence does not support" in result["candidate_dispositions"][
-        "candidate_0004"
-    ]["reason"]
+    assert (
+        "Stage 1 evidence does not support"
+        in result["candidate_dispositions"]["candidate_0004"]["reason"]
+    )
     assert [_prompt_job(body) for body in prompt_bodies].count(
         "consolidate_stage2_candidate_pool"
     ) == 2
@@ -4986,9 +4980,7 @@ def test_inner_heldout_signal_pruning_keeps_causal_roles_and_drops_noise():
     treatment_probability = 1.0 / (1.0 + np.exp(-1.5 * confounder))
     treatment = rng.binomial(1, treatment_probability)
     outcome = (
-        2.0 * confounder
-        + treatment * (1.0 + 2.0 * modifier)
-        + rng.normal(scale=0.4, size=rows)
+        2.0 * confounder + treatment * (1.0 + 2.0 * modifier) + rng.normal(scale=0.4, size=rows)
     )
     dataset = pd.DataFrame({"treatment": treatment, "outcome": outcome})
     extracted = pd.DataFrame(
@@ -5057,13 +5049,256 @@ def test_inner_heldout_signal_pruning_keeps_causal_roles_and_drops_noise():
         "feature_confounder",
         "feature_modifier",
     ]
-    signals = {
-        row["feature_id"]: row for row in performance["individual_feature_signal"]
-    }
+    signals = {row["feature_id"]: row for row in performance["individual_feature_signal"]}
     assert signals["feature_confounder"]["role_signals"]["confounder"]["supported"]
     assert signals["feature_modifier"]["role_signals"]["effect_modifier"]["supported"]
     assert signals["feature_noise"]["has_any_claimed_role_signal"] is False
     assert report["features_dropped"] == 1
+
+
+def test_stage2_feature_models_use_forests_for_both_causal_roles():
+    rng = np.random.default_rng(123)
+    features = rng.normal(size=(80, 3))
+    binary = rng.binomial(1, 0.5, size=80)
+    continuous = rng.normal(size=80)
+
+    classifier = stage2_analysis._fit_classifier(
+        features,
+        binary,
+        seed=11,
+        trees=10,
+    )
+    outcome_regressor = stage2_analysis._fit_regressor(
+        features,
+        continuous,
+        seed=12,
+        trees=10,
+    )
+    effect_model = stage2_analysis._fit_effect_model(
+        features,
+        continuous,
+        seed=13,
+        trees=10,
+    )
+
+    assert classifier.__class__.__name__ == "RandomForestClassifier"
+    assert outcome_regressor.__class__.__name__ == "RandomForestRegressor"
+    assert effect_model.model.__class__.__name__ == "RandomForestRegressor"
+
+
+def test_stability_selection_prunes_modifiers_only_after_stable_negative_margin():
+    definitions = [
+        {
+            "feature_id": "feature_confounder",
+            "name": "baseline_factor",
+            "value_type": "continuous",
+            "modeling_strategy": "continuous",
+            "roles": ["confounder"],
+        },
+        {
+            "feature_id": "feature_modifier_small_negative",
+            "name": "candidate_interaction",
+            "value_type": "continuous",
+            "modeling_strategy": "continuous",
+            "roles": ["effect_modifier"],
+        },
+        {
+            "feature_id": "feature_modifier_harmful",
+            "name": "harmful_interaction",
+            "value_type": "continuous",
+            "modeling_strategy": "continuous",
+            "roles": ["effect_modifier"],
+        },
+    ]
+
+    def performance_for_round():
+        return {
+            "individual_feature_signal": [
+                {
+                    "feature_id": "feature_confounder",
+                    "name": "baseline_factor",
+                    "baseline": {"effect_model_r_loss": 0.2},
+                    "role_signals": {
+                        "confounder": {"supported": False},
+                    },
+                },
+                {
+                    "feature_id": "feature_modifier_small_negative",
+                    "name": "candidate_interaction",
+                    "baseline": {"effect_model_r_loss": 0.2},
+                    "role_signals": {
+                        "effect_modifier": {
+                            "supported": False,
+                            "residual_effect_signal": {
+                                "aggregate_improvement": -0.0005,
+                                "fold_improvements": [-0.0006] * 5,
+                            },
+                        }
+                    },
+                },
+                {
+                    "feature_id": "feature_modifier_harmful",
+                    "name": "harmful_interaction",
+                    "baseline": {"effect_model_r_loss": 0.2},
+                    "role_signals": {
+                        "effect_modifier": {
+                            "supported": False,
+                            "residual_effect_signal": {
+                                "aggregate_improvement": -0.002,
+                                "fold_improvements": [-0.002] * 4 + [0.0001],
+                            },
+                        }
+                    },
+                },
+            ]
+        }
+
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        stability_selection_rounds=3,
+        stability_selection_frequency=2.0 / 3.0,
+        effect_modifier_negative_margin_fraction=0.005,
+        effect_modifier_negative_fold_fraction=0.6,
+    )
+    history = {}
+    first_performance = performance_for_round()
+    first_performance["stability_selection"] = stage2_analysis._update_stability_selection(
+        definitions=definitions,
+        performance=first_performance,
+        history=history,
+        evaluation_round=1,
+        config=config,
+    )
+    first_retained, first_report = stage2_analysis._apply_empirical_signal_pruning(
+        definitions,
+        first_performance,
+    )
+    assert len(first_retained) == 3
+    assert first_report["selection_complete"] is False
+
+    final_performance = first_performance
+    for round_index in (2, 3):
+        final_performance = performance_for_round()
+        final_performance["stability_selection"] = stage2_analysis._update_stability_selection(
+            definitions=definitions,
+            performance=final_performance,
+            history=history,
+            evaluation_round=round_index,
+            config=config,
+        )
+    retained, report = stage2_analysis._apply_empirical_signal_pruning(
+        definitions,
+        final_performance,
+    )
+
+    assert [feature["feature_id"] for feature in retained] == ["feature_modifier_small_negative"]
+    assert report["selection_complete"] is True
+    decisions = {row["feature_id"]: row for row in report["decisions"]}
+    assert decisions["feature_confounder"]["action"] == "drop_no_heldout_role_signal"
+    assert decisions["feature_modifier_harmful"]["action"] == ("drop_no_heldout_role_signal")
+    assert (
+        "retained without stable"
+        in decisions["feature_modifier_small_negative"]["stability_reasons"][0]
+    )
+
+    review = {
+        "feature_decisions": [
+            {"feature_id": feature["feature_id"], "action": "drop"} for feature in definitions
+        ]
+    }
+    protected, guard = stage2_analysis._review_drop_stability_guards(
+        definitions,
+        review,
+        final_performance["stability_selection"],
+    )
+    assert protected == {"feature_modifier_small_negative"}
+    assert guard["drop_decisions_overridden"] == 1
+
+
+def test_llm_harmonizes_generic_mixed_values_and_applies_plan_to_heldout(
+    tmp_path: Path,
+):
+    definition = {
+        "feature_id": "feature_marker",
+        "name": "tumor_marker_score",
+        "description": "A pretreatment tumor marker score.",
+        "value_type": "continuous",
+        "categories_or_unit": ["points"],
+        "modeling_strategy": "continuous_with_categorical_fallback",
+        "roles": ["effect_modifier"],
+        "measurement_definition": "Extract the documented pretreatment score.",
+        "missing_value_rule": "Return null when undocumented.",
+    }
+    extracted = pd.DataFrame(
+        {
+            "_oci_row_id": [0, 1, 2, 3],
+            "tumor_marker_score": [10.0, 60.0, "low", "high"],
+        }
+    )
+    jobs = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        assert request_kind == "interpretation"
+        body = json.loads(messages[1]["content"])
+        jobs.append(body["job"])
+        assert body["feature"]["name"] == "tumor_marker_score"
+        return validate(
+            {
+                "target_representation": "categorical",
+                "reason": "Text labels encode ranges, so common bins preserve meaning.",
+                "canonical_categories": ["low", "high"],
+                "categorical_value_map": [
+                    {"raw_value": "low", "canonical_value": "low"},
+                    {"raw_value": "high", "canonical_value": "high"},
+                ],
+                "numeric_bin_rules": [
+                    {
+                        "lower_bound": None,
+                        "lower_inclusive": False,
+                        "upper_bound": 50,
+                        "upper_inclusive": False,
+                        "canonical_value": "low",
+                    },
+                    {
+                        "lower_bound": 50,
+                        "lower_inclusive": True,
+                        "upper_bound": None,
+                        "upper_inclusive": False,
+                        "canonical_value": "high",
+                    },
+                ],
+            }
+        )
+
+    harmonized, definitions, report = stage2_analysis._harmonize_training_extraction(
+        extracted=extracted,
+        definitions=[definition],
+        output_dir=tmp_path / "harmonization",
+        request_json=request_json,
+        max_prompt_chars=20_000,
+    )
+
+    assert jobs == ["harmonize_stage2_mixed_numeric_and_categorical_values"]
+    assert definitions[0]["modeling_strategy"] == "categorical"
+    assert definitions[0]["harmonization_plan"]["target_representation"] == ("categorical")
+    assert harmonized["tumor_marker_score"].tolist() == ["low", "high", "low", "high"]
+    assert report["plans_requested_from_llm"] == 1
+
+    heldout = pd.DataFrame(
+        {
+            "_oci_row_id": [4, 5, 6],
+            "tumor_marker_score": [75.0, "LOW", "unknown"],
+        }
+    )
+    heldout_harmonized, audit = stage2_analysis._apply_harmonization_plans(
+        heldout,
+        definitions,
+        scope="outer_heldout",
+    )
+    assert heldout_harmonized["tumor_marker_score"].tolist()[:2] == ["high", "low"]
+    assert pd.isna(heldout_harmonized["tumor_marker_score"].iloc[2])
+    assert audit["features"][0]["unmapped_nonmissing_rows"] == 1
 
 
 def test_stage2_posthoc_oracle_ite_evaluation_uses_frozen_predictions(tmp_path: Path):
@@ -5839,16 +6074,14 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
     )
 
     assert [feature["name"] for feature in result["features"]] == ["age"]
-    assert result["evaluation_rounds"] == 2
-    second_performance = json.loads(
-        (output / "review" / "round_002" / "performance.json").read_text(
-            encoding="utf-8"
-        )
+    assert result["evaluation_rounds"] == 4
+    converged_performance = json.loads(
+        (output / "review" / "round_004" / "performance.json").read_text(encoding="utf-8")
     )
-    assert [
-        row["feature_id"] for row in second_performance["individual_feature_signal"]
-    ] == ["outer_001_feature_001"]
-    assert len(second_performance["leave_one_feature_out"]) == 1
+    assert [row["feature_id"] for row in converged_performance["individual_feature_signal"]] == [
+        "outer_001_feature_001"
+    ]
+    assert len(converged_performance["leave_one_feature_out"]) == 1
     assert ("age", "blood_pressure") in extraction_feature_sets
     assert extraction_feature_sets.count(("age",)) == 24
     final_fit = pd.read_csv(output / "extraction" / "fit" / "extracted.csv")
