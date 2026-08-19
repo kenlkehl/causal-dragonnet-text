@@ -675,6 +675,7 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "consolidation_max_rounds": 55,
     "extraction_feature_batch_size": 10,
     "max_review_rounds": 2,
+    "max_evaluation_rounds": 10,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
     "screening_trees": 200,
@@ -894,7 +895,9 @@ The language model may revise an extraction definition for at most
 set change—including an ordinary drop—forces another extraction/evaluation
 round. After the final allowed language-model review, evaluation-only rounds
 continue until stability selection is complete and the retained feature set is
-unchanged, so the final set is always rescored.
+unchanged, so the final set is always rescored. An outer fold is limited to
+`max_evaluation_rounds` total cycles (10 by default); reaching that cap without
+convergence fails explicitly rather than accepting an uncertified feature set.
 
 Each patient extraction also records feature-attributable validation failures.
 After the training patients finish, Stage 2 aggregates repeated failures across

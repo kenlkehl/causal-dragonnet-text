@@ -52,6 +52,7 @@ DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE = 10
 DEFAULT_SCREENING_TREES = 200
+DEFAULT_MAX_EVALUATION_ROUNDS = 10
 DEFAULT_STABILITY_SELECTION_ROUNDS = 3
 DEFAULT_STABILITY_SELECTION_FREQUENCY = 2.0 / 3.0
 DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION = 0.01
@@ -5311,13 +5312,12 @@ def run_fold_analysis(
     selection_history: dict[str, list[dict[str, Any]]] = {}
     screening_trees = int(getattr(config, "screening_trees", DEFAULT_SCREENING_TREES))
     selection_policy = _stability_selection_policy(config)
-    maximum_evaluation_rounds = (
-        max(
-            int(config.max_review_rounds),
-            int(selection_policy["minimum_evaluations"]),
+    maximum_evaluation_rounds = int(
+        getattr(
+            config,
+            "max_evaluation_rounds",
+            DEFAULT_MAX_EVALUATION_ROUNDS,
         )
-        + 4 * len(current)
-        + 4
     )
     for round_index in range(1, maximum_evaluation_rounds + 1):
         evaluation_rounds = round_index
@@ -5498,7 +5498,10 @@ def run_fold_analysis(
         if not definitions_changed and bool(signal_pruning.get("selection_complete", True)):
             break
     else:  # pragma: no cover - finite feature/role changes should converge first
-        raise RuntimeError("Stage 2 empirical feature pruning did not converge")
+        raise RuntimeError(
+            "Stage 2 empirical feature pruning did not converge within "
+            f"max_evaluation_rounds={maximum_evaluation_rounds}"
+        )
 
     if final_fit_extraction is None or final_fit_definitions is None:
         raise RuntimeError("Stage 2 review did not produce a training-fold extraction")

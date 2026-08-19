@@ -160,6 +160,7 @@ An external endpoint configuration is:
     "consolidation_alphabetical_rounds": 5,
     "consolidation_max_rounds": 55,
     "max_review_rounds": 2,
+    "max_evaluation_rounds": 10,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
     "screening_trees": 200,
@@ -380,7 +381,8 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `extraction_max_prompt_chars`, `extraction_feature_batch_size`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
-`max_review_rounds`, `ontology_refinement_min_failure_patients`,
+`max_review_rounds`, `max_evaluation_rounds`,
+`ontology_refinement_min_failure_patients`,
 `max_ontology_refinement_rounds`, `screening_trees`,
 `stability_selection_rounds`, `stability_selection_frequency`,
 `effect_modifier_negative_margin_fraction`,
@@ -459,6 +461,7 @@ uv run python scripts/run_all_evidence.py \
   --stage2-endpoint http://127.0.0.1:8010/v1 \
   --stage2-model Qwen/Qwen3-32B \
   --stage2-review-rounds 2 \
+  --stage2-max-evaluation-rounds 10 \
   --stage2-estimation-trees 200
 ```
 
@@ -686,9 +689,10 @@ the configured relative negative margin. LLM drop recommendations pass through
 the same gate. Any drop, role change, measurement revision, or modeling-strategy
 change starts another evaluation round. Evaluation-only convergence rounds may
 therefore extend beyond `max_review_rounds`, which limits language-model reviews
-rather than final empirical certification. Each round records the full votes,
-margins, deterministic decisions, and per-role evidence in
-`signal_pruning.json`.
+rather than final empirical certification. They may not extend beyond
+`max_evaluation_rounds` (10 by default); hitting that absolute per-fold cap
+without convergence raises an error. Each round records the full votes, margins,
+deterministic decisions, and per-role evidence in `signal_pruning.json`.
 
 When a continuous extraction contains both numeric and categorical values, a
 separate LLM request receives only the feature ontology and aggregated

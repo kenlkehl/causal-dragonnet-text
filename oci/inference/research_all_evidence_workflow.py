@@ -1938,6 +1938,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--stage2-max-evaluation-rounds",
+        type=int,
+        help=(
+            "absolute per-fold extraction/evaluation round cap "
+            "(default: 10)"
+        ),
+    )
+    parser.add_argument(
         "--stage2-extraction-feature-batch-size",
         type=int,
         help=(
@@ -2069,6 +2077,7 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
                 vllm[key] = value
     stage2_numeric_overrides = {
         "max_review_rounds": args.stage2_review_rounds,
+        "max_evaluation_rounds": args.stage2_max_evaluation_rounds,
         "extraction_feature_batch_size": args.stage2_extraction_feature_batch_size,
         "estimation_trees": args.stage2_estimation_trees,
     }

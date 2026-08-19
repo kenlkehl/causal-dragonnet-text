@@ -34,6 +34,7 @@ stage2_consolidation_max_rounds="${STAGE2_CONSOLIDATION_MAX_ROUNDS:-}"
 stage2_extraction_feature_batch_size="${STAGE2_EXTRACTION_FEATURE_BATCH_SIZE:-}"
 stage2_ontology_refinement_min_failure_patients="${STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS:-}"
 stage2_max_ontology_refinement_rounds="${STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS:-}"
+stage2_max_evaluation_rounds="${STAGE2_MAX_EVALUATION_ROUNDS:-}"
 stage1_architectures="${STAGE1_ARCHITECTURES:-}"
 min_free_gpu_gib="${MIN_FREE_GPU_GB:-20}"
 python_bin="${OCI_PYTHON:-}"
@@ -195,6 +196,11 @@ fi
 if [[ -n "${stage2_max_ontology_refinement_rounds}" ]]; then
     stage2_policy_args+=(
         --set "stage2.max_ontology_refinement_rounds=${stage2_max_ontology_refinement_rounds}"
+    )
+fi
+if [[ -n "${stage2_max_evaluation_rounds}" ]]; then
+    stage2_policy_args+=(
+        --stage2-max-evaluation-rounds "${stage2_max_evaluation_rounds}"
     )
 fi
 

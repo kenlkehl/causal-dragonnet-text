@@ -74,6 +74,7 @@ DEFAULT_CONSOLIDATION_MAX_ROUNDS = (
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 DEFAULT_SCREENING_TREES = 200
+DEFAULT_MAX_EVALUATION_ROUNDS = 10
 DEFAULT_STABILITY_SELECTION_ROUNDS = 3
 DEFAULT_STABILITY_SELECTION_FREQUENCY = 2.0 / 3.0
 DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION = 0.01
@@ -667,6 +668,10 @@ class PlainHandoffStage2Config:
     # rounds may continue after this many reviews when the last review changes
     # the retained features, causal roles, or modeling representation.
     max_review_rounds: int = 2
+    # Absolute per-outer-fold cap across reviewed and evaluation-only rounds.
+    # A fold that has not achieved stability by this point fails explicitly
+    # instead of continuing an effectively unbounded extraction loop.
+    max_evaluation_rounds: int = DEFAULT_MAX_EVALUATION_ROUNDS
     ontology_refinement_min_failure_patients: int = DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS
     max_ontology_refinement_rounds: int = DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS
     # Use the same nonlinear model family during training-fold screening that
@@ -801,6 +806,17 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.workers must be positive")
         if self.max_review_rounds < 1:
             raise ValueError("stage2.max_review_rounds must be positive")
+        if (
+            isinstance(self.max_evaluation_rounds, bool)
+            or not isinstance(self.max_evaluation_rounds, int)
+            or self.max_evaluation_rounds < 1
+        ):
+            raise ValueError("stage2.max_evaluation_rounds must be a positive integer")
+        if self.max_evaluation_rounds < self.stability_selection_rounds:
+            raise ValueError(
+                "stage2.max_evaluation_rounds must be at least "
+                "stage2.stability_selection_rounds"
+            )
         if self.ontology_refinement_min_failure_patients < 2:
             raise ValueError("stage2.ontology_refinement_min_failure_patients must be at least 2")
         if self.max_ontology_refinement_rounds < 0:
@@ -989,6 +1005,9 @@ def plain_stage2_config_from_mapping(
         consolidation_oversample_factor=int(raw.get("consolidation_oversample_factor", 4)),
         workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
         max_review_rounds=int(raw.get("max_review_rounds", 2)),
+        max_evaluation_rounds=int(
+            raw.get("max_evaluation_rounds", DEFAULT_MAX_EVALUATION_ROUNDS)
+        ),
         ontology_refinement_min_failure_patients=int(
             raw.get(
                 "ontology_refinement_min_failure_patients",

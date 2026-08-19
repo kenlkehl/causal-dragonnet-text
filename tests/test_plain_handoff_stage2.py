@@ -73,6 +73,7 @@ def test_stage2_config_allows_endpoint_without_model():
     )
     assert config.extraction_max_prompt_chars == 640_000
     assert config.extraction_feature_batch_size == 10
+    assert config.max_evaluation_rounds == 10
     assert config.ontology_refinement_min_failure_patients == 3
     assert config.max_ontology_refinement_rounds == 2
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
@@ -106,6 +107,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "consolidation_max_rounds": 7,
             "extraction_max_prompt_chars": 500_000,
             "extraction_feature_batch_size": 7,
+            "max_evaluation_rounds": 12,
             "ontology_refinement_min_failure_patients": 4,
             "max_ontology_refinement_rounds": 3,
             "screening_trees": 64,
@@ -130,6 +132,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.consolidation_max_rounds == 7
     assert config.extraction_max_prompt_chars == 500_000
     assert config.extraction_feature_batch_size == 7
+    assert config.max_evaluation_rounds == 12
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
     assert config.screening_trees == 64
@@ -148,6 +151,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.public_dict()["consolidation_max_rounds"] == 7
     assert config.public_dict()["extraction_max_prompt_chars"] == 500_000
     assert config.public_dict()["extraction_feature_batch_size"] == 7
+    assert config.public_dict()["max_evaluation_rounds"] == 12
     assert config.public_dict()["ontology_refinement_min_failure_patients"] == 4
     assert config.public_dict()["max_ontology_refinement_rounds"] == 3
     assert config.public_dict()["screening_trees"] == 64
@@ -205,6 +209,26 @@ def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
             endpoint="http://stage2.test/v1",
             model="test-model",
             extraction_feature_batch_size=0,
+        ).validate()
+
+
+@pytest.mark.parametrize("max_evaluation_rounds", [0, -1, True, 1.5, "10"])
+def test_stage2_config_rejects_invalid_max_evaluation_rounds(max_evaluation_rounds):
+    with pytest.raises(ValueError, match="max_evaluation_rounds must be a positive integer"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            max_evaluation_rounds=max_evaluation_rounds,
+        ).validate()
+
+
+def test_stage2_config_requires_enough_evaluation_rounds_for_stability_selection():
+    with pytest.raises(ValueError, match="must be at least stage2.stability_selection_rounds"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            max_evaluation_rounds=2,
+            stability_selection_rounds=3,
         ).validate()
 
 
@@ -5214,6 +5238,86 @@ def test_stability_selection_prunes_modifiers_only_after_stable_negative_margin(
     )
     assert protected == {"feature_modifier_small_negative"}
     assert guard["drop_decisions_overridden"] == 1
+
+
+def test_fold_analysis_stops_at_configured_evaluation_round_cap(tmp_path, monkeypatch):
+    dataset = pd.DataFrame(
+        {
+            "patient_id": ["fit", "heldout"],
+            "clinical_text": ["", ""],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [0, 1],
+        }
+    )
+    split = {
+        "outer_fold": 1,
+        "fit_row_ids": [0],
+        "heldout_row_ids": [1],
+        "inner_splits": [],
+    }
+
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_extract_training_with_ontology_feedback",
+        lambda **kwargs: (
+            pd.DataFrame({"_oci_row_id": kwargs["row_ids"]}),
+            list(kwargs["definitions"]),
+            0,
+        ),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_harmonize_training_extraction",
+        lambda **kwargs: (
+            kwargs["extracted"],
+            list(kwargs["definitions"]),
+            {"plans": []},
+        ),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "evaluate_definitions",
+        lambda **_kwargs: {"individual_feature_signal": []},
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_apply_empirical_signal_pruning",
+        lambda definitions, _performance, **_kwargs: (
+            list(definitions),
+            {"selection_complete": False},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="max_evaluation_rounds=2"):
+        run_fold_analysis(
+            dataset=dataset,
+            definitions=[],
+            split=split,
+            clinical_question="Estimate treatment effect.",
+            unit_id_column="patient_id",
+            text_column="clinical_text",
+            treatment_column="treatment_indicator",
+            outcome_column="outcome_indicator",
+            outcome_type="binary",
+            inner_folds=2,
+            seed=7,
+            output_dir=tmp_path / "outer_001",
+            request_json=lambda *_args, **_kwargs: pytest.fail(
+                "an empty feature set should not request LLM review"
+            ),
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="test-model",
+                max_review_rounds=1,
+                max_evaluation_rounds=2,
+                stability_selection_rounds=2,
+                estimation_trees=10,
+            ),
+        )
+
+    assert (tmp_path / "outer_001" / "review" / "round_001" / "complete.json").is_file()
+    assert (tmp_path / "outer_001" / "review" / "round_002" / "complete.json").is_file()
+    assert not (tmp_path / "outer_001" / "review" / "round_003").exists()
 
 
 def test_llm_harmonizes_generic_mixed_values_and_applies_plan_to_heldout(
