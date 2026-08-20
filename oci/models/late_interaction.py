@@ -106,6 +106,9 @@ class _SentenceTransformersMultiVectorAdapter:
         except (TypeError, ValueError):
             configured_length = 300
         self.document_length = min(300, max(8, configured_length))
+        # Native MultiVectorEncoder receives the unframed text.  Its tokenizer
+        # therefore supplies the exact length check used for chunking.
+        self.document_encoding_prefix = ""
 
     def encode_queries(self, texts: Sequence[str]) -> list[np.ndarray]:
         values = self.model.encode_query(
@@ -160,6 +163,7 @@ class _StanfordColbertCompatibilityAdapter:
         )
         self.query_marker = str(metadata.get("query_token_id") or "[unused0]")
         self.document_marker = str(metadata.get("doc_token_id") or "[unused1]")
+        self.document_encoding_prefix = f"{self.document_marker} "
         self.query_length = int(metadata.get("query_maxlen") or 32)
         self.document_length = int(metadata.get("doc_maxlen") or 300)
         self.attend_to_expansion = bool(metadata.get("attend_to_mask_tokens"))
@@ -355,14 +359,19 @@ def score_late_interaction_pairs(
 
         chunks: list[str] = []
         chunk_spans: dict[str, tuple[int, int]] = {}
-        content_length = max(4, int(encoder.document_length) - 1)
-        overlap = min(int(document_chunk_overlap_tokens), max(0, content_length - 3))
+        document_length = int(encoder.document_length)
+        overlap = min(
+            int(document_chunk_overlap_tokens),
+            max(0, document_length - 3),
+        )
+        encoding_prefix = str(getattr(encoder, "document_encoding_prefix", ""))
         for document in unique_documents:
             document_chunks = split_text_to_token_chunks(
                 document,
                 encoder.tokenizer,
-                max_seq_length=content_length,
+                max_seq_length=document_length,
                 chunk_overlap_tokens=overlap,
+                encoding_prefix=encoding_prefix,
             )
             begin = len(chunks)
             chunks.extend(document_chunks)

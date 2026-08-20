@@ -91,6 +91,37 @@ class _VerboseWarningCharacterTokenizer(_CharacterTokenizer):
         return super().encode(text, add_special_tokens=add_special_tokens)
 
 
+class _RoundTripExpandingTokenizer:
+    """Mimic WordPiece fragments that expand after slice decoding."""
+
+    marker = "[D] "
+
+    def encode(self, text, add_special_tokens=False, verbose=True):
+        del verbose
+        value = str(text)
+        marker_tokens = []
+        if value.startswith(self.marker):
+            marker_tokens = [900]
+            value = value[len(self.marker) :]
+        content_tokens = [ord(character) for character in value]
+        tokens = marker_tokens + content_tokens
+        if add_special_tokens:
+            return [101, *tokens, 102]
+        return tokens
+
+    def decode(self, token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False):
+        del skip_special_tokens, clean_up_tokenization_spaces
+        values = [int(token_id) for token_id in token_ids]
+        decoded = "".join(chr(token_id) for token_id in values)
+        # A slice beginning inside the source resembles a WordPiece continuation:
+        # its decoded ``##`` prefix consumes two extra tokens on re-encoding.
+        return decoded if values[0] == ord("a") else f"##{decoded}"
+
+    def num_special_tokens_to_add(self, pair=False):
+        del pair
+        return 2
+
+
 def test_lossless_tokenizer_never_enables_truncation():
     tokenizer = _Tokenizer()
     encoded = tokenize_losslessly(
@@ -181,9 +212,32 @@ def test_token_chunk_boundaries_suppress_length_warning_without_truncating():
             chunk_overlap_tokens=0,
         )
 
-    assert tokenizer.verbose_values == [False]
+    assert tokenizer.verbose_values
+    assert all(value is False for value in tokenizer.verbose_values)
     assert "".join(chunks) == text
     assert max(map(len, chunks)) <= 7
+
+
+def test_token_chunks_are_bounded_after_framed_decode_encode_round_trip():
+    from oci.models.concept_embedding_utils import split_text_to_token_chunks
+
+    tokenizer = _RoundTripExpandingTokenizer()
+    chunks = split_text_to_token_chunks(
+        "abcdefghij",
+        tokenizer,
+        max_seq_length=8,
+        chunk_overlap_tokens=1,
+        encoding_prefix=tokenizer.marker,
+    )
+
+    # The verified ends, rather than the too-large proposed ends, drive each
+    # subsequent boundary.  Every original token consequently remains covered.
+    assert chunks == ["abcde", "##efg", "##ghi", "##ij"]
+    assert all(
+        len(tokenizer.encode(f"{tokenizer.marker}{chunk}", add_special_tokens=True))
+        <= 8
+        for chunk in chunks
+    )
 
 
 def test_production_sources_have_no_literal_truncation_true():

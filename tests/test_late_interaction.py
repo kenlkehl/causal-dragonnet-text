@@ -41,6 +41,7 @@ def test_late_interaction_pair_scorer_deduplicates_and_chunks(monkeypatch):
 
     class Encoder:
         document_length = 6
+        document_encoding_prefix = "[DOC] "
 
         def __init__(self):
             self.tokenizer = Tokenizer()
@@ -59,6 +60,16 @@ def test_late_interaction_pair_scorer_deduplicates_and_chunks(monkeypatch):
 
         def encode_documents(self, texts):
             self.document_calls.append(list(texts))
+            assert all(
+                len(
+                    self.tokenizer.encode(
+                        f"{self.document_encoding_prefix}{text}",
+                        add_special_tokens=True,
+                    )
+                )
+                <= self.document_length
+                for text in texts
+            )
             return [
                 np.asarray(
                     [[1.0, 0.0] if "age" in text else [0.0, 1.0]],
