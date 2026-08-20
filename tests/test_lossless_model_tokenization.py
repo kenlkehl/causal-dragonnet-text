@@ -78,6 +78,19 @@ class _CharacterTokenizer:
         return 0
 
 
+class _VerboseWarningCharacterTokenizer(_CharacterTokenizer):
+    def __init__(self) -> None:
+        self.verbose_values: list[bool] = []
+
+    def encode(self, text, add_special_tokens=False, verbose=True):
+        import warnings
+
+        self.verbose_values.append(bool(verbose))
+        if verbose and len(text) > 8:
+            warnings.warn("sequence length exceeds model_max_length", UserWarning)
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+
 def test_lossless_tokenizer_never_enables_truncation():
     tokenizer = _Tokenizer()
     encoded = tokenize_losslessly(
@@ -150,6 +163,27 @@ def test_concept_embedding_cache_rejects_token_chunk_overflow(tmp_path):
             tokenizer=_CharacterTokenizer(),
             max_seq_length=5,
         )
+
+
+def test_token_chunk_boundaries_suppress_length_warning_without_truncating():
+    import warnings
+
+    from oci.models.concept_embedding_utils import split_text_to_token_chunks
+
+    tokenizer = _VerboseWarningCharacterTokenizer()
+    text = "abcdefghijklmnopqrstuvwxyz"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        chunks = split_text_to_token_chunks(
+            text,
+            tokenizer,
+            max_seq_length=7,
+            chunk_overlap_tokens=0,
+        )
+
+    assert tokenizer.verbose_values == [False]
+    assert "".join(chunks) == text
+    assert max(map(len, chunks)) <= 7
 
 
 def test_production_sources_have_no_literal_truncation_true():

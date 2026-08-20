@@ -97,10 +97,26 @@ def split_text_to_token_chunks(
 
 
 def _encode_without_special_tokens(tokenizer, text: str) -> List[int]:
-    try:
-        token_ids = tokenizer.encode(text, add_special_tokens=False)
-    except TypeError:
-        encoded = tokenizer(text, add_special_tokens=False)
+    encode = getattr(tokenizer, "encode", None)
+    if callable(encode):
+        try:
+            # Hugging Face tokenizers warn when this boundary-discovery pass is
+            # longer than model_max_length, even though it is never sent to the
+            # model and is immediately split into bounded chunks below.
+            token_ids = encode(text, add_special_tokens=False, verbose=False)
+        except TypeError:
+            # Lightweight/custom tokenizers may not expose the optional
+            # Hugging Face ``verbose`` argument.
+            token_ids = encode(text, add_special_tokens=False)
+    else:
+        try:
+            encoded = tokenizer(
+                text,
+                add_special_tokens=False,
+                verbose=False,
+            )
+        except TypeError:
+            encoded = tokenizer(text, add_special_tokens=False)
         token_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded
     if token_ids and isinstance(token_ids[0], list):
         token_ids = token_ids[0]
