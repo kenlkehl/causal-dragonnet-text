@@ -92,7 +92,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
     assert config.evidence_max_cards_per_fold == 400
     assert config.consolidation_oversample_factor == 4
-    assert config.candidate_selection_top_n == 5
+    assert config.candidate_selection_top_n == 50
     assert config.candidate_registry_embedding_model == "Qwen/Qwen3-Embedding-0.6B"
     assert config.candidate_registry_embedding_device == "cpu"
     assert config.candidate_registry_similarity_threshold == 0.94

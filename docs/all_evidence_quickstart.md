@@ -57,7 +57,7 @@ effect estimates. The common controls are:
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
     "max_candidates_per_fold": 50,
-    "candidate_selection_top_n": 5,
+    "candidate_selection_top_n": 50,
     "candidate_registry_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
     "candidate_registry_embedding_device": "cpu",
     "candidate_registry_similarity_threshold": 0.94,

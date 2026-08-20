@@ -174,7 +174,7 @@ An external endpoint configuration is:
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
     "max_candidates_per_fold": 50,
-    "candidate_selection_top_n": 5,
+    "candidate_selection_top_n": 50,
     "candidate_registry_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
     "candidate_registry_embedding_device": "cpu",
     "candidate_registry_similarity_threshold": 0.94,
