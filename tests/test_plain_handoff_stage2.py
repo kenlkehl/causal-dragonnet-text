@@ -37,6 +37,19 @@ def _original_evidence_packets(packet_ids):
     ]
 
 
+def _install_test_candidate_scorer(monkeypatch):
+    from oci.models import late_interaction
+
+    monkeypatch.setattr(
+        late_interaction,
+        "score_late_interaction_pairs",
+        lambda queries, _documents, _model, _device, **_kwargs: np.asarray(
+            [0.9] * len(queries),
+            dtype=np.float32,
+        ),
+    )
+
+
 def _prompt_job(body):
     if "job" in body:
         return body["job"]
@@ -79,6 +92,18 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
     assert config.evidence_max_cards_per_fold == 400
     assert config.consolidation_oversample_factor == 4
+    assert config.candidate_selection_top_n == 5
+    assert config.candidate_registry_embedding_model == "Qwen/Qwen3-Embedding-0.6B"
+    assert config.candidate_registry_embedding_device == "cpu"
+    assert config.candidate_registry_similarity_threshold == 0.94
+    assert config.candidate_selection_method == "late_interaction"
+    assert (
+        config.candidate_selection_late_interaction_model
+        == "answerdotai/answerai-colbert-small-v1"
+    )
+    assert config.candidate_selection_late_interaction_device == "cpu"
+    assert config.candidate_selection_top_evidence_packets == 3
+    assert config.candidate_selection_document_chunk_overlap_tokens == 32
 
 
 def test_stage2_analysis_defaults_pre_refinement_config_fields(caplog):
@@ -115,6 +140,15 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "stability_selection_frequency": 0.75,
             "effect_modifier_negative_margin_fraction": 0.01,
             "effect_modifier_negative_fold_fraction": 0.7,
+            "candidate_selection_top_n": 7,
+            "candidate_registry_embedding_model": "local/clinical-embedding-model",
+            "candidate_registry_embedding_device": "cuda:2",
+            "candidate_registry_similarity_threshold": 0.91,
+            "candidate_selection_method": "dense_cosine",
+            "candidate_selection_late_interaction_model": "local/colbert-model",
+            "candidate_selection_late_interaction_device": "cuda:3",
+            "candidate_selection_top_evidence_packets": 4,
+            "candidate_selection_document_chunk_overlap_tokens": 24,
         },
         default_workers=1,
     )
@@ -140,6 +174,15 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.stability_selection_frequency == 0.75
     assert config.effect_modifier_negative_margin_fraction == 0.01
     assert config.effect_modifier_negative_fold_fraction == 0.7
+    assert config.candidate_selection_top_n == 7
+    assert config.candidate_registry_embedding_model == "local/clinical-embedding-model"
+    assert config.candidate_registry_embedding_device == "cuda:2"
+    assert config.candidate_registry_similarity_threshold == 0.91
+    assert config.candidate_selection_method == "dense_cosine"
+    assert config.candidate_selection_late_interaction_model == "local/colbert-model"
+    assert config.candidate_selection_late_interaction_device == "cuda:3"
+    assert config.candidate_selection_top_evidence_packets == 4
+    assert config.candidate_selection_document_chunk_overlap_tokens == 24
     assert config.public_dict()["max_tokens"] == 48_000
     assert config.public_dict()["repetition_penalty"] == 1.15
     assert config.public_dict()["interpretation_reasoning_effort"] == "medium"
@@ -159,6 +202,36 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.public_dict()["stability_selection_frequency"] == 0.75
     assert config.public_dict()["effect_modifier_negative_margin_fraction"] == 0.01
     assert config.public_dict()["effect_modifier_negative_fold_fraction"] == 0.7
+    assert config.public_dict()["candidate_selection_top_n"] == 7
+    assert (
+        config.public_dict()["candidate_registry_embedding_model"]
+        == "local/clinical-embedding-model"
+    )
+    assert config.public_dict()["candidate_registry_embedding_device"] == "cuda:2"
+    assert config.public_dict()["candidate_registry_similarity_threshold"] == 0.91
+    assert config.public_dict()["candidate_selection_method"] == "dense_cosine"
+    assert (
+        config.public_dict()["candidate_selection_late_interaction_model"]
+        == "local/colbert-model"
+    )
+    assert config.public_dict()["candidate_selection_top_evidence_packets"] == 4
+
+
+def test_stage2_config_maps_prior_selector_embedding_fields_to_registry():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "candidate_selection_embedding_model": "prior/model-name",
+            "candidate_selection_embedding_device": "cuda:4",
+        },
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert config.candidate_registry_embedding_model == "prior/model-name"
+    assert config.candidate_registry_embedding_device == "cuda:4"
+    assert "candidate_selection_embedding_model" not in config.public_dict()
+    assert "candidate_selection_embedding_device" not in config.public_dict()
 
 
 def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
@@ -209,6 +282,63 @@ def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
             endpoint="http://stage2.test/v1",
             model="test-model",
             extraction_feature_batch_size=0,
+        ).validate()
+
+
+@pytest.mark.parametrize("top_n", [0, -1, True, 1.5, "5"])
+def test_stage2_config_rejects_invalid_candidate_selection_top_n(top_n):
+    with pytest.raises(ValueError, match="candidate_selection_top_n must be a positive integer"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            candidate_selection_top_n=top_n,
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "candidate_registry_embedding_model",
+        "candidate_registry_embedding_device",
+        "candidate_selection_late_interaction_model",
+        "candidate_selection_late_interaction_device",
+    ],
+)
+def test_stage2_config_rejects_blank_candidate_selection_model_settings(field_name):
+    with pytest.raises(ValueError, match=field_name):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            **{field_name: "  "},
+        ).validate()
+
+
+@pytest.mark.parametrize("threshold", [0.0, -0.1, 1.1, True, float("nan")])
+def test_stage2_config_rejects_invalid_candidate_registry_threshold(threshold):
+    with pytest.raises(ValueError, match="candidate_registry_similarity_threshold"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            candidate_registry_similarity_threshold=threshold,
+        ).validate()
+
+
+def test_stage2_config_rejects_invalid_candidate_selection_method():
+    with pytest.raises(ValueError, match="candidate_selection_method"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            candidate_selection_method="cross_encoder",
+        ).validate()
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "3"])
+def test_stage2_config_rejects_invalid_top_evidence_packet_count(value):
+    with pytest.raises(ValueError, match="candidate_selection_top_evidence_packets"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            candidate_selection_top_evidence_packets=value,
         ).validate()
 
 
@@ -1695,6 +1825,552 @@ def test_readable_supporting_text_strips_packet_structure_and_deduplicates():
     ]
 
 
+def test_natural_language_feature_name_humanizes_identifiers():
+    assert stage2_workflow._natural_language_feature_name("patient_age") == "Patient Age"
+    assert stage2_workflow._natural_language_feature_name("HER2_status") == "HER2 Status"
+    assert stage2_workflow._natural_language_feature_name("diseaseStage") == "Disease Stage"
+
+
+def test_candidate_registry_collapses_exact_names_and_conservative_semantic_aliases():
+    candidates = [
+        {
+            "candidate_id": "candidate-age-1",
+            "name": "patient_age",
+            "description": "Patient age at treatment.",
+            "supporting_packet_ids": ["packet-a"],
+            "evidence_axes": ["treatment"],
+        },
+        {
+            "candidate_id": "candidate-age-2",
+            "name": "patient-age",
+            "description": "Patient age.",
+            "supporting_packet_ids": ["packet-b"],
+            "evidence_axes": ["outcome"],
+        },
+        {
+            "candidate_id": "candidate-age-3",
+            "name": "age_at_treatment",
+            "description": "Patient age at treatment.",
+            "supporting_packet_ids": ["packet-c"],
+            "evidence_axes": ["outcome"],
+        },
+        {
+            "candidate_id": "candidate-renal",
+            "name": "renal_function",
+            "description": "Pretreatment renal function.",
+            "supporting_packet_ids": ["packet-d"],
+            "evidence_axes": ["outcome"],
+        },
+    ]
+    calls = []
+
+    def embed(texts, model_name, device):
+        calls.append((list(texts), model_name, device))
+        return np.asarray(
+            [
+                [1.0, 0.0] if "Age" in text or "age" in text else [0.0, 1.0]
+                for text in texts
+            ],
+            dtype=np.float32,
+        )
+
+    registry, audit = stage2_workflow._build_candidate_registry(
+        candidates=candidates,
+        embedding_model="configured-registry-model",
+        embedding_device="cuda:2",
+        similarity_threshold=0.94,
+        embedding_function=embed,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1:] == ("configured-registry-model", "cuda:2")
+    assert audit["raw_candidates"] == 4
+    assert audit["exact_name_groups"] == 3
+    assert audit["registry_candidates"] == 2
+    assert audit["exact_name_merges"] == 1
+    assert audit["semantic_merges"] == 1
+    age = next(candidate for candidate in registry if candidate["name"] == "patient_age")
+    assert age["supporting_packet_ids"] == ["packet-a", "packet-b", "packet-c"]
+    assert age["evidence_axes"] == ["outcome", "treatment"]
+    assert age["origin_candidate_ids"] == [
+        "candidate-age-1",
+        "candidate-age-2",
+        "candidate-age-3",
+    ]
+
+
+def test_candidate_registry_skips_dense_model_without_anchored_comparison():
+    def unexpected_embed(_texts, _model_name, _device):
+        raise AssertionError("non-discriminative anchors should not invoke dense embeddings")
+
+    registry, audit = stage2_workflow._build_candidate_registry(
+        candidates=[
+            {
+                "candidate_id": f"candidate-{index:02d}",
+                "name": f"measurement_{index:02d}",
+                "description": f"Unique measurement {index}.",
+                "supporting_packet_ids": [f"packet-{index:02d}"],
+            }
+            for index in range(20)
+        ],
+        embedding_model="unused",
+        embedding_device="cpu",
+        similarity_threshold=0.94,
+        embedding_function=unexpected_embed,
+    )
+
+    assert len(registry) == 20
+    assert audit["semantic_embedding_invoked"] is False
+    assert "unique" in audit["semantic_ignored_high_frequency_anchors"]
+
+
+def test_candidate_registry_selection_ranks_canonical_candidates_by_evidence_axis():
+    packets = {
+        "packet-age": {
+            "observable_axes": ["treatment"],
+            "architecture": "contrast",
+            "content": {
+                "source_architectures": ["contrast"],
+                "support": {"inner_folds": [1, 2]},
+                "representative_evidence": [
+                    {"text": "The cohort contrast is strongest across patient ages."}
+                ]
+            },
+        },
+        "packet-renal": {
+            "observable_axes": ["outcome"],
+            "architecture": "outcome",
+            "content": {
+                "source_architectures": ["outcome"],
+                "support": {"inner_folds": [1, 2]},
+                "representative_evidence": [
+                    {"text": "Creatinine and renal function distinguish outcomes."}
+                ]
+            },
+        },
+    }
+    candidates = [
+        {
+            "candidate_id": "candidate-age",
+            "name": "patient_age",
+            "supporting_packet_ids": ["packet-age", "packet-renal"],
+            "evidence_axes": ["treatment"],
+            "origin_candidate_ids": ["origin-age"],
+        },
+        {
+            "candidate_id": "candidate-renal",
+            "name": "renal_function",
+            "supporting_packet_ids": ["packet-age", "packet-renal"],
+            "evidence_axes": ["outcome"],
+            "origin_candidate_ids": ["origin-renal"],
+        },
+        {
+            "candidate_id": "candidate-stage",
+            "name": "tumor_stage",
+            "supporting_packet_ids": ["packet-age", "packet-renal"],
+            "evidence_axes": ["treatment", "outcome"],
+            "origin_candidate_ids": ["origin-stage"],
+        },
+    ]
+    pair_scores = {
+        ("Patient Age", "The cohort contrast is strongest across patient ages."): 0.95,
+        ("Patient Age", "Creatinine and renal function distinguish outcomes."): 0.10,
+        ("Renal Function", "The cohort contrast is strongest across patient ages."): 0.05,
+        ("Renal Function", "Creatinine and renal function distinguish outcomes."): 0.98,
+        ("Tumor Stage", "The cohort contrast is strongest across patient ages."): 0.30,
+        ("Tumor Stage", "Creatinine and renal function distinguish outcomes."): 0.35,
+    }
+    calls = []
+
+    def score(queries, documents, model_name, device):
+        calls.append((list(queries), list(documents), model_name, device))
+        return np.asarray(
+            [pair_scores[(query, document)] for query, document in zip(queries, documents)],
+            dtype=np.float32,
+        )
+
+    selected, audit = stage2_workflow._select_candidates_from_registry(
+        candidates=candidates,
+        packet_by_id=packets,
+        top_n_per_axis=1,
+        max_candidates=10,
+        scoring_method="late_interaction",
+        late_interaction_model="configured-colbert-model",
+        late_interaction_device="cuda:3",
+        dense_embedding_model="unused-dense-model",
+        dense_embedding_device="cpu",
+        top_evidence_packets=1,
+        document_chunk_overlap_tokens=24,
+        late_interaction_scoring_function=score,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][2:] == ("configured-colbert-model", "cuda:3")
+    assert set(calls[0][0]) == {"Patient Age", "Renal Function", "Tumor Stage"}
+    assert [candidate["candidate_id"] for candidate in selected] == [
+        "candidate-age",
+        "candidate-renal",
+    ]
+    # Provenance is not discarded. The highest-scoring packet is separately
+    # selected for downstream ontology definition.
+    assert selected[0]["supporting_packet_ids"] == ["packet-age", "packet-renal"]
+    assert selected[0]["ontology_packet_ids"] == ["packet-age"]
+    assert selected[0]["evidence_axes"] == ["treatment"]
+    assert selected[0]["candidate_selection"]["natural_language_query"] == "Patient Age"
+    assert selected[0]["candidate_selection"]["best_evidence_score"] == pytest.approx(0.95)
+    assert selected[1]["ontology_packet_ids"] == ["packet-renal"]
+    assert selected[1]["evidence_axes"] == ["outcome"]
+    assert audit["candidate_packet_associations_scored"] == 6
+    assert audit["retained_candidates"] == 2
+    assert audit["dropped_registry_candidate_ids"] == ["candidate-stage"]
+    assert audit["dropped_origin_candidate_ids"] == ["origin-stage"]
+    assert audit["axis_rankings"]["treatment"][0] == "candidate-age"
+    assert audit["axis_rankings"]["outcome"][0] == "candidate-renal"
+
+
+def test_candidate_registry_selection_supports_configured_dense_cosine_fallback():
+    packet = {
+        "packet": {
+            "architecture": "test",
+            "observable_axes": ["outcome"],
+            "content": {
+                "representative_evidence": [{"text": "Evidence about patient age."}]
+            },
+        }
+    }
+    candidates = [
+        {
+            "candidate_id": "candidate-age",
+            "name": "patient_age",
+            "supporting_packet_ids": ["packet"],
+            "evidence_axes": ["outcome"],
+        },
+        {
+            "candidate_id": "candidate-renal",
+            "name": "renal_function",
+            "supporting_packet_ids": ["packet"],
+            "evidence_axes": ["outcome"],
+        },
+    ]
+    vectors = {
+        "Patient Age": [1.0, 0.0],
+        "Renal Function": [0.0, 1.0],
+        "Evidence about patient age.": [1.0, 0.0],
+    }
+
+    selected, audit = stage2_workflow._select_candidates_from_registry(
+        candidates=candidates,
+        packet_by_id=packet,
+        top_n_per_axis=1,
+        max_candidates=10,
+        scoring_method="dense_cosine",
+        late_interaction_model="unused-colbert",
+        late_interaction_device="cpu",
+        dense_embedding_model="configured-dense-model",
+        dense_embedding_device="cuda:2",
+        top_evidence_packets=1,
+        document_chunk_overlap_tokens=32,
+        embedding_function=lambda texts, _model, _device: np.asarray(
+            [vectors[text] for text in texts],
+            dtype=np.float32,
+        ),
+    )
+
+    assert [candidate["candidate_id"] for candidate in selected] == ["candidate-age"]
+    assert audit["scoring_method"] == "dense_cosine"
+    assert audit["scoring_model"] == "configured-dense-model"
+    assert audit["scoring_device"] == "cuda:2"
+
+
+def test_candidate_registry_selection_enforces_axis_and_fold_cardinality_caps():
+    packets = {
+        "packet": {
+            "architecture": "test",
+            "observable_axes": ["treatment", "outcome"],
+            "content": {
+                "source_architectures": ["test"],
+                "support": {"inner_folds": [1, 2]},
+                "representative_evidence": [{"text": "Evidence packet."}],
+            },
+        }
+    }
+    candidates = [
+        {
+            "candidate_id": f"candidate-{index:02d}",
+            "name": f"feature_{index:02d}",
+            "supporting_packet_ids": ["packet"],
+            "evidence_axes": ["treatment" if index % 2 else "outcome"],
+            "origin_candidate_ids": [f"origin-{index:02d}"],
+        }
+        for index in range(12)
+    ]
+
+    def score(queries, _documents, _model_name, _device):
+        return np.asarray(
+            [1.0 - int(query.split()[-1]) / 100.0 for query in queries],
+            dtype=np.float32,
+        )
+
+    selected, audit = stage2_workflow._select_candidates_from_registry(
+        candidates=candidates,
+        packet_by_id=packets,
+        top_n_per_axis=5,
+        max_candidates=3,
+        scoring_method="late_interaction",
+        late_interaction_model="test-colbert",
+        late_interaction_device="cpu",
+        dense_embedding_model="unused",
+        dense_embedding_device="cpu",
+        top_evidence_packets=1,
+        document_chunk_overlap_tokens=32,
+        late_interaction_scoring_function=score,
+    )
+
+    assert len(selected) == 3
+    assert audit["shortlisted_candidates_before_fold_cap"] == 10
+    assert audit["hard_cap_applied"] is True
+    assert audit["retained_candidates"] <= audit["max_candidates_per_fold"]
+    assert {candidate["evidence_axes"][0] for candidate in selected} == {
+        "treatment",
+        "outcome",
+    }
+
+
+def test_candidate_funnel_bounds_two_thousand_packet_ten_thousand_candidate_case():
+    packet_count = 2_000
+    candidates_per_packet = 5
+    packets = {
+        f"packet-{packet_index:04d}": {
+            "architecture": f"architecture-{packet_index % 4}",
+            "observable_axes": ["treatment" if packet_index % 2 else "outcome"],
+            "content": {
+                "source_architectures": [f"architecture-{packet_index % 4}"],
+                "support": {"inner_folds": [1 + packet_index % 5]},
+                "representative_evidence": [
+                    {"text": f"Readable evidence packet {packet_index}."}
+                ],
+            },
+        }
+        for packet_index in range(packet_count)
+    }
+    candidates = []
+    for packet_index in range(packet_count):
+        for offset in range(candidates_per_packet):
+            candidate_index = packet_index * candidates_per_packet + offset
+            candidates.append(
+                {
+                    "candidate_id": f"candidate-{candidate_index:05d}",
+                    "name": f"measurement_{candidate_index:05d}",
+                    "description": f"Unique measurement {candidate_index}.",
+                    "supporting_packet_ids": [f"packet-{packet_index:04d}"],
+                    "evidence_axes": [
+                        "treatment" if packet_index % 2 else "outcome"
+                    ],
+                }
+            )
+
+    def unexpected_embed(*_args):
+        raise AssertionError(
+            "a ubiquitous lexical anchor must not trigger dense all-pairs work"
+        )
+
+    selected, audit = stage2_workflow._build_and_select_candidate_registry(
+        candidates=candidates,
+        packet_by_id=packets,
+        top_n_per_axis=5,
+        max_candidates=50,
+        registry_embedding_model="unused",
+        registry_embedding_device="cpu",
+        registry_similarity_threshold=0.94,
+        scoring_method="late_interaction",
+        late_interaction_model="test-colbert",
+        late_interaction_device="cpu",
+        top_evidence_packets=3,
+        document_chunk_overlap_tokens=32,
+        embedding_function=unexpected_embed,
+        late_interaction_scoring_function=(
+            lambda queries, _documents, _model, _device: np.full(
+                len(queries),
+                0.5,
+                dtype=np.float32,
+            )
+        ),
+    )
+
+    assert audit["registry"]["raw_candidates"] == 10_000
+    assert audit["registry"]["registry_candidates"] == 10_000
+    assert audit["selection"]["candidate_packet_associations_scored"] == 10_000
+    assert audit["selection"]["shortlisted_candidates_before_fold_cap"] == 10
+    assert len(selected) == 10
+
+
+def test_outer_fold_sends_only_registry_selected_candidates_to_consolidation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            required_architectures=(),
+            candidate_selection_top_n=1,
+            candidate_selection_late_interaction_model="test-colbert-model",
+        ),
+        clinical_question="Identify confounders.",
+        completion=lambda _messages, _config: "{}",
+    )
+    packet = {
+        "packet_id": "packet-age",
+        "architecture": "test-architecture",
+        "observable_axes": ["treatment", "outcome"],
+        "content": {
+            "representative_evidence": [{"text": "Age strongly separates the cohorts."}]
+        },
+    }
+    monkeypatch.setattr(
+        runner,
+        "_interpret_batch",
+        lambda **_kwargs: {
+            "concepts": [
+                {
+                    "name": "patient_age",
+                    "description": "Patient age.",
+                    "supporting_packet_ids": ["packet-age"],
+                    "evidence_axes": ["treatment", "outcome"],
+                    "evidence_rationale": "The evidence explicitly concerns age.",
+                    "caveats": "",
+                },
+                {
+                    "name": "renal_function",
+                    "description": "Renal function.",
+                    "supporting_packet_ids": ["packet-age"],
+                    "evidence_axes": ["treatment", "outcome"],
+                    "evidence_rationale": "A weaker possible explanation.",
+                    "caveats": "",
+                },
+            ]
+        },
+    )
+
+    from oci.models import late_interaction
+
+    def score(queries, documents, model_name, device, **kwargs):
+        assert model_name == "test-colbert-model"
+        assert device == "cpu"
+        assert kwargs["document_chunk_overlap_tokens"] == 32
+        assert set(documents) == {"Age strongly separates the cohorts."}
+        return np.asarray(
+            [1.0 if query == "Patient Age" else 0.1 for query in queries],
+            dtype=np.float32,
+        )
+
+    monkeypatch.setattr(late_interaction, "score_late_interaction_pairs", score)
+    captured = {}
+
+    def consolidate(**kwargs):
+        captured["candidates"] = kwargs["candidates"]
+        return {"features": [], "candidate_dispositions": {}}
+
+    monkeypatch.setattr(runner, "_consolidate_candidates", consolidate)
+
+    runner._run_outer_fold(
+        outer_fold=1,
+        packets=[packet],
+        output_dir=tmp_path / "outer_001",
+    )
+
+    assert [candidate["name"] for candidate in captured["candidates"]] == ["patient_age"]
+    interpreted = json.loads(
+        (tmp_path / "outer_001" / "interpreted_candidates.json").read_text(encoding="utf-8")
+    )
+    selected = json.loads(
+        (tmp_path / "outer_001" / "selected_candidates.json").read_text(encoding="utf-8")
+    )
+    selection = json.loads(
+        (tmp_path / "outer_001" / "candidate_registry_selection.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [candidate["name"] for candidate in interpreted] == [
+        "patient_age",
+        "renal_function",
+    ]
+    assert [candidate["name"] for candidate in selected] == ["patient_age"]
+    assert selection["selection"]["scoring_model"] == "test-colbert-model"
+    assert selection["selection"]["dropped_origin_candidate_ids"] == ["candidate_0002"]
+
+
+def test_outer_fold_reuses_completed_candidate_funnel_after_consolidation_failure(
+    tmp_path: Path,
+    monkeypatch,
+):
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            required_architectures=(),
+        ),
+        clinical_question="Identify confounders.",
+        completion=lambda _messages, _config: "{}",
+    )
+    packet = {
+        "packet_id": "packet-age",
+        "architecture": "test-architecture",
+        "observable_axes": ["treatment", "outcome"],
+        "content": {
+            "representative_evidence": [{"text": "Age separates the cohorts."}]
+        },
+    }
+    calls = {"interpret": 0, "score": 0, "consolidate": 0}
+
+    def interpret(**_kwargs):
+        calls["interpret"] += 1
+        return {
+            "concepts": [
+                {
+                    "name": "patient_age",
+                    "description": "Patient age.",
+                    "supporting_packet_ids": ["packet-age"],
+                    "evidence_axes": ["treatment", "outcome"],
+                    "evidence_rationale": "The evidence concerns age.",
+                    "caveats": "",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(runner, "_interpret_batch", interpret)
+    from oci.models import late_interaction
+
+    def score(queries, _documents, _model, _device, **_kwargs):
+        calls["score"] += 1
+        return np.full(len(queries), 0.9, dtype=np.float32)
+
+    monkeypatch.setattr(late_interaction, "score_late_interaction_pairs", score)
+
+    def consolidate(**_kwargs):
+        calls["consolidate"] += 1
+        if calls["consolidate"] == 1:
+            raise RuntimeError("simulated consolidation interruption")
+        return {"features": [], "candidate_dispositions": {}}
+
+    monkeypatch.setattr(runner, "_consolidate_candidates", consolidate)
+    output_dir = tmp_path / "outer_001"
+    with pytest.raises(RuntimeError, match="simulated consolidation interruption"):
+        runner._run_outer_fold(
+            outer_fold=1,
+            packets=[packet],
+            output_dir=output_dir,
+        )
+
+    runner._run_outer_fold(
+        outer_fold=1,
+        packets=[packet],
+        output_dir=output_dir,
+    )
+
+    assert calls == {"interpret": 1, "score": 1, "consolidate": 2}
+
+
 def test_interpretation_normalizes_axes_and_derives_complete_dispositions():
     packet_ids = ["packet-a", "packet-b"]
     result = stage2_workflow._validate_interpretation(
@@ -3013,6 +3689,53 @@ def test_stage2_iterative_consolidation_does_not_lose_candidates():
     assert set(result["features"][0]["supporting_packet_ids"]) == {
         candidate["supporting_packet_ids"][0] for candidate in candidates
     }
+
+
+def test_consolidation_dispositions_follow_registry_origin_candidates():
+    def completion(messages, _request_config):
+        body = json.loads(messages[1]["content"])
+        if _prompt_job(body) == "consolidate_stage2_candidate_pool":
+            return json.dumps({"merge_directives": []})
+        return json.dumps(
+            {
+                "description": "Patient age.",
+                "value_type": "continuous",
+                "categories_or_unit": ["years"],
+                "measurement_definition": "Extract pretreatment age in years.",
+                "missing_value_rule": "Return null when undocumented.",
+                "stability_summary": "Supported by the cited evidence.",
+                "caveats": "",
+            }
+        )
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+        clinical_question="Identify confounders.",
+        completion=completion,
+    )
+    result = runner._consolidate_candidates(
+        outer_fold=1,
+        candidates=[
+            {
+                "candidate_id": "candidate_registry_0001",
+                "origin_candidate_ids": ["candidate_0001", "candidate_0002"],
+                "architecture": "deterministic_candidate_group",
+                "name": "patient_age",
+                "description": "Patient age.",
+                "supporting_packet_ids": ["packet_1"],
+                "ontology_packet_ids": ["packet_1"],
+                "evidence_axes": ["treatment", "outcome"],
+            }
+        ],
+        evidence_packets=_original_evidence_packets(["packet_1"]),
+    )
+
+    assert set(result["candidate_dispositions"]) == {"candidate_0001", "candidate_0002"}
+    assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
+    assert result["candidate_dispositions"]["candidate_0002"]["status"] == "merged"
 
 
 def test_global_candidate_pool_prompt_exposes_all_unique_names_and_descriptions():
@@ -5459,7 +6182,8 @@ def test_stage2_posthoc_oracle_ite_reports_unavailable_for_real_dataset(tmp_path
     assert not (tmp_path / "posthoc_predictions_with_oracle_ite.csv").exists()
 
 
-def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path):
+def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path, monkeypatch):
+    _install_test_candidate_scorer(monkeypatch)
     handoff = tmp_path / "handoff.jsonl"
     rows = [
         {
@@ -5601,7 +6325,11 @@ def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
     assert result["outer_folds"] == 3
 
 
-def test_plain_stage2_finishes_extraction_review_and_causal_estimation(tmp_path: Path):
+def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _install_test_candidate_scorer(monkeypatch)
     handoff = tmp_path / "handoff.jsonl"
     evidence_rows = []
     for outer_fold in (1, 2):

@@ -34,8 +34,14 @@ $OUT/stage2/evidence_compilation/
 |  Parallel LLM interpretation                                  |
 |  packets ---> candidate concepts + grounded packet citations  |
 |       |                                                       |
+|  interpreted_candidates.json (unfiltered)                     |
+|       |                                                       |
+|       | exact names + conservative dense semantic registry    |
+|       | ColBERT candidate<->cited-packet MeanMaxSim            |
+|       | top N per evidence axis + hard outer-fold cap          |
 |       v                                                       |
-|  interpreted_candidates.json                                  |
+|  selected_candidates.json                                     |
+|  candidate_registry_selection.json                            |
 |       |                                                       |
 |       +---- configured explicit features + supplied ontologies|
 |       | local pairwise alias judgments                         |
@@ -89,7 +95,7 @@ summary.json
 |---|---|---|
 | Evidence compilation | Stage 1 handoff rows plus the existing memory-mapped Stage 1 chunk-embedding cache, when available | Fold-local semantic cards, exact-member and raw-path lineage manifests, a reduction audit, and bounded prompt packets |
 | Interpretation | One architecture-specific batch projected to prompt-local item numbers and readable text only | Candidate clinical concepts and citations to supplied item numbers; Python maps these back to packet provenance |
-| Candidate assembly | Concepts from all interpretation batches | `interpreted_candidates.json`; evidence axes are recomputed from citations and mapped to possible causal roles |
+| Candidate selection and assembly | Concepts from all interpretation batches plus readable packet evidence | Exact names and conservative dense aliases form a fold-level registry; natural-language candidate names receive ColBERT MeanMaxSim scores only against cited packets; the default top five per evidence axis, subject to the hard fold cap, continue to `selected_candidates.json`, with complete lineage and rankings in `candidate_registry_selection.json` |
 | Consolidation | Candidates from all Stage 1 architectures plus optional `stage2.explicit_features` | Deduplicated operational definitions in `feature_definitions.json`; configured groups use their supplied ontology |
 | Training extraction | Operational definitions plus outer-training patient text | A patient-by-feature matrix for the training patients |
 | Review | Training-only extraction summaries and inner-fold treatment/outcome performance | Keep, drop, or measurement-revision decisions; a revision may trigger another extraction round |
@@ -165,8 +171,19 @@ skips model-authored ontology definition while retaining any Stage 1 provenance
 carried by the merged candidates. Training-fold diagnostics are still computed,
 but review must keep the feature without revising its supplied ontology.
 
-Python coalesces exact normalized-name duplicates, then repeatedly presents
-bounded candidate batches to the LLM. Early rounds use shifted alphabetical
+Before that expensive review, Python builds one registry from all interpreted
+candidates in the outer fold. It coalesces exact normalized names and performs
+only high-threshold dense semantic merges that also share a non-generic lexical
+measurement anchor. It then turns each canonical identifier into a readable
+query and computes ColBERT MeanMaxSim only along its cited evidence-packet
+edges. The rank aggregates the best evidence scores with source-architecture
+and inner-fold coverage. A stratified top-N union preserves each evidence axis,
+and `max_candidates_per_fold` bounds the final discovered set. Packet
+provenance is retained even though only the best evidence packets are routed to
+ontology definition.
+
+The bounded registry candidates are then repeatedly presented in batches to
+the LLM. Early rounds use shifted alphabetical
 partitions; later rounds use reproducible seeded shuffles so lexically distant
 aliases can meet. Every response contains only merge directives of the form
 `inputs -> output`; it contains no opaque IDs, exclusion list, or enumeration
@@ -192,6 +209,6 @@ value type. It chooses the value type and supplies allowed values or a unit
 based on the readable text. Python keeps provenance and causal-role routing
 outside the prompt and validates ontology shape without encoding domain-specific
 clinical answers. There is no diversity-ranking prompt or feature-count pruning
-step. The legacy `max_candidates_per_fold` and
-`consolidation_oversample_factor` configuration fields remain readable only so
-existing run files continue to parse.
+prompt. `max_candidates_per_fold` is enforced deterministically before these
+requests; `consolidation_oversample_factor` remains readable only so existing
+run files continue to parse.

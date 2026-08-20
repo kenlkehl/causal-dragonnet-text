@@ -134,7 +134,25 @@ architectures, scores, support counts, folds, and other provenance stay outside
 the model prompt. The model returns feature names, descriptions, rationales,
 and `supporting_items` such as `[1, 3]`; Python immediately maps those ordinal
 labels back to the original packets and derives evidence axes and causal roles
-without model-authored IDs. Discovery does not choose value types, units,
+without model-authored IDs. Python collapses exact normalized names across the
+whole outer fold, then uses dense embeddings for conservative semantic registry
+merges only when two names or descriptions share a non-generic lexical anchor.
+Fold-ubiquitous anchors are ignored so registry construction cannot degenerate
+into an all-pairs comparison. The dense threshold prevents an embedding-neighbor
+graph from merging merely related clinical measurements.
+
+Each canonical identifier is rendered as a natural-language query
+(`patient_age` becomes `Patient Age`). A ColBERT-style multi-vector encoder
+scores that query only against the readable text of packets already cited by
+the candidate; Stage 2 never constructs the full candidate-by-packet Cartesian
+product. Scores are aggregated with architecture and inner-fold coverage. The
+best `candidate_selection_top_n` candidates within each evidence axis enter a
+stratified union, and `max_candidates_per_fold` is then enforced as a hard
+overall discovery cap. All supporting packet provenance remains attached, but
+only the highest-scoring `candidate_selection_top_evidence_packets` packets are
+used for ontology definition. Thus 2,000 packets with five interpreted ideas
+each can require 10,000 relevance scores, but cannot become 10,000 downstream
+feature candidates. Discovery does not choose value types, units,
 categories, or extraction ontologies; the later one-feature ontology request
 makes those decisions from the retained feature name and supporting text.
 
@@ -155,6 +173,16 @@ An external endpoint configuration is:
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
+    "max_candidates_per_fold": 50,
+    "candidate_selection_top_n": 5,
+    "candidate_registry_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+    "candidate_registry_embedding_device": "cpu",
+    "candidate_registry_similarity_threshold": 0.94,
+    "candidate_selection_method": "late_interaction",
+    "candidate_selection_late_interaction_model": "answerdotai/answerai-colbert-small-v1",
+    "candidate_selection_late_interaction_device": "cpu",
+    "candidate_selection_top_evidence_packets": 3,
+    "candidate_selection_document_chunk_overlap_tokens": 32,
     "operationalization_max_prompt_chars": 640000,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
@@ -183,6 +211,24 @@ An external endpoint configuration is:
   }
 }
 ```
+
+Candidate selection defaults to five canonical features per evidence axis and
+an overall fold cap of 50. `Qwen/Qwen3-Embedding-0.6B` is used for conservative
+registry deduplication; `answerdotai/answerai-colbert-small-v1` supplies
+MeanMaxSim evidence relevance. Both run on CPU by default so pipeline-managed
+vLLM servers retain their GPU allocation. The native Sentence Transformers
+`MultiVectorEncoder` API is used when installed; the project also supports the
+same Stanford ColBERT checkpoint format under the currently pinned release.
+Set either device field to a concrete device such as `cuda:0`, or set it to
+`auto`. `candidate_selection_method: "dense_cosine"` is an explicit fallback
+that uses the registry sentence transformer for evidence scoring too.
+
+The unfiltered interpretation output is written to
+`outer_NNN/interpreted_candidates.json`; the bounded canonical set is written
+to `selected_candidates.json`. Exact merge lineage, semantic merge decisions,
+every candidate-packet score, coverage components, per-axis ranks, hard-cap
+decisions, and dropped origin IDs are written to
+`candidate_registry_selection.json`.
 
 `stage2.explicit_features` is optional. Each entry is a complete, investigator-
 specified variable definition, not merely a requested name. It requires
@@ -381,6 +427,13 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `extraction_max_prompt_chars`, `extraction_feature_batch_size`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
+`max_candidates_per_fold`, `candidate_selection_top_n`,
+`candidate_registry_embedding_model`, `candidate_registry_embedding_device`,
+`candidate_registry_similarity_threshold`, `candidate_selection_method`,
+`candidate_selection_late_interaction_model`,
+`candidate_selection_late_interaction_device`,
+`candidate_selection_top_evidence_packets`,
+`candidate_selection_document_chunk_overlap_tokens`,
 `max_review_rounds`, `max_evaluation_rounds`,
 `ontology_refinement_min_failure_patients`,
 `max_ontology_refinement_rounds`, `screening_trees`,
@@ -389,9 +442,9 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `effect_modifier_negative_fold_fraction`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
 `temperature`, `repetition_penalty`, `interpretation_reasoning_effort`, and
-`extraction_reasoning_effort`. The legacy `max_candidates_per_fold` and
-`consolidation_oversample_factor` fields are still accepted in existing run
-files but do not affect consolidation. A configured endpoint or managed vLLM
+`extraction_reasoning_effort`. `consolidation_oversample_factor` remains an
+inert compatibility field; `max_candidates_per_fold` is now the hard cap on
+discovered canonical candidates before LLM consolidation. A configured endpoint or managed vLLM
 pool makes the default mode `full`. The modes can always be made explicit:
 
 Each candidate-consolidation batch uses the independent
@@ -582,6 +635,8 @@ my_stage1_run/
       input_packets.jsonl
       interpretations/...
       interpreted_candidates.json
+      selected_candidates.json
+      candidate_registry_selection.json
       feature_definitions.json
       definitions_complete.json
       review/

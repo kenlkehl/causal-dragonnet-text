@@ -71,6 +71,17 @@ DEFAULT_CONSOLIDATION_SHUFFLE_ROUNDS = 50
 DEFAULT_CONSOLIDATION_MAX_ROUNDS = (
     DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS + DEFAULT_CONSOLIDATION_SHUFFLE_ROUNDS
 )
+DEFAULT_CANDIDATE_SELECTION_TOP_N = 5
+DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_DEVICE = "cpu"
+DEFAULT_CANDIDATE_REGISTRY_SIMILARITY_THRESHOLD = 0.94
+DEFAULT_CANDIDATE_SELECTION_METHOD = "late_interaction"
+DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_MODEL = (
+    "answerdotai/answerai-colbert-small-v1"
+)
+DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_DEVICE = "cpu"
+DEFAULT_CANDIDATE_SELECTION_TOP_EVIDENCE_PACKETS = 3
+DEFAULT_CANDIDATE_SELECTION_DOCUMENT_CHUNK_OVERLAP_TOKENS = 32
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 DEFAULT_SCREENING_TREES = 200
@@ -91,7 +102,12 @@ OPERATIONALIZATION_SCHEMA_VERSION = (
 )
 INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v9_request_policy"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v6_request_policy"
+CANDIDATE_SELECTION_SCHEMA_VERSION = (
+    "fold_candidate_registry_late_interaction_axis_top_n_v1"
+)
 CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE = "configured_explicit_feature"
+
+_CANDIDATE_SELECTION_ENCODING_LOCK = threading.Lock()
 
 _CONCEPT_IDENTITY_STOPWORDS = {
     "a",
@@ -657,12 +673,38 @@ class PlainHandoffStage2Config:
     evidence_max_cards_per_fold: int = 400
     evidence_max_exemplars_per_card: int = 4
     evidence_max_exemplar_chars: int = 2_400
-    # Accepted for compatibility with existing run files. Consolidation no
-    # longer caps or ranks semantic groups before extraction.
+    # Hard downstream cardinality cap after fold-local candidate registry and
+    # evidence ranking. Investigator-configured features are added later and
+    # are never subject to this discovery cap.
     max_candidates_per_fold: int = 50
     # Accepted for compatibility with existing run files. Consolidation no
     # longer uses a progressive or oversampled feature beam.
     consolidation_oversample_factor: int = 4
+    # Retain the best discovered candidates within each evidence axis, then
+    # take their union subject to max_candidates_per_fold.
+    candidate_selection_top_n: int = DEFAULT_CANDIDATE_SELECTION_TOP_N
+    # Exact normalized names are collapsed first. Dense embeddings are then
+    # used only for conservative, lexically anchored semantic registry merges.
+    candidate_registry_embedding_model: str = DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_MODEL
+    candidate_registry_embedding_device: str = DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_DEVICE
+    candidate_registry_similarity_threshold: float = (
+        DEFAULT_CANDIDATE_REGISTRY_SIMILARITY_THRESHOLD
+    )
+    # Late interaction is the default relevance scorer. Dense cosine remains
+    # available as an explicit fallback and reuses the registry encoder.
+    candidate_selection_method: str = DEFAULT_CANDIDATE_SELECTION_METHOD
+    candidate_selection_late_interaction_model: str = (
+        DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_MODEL
+    )
+    candidate_selection_late_interaction_device: str = (
+        DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_DEVICE
+    )
+    candidate_selection_top_evidence_packets: int = (
+        DEFAULT_CANDIDATE_SELECTION_TOP_EVIDENCE_PACKETS
+    )
+    candidate_selection_document_chunk_overlap_tokens: int = (
+        DEFAULT_CANDIDATE_SELECTION_DOCUMENT_CHUNK_OVERLAP_TOKENS
+    )
     workers: int = 4
     # Limits language-model reviews. Deterministic evaluation-only convergence
     # rounds may continue after this many reviews when the last review changes
@@ -802,6 +844,57 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.max_candidates_per_fold must be positive")
         if self.consolidation_oversample_factor < 1:
             raise ValueError("stage2.consolidation_oversample_factor must be positive")
+        if (
+            isinstance(self.candidate_selection_top_n, bool)
+            or not isinstance(self.candidate_selection_top_n, int)
+            or self.candidate_selection_top_n < 1
+        ):
+            raise ValueError("stage2.candidate_selection_top_n must be a positive integer")
+        if not str(self.candidate_registry_embedding_model).strip():
+            raise ValueError("stage2.candidate_registry_embedding_model must be nonempty")
+        if not str(self.candidate_registry_embedding_device).strip():
+            raise ValueError("stage2.candidate_registry_embedding_device must be nonempty")
+        if (
+            isinstance(self.candidate_registry_similarity_threshold, bool)
+            or not isinstance(self.candidate_registry_similarity_threshold, (int, float))
+            or not math.isfinite(float(self.candidate_registry_similarity_threshold))
+            or not 0.0 < float(self.candidate_registry_similarity_threshold) <= 1.0
+        ):
+            raise ValueError(
+                "stage2.candidate_registry_similarity_threshold must be between 0 and 1"
+            )
+        if self.candidate_selection_method not in {"late_interaction", "dense_cosine"}:
+            raise ValueError(
+                "stage2.candidate_selection_method must be late_interaction or dense_cosine"
+            )
+        if not str(self.candidate_selection_late_interaction_model).strip():
+            raise ValueError(
+                "stage2.candidate_selection_late_interaction_model must be nonempty"
+            )
+        if not str(self.candidate_selection_late_interaction_device).strip():
+            raise ValueError(
+                "stage2.candidate_selection_late_interaction_device must be nonempty"
+            )
+        if (
+            isinstance(self.candidate_selection_top_evidence_packets, bool)
+            or not isinstance(self.candidate_selection_top_evidence_packets, int)
+            or self.candidate_selection_top_evidence_packets < 1
+        ):
+            raise ValueError(
+                "stage2.candidate_selection_top_evidence_packets must be a positive integer"
+            )
+        if (
+            isinstance(self.candidate_selection_document_chunk_overlap_tokens, bool)
+            or not isinstance(
+                self.candidate_selection_document_chunk_overlap_tokens,
+                int,
+            )
+            or self.candidate_selection_document_chunk_overlap_tokens < 0
+        ):
+            raise ValueError(
+                "stage2.candidate_selection_document_chunk_overlap_tokens must be a "
+                "nonnegative integer"
+            )
         if self.workers < 1:
             raise ValueError("stage2.workers must be positive")
         if self.max_review_rounds < 1:
@@ -1003,6 +1096,60 @@ def plain_stage2_config_from_mapping(
         evidence_max_exemplar_chars=int(raw.get("evidence_max_exemplar_chars", 2_400)),
         max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
         consolidation_oversample_factor=int(raw.get("consolidation_oversample_factor", 4)),
+        candidate_selection_top_n=int(
+            raw.get("candidate_selection_top_n", DEFAULT_CANDIDATE_SELECTION_TOP_N)
+        ),
+        candidate_registry_embedding_model=str(
+            raw.get(
+                "candidate_registry_embedding_model",
+                raw.get(
+                    "candidate_selection_embedding_model",
+                    DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_MODEL,
+                ),
+            )
+        ).strip(),
+        candidate_registry_embedding_device=str(
+            raw.get(
+                "candidate_registry_embedding_device",
+                raw.get(
+                    "candidate_selection_embedding_device",
+                    DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_DEVICE,
+                ),
+            )
+        ).strip(),
+        candidate_registry_similarity_threshold=float(
+            raw.get(
+                "candidate_registry_similarity_threshold",
+                DEFAULT_CANDIDATE_REGISTRY_SIMILARITY_THRESHOLD,
+            )
+        ),
+        candidate_selection_method=str(
+            raw.get("candidate_selection_method", DEFAULT_CANDIDATE_SELECTION_METHOD)
+        ).strip(),
+        candidate_selection_late_interaction_model=str(
+            raw.get(
+                "candidate_selection_late_interaction_model",
+                DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_MODEL,
+            )
+        ).strip(),
+        candidate_selection_late_interaction_device=str(
+            raw.get(
+                "candidate_selection_late_interaction_device",
+                DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_DEVICE,
+            )
+        ).strip(),
+        candidate_selection_top_evidence_packets=int(
+            raw.get(
+                "candidate_selection_top_evidence_packets",
+                DEFAULT_CANDIDATE_SELECTION_TOP_EVIDENCE_PACKETS,
+            )
+        ),
+        candidate_selection_document_chunk_overlap_tokens=int(
+            raw.get(
+                "candidate_selection_document_chunk_overlap_tokens",
+                DEFAULT_CANDIDATE_SELECTION_DOCUMENT_CHUNK_OVERLAP_TOKENS,
+            )
+        ),
         workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
         max_review_rounds=int(raw.get("max_review_rounds", 2)),
         max_evaluation_rounds=int(
@@ -3623,6 +3770,748 @@ def _readable_supporting_text(
     return list(dict.fromkeys(texts))
 
 
+def _natural_language_feature_name(value: Any) -> str:
+    """Render an identifier as a short natural-language embedding query."""
+
+    raw = str(value or "").strip()
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", raw)
+    words = re.findall(r"[A-Za-z0-9]+", spaced.replace("_", " ").replace("-", " "))
+    rendered: list[str] = []
+    for word in words:
+        if word.isupper():
+            rendered.append(word)
+        elif any(character.isdigit() for character in word) and len(word) <= 8:
+            rendered.append(word.upper())
+        else:
+            rendered.append(word[:1].upper() + word[1:].lower())
+    return " ".join(rendered) or raw
+
+
+def _packet_observable_axes(packet: Mapping[str, Any]) -> list[str]:
+    raw_axes = packet.get("observable_axes") or packet.get("evidence_axes")
+    content = packet.get("content")
+    if not raw_axes and isinstance(content, Mapping):
+        raw_axes = content.get("evidence_axes") or content.get("observable_axes")
+    return _canonical_evidence_axes(raw_axes)
+
+
+def _encode_candidate_selection_texts(
+    texts: Sequence[str],
+    model_name: str,
+    device: str,
+) -> np.ndarray:
+    """Encode and L2-normalize selector text with one shared local model."""
+
+    if not texts:
+        raise ValueError("candidate selection requires at least one text to embed")
+    from ..models.concept_embedding_cache import load_sentence_transformer
+
+    resolved_device = None if str(device).strip().lower() == "auto" else str(device).strip()
+    # Outer folds execute concurrently. SentenceTransformer modules are shared
+    # to avoid loading one 0.6B model per fold, so serialize their forward calls.
+    with _CANDIDATE_SELECTION_ENCODING_LOCK:
+        encoder = load_sentence_transformer(
+            str(model_name).strip(),
+            device=resolved_device,
+        )
+        embeddings = encoder.encode(
+            list(texts),
+            batch_size=min(32, len(texts)),
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+    matrix = np.asarray(embeddings, dtype=np.float32)
+    if matrix.ndim == 1:
+        matrix = matrix.reshape(1, -1)
+    if matrix.ndim != 2 or matrix.shape[0] != len(texts) or matrix.shape[1] < 1:
+        raise RuntimeError(
+            "candidate selection sentence transformer returned unexpected shape "
+            f"{matrix.shape} for {len(texts)} texts"
+        )
+    if not np.isfinite(matrix).all():
+        raise RuntimeError("candidate selection sentence transformer returned non-finite values")
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    if np.any(norms <= 0.0):
+        raise RuntimeError("candidate selection sentence transformer returned a zero vector")
+    return matrix / norms
+
+
+def _candidate_registry_text(candidate: Mapping[str, Any]) -> str:
+    name = _natural_language_feature_name(candidate.get("name"))
+    descriptions = list(
+        dict.fromkeys(
+            text
+            for text in [
+                _short_text(candidate.get("description"), max_chars=600),
+                *(
+                    _short_text(member.get("description"), max_chars=600)
+                    for member in list(candidate.get("member_measurements") or [])
+                ),
+            ]
+            if text
+        )
+    )
+    # Exact-name groups can carry thousands of distinct interpretations. The
+    # name remains the primary identity signal; a small deterministic sample of
+    # descriptions supplies enough context for conservative alias matching.
+    return ". ".join([name, *descriptions[:4]])
+
+
+def _normalized_embedding_matrix(
+    texts: Sequence[str],
+    *,
+    model_name: str,
+    device: str,
+    embedding_function: Callable[[Sequence[str], str, str], np.ndarray] | None,
+) -> np.ndarray:
+    encode = embedding_function or _encode_candidate_selection_texts
+    matrix = np.asarray(encode(texts, model_name, device), dtype=np.float32)
+    if matrix.ndim == 1:
+        matrix = matrix.reshape(1, -1)
+    if matrix.ndim != 2 or matrix.shape[0] != len(texts) or matrix.shape[1] < 1:
+        raise RuntimeError(
+            "candidate registry embedding function returned unexpected shape "
+            f"{matrix.shape} for {len(texts)} texts"
+        )
+    if not np.isfinite(matrix).all():
+        raise RuntimeError("candidate registry embedding function returned non-finite values")
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    if np.any(norms <= 0.0):
+        raise RuntimeError("candidate registry embedding function returned a zero vector")
+    return matrix / norms
+
+
+def _build_candidate_registry(
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    embedding_model: str,
+    embedding_device: str,
+    similarity_threshold: float,
+    embedding_function: Callable[[Sequence[str], str, str], np.ndarray] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Collapse exact names, then conservatively merge anchored semantic aliases."""
+
+    if (
+        isinstance(similarity_threshold, bool)
+        or not isinstance(similarity_threshold, (int, float))
+        or not math.isfinite(float(similarity_threshold))
+        or not 0.0 < float(similarity_threshold) <= 1.0
+    ):
+        raise ValueError("candidate registry similarity_threshold must be between 0 and 1")
+    candidate_ids = [str(candidate.get("candidate_id") or "") for candidate in candidates]
+    if any(not candidate_id for candidate_id in candidate_ids):
+        raise ValueError("candidate registry inputs must have candidate_id values")
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError("candidate registry received duplicate candidate IDs")
+    exact_groups = _materialize_exact_name_groups(candidates)
+    texts = [_candidate_registry_text(group) for group in exact_groups]
+    anchors = [
+        _concept_identity_tokens(
+            group.get("name"),
+            group.get("description"),
+            *(member.get("description") for member in group.get("member_measurements") or []),
+        )
+        for group in exact_groups
+    ]
+    anchor_counts = Counter(anchor for values in anchors for anchor in values)
+    max_anchor_frequency = max(
+        8,
+        min(128, int(math.ceil(math.sqrt(max(1, len(exact_groups)))))),
+    )
+    informative_anchors = {
+        anchor
+        for anchor, count in anchor_counts.items()
+        if 1 < count <= max_anchor_frequency
+    }
+    routing_anchors = [values.intersection(informative_anchors) for values in anchors]
+    comparison_indexes = {
+        index
+        for index, values in enumerate(routing_anchors)
+        if values
+    }
+    embedding_invoked = len(comparison_indexes) > 1
+    matrix = (
+        _normalized_embedding_matrix(
+            texts,
+            model_name=str(embedding_model).strip(),
+            device=str(embedding_device).strip(),
+            embedding_function=embedding_function,
+        )
+        if embedding_invoked
+        else None
+    )
+
+    clusters: list[dict[str, Any]] = []
+    cluster_ids_by_anchor: dict[str, set[int]] = defaultdict(set)
+    assignments: list[dict[str, Any]] = []
+    for index, group in enumerate(exact_groups):
+        eligible_cluster_ids = sorted(
+            {
+                cluster_id
+                for anchor in routing_anchors[index]
+                for cluster_id in cluster_ids_by_anchor.get(anchor, set())
+            }
+        )
+        best_cluster_id: int | None = None
+        best_similarity: float | None = None
+        if matrix is not None and index in comparison_indexes:
+            for cluster_id in eligible_cluster_ids:
+                similarity = float(np.dot(matrix[index], clusters[cluster_id]["centroid"]))
+                if similarity < float(similarity_threshold):
+                    continue
+                if best_similarity is None or similarity > best_similarity:
+                    best_cluster_id = cluster_id
+                    best_similarity = similarity
+        if best_cluster_id is None:
+            cluster_id = len(clusters)
+            clusters.append(
+                {
+                    "members": [group],
+                    "member_indexes": [index],
+                    "anchors": set(routing_anchors[index]),
+                    "centroid": matrix[index].copy() if matrix is not None else None,
+                }
+            )
+            for anchor in routing_anchors[index]:
+                cluster_ids_by_anchor[anchor].add(cluster_id)
+            assignments.append(
+                {
+                    "exact_group_id": str(group["candidate_id"]),
+                    "registry_cluster": cluster_id + 1,
+                    "action": "new_cluster",
+                    "cosine_similarity": None,
+                }
+            )
+            continue
+        cluster = clusters[best_cluster_id]
+        cluster["members"].append(group)
+        cluster["member_indexes"].append(index)
+        cluster["anchors"].update(routing_anchors[index])
+        centroid = matrix[cluster["member_indexes"]].mean(axis=0)
+        centroid_norm = float(np.linalg.norm(centroid))
+        cluster["centroid"] = centroid / centroid_norm
+        for anchor in routing_anchors[index]:
+            cluster_ids_by_anchor[anchor].add(best_cluster_id)
+        assignments.append(
+            {
+                "exact_group_id": str(group["candidate_id"]),
+                "registry_cluster": best_cluster_id + 1,
+                "action": "semantic_merge",
+                "cosine_similarity": best_similarity,
+            }
+        )
+
+    registry: list[dict[str, Any]] = []
+    cluster_rows: list[dict[str, Any]] = []
+    for cluster_index, cluster in enumerate(clusters, start=1):
+        members = list(cluster["members"])
+        canonical = _canonical_cluster_member(members)
+        canonical_name = _snake_case_name(
+            canonical.get("name"),
+            fallback=f"measurement_{cluster_index:03d}",
+        )
+        registry_group = _materialize_candidate_group(
+            candidate_id=f"candidate_registry_{cluster_index:04d}",
+            members=members,
+            canonical_name=canonical_name,
+            canonical_description=_short_text(
+                canonical.get("description") or canonical_name,
+                max_chars=2_000,
+            ),
+        )
+        registry.append(registry_group)
+        cluster_rows.append(
+            {
+                "candidate_id": registry_group["candidate_id"],
+                "canonical_name": registry_group["name"],
+                "exact_group_names": [str(member["name"]) for member in members],
+                "origin_candidate_ids": list(registry_group["origin_candidate_ids"]),
+                "supporting_packet_ids": list(registry_group["supporting_packet_ids"]),
+            }
+        )
+    return registry, {
+        "raw_candidates": len(candidates),
+        "exact_name_groups": len(exact_groups),
+        "registry_candidates": len(registry),
+        "exact_name_merges": len(candidates) - len(exact_groups),
+        "semantic_merges": len(exact_groups) - len(registry),
+        "semantic_embedding_invoked": embedding_invoked,
+        "semantic_embedding_model": str(embedding_model).strip(),
+        "semantic_embedding_device": str(embedding_device).strip(),
+        "semantic_similarity_threshold": float(similarity_threshold),
+        "semantic_comparison_candidates": len(comparison_indexes),
+        "semantic_anchor_max_frequency": max_anchor_frequency,
+        "semantic_ignored_high_frequency_anchors": sorted(
+            anchor
+            for anchor, count in anchor_counts.items()
+            if count > max_anchor_frequency
+        ),
+        "assignments": assignments,
+        "clusters": cluster_rows,
+    }
+
+
+def _packet_support_architectures(packet: Mapping[str, Any]) -> list[str]:
+    content = packet.get("content")
+    architectures = content.get("source_architectures") if isinstance(content, Mapping) else None
+    if not architectures and packet.get("architecture"):
+        architectures = [packet["architecture"]]
+    return list(dict.fromkeys(_string_values(architectures)))
+
+
+def _packet_support_inner_folds(packet: Mapping[str, Any]) -> list[int]:
+    content = packet.get("content")
+    support = content.get("support") if isinstance(content, Mapping) else None
+    raw_folds = support.get("inner_folds") if isinstance(support, Mapping) else None
+    folds: list[int] = []
+    for value in raw_folds or []:
+        try:
+            fold = int(value)
+        except (TypeError, ValueError):
+            continue
+        if fold not in folds:
+            folds.append(fold)
+    return folds
+
+
+def _dense_candidate_packet_scores(
+    queries: Sequence[str],
+    documents: Sequence[str],
+    *,
+    embedding_model: str,
+    embedding_device: str,
+    embedding_function: Callable[[Sequence[str], str, str], np.ndarray] | None,
+) -> np.ndarray:
+    texts = list(dict.fromkeys([*queries, *documents]))
+    matrix = _normalized_embedding_matrix(
+        texts,
+        model_name=embedding_model,
+        device=embedding_device,
+        embedding_function=embedding_function,
+    )
+    index = {text: position for position, text in enumerate(texts)}
+    return np.asarray(
+        [
+            float(np.dot(matrix[index[query]], matrix[index[document]]))
+            for query, document in zip(queries, documents)
+        ],
+        dtype=np.float32,
+    )
+
+
+def _candidate_selection_sort_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        -float(row["aggregate_support_score"]),
+        -float(row["top_evidence_mean_score"]),
+        -float(row["best_evidence_score"]),
+        -float(row["architecture_coverage"]),
+        -float(row["inner_fold_coverage"]),
+        -int(row["supporting_packet_count"]),
+        str(row["feature_name"]).casefold(),
+        str(row["candidate_id"]),
+    )
+
+
+def _select_candidates_from_registry(
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    packet_by_id: Mapping[str, Mapping[str, Any]],
+    top_n_per_axis: int,
+    max_candidates: int,
+    scoring_method: str,
+    late_interaction_model: str,
+    late_interaction_device: str,
+    dense_embedding_model: str,
+    dense_embedding_device: str,
+    top_evidence_packets: int,
+    document_chunk_overlap_tokens: int,
+    embedding_function: Callable[[Sequence[str], str, str], np.ndarray] | None = None,
+    late_interaction_scoring_function: (
+        Callable[[Sequence[str], Sequence[str], str, str], np.ndarray] | None
+    ) = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Rank canonical candidates by evidence support and enforce fold-level caps."""
+
+    if top_n_per_axis < 1 or max_candidates < 1 or top_evidence_packets < 1:
+        raise ValueError("candidate selection limits must be positive")
+    if scoring_method not in {"late_interaction", "dense_cosine"}:
+        raise ValueError(f"unsupported candidate selection scoring method {scoring_method!r}")
+    if not candidates:
+        scoring_model = (
+            late_interaction_model
+            if scoring_method == "late_interaction"
+            else dense_embedding_model
+        )
+        scoring_device = (
+            late_interaction_device
+            if scoring_method == "late_interaction"
+            else dense_embedding_device
+        )
+        return [], {
+            "scoring_method": scoring_method,
+            "scoring_model": scoring_model,
+            "scoring_device": scoring_device,
+            "top_n_per_evidence_axis": top_n_per_axis,
+            "max_candidates_per_fold": max_candidates,
+            "top_evidence_packets_per_candidate": top_evidence_packets,
+            "document_chunk_overlap_tokens": document_chunk_overlap_tokens,
+            "registry_candidates": 0,
+            "candidate_packet_associations_scored": 0,
+            "shortlisted_candidates_before_fold_cap": 0,
+            "hard_cap_applied": False,
+            "retained_candidates": 0,
+            "dropped_registry_candidate_ids": [],
+            "dropped_origin_candidate_ids": [],
+            "score_aggregation": {
+                "top_evidence_mean_count": top_evidence_packets,
+                "relevance_weight": 0.75,
+                "architecture_coverage_weight": 0.125,
+                "inner_fold_coverage_weight": 0.125,
+                "relevance_normalization": "clip((mean_maxsim + 1) / 2, 0, 1)",
+            },
+            "axis_rankings": {},
+            "candidate_rankings": [],
+        }
+    ordered_packets = {str(packet_id): packet for packet_id, packet in packet_by_id.items()}
+    queries: list[str] = []
+    documents: list[str] = []
+    association_keys: list[tuple[str, str]] = []
+    candidate_by_id: dict[str, Mapping[str, Any]] = {}
+    support_ids_by_candidate: dict[str, list[str]] = {}
+    query_by_candidate: dict[str, str] = {}
+    packet_text_by_id: dict[str, str] = {}
+    for position, candidate in enumerate(candidates, start=1):
+        candidate_id = str(candidate.get("candidate_id") or "").strip()
+        if not candidate_id or candidate_id in candidate_by_id:
+            raise ValueError(
+                "candidate selection requires unique candidate IDs; invalid value at "
+                f"position {position}: {candidate_id!r}"
+            )
+        support_ids = list(dict.fromkeys(_string_values(candidate.get("supporting_packet_ids"))))
+        if not support_ids:
+            raise ValueError(f"candidate selection input {candidate_id!r} has no supporting packet")
+        unknown = sorted(set(support_ids) - set(ordered_packets))
+        if unknown:
+            raise ValueError(
+                f"candidate selection input {candidate_id!r} cites unknown packets: {unknown[:8]}"
+            )
+        query = _natural_language_feature_name(candidate.get("name"))
+        if not query:
+            raise ValueError(f"candidate selection input {candidate_id!r} has no readable name")
+        candidate_by_id[candidate_id] = candidate
+        support_ids_by_candidate[candidate_id] = support_ids
+        query_by_candidate[candidate_id] = query
+        for packet_id in support_ids:
+            if packet_id not in packet_text_by_id:
+                evidence = _readable_supporting_text([ordered_packets[packet_id]])
+                if not evidence:
+                    raise ValueError(
+                        f"candidate selection packet {packet_id!r} has no readable evidence text"
+                    )
+                packet_text_by_id[packet_id] = "\n\n".join(evidence)
+            queries.append(query)
+            documents.append(packet_text_by_id[packet_id])
+            association_keys.append((candidate_id, packet_id))
+
+    if scoring_method == "late_interaction":
+        if late_interaction_scoring_function is None:
+            from ..models.late_interaction import score_late_interaction_pairs
+
+            scores = score_late_interaction_pairs(
+                queries,
+                documents,
+                late_interaction_model,
+                late_interaction_device,
+                document_chunk_overlap_tokens=document_chunk_overlap_tokens,
+            )
+        else:
+            scores = late_interaction_scoring_function(
+                queries,
+                documents,
+                late_interaction_model,
+                late_interaction_device,
+            )
+        scoring_model = late_interaction_model
+        scoring_device = late_interaction_device
+    elif scoring_method == "dense_cosine":
+        scores = _dense_candidate_packet_scores(
+            queries,
+            documents,
+            embedding_model=dense_embedding_model,
+            embedding_device=dense_embedding_device,
+            embedding_function=embedding_function,
+        )
+        scoring_model = dense_embedding_model
+        scoring_device = dense_embedding_device
+    else:  # pragma: no cover - validated above
+        raise AssertionError("unreachable candidate selection method")
+    scores = np.asarray(scores, dtype=np.float32)
+    if scores.ndim != 1 or scores.shape[0] != len(association_keys):
+        raise RuntimeError(
+            "candidate support scorer returned unexpected shape "
+            f"{scores.shape} for {len(association_keys)} associations"
+        )
+    if not np.isfinite(scores).all():
+        raise RuntimeError("candidate support scorer returned non-finite scores")
+    score_by_association = {
+        key: float(score) for key, score in zip(association_keys, scores.tolist())
+    }
+
+    fold_architectures = {
+        architecture
+        for packet in ordered_packets.values()
+        for architecture in _packet_support_architectures(packet)
+    }
+    fold_inner_folds = {
+        fold
+        for packet in ordered_packets.values()
+        for fold in _packet_support_inner_folds(packet)
+    }
+    rows: list[dict[str, Any]] = []
+    for candidate_id, candidate in candidate_by_id.items():
+        support_ids = support_ids_by_candidate[candidate_id]
+        ranked_packets = sorted(
+            support_ids,
+            key=lambda packet_id: (
+                -score_by_association[(candidate_id, packet_id)],
+                packet_id,
+            ),
+        )
+        top_packet_ids = ranked_packets[: min(top_evidence_packets, len(ranked_packets))]
+        top_scores = [
+            score_by_association[(candidate_id, packet_id)] for packet_id in top_packet_ids
+        ]
+        top_mean = float(np.mean(top_scores))
+        best_score = float(top_scores[0])
+        candidate_architectures = {
+            architecture
+            for packet_id in support_ids
+            for architecture in _packet_support_architectures(ordered_packets[packet_id])
+        }
+        candidate_inner_folds = {
+            fold
+            for packet_id in support_ids
+            for fold in _packet_support_inner_folds(ordered_packets[packet_id])
+        }
+        architecture_coverage = (
+            len(candidate_architectures) / len(fold_architectures)
+            if fold_architectures
+            else 1.0
+        )
+        inner_fold_coverage = (
+            len(candidate_inner_folds) / len(fold_inner_folds)
+            if fold_inner_folds
+            else 1.0
+        )
+        normalized_relevance = min(1.0, max(0.0, (top_mean + 1.0) / 2.0))
+        aggregate = (
+            0.75 * normalized_relevance
+            + 0.125 * architecture_coverage
+            + 0.125 * inner_fold_coverage
+        )
+        axes = _canonical_evidence_axes(candidate.get("evidence_axes")) or ["unclear"]
+        rows.append(
+            {
+                "candidate_id": candidate_id,
+                "feature_name": str(candidate.get("name") or ""),
+                "natural_language_query": query_by_candidate[candidate_id],
+                "evidence_axes": axes,
+                "supporting_packet_count": len(support_ids),
+                "supporting_architectures": sorted(candidate_architectures),
+                "supporting_inner_folds": sorted(candidate_inner_folds),
+                "architecture_coverage": float(architecture_coverage),
+                "inner_fold_coverage": float(inner_fold_coverage),
+                "best_evidence_score": best_score,
+                "top_evidence_mean_score": top_mean,
+                "aggregate_support_score": float(aggregate),
+                "ranked_packet_scores": [
+                    {
+                        "packet_id": packet_id,
+                        "score": score_by_association[(candidate_id, packet_id)],
+                        "ontology_evidence": packet_id in top_packet_ids,
+                    }
+                    for packet_id in ranked_packets
+                ],
+                "ontology_packet_ids": top_packet_ids,
+            }
+        )
+
+    axis_order = [
+        "treatment",
+        "outcome",
+        "residual_effect",
+        "matched_pair",
+        "semantic",
+        "unclear",
+    ]
+    axis_ranked_rows: dict[str, list[dict[str, Any]]] = {}
+    axis_rank_by_candidate: dict[str, dict[str, int]] = defaultdict(dict)
+    for axis in axis_order:
+        ranked = sorted(
+            [row for row in rows if axis in row["evidence_axes"]],
+            key=_candidate_selection_sort_key,
+        )
+        axis_ranked_rows[axis] = ranked
+        for rank, row in enumerate(ranked, start=1):
+            axis_rank_by_candidate[row["candidate_id"]][axis] = rank
+
+    # Round-robin over the axis top-N lists so a restrictive overall cap does
+    # not fill entirely from the first or largest stratum.
+    selected_ids: list[str] = []
+    selected_set: set[str] = set()
+    for rank_index in range(top_n_per_axis):
+        for axis in axis_order:
+            ranked = axis_ranked_rows[axis]
+            if rank_index >= len(ranked):
+                continue
+            candidate_id = str(ranked[rank_index]["candidate_id"])
+            if candidate_id in selected_set:
+                continue
+            selected_ids.append(candidate_id)
+            selected_set.add(candidate_id)
+            if len(selected_ids) >= max_candidates:
+                break
+        if len(selected_ids) >= max_candidates:
+            break
+
+    row_by_id = {str(row["candidate_id"]): row for row in rows}
+    retained: list[dict[str, Any]] = []
+    for candidate_id in selected_ids:
+        candidate = dict(candidate_by_id[candidate_id])
+        row = row_by_id[candidate_id]
+        retained.append(
+            {
+                **candidate,
+                "ontology_packet_ids": list(row["ontology_packet_ids"]),
+                "candidate_selection": {
+                    "schema_version": CANDIDATE_SELECTION_SCHEMA_VERSION,
+                    "scoring_method": scoring_method,
+                    "scoring_model": scoring_model,
+                    "natural_language_query": row["natural_language_query"],
+                    "aggregate_support_score": row["aggregate_support_score"],
+                    "best_evidence_score": row["best_evidence_score"],
+                    "top_evidence_mean_score": row["top_evidence_mean_score"],
+                    "architecture_coverage": row["architecture_coverage"],
+                    "inner_fold_coverage": row["inner_fold_coverage"],
+                    "axis_ranks": axis_rank_by_candidate[candidate_id],
+                    "score_by_packet": {
+                        item["packet_id"]: item["score"]
+                        for item in row["ranked_packet_scores"]
+                    },
+                },
+            }
+        )
+
+    shortlisted_without_hard_cap = {
+        str(row["candidate_id"])
+        for axis in axis_order
+        for row in axis_ranked_rows[axis][:top_n_per_axis]
+    }
+    for row in rows:
+        candidate_id = str(row["candidate_id"])
+        row["axis_ranks"] = axis_rank_by_candidate[candidate_id]
+        row["selected"] = candidate_id in selected_set
+        row["selection_reason"] = (
+            "selected_axis_top_n"
+            if candidate_id in selected_set
+            else (
+                "removed_by_overall_fold_cap"
+                if candidate_id in shortlisted_without_hard_cap
+                else "outside_axis_top_n"
+            )
+        )
+    dropped_origin_ids = list(
+        dict.fromkeys(
+            origin
+            for candidate_id, candidate in candidate_by_id.items()
+            if candidate_id not in selected_set
+            for origin in (
+                _string_values(candidate.get("origin_candidate_ids")) or [candidate_id]
+            )
+        )
+    )
+    audit = {
+        "scoring_method": scoring_method,
+        "scoring_model": scoring_model,
+        "scoring_device": scoring_device,
+        "top_n_per_evidence_axis": top_n_per_axis,
+        "max_candidates_per_fold": max_candidates,
+        "top_evidence_packets_per_candidate": top_evidence_packets,
+        "document_chunk_overlap_tokens": document_chunk_overlap_tokens,
+        "registry_candidates": len(candidates),
+        "candidate_packet_associations_scored": len(association_keys),
+        "shortlisted_candidates_before_fold_cap": len(shortlisted_without_hard_cap),
+        "hard_cap_applied": len(shortlisted_without_hard_cap) > max_candidates,
+        "retained_candidates": len(retained),
+        "dropped_registry_candidate_ids": [
+            candidate_id for candidate_id in candidate_by_id if candidate_id not in selected_set
+        ],
+        "dropped_origin_candidate_ids": dropped_origin_ids,
+        "score_aggregation": {
+            "top_evidence_mean_count": top_evidence_packets,
+            "relevance_weight": 0.75,
+            "architecture_coverage_weight": 0.125,
+            "inner_fold_coverage_weight": 0.125,
+            "relevance_normalization": "clip((mean_maxsim + 1) / 2, 0, 1)",
+        },
+        "axis_rankings": {
+            axis: [str(row["candidate_id"]) for row in ranked]
+            for axis, ranked in axis_ranked_rows.items()
+        },
+        "candidate_rankings": sorted(rows, key=_candidate_selection_sort_key),
+    }
+    return retained, audit
+
+
+def _build_and_select_candidate_registry(
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    packet_by_id: Mapping[str, Mapping[str, Any]],
+    top_n_per_axis: int,
+    max_candidates: int,
+    registry_embedding_model: str,
+    registry_embedding_device: str,
+    registry_similarity_threshold: float,
+    scoring_method: str,
+    late_interaction_model: str,
+    late_interaction_device: str,
+    top_evidence_packets: int,
+    document_chunk_overlap_tokens: int,
+    embedding_function: Callable[[Sequence[str], str, str], np.ndarray] | None = None,
+    late_interaction_scoring_function: (
+        Callable[[Sequence[str], Sequence[str], str, str], np.ndarray] | None
+    ) = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    registry, registry_audit = _build_candidate_registry(
+        candidates=candidates,
+        embedding_model=registry_embedding_model,
+        embedding_device=registry_embedding_device,
+        similarity_threshold=registry_similarity_threshold,
+        embedding_function=embedding_function,
+    )
+    retained, selection_audit = _select_candidates_from_registry(
+        candidates=registry,
+        packet_by_id=packet_by_id,
+        top_n_per_axis=top_n_per_axis,
+        max_candidates=max_candidates,
+        scoring_method=scoring_method,
+        late_interaction_model=late_interaction_model,
+        late_interaction_device=late_interaction_device,
+        dense_embedding_model=registry_embedding_model,
+        dense_embedding_device=registry_embedding_device,
+        top_evidence_packets=top_evidence_packets,
+        document_chunk_overlap_tokens=document_chunk_overlap_tokens,
+        embedding_function=embedding_function,
+        late_interaction_scoring_function=late_interaction_scoring_function,
+    )
+    return retained, {
+        "schema_version": CANDIDATE_SELECTION_SCHEMA_VERSION,
+        "registry": registry_audit,
+        "selection": selection_audit,
+    }
+
+
 def _pack_operationalization_supporting_evidence(
     *,
     feature_name: str,
@@ -4157,11 +5046,7 @@ class PlainHandoffStage2:
         packet_evidence_axes: dict[str, list[str]] = {}
         for packet in packets:
             packet_id = str(packet["packet_id"])
-            raw_axes = packet.get("observable_axes") or packet.get("evidence_axes")
-            content = packet.get("content")
-            if not raw_axes and isinstance(content, Mapping):
-                raw_axes = content.get("evidence_axes") or content.get("observable_axes")
-            packet_evidence_axes[packet_id] = _canonical_evidence_axes(raw_axes)
+            packet_evidence_axes[packet_id] = _packet_observable_axes(packet)
         initial = _checkpointed_request_json(
             output_dir=output_dir / "initial",
             input_value={
@@ -4724,9 +5609,19 @@ class PlainHandoffStage2:
             for index, feature in enumerate(self.config.explicit_features, start=1)
         ]
         all_candidates = [*configured_candidates, *(dict(candidate) for candidate in candidates)]
-        original_ids = [str(candidate["candidate_id"]) for candidate in all_candidates]
-        if len(original_ids) != len(set(original_ids)):
+        input_candidate_ids = [str(candidate["candidate_id"]) for candidate in all_candidates]
+        if len(input_candidate_ids) != len(set(input_candidate_ids)):
             raise ValueError("Stage 2 consolidation received duplicate candidate IDs")
+        original_ids = [
+            origin
+            for candidate in all_candidates
+            for origin in (
+                _string_values(candidate.get("origin_candidate_ids"))
+                or [str(candidate["candidate_id"])]
+            )
+        ]
+        if len(original_ids) != len(set(original_ids)):
+            raise ValueError("Stage 2 consolidation received duplicate origin candidate IDs")
         packet_by_id = {str(packet["packet_id"]): packet for packet in evidence_packets}
         if len(packet_by_id) != len(evidence_packets):
             raise ValueError("Stage 2 ontology evidence contains duplicate packet IDs")
@@ -4842,6 +5737,8 @@ class PlainHandoffStage2:
         final_features_path = output_dir / "final_definitions.json"
         definitions_complete_path = output_dir / "definitions_complete.json"
         interpreted_candidates_path = output_dir / "interpreted_candidates.json"
+        selected_candidates_path = output_dir / "selected_candidates.json"
+        candidate_selection_path = output_dir / "candidate_registry_selection.json"
         definition_inputs = {
             "outer_fold": int(outer_fold),
             "compiler": self.config.evidence_compiler,
@@ -4859,6 +5756,31 @@ class PlainHandoffStage2:
             "consolidation_alphabetical_rounds": int(self.config.consolidation_alphabetical_rounds),
             "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
             "consolidation_seed": int(seed),
+            "candidate_selection_schema": CANDIDATE_SELECTION_SCHEMA_VERSION,
+            "candidate_selection_top_n": int(self.config.candidate_selection_top_n),
+            "max_candidates_per_fold": int(self.config.max_candidates_per_fold),
+            "candidate_registry_embedding_model": (
+                self.config.candidate_registry_embedding_model
+            ),
+            "candidate_registry_embedding_device": (
+                self.config.candidate_registry_embedding_device
+            ),
+            "candidate_registry_similarity_threshold": float(
+                self.config.candidate_registry_similarity_threshold
+            ),
+            "candidate_selection_method": self.config.candidate_selection_method,
+            "candidate_selection_late_interaction_model": (
+                self.config.candidate_selection_late_interaction_model
+            ),
+            "candidate_selection_late_interaction_device": (
+                self.config.candidate_selection_late_interaction_device
+            ),
+            "candidate_selection_top_evidence_packets": int(
+                self.config.candidate_selection_top_evidence_packets
+            ),
+            "candidate_selection_document_chunk_overlap_tokens": int(
+                self.config.candidate_selection_document_chunk_overlap_tokens
+            ),
             "extraction_ontology_feedback_schema": (EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION),
             "ontology_refinement_min_failure_patients": int(
                 self.config.ontology_refinement_min_failure_patients
@@ -4924,6 +5846,28 @@ class PlainHandoffStage2:
         for packet in packets:
             by_architecture[str(packet["architecture"])].append(packet)
         candidates: list[dict[str, Any]] | None = None
+        candidate_selection: dict[str, Any] | None = None
+        if (
+            not features_path.is_file()
+            and interpreted_candidates_path.is_file()
+            and selected_candidates_path.is_file()
+            and candidate_selection_path.is_file()
+        ):
+            saved_selection = json.loads(candidate_selection_path.read_text(encoding="utf-8"))
+            if saved_selection.get("evidence_input_fingerprint") == evidence_input_fingerprint:
+                saved_candidates = json.loads(selected_candidates_path.read_text(encoding="utf-8"))
+                if not isinstance(saved_candidates, list):
+                    raise ValueError(
+                        f"Stage 2 outer fold {outer_fold} selected_candidates.json must "
+                        "contain a JSON list"
+                    )
+                candidates = [dict(candidate) for candidate in saved_candidates]
+                candidate_selection = dict(saved_selection)
+                LOGGER.info(
+                    "reuse completed Stage 2 candidate funnel outer_fold=%s retained=%s",
+                    outer_fold,
+                    len(candidates),
+                )
         if features_path.is_file():
             if definitions_state.get("evidence_input_fingerprint") == evidence_input_fingerprint:
                 final = json.loads(features_path.read_text(encoding="utf-8"))
@@ -4934,7 +5878,7 @@ class PlainHandoffStage2:
                     "configuration. Preserve the old output for audit and use a fresh "
                     "Stage 2 output directory."
                 )
-        else:
+        elif candidates is None:
             jobs: list[tuple[str, int, list[Mapping[str, Any]], Path]] = []
             for architecture_index, architecture in enumerate(sorted(by_architecture), start=1):
                 batches = _partition_interpretation_packets(
@@ -4961,7 +5905,7 @@ class PlainHandoffStage2:
                 len(jobs),
                 min(self.config.workers, len(jobs)),
             )
-            results: list[tuple[str, Mapping[str, Any]]] = []
+            results: list[tuple[str, int, Mapping[str, Any]]] = []
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(1, min(self.config.workers, len(jobs)))
             ) as executor:
@@ -4971,15 +5915,21 @@ class PlainHandoffStage2:
                         architecture=architecture,
                         packets=batch,
                         output_dir=job_dir,
-                    ): architecture
-                    for architecture, _batch_index, batch, job_dir in jobs
+                    ): (architecture, batch_index)
+                    for architecture, batch_index, batch, job_dir in jobs
                 }
                 for future in concurrent.futures.as_completed(futures):
-                    results.append((futures[future], future.result()))
+                    architecture, batch_index = futures[future]
+                    results.append((architecture, batch_index, future.result()))
 
             packet_by_id = {str(packet["packet_id"]): packet for packet in packets}
+            if len(packet_by_id) != len(packets):
+                raise ValueError("Stage 2 candidate selection received duplicate packet IDs")
             candidates = []
-            for architecture, result in sorted(results, key=lambda item: item[0]):
+            for architecture, _batch_index, result in sorted(
+                results,
+                key=lambda item: (item[0], item[1]),
+            ):
                 for concept in result["concepts"]:
                     supporting_packet_ids = [
                         str(packet_id) for packet_id in concept["supporting_packet_ids"]
@@ -5007,6 +5957,46 @@ class PlainHandoffStage2:
                         }
                     )
             _write_json(interpreted_candidates_path, candidates)
+            candidates, candidate_selection = _build_and_select_candidate_registry(
+                candidates=candidates,
+                packet_by_id=packet_by_id,
+                top_n_per_axis=self.config.candidate_selection_top_n,
+                max_candidates=self.config.max_candidates_per_fold,
+                registry_embedding_model=self.config.candidate_registry_embedding_model,
+                registry_embedding_device=self.config.candidate_registry_embedding_device,
+                registry_similarity_threshold=(
+                    self.config.candidate_registry_similarity_threshold
+                ),
+                scoring_method=self.config.candidate_selection_method,
+                late_interaction_model=(
+                    self.config.candidate_selection_late_interaction_model
+                ),
+                late_interaction_device=(
+                    self.config.candidate_selection_late_interaction_device
+                ),
+                top_evidence_packets=(
+                    self.config.candidate_selection_top_evidence_packets
+                ),
+                document_chunk_overlap_tokens=(
+                    self.config.candidate_selection_document_chunk_overlap_tokens
+                ),
+            )
+            candidate_selection["evidence_input_fingerprint"] = evidence_input_fingerprint
+            _write_json(candidate_selection_path, candidate_selection)
+            _write_json(selected_candidates_path, candidates)
+            LOGGER.info(
+                "Stage 2 candidate funnel outer_fold=%s raw=%s registry=%s retained=%s "
+                "associations_scored=%s top_n_per_axis=%s fold_cap=%s method=%s model=%s",
+                outer_fold,
+                candidate_selection["registry"]["raw_candidates"],
+                candidate_selection["registry"]["registry_candidates"],
+                candidate_selection["selection"]["retained_candidates"],
+                candidate_selection["selection"]["candidate_packet_associations_scored"],
+                candidate_selection["selection"]["top_n_per_evidence_axis"],
+                candidate_selection["selection"]["max_candidates_per_fold"],
+                candidate_selection["selection"]["scoring_method"],
+                candidate_selection["selection"]["scoring_model"],
+            )
 
         if candidates is not None:
             if not candidates and not self.config.explicit_features:
@@ -5023,6 +6013,21 @@ class PlainHandoffStage2:
                     output_dir=output_dir / "consolidation",
                     seed=seed,
                 )
+                if candidate_selection is not None:
+                    for candidate_id in candidate_selection["selection"].get(
+                        "dropped_origin_candidate_ids", []
+                    ):
+                        consolidated["candidate_dispositions"].setdefault(
+                            str(candidate_id),
+                            {
+                                "status": "excluded",
+                                "feature_name": "",
+                                "reason": (
+                                    "Excluded by fold-level canonical candidate evidence "
+                                    "ranking before LLM consolidation."
+                                ),
+                            },
+                        )
                 features = []
                 for index, feature in enumerate(consolidated["features"], start=1):
                     features.append(
@@ -5045,6 +6050,31 @@ class PlainHandoffStage2:
                     "evidence_input_fingerprint": evidence_input_fingerprint,
                     "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                     "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
+                    "candidate_selection_schema": CANDIDATE_SELECTION_SCHEMA_VERSION,
+                    "candidate_selection_top_n": int(self.config.candidate_selection_top_n),
+                    "max_candidates_per_fold": int(self.config.max_candidates_per_fold),
+                    "candidate_registry_embedding_model": (
+                        self.config.candidate_registry_embedding_model
+                    ),
+                    "candidate_registry_embedding_device": (
+                        self.config.candidate_registry_embedding_device
+                    ),
+                    "candidate_registry_similarity_threshold": float(
+                        self.config.candidate_registry_similarity_threshold
+                    ),
+                    "candidate_selection_method": self.config.candidate_selection_method,
+                    "candidate_selection_late_interaction_model": (
+                        self.config.candidate_selection_late_interaction_model
+                    ),
+                    "candidate_selection_late_interaction_device": (
+                        self.config.candidate_selection_late_interaction_device
+                    ),
+                    "candidate_selection_top_evidence_packets": int(
+                        self.config.candidate_selection_top_evidence_packets
+                    ),
+                    "candidate_selection_document_chunk_overlap_tokens": int(
+                        self.config.candidate_selection_document_chunk_overlap_tokens
+                    ),
                     "consolidation_batch_size": int(self.config.consolidation_batch_size),
                     "consolidation_alphabetical_rounds": int(
                         self.config.consolidation_alphabetical_rounds
