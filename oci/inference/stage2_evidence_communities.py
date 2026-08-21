@@ -1,10 +1,14 @@
-"""Pre-LLM reciprocal-ColBERT distillation of compiled Stage 2 evidence.
+"""Reciprocal-ColBERT organization of compiled Stage 2 evidence.
 
 The Stage 2 evidence compiler deliberately preserves broad, auditable coverage.
-This module adds a second, semantic reduction before any language-model
-interpretation. It breaks card representatives into short evidence atoms,
-retrieves cross-architecture neighbors, reranks mutual neighbors with symmetric
-document/document ColBERT MeanMaxSim, and clusters the reciprocal graph.
+Candidate discovery consumes the compiled packets directly.  This module builds
+an independent, auditable evidence hierarchy that later routes named candidates
+back to their most relevant compiled evidence.  It breaks card representatives
+into short evidence atoms, retrieves cross-architecture neighbors, reranks
+mutual neighbors with symmetric document/document ColBERT MeanMaxSim, and
+clusters the reciprocal graph.  Optional later rounds encode whole communities,
+compare them without the first round's cross-architecture restriction, and
+coarsen them before final packet serialization.
 
 Selection is causal-lane aware. The strongest confounder-evidence and
 effect-modifier-evidence communities receive independent reserves, overlaps are
@@ -21,7 +25,7 @@ import math
 import re
 import time
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -34,7 +38,7 @@ from ..models.late_interaction import encode_late_interaction_documents
 
 LOGGER = logging.getLogger(__name__)
 
-EVIDENCE_COMMUNITY_SCHEMA_VERSION = "reciprocal_colbert_evidence_communities_v1"
+EVIDENCE_COMMUNITY_SCHEMA_VERSION = "hierarchical_reciprocal_colbert_evidence_v2"
 EVIDENCE_COMMUNITY_ARCHITECTURE = "cross_architecture_colbert_community"
 
 _WORD_RE = re.compile(r"[a-z0-9]+(?:[-'][a-z0-9]+)?", re.IGNORECASE)
@@ -101,6 +105,10 @@ class Stage2EvidenceCommunityConfig:
     max_consensus_phrases: int = 20
     inner_fold_saturation: int = 5
     architecture_saturation: int = 4
+    # Each value requests another ColBERT community/community round whose
+    # Louvain resolution is selected deterministically to approach that count.
+    # Targets at or above the current community count are skipped.
+    hierarchy_target_communities: tuple[int, ...] = (300, 75)
 
     def validate(self) -> None:
         if not str(self.model_name).strip():
@@ -159,6 +167,23 @@ class Stage2EvidenceCommunityConfig:
             raise ValueError("evidence community inner_fold_saturation must be positive")
         if self.architecture_saturation < 1:
             raise ValueError("evidence community architecture_saturation must be positive")
+        hierarchy_targets = tuple(self.hierarchy_target_communities)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in hierarchy_targets
+        ):
+            raise ValueError(
+                "evidence community hierarchy_target_communities must contain "
+                "positive integers"
+            )
+        if any(
+            later >= earlier
+            for earlier, later in zip(hierarchy_targets, hierarchy_targets[1:])
+        ):
+            raise ValueError(
+                "evidence community hierarchy_target_communities must be strictly "
+                "decreasing"
+            )
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -174,6 +199,8 @@ class DistilledStage2EvidenceCommunities:
     communities: tuple[dict[str, Any], ...]
     edges: tuple[dict[str, Any], ...]
     summary: Mapping[str, Any]
+    hierarchy_communities: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    hierarchy_edges: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
 
 def _canonical_json(value: Any) -> str:
@@ -447,15 +474,16 @@ def _build_atoms(
     return atoms
 
 
-def _encode_atoms(
-    atoms: Sequence[Mapping[str, Any]],
+def _encode_documents(
+    texts: Sequence[str],
     *,
     config: Stage2EvidenceCommunityConfig,
     document_encoder: DocumentEncoder | None,
+    label: str,
 ) -> tuple[list[np.ndarray], np.ndarray]:
-    texts = [str(atom["text"]) for atom in atoms]
     LOGGER.info(
-        "encode Stage 2 evidence-community atoms=%s model=%s device=%s",
+        "encode Stage 2 evidence-community %s=%s model=%s device=%s",
+        label,
         len(texts),
         config.model_name,
         config.device,
@@ -471,10 +499,10 @@ def _encode_atoms(
             strip_common_framing_tokens=True,
         )
     )
-    if len(raw_matrices) != len(atoms):
+    if len(raw_matrices) != len(texts):
         raise RuntimeError(
             "evidence community document encoder returned "
-            f"{len(raw_matrices)} matrices for {len(atoms)} atoms"
+            f"{len(raw_matrices)} matrices for {len(texts)} {label}"
         )
     matrices: list[np.ndarray] = []
     dimensions: set[int] = set()
@@ -500,14 +528,29 @@ def _encode_atoms(
     return matrices, pooled
 
 
+def _encode_atoms(
+    atoms: Sequence[Mapping[str, Any]],
+    *,
+    config: Stage2EvidenceCommunityConfig,
+    document_encoder: DocumentEncoder | None,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    return _encode_documents(
+        [str(atom["text"]) for atom in atoms],
+        config=config,
+        document_encoder=document_encoder,
+        label="atoms",
+    )
+
+
 def _pooled_neighbors(
     pooled: np.ndarray,
     architectures: Sequence[str],
     *,
     candidate_neighbors: int,
+    require_cross_architecture: bool = True,
     block_size: int = 256,
 ) -> list[set[int]]:
-    """Generate cross-architecture candidates from centroid-residualized pools."""
+    """Generate candidates from centroid-residualized pooled token vectors."""
 
     centered = pooled - pooled.mean(axis=0, keepdims=True)
     centered /= np.maximum(np.linalg.norm(centered, axis=1, keepdims=True), 1e-12)
@@ -519,7 +562,11 @@ def _pooled_neighbors(
         scores = centered[begin:end] @ centered.T
         for local_index, row in enumerate(scores):
             index = begin + local_index
-            eligible = architecture_array != architecture_array[index]
+            eligible = (
+                architecture_array != architecture_array[index]
+                if require_cross_architecture
+                else np.ones(count, dtype=bool)
+            )
             eligible[index] = False
             eligible_indexes = np.flatnonzero(eligible)
             keep = min(candidate_neighbors, len(eligible_indexes))
@@ -633,6 +680,193 @@ def _cluster_graph(graph: nx.Graph, *, resolution: float, seed: int) -> list[set
         )
     communities.extend([{node} for node in sorted(isolates)])
     return sorted(communities, key=lambda values: (min(values), len(values)))
+
+
+def _cluster_graph_near_target(
+    graph: nx.Graph,
+    *,
+    target_communities: int,
+    seed: int,
+) -> tuple[list[set[int]], float]:
+    """Choose a deterministic Louvain resolution near a requested community count."""
+
+    if target_communities < 1:
+        raise ValueError("hierarchical community target must be positive")
+    node_count = graph.number_of_nodes()
+    if target_communities >= node_count:
+        return [{node} for node in sorted(graph.nodes)], math.inf
+
+    # Resolution/count is usually monotone but not guaranteed for every graph.
+    # A fixed logarithmic search is deterministic and robust to small local
+    # reversals while keeping the hierarchy policy independent of corpus size.
+    resolutions = np.geomspace(0.025, 8.0, num=25).tolist()
+    evaluated: list[tuple[tuple[Any, ...], list[set[int]], float]] = []
+    for resolution in resolutions:
+        partition = _cluster_graph(
+            graph,
+            resolution=float(resolution),
+            seed=int(seed),
+        )
+        count = len(partition)
+        key = (
+            abs(count - target_communities),
+            0 if count >= target_communities else 1,
+            abs(math.log(float(resolution))),
+            float(resolution),
+        )
+        evaluated.append((key, partition, float(resolution)))
+    _key, partition, resolution = min(evaluated, key=lambda item: item[0])
+    return partition, resolution
+
+
+def _community_colbert_document(
+    record: Mapping[str, Any],
+    *,
+    atom_text_by_id: Mapping[str, str],
+) -> str:
+    """Render every underlying evidence atom once for hierarchy routing."""
+
+    texts: list[str] = []
+    for atom_id in _string_values(record.get("atom_ids")):
+        text = str(atom_text_by_id.get(atom_id) or "").strip()
+        if text:
+            texts.append(text)
+    document = "\n".join(dict.fromkeys(texts))
+    if not document:
+        raise ValueError(
+            f"evidence community {record.get('community_id')!r} has no ColBERT document"
+        )
+    return document
+
+
+def _coarsen_community_level(
+    records: Sequence[dict[str, Any]],
+    *,
+    atom_graph: nx.Graph,
+    atoms: Sequence[Mapping[str, Any]],
+    atom_index_by_id: Mapping[str, int],
+    atom_text_by_id: Mapping[str, str],
+    config: Stage2EvidenceCommunityConfig,
+    target_communities: int,
+    hierarchy_level: int,
+    seed: int,
+    document_encoder: DocumentEncoder | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Run one unrestricted community/community ColBERT coarsening round."""
+
+    documents = [
+        _community_colbert_document(record, atom_text_by_id=atom_text_by_id)
+        for record in records
+    ]
+    matrices, pooled = _encode_documents(
+        documents,
+        config=config,
+        document_encoder=document_encoder,
+        label=f"hierarchy_level_{hierarchy_level}_communities",
+    )
+    pooled_neighbors = _pooled_neighbors(
+        pooled,
+        [f"hierarchy_level_{hierarchy_level - 1}"] * len(records),
+        candidate_neighbors=config.candidate_neighbors,
+        require_cross_architecture=False,
+    )
+    hierarchy_graph, reranked_pairs = _reciprocal_graph(
+        matrices,
+        pooled_neighbors,
+        reciprocal_neighbors=config.reciprocal_neighbors,
+    )
+    clusters, resolution = _cluster_graph_near_target(
+        hierarchy_graph,
+        target_communities=target_communities,
+        seed=seed,
+    )
+    if len(clusters) >= len(records):
+        return list(records), [], {
+            "hierarchy_level": hierarchy_level,
+            "target_communities": int(target_communities),
+            "input_communities": len(records),
+            "output_communities": len(records),
+            "louvain_resolution": resolution,
+            "pooled_mutual_pairs_reranked": reranked_pairs,
+            "reciprocal_edges": hierarchy_graph.number_of_edges(),
+            "status": "no_reduction",
+        }
+
+    atom_node_sets: list[set[int]] = []
+    child_ids_by_temporary_id: dict[str, list[str]] = {}
+    descendants_by_temporary_id: dict[str, list[str]] = {}
+    for cluster_index, cluster in enumerate(clusters, start=1):
+        temporary_id = f"community_{cluster_index:04d}"
+        child_records = [records[index] for index in sorted(cluster)]
+        child_ids_by_temporary_id[temporary_id] = [
+            str(record["community_id"]) for record in child_records
+        ]
+        descendants_by_temporary_id[temporary_id] = sorted(
+            {
+                descendant
+                for record in child_records
+                for descendant in _string_values(
+                    record.get("descendant_leaf_community_ids")
+                    or record.get("community_id")
+                )
+            }
+        )
+        atom_node_sets.append(
+            {
+                atom_index_by_id[atom_id]
+                for record in child_records
+                for atom_id in _string_values(record.get("atom_ids"))
+            }
+        )
+
+    coarsened = _community_records(
+        atom_node_sets,
+        atom_graph,
+        atoms,
+        config=config,
+    )
+    child_by_id = {str(record["community_id"]): record for record in records}
+    for record in coarsened:
+        temporary_id = str(record["community_id"])
+        record["community_id"] = (
+            f"hierarchy_{hierarchy_level:02d}_{temporary_id}"
+        )
+        record["hierarchy_level"] = int(hierarchy_level)
+        record["child_community_ids"] = child_ids_by_temporary_id[temporary_id]
+        record["descendant_leaf_community_ids"] = descendants_by_temporary_id[
+            temporary_id
+        ]
+        record["parent_community_id"] = None
+        for child_id in record["child_community_ids"]:
+            child_by_id[child_id]["parent_community_id"] = str(record["community_id"])
+
+    input_ids = [str(record["community_id"]) for record in records]
+    hierarchy_edges = [
+        {
+            "hierarchy_level": int(hierarchy_level),
+            "left_community_id": input_ids[left],
+            "right_community_id": input_ids[right],
+            "weight": float(data["weight"]),
+            "colbert_score": float(data["colbert_score"]),
+            "left_rank": int(data["left_rank"]),
+            "right_rank": int(data["right_rank"]),
+        }
+        for left, right, data in sorted(
+            hierarchy_graph.edges(data=True),
+            key=lambda item: (item[0], item[1]),
+        )
+    ]
+    return coarsened, hierarchy_edges, {
+        "hierarchy_level": int(hierarchy_level),
+        "target_communities": int(target_communities),
+        "input_communities": len(records),
+        "output_communities": len(coarsened),
+        "louvain_resolution": float(resolution),
+        "pooled_mutual_pairs_reranked": int(reranked_pairs),
+        "reciprocal_edges": hierarchy_graph.number_of_edges(),
+        "input_document_characters": sum(map(len, documents)),
+        "status": "completed",
+    }
 
 
 def _tokens(text: str) -> list[str]:
@@ -1009,6 +1243,7 @@ def _community_packet(
     *,
     outer_fold: int,
     config: Stage2EvidenceCommunityConfig,
+    atom_text_by_id: Mapping[str, str],
 ) -> dict[str, Any]:
     consensus = list(record["consensus_phrases"])
     representative_evidence: list[dict[str, Any]] = []
@@ -1037,6 +1272,11 @@ def _community_packet(
         "content": {
             "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
             "community_id": str(record["community_id"]),
+            "hierarchy_level": int(record.get("hierarchy_level") or 0),
+            "child_community_ids": _string_values(record.get("child_community_ids")),
+            "descendant_leaf_community_ids": _string_values(
+                record.get("descendant_leaf_community_ids")
+            ),
             "community_rank": int(record["rank"]),
             "community_score": float(record["community_score"]),
             "selection_lanes": list(record["selection_lanes"]),
@@ -1072,6 +1312,12 @@ def _community_packet(
             },
             "consensus_phrases": consensus,
             "representative_evidence": representative_evidence,
+            # Candidate discovery never reads this field.  It is the lossless
+            # evidence-atom document used by post-discovery ColBERT routing.
+            "colbert_document": _community_colbert_document(
+                record,
+                atom_text_by_id=atom_text_by_id,
+            ),
         },
     }
 
@@ -1136,13 +1382,76 @@ def distill_stage2_evidence_communities(
         atoms,
         config=config,
     )
+    # Later hierarchy rounds re-encode community documents. Release the large
+    # first-round token matrices before allocating those next-level matrices.
+    del matrices, pooled, pooled_neighbors
+    for record in records:
+        record["hierarchy_level"] = 0
+        record["child_community_ids"] = []
+        record["descendant_leaf_community_ids"] = [str(record["community_id"])]
+        record["parent_community_id"] = None
+
+    atom_index_by_id = {
+        str(atom["atom_id"]): index for index, atom in enumerate(atoms)
+    }
+    atom_text_by_id = {
+        str(atom["atom_id"]): str(atom["text"]) for atom in atoms
+    }
+    final_records = records
+    hierarchy_records: list[dict[str, Any]] = []
+    hierarchy_edges: list[dict[str, Any]] = []
+    hierarchy_summaries: list[dict[str, Any]] = []
+    hierarchy_level = 0
+    for requested_round, target in enumerate(
+        config.hierarchy_target_communities,
+        start=1,
+    ):
+        if int(target) >= len(final_records):
+            hierarchy_summaries.append(
+                {
+                    "requested_round": requested_round,
+                    "hierarchy_level": None,
+                    "target_communities": int(target),
+                    "input_communities": len(final_records),
+                    "output_communities": len(final_records),
+                    "status": "target_not_smaller_than_input",
+                }
+            )
+            continue
+        proposed_level = hierarchy_level + 1
+        coarsened, level_edges, level_summary = _coarsen_community_level(
+            final_records,
+            atom_graph=graph,
+            atoms=atoms,
+            atom_index_by_id=atom_index_by_id,
+            atom_text_by_id=atom_text_by_id,
+            config=config,
+            target_communities=int(target),
+            hierarchy_level=proposed_level,
+            seed=int(seed) + 10_000 * proposed_level,
+            document_encoder=document_encoder,
+        )
+        level_summary["requested_round"] = requested_round
+        hierarchy_summaries.append(level_summary)
+        if level_summary["status"] != "completed":
+            continue
+        hierarchy_level = proposed_level
+        hierarchy_records.extend(coarsened)
+        hierarchy_edges.extend(level_edges)
+        final_records = coarsened
+
     selected = _select_communities(
-        records,
+        final_records,
         max_communities=config.max_communities,
         min_per_causal_lane=config.min_per_causal_lane,
     )
     output_packets = [
-        _community_packet(record, outer_fold=outer_fold, config=config)
+        _community_packet(
+            record,
+            outer_fold=outer_fold,
+            config=config,
+            atom_text_by_id=atom_text_by_id,
+        )
         for record in selected
     ]
     edges = [
@@ -1173,6 +1482,10 @@ def distill_stage2_evidence_communities(
         for packet in output_packets
         for item in packet["content"]["representative_evidence"]
     )
+    selected_colbert_chars = sum(
+        len(str(packet["content"].get("colbert_document") or ""))
+        for packet in output_packets
+    )
     summary = {
         "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
         "outer_fold": outer_fold,
@@ -1186,6 +1499,13 @@ def distill_stage2_evidence_communities(
         "pooled_mutual_pairs_reranked": reranked_pairs,
         "reciprocal_edges": graph.number_of_edges(),
         "communities": len(records),
+        "hierarchy_communities": len(hierarchy_records),
+        "final_communities": len(final_records),
+        "final_hierarchy_level": max(
+            (int(record.get("hierarchy_level") or 0) for record in final_records),
+            default=0,
+        ),
+        "hierarchy_levels": hierarchy_summaries,
         "selected_communities": len(selected),
         "selected_atoms": len(selected_atom_ids),
         "selected_confounder_lane_communities": sum(
@@ -1211,6 +1531,7 @@ def distill_stage2_evidence_communities(
         "source_readable_chars": source_chars,
         "source_packet_chars": source_packet_chars,
         "selected_readable_chars": selected_readable_chars,
+        "selected_colbert_chars": selected_colbert_chars,
         "selected_packet_chars": selected_chars,
         "prompt_character_reduction_fraction": (
             1.0 - selected_readable_chars / source_chars if source_chars else 0.0
@@ -1222,7 +1543,7 @@ def distill_stage2_evidence_communities(
         ),
         "selected_community_ids": [
             str(record["community_id"])
-            for record in records
+            for record in final_records
             if str(record["community_id"]) in selected_ids
         ],
     }
@@ -1232,6 +1553,8 @@ def distill_stage2_evidence_communities(
         communities=tuple(records),
         edges=tuple(edges),
         summary=summary,
+        hierarchy_communities=tuple(hierarchy_records),
+        hierarchy_edges=tuple(hierarchy_edges),
     )
 
 

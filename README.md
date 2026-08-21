@@ -671,11 +671,15 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
+    "candidate_discovery_source": "compiled_packets",
     "evidence_community_enabled": true,
     "evidence_community_model": "answerdotai/answerai-colbert-small-v1",
     "evidence_community_device": "cpu",
     "evidence_community_max_packets": 75,
     "evidence_community_min_per_causal_lane": 30,
+    "evidence_community_hierarchy_target_communities": [300, 75],
+    "candidate_selection_hierarchical_colbert": true,
+    "candidate_selection_hierarchy_top_communities": 3,
     "operationalization_max_prompt_chars": 640000,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
@@ -828,19 +832,18 @@ does not load another embedding model beside the serving process. The raw Stage
 reduction audit are written under `stage2/evidence_compilation/`. The compiled
 packet plan is cached and input-fingerprinted for fast, safe restarts.
 
-Stage 2 then applies a deterministic pre-LLM evidence distiller. Card
-representatives become overlapping 16-word atoms with exact member-manifest
-fold provenance. Candidate neighbors are restricted to different Stage 1
-architectures, reranked by symmetric document/document ColBERT MeanMaxSim, and
-connected only when their top-five relationship is reciprocal. Louvain
-communities are ranked by inner-fold coverage, architecture diversity, causal
-axis corroboration, graph cohesion, and support size. The default 75-packet
-budget reserves the best 30 confounder-lane and 30 modifier-lane communities,
-deduplicates communities appearing in both lanes, and fills unused slots by
-global rank. Each interpretation item contains consensus phrases and at most
-three architecture-diverse exemplars. Atom, edge, community, packet, and resume
-audits are written under `stage2/evidence_communities/`; oracle metadata never
-participates in this selection.
+Stage 2 performs candidate discovery from every compiled evidence card. An
+independent deterministic ColBERT hierarchy then organizes evidence for
+post-discovery retrieval. Card representatives become overlapping 16-word atoms
+with exact member-manifest fold provenance. First-round neighbors are restricted
+to different Stage 1 architectures, reranked by symmetric document/document
+ColBERT MeanMaxSim, and connected only when their top-five relationship is
+reciprocal. By default, whole community documents retain all underlying atoms
+and undergo later ColBERT rounds targeting 300 and 75 communities. Named
+candidates query the final communities and then the compiled packets beneath
+their top routers. Atom, edge, community, hierarchy, packet, and resume audits
+are written under `stage2/evidence_communities/`; oracle metadata never
+participates in this organization.
 
 `semantic_cluster_cards_v2` is the only supported Stage 2 evidence compiler.
 Before any interpretation request, it compares the architectures present in
@@ -853,8 +856,8 @@ bundle attestation, checkpoint adoption, or deployment gates. The former
 `raw_packets_v1` option was retired because it merged distinct architectures
 into broad prompt buckets.
 
-Stage 2 then interprets the selected evidence communities and consolidates
-the result into operational patient-level definitions. After exact-name
+Stage 2 then consolidates the candidates discovered from compiled packets into
+operational patient-level definitions. After exact-name
 coalescing, consolidation alphabetically sorts candidates into batches of 20
 by default, applies each batch's merge directives, re-sorts the consolidated
 versions, and repeats for up to 55 rounds. The first five rounds shift

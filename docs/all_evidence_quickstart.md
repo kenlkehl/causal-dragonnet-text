@@ -58,11 +58,13 @@ effect estimates. The common controls are:
     "extraction_reasoning_effort": "none",
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
+    "candidate_discovery_source": "compiled_packets",
     "evidence_community_enabled": true,
     "evidence_community_model": "answerdotai/answerai-colbert-small-v1",
     "evidence_community_device": "cpu",
     "evidence_community_max_packets": 75,
     "evidence_community_min_per_causal_lane": 30,
+    "evidence_community_hierarchy_target_communities": [300, 75],
     "max_candidates_per_fold": 50,
     "candidate_selection_top_n": 50,
     "candidate_registry_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
@@ -72,6 +74,8 @@ effect estimates. The common controls are:
     "candidate_selection_late_interaction_model": "answerdotai/answerai-colbert-small-v1",
     "candidate_selection_late_interaction_device": "cpu",
     "candidate_selection_top_evidence_packets": 3,
+    "candidate_selection_hierarchical_colbert": true,
+    "candidate_selection_hierarchy_top_communities": 3,
     "max_review_rounds": 2,
     "max_evaluation_rounds": 10,
     "screening_trees": 200,
@@ -132,28 +136,29 @@ as described above. Qwen defaults to the `qwen3` reasoning parser and
 language-model-only mode. See the complete
 workflow guide for GPU partition rules and all managed-server settings.
 
-Before interpretation, Stage 2 compiles the raw handoff into fold-local,
-provenance-preserving semantic cards under `stage2/evidence_compilation/`.
-It then turns each card representative into overlapping 16-word atoms, builds a
-cross-architecture reciprocal-neighbor graph with symmetric document/document
-ColBERT scoring, and clusters it. The best 30 confounder-lane and 30
-modifier-lane communities are reserved independently, overlaps are
-deduplicated, and the remaining capacity is filled by global rank up to 75.
-Each LLM item contains community consensus phrases plus at most three
-architecture-diverse exemplars. The full atom, edge, community, and source
+Stage 2 compiles the raw handoff into fold-local, provenance-preserving
+semantic cards under `stage2/evidence_compilation/`. Candidate discovery reads
+all of those compiled cards. Independently, Stage 2 turns card representatives
+into overlapping 16-word atoms, builds a cross-architecture reciprocal-neighbor
+graph with symmetric document/document ColBERT scoring, and clusters it. By
+default, community documents then undergo additional ColBERT rounds targeting
+300 and 75 communities while retaining every underlying atom. The final
+communities route named candidates back to compiled leaf packets; they do not
+gate interpretation. The full atom, edge, hierarchy, community, and source
 lineage audits are under `stage2/evidence_communities/`; no oracle metadata is
 used in selection.
 
 After interpretation, Stage 2 first collapses exact normalized names, then uses
 the registry embedding model for conservative, lexically anchored alias
 merges. Each canonical name is rendered as natural language (`patient_age`
-becomes `Patient Age`) and scored only against the evidence packets that cited
-it. The default ColBERT-style scorer keeps at most five candidates per evidence
-axis, and `max_candidates_per_fold` supplies a hard overall cap before global
-LLM alias consolidation. Provenance associations are retained; the three
-highest-scoring packets are separately chosen as ontology evidence. This means
-2,000 packets can create 10,000 scored candidate-packet associations, but they
-cannot send 10,000 candidate features downstream.
+becomes `Patient Age`), scored against final community routers, and then
+reranked against the compiled packets beneath its top routers together with
+its directly cited packets. The default selector keeps the best 50 candidates
+per evidence axis before `max_candidates_per_fold` supplies a hard overall cap.
+Provenance associations are retained; the three highest-scoring compiled
+packets are separately chosen as ontology evidence. Architecture and fold
+coverage remain based on directly cited packets rather than broad router
+membership.
 Each completed request is saved beneath the relevant outer-fold directory, so
 the same command resumes after interruption without repeating it.
 

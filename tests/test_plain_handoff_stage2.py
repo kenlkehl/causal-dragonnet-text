@@ -93,6 +93,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.max_ontology_refinement_rounds == 2
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
     assert config.evidence_max_cards_per_fold == 400
+    assert config.candidate_discovery_source == "compiled_packets"
     assert config.evidence_community_enabled is True
     assert config.evidence_community_model == "answerdotai/answerai-colbert-small-v1"
     assert config.evidence_community_device == "cpu"
@@ -105,6 +106,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.evidence_community_louvain_resolution == 2.5
     assert config.evidence_community_max_exemplars == 3
     assert config.evidence_community_max_consensus_phrases == 20
+    assert config.evidence_community_hierarchy_target_communities == (300, 75)
     assert config.consolidation_oversample_factor == 4
     assert config.candidate_selection_top_n == 50
     assert config.candidate_registry_embedding_model == "Qwen/Qwen3-Embedding-0.6B"
@@ -118,6 +120,8 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.candidate_selection_late_interaction_device == "cpu"
     assert config.candidate_selection_top_evidence_packets == 3
     assert config.candidate_selection_document_chunk_overlap_tokens == 32
+    assert config.candidate_selection_hierarchical_colbert is True
+    assert config.candidate_selection_hierarchy_top_communities == 3
 
 
 def test_stage2_analysis_defaults_pre_refinement_config_fields(caplog):
@@ -272,6 +276,10 @@ def test_stage2_config_parses_lane_aware_evidence_community_settings():
             "evidence_community_max_consensus_phrases": 12,
             "evidence_community_inner_fold_saturation": 4,
             "evidence_community_architecture_saturation": 3,
+            "evidence_community_hierarchy_target_communities": [120, 60],
+            "candidate_discovery_source": "compiled_packets",
+            "candidate_selection_hierarchical_colbert": False,
+            "candidate_selection_hierarchy_top_communities": 5,
         },
         default_workers=1,
     )
@@ -290,6 +298,10 @@ def test_stage2_config_parses_lane_aware_evidence_community_settings():
     assert config.evidence_community_max_consensus_phrases == 12
     assert config.evidence_community_inner_fold_saturation == 4
     assert config.evidence_community_architecture_saturation == 3
+    assert config.evidence_community_hierarchy_target_communities == (120, 60)
+    assert config.candidate_discovery_source == "compiled_packets"
+    assert config.candidate_selection_hierarchical_colbert is False
+    assert config.candidate_selection_hierarchy_top_communities == 5
     assert config.public_dict()["evidence_community_min_per_causal_lane"] == 20
 
 
@@ -312,6 +324,25 @@ def test_stage2_config_rejects_non_boolean_evidence_community_switch():
             },
             default_workers=1,
         )
+
+
+def test_stage2_config_rejects_non_decreasing_community_hierarchy_targets():
+    with pytest.raises(ValueError, match="strictly decreasing"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            evidence_community_hierarchy_target_communities=(75, 300),
+        ).validate()
+
+
+def test_stage2_config_requires_communities_for_legacy_community_discovery():
+    with pytest.raises(ValueError, match="community_packets requires"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            candidate_discovery_source="community_packets",
+            evidence_community_enabled=False,
+        ).validate()
 
 
 def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
@@ -2197,6 +2228,104 @@ def test_candidate_registry_selection_ranks_canonical_candidates_by_evidence_axi
     assert audit["dropped_origin_candidate_ids"] == ["origin-stage"]
     assert audit["axis_rankings"]["treatment"][0] == "candidate-age"
     assert audit["axis_rankings"]["outcome"][0] == "candidate-renal"
+
+
+def test_candidate_selection_uses_hierarchical_colbert_to_route_back_to_leaf_packets():
+    packets = {
+        "packet-pdl1-a": {
+            "architecture": "architecture-a",
+            "observable_axes": ["treatment"],
+            "content": {
+                "support": {"inner_folds": [1, 2]},
+                "representative_evidence": [{"text": "PD-L1 TPS was 30%."}],
+            },
+        },
+        "packet-pdl1-b": {
+            "architecture": "architecture-b",
+            "observable_axes": ["outcome"],
+            "content": {
+                "support": {"inner_folds": [3, 4]},
+                "representative_evidence": [
+                    {"text": "Low PD-L1 expression was documented."}
+                ],
+            },
+        },
+        "packet-age": {
+            "architecture": "architecture-c",
+            "observable_axes": ["outcome"],
+            "content": {
+                "support": {"inner_folds": [5]},
+                "representative_evidence": [{"text": "Patient age was 72 years."}],
+            },
+        },
+    }
+    hierarchy_packets = {
+        "community-pdl1": {
+            "content": {
+                "source_packet_ids": ["packet-pdl1-a", "packet-pdl1-b"],
+                "colbert_document": "PD-L1 expression and tumor proportion score evidence.",
+            }
+        },
+        "community-age": {
+            "content": {
+                "source_packet_ids": ["packet-age"],
+                "colbert_document": "Age at treatment evidence.",
+            }
+        },
+    }
+    candidate = {
+        "candidate_id": "candidate-pdl1",
+        "name": "pd_l1_expression",
+        "supporting_packet_ids": ["packet-pdl1-a"],
+        "evidence_axes": ["treatment"],
+    }
+    scores = {
+        "PD-L1 expression and tumor proportion score evidence.": 0.99,
+        "Age at treatment evidence.": 0.10,
+        "PD-L1 TPS was 30%.": 0.97,
+        "Low PD-L1 expression was documented.": 0.96,
+    }
+    calls = []
+
+    def score(queries, documents, _model, _device):
+        calls.append(list(documents))
+        assert set(queries) == {"Pd L1 Expression"}
+        return np.asarray([scores[document] for document in documents], dtype=np.float32)
+
+    selected, audit = stage2_workflow._select_candidates_from_registry(
+        candidates=[candidate],
+        packet_by_id=packets,
+        hierarchy_packet_by_id=hierarchy_packets,
+        top_n_per_axis=1,
+        max_candidates=1,
+        scoring_method="late_interaction",
+        late_interaction_model="test-colbert",
+        late_interaction_device="cpu",
+        dense_embedding_model="unused",
+        dense_embedding_device="cpu",
+        top_evidence_packets=2,
+        hierarchy_top_communities=1,
+        document_chunk_overlap_tokens=32,
+        late_interaction_scoring_function=score,
+    )
+
+    assert len(calls) == 2
+    assert selected[0]["supporting_packet_ids"] == ["packet-pdl1-a"]
+    assert selected[0]["ontology_packet_ids"] == [
+        "packet-pdl1-a",
+        "packet-pdl1-b",
+    ]
+    assert selected[0]["candidate_selection"]["hierarchy_packet_ids"] == [
+        "community-pdl1"
+    ]
+    # Retrieval can improve ontology evidence, but broad router membership does
+    # not manufacture architecture/fold coverage for the candidate.
+    row = audit["candidate_rankings"][0]
+    assert row["supporting_architectures"] == ["architecture-a"]
+    assert row["architecture_coverage"] == pytest.approx(1 / 3)
+    assert row["retrieved_packet_count"] == 2
+    assert audit["candidate_hierarchy_associations_scored"] == 2
+    assert audit["candidate_packet_associations_scored"] == 2
 
 
 def test_candidate_registry_selection_supports_configured_dense_cosine_fallback():

@@ -126,14 +126,27 @@ not an artifact-authentication, byte-attestation, or deployment-gate system.
 The former `raw_packets_v1` compatibility option is intentionally unsupported
 because it combined scientifically distinct architectures.
 
-Before feature discovery, Stage 2 distills the card atlas without an LLM. It
-splits representatives into overlapping 16-word atoms, restores each atom's
-exact full/inner-fold coverage from `members.jsonl`, and retrieves neighbors
-only across distinct Stage 1 architectures. Pooled residualized vectors supply
-the candidate set; symmetric document/document ColBERT MeanMaxSim reranks the
-mutual candidates. Reciprocal top-five edges are clustered with Louvain.
-Community rank combines inner-fold coverage, architecture diversity, causal
-axis corroboration, graph cohesion, and support size.
+Stage 2 candidate discovery reads every compiled evidence packet by default;
+the evidence-community layer no longer gates which text the interpretation
+model can inspect. Separately, Stage 2 organizes the card atlas without an
+LLM for post-discovery ColBERT routing. It splits representatives into
+overlapping 16-word atoms, restores each atom's exact full/inner-fold coverage
+from `members.jsonl`, and retrieves first-round neighbors only across distinct
+Stage 1 architectures. Pooled residualized vectors supply the candidate set;
+symmetric document/document ColBERT MeanMaxSim reranks the mutual candidates.
+Reciprocal top-five edges are clustered with Louvain. Community rank combines
+inner-fold coverage, architecture diversity, causal-axis corroboration, graph
+cohesion, and support size.
+
+When `evidence_community_hierarchy_target_communities` is nonempty, every
+first-round community is retained for another ColBERT round before final
+packet selection. Each community document contains all of its underlying
+evidence atoms, not its abbreviated packet summary. Later rounds allow
+community/community neighbors regardless of their common packet architecture,
+choose a deterministic Louvain resolution near each configured target, and
+preserve atom -> leaf community -> parent community lineage. The default
+targets are 300 and 75. Serialization happens only after the last successful
+coarsening round.
 
 The packet cap is lane-aware rather than one unprotected global cutoff. By
 default, the top 30 treatment/outcome confounder-lane communities and top 30
@@ -144,15 +157,16 @@ remaining slots are filled by global rank to `evidence_community_max_packets`
 global fill without allowing one causal lane to crowd out the other. Selection
 uses no oracle names, labels, regexes, outcomes, or held-out rows.
 
-For feature discovery, Python projects every selected community to a
-prompt-local integer `item` and a list containing its consensus phrases and at
-most three architecture-diverse evidence atoms. Card and packet IDs, evidence kind,
-detail objects, truncation flags, axes, polarity, semantic grouping,
-architectures, scores, support counts, folds, and other provenance stay outside
-the model prompt. The model returns feature names, descriptions, rationales,
-and `supporting_items` such as `[1, 3]`; Python immediately maps those ordinal
-labels back to the original packets and derives evidence axes and causal roles
-without model-authored IDs. Python collapses exact normalized names across the
+For feature discovery, Python projects every compiled packet to a prompt-local
+integer `item` and its readable representative texts. Card and packet IDs,
+evidence kind, detail objects, truncation flags, axes, polarity, semantic
+grouping, architectures, scores, support counts, folds, and other provenance
+stay outside the model prompt. The model returns feature names, descriptions,
+rationales, and `supporting_items` such as `[1, 3]`; Python immediately maps
+those ordinal labels back to the original compiled packets and derives evidence
+axes and causal roles without model-authored IDs. Set
+`candidate_discovery_source: "community_packets"` only to reproduce the former
+community-gated behavior. Python collapses exact normalized names across the
 whole outer fold, then uses dense embeddings for conservative semantic registry
 merges only when two names or descriptions share a non-generic lexical anchor.
 Fold-ubiquitous anchors are ignored so registry construction cannot degenerate
@@ -160,19 +174,22 @@ into an all-pairs comparison. The dense threshold prevents an embedding-neighbor
 graph from merging merely related clinical measurements.
 
 Each canonical identifier is rendered as a natural-language query
-(`patient_age` becomes `Patient Age`). A ColBERT-style multi-vector encoder
-scores that query only against the readable text of packets already cited by
-the candidate; Stage 2 never constructs the full candidate-by-packet Cartesian
-product. Scores are aggregated with architecture and inner-fold coverage. The
-best `candidate_selection_top_n` candidates within each evidence axis enter a
-stratified union, and `max_candidates_per_fold` is then enforced as a hard
-overall discovery cap. All supporting packet provenance remains attached, but
-only the highest-scoring `candidate_selection_top_evidence_packets` packets are
-used for ontology definition. Thus 2,000 packets with five interpreted ideas
-each can require 10,000 relevance scores, but cannot become 10,000 downstream
-feature candidates. Discovery does not choose value types, units,
-categories, or extraction ontologies; the later one-feature ontology request
-makes those decisions from the retained feature name and supporting text.
+(`patient_age` becomes `Patient Age`). With hierarchical routing enabled, a
+ColBERT-style multi-vector encoder first scores that query against the bounded
+set of final community packets. Stage 2 descends through the top
+`candidate_selection_hierarchy_top_communities` communities to their original
+compiled packet IDs, adds the packets cited during discovery, and performs a
+second ColBERT reranking at the leaf level. The highest-scoring
+`candidate_selection_top_evidence_packets` leaves define the ontology.
+Architecture and inner-fold coverage remain calculated only from packets that
+the interpretation model actually cited; broad parent-community membership
+cannot manufacture scientific support. Scores are aggregated with that
+grounded coverage. The best `candidate_selection_top_n` candidates within each
+evidence axis enter a stratified union, and `max_candidates_per_fold` is then
+enforced as a hard overall discovery cap. Discovery does not choose value
+types, units, categories, or extraction ontologies; the later one-feature
+ontology request makes those decisions from the retained feature name and
+retrieved supporting text.
 
 An external endpoint configuration is:
 
@@ -193,6 +210,7 @@ An external endpoint configuration is:
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
+    "candidate_discovery_source": "compiled_packets",
     "evidence_community_enabled": true,
     "evidence_community_model": "answerdotai/answerai-colbert-small-v1",
     "evidence_community_device": "cpu",
@@ -204,6 +222,7 @@ An external endpoint configuration is:
     "evidence_community_reciprocal_neighbors": 5,
     "evidence_community_louvain_resolution": 2.5,
     "evidence_community_max_exemplars": 3,
+    "evidence_community_hierarchy_target_communities": [300, 75],
     "max_candidates_per_fold": 50,
     "candidate_selection_top_n": 50,
     "candidate_registry_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
@@ -214,6 +233,8 @@ An external endpoint configuration is:
     "candidate_selection_late_interaction_device": "cpu",
     "candidate_selection_top_evidence_packets": 3,
     "candidate_selection_document_chunk_overlap_tokens": 32,
+    "candidate_selection_hierarchical_colbert": true,
+    "candidate_selection_hierarchy_top_communities": 3,
     "operationalization_max_prompt_chars": 640000,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
@@ -431,7 +452,7 @@ filter is operationalized for extraction. Each ontology request contains only th
 canonical feature name, a deduplicated flat list of readable supporting text,
 the ontology instructions, and the response contract. Python extracts only
 `representative_evidence.text`
-from the internally selected compiled packets. Packet boundaries, evidence
+from the compiled packets selected by leaf-level ColBERT reranking. Packet boundaries, evidence
 kind, truncation flags, details, the outer-fold number, clinical question,
 candidate or group IDs, discovery value type, evidence axes, semantic grouping,
 architecture names, scores, support counts, and candidate summaries are not
@@ -466,6 +487,7 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `extraction_max_prompt_chars`, `extraction_feature_batch_size`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
+`candidate_discovery_source`,
 `evidence_community_enabled`, `evidence_community_model`,
 `evidence_community_device`, `evidence_community_max_packets`,
 `evidence_community_min_per_causal_lane`,
@@ -476,8 +498,9 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `evidence_community_louvain_resolution`,
 `evidence_community_max_exemplars`,
 `evidence_community_max_consensus_phrases`,
-`evidence_community_inner_fold_saturation`, and
+`evidence_community_inner_fold_saturation`,
 `evidence_community_architecture_saturation`,
+`evidence_community_hierarchy_target_communities`,
 `max_candidates_per_fold`, `candidate_selection_top_n`,
 `candidate_registry_embedding_model`, `candidate_registry_embedding_device`,
 `candidate_registry_similarity_threshold`, `candidate_selection_method`,
@@ -485,6 +508,8 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `candidate_selection_late_interaction_device`,
 `candidate_selection_top_evidence_packets`,
 `candidate_selection_document_chunk_overlap_tokens`,
+`candidate_selection_hierarchical_colbert`,
+`candidate_selection_hierarchy_top_communities`,
 `max_review_rounds`, `max_evaluation_rounds`,
 `ontology_refinement_min_failure_patients`,
 `max_ontology_refinement_rounds`, `screening_trees`,
@@ -775,7 +800,7 @@ than reparsing and reclustering the raw Stage 1 evidence. Each reciprocal-
 ColBERT graph is cached independently under `stage2/evidence_communities/` and
 sealed against the compiled packets, member-manifest hash, model/configuration,
 and seed. Interpretation batches are skipped only when their input fingerprint
-(selected community packets plus clinical question) matches.
+(compiled discovery packets plus clinical question by default) matches.
 It writes an outer-fold completion marker only after held-out estimation, and
 writes the final top-level marker only after the cross-fitted estimates have
 been assembled.

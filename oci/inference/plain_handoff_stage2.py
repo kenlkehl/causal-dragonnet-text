@@ -104,6 +104,10 @@ DEFAULT_EVIDENCE_COMMUNITY_MAX_EXEMPLARS = 3
 DEFAULT_EVIDENCE_COMMUNITY_MAX_CONSENSUS_PHRASES = 20
 DEFAULT_EVIDENCE_COMMUNITY_INNER_FOLD_SATURATION = 5
 DEFAULT_EVIDENCE_COMMUNITY_ARCHITECTURE_SATURATION = 4
+DEFAULT_EVIDENCE_COMMUNITY_HIERARCHY_TARGET_COMMUNITIES = (300, 75)
+DEFAULT_CANDIDATE_DISCOVERY_SOURCE = "compiled_packets"
+DEFAULT_CANDIDATE_SELECTION_HIERARCHICAL_COLBERT = True
+DEFAULT_CANDIDATE_SELECTION_HIERARCHY_TOP_COMMUNITIES = 3
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 DEFAULT_SCREENING_TREES = 200
@@ -122,12 +126,14 @@ EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
 OPERATIONALIZATION_SCHEMA_VERSION = (
     "feature_name_bounded_supporting_text_v6_continuous_category_fallback"
 )
-INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v10_exhaustive_decomposition"
+INTERPRETATION_SCHEMA_VERSION = (
+    "candidate_first_compiled_evidence_v11_exhaustive_decomposition"
+)
 INTERPRETATION_AUDIT_SCHEMA_VERSION = (
     "rejected_packet_text_only_ordinals_v7_exhaustive_decomposition"
 )
 CANDIDATE_SELECTION_SCHEMA_VERSION = (
-    "fold_candidate_registry_late_interaction_axis_top_n_v1"
+    "candidate_first_hierarchical_colbert_axis_top_n_v2"
 )
 CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE = "configured_explicit_feature"
 
@@ -702,10 +708,12 @@ class PlainHandoffStage2Config:
     evidence_max_cards_per_fold: int = 400
     evidence_max_exemplars_per_card: int = 4
     evidence_max_exemplar_chars: int = 2_400
-    # Distill the compiled card representatives into reciprocal cross-
-    # architecture ColBERT communities before the first LLM interpretation.
-    # Independent confounder/modifier reserves are deduplicated before global
-    # fill, so neither causal lane can consume the whole prompt packet budget.
+    # Candidate discovery defaults to every compiled evidence packet. The old
+    # community-gated behavior remains an explicit compatibility mode.
+    candidate_discovery_source: str = DEFAULT_CANDIDATE_DISCOVERY_SOURCE
+    # Independently organize compiled evidence into reciprocal ColBERT
+    # communities for post-discovery routing. Independent confounder/modifier
+    # reserves are deduplicated before global fill.
     evidence_community_enabled: bool = DEFAULT_EVIDENCE_COMMUNITY_ENABLED
     evidence_community_model: str = DEFAULT_EVIDENCE_COMMUNITY_MODEL
     evidence_community_device: str = DEFAULT_EVIDENCE_COMMUNITY_DEVICE
@@ -735,6 +743,9 @@ class PlainHandoffStage2Config:
     )
     evidence_community_architecture_saturation: int = (
         DEFAULT_EVIDENCE_COMMUNITY_ARCHITECTURE_SATURATION
+    )
+    evidence_community_hierarchy_target_communities: tuple[int, ...] = (
+        DEFAULT_EVIDENCE_COMMUNITY_HIERARCHY_TARGET_COMMUNITIES
     )
     # Hard downstream cardinality cap after fold-local candidate registry and
     # evidence ranking. Investigator-configured features are added later and
@@ -767,6 +778,14 @@ class PlainHandoffStage2Config:
     )
     candidate_selection_document_chunk_overlap_tokens: int = (
         DEFAULT_CANDIDATE_SELECTION_DOCUMENT_CHUNK_OVERLAP_TOKENS
+    )
+    # Score candidate queries against final community routers, descend through
+    # their source-packet lineage, and rerank the resulting compiled packets.
+    candidate_selection_hierarchical_colbert: bool = (
+        DEFAULT_CANDIDATE_SELECTION_HIERARCHICAL_COLBERT
+    )
+    candidate_selection_hierarchy_top_communities: int = (
+        DEFAULT_CANDIDATE_SELECTION_HIERARCHY_TOP_COMMUNITIES
     )
     workers: int = 4
     # Limits language-model reviews. Deterministic evaluation-only convergence
@@ -931,8 +950,24 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.evidence_max_exemplars_per_card must be positive")
         if self.evidence_max_exemplar_chars < 256:
             raise ValueError("stage2.evidence_max_exemplar_chars must be at least 256")
+        if self.candidate_discovery_source not in {
+            "compiled_packets",
+            "community_packets",
+        }:
+            raise ValueError(
+                "stage2.candidate_discovery_source must be compiled_packets or "
+                "community_packets"
+            )
         if not isinstance(self.evidence_community_enabled, bool):
             raise ValueError("stage2.evidence_community_enabled must be true or false")
+        if (
+            self.candidate_discovery_source == "community_packets"
+            and not self.evidence_community_enabled
+        ):
+            raise ValueError(
+                "stage2.candidate_discovery_source=community_packets requires "
+                "stage2.evidence_community_enabled=true"
+            )
         try:
             Stage2EvidenceCommunityConfig(
                 model_name=self.evidence_community_model,
@@ -948,6 +983,9 @@ class PlainHandoffStage2Config:
                 max_consensus_phrases=self.evidence_community_max_consensus_phrases,
                 inner_fold_saturation=self.evidence_community_inner_fold_saturation,
                 architecture_saturation=self.evidence_community_architecture_saturation,
+                hierarchy_target_communities=(
+                    self.evidence_community_hierarchy_target_communities
+                ),
             ).validate()
         except ValueError as exc:
             raise ValueError(f"stage2.{exc}") from exc
@@ -1005,6 +1043,22 @@ class PlainHandoffStage2Config:
             raise ValueError(
                 "stage2.candidate_selection_document_chunk_overlap_tokens must be a "
                 "nonnegative integer"
+            )
+        if not isinstance(self.candidate_selection_hierarchical_colbert, bool):
+            raise ValueError(
+                "stage2.candidate_selection_hierarchical_colbert must be true or false"
+            )
+        if (
+            isinstance(self.candidate_selection_hierarchy_top_communities, bool)
+            or not isinstance(
+                self.candidate_selection_hierarchy_top_communities,
+                int,
+            )
+            or self.candidate_selection_hierarchy_top_communities < 1
+        ):
+            raise ValueError(
+                "stage2.candidate_selection_hierarchy_top_communities must be a "
+                "positive integer"
             )
         if self.workers < 1:
             raise ValueError("stage2.workers must be positive")
@@ -1120,6 +1174,22 @@ def plain_stage2_config_from_mapping(
             return tuple(part.strip() for part in value.split(",") if part.strip())
         return tuple(value)
 
+    def integer_tuple(value: Any, *, field_name: str) -> tuple[int, ...]:
+        if isinstance(value, str):
+            raw_values: Sequence[Any] = [
+                part.strip() for part in value.split(",") if part.strip()
+            ]
+        elif isinstance(value, Sequence):
+            raw_values = value
+        else:
+            raise ValueError(f"stage2.{field_name} must be an array or comma-separated string")
+        if any(isinstance(item, bool) for item in raw_values):
+            raise ValueError(f"stage2.{field_name} must contain integers")
+        try:
+            return tuple(int(item) for item in raw_values)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"stage2.{field_name} must contain integers") from exc
+
     if "interpretation_reasoning_effort" in raw:
         interpretation_reasoning_effort = (
             str(raw["interpretation_reasoning_effort"]).strip().lower()
@@ -1152,6 +1222,14 @@ def plain_stage2_config_from_mapping(
     )
     if not isinstance(evidence_community_enabled, bool):
         raise ValueError("stage2.evidence_community_enabled must be true or false")
+    candidate_selection_hierarchical_colbert = raw.get(
+        "candidate_selection_hierarchical_colbert",
+        DEFAULT_CANDIDATE_SELECTION_HIERARCHICAL_COLBERT,
+    )
+    if not isinstance(candidate_selection_hierarchical_colbert, bool):
+        raise ValueError(
+            "stage2.candidate_selection_hierarchical_colbert must be true or false"
+        )
 
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
@@ -1221,6 +1299,9 @@ def plain_stage2_config_from_mapping(
         evidence_max_cards_per_fold=int(raw.get("evidence_max_cards_per_fold", 400)),
         evidence_max_exemplars_per_card=int(raw.get("evidence_max_exemplars_per_card", 4)),
         evidence_max_exemplar_chars=int(raw.get("evidence_max_exemplar_chars", 2_400)),
+        candidate_discovery_source=str(
+            raw.get("candidate_discovery_source", DEFAULT_CANDIDATE_DISCOVERY_SOURCE)
+        ).strip().lower(),
         evidence_community_enabled=evidence_community_enabled,
         evidence_community_model=str(
             raw.get("evidence_community_model", DEFAULT_EVIDENCE_COMMUNITY_MODEL)
@@ -1294,6 +1375,13 @@ def plain_stage2_config_from_mapping(
                 DEFAULT_EVIDENCE_COMMUNITY_ARCHITECTURE_SATURATION,
             )
         ),
+        evidence_community_hierarchy_target_communities=integer_tuple(
+            raw.get(
+                "evidence_community_hierarchy_target_communities",
+                DEFAULT_EVIDENCE_COMMUNITY_HIERARCHY_TARGET_COMMUNITIES,
+            ),
+            field_name="evidence_community_hierarchy_target_communities",
+        ),
         max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
         consolidation_oversample_factor=int(raw.get("consolidation_oversample_factor", 4)),
         candidate_selection_top_n=int(
@@ -1348,6 +1436,15 @@ def plain_stage2_config_from_mapping(
             raw.get(
                 "candidate_selection_document_chunk_overlap_tokens",
                 DEFAULT_CANDIDATE_SELECTION_DOCUMENT_CHUNK_OVERLAP_TOKENS,
+            )
+        ),
+        candidate_selection_hierarchical_colbert=(
+            candidate_selection_hierarchical_colbert
+        ),
+        candidate_selection_hierarchy_top_communities=int(
+            raw.get(
+                "candidate_selection_hierarchy_top_communities",
+                DEFAULT_CANDIDATE_SELECTION_HIERARCHY_TOP_COMMUNITIES,
             )
         ),
         workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
@@ -4013,6 +4110,17 @@ def _readable_supporting_text(
     return list(dict.fromkeys(texts))
 
 
+def _colbert_supporting_text(packet: Mapping[str, Any]) -> str:
+    """Return the lossless router document or the packet's readable excerpts."""
+
+    content = packet.get("content")
+    if isinstance(content, Mapping):
+        hierarchy_document = str(content.get("colbert_document") or "").strip()
+        if hierarchy_document:
+            return hierarchy_document
+    return "\n\n".join(_readable_supporting_text([packet]))
+
+
 def _natural_language_feature_name(value: Any) -> str:
     """Render an identifier as a short natural-language embedding query."""
 
@@ -4360,6 +4468,7 @@ def _select_candidates_from_registry(
     *,
     candidates: Sequence[Mapping[str, Any]],
     packet_by_id: Mapping[str, Mapping[str, Any]],
+    hierarchy_packet_by_id: Mapping[str, Mapping[str, Any]] | None = None,
     top_n_per_axis: int,
     max_candidates: int,
     scoring_method: str,
@@ -4369,6 +4478,7 @@ def _select_candidates_from_registry(
     dense_embedding_device: str,
     top_evidence_packets: int,
     document_chunk_overlap_tokens: int,
+    hierarchy_top_communities: int = DEFAULT_CANDIDATE_SELECTION_HIERARCHY_TOP_COMMUNITIES,
     embedding_function: Callable[[Sequence[str], str, str], np.ndarray] | None = None,
     late_interaction_scoring_function: (
         Callable[[Sequence[str], Sequence[str], str, str], np.ndarray] | None
@@ -4376,7 +4486,12 @@ def _select_candidates_from_registry(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Rank canonical candidates by evidence support and enforce fold-level caps."""
 
-    if top_n_per_axis < 1 or max_candidates < 1 or top_evidence_packets < 1:
+    if (
+        top_n_per_axis < 1
+        or max_candidates < 1
+        or top_evidence_packets < 1
+        or hierarchy_top_communities < 1
+    ):
         raise ValueError("candidate selection limits must be positive")
     if scoring_method not in {"late_interaction", "dense_cosine"}:
         raise ValueError(f"unsupported candidate selection scoring method {scoring_method!r}")
@@ -4398,9 +4513,12 @@ def _select_candidates_from_registry(
             "top_n_per_evidence_axis": top_n_per_axis,
             "max_candidates_per_fold": max_candidates,
             "top_evidence_packets_per_candidate": top_evidence_packets,
+            "hierarchy_top_communities_per_candidate": hierarchy_top_communities,
+            "hierarchy_packets": len(hierarchy_packet_by_id or {}),
             "document_chunk_overlap_tokens": document_chunk_overlap_tokens,
             "registry_candidates": 0,
             "candidate_packet_associations_scored": 0,
+            "candidate_hierarchy_associations_scored": 0,
             "shortlisted_candidates_before_fold_cap": 0,
             "hard_cap_applied": False,
             "retained_candidates": 0,
@@ -4417,13 +4535,13 @@ def _select_candidates_from_registry(
             "candidate_rankings": [],
         }
     ordered_packets = {str(packet_id): packet for packet_id, packet in packet_by_id.items()}
-    queries: list[str] = []
-    documents: list[str] = []
-    association_keys: list[tuple[str, str]] = []
+    ordered_hierarchy_packets = {
+        str(packet_id): packet
+        for packet_id, packet in (hierarchy_packet_by_id or {}).items()
+    }
     candidate_by_id: dict[str, Mapping[str, Any]] = {}
     support_ids_by_candidate: dict[str, list[str]] = {}
     query_by_candidate: dict[str, str] = {}
-    packet_text_by_id: dict[str, str] = {}
     for position, candidate in enumerate(candidates, start=1):
         candidate_id = str(candidate.get("candidate_id") or "").strip()
         if not candidate_id or candidate_id in candidate_by_id:
@@ -4445,61 +4563,125 @@ def _select_candidates_from_registry(
         candidate_by_id[candidate_id] = candidate
         support_ids_by_candidate[candidate_id] = support_ids
         query_by_candidate[candidate_id] = query
-        for packet_id in support_ids:
-            if packet_id not in packet_text_by_id:
-                evidence = _readable_supporting_text([ordered_packets[packet_id]])
-                if not evidence:
+
+    scoring_model = (
+        late_interaction_model
+        if scoring_method == "late_interaction"
+        else dense_embedding_model
+    )
+    scoring_device = (
+        late_interaction_device
+        if scoring_method == "late_interaction"
+        else dense_embedding_device
+    )
+
+    def score_associations(
+        association_keys: Sequence[tuple[str, str]],
+        *,
+        packets_for_scoring: Mapping[str, Mapping[str, Any]],
+    ) -> dict[tuple[str, str], float]:
+        if not association_keys:
+            return {}
+        text_by_packet_id: dict[str, str] = {}
+        queries: list[str] = []
+        documents: list[str] = []
+        for candidate_id, packet_id in association_keys:
+            if packet_id not in text_by_packet_id:
+                text = _colbert_supporting_text(packets_for_scoring[packet_id])
+                if not text:
                     raise ValueError(
-                        f"candidate selection packet {packet_id!r} has no readable evidence text"
+                        f"candidate selection packet {packet_id!r} has no readable "
+                        "evidence text"
                     )
-                packet_text_by_id[packet_id] = "\n\n".join(evidence)
-            queries.append(query)
-            documents.append(packet_text_by_id[packet_id])
-            association_keys.append((candidate_id, packet_id))
+                text_by_packet_id[packet_id] = text
+            queries.append(query_by_candidate[candidate_id])
+            documents.append(text_by_packet_id[packet_id])
+        if scoring_method == "late_interaction":
+            if late_interaction_scoring_function is None:
+                from ..models.late_interaction import score_late_interaction_pairs
 
-    if scoring_method == "late_interaction":
-        if late_interaction_scoring_function is None:
-            from ..models.late_interaction import score_late_interaction_pairs
-
-            scores = score_late_interaction_pairs(
-                queries,
-                documents,
-                late_interaction_model,
-                late_interaction_device,
-                document_chunk_overlap_tokens=document_chunk_overlap_tokens,
-            )
+                raw_scores = score_late_interaction_pairs(
+                    queries,
+                    documents,
+                    late_interaction_model,
+                    late_interaction_device,
+                    document_chunk_overlap_tokens=document_chunk_overlap_tokens,
+                )
+            else:
+                raw_scores = late_interaction_scoring_function(
+                    queries,
+                    documents,
+                    late_interaction_model,
+                    late_interaction_device,
+                )
         else:
-            scores = late_interaction_scoring_function(
+            raw_scores = _dense_candidate_packet_scores(
                 queries,
                 documents,
-                late_interaction_model,
-                late_interaction_device,
+                embedding_model=dense_embedding_model,
+                embedding_device=dense_embedding_device,
+                embedding_function=embedding_function,
             )
-        scoring_model = late_interaction_model
-        scoring_device = late_interaction_device
-    elif scoring_method == "dense_cosine":
-        scores = _dense_candidate_packet_scores(
-            queries,
-            documents,
-            embedding_model=dense_embedding_model,
-            embedding_device=dense_embedding_device,
-            embedding_function=embedding_function,
+        scores = np.asarray(raw_scores, dtype=np.float32)
+        if scores.ndim != 1 or scores.shape[0] != len(association_keys):
+            raise RuntimeError(
+                "candidate support scorer returned unexpected shape "
+                f"{scores.shape} for {len(association_keys)} associations"
+            )
+        if not np.isfinite(scores).all():
+            raise RuntimeError("candidate support scorer returned non-finite scores")
+        return {
+            key: float(score)
+            for key, score in zip(association_keys, scores.tolist())
+        }
+
+    hierarchy_association_keys = [
+        (candidate_id, packet_id)
+        for candidate_id in candidate_by_id
+        for packet_id in sorted(ordered_hierarchy_packets)
+    ]
+    hierarchy_score_by_association = score_associations(
+        hierarchy_association_keys,
+        packets_for_scoring=ordered_hierarchy_packets,
+    )
+    top_hierarchy_ids_by_candidate: dict[str, list[str]] = {}
+    retrieval_ids_by_candidate: dict[str, list[str]] = {}
+    for candidate_id in candidate_by_id:
+        ranked_hierarchy_ids = sorted(
+            ordered_hierarchy_packets,
+            key=lambda packet_id: (
+                -hierarchy_score_by_association[(candidate_id, packet_id)],
+                packet_id,
+            ),
         )
-        scoring_model = dense_embedding_model
-        scoring_device = dense_embedding_device
-    else:  # pragma: no cover - validated above
-        raise AssertionError("unreachable candidate selection method")
-    scores = np.asarray(scores, dtype=np.float32)
-    if scores.ndim != 1 or scores.shape[0] != len(association_keys):
-        raise RuntimeError(
-            "candidate support scorer returned unexpected shape "
-            f"{scores.shape} for {len(association_keys)} associations"
-        )
-    if not np.isfinite(scores).all():
-        raise RuntimeError("candidate support scorer returned non-finite scores")
-    score_by_association = {
-        key: float(score) for key, score in zip(association_keys, scores.tolist())
-    }
+        top_hierarchy_ids = ranked_hierarchy_ids[
+            : min(hierarchy_top_communities, len(ranked_hierarchy_ids))
+        ]
+        top_hierarchy_ids_by_candidate[candidate_id] = top_hierarchy_ids
+        routed_ids: list[str] = list(support_ids_by_candidate[candidate_id])
+        for hierarchy_id in top_hierarchy_ids:
+            content = ordered_hierarchy_packets[hierarchy_id].get("content")
+            source_packet_ids = (
+                _string_values(content.get("source_packet_ids"))
+                if isinstance(content, Mapping)
+                else []
+            )
+            routed_ids.extend(
+                packet_id
+                for packet_id in source_packet_ids
+                if packet_id in ordered_packets
+            )
+        retrieval_ids_by_candidate[candidate_id] = list(dict.fromkeys(routed_ids))
+
+    association_keys = [
+        (candidate_id, packet_id)
+        for candidate_id in candidate_by_id
+        for packet_id in retrieval_ids_by_candidate[candidate_id]
+    ]
+    score_by_association = score_associations(
+        association_keys,
+        packets_for_scoring=ordered_packets,
+    )
 
     fold_architectures = {
         architecture
@@ -4514,8 +4696,9 @@ def _select_candidates_from_registry(
     rows: list[dict[str, Any]] = []
     for candidate_id, candidate in candidate_by_id.items():
         support_ids = support_ids_by_candidate[candidate_id]
+        retrieval_ids = retrieval_ids_by_candidate[candidate_id]
         ranked_packets = sorted(
-            support_ids,
+            retrieval_ids,
             key=lambda packet_id: (
                 -score_by_association[(candidate_id, packet_id)],
                 packet_id,
@@ -4561,6 +4744,7 @@ def _select_candidates_from_registry(
                 "natural_language_query": query_by_candidate[candidate_id],
                 "evidence_axes": axes,
                 "supporting_packet_count": len(support_ids),
+                "retrieved_packet_count": len(retrieval_ids),
                 "supporting_architectures": sorted(candidate_architectures),
                 "supporting_inner_folds": sorted(candidate_inner_folds),
                 "architecture_coverage": float(architecture_coverage),
@@ -4572,11 +4756,31 @@ def _select_candidates_from_registry(
                     {
                         "packet_id": packet_id,
                         "score": score_by_association[(candidate_id, packet_id)],
+                        "directly_cited": packet_id in support_ids,
                         "ontology_evidence": packet_id in top_packet_ids,
                     }
                     for packet_id in ranked_packets
                 ],
                 "ontology_packet_ids": top_packet_ids,
+                "ranked_hierarchy_packet_scores": [
+                    {
+                        "packet_id": packet_id,
+                        "score": hierarchy_score_by_association[
+                            (candidate_id, packet_id)
+                        ],
+                        "selected_for_descent": packet_id
+                        in top_hierarchy_ids_by_candidate[candidate_id],
+                    }
+                    for packet_id in sorted(
+                        ordered_hierarchy_packets,
+                        key=lambda packet_id: (
+                            -hierarchy_score_by_association[
+                                (candidate_id, packet_id)
+                            ],
+                            packet_id,
+                        ),
+                    )
+                ],
             }
         )
 
@@ -4642,6 +4846,13 @@ def _select_candidates_from_registry(
                         item["packet_id"]: item["score"]
                         for item in row["ranked_packet_scores"]
                     },
+                    "hierarchy_packet_ids": list(
+                        top_hierarchy_ids_by_candidate[candidate_id]
+                    ),
+                    "score_by_hierarchy_packet": {
+                        item["packet_id"]: item["score"]
+                        for item in row["ranked_hierarchy_packet_scores"]
+                    },
                 },
             }
         )
@@ -4681,9 +4892,14 @@ def _select_candidates_from_registry(
         "top_n_per_evidence_axis": top_n_per_axis,
         "max_candidates_per_fold": max_candidates,
         "top_evidence_packets_per_candidate": top_evidence_packets,
+        "hierarchy_top_communities_per_candidate": hierarchy_top_communities,
+        "hierarchy_packets": len(ordered_hierarchy_packets),
         "document_chunk_overlap_tokens": document_chunk_overlap_tokens,
         "registry_candidates": len(candidates),
         "candidate_packet_associations_scored": len(association_keys),
+        "candidate_hierarchy_associations_scored": len(
+            hierarchy_association_keys
+        ),
         "shortlisted_candidates_before_fold_cap": len(shortlisted_without_hard_cap),
         "hard_cap_applied": len(shortlisted_without_hard_cap) > max_candidates,
         "retained_candidates": len(retained),
@@ -4711,6 +4927,7 @@ def _build_and_select_candidate_registry(
     *,
     candidates: Sequence[Mapping[str, Any]],
     packet_by_id: Mapping[str, Mapping[str, Any]],
+    hierarchy_packet_by_id: Mapping[str, Mapping[str, Any]] | None = None,
     top_n_per_axis: int,
     max_candidates: int,
     registry_embedding_model: str,
@@ -4721,6 +4938,7 @@ def _build_and_select_candidate_registry(
     late_interaction_device: str,
     top_evidence_packets: int,
     document_chunk_overlap_tokens: int,
+    hierarchy_top_communities: int = DEFAULT_CANDIDATE_SELECTION_HIERARCHY_TOP_COMMUNITIES,
     embedding_function: Callable[[Sequence[str], str, str], np.ndarray] | None = None,
     late_interaction_scoring_function: (
         Callable[[Sequence[str], Sequence[str], str, str], np.ndarray] | None
@@ -4736,6 +4954,7 @@ def _build_and_select_candidate_registry(
     retained, selection_audit = _select_candidates_from_registry(
         candidates=registry,
         packet_by_id=packet_by_id,
+        hierarchy_packet_by_id=hierarchy_packet_by_id,
         top_n_per_axis=top_n_per_axis,
         max_candidates=max_candidates,
         scoring_method=scoring_method,
@@ -4745,6 +4964,7 @@ def _build_and_select_candidate_registry(
         dense_embedding_device=registry_embedding_device,
         top_evidence_packets=top_evidence_packets,
         document_chunk_overlap_tokens=document_chunk_overlap_tokens,
+        hierarchy_top_communities=hierarchy_top_communities,
         embedding_function=embedding_function,
         late_interaction_scoring_function=late_interaction_scoring_function,
     )
@@ -5266,6 +5486,9 @@ class PlainHandoffStage2:
             architecture_saturation=(
                 self.config.evidence_community_architecture_saturation
             ),
+            hierarchy_target_communities=(
+                self.config.evidence_community_hierarchy_target_communities
+            ),
         )
 
     def _load_or_distill_evidence_communities(
@@ -5275,7 +5498,7 @@ class PlainHandoffStage2:
         output_dir: Path,
         seed: int,
     ) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
-        """Load or build the sealed pre-interpretation evidence communities."""
+        """Load or build sealed evidence communities for candidate routing."""
 
         if not self.config.evidence_community_enabled:
             summary = {
@@ -5326,6 +5549,8 @@ class PlainHandoffStage2:
             atoms_path = fold_dir / "atoms.jsonl"
             communities_path = fold_dir / "communities.jsonl"
             edges_path = fold_dir / "edges.jsonl"
+            hierarchy_communities_path = fold_dir / "hierarchy_communities.jsonl"
+            hierarchy_edges_path = fold_dir / "hierarchy_edges.jsonl"
             summary_path = fold_dir / "summary.json"
             complete_path = fold_dir / "complete.json"
             required_paths = (
@@ -5333,6 +5558,8 @@ class PlainHandoffStage2:
                 atoms_path,
                 communities_path,
                 edges_path,
+                hierarchy_communities_path,
+                hierarchy_edges_path,
                 summary_path,
             )
             if complete_path.is_file() and all(path.is_file() for path in required_paths):
@@ -5344,6 +5571,8 @@ class PlainHandoffStage2:
                         "atoms": atoms_path,
                         "communities": communities_path,
                         "edges": edges_path,
+                        "hierarchy_communities": hierarchy_communities_path,
+                        "hierarchy_edges": hierarchy_edges_path,
                         "summary": summary_path,
                     }
                     artifacts_match = isinstance(expected_hashes, Mapping) and all(
@@ -5413,18 +5642,27 @@ class PlainHandoffStage2:
                     "atoms": str(atoms_path),
                     "communities": str(communities_path),
                     "edges": str(edges_path),
+                    "hierarchy_communities": str(hierarchy_communities_path),
+                    "hierarchy_edges": str(hierarchy_edges_path),
                 },
             }
             _write_jsonl(selected_path, distilled.packets)
             _write_jsonl(atoms_path, distilled.atoms)
             _write_jsonl(communities_path, distilled.communities)
             _write_jsonl(edges_path, distilled.edges)
+            _write_jsonl(
+                hierarchy_communities_path,
+                distilled.hierarchy_communities,
+            )
+            _write_jsonl(hierarchy_edges_path, distilled.hierarchy_edges)
             _write_json(summary_path, fold_summary)
             artifact_sha256 = {
                 "packets": _file_sha256(selected_path),
                 "atoms": _file_sha256(atoms_path),
                 "communities": _file_sha256(communities_path),
                 "edges": _file_sha256(edges_path),
+                "hierarchy_communities": _file_sha256(hierarchy_communities_path),
+                "hierarchy_edges": _file_sha256(hierarchy_edges_path),
                 "summary": _file_sha256(summary_path),
             }
             _write_json(
@@ -5439,6 +5677,8 @@ class PlainHandoffStage2:
                     "atoms": len(distilled.atoms),
                     "communities": len(distilled.communities),
                     "reciprocal_edges": len(distilled.edges),
+                    "hierarchy_communities": len(distilled.hierarchy_communities),
+                    "hierarchy_edges": len(distilled.hierarchy_edges),
                     "artifact_sha256": artifact_sha256,
                 },
             )
@@ -5463,6 +5703,8 @@ class PlainHandoffStage2:
             "pooled_mutual_pairs_reranked",
             "reciprocal_edges",
             "communities",
+            "hierarchy_communities",
+            "final_communities",
             "selected_communities",
             "selected_atoms",
             "selected_confounder_lane_communities",
@@ -5473,6 +5715,7 @@ class PlainHandoffStage2:
             "source_readable_chars",
             "source_packet_chars",
             "selected_readable_chars",
+            "selected_colbert_chars",
             "selected_packet_chars",
         )
         totals = {
@@ -6257,6 +6500,7 @@ class PlainHandoffStage2:
         *,
         outer_fold: int,
         packets: Sequence[Mapping[str, Any]],
+        support_packets: Sequence[Mapping[str, Any]] | None = None,
         output_dir: Path,
         dataset: pd.DataFrame | None = None,
         split: Mapping[str, Any] | None = None,
@@ -6268,6 +6512,8 @@ class PlainHandoffStage2:
         inner_folds: int = 5,
         seed: int = 42,
     ) -> Mapping[str, Any]:
+        discovery_packets = list(packets)
+        hierarchy_packets = list(support_packets or [])
         complete_path = output_dir / "complete.json"
         features_path = output_dir / "feature_definitions.json"
         final_features_path = output_dir / "final_definitions.json"
@@ -6278,6 +6524,7 @@ class PlainHandoffStage2:
         definition_inputs = {
             "outer_fold": int(outer_fold),
             "compiler": self.config.evidence_compiler,
+            "candidate_discovery_source": self.config.candidate_discovery_source,
             "evidence_community_schema": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
             "evidence_community_enabled": self.config.evidence_community_enabled,
             "evidence_community_config": (
@@ -6324,6 +6571,12 @@ class PlainHandoffStage2:
             "candidate_selection_document_chunk_overlap_tokens": int(
                 self.config.candidate_selection_document_chunk_overlap_tokens
             ),
+            "candidate_selection_hierarchical_colbert": (
+                self.config.candidate_selection_hierarchical_colbert
+            ),
+            "candidate_selection_hierarchy_top_communities": int(
+                self.config.candidate_selection_hierarchy_top_communities
+            ),
             "extraction_ontology_feedback_schema": (EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION),
             "ontology_refinement_min_failure_patients": int(
                 self.config.ontology_refinement_min_failure_patients
@@ -6333,7 +6586,8 @@ class PlainHandoffStage2:
             "explicit_features": [
                 feature.as_definition() for feature in self.config.explicit_features
             ],
-            "packets": list(packets),
+            "discovery_packets": discovery_packets,
+            "hierarchy_packets": hierarchy_packets,
         }
         evidence_input_fingerprint = _value_fingerprint(
             {
@@ -6404,10 +6658,11 @@ class PlainHandoffStage2:
                 ),
             }
         output_dir.mkdir(parents=True, exist_ok=True)
-        _write_jsonl(output_dir / "input_packets.jsonl", packets)
+        _write_jsonl(output_dir / "input_packets.jsonl", discovery_packets)
+        _write_jsonl(output_dir / "colbert_support_packets.jsonl", hierarchy_packets)
 
         by_architecture: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-        for packet in packets:
+        for packet in discovery_packets:
             by_architecture[str(packet["architecture"])].append(packet)
         candidates: list[dict[str, Any]] | None = None
         candidate_selection: dict[str, Any] | None = None
@@ -6486,9 +6741,18 @@ class PlainHandoffStage2:
                     architecture, batch_index = futures[future]
                     results.append((architecture, batch_index, future.result()))
 
-            packet_by_id = {str(packet["packet_id"]): packet for packet in packets}
-            if len(packet_by_id) != len(packets):
+            packet_by_id = {
+                str(packet["packet_id"]): packet for packet in discovery_packets
+            }
+            if len(packet_by_id) != len(discovery_packets):
                 raise ValueError("Stage 2 candidate selection received duplicate packet IDs")
+            hierarchy_packet_by_id = {
+                str(packet["packet_id"]): packet for packet in hierarchy_packets
+            }
+            if len(hierarchy_packet_by_id) != len(hierarchy_packets):
+                raise ValueError(
+                    "Stage 2 candidate selection received duplicate hierarchy packet IDs"
+                )
             candidates = []
             for architecture, _batch_index, result in sorted(
                 results,
@@ -6534,6 +6798,11 @@ class PlainHandoffStage2:
             candidates, candidate_selection = _build_and_select_candidate_registry(
                 candidates=candidates,
                 packet_by_id=packet_by_id,
+                hierarchy_packet_by_id=(
+                    hierarchy_packet_by_id
+                    if self.config.candidate_selection_hierarchical_colbert
+                    else None
+                ),
                 top_n_per_axis=self.config.candidate_selection_top_n,
                 max_candidates=self.config.max_candidates_per_fold,
                 registry_embedding_model=self.config.candidate_registry_embedding_model,
@@ -6553,6 +6822,9 @@ class PlainHandoffStage2:
                 ),
                 document_chunk_overlap_tokens=(
                     self.config.candidate_selection_document_chunk_overlap_tokens
+                ),
+                hierarchy_top_communities=(
+                    self.config.candidate_selection_hierarchy_top_communities
                 ),
             )
             candidate_selection["evidence_input_fingerprint"] = evidence_input_fingerprint
@@ -6583,7 +6855,7 @@ class PlainHandoffStage2:
                 consolidated = self._consolidate_candidates(
                     outer_fold=outer_fold,
                     candidates=candidates,
-                    evidence_packets=packets,
+                    evidence_packets=discovery_packets,
                     output_dir=output_dir / "consolidation",
                     seed=seed,
                 )
@@ -6649,6 +6921,12 @@ class PlainHandoffStage2:
                     "candidate_selection_document_chunk_overlap_tokens": int(
                         self.config.candidate_selection_document_chunk_overlap_tokens
                     ),
+                    "candidate_selection_hierarchical_colbert": (
+                        self.config.candidate_selection_hierarchical_colbert
+                    ),
+                    "candidate_selection_hierarchy_top_communities": int(
+                        self.config.candidate_selection_hierarchy_top_communities
+                    ),
                     "consolidation_batch_size": int(self.config.consolidation_batch_size),
                     "consolidation_alphabetical_rounds": int(
                         self.config.consolidation_alphabetical_rounds
@@ -6664,7 +6942,9 @@ class PlainHandoffStage2:
                         self.config.max_ontology_refinement_rounds
                     ),
                     "architectures": len(by_architecture),
-                    "packets": len(packets),
+                    "packets": len(discovery_packets),
+                    "discovery_packets": len(discovery_packets),
+                    "hierarchy_packets": len(hierarchy_packets),
                     "features": len(final["features"]),
                 },
             )
@@ -6784,15 +7064,27 @@ class PlainHandoffStage2:
             output_dir=output_dir,
             seed=seed,
         )
-        packets, community_summary = self._load_or_distill_evidence_communities(
+        community_packets, community_summary = self._load_or_distill_evidence_communities(
             packets=compiled_packets,
             output_dir=output_dir,
             seed=seed,
         )
+        discovery_packets = (
+            compiled_packets
+            if self.config.candidate_discovery_source == "compiled_packets"
+            else community_packets
+        )
 
         packets_by_outer: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
-        for packet in packets:
+        for packet in discovery_packets:
             packets_by_outer[int(packet["outer_fold"])].append(packet)
+        hierarchy_packets_by_outer: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
+        if (
+            self.config.evidence_community_enabled
+            and self.config.candidate_selection_hierarchical_colbert
+        ):
+            for packet in community_packets:
+                hierarchy_packets_by_outer[int(packet["outer_fold"])].append(packet)
         splits: dict[int, dict[str, Any]] = {}
         if dataset is not None:
             dataset = dataset.reset_index(drop=True)
@@ -6843,6 +7135,7 @@ class PlainHandoffStage2:
                         self._run_outer_fold,
                         outer_fold=outer_fold,
                         packets=packets_by_outer[outer_fold],
+                        support_packets=hierarchy_packets_by_outer.get(outer_fold, []),
                         output_dir=output_dir / f"outer_{outer_fold:03d}",
                         dataset=dataset,
                         split=splits.get(outer_fold),
@@ -6871,7 +7164,12 @@ class PlainHandoffStage2:
             name_counts.update(names_in_fold)
         summary = {
             "outer_folds": len(fold_results),
-            "evidence_packets": len(packets),
+            "candidate_discovery_source": self.config.candidate_discovery_source,
+            "evidence_packets": len(discovery_packets),
+            "candidate_discovery_packets": len(discovery_packets),
+            "colbert_support_packets": sum(
+                len(values) for values in hierarchy_packets_by_outer.values()
+            ),
             "compiled_evidence_packets": len(compiled_packets),
             "evidence_compiler": self.config.evidence_compiler,
             "evidence_compilation_path": str(output_dir / "evidence_compilation"),

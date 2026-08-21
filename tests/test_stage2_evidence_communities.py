@@ -212,6 +212,110 @@ def test_lane_reserves_deduplicate_dual_lane_communities_before_global_fill():
     assert records[3]["selection_lanes"] == ["global_fill"]
 
 
+def test_distillation_can_coarsen_communities_over_multiple_colbert_rounds(tmp_path):
+    topics = [
+        ("pdl1", "PD-L1 expression", ["treatment", "outcome"]),
+        ("tps", "tumor proportion score", ["treatment", "outcome"]),
+        ("age", "baseline patient age", ["residual_effect"]),
+        ("ecog", "ECOG performance status", ["matched_pair"]),
+    ]
+    packets = [
+        _packet(
+            f"{topic}_{architecture}",
+            architecture,
+            f"{text} source {architecture}",
+            axes,
+        )
+        for topic, text, axes in topics
+        for architecture in ("architecture_a", "architecture_b")
+    ]
+    member_path = tmp_path / "members.jsonl"
+    member_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "member_id": f"member_{packet['packet_id']}",
+                    "text_sha256": hashlib.sha256(
+                        packet["content"]["representative_evidence"][0]["text"].encode(
+                            "utf-8"
+                        )
+                    ).hexdigest(),
+                    "raw_references": [
+                        {"scope": "inner_train", "inner_fold": 1},
+                        {"scope": "inner_train", "inner_fold": 2},
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n"
+            for packet in packets
+        ),
+        encoding="utf-8",
+    )
+
+    def encode_documents(texts):
+        vectors = []
+        for text in texts:
+            lower = text.lower()
+            if "\n" in text:
+                vector = (
+                    [1.0, 0.0, 0.0, 0.0]
+                    if "pd-l1" in lower or "tumor proportion" in lower
+                    else [0.0, 1.0, 0.0, 0.0]
+                )
+            elif "pd-l1" in lower:
+                vector = [1.0, 0.0, 0.0, 0.0]
+            elif "tumor proportion" in lower:
+                vector = [0.0, 1.0, 0.0, 0.0]
+            elif "age" in lower:
+                vector = [0.0, 0.0, 1.0, 0.0]
+            else:
+                vector = [0.0, 0.0, 0.0, 1.0]
+            vectors.append(np.asarray([vector], dtype=np.float32))
+        return vectors
+
+    result = distill_stage2_evidence_communities(
+        packets,
+        member_manifest_path=member_path,
+        config=Stage2EvidenceCommunityConfig(
+            model_name="test-colbert",
+            max_communities=2,
+            min_per_causal_lane=0,
+            candidate_neighbors=4,
+            reciprocal_neighbors=1,
+            louvain_resolution=1.0,
+            inner_fold_saturation=2,
+            architecture_saturation=2,
+            hierarchy_target_communities=(10, 2, 1),
+        ),
+        seed=42,
+        document_encoder=encode_documents,
+    )
+
+    assert result.summary["communities"] == 4
+    assert result.summary["final_communities"] == 1
+    assert result.summary["final_hierarchy_level"] == 2
+    assert [level["status"] for level in result.summary["hierarchy_levels"]] == [
+        "target_not_smaller_than_input",
+        "completed",
+        "completed",
+    ]
+    assert result.summary["hierarchy_levels"][0]["hierarchy_level"] is None
+    assert len(result.hierarchy_communities) == 3
+    assert len(result.packets) == 1
+    assert result.hierarchy_edges
+    final_packet = result.packets[0]
+    assert final_packet["content"]["hierarchy_level"] == 2
+    assert len(final_packet["content"]["child_community_ids"]) == 2
+    assert len(final_packet["content"]["descendant_leaf_community_ids"]) == 4
+    assert len(final_packet["content"]["source_packet_ids"]) == 8
+    assert any(
+        "PD-L1 expression" in packet["content"]["colbert_document"]
+        and "tumor proportion score" in packet["content"]["colbert_document"]
+        for packet in result.packets
+    )
+
+
 def test_stage2_runner_seals_and_reuses_distilled_packets(monkeypatch, tmp_path):
     runner = PlainHandoffStage2(
         config=PlainHandoffStage2Config(
@@ -290,3 +394,61 @@ def test_stage2_runner_seals_and_reuses_distilled_packets(monkeypatch, tmp_path)
     assert first_summary == second_summary
     assert (tmp_path / "evidence_communities" / "outer_001" / "complete.json").is_file()
     assert (tmp_path / "evidence_communities" / "packets.jsonl").is_file()
+
+
+def test_stage2_run_discovers_candidates_from_compiled_packets_and_routes_with_communities(
+    monkeypatch,
+    tmp_path,
+):
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            candidate_discovery_source="compiled_packets",
+        ),
+        clinical_question="Identify candidate features.",
+        completion=lambda _messages, _config: "{}",
+    )
+    compiled_packets = [
+        _packet("compiled_a", "architecture_a", "PD-L1 TPS 30%", ["treatment"]),
+        _packet("compiled_b", "architecture_b", "patient age 72", ["outcome"]),
+    ]
+    community_packet = {
+        "packet_id": "outer_001_hierarchy_01_community_0001",
+        "architecture": EVIDENCE_COMMUNITY_ARCHITECTURE,
+        "outer_fold": 1,
+        "observable_axes": ["treatment", "outcome"],
+        "content": {
+            "source_packet_ids": ["compiled_a", "compiled_b"],
+            "representative_evidence": [{"text": "PD-L1 and age evidence"}],
+            "colbert_document": "PD-L1 TPS 30%\npatient age 72",
+        },
+    }
+    monkeypatch.setattr(
+        runner,
+        "_load_or_compile_evidence",
+        lambda **_kwargs: (compiled_packets, {"compiled": 2}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_or_distill_evidence_communities",
+        lambda **_kwargs: ([community_packet], {"selected_packets": 1}),
+    )
+    captured = {}
+
+    def run_outer_fold(**kwargs):
+        captured.update(kwargs)
+        return {"outer_fold": 1, "features": [], "candidate_dispositions": {}}
+
+    monkeypatch.setattr(runner, "_run_outer_fold", run_outer_fold)
+
+    summary = runner.run(
+        handoff_path=tmp_path / "handoff",
+        output_dir=tmp_path / "stage2",
+    )
+
+    assert captured["packets"] == compiled_packets
+    assert captured["support_packets"] == [community_packet]
+    assert summary["candidate_discovery_source"] == "compiled_packets"
+    assert summary["candidate_discovery_packets"] == 2
+    assert summary["colbert_support_packets"] == 1
