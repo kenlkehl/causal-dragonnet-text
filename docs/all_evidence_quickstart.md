@@ -58,6 +58,11 @@ effect estimates. The common controls are:
     "extraction_reasoning_effort": "none",
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
+    "evidence_community_enabled": true,
+    "evidence_community_model": "answerdotai/answerai-colbert-small-v1",
+    "evidence_community_device": "cpu",
+    "evidence_community_max_packets": 75,
+    "evidence_community_min_per_causal_lane": 30,
     "max_candidates_per_fold": 50,
     "candidate_selection_top_n": 50,
     "candidate_registry_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
@@ -129,6 +134,16 @@ workflow guide for GPU partition rules and all managed-server settings.
 
 Before interpretation, Stage 2 compiles the raw handoff into fold-local,
 provenance-preserving semantic cards under `stage2/evidence_compilation/`.
+It then turns each card representative into overlapping 16-word atoms, builds a
+cross-architecture reciprocal-neighbor graph with symmetric document/document
+ColBERT scoring, and clusters it. The best 30 confounder-lane and 30
+modifier-lane communities are reserved independently, overlaps are
+deduplicated, and the remaining capacity is filled by global rank up to 75.
+Each LLM item contains community consensus phrases plus at most three
+architecture-diverse exemplars. The full atom, edge, community, and source
+lineage audits are under `stage2/evidence_communities/`; no oracle metadata is
+used in selection.
+
 After interpretation, Stage 2 first collapses exact normalized names, then uses
 the registry embedding model for conservative, lexically anchored alias
 merges. Each canonical name is rendered as natural language (`patient_age`

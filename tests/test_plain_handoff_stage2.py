@@ -93,6 +93,18 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.max_ontology_refinement_rounds == 2
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
     assert config.evidence_max_cards_per_fold == 400
+    assert config.evidence_community_enabled is True
+    assert config.evidence_community_model == "answerdotai/answerai-colbert-small-v1"
+    assert config.evidence_community_device == "cpu"
+    assert config.evidence_community_max_packets == 75
+    assert config.evidence_community_min_per_causal_lane == 30
+    assert config.evidence_community_max_atom_words == 16
+    assert config.evidence_community_atom_overlap_words == 4
+    assert config.evidence_community_candidate_neighbors == 40
+    assert config.evidence_community_reciprocal_neighbors == 5
+    assert config.evidence_community_louvain_resolution == 2.5
+    assert config.evidence_community_max_exemplars == 3
+    assert config.evidence_community_max_consensus_phrases == 20
     assert config.consolidation_oversample_factor == 4
     assert config.candidate_selection_top_n == 50
     assert config.candidate_registry_embedding_model == "Qwen/Qwen3-Embedding-0.6B"
@@ -240,6 +252,66 @@ def test_stage2_config_maps_prior_selector_embedding_fields_to_registry():
     assert config.candidate_registry_embedding_device == "cuda:4"
     assert "candidate_selection_embedding_model" not in config.public_dict()
     assert "candidate_selection_embedding_device" not in config.public_dict()
+
+
+def test_stage2_config_parses_lane_aware_evidence_community_settings():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "evidence_community_enabled": True,
+            "evidence_community_model": "local/evidence-colbert",
+            "evidence_community_device": "cuda:2",
+            "evidence_community_max_packets": 60,
+            "evidence_community_min_per_causal_lane": 20,
+            "evidence_community_max_atom_words": 18,
+            "evidence_community_atom_overlap_words": 5,
+            "evidence_community_candidate_neighbors": 32,
+            "evidence_community_reciprocal_neighbors": 4,
+            "evidence_community_louvain_resolution": 1.75,
+            "evidence_community_max_exemplars": 2,
+            "evidence_community_max_consensus_phrases": 12,
+            "evidence_community_inner_fold_saturation": 4,
+            "evidence_community_architecture_saturation": 3,
+        },
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert config.evidence_community_model == "local/evidence-colbert"
+    assert config.evidence_community_device == "cuda:2"
+    assert config.evidence_community_max_packets == 60
+    assert config.evidence_community_min_per_causal_lane == 20
+    assert config.evidence_community_max_atom_words == 18
+    assert config.evidence_community_atom_overlap_words == 5
+    assert config.evidence_community_candidate_neighbors == 32
+    assert config.evidence_community_reciprocal_neighbors == 4
+    assert config.evidence_community_louvain_resolution == 1.75
+    assert config.evidence_community_max_exemplars == 2
+    assert config.evidence_community_max_consensus_phrases == 12
+    assert config.evidence_community_inner_fold_saturation == 4
+    assert config.evidence_community_architecture_saturation == 3
+    assert config.public_dict()["evidence_community_min_per_causal_lane"] == 20
+
+
+def test_stage2_config_rejects_impossible_evidence_community_lane_reserve():
+    with pytest.raises(ValueError, match="min_per_causal_lane"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            evidence_community_max_packets=75,
+            evidence_community_min_per_causal_lane=38,
+        ).validate()
+
+
+def test_stage2_config_rejects_non_boolean_evidence_community_switch():
+    with pytest.raises(ValueError, match="evidence_community_enabled"):
+        plain_stage2_config_from_mapping(
+            {
+                "endpoint": "http://stage2.test/v1",
+                "evidence_community_enabled": "true",
+            },
+            default_workers=1,
+        )
 
 
 def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
@@ -6735,6 +6807,7 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path, monkeypatch):
         max_prompt_chars=8_000,
         workers=2,
         required_architectures=(),
+        evidence_community_enabled=False,
     )
 
     first = run_plain_handoff_stage2(
@@ -6791,6 +6864,7 @@ def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
             model="test-model",
             workers=3,
             required_architectures=(),
+            evidence_community_enabled=False,
         ),
         clinical_question="Identify confounders.",
         completion=lambda _messages, _config: "{}",
@@ -6940,6 +7014,7 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
         max_review_rounds=1,
         estimation_trees=10,
         required_architectures=(),
+        evidence_community_enabled=False,
     )
 
     first = run_plain_handoff_stage2(

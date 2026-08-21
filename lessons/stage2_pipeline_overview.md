@@ -141,15 +141,34 @@ Reduction happens independently inside each outer fold:
 
 The default ceiling is `evidence_max_cards_per_fold=400`, with up to four
 representatives per card. This is deliberately an oversampled evidence atlas,
-not a variable limit. The LLM may recover many concepts from each card. If a
+not a variable limit; the community distiller may carry many concepts forward
+from its atoms. If a
 sensitivity analysis is warranted, raise the card ceiling rather than reverting
-to raw packetization. `raw_packets_v1` remains available as an explicit
-comparator via `stage2.evidence_compiler`.
+to raw packetization. `raw_packets_v1` is retired because it merged distinct
+scientific architectures.
 
-Before interpretation, Python strips each card to
+Before the LLM sees this atlas, Stage 2 builds a second fold-local reduction.
+Representatives are divided into overlapping 16-word atoms; exact member
+lineage restores their inner-fold and full-outer support. Pooled,
+centroid-residualized ColBERT vectors retrieve candidates only from other Stage
+1 architectures. Mutual candidates are reranked with symmetric
+document/document MeanMaxSim, reciprocal top-five edges are clustered, and
+communities are scored by fold coverage, architecture diversity, causal-axis
+corroboration, graph cohesion, and support size.
+
+The default 75-community budget is lane-aware. The best 30
+treatment/outcome communities and best 30 residual-effect/matched-pair
+communities are reserved independently; overlaps consume one slot, and global
+rank fills the remainder. This keeps confounder and modifier evidence from
+crowding each other out. Oracle values never participate. Every atom, edge,
+community, selected packet, and cache seal is retained under
+`stage2/evidence_communities`.
+
+Before interpretation, Python strips each selected community to
 `{"item": N, "text": ["..."]}`. The integer is local to that request and is
 mapped back to the original packet immediately after validation. The LLM does
-not see packet or card IDs, evidence kind, detail objects, truncation flags,
+see the community's consensus phrases plus at most three architecture-diverse
+evidence atoms. It does not see packet or card IDs, evidence kind, detail objects, truncation flags,
 axes, polarity, semantic grouping, architectures, scores, support counts,
 folds, or other compiler metadata. It returns feature names, descriptions,
 rationales, and `supporting_items`; it does not choose value types or any other
@@ -159,7 +178,9 @@ Compilation is cached under `stage2/evidence_compilation`. A restart hashes the
 Stage 1 handoff, loads the compact packet cache when its compiler signature
 matches, and avoids reparsing and reclustering the raw evidence. Interpretation
 checkpoints also carry an input fingerprint: completed batches are reused only
-when their exact card inputs and clinical question match.
+when their exact selected-community inputs and clinical question match. The
+community graph has its own fingerprint over the compiled cards, member
+manifest, ColBERT configuration, graph configuration, and seed.
 
 ## Candidate consolidation
 

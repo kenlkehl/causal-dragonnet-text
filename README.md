@@ -671,6 +671,11 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
+    "evidence_community_enabled": true,
+    "evidence_community_model": "answerdotai/answerai-colbert-small-v1",
+    "evidence_community_device": "cpu",
+    "evidence_community_max_packets": 75,
+    "evidence_community_min_per_causal_lane": 30,
     "operationalization_max_prompt_chars": 640000,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
@@ -823,6 +828,20 @@ does not load another embedding model beside the serving process. The raw Stage
 reduction audit are written under `stage2/evidence_compilation/`. The compiled
 packet plan is cached and input-fingerprinted for fast, safe restarts.
 
+Stage 2 then applies a deterministic pre-LLM evidence distiller. Card
+representatives become overlapping 16-word atoms with exact member-manifest
+fold provenance. Candidate neighbors are restricted to different Stage 1
+architectures, reranked by symmetric document/document ColBERT MeanMaxSim, and
+connected only when their top-five relationship is reciprocal. Louvain
+communities are ranked by inner-fold coverage, architecture diversity, causal
+axis corroboration, graph cohesion, and support size. The default 75-packet
+budget reserves the best 30 confounder-lane and 30 modifier-lane communities,
+deduplicates communities appearing in both lanes, and fills unused slots by
+global rank. Each interpretation item contains consensus phrases and at most
+three architecture-diverse exemplars. Atom, edge, community, packet, and resume
+audits are written under `stage2/evidence_communities/`; oracle metadata never
+participates in this selection.
+
 `semantic_cluster_cards_v2` is the only supported Stage 2 evidence compiler.
 Before any interpretation request, it compares the architectures present in
 each outer fold with the run's frozen Stage 1 selection: either the explicit
@@ -834,7 +853,7 @@ bundle attestation, checkpoint adoption, or deployment gates. The former
 `raw_packets_v1` option was retired because it merged distinct architectures
 into broad prompt buckets.
 
-Stage 2 then interprets the compiled evidence architectures and consolidates
+Stage 2 then interprets the selected evidence communities and consolidates
 the result into operational patient-level definitions. After exact-name
 coalescing, consolidation alphabetically sorts candidates into batches of 20
 by default, applies each batch's merge directives, re-sorts the consolidated
@@ -1006,7 +1025,20 @@ nsclc_all_evidence/
       architectures/.../metrics.jsonl
   stage2/
     config.json
+    evidence_compilation/
+      packets.jsonl
+      outer_001/{cards,members,lineage}.jsonl
+    evidence_communities/
+      packets.jsonl
+      summary.json
+      outer_001/
+        atoms.jsonl
+        edges.jsonl
+        communities.jsonl
+        packets.jsonl
+        complete.json
     outer_001/
+      input_packets.jsonl
       interpretations/...
       feature_definitions.json
       review/

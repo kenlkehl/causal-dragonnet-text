@@ -25,6 +25,7 @@ dependencies = [
     "transformers>=5.3.0",
     "pandas>=1.5.0",
     "numpy>=1.23.0",
+    "networkx>=3.2.0",
     # LogisticRegression.multi_class is still used by the Stage 1 scientific
     # configuration and was removed in scikit-learn 1.8.
     "scikit-learn>=1.2.0,<1.8.0",

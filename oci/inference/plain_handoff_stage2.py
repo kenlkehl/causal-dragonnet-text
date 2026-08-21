@@ -33,6 +33,12 @@ from .plain_handoff_stage2_evidence import (
     SUPPORTED_STAGE2_ARCHITECTURES,
     compile_stage2_handoff_evidence,
 )
+from .stage2_evidence_communities import (
+    EVIDENCE_COMMUNITY_ARCHITECTURE,
+    EVIDENCE_COMMUNITY_SCHEMA_VERSION,
+    Stage2EvidenceCommunityConfig,
+    distill_stage2_evidence_communities,
+)
 from .plain_handoff_stage2_analysis import run_fold_analysis
 from .vllm_server_pool import (
     ManagedVLLMConfig,
@@ -84,6 +90,20 @@ DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_MODEL = (
 DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_DEVICE = "cpu"
 DEFAULT_CANDIDATE_SELECTION_TOP_EVIDENCE_PACKETS = 3
 DEFAULT_CANDIDATE_SELECTION_DOCUMENT_CHUNK_OVERLAP_TOKENS = 32
+DEFAULT_EVIDENCE_COMMUNITY_ENABLED = True
+DEFAULT_EVIDENCE_COMMUNITY_MODEL = "answerdotai/answerai-colbert-small-v1"
+DEFAULT_EVIDENCE_COMMUNITY_DEVICE = "cpu"
+DEFAULT_EVIDENCE_COMMUNITY_MAX_PACKETS = 75
+DEFAULT_EVIDENCE_COMMUNITY_MIN_PER_CAUSAL_LANE = 30
+DEFAULT_EVIDENCE_COMMUNITY_MAX_ATOM_WORDS = 16
+DEFAULT_EVIDENCE_COMMUNITY_ATOM_OVERLAP_WORDS = 4
+DEFAULT_EVIDENCE_COMMUNITY_CANDIDATE_NEIGHBORS = 40
+DEFAULT_EVIDENCE_COMMUNITY_RECIPROCAL_NEIGHBORS = 5
+DEFAULT_EVIDENCE_COMMUNITY_LOUVAIN_RESOLUTION = 2.5
+DEFAULT_EVIDENCE_COMMUNITY_MAX_EXEMPLARS = 3
+DEFAULT_EVIDENCE_COMMUNITY_MAX_CONSENSUS_PHRASES = 20
+DEFAULT_EVIDENCE_COMMUNITY_INNER_FOLD_SATURATION = 5
+DEFAULT_EVIDENCE_COMMUNITY_ARCHITECTURE_SATURATION = 4
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 DEFAULT_SCREENING_TREES = 200
@@ -680,6 +700,40 @@ class PlainHandoffStage2Config:
     evidence_max_cards_per_fold: int = 400
     evidence_max_exemplars_per_card: int = 4
     evidence_max_exemplar_chars: int = 2_400
+    # Distill the compiled card representatives into reciprocal cross-
+    # architecture ColBERT communities before the first LLM interpretation.
+    # Independent confounder/modifier reserves are deduplicated before global
+    # fill, so neither causal lane can consume the whole prompt packet budget.
+    evidence_community_enabled: bool = DEFAULT_EVIDENCE_COMMUNITY_ENABLED
+    evidence_community_model: str = DEFAULT_EVIDENCE_COMMUNITY_MODEL
+    evidence_community_device: str = DEFAULT_EVIDENCE_COMMUNITY_DEVICE
+    evidence_community_max_packets: int = DEFAULT_EVIDENCE_COMMUNITY_MAX_PACKETS
+    evidence_community_min_per_causal_lane: int = (
+        DEFAULT_EVIDENCE_COMMUNITY_MIN_PER_CAUSAL_LANE
+    )
+    evidence_community_max_atom_words: int = DEFAULT_EVIDENCE_COMMUNITY_MAX_ATOM_WORDS
+    evidence_community_atom_overlap_words: int = (
+        DEFAULT_EVIDENCE_COMMUNITY_ATOM_OVERLAP_WORDS
+    )
+    evidence_community_candidate_neighbors: int = (
+        DEFAULT_EVIDENCE_COMMUNITY_CANDIDATE_NEIGHBORS
+    )
+    evidence_community_reciprocal_neighbors: int = (
+        DEFAULT_EVIDENCE_COMMUNITY_RECIPROCAL_NEIGHBORS
+    )
+    evidence_community_louvain_resolution: float = (
+        DEFAULT_EVIDENCE_COMMUNITY_LOUVAIN_RESOLUTION
+    )
+    evidence_community_max_exemplars: int = DEFAULT_EVIDENCE_COMMUNITY_MAX_EXEMPLARS
+    evidence_community_max_consensus_phrases: int = (
+        DEFAULT_EVIDENCE_COMMUNITY_MAX_CONSENSUS_PHRASES
+    )
+    evidence_community_inner_fold_saturation: int = (
+        DEFAULT_EVIDENCE_COMMUNITY_INNER_FOLD_SATURATION
+    )
+    evidence_community_architecture_saturation: int = (
+        DEFAULT_EVIDENCE_COMMUNITY_ARCHITECTURE_SATURATION
+    )
     # Hard downstream cardinality cap after fold-local candidate registry and
     # evidence ranking. Investigator-configured features are added later and
     # are never subject to this discovery cap.
@@ -875,6 +929,26 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.evidence_max_exemplars_per_card must be positive")
         if self.evidence_max_exemplar_chars < 256:
             raise ValueError("stage2.evidence_max_exemplar_chars must be at least 256")
+        if not isinstance(self.evidence_community_enabled, bool):
+            raise ValueError("stage2.evidence_community_enabled must be true or false")
+        try:
+            Stage2EvidenceCommunityConfig(
+                model_name=self.evidence_community_model,
+                device=self.evidence_community_device,
+                max_communities=self.evidence_community_max_packets,
+                min_per_causal_lane=self.evidence_community_min_per_causal_lane,
+                max_atom_words=self.evidence_community_max_atom_words,
+                atom_overlap_words=self.evidence_community_atom_overlap_words,
+                candidate_neighbors=self.evidence_community_candidate_neighbors,
+                reciprocal_neighbors=self.evidence_community_reciprocal_neighbors,
+                louvain_resolution=self.evidence_community_louvain_resolution,
+                max_exemplars=self.evidence_community_max_exemplars,
+                max_consensus_phrases=self.evidence_community_max_consensus_phrases,
+                inner_fold_saturation=self.evidence_community_inner_fold_saturation,
+                architecture_saturation=self.evidence_community_architecture_saturation,
+            ).validate()
+        except ValueError as exc:
+            raise ValueError(f"stage2.{exc}") from exc
         if self.max_candidates_per_fold < 1:
             raise ValueError("stage2.max_candidates_per_fold must be positive")
         if self.consolidation_oversample_factor < 1:
@@ -1070,6 +1144,12 @@ def plain_stage2_config_from_mapping(
         .strip()
         .lower()
     )
+    evidence_community_enabled = raw.get(
+        "evidence_community_enabled",
+        DEFAULT_EVIDENCE_COMMUNITY_ENABLED,
+    )
+    if not isinstance(evidence_community_enabled, bool):
+        raise ValueError("stage2.evidence_community_enabled must be true or false")
 
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
@@ -1139,6 +1219,79 @@ def plain_stage2_config_from_mapping(
         evidence_max_cards_per_fold=int(raw.get("evidence_max_cards_per_fold", 400)),
         evidence_max_exemplars_per_card=int(raw.get("evidence_max_exemplars_per_card", 4)),
         evidence_max_exemplar_chars=int(raw.get("evidence_max_exemplar_chars", 2_400)),
+        evidence_community_enabled=evidence_community_enabled,
+        evidence_community_model=str(
+            raw.get("evidence_community_model", DEFAULT_EVIDENCE_COMMUNITY_MODEL)
+        ).strip(),
+        evidence_community_device=str(
+            raw.get("evidence_community_device", DEFAULT_EVIDENCE_COMMUNITY_DEVICE)
+        ).strip(),
+        evidence_community_max_packets=int(
+            raw.get(
+                "evidence_community_max_packets",
+                DEFAULT_EVIDENCE_COMMUNITY_MAX_PACKETS,
+            )
+        ),
+        evidence_community_min_per_causal_lane=int(
+            raw.get(
+                "evidence_community_min_per_causal_lane",
+                DEFAULT_EVIDENCE_COMMUNITY_MIN_PER_CAUSAL_LANE,
+            )
+        ),
+        evidence_community_max_atom_words=int(
+            raw.get(
+                "evidence_community_max_atom_words",
+                DEFAULT_EVIDENCE_COMMUNITY_MAX_ATOM_WORDS,
+            )
+        ),
+        evidence_community_atom_overlap_words=int(
+            raw.get(
+                "evidence_community_atom_overlap_words",
+                DEFAULT_EVIDENCE_COMMUNITY_ATOM_OVERLAP_WORDS,
+            )
+        ),
+        evidence_community_candidate_neighbors=int(
+            raw.get(
+                "evidence_community_candidate_neighbors",
+                DEFAULT_EVIDENCE_COMMUNITY_CANDIDATE_NEIGHBORS,
+            )
+        ),
+        evidence_community_reciprocal_neighbors=int(
+            raw.get(
+                "evidence_community_reciprocal_neighbors",
+                DEFAULT_EVIDENCE_COMMUNITY_RECIPROCAL_NEIGHBORS,
+            )
+        ),
+        evidence_community_louvain_resolution=float(
+            raw.get(
+                "evidence_community_louvain_resolution",
+                DEFAULT_EVIDENCE_COMMUNITY_LOUVAIN_RESOLUTION,
+            )
+        ),
+        evidence_community_max_exemplars=int(
+            raw.get(
+                "evidence_community_max_exemplars",
+                DEFAULT_EVIDENCE_COMMUNITY_MAX_EXEMPLARS,
+            )
+        ),
+        evidence_community_max_consensus_phrases=int(
+            raw.get(
+                "evidence_community_max_consensus_phrases",
+                DEFAULT_EVIDENCE_COMMUNITY_MAX_CONSENSUS_PHRASES,
+            )
+        ),
+        evidence_community_inner_fold_saturation=int(
+            raw.get(
+                "evidence_community_inner_fold_saturation",
+                DEFAULT_EVIDENCE_COMMUNITY_INNER_FOLD_SATURATION,
+            )
+        ),
+        evidence_community_architecture_saturation=int(
+            raw.get(
+                "evidence_community_architecture_saturation",
+                DEFAULT_EVIDENCE_COMMUNITY_ARCHITECTURE_SATURATION,
+            )
+        ),
         max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
         consolidation_oversample_factor=int(raw.get("consolidation_oversample_factor", 4)),
         candidate_selection_top_n=int(
@@ -3002,6 +3155,7 @@ def _candidate_architectures(candidate: Mapping[str, Any]) -> list[str]:
     if primary in {
         "deterministic_candidate_group",
         "bounded_multi_architecture_consolidation",
+        EVIDENCE_COMMUNITY_ARCHITECTURE,
     }:
         primary = ""
     if primary == CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE:
@@ -5004,13 +5158,24 @@ class PlainHandoffStage2:
                 and complete.get("compiler_signature_sha256") == signature_fingerprint
             ):
                 packets = _read_jsonl(packets_path)
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                LOGGER.info(
-                    "loaded cached Stage 2 evidence compilation packets=%s path=%s",
-                    len(packets),
-                    compilation_dir,
+                outer_folds = sorted({int(packet["outer_fold"]) for packet in packets})
+                manifest_paths = [
+                    compilation_dir / f"outer_{outer_fold:03d}" / filename
+                    for outer_fold in outer_folds
+                    for filename in ("cards.jsonl", "members.jsonl", "lineage.jsonl")
+                ]
+                if all(path.is_file() for path in manifest_paths):
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    LOGGER.info(
+                        "loaded cached Stage 2 evidence compilation packets=%s path=%s",
+                        len(packets),
+                        compilation_dir,
+                    )
+                    return packets, summary
+                LOGGER.warning(
+                    "rebuild incomplete Stage 2 evidence compilation; missing manifests=%s",
+                    [str(path) for path in manifest_paths if not path.is_file()][:8],
                 )
-                return packets, summary
 
         compile_started = time.monotonic()
         compiled = compile_stage2_handoff_evidence(
@@ -5067,6 +5232,288 @@ class PlainHandoffStage2:
             compilation_dir,
         )
         return packets, summary
+
+    def _evidence_community_config(self) -> Stage2EvidenceCommunityConfig:
+        return Stage2EvidenceCommunityConfig(
+            model_name=self.config.evidence_community_model,
+            device=self.config.evidence_community_device,
+            max_communities=self.config.evidence_community_max_packets,
+            min_per_causal_lane=self.config.evidence_community_min_per_causal_lane,
+            max_atom_words=self.config.evidence_community_max_atom_words,
+            atom_overlap_words=self.config.evidence_community_atom_overlap_words,
+            candidate_neighbors=self.config.evidence_community_candidate_neighbors,
+            reciprocal_neighbors=self.config.evidence_community_reciprocal_neighbors,
+            louvain_resolution=self.config.evidence_community_louvain_resolution,
+            max_exemplars=self.config.evidence_community_max_exemplars,
+            max_consensus_phrases=(
+                self.config.evidence_community_max_consensus_phrases
+            ),
+            inner_fold_saturation=(
+                self.config.evidence_community_inner_fold_saturation
+            ),
+            architecture_saturation=(
+                self.config.evidence_community_architecture_saturation
+            ),
+        )
+
+    def _load_or_distill_evidence_communities(
+        self,
+        *,
+        packets: Sequence[Mapping[str, Any]],
+        output_dir: Path,
+        seed: int,
+    ) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
+        """Load or build the sealed pre-interpretation evidence communities."""
+
+        if not self.config.evidence_community_enabled:
+            summary = {
+                "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
+                "enabled": False,
+                "source_packets": len(packets),
+                "selected_packets": len(packets),
+                "reason": "disabled_by_stage2_configuration",
+            }
+            return [dict(packet) for packet in packets], summary
+
+        community_config = self._evidence_community_config()
+        community_config.validate()
+        community_dir = output_dir / "evidence_communities"
+        packets_by_outer: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
+        for packet in packets:
+            packets_by_outer[int(packet["outer_fold"])].append(packet)
+
+        selected_packets: list[dict[str, Any]] = []
+        fold_summaries: dict[str, Mapping[str, Any]] = {}
+        fold_fingerprints: dict[str, str] = {}
+        for outer_fold in sorted(packets_by_outer):
+            fold_packets = packets_by_outer[outer_fold]
+            member_manifest_path = (
+                output_dir
+                / "evidence_compilation"
+                / f"outer_{outer_fold:03d}"
+                / "members.jsonl"
+            )
+            if not member_manifest_path.is_file():
+                raise FileNotFoundError(
+                    "Stage 2 evidence-community construction requires the exact member "
+                    f"manifest for outer fold {outer_fold}: {member_manifest_path}"
+                )
+            member_sha256 = _file_sha256(member_manifest_path)
+            fold_input = {
+                "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
+                "outer_fold": outer_fold,
+                "config": community_config.public_dict(),
+                "seed": int(seed),
+                "compiled_packets": list(fold_packets),
+                "member_manifest_sha256": member_sha256,
+            }
+            input_fingerprint = _value_fingerprint(fold_input)
+            fold_fingerprints[str(outer_fold)] = input_fingerprint
+            fold_dir = community_dir / f"outer_{outer_fold:03d}"
+            selected_path = fold_dir / "packets.jsonl"
+            atoms_path = fold_dir / "atoms.jsonl"
+            communities_path = fold_dir / "communities.jsonl"
+            edges_path = fold_dir / "edges.jsonl"
+            summary_path = fold_dir / "summary.json"
+            complete_path = fold_dir / "complete.json"
+            required_paths = (
+                selected_path,
+                atoms_path,
+                communities_path,
+                edges_path,
+                summary_path,
+            )
+            if complete_path.is_file() and all(path.is_file() for path in required_paths):
+                complete = json.loads(complete_path.read_text(encoding="utf-8"))
+                if complete.get("input_fingerprint") == input_fingerprint:
+                    expected_hashes = complete.get("artifact_sha256")
+                    artifact_paths = {
+                        "packets": selected_path,
+                        "atoms": atoms_path,
+                        "communities": communities_path,
+                        "edges": edges_path,
+                        "summary": summary_path,
+                    }
+                    artifacts_match = isinstance(expected_hashes, Mapping) and all(
+                        str(expected_hashes.get(name) or "") == _file_sha256(path)
+                        for name, path in artifact_paths.items()
+                    )
+                    cached_packets = _read_jsonl(selected_path) if artifacts_match else []
+                    cached_summary = (
+                        json.loads(summary_path.read_text(encoding="utf-8"))
+                        if artifacts_match
+                        else {}
+                    )
+                    cached_packet_ids = [
+                        str(packet.get("packet_id") or "") for packet in cached_packets
+                    ]
+                    if (
+                        len(cached_packets) == int(complete.get("selected_packets") or -1)
+                        and len(cached_packets) > 0
+                        and len(cached_packet_ids) == len(set(cached_packet_ids))
+                        and cached_summary.get("input_fingerprint") == input_fingerprint
+                        and all(
+                            packet_id
+                            and int(packet.get("outer_fold", -1)) == outer_fold
+                            and packet.get("architecture")
+                            == EVIDENCE_COMMUNITY_ARCHITECTURE
+                            and isinstance(packet.get("content"), Mapping)
+                            and packet["content"].get("schema_version")
+                            == EVIDENCE_COMMUNITY_SCHEMA_VERSION
+                            for packet_id, packet in zip(
+                                cached_packet_ids,
+                                cached_packets,
+                            )
+                        )
+                    ):
+                        selected_packets.extend(cached_packets)
+                        fold_summaries[str(outer_fold)] = cached_summary
+                        LOGGER.info(
+                            "loaded cached Stage 2 evidence communities outer_fold=%s "
+                            "selected=%s path=%s",
+                            outer_fold,
+                            len(cached_packets),
+                            fold_dir,
+                        )
+                        continue
+                LOGGER.info(
+                    "rebuild stale Stage 2 evidence communities outer_fold=%s path=%s",
+                    outer_fold,
+                    fold_dir,
+                )
+
+            started = time.monotonic()
+            distilled = distill_stage2_evidence_communities(
+                fold_packets,
+                member_manifest_path=member_manifest_path,
+                config=community_config,
+                seed=seed,
+            )
+            elapsed = time.monotonic() - started
+            fold_summary = {
+                **dict(distilled.summary),
+                "input_fingerprint": input_fingerprint,
+                "member_manifest_path": str(member_manifest_path),
+                "member_manifest_sha256": member_sha256,
+                "distillation_seconds": elapsed,
+                "artifacts": {
+                    "packets": str(selected_path),
+                    "atoms": str(atoms_path),
+                    "communities": str(communities_path),
+                    "edges": str(edges_path),
+                },
+            }
+            _write_jsonl(selected_path, distilled.packets)
+            _write_jsonl(atoms_path, distilled.atoms)
+            _write_jsonl(communities_path, distilled.communities)
+            _write_jsonl(edges_path, distilled.edges)
+            _write_json(summary_path, fold_summary)
+            artifact_sha256 = {
+                "packets": _file_sha256(selected_path),
+                "atoms": _file_sha256(atoms_path),
+                "communities": _file_sha256(communities_path),
+                "edges": _file_sha256(edges_path),
+                "summary": _file_sha256(summary_path),
+            }
+            _write_json(
+                complete_path,
+                {
+                    "status": "complete",
+                    "completed_at": _now(),
+                    "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
+                    "input_fingerprint": input_fingerprint,
+                    "member_manifest_sha256": member_sha256,
+                    "selected_packets": len(distilled.packets),
+                    "atoms": len(distilled.atoms),
+                    "communities": len(distilled.communities),
+                    "reciprocal_edges": len(distilled.edges),
+                    "artifact_sha256": artifact_sha256,
+                },
+            )
+            selected_packets.extend(dict(packet) for packet in distilled.packets)
+            fold_summaries[str(outer_fold)] = fold_summary
+            LOGGER.info(
+                "built Stage 2 evidence communities outer_fold=%s source_packets=%s "
+                "atoms=%s communities=%s selected=%s seconds=%.2f",
+                outer_fold,
+                len(fold_packets),
+                len(distilled.atoms),
+                len(distilled.communities),
+                len(distilled.packets),
+                elapsed,
+            )
+
+        aggregate_keys = (
+            "source_representatives",
+            "exact_member_hashes_matched",
+            "member_manifest_records_scanned",
+            "atoms",
+            "pooled_mutual_pairs_reranked",
+            "reciprocal_edges",
+            "communities",
+            "selected_communities",
+            "selected_atoms",
+            "selected_confounder_lane_communities",
+            "selected_modifier_lane_communities",
+            "selected_lane_overlap",
+            "selected_global_fill_communities",
+            "selected_full_inner_fold_coverage",
+            "source_readable_chars",
+            "source_packet_chars",
+            "selected_readable_chars",
+            "selected_packet_chars",
+        )
+        totals = {
+            key: sum(int(summary.get(key) or 0) for summary in fold_summaries.values())
+            for key in aggregate_keys
+        }
+        source_chars = totals["source_readable_chars"]
+        source_packet_chars = totals["source_packet_chars"]
+        selected_readable_chars = totals["selected_readable_chars"]
+        selected_chars = totals["selected_packet_chars"]
+        summary = {
+            "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
+            "enabled": True,
+            "config": community_config.public_dict(),
+            "seed": int(seed),
+            "source_packets": len(packets),
+            "selected_packets": len(selected_packets),
+            "outer_folds": fold_summaries,
+            "totals": totals,
+            "prompt_character_reduction_fraction": (
+                1.0 - selected_readable_chars / source_chars if source_chars else 0.0
+            ),
+            "serialized_packet_reduction_fraction": (
+                1.0 - selected_chars / source_packet_chars
+                if source_packet_chars
+                else 0.0
+            ),
+        }
+        root_fingerprint = _value_fingerprint(
+            {
+                "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
+                "fold_input_fingerprints": fold_fingerprints,
+            }
+        )
+        _write_jsonl(community_dir / "packets.jsonl", selected_packets)
+        _write_json(community_dir / "summary.json", summary)
+        root_artifact_sha256 = {
+            "packets": _file_sha256(community_dir / "packets.jsonl"),
+            "summary": _file_sha256(community_dir / "summary.json"),
+        }
+        _write_json(
+            community_dir / "complete.json",
+            {
+                "status": "complete",
+                "completed_at": _now(),
+                "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
+                "input_fingerprint": root_fingerprint,
+                "fold_input_fingerprints": fold_fingerprints,
+                "selected_packets": len(selected_packets),
+                "artifact_sha256": root_artifact_sha256,
+            },
+        )
+        return selected_packets, summary
 
     def _interpret_batch(
         self,
@@ -5819,6 +6266,13 @@ class PlainHandoffStage2:
         definition_inputs = {
             "outer_fold": int(outer_fold),
             "compiler": self.config.evidence_compiler,
+            "evidence_community_schema": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
+            "evidence_community_enabled": self.config.evidence_community_enabled,
+            "evidence_community_config": (
+                self._evidence_community_config().public_dict()
+                if self.config.evidence_community_enabled
+                else None
+            ),
             "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
             "interpretation_request_policy": _stage2_request_policy(
                 self.config,
@@ -6045,12 +6499,22 @@ class PlainHandoffStage2:
                             for axis in packet_by_id[packet_id]["observable_axes"]
                         }
                     )
+                    supporting_architectures = sorted(
+                        {
+                            source_architecture
+                            for packet_id in supporting_packet_ids
+                            for source_architecture in _packet_support_architectures(
+                                packet_by_id[packet_id]
+                            )
+                        }
+                    )
                     candidates.append(
                         {
                             "candidate_id": f"candidate_{len(candidates) + 1:04d}",
                             "architecture": architecture,
                             **concept,
                             "supporting_packet_ids": supporting_packet_ids,
+                            "supporting_architectures": supporting_architectures,
                             "evidence_axes": evidence_axes,
                         }
                     )
@@ -6303,8 +6767,13 @@ class PlainHandoffStage2:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_json(output_dir / "config.json", self.config.public_dict())
-        packets, compilation_summary = self._load_or_compile_evidence(
+        compiled_packets, compilation_summary = self._load_or_compile_evidence(
             handoff_path=handoff_path,
+            output_dir=output_dir,
+            seed=seed,
+        )
+        packets, community_summary = self._load_or_distill_evidence_communities(
+            packets=compiled_packets,
             output_dir=output_dir,
             seed=seed,
         )
@@ -6391,9 +6860,16 @@ class PlainHandoffStage2:
         summary = {
             "outer_folds": len(fold_results),
             "evidence_packets": len(packets),
+            "compiled_evidence_packets": len(compiled_packets),
             "evidence_compiler": self.config.evidence_compiler,
             "evidence_compilation_path": str(output_dir / "evidence_compilation"),
             "evidence_compilation": compilation_summary,
+            "evidence_communities_path": (
+                str(output_dir / "evidence_communities")
+                if self.config.evidence_community_enabled
+                else None
+            ),
+            "evidence_communities": community_summary,
             "features_by_fold": {
                 str(result["outer_fold"]): len(result["features"]) for result in fold_results
             },
@@ -6428,6 +6904,13 @@ class PlainHandoffStage2:
             str(output_dir / "features_by_outer_fold.jsonl"),
             str(output_dir / "summary.json"),
         ]
+        if self.config.evidence_community_enabled:
+            artifacts.extend(
+                [
+                    str(output_dir / "evidence_communities" / "packets.jsonl"),
+                    str(output_dir / "evidence_communities" / "summary.json"),
+                ]
+            )
         if dataset is not None:
             prediction_frames = []
             for result in fold_results:

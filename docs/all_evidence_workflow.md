@@ -126,9 +126,27 @@ not an artifact-authentication, byte-attestation, or deployment-gate system.
 The former `raw_packets_v1` compatibility option is intentionally unsupported
 because it combined scientifically distinct architectures.
 
-For feature discovery, Python projects every compiled card to a prompt-local
-integer `item` and a list containing only its deduplicated
-`representative_evidence.text` strings. Card and packet IDs, evidence kind,
+Before feature discovery, Stage 2 distills the card atlas without an LLM. It
+splits representatives into overlapping 16-word atoms, restores each atom's
+exact full/inner-fold coverage from `members.jsonl`, and retrieves neighbors
+only across distinct Stage 1 architectures. Pooled residualized vectors supply
+the candidate set; symmetric document/document ColBERT MeanMaxSim reranks the
+mutual candidates. Reciprocal top-five edges are clustered with Louvain.
+Community rank combines inner-fold coverage, architecture diversity, causal
+axis corroboration, graph cohesion, and support size.
+
+The packet cap is lane-aware rather than one unprotected global cutoff. By
+default, the top 30 treatment/outcome confounder-lane communities and top 30
+residual-effect/matched-pair modifier-lane communities are reserved using
+lane-specific scores. A community in both lists consumes one packet, and the
+remaining slots are filled by global rank to `evidence_community_max_packets`
+(75). Communities lacking causal-axis metadata can therefore enter through the
+global fill without allowing one causal lane to crowd out the other. Selection
+uses no oracle names, labels, regexes, outcomes, or held-out rows.
+
+For feature discovery, Python projects every selected community to a
+prompt-local integer `item` and a list containing its consensus phrases and at
+most three architecture-diverse evidence atoms. Card and packet IDs, evidence kind,
 detail objects, truncation flags, axes, polarity, semantic grouping,
 architectures, scores, support counts, folds, and other provenance stay outside
 the model prompt. The model returns feature names, descriptions, rationales,
@@ -175,6 +193,17 @@ An external endpoint configuration is:
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
+    "evidence_community_enabled": true,
+    "evidence_community_model": "answerdotai/answerai-colbert-small-v1",
+    "evidence_community_device": "cpu",
+    "evidence_community_max_packets": 75,
+    "evidence_community_min_per_causal_lane": 30,
+    "evidence_community_max_atom_words": 16,
+    "evidence_community_atom_overlap_words": 4,
+    "evidence_community_candidate_neighbors": 40,
+    "evidence_community_reciprocal_neighbors": 5,
+    "evidence_community_louvain_resolution": 2.5,
+    "evidence_community_max_exemplars": 3,
     "max_candidates_per_fold": 50,
     "candidate_selection_top_n": 50,
     "candidate_registry_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
@@ -437,6 +466,18 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `extraction_max_prompt_chars`, `extraction_feature_batch_size`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
+`evidence_community_enabled`, `evidence_community_model`,
+`evidence_community_device`, `evidence_community_max_packets`,
+`evidence_community_min_per_causal_lane`,
+`evidence_community_max_atom_words`,
+`evidence_community_atom_overlap_words`,
+`evidence_community_candidate_neighbors`,
+`evidence_community_reciprocal_neighbors`,
+`evidence_community_louvain_resolution`,
+`evidence_community_max_exemplars`,
+`evidence_community_max_consensus_phrases`,
+`evidence_community_inner_fold_saturation`, and
+`evidence_community_architecture_saturation`,
 `max_candidates_per_fold`, `candidate_selection_top_n`,
 `candidate_registry_embedding_model`, `candidate_registry_embedding_device`,
 `candidate_registry_similarity_threshold`, `candidate_selection_method`,
@@ -641,6 +682,17 @@ my_stage1_run/
         cards.jsonl
         members.jsonl
         lineage.jsonl
+    evidence_communities/
+      packets.jsonl
+      summary.json
+      complete.json
+      outer_001/
+        atoms.jsonl
+        edges.jsonl
+        communities.jsonl
+        packets.jsonl
+        summary.json
+        complete.json
     outer_001/
       input_packets.jsonl
       interpretations/...
@@ -719,9 +771,11 @@ An interrupted component's partial files are left in place. There is no
 and extraction batches, completed review rounds, and completed fold estimates.
 The compiled packet plan is cached under `stage2/evidence_compilation/`; on a
 restart the runner hashes the handoff and normally loads this small cache rather
-than reparsing and reclustering the raw Stage 1 evidence. Interpretation batches
-are skipped only when their input fingerprint (cards plus clinical question)
-matches.
+than reparsing and reclustering the raw Stage 1 evidence. Each reciprocal-
+ColBERT graph is cached independently under `stage2/evidence_communities/` and
+sealed against the compiled packets, member-manifest hash, model/configuration,
+and seed. Interpretation batches are skipped only when their input fingerprint
+(selected community packets plus clinical question) matches.
 It writes an outer-fold completion marker only after held-out estimation, and
 writes the final top-level marker only after the cross-fitted estimates have
 been assembled.
