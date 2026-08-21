@@ -52,7 +52,9 @@ ALLOWED_EVIDENCE_AXES = {
     "unclear",
 }
 ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
-MAX_RESPONSE_REPAIRS = 5
+DEFAULT_MAX_RESPONSE_REPAIRS = 10
+DEFAULT_THINKING_AFTER_RESPONSE_REPAIRS = 5
+THINKING_RESPONSE_REPAIR_EFFORT = "high"
 DEFAULT_MAX_TOKENS = 50_000
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_INTERPRETATION_REASONING_EFFORT = "high"
@@ -646,6 +648,11 @@ class PlainHandoffStage2Config:
     request_timeout: float = 7_200.0
     transport_max_attempts: int = 3
     transport_retry_backoff: float = 2.0
+    # Invalid completed responses receive validator-guided repair requests.
+    # Later repairs turn reasoning on without changing the initial request's
+    # request-kind policy.
+    max_response_repairs: int = DEFAULT_MAX_RESPONSE_REPAIRS
+    thinking_after_response_repairs: int = DEFAULT_THINKING_AFTER_RESPONSE_REPAIRS
     # Patient-level extraction remains output-bounded. Interpretation-class
     # requests deliberately omit max_tokens and may use the model's remaining
     # context window.
@@ -744,6 +751,9 @@ class PlainHandoffStage2Config:
     # Set only on the immutable config copy passed to one completion. It is not
     # persisted as scientific configuration because both request policies are.
     runtime_request_kind: str = "interpretation"
+    # A bounded repair may temporarily strengthen the request-level reasoning
+    # policy. This override is transport state, not scientific configuration.
+    runtime_reasoning_effort: str | None = None
 
     def validate(
         self,
@@ -768,6 +778,20 @@ class PlainHandoffStage2Config:
         if self.transport_retry_backoff < 0:
             raise ValueError("stage2.transport_retry_backoff must be nonnegative")
         if (
+            isinstance(self.max_response_repairs, bool)
+            or not isinstance(self.max_response_repairs, int)
+            or self.max_response_repairs < 0
+        ):
+            raise ValueError("stage2.max_response_repairs must be a nonnegative integer")
+        if (
+            isinstance(self.thinking_after_response_repairs, bool)
+            or not isinstance(self.thinking_after_response_repairs, int)
+            or self.thinking_after_response_repairs < 0
+        ):
+            raise ValueError(
+                "stage2.thinking_after_response_repairs must be a nonnegative integer"
+            )
+        if (
             isinstance(self.max_tokens, bool)
             or not isinstance(self.max_tokens, int)
             or self.max_tokens < 1
@@ -783,6 +807,17 @@ class PlainHandoffStage2Config:
                 )
         if self.runtime_request_kind not in STAGE2_REQUEST_KINDS:
             raise ValueError("stage2.runtime_request_kind must be interpretation or extraction")
+        if (
+            self.runtime_reasoning_effort is not None
+            and (
+                not isinstance(self.runtime_reasoning_effort, str)
+                or self.runtime_reasoning_effort not in SUPPORTED_REASONING_EFFORTS
+            )
+        ):
+            raise ValueError(
+                "stage2.runtime_reasoning_effort must be null or one of "
+                f"{sorted(SUPPORTED_REASONING_EFFORTS)}"
+            )
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.consolidation_max_prompt_chars < 4_000:
@@ -965,6 +1000,7 @@ class PlainHandoffStage2Config:
         values["api_key"] = "<redacted>"
         values.pop("runtime_endpoints", None)
         values.pop("runtime_request_kind", None)
+        values.pop("runtime_reasoning_effort", None)
         values["explicit_features"] = [
             feature.as_definition() for feature in self.explicit_features
         ]
@@ -1042,6 +1078,15 @@ def plain_stage2_config_from_mapping(
         request_timeout=float(raw.get("request_timeout", 7_200.0)),
         transport_max_attempts=int(raw.get("transport_max_attempts", 3)),
         transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
+        max_response_repairs=int(
+            raw.get("max_response_repairs", DEFAULT_MAX_RESPONSE_REPAIRS)
+        ),
+        thinking_after_response_repairs=int(
+            raw.get(
+                "thinking_after_response_repairs",
+                DEFAULT_THINKING_AFTER_RESPONSE_REPAIRS,
+            )
+        ),
         max_tokens=int(raw.get("max_tokens", DEFAULT_MAX_TOKENS)),
         interpretation_reasoning_effort=interpretation_reasoning_effort,
         extraction_reasoning_effort=extraction_reasoning_effort,
@@ -1676,19 +1721,33 @@ def _stage2_request_policy(
     kind = str(request_kind or config.runtime_request_kind).strip().lower()
     if kind not in STAGE2_REQUEST_KINDS:
         raise ValueError("Stage 2 request_kind must be interpretation or extraction")
+    configured_reasoning_effort = (
+        config.extraction_reasoning_effort
+        if kind == "extraction"
+        else config.interpretation_reasoning_effort
+    )
+    reasoning_effort = config.runtime_reasoning_effort or configured_reasoning_effort
     if kind == "extraction":
         return {
             "request_kind": kind,
-            "reasoning_effort": config.extraction_reasoning_effort,
+            "reasoning_effort": reasoning_effort,
             "max_tokens": int(config.max_tokens),
             "repetition_penalty": float(config.repetition_penalty),
         }
     return {
         "request_kind": kind,
-        "reasoning_effort": config.interpretation_reasoning_effort,
+        "reasoning_effort": reasoning_effort,
         "max_tokens": None,
         "repetition_penalty": float(config.repetition_penalty),
     }
+
+
+def _thinking_response_repair_effort(configured_effort: str) -> str:
+    """Turn thinking on for a late repair without weakening stronger policies."""
+
+    if configured_effort in {"high", "xhigh", "max"}:
+        return configured_effort
+    return THINKING_RESPONSE_REPAIR_EFFORT
 
 
 def _openai_completion(
@@ -1915,11 +1974,13 @@ def _request_json(
     request_config = replace(
         config,
         runtime_request_kind=str(request_policy["request_kind"]),
+        runtime_reasoning_effort=None,
     )
     base_conversation = [dict(message) for message in messages]
     conversation = [dict(message) for message in base_conversation]
     first_error: Exception | None = None
-    max_attempts = 1 + MAX_RESPONSE_REPAIRS
+    max_repairs = int(config.max_response_repairs)
+    max_attempts = 1 + max_repairs
     for attempt in range(max_attempts):
         response: str | None = None
         prompt_chars = sum(len(str(message.get("content") or "")) for message in conversation)
@@ -1929,9 +1990,25 @@ def _request_json(
                 f"({prompt_chars} > {config.max_prompt_chars})"
             )
         try:
+            attempt_config = request_config
+            if attempt > int(config.thinking_after_response_repairs):
+                attempt_config = replace(
+                    request_config,
+                    runtime_reasoning_effort=_thinking_response_repair_effort(
+                        str(request_policy["reasoning_effort"])
+                    ),
+                )
+                if attempt == int(config.thinking_after_response_repairs) + 1:
+                    LOGGER.warning(
+                        "Stage 2 response repair attempt %s/%s enables thinking "
+                        "with reasoning_effort=%s",
+                        attempt,
+                        max_repairs,
+                        attempt_config.runtime_reasoning_effort,
+                    )
             response = _completion_with_transport_retries(
                 conversation,
-                request_config,
+                attempt_config,
                 completion,
             )
             return validate(_parse_json_object(response))
@@ -1944,7 +2021,7 @@ def _request_json(
             LOGGER.warning(
                 "Stage 2 response failed validation; repair attempt %s/%s (%s: %s)",
                 attempt + 1,
-                max_attempts - 1,
+                max_repairs,
                 type(exc).__name__,
                 exc,
             )

@@ -662,6 +662,8 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "workers": 32,
     "request_timeout": 7200,
     "max_tokens": 50000,
+    "max_response_repairs": 10,
+    "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
     "interpretation_reasoning_effort": "high",
     "extraction_reasoning_effort": "none",
@@ -763,6 +765,13 @@ requests send `reasoning_effort: "none"` and retain the configured
 `interpretation_reasoning_effort` and `extraction_reasoning_effort` in the
 Stage 2 configuration. Every Stage 2 completion request also sends the
 configured `repetition_penalty` (1.1 by default).
+
+A completed response that fails JSON parsing or schema validation receives up
+to `max_response_repairs` validator-guided retries (10 by default), each with
+the concrete validation error. Repair attempts through
+`thinking_after_response_repairs` (5 by default) retain the request's normal
+reasoning policy; later repairs force `reasoning_effort` to at least `high`,
+which enables thinking for the managed vLLM reasoning parsers.
 
 The equivalent direct CLI invocation is:
 

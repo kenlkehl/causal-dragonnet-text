@@ -69,6 +69,8 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.model == ""
     assert config.request_timeout == 7_200.0
     assert config.transport_max_attempts == 3
+    assert config.max_response_repairs == 10
+    assert config.thinking_after_response_repairs == 5
     assert config.max_tokens == 50_000
     assert config.repetition_penalty == 1.1
     assert config.interpretation_reasoning_effort == "high"
@@ -121,6 +123,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
         {
             "endpoint": "http://stage2.test/v1",
             "max_tokens": 48_000,
+            "max_response_repairs": 8,
+            "thinking_after_response_repairs": 3,
             "repetition_penalty": 1.15,
             "interpretation_reasoning_effort": "medium",
             "extraction_reasoning_effort": "none",
@@ -155,6 +159,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
 
     assert config is not None
     assert config.max_tokens == 48_000
+    assert config.max_response_repairs == 8
+    assert config.thinking_after_response_repairs == 3
     assert config.repetition_penalty == 1.15
     assert config.interpretation_reasoning_effort == "medium"
     assert config.extraction_reasoning_effort == "none"
@@ -184,6 +190,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.candidate_selection_top_evidence_packets == 4
     assert config.candidate_selection_document_chunk_overlap_tokens == 24
     assert config.public_dict()["max_tokens"] == 48_000
+    assert config.public_dict()["max_response_repairs"] == 8
+    assert config.public_dict()["thinking_after_response_repairs"] == 3
     assert config.public_dict()["repetition_penalty"] == 1.15
     assert config.public_dict()["interpretation_reasoning_effort"] == "medium"
     assert config.public_dict()["extraction_reasoning_effort"] == "none"
@@ -369,6 +377,31 @@ def test_stage2_config_rejects_invalid_max_tokens(max_tokens):
             endpoint="http://stage2.test/v1",
             model="test-model",
             max_tokens=max_tokens,
+        ).validate()
+
+
+@pytest.mark.parametrize("max_response_repairs", [-1, True, 1.5, "10"])
+def test_stage2_config_rejects_invalid_max_response_repairs(max_response_repairs):
+    with pytest.raises(ValueError, match="max_response_repairs must be a nonnegative integer"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            max_response_repairs=max_response_repairs,
+        ).validate()
+
+
+@pytest.mark.parametrize("thinking_after_response_repairs", [-1, True, 1.5, "5"])
+def test_stage2_config_rejects_invalid_thinking_repair_threshold(
+    thinking_after_response_repairs,
+):
+    with pytest.raises(
+        ValueError,
+        match="thinking_after_response_repairs must be a nonnegative integer",
+    ):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            thinking_after_response_repairs=thinking_after_response_repairs,
         ).validate()
 
 
@@ -595,7 +628,7 @@ def test_json_repair_retry_stays_within_full_initial_prompt_budget():
         )
 
 
-def test_json_repair_stops_after_five_repairs():
+def test_json_repair_stops_after_ten_repairs():
     calls = []
 
     def completion(messages, _config):
@@ -605,7 +638,7 @@ def test_json_repair_stops_after_five_repairs():
     def reject(_value):
         raise ValueError("missing ok=true")
 
-    with pytest.raises(ValueError, match="remained invalid after 5 repairs"):
+    with pytest.raises(ValueError, match="remained invalid after 10 repairs"):
         stage2_workflow._request_json(
             messages=[
                 {"role": "system", "content": "Return JSON only."},
@@ -619,7 +652,50 @@ def test_json_repair_stops_after_five_repairs():
             validate=reject,
         )
 
-    assert len(calls) == 6
+    assert len(calls) == 11
+
+
+def test_json_repair_enables_thinking_after_five_repairs():
+    efforts = []
+    conversations = []
+
+    def completion(messages, request_config):
+        efforts.append(stage2_workflow._stage2_request_policy(request_config)["reasoning_effort"])
+        conversations.append([dict(message) for message in messages])
+        response_attempt = len(efforts)
+        return json.dumps(
+            {
+                "ok": response_attempt == 11,
+                "response_attempt": response_attempt,
+            }
+        )
+
+    def validate(value):
+        if value["ok"] is not True:
+            raise ValueError(f"response attempt {value['response_attempt']} rejected")
+        return dict(value)
+
+    result = stage2_workflow._request_json(
+        messages=[
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": "Return an object containing ok=true."},
+        ],
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+        completion=completion,
+        validate=validate,
+        request_kind="extraction",
+    )
+
+    assert result == {"ok": True, "response_attempt": 11}
+    assert efforts == ["none"] * 6 + ["high"] * 5
+    for response_attempt in range(1, 11):
+        assert (
+            f"response attempt {response_attempt} rejected"
+            in conversations[response_attempt][-1]["content"]
+        )
 
 
 def test_output_length_repair_explicitly_requests_a_shorter_complete_object():
@@ -1382,7 +1458,7 @@ def test_resume_retries_only_checkpoints_with_stale_range_ontology_repairs(tmp_p
     assert audit["previous_audit"]["resolution"] == "conservative_null"
 
 
-def test_extraction_uses_note_free_category_ontology_after_five_failed_repairs(
+def test_extraction_uses_note_free_category_ontology_after_ten_failed_repairs(
     tmp_path: Path,
 ):
     note = "PRIVATE_NOTE_SENTINEL: prior immunotherapy was documented."
@@ -1452,7 +1528,7 @@ def test_extraction_uses_note_free_category_ontology_after_five_failed_repairs(
         max_prompt_chars=config.max_prompt_chars,
     )
 
-    assert jobs == ["extract_stage2_patient_variables"] * 6 + [
+    assert jobs == ["extract_stage2_patient_variables"] * 11 + [
         "map_extracted_values_to_declared_category_ontology"
     ]
     assert ontology_body is not None
@@ -1534,7 +1610,7 @@ def test_extraction_defaults_structurally_invalid_response_to_audited_null(
 
     def request_json(_messages, _validate, *, request_kind="interpretation"):
         raise ValueError(
-            "Stage 2 response remained invalid after 5 repairs: "
+            "Stage 2 response remained invalid after 10 repairs: "
             "Unterminated string at character 104409"
         )
 
@@ -4128,7 +4204,7 @@ def test_iterative_consolidation_retains_batch_and_explicit_feature_after_invali
         output_dir=output_dir,
     )
 
-    assert calls == 6
+    assert calls == 11
     assert [group["name"] for group in consolidated] == [
         "alpha_measurement",
         "investigator_marker",
@@ -4198,7 +4274,7 @@ def test_iterative_consolidation_cannot_exclude_an_ordinary_candidate(tmp_path: 
         output_dir=output_dir,
     )
 
-    assert calls == 6
+    assert calls == 11
     assert [group["name"] for group in consolidated] == ["age", "serum_sodium"]
     fallback = json.loads(
         (output_dir / "round_001" / "batch_001" / "fallback.json").read_text(encoding="utf-8")
@@ -5537,7 +5613,7 @@ def test_operationalization_uses_audited_ambiguous_fallback_after_exhausted_repa
         output_dir=output_dir,
     )
 
-    assert calls == 6
+    assert calls == 11
     assert first == second
     assert first["value_type"] == "ambiguous"
     assert first["categories_or_unit"] == []

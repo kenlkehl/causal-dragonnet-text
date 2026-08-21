@@ -26,6 +26,8 @@
     "api_key": "EMPTY",
     "workers": 32,
     "max_tokens": 50000,
+    "max_response_repairs": 10,
+    "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
     "interpretation_reasoning_effort": "high",
     "extraction_reasoning_effort": "none",

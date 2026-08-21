@@ -166,6 +166,8 @@ An external endpoint configuration is:
     "workers": 32,
     "request_timeout": 7200,
     "max_tokens": 50000,
+    "max_response_repairs": 10,
+    "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
     "interpretation_reasoning_effort": "high",
     "extraction_reasoning_effort": "none",
@@ -341,6 +343,13 @@ switch. The configured fields are `interpretation_reasoning_effort` and
 `extraction_reasoning_effort`; request-scoped values take precedence over a
 server default.
 
+A completed response that fails JSON parsing or schema validation receives up
+to `max_response_repairs` validator-guided retries (10 by default). Every retry
+includes the concrete validation error. Repairs through
+`thinking_after_response_repairs` (5 by default) retain the normal request
+policy; repairs after that threshold force `reasoning_effort` to at least
+`high`, enabling thinking for the managed vLLM reasoning parsers.
+
 Python first coalesces only exact normalized-name duplicates; this is identity
 bookkeeping and makes no semantic decision between distinct names. It then
 sorts the distinct candidates by normalized feature name and sends
@@ -419,7 +428,8 @@ extraction and review rather than aborting the fold.
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts`,
-`transport_retry_backoff`, `max_tokens`, `max_prompt_chars`,
+`transport_retry_backoff`, `max_response_repairs`,
+`thinking_after_response_repairs`, `max_tokens`, `max_prompt_chars`,
 `consolidation_max_prompt_chars`,
 `operationalization_max_prompt_chars`,
 `consolidation_batch_size`, `consolidation_alphabetical_rounds`,

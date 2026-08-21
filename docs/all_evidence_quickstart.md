@@ -51,6 +51,8 @@ effect estimates. The common controls are:
     "model": "Qwen/Qwen3-32B",
     "workers": 32,
     "max_tokens": 50000,
+    "max_response_repairs": 10,
+    "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
     "interpretation_reasoning_effort": "high",
     "extraction_reasoning_effort": "none",
@@ -84,6 +86,9 @@ extraction sends `reasoning_effort: "none"`; `max_tokens` is its response cap.
 All Stage 2 completion requests send `repetition_penalty: 1.1` by default.
 Managed Gemma 4 servers therefore use the `gemma4` reasoning parser without a
 server-wide `enable_thinking` default.
+Invalid completed responses receive up to 10 validator-guided repair retries.
+The first five repairs retain the request's normal reasoning policy; repairs
+6–10 force `reasoning_effort` to at least `high`, enabling thinking.
 
 `stage2.explicit_features` may contain investigator-specified feature
 definitions. Each entry must include its complete extraction ontology and
