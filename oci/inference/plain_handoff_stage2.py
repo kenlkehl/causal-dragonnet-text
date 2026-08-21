@@ -711,8 +711,8 @@ class PlainHandoffStage2Config:
     # the retained features, causal roles, or modeling representation.
     max_review_rounds: int = 2
     # Absolute per-outer-fold cap across reviewed and evaluation-only rounds.
-    # A fold that has not achieved stability by this point fails explicitly
-    # instead of continuing an effectively unbounded extraction loop.
+    # A fold that has not achieved stability by this point is flagged and
+    # continues with its latest retained definitions.
     max_evaluation_rounds: int = DEFAULT_MAX_EVALUATION_ROUNDS
     ontology_refinement_min_failure_patients: int = DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS
     max_ontology_refinement_rounds: int = DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS
@@ -5820,6 +5820,18 @@ class PlainHandoffStage2:
                 )
             LOGGER.info("skip completed Stage 2 outer fold=%s", outer_fold)
             final = json.loads(final_features_path.read_text(encoding="utf-8"))
+            review_convergence = final.get("review_convergence")
+            convergence_path = output_dir / "review" / "convergence.json"
+            if not isinstance(review_convergence, Mapping) and convergence_path.is_file():
+                review_convergence = json.loads(convergence_path.read_text(encoding="utf-8"))
+            review_converged = final.get("review_converged")
+            if not isinstance(review_converged, bool) and isinstance(
+                review_convergence, Mapping
+            ):
+                stored_converged = review_convergence.get("converged")
+                review_converged = (
+                    stored_converged if isinstance(stored_converged, bool) else None
+                )
             return {
                 "outer_fold": outer_fold,
                 "features": list(final.get("features") or []),
@@ -5833,6 +5845,15 @@ class PlainHandoffStage2:
                 "review_rounds": int(final.get("review_rounds") or 0),
                 "evaluation_rounds": int(
                     final.get("evaluation_rounds") or final.get("review_rounds") or 0
+                ),
+                "review_converged": review_converged,
+                "review_convergence": (
+                    dict(review_convergence)
+                    if isinstance(review_convergence, Mapping)
+                    else None
+                ),
+                "harmonization_validation_fallbacks": list(
+                    final.get("harmonization_validation_fallbacks") or []
                 ),
                 "ontology_refinement_rounds": int(final.get("ontology_refinement_rounds") or 0),
                 "estimation": json.loads(
@@ -6157,6 +6178,11 @@ class PlainHandoffStage2:
             "candidate_dispositions": final.get("candidate_dispositions", {}),
             "review_rounds": analysis["review_rounds"],
             "evaluation_rounds": analysis["evaluation_rounds"],
+            "review_converged": analysis["review_converged"],
+            "review_convergence": analysis["review_convergence"],
+            "harmonization_validation_fallbacks": analysis[
+                "harmonization_validation_fallbacks"
+            ],
             "ontology_refinement_rounds": analysis["ontology_refinement_rounds"],
             "estimation": analysis["estimation"],
         }
@@ -6170,6 +6196,11 @@ class PlainHandoffStage2:
                 "features": len(completed["features"]),
                 "review_rounds": completed["review_rounds"],
                 "evaluation_rounds": completed["evaluation_rounds"],
+                "review_converged": completed["review_converged"],
+                "review_convergence": completed["review_convergence"],
+                "harmonization_validation_fallbacks": completed[
+                    "harmonization_validation_fallbacks"
+                ],
                 "ontology_refinement_rounds": completed["ontology_refinement_rounds"],
                 "estimation": completed["estimation"],
             },
@@ -6292,6 +6323,30 @@ class PlainHandoffStage2:
             "feature_name_fold_counts": dict(sorted(name_counts.items())),
             "features_path": str(output_dir / "features_by_outer_fold.jsonl"),
         }
+        convergence_results = [
+            result for result in fold_results if "review_converged" in result
+        ]
+        if convergence_results:
+            summary["review_convergence_by_fold"] = {
+                str(result["outer_fold"]): result.get("review_convergence")
+                for result in convergence_results
+            }
+            summary["nonconverged_outer_folds"] = [
+                int(result["outer_fold"])
+                for result in convergence_results
+                if result.get("review_converged") is False
+            ]
+        summary["harmonization_validation_fallbacks_by_fold"] = {
+            str(result["outer_fold"]): list(
+                result.get("harmonization_validation_fallbacks") or []
+            )
+            for result in fold_results
+        }
+        summary["outer_folds_with_harmonization_validation_fallbacks"] = [
+            int(result["outer_fold"])
+            for result in fold_results
+            if result.get("harmonization_validation_fallbacks")
+        ]
         artifacts = [
             str(output_dir / "features_by_outer_fold.jsonl"),
             str(output_dir / "summary.json"),

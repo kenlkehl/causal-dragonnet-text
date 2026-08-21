@@ -5963,7 +5963,10 @@ def test_stability_selection_prunes_modifiers_only_after_stable_negative_margin(
     assert guard["drop_decisions_overridden"] == 1
 
 
-def test_fold_analysis_stops_at_configured_evaluation_round_cap(tmp_path, monkeypatch):
+def test_fold_analysis_flags_nonconvergence_and_continues_at_evaluation_round_cap(
+    tmp_path,
+    monkeypatch,
+):
     dataset = pd.DataFrame(
         {
             "patient_id": ["fit", "heldout"],
@@ -6010,37 +6013,199 @@ def test_fold_analysis_stops_at_configured_evaluation_round_cap(tmp_path, monkey
             {"selection_complete": False},
         ),
     )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_assert_extraction_health",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "extract_rows",
+        lambda **kwargs: pd.DataFrame({"_oci_row_id": kwargs["row_ids"]}),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_apply_harmonization_plans",
+        lambda extracted, _definitions, **_kwargs: (extracted, {"plans": []}),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "estimate_outer_fold",
+        lambda **_kwargs: {"status": "estimated_after_non_convergence"},
+    )
 
-    with pytest.raises(RuntimeError, match="max_evaluation_rounds=2"):
-        run_fold_analysis(
-            dataset=dataset,
-            definitions=[],
-            split=split,
-            clinical_question="Estimate treatment effect.",
-            unit_id_column="patient_id",
-            text_column="clinical_text",
-            treatment_column="treatment_indicator",
-            outcome_column="outcome_indicator",
-            outcome_type="binary",
-            inner_folds=2,
-            seed=7,
-            output_dir=tmp_path / "outer_001",
-            request_json=lambda *_args, **_kwargs: pytest.fail(
-                "an empty feature set should not request LLM review"
-            ),
-            config=PlainHandoffStage2Config(
-                endpoint="http://stage2.test/v1",
-                model="test-model",
-                max_review_rounds=1,
-                max_evaluation_rounds=2,
-                stability_selection_rounds=2,
-                estimation_trees=10,
-            ),
-        )
+    output = tmp_path / "outer_001"
+    result = run_fold_analysis(
+        dataset=dataset,
+        definitions=[],
+        split=split,
+        clinical_question="Estimate treatment effect.",
+        unit_id_column="patient_id",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        inner_folds=2,
+        seed=7,
+        output_dir=output,
+        request_json=lambda *_args, **_kwargs: pytest.fail(
+            "an empty feature set should not request LLM review"
+        ),
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            max_review_rounds=1,
+            max_evaluation_rounds=2,
+            stability_selection_rounds=2,
+            estimation_trees=10,
+        ),
+    )
 
-    assert (tmp_path / "outer_001" / "review" / "round_001" / "complete.json").is_file()
-    assert (tmp_path / "outer_001" / "review" / "round_002" / "complete.json").is_file()
-    assert not (tmp_path / "outer_001" / "review" / "round_003").exists()
+    assert result["review_converged"] is False
+    assert result["estimation"]["status"] == "estimated_after_non_convergence"
+    assert result["review_convergence"]["status"] == "non_converged"
+    assert result["review_convergence"]["reason"] == "max_evaluation_rounds_reached"
+    assert result["review_convergence"]["pending_conditions"] == [
+        "stability_selection_incomplete"
+    ]
+    convergence = json.loads((output / "review" / "convergence.json").read_text())
+    assert convergence == result["review_convergence"]
+    assert convergence["continued_after_non_convergence"] is True
+    assert convergence["continuation_policy"] == "use_latest_retained_definitions"
+    final_definitions = json.loads((output / "final_definitions.json").read_text())
+    assert final_definitions["review_converged"] is False
+    assert final_definitions["review_convergence"] == convergence
+    assert (output / "review" / "round_001" / "complete.json").is_file()
+    assert (output / "review" / "round_002" / "complete.json").is_file()
+    assert not (output / "review" / "round_003").exists()
+
+
+def test_fold_analysis_reextracts_final_definition_change_at_evaluation_round_cap(
+    tmp_path,
+    monkeypatch,
+):
+    dataset = pd.DataFrame(
+        {
+            "patient_id": ["fit", "heldout"],
+            "clinical_text": ["", ""],
+            "treatment_indicator": [0, 1],
+            "outcome_indicator": [0, 1],
+        }
+    )
+    split = {
+        "outer_fold": 1,
+        "fit_row_ids": [0],
+        "heldout_row_ids": [1],
+        "inner_splits": [],
+    }
+    retained_feature = {
+        "feature_id": "outer_001_feature_001",
+        "name": "pretreatment_biomarker_percentage",
+        "description": "Pretreatment tumor biomarker percentage.",
+        "value_type": "continuous",
+        "categories_or_unit": ["percent"],
+        "modeling_strategy": "continuous",
+        "roles": ["effect_modifier"],
+        "measurement_definition": "Extract the pretreatment tumor biomarker percentage.",
+        "missing_value_rule": "Return null when undocumented.",
+    }
+    training_definition_calls = []
+
+    def extract_training(**kwargs):
+        definitions = list(kwargs["definitions"])
+        training_definition_calls.append([feature["name"] for feature in definitions])
+        values = {"_oci_row_id": kwargs["row_ids"]}
+        for feature in definitions:
+            values[feature["name"]] = [50.0] * len(kwargs["row_ids"])
+        return pd.DataFrame(values), definitions, 0
+
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_extract_training_with_ontology_feedback",
+        extract_training,
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_harmonize_training_extraction",
+        lambda **kwargs: (
+            kwargs["extracted"],
+            list(kwargs["definitions"]),
+            {"plans": []},
+        ),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "evaluate_definitions",
+        lambda **_kwargs: {"individual_feature_signal": []},
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_apply_empirical_signal_pruning",
+        lambda _definitions, _performance, **_kwargs: (
+            [dict(retained_feature)],
+            {"selection_complete": True},
+        ),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_assert_extraction_health",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "extract_rows",
+        lambda **kwargs: pd.DataFrame(
+            {
+                "_oci_row_id": kwargs["row_ids"],
+                "pretreatment_biomarker_percentage": [60.0] * len(kwargs["row_ids"]),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_apply_harmonization_plans",
+        lambda extracted, _definitions, **_kwargs: (extracted, {"plans": []}),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "estimate_outer_fold",
+        lambda **_kwargs: {"status": "estimated_after_final_reextraction"},
+    )
+
+    result = run_fold_analysis(
+        dataset=dataset,
+        definitions=[],
+        split=split,
+        clinical_question="Estimate treatment effect.",
+        unit_id_column="patient_id",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        inner_folds=2,
+        seed=7,
+        output_dir=tmp_path / "outer_001",
+        request_json=lambda *_args, **_kwargs: pytest.fail(
+            "an initially empty feature set should not request LLM review"
+        ),
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            max_review_rounds=1,
+            max_evaluation_rounds=1,
+            stability_selection_rounds=1,
+            estimation_trees=10,
+        ),
+    )
+
+    assert result["review_converged"] is False
+    assert result["review_convergence"]["pending_conditions"] == [
+        "definitions_changed_in_final_round"
+    ]
+    assert result["estimation"]["status"] == "estimated_after_final_reextraction"
+    assert training_definition_calls == [[], ["pretreatment_biomarker_percentage"]]
+    final_fit = pd.read_csv(tmp_path / "outer_001" / "extraction" / "fit" / "harmonized.csv")
+    assert final_fit["pretreatment_biomarker_percentage"].tolist() == [50.0]
 
 
 def test_llm_harmonizes_generic_mixed_values_and_applies_plan_to_heldout(
@@ -6126,6 +6291,280 @@ def test_llm_harmonizes_generic_mixed_values_and_applies_plan_to_heldout(
     assert heldout_harmonized["tumor_marker_score"].tolist()[:2] == ["high", "low"]
     assert pd.isna(heldout_harmonized["tumor_marker_score"].iloc[2])
     assert audit["features"][0]["unmapped_nonmissing_rows"] == 1
+
+
+def test_harmonization_plan_conservatively_normalizes_value_map_bookkeeping():
+    feature = {"feature_id": "feature_assay", "name": "assay_measurement"}
+    observations = {
+        "numeric_count": 2,
+        "numeric_quantiles": [
+            {"probability": 0.0, "value": 1.0},
+            {"probability": 1.0, "value": 2.0},
+        ],
+        "categorical_count": 3,
+        "categorical_values": [
+            {"raw_value": "reported one", "count": 1},
+            {"raw_value": "reported two", "count": 1},
+            {"raw_value": "reported three", "count": 1},
+        ],
+    }
+
+    plan = stage2_analysis._validate_harmonization_plan(
+        {
+            "target_representation": "continuous",
+            "reason": "Each usable text token denotes an exact assay value.",
+            "canonical_categories": [],
+            "categorical_value_map": [
+                None,
+                {"raw_value": "", "canonical_value": 9.0},
+                {"raw_value": "unobserved", "canonical_value": 8.0},
+                {"raw_value": "reported one", "canonical_value": 1.0},
+                {"raw_value": "reported one", "canonical_value": 1.0},
+                {"raw_value": "reported two", "canonical_value": 2.0},
+                {"raw_value": "reported two", "canonical_value": 3.0},
+            ],
+            "numeric_bin_rules": [],
+        },
+        feature=feature,
+        observations=observations,
+    )
+
+    mapping = {
+        row["raw_value"]: row["canonical_value"]
+        for row in plan["categorical_value_map"]
+    }
+    assert mapping == {
+        "reported one": 1.0,
+        "reported two": None,
+        "reported three": None,
+    }
+    normalization = plan["categorical_value_map_normalization"]
+    assert normalization["non_object_entries_dropped"] == 1
+    assert normalization["empty_raw_value_entries_dropped"] == 1
+    assert normalization["extra_raw_values_dropped"] == ["unobserved"]
+    assert normalization["identical_duplicate_raw_values_deduplicated"] == [
+        "reported one"
+    ]
+    assert normalization["conflicting_duplicate_raw_values_mapped_to_null"] == [
+        "reported two"
+    ]
+    assert normalization["missing_raw_values_mapped_to_null"] == ["reported three"]
+
+
+def _generic_feature_with_harmonization_plan():
+    return {
+        "feature_id": "feature_assay",
+        "name": "assay_measurement",
+        "description": "A pretreatment assay measurement.",
+        "value_type": "continuous",
+        "categories_or_unit": ["units"],
+        "modeling_strategy": "categorical",
+        "roles": ["prognostic"],
+        "measurement_definition": "Extract the documented pretreatment assay measurement.",
+        "missing_value_rule": "Return null when undocumented.",
+        "harmonization_plan": {
+            "schema_version": "stage2_mixed_value_harmonization_v1_llm_training_only",
+            "feature_id": "feature_assay",
+            "target_representation": "categorical",
+            "reason": "Text labels and numeric values share two ordered tiers.",
+            "canonical_categories": ["lower", "upper"],
+            "categorical_value_map": [
+                {"raw_value": "lower label", "canonical_value": "lower"},
+                {"raw_value": "upper label", "canonical_value": "upper"},
+            ],
+            "numeric_bin_rules": [
+                {
+                    "lower_bound": None,
+                    "lower_inclusive": False,
+                    "upper_bound": 50,
+                    "upper_inclusive": False,
+                    "canonical_value": "lower",
+                },
+                {
+                    "lower_bound": 50,
+                    "lower_inclusive": True,
+                    "upper_bound": None,
+                    "upper_inclusive": False,
+                    "canonical_value": "upper",
+                },
+            ],
+            "unmapped_value_rule": "null",
+            "training_observations_fingerprint": "prior",
+        },
+    }
+
+
+def test_harmonization_extends_only_new_values_in_a_frozen_prior_plan(tmp_path: Path):
+    extracted = pd.DataFrame(
+        {
+            "_oci_row_id": list(range(5)),
+            "assay_measurement": [10.0, 75.0, "lower label", "upper label", "new label"],
+        }
+    )
+    jobs = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        assert request_kind == "interpretation"
+        body = json.loads(messages[1]["content"])
+        jobs.append(body["job"])
+        assert body["new_observed_training_text_values"] == [
+            {"raw_value": "new label", "count": 1}
+        ]
+        assert "observed_training_representations" not in body
+        return validate(
+            {
+                "categorical_value_map": [
+                    {"raw_value": "new label", "canonical_value": "lower"}
+                ]
+            }
+        )
+
+    harmonized, definitions, report = stage2_analysis._harmonize_training_extraction(
+        extracted=extracted,
+        definitions=[_generic_feature_with_harmonization_plan()],
+        output_dir=tmp_path / "harmonization",
+        request_json=request_json,
+        max_prompt_chars=20_000,
+    )
+
+    assert jobs == ["extend_stage2_harmonization_map_for_new_text_values"]
+    assert report["plans_requested_from_llm"] == 1
+    assert report["harmonization_validation_fallbacks"] == 0
+    assert harmonized["assay_measurement"].tolist() == [
+        "lower",
+        "upper",
+        "lower",
+        "upper",
+        "lower",
+    ]
+    mapping = {
+        row["raw_value"]: row["canonical_value"]
+        for row in definitions[0]["harmonization_plan"]["categorical_value_map"]
+    }
+    assert mapping == {
+        "lower label": "lower",
+        "new label": "lower",
+        "upper label": "upper",
+    }
+
+
+def test_harmonization_retains_prior_plan_and_nulls_failed_delta(tmp_path: Path):
+    extracted = pd.DataFrame(
+        {
+            "_oci_row_id": list(range(5)),
+            "assay_measurement": [10.0, 75.0, "lower label", "upper label", "new label"],
+        }
+    )
+
+    def invalid_delta(*_args, **_kwargs):
+        raise ValueError("mapping response remained invalid after bounded repairs")
+
+    harmonized, definitions, report = stage2_analysis._harmonize_training_extraction(
+        extracted=extracted,
+        definitions=[_generic_feature_with_harmonization_plan()],
+        output_dir=tmp_path / "harmonization",
+        request_json=invalid_delta,
+        max_prompt_chars=20_000,
+    )
+
+    fallback = definitions[0]["harmonization_fallback"]
+    assert fallback["status"] == "prior_plan_extended_with_null_mappings"
+    assert fallback["unresolved_raw_values"] == ["new label"]
+    assert report["harmonization_validation_fallbacks"] == 1
+    assert report["features_with_harmonization_validation_fallback"] == ["feature_assay"]
+    assert harmonized["assay_measurement"].tolist()[:4] == [
+        "lower",
+        "upper",
+        "lower",
+        "upper",
+    ]
+    assert pd.isna(harmonized["assay_measurement"].iloc[4])
+    persisted = json.loads(
+        (tmp_path / "harmonization" / "feature_assay" / "fallback.json").read_text()
+    )
+    assert persisted == fallback
+    completion = json.loads(
+        (tmp_path / "harmonization" / "feature_assay" / "complete.json").read_text()
+    )
+    assert completion["status"] == "complete_with_validation_fallback"
+
+
+def test_harmonization_uses_audited_hybrid_fallback_without_prior_plan(
+    tmp_path: Path,
+):
+    definition = {
+        "feature_id": "feature_assay",
+        "name": "assay_measurement",
+        "description": "A pretreatment assay measurement.",
+        "value_type": "continuous",
+        "categories_or_unit": ["units"],
+        "modeling_strategy": "continuous",
+        "roles": ["prognostic"],
+        "measurement_definition": "Extract the documented pretreatment assay measurement.",
+        "missing_value_rule": "Return null when undocumented.",
+    }
+    extracted = pd.DataFrame(
+        {
+            "_oci_row_id": [0, 1, 2],
+            "assay_measurement": [10.0, "lower label", "upper label"],
+        }
+    )
+
+    def invalid_plan(*_args, **_kwargs):
+        raise ValueError("plan response remained invalid after bounded repairs")
+
+    harmonized, definitions, report = stage2_analysis._harmonize_training_extraction(
+        extracted=extracted,
+        definitions=[definition],
+        output_dir=tmp_path / "round_001" / "harmonization",
+        request_json=invalid_plan,
+        max_prompt_chars=20_000,
+    )
+
+    assert definitions[0]["modeling_strategy"] == "continuous_with_categorical_fallback"
+    assert "harmonization_plan" not in definitions[0]
+    fallback = definitions[0]["harmonization_fallback"]
+    assert fallback["status"] == "hybrid_modeling_without_harmonization_plan"
+    assert fallback["unresolved_value_rule"] == "retain_raw_hybrid_value"
+    assert report["harmonization_validation_fallbacks"] == 1
+    assert harmonized["assay_measurement"].tolist() == [
+        10.0,
+        "lower label",
+        "upper label",
+    ]
+
+    cached, cached_definitions, cached_report = (
+        stage2_analysis._harmonize_training_extraction(
+            extracted=extracted,
+            definitions=[definition],
+            output_dir=tmp_path / "round_001" / "harmonization",
+            request_json=lambda *_args, **_kwargs: pytest.fail(
+                "the completed fallback checkpoint should be reused"
+            ),
+            max_prompt_chars=20_000,
+        )
+    )
+    assert cached_definitions[0]["modeling_strategy"] == (
+        "continuous_with_categorical_fallback"
+    )
+    assert cached_report["plans_requested_from_llm"] == 0
+    assert cached["assay_measurement"].tolist() == harmonized["assay_measurement"].tolist()
+
+    reused, reused_definitions, reused_report = (
+        stage2_analysis._harmonize_training_extraction(
+            extracted=extracted,
+            definitions=definitions,
+            output_dir=tmp_path / "round_002" / "harmonization",
+            request_json=lambda *_args, **_kwargs: pytest.fail(
+                "a recorded hybrid fallback should prevent repeated plan requests"
+            ),
+            max_prompt_chars=20_000,
+        )
+    )
+    assert reused_definitions == definitions
+    assert reused_report["plans_requested_from_llm"] == 0
+    assert reused_report["fallbacks"][0]["reused_from_prior_round"] is True
+    assert reused["assay_measurement"].tolist() == harmonized["assay_measurement"].tolist()
 
 
 def test_stage2_posthoc_oracle_ite_evaluation_uses_frozen_predictions(tmp_path: Path):
@@ -6304,7 +6743,26 @@ def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
             third_completed.set()
         elif outer_fold == 2:
             second_completed.set()
-        return {"outer_fold": outer_fold, "features": []}
+        converged = outer_fold != 2
+        return {
+            "outer_fold": outer_fold,
+            "features": [],
+            "review_converged": converged,
+            "review_convergence": {
+                "status": "converged" if converged else "non_converged",
+                "converged": converged,
+            },
+            "harmonization_validation_fallbacks": (
+                [
+                    {
+                        "feature_id": "feature_generic_assay",
+                        "status": "prior_plan_retained_with_unresolved_new_values",
+                    }
+                ]
+                if outer_fold == 3
+                else []
+            ),
+        }
 
     monkeypatch.setattr(runner, "_run_outer_fold", run_outer_fold)
     output_dir = tmp_path / "stage2"
@@ -6323,6 +6781,15 @@ def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
     assert completion_order == [3, 2, 1]
     assert [row["outer_fold"] for row in persisted] == [1, 2, 3]
     assert result["outer_folds"] == 3
+    assert result["nonconverged_outer_folds"] == [2]
+    assert result["review_convergence_by_fold"]["2"]["converged"] is False
+    assert result["outer_folds_with_harmonization_validation_fallbacks"] == [3]
+    assert result["harmonization_validation_fallbacks_by_fold"]["3"] == [
+        {
+            "feature_id": "feature_generic_assay",
+            "status": "prior_plan_retained_with_unresolved_new_values",
+        }
+    ]
 
 
 def test_plain_stage2_finishes_extraction_review_and_causal_estimation(

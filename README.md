@@ -880,6 +880,15 @@ appear, a separate LLM harmonization step sees only outer-training values and
 chooses one common continuous or categorical ontology. The validated plan is
 then frozen and applied deterministically to training and held-out rows;
 categorical ranges are not silently coerced to invented numeric midpoints.
+When later training rounds expose new text tokens, Stage 2 keeps the frozen
+ontology and requests mappings only for those new tokens. Empty, extra, missing,
+or duplicate mapping rows are normalized conservatively and audited; ambiguous
+or conflicting mappings become null. If bounded validation repairs still cannot
+produce a safe plan, `fallback.json` records the failure and the fold continues:
+a valid prior plan is retained with unresolved new tokens mapped to null, while
+a feature without a prior plan retains its raw mixed values under
+`continuous_with_categorical_fallback` modeling. Final fold definitions and the
+run summary retain these fallback records for audit.
 Leave-one-feature-out measurements show whether each variable improves or
 degrades the complete extracted feature set.
 
@@ -897,7 +906,11 @@ round. After the final allowed language-model review, evaluation-only rounds
 continue until stability selection is complete and the retained feature set is
 unchanged, so the final set is always rescored. An outer fold is limited to
 `max_evaluation_rounds` total cycles (10 by default); reaching that cap without
-convergence fails explicitly rather than accepting an uncertified feature set.
+convergence writes a non-convergence flag to `review/convergence.json` and
+continues with the latest retained definitions. The flag is also carried in
+`final_definitions.json`, the outer-fold completion record, and the run summary's
+`nonconverged_outer_folds`; if the definitions changed in the capped final
+round, the final training extraction is refreshed before held-out estimation.
 
 Each patient extraction also records feature-attributable validation failures.
 After the training patients finish, Stage 2 aggregates repeated failures across

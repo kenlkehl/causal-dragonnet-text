@@ -39,12 +39,14 @@ PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_lossless_feature_partition_reconciliation_v4_continuous_category_fallback"
 )
 REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v4_stable_forest_pruning"
+REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_review_convergence_v1"
 ESTIMATION_CHECKPOINT_SCHEMA_VERSION = "stage2_outer_estimation_v3_all_forest_models"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
 ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_training_failure_ontology_refinement_v2_request_policy"
 )
 HARMONIZATION_CHECKPOINT_SCHEMA_VERSION = "stage2_mixed_value_harmonization_v1_llm_training_only"
+HARMONIZATION_FALLBACK_SCHEMA_VERSION = "stage2_mixed_value_harmonization_fallback_v1"
 # Compatibility defaults for Stage 2 config objects created before ontology
 # refinement was added.  Keeping this boundary tolerant also protects a
 # long-running workflow if an older caller passes a config object directly.
@@ -2416,6 +2418,73 @@ def _harmonization_prompt(
     ]
 
 
+def _harmonization_delta_prompt(
+    *,
+    feature: Mapping[str, Any],
+    prior_plan: Mapping[str, Any],
+    new_categorical_values: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    body = {
+        "job": "extend_stage2_harmonization_map_for_new_text_values",
+        "information_boundary": (
+            "The values come only from outer-training patients. No treatment, outcome, "
+            "held-out text, or held-out values are supplied."
+        ),
+        "feature": {
+            key: copy.deepcopy(feature.get(key))
+            for key in (
+                "feature_id",
+                "name",
+                "description",
+                "categories_or_unit",
+                "measurement_definition",
+                "missing_value_rule",
+            )
+        },
+        "frozen_harmonization_plan": {
+            key: copy.deepcopy(prior_plan.get(key))
+            for key in (
+                "target_representation",
+                "reason",
+                "canonical_categories",
+                "numeric_bin_rules",
+                "unmapped_value_rule",
+            )
+        },
+        "new_observed_training_text_values": copy.deepcopy(list(new_categorical_values)),
+        "rules": [
+            "Do not revise the frozen target representation, categories, or numeric bins.",
+            "Return exactly one mapping for each supplied raw_value and no other raw values.",
+            "Copy every raw_value exactly, including punctuation, spacing, and case.",
+            "For a continuous target, use a finite number only when the exact text has "
+            "an unambiguous value in the feature's stated unit.",
+            "For a categorical target, use only a frozen canonical category.",
+            "Map an unusable or ambiguous text token to null rather than guessing.",
+        ],
+        "response_schema": {
+            "categorical_value_map": [
+                {
+                    "raw_value": "one exact supplied text token",
+                    "canonical_value": (
+                        "finite number/null for continuous; frozen canonical category/null "
+                        "for categorical"
+                    ),
+                }
+            ]
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You extend one frozen clinical value map without revising its ontology. "
+                "Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True)},
+    ]
+
+
 def _bin_contains(value: float, rule: Mapping[str, Any]) -> bool:
     lower = rule.get("lower_bound")
     upper = rule.get("upper_bound")
@@ -2430,6 +2499,157 @@ def _bin_contains(value: float, rule: Mapping[str, Any]) -> bool:
         or (bool(rule.get("upper_inclusive")) and value == float(upper))
     )
     return bool(lower_ok and upper_ok)
+
+
+_HARMONIZATION_MAPPING_NORMALIZATION_COUNT_FIELDS = (
+    "non_object_entries_dropped",
+    "empty_raw_value_entries_dropped",
+)
+_HARMONIZATION_MAPPING_NORMALIZATION_VALUE_FIELDS = (
+    "extra_raw_values_dropped",
+    "identical_duplicate_raw_values_deduplicated",
+    "conflicting_duplicate_raw_values_mapped_to_null",
+    "missing_raw_values_mapped_to_null",
+    "invalid_canonical_raw_values_mapped_to_null",
+)
+
+
+def _finalize_harmonization_mapping_normalization(
+    audit: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        field: int(audit.get(field) or 0)
+        for field in _HARMONIZATION_MAPPING_NORMALIZATION_COUNT_FIELDS
+    }
+    payload.update(
+        {
+            field: sorted(
+                {
+                    str(item)
+                    for item in audit.get(field) or []
+                    if str(item)
+                }
+            )
+            for field in _HARMONIZATION_MAPPING_NORMALIZATION_VALUE_FIELDS
+        }
+    )
+    payload["status"] = (
+        "normalized"
+        if any(payload[field] for field in _HARMONIZATION_MAPPING_NORMALIZATION_COUNT_FIELDS)
+        or any(payload[field] for field in _HARMONIZATION_MAPPING_NORMALIZATION_VALUE_FIELDS)
+        else "unchanged"
+    )
+    return payload
+
+
+def _merge_harmonization_mapping_normalizations(
+    *audits: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    present = [audit for audit in audits if isinstance(audit, Mapping)]
+    if not present:
+        return None
+    combined: dict[str, Any] = {
+        field: sum(int(audit.get(field) or 0) for audit in present)
+        for field in _HARMONIZATION_MAPPING_NORMALIZATION_COUNT_FIELDS
+    }
+    combined.update(
+        {
+            field: [
+                item
+                for audit in present
+                for item in audit.get(field) or []
+            ]
+            for field in _HARMONIZATION_MAPPING_NORMALIZATION_VALUE_FIELDS
+        }
+    )
+    finalized = _finalize_harmonization_mapping_normalization(combined)
+    return finalized if finalized["status"] == "normalized" else None
+
+
+def _normalize_harmonization_value_map(
+    raw_mapping: Any,
+    *,
+    expected_raw_values: Sequence[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Conservatively repair bookkeeping defects in an otherwise usable value map."""
+
+    if not isinstance(raw_mapping, list):
+        raise ValueError("harmonization requires categorical_value_map")
+    expected = list(dict.fromkeys(str(raw_value) for raw_value in expected_raw_values))
+    expected_set = set(expected)
+    mapping_by_raw: dict[str, Any] = {}
+    conflicts: set[str] = set()
+    audit: dict[str, Any] = {
+        "non_object_entries_dropped": 0,
+        "empty_raw_value_entries_dropped": 0,
+        "extra_raw_values_dropped": [],
+        "identical_duplicate_raw_values_deduplicated": [],
+        "conflicting_duplicate_raw_values_mapped_to_null": [],
+        "missing_raw_values_mapped_to_null": [],
+        "invalid_canonical_raw_values_mapped_to_null": [],
+    }
+    for row in raw_mapping:
+        if not isinstance(row, Mapping):
+            audit["non_object_entries_dropped"] += 1
+            continue
+        raw_value = str(row.get("raw_value") or "")
+        if not raw_value:
+            audit["empty_raw_value_entries_dropped"] += 1
+            continue
+        if raw_value not in expected_set:
+            audit["extra_raw_values_dropped"].append(raw_value)
+            continue
+        canonical = row.get("canonical_value")
+        if raw_value in mapping_by_raw:
+            if raw_value in conflicts or mapping_by_raw[raw_value] != canonical:
+                mapping_by_raw[raw_value] = None
+                conflicts.add(raw_value)
+                audit["conflicting_duplicate_raw_values_mapped_to_null"].append(raw_value)
+            else:
+                audit["identical_duplicate_raw_values_deduplicated"].append(raw_value)
+            continue
+        mapping_by_raw[raw_value] = canonical
+    for raw_value in expected:
+        if raw_value not in mapping_by_raw:
+            mapping_by_raw[raw_value] = None
+            audit["missing_raw_values_mapped_to_null"].append(raw_value)
+    return mapping_by_raw, _finalize_harmonization_mapping_normalization(audit)
+
+
+def _clean_harmonization_mapping_values(
+    mapping_by_raw: Mapping[str, Any],
+    *,
+    expected_raw_values: Sequence[str],
+    target: str,
+    categories: Sequence[str],
+    normalization: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    audit = dict(normalization)
+    invalid = list(audit.get("invalid_canonical_raw_values_mapped_to_null") or [])
+    clean_mapping: list[dict[str, Any]] = []
+    for raw_value in expected_raw_values:
+        canonical = mapping_by_raw[str(raw_value)]
+        if canonical is not None and target == "continuous":
+            if (
+                isinstance(canonical, bool)
+                or not isinstance(canonical, (int, float))
+                or not math.isfinite(float(canonical))
+            ):
+                canonical = None
+                invalid.append(str(raw_value))
+            else:
+                canonical = float(canonical)
+        elif canonical is not None:
+            canonical = str(canonical)
+            if canonical not in categories:
+                canonical = None
+                invalid.append(str(raw_value))
+        clean_mapping.append(
+            {"raw_value": str(raw_value), "canonical_value": canonical}
+        )
+    audit["invalid_canonical_raw_values_mapped_to_null"] = invalid
+    clean_mapping.sort(key=lambda row: str(row["raw_value"]))
+    return clean_mapping, _finalize_harmonization_mapping_normalization(audit)
 
 
 def _validate_harmonization_plan(
@@ -2447,24 +2667,10 @@ def _validate_harmonization_plan(
     expected_raw_values = [
         str(row["raw_value"]) for row in observations.get("categorical_values") or []
     ]
-    raw_mapping = value.get("categorical_value_map")
-    if not isinstance(raw_mapping, list):
-        raise ValueError("harmonization requires categorical_value_map")
-    mapping_by_raw: dict[str, Any] = {}
-    for row in raw_mapping:
-        if not isinstance(row, Mapping):
-            raise ValueError("each categorical_value_map entry must be an object")
-        raw_value = str(row.get("raw_value") or "")
-        if not raw_value or raw_value in mapping_by_raw:
-            raise ValueError("categorical_value_map contains an empty or duplicate raw_value")
-        mapping_by_raw[raw_value] = row.get("canonical_value")
-    if set(mapping_by_raw) != set(expected_raw_values):
-        missing = sorted(set(expected_raw_values) - set(mapping_by_raw))
-        extra = sorted(set(mapping_by_raw) - set(expected_raw_values))
-        raise ValueError(
-            "categorical_value_map must map every exact observed text value once; "
-            f"missing={missing[:8]} extra={extra[:8]}"
-        )
+    mapping_by_raw, mapping_normalization = _normalize_harmonization_value_map(
+        value.get("categorical_value_map"),
+        expected_raw_values=expected_raw_values,
+    )
 
     raw_categories = value.get("canonical_categories")
     raw_bins = value.get("numeric_bin_rules")
@@ -2472,23 +2678,9 @@ def _validate_harmonization_plan(
         raise ValueError("harmonization requires canonical_categories and numeric_bin_rules arrays")
     categories: list[str] = []
     bins: list[dict[str, Any]] = []
-    clean_mapping: list[dict[str, Any]] = []
     if target == "continuous":
         if raw_categories or raw_bins:
             raise ValueError("continuous harmonization requires empty categories and numeric bins")
-        for raw_value in expected_raw_values:
-            canonical = mapping_by_raw[raw_value]
-            if canonical is not None:
-                if isinstance(canonical, bool) or not isinstance(canonical, (int, float)):
-                    raise ValueError(
-                        "continuous categorical mappings must be finite numbers or null"
-                    )
-                canonical = float(canonical)
-                if not math.isfinite(canonical):
-                    raise ValueError(
-                        "continuous categorical mappings must be finite numbers or null"
-                    )
-            clean_mapping.append({"raw_value": raw_value, "canonical_value": canonical})
     else:
         categories = [str(item).strip() for item in raw_categories]
         if (
@@ -2497,15 +2689,6 @@ def _validate_harmonization_plan(
             or len(set(categories)) != len(categories)
         ):
             raise ValueError("categorical harmonization requires at least two distinct categories")
-        for raw_value in expected_raw_values:
-            canonical = mapping_by_raw[raw_value]
-            if canonical is not None:
-                canonical = str(canonical)
-                if canonical not in categories:
-                    raise ValueError(
-                        "categorical_value_map values must be canonical categories or null"
-                    )
-            clean_mapping.append({"raw_value": raw_value, "canonical_value": canonical})
         if not raw_bins:
             raise ValueError("categorical harmonization requires numeric_bin_rules")
         for index, raw_rule in enumerate(raw_bins):
@@ -2560,8 +2743,22 @@ def _validate_harmonization_plan(
         if any(sum(_bin_contains(item, rule) for rule in bins) != 1 for item in observed_numeric):
             raise ValueError("numeric bins must assign every observed numeric summary value once")
 
-    clean_mapping.sort(key=lambda row: str(row["raw_value"]))
-    return {
+    clean_mapping, mapping_normalization = _clean_harmonization_mapping_values(
+        mapping_by_raw,
+        expected_raw_values=expected_raw_values,
+        target=target,
+        categories=categories,
+        normalization=mapping_normalization,
+    )
+    combined_normalization = _merge_harmonization_mapping_normalizations(
+        (
+            value.get("categorical_value_map_normalization")
+            if isinstance(value.get("categorical_value_map_normalization"), Mapping)
+            else None
+        ),
+        mapping_normalization,
+    )
+    result = {
         "schema_version": HARMONIZATION_CHECKPOINT_SCHEMA_VERSION,
         "feature_id": str(feature["feature_id"]),
         "target_representation": target,
@@ -2572,6 +2769,125 @@ def _validate_harmonization_plan(
         "unmapped_value_rule": "null",
         "training_observations_fingerprint": _value_fingerprint(observations),
     }
+    if combined_normalization is not None:
+        result["categorical_value_map_normalization"] = combined_normalization
+    return result
+
+
+def _validate_harmonization_delta(
+    value: Mapping[str, Any],
+    *,
+    prior_plan: Mapping[str, Any],
+    new_raw_values: Sequence[str],
+) -> dict[str, Any]:
+    mapping_by_raw, normalization = _normalize_harmonization_value_map(
+        value.get("categorical_value_map"),
+        expected_raw_values=new_raw_values,
+    )
+    clean_mapping, normalization = _clean_harmonization_mapping_values(
+        mapping_by_raw,
+        expected_raw_values=new_raw_values,
+        target=str(prior_plan["target_representation"]),
+        categories=[str(item) for item in prior_plan.get("canonical_categories") or []],
+        normalization=normalization,
+    )
+    result: dict[str, Any] = {"categorical_value_map": clean_mapping}
+    if normalization["status"] == "normalized":
+        result["categorical_value_map_normalization"] = normalization
+    return result
+
+
+def _validate_prior_harmonization_plan_for_extension(
+    prior_plan: Mapping[str, Any],
+    *,
+    feature: Mapping[str, Any],
+    observations: Mapping[str, Any],
+) -> dict[str, Any]:
+    current_counts = {
+        str(row["raw_value"]): int(row.get("count") or 0)
+        for row in observations.get("categorical_values") or []
+    }
+    prior_raw_values = list(
+        dict.fromkeys(
+            str(row.get("raw_value") or "")
+            for row in prior_plan.get("categorical_value_map") or []
+            if isinstance(row, Mapping) and str(row.get("raw_value") or "")
+        )
+    )
+    prior_observations = copy.deepcopy(dict(observations))
+    prior_observations["categorical_values"] = [
+        {"raw_value": raw_value, "count": current_counts.get(raw_value, 0)}
+        for raw_value in prior_raw_values
+    ]
+    return _validate_harmonization_plan(
+        prior_plan,
+        feature=feature,
+        observations=prior_observations,
+    )
+
+
+def _harmonization_validation_fallback(
+    *,
+    feature: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    validation_error: ValueError,
+    status: str,
+    unresolved_raw_values: Sequence[str],
+    retained_prior_plan: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": HARMONIZATION_FALLBACK_SCHEMA_VERSION,
+        "status": status,
+        "feature_id": str(feature["feature_id"]),
+        "recorded_at": _now(),
+        "validation_error": f"{type(validation_error).__name__}: {validation_error}",
+        "retained_prior_plan": retained_prior_plan,
+        "unresolved_raw_values": sorted(set(map(str, unresolved_raw_values))),
+        "unresolved_value_rule": "null" if retained_prior_plan else "retain_raw_hybrid_value",
+        "modeling_strategy": (
+            None if retained_prior_plan else "continuous_with_categorical_fallback"
+        ),
+        "numeric_training_values": int(observations.get("numeric_count") or 0),
+        "categorical_training_values": int(observations.get("categorical_count") or 0),
+        "training_observations_fingerprint": _value_fingerprint(observations),
+    }
+
+
+def _extend_prior_plan_with_null_mappings(
+    prior_plan: Mapping[str, Any],
+    *,
+    feature: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    new_raw_values: Sequence[str],
+) -> dict[str, Any]:
+    candidate = copy.deepcopy(dict(prior_plan))
+    candidate["categorical_value_map"] = [
+        *[dict(row) for row in prior_plan.get("categorical_value_map") or []],
+        *[
+            {"raw_value": str(raw_value), "canonical_value": None}
+            for raw_value in new_raw_values
+        ],
+    ]
+    null_extension_normalization = _finalize_harmonization_mapping_normalization(
+        {
+            "missing_raw_values_mapped_to_null": list(new_raw_values),
+        }
+    )
+    combined_normalization = _merge_harmonization_mapping_normalizations(
+        (
+            prior_plan.get("categorical_value_map_normalization")
+            if isinstance(prior_plan.get("categorical_value_map_normalization"), Mapping)
+            else None
+        ),
+        null_extension_normalization,
+    )
+    if combined_normalization is not None:
+        candidate["categorical_value_map_normalization"] = combined_normalization
+    return _validate_harmonization_plan(
+        candidate,
+        feature=feature,
+        observations=observations,
+    )
 
 
 def _request_harmonization_plan(
@@ -2582,7 +2898,7 @@ def _request_harmonization_plan(
     output_dir: Path,
     request_json: RequestJSON,
     max_prompt_chars: int,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
     input_value = {
         "schema_version": HARMONIZATION_CHECKPOINT_SCHEMA_VERSION,
         "feature": {
@@ -2601,58 +2917,198 @@ def _request_harmonization_plan(
     }
     input_fingerprint = _value_fingerprint(input_value)
     result_path = output_dir / "result.json"
+    fallback_path = output_dir / "fallback.json"
     complete_path = output_dir / "complete.json"
-    if result_path.is_file() and complete_path.is_file():
+    if complete_path.is_file():
         try:
             completion = json.loads(complete_path.read_text(encoding="utf-8"))
             if (
                 completion.get("schema_version") == HARMONIZATION_CHECKPOINT_SCHEMA_VERSION
                 and completion.get("input_fingerprint") == input_fingerprint
             ):
-                return _validate_harmonization_plan(
-                    json.loads(result_path.read_text(encoding="utf-8")),
-                    feature=feature,
-                    observations=observations,
+                fallback = (
+                    json.loads(fallback_path.read_text(encoding="utf-8"))
+                    if completion.get("validation_fallback") is True
+                    and fallback_path.is_file()
+                    else None
                 )
+                if result_path.is_file():
+                    plan = _validate_harmonization_plan(
+                        json.loads(result_path.read_text(encoding="utf-8")),
+                        feature=feature,
+                        observations=observations,
+                    )
+                    return plan, fallback, False
+                if (
+                    isinstance(fallback, Mapping)
+                    and fallback.get("schema_version")
+                    == HARMONIZATION_FALLBACK_SCHEMA_VERSION
+                ):
+                    return None, dict(fallback), False
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
-    messages = _harmonization_prompt(
-        feature=feature,
-        observations=observations,
-        prior_plan=prior_plan,
-    )
-    prompt_chars = _prompt_chars(messages)
-    if prompt_chars > int(max_prompt_chars):
-        raise ValueError(
-            "Stage 2 mixed-value harmonization prompt exceeds max_prompt_chars "
-            f"({prompt_chars} > {max_prompt_chars}) for {feature.get('name')!r}"
+
+    validated_prior: dict[str, Any] | None = None
+    if isinstance(prior_plan, Mapping):
+        try:
+            validated_prior = _validate_prior_harmonization_plan_for_extension(
+                prior_plan,
+                feature=feature,
+                observations=observations,
+            )
+        except ValueError:
+            validated_prior = None
+    expected_rows = list(observations.get("categorical_values") or [])
+    expected_raw_values = [str(row["raw_value"]) for row in expected_rows]
+    new_rows: list[Mapping[str, Any]] = []
+    if validated_prior is not None:
+        prior_raw_values = {
+            str(row["raw_value"])
+            for row in validated_prior.get("categorical_value_map") or []
+        }
+        new_rows = [
+            row for row in expected_rows if str(row["raw_value"]) not in prior_raw_values
+        ]
+        if not new_rows:
+            return validated_prior, None, False
+        messages = _harmonization_delta_prompt(
+            feature=feature,
+            prior_plan=validated_prior,
+            new_categorical_values=new_rows,
         )
+        request_mode = "prior_plan_delta"
+    else:
+        messages = _harmonization_prompt(
+            feature=feature,
+            observations=observations,
+            prior_plan=prior_plan,
+        )
+        request_mode = "full_plan"
+    prompt_chars = _prompt_chars(messages)
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(
         output_dir / "input.json",
-        {**input_value, "input_fingerprint": input_fingerprint},
+        {
+            **input_value,
+            "input_fingerprint": input_fingerprint,
+            "request_mode": request_mode,
+            "new_categorical_values": copy.deepcopy(new_rows),
+        },
     )
-    plan = request_json(
-        messages,
-        lambda response: _validate_harmonization_plan(
-            response,
-            feature=feature,
-            observations=observations,
-        ),
-        request_kind="interpretation",
-    )
-    _write_json(result_path, plan)
+    request_performed = False
+    validation_error: ValueError | None = None
+    plan: dict[str, Any] | None = None
+    try:
+        if prompt_chars > int(max_prompt_chars):
+            raise ValueError(
+                "Stage 2 mixed-value harmonization prompt exceeds max_prompt_chars "
+                f"({prompt_chars} > {max_prompt_chars}) for {feature.get('name')!r}"
+            )
+        request_performed = True
+        if validated_prior is not None:
+            new_raw_values = [str(row["raw_value"]) for row in new_rows]
+            delta = request_json(
+                messages,
+                lambda response: _validate_harmonization_delta(
+                    response,
+                    prior_plan=validated_prior,
+                    new_raw_values=new_raw_values,
+                ),
+                request_kind="interpretation",
+            )
+            candidate = copy.deepcopy(validated_prior)
+            candidate["categorical_value_map"] = [
+                *[dict(row) for row in validated_prior["categorical_value_map"]],
+                *[dict(row) for row in delta["categorical_value_map"]],
+            ]
+            delta_normalization = delta.get("categorical_value_map_normalization")
+            combined_normalization = _merge_harmonization_mapping_normalizations(
+                (
+                    validated_prior.get("categorical_value_map_normalization")
+                    if isinstance(
+                        validated_prior.get("categorical_value_map_normalization"), Mapping
+                    )
+                    else None
+                ),
+                delta_normalization if isinstance(delta_normalization, Mapping) else None,
+            )
+            if combined_normalization is not None:
+                candidate["categorical_value_map_normalization"] = combined_normalization
+            plan = _validate_harmonization_plan(
+                candidate,
+                feature=feature,
+                observations=observations,
+            )
+        else:
+            plan = request_json(
+                messages,
+                lambda response: _validate_harmonization_plan(
+                    response,
+                    feature=feature,
+                    observations=observations,
+                ),
+                request_kind="interpretation",
+            )
+    except ValueError as exc:
+        validation_error = exc
+
+    fallback: dict[str, Any] | None = None
+    if validation_error is not None:
+        if validated_prior is not None:
+            unresolved = [str(row["raw_value"]) for row in new_rows]
+            plan = _extend_prior_plan_with_null_mappings(
+                validated_prior,
+                feature=feature,
+                observations=observations,
+                new_raw_values=unresolved,
+            )
+            fallback = _harmonization_validation_fallback(
+                feature=feature,
+                observations=observations,
+                validation_error=validation_error,
+                status="prior_plan_extended_with_null_mappings",
+                unresolved_raw_values=unresolved,
+                retained_prior_plan=True,
+            )
+        else:
+            plan = None
+            fallback = _harmonization_validation_fallback(
+                feature=feature,
+                observations=observations,
+                validation_error=validation_error,
+                status="hybrid_modeling_without_harmonization_plan",
+                unresolved_raw_values=expected_raw_values,
+                retained_prior_plan=False,
+            )
+        _write_json(fallback_path, fallback)
+        LOGGER.warning(
+            "Stage 2 harmonization remained invalid for feature=%s; using audited "
+            "fallback status=%s (%s)",
+            feature.get("feature_id"),
+            fallback["status"],
+            validation_error,
+        )
+    if plan is not None:
+        _write_json(result_path, plan)
     _write_json(
         complete_path,
         {
-            "status": "complete",
+            "status": (
+                "complete_with_validation_fallback" if fallback is not None else "complete"
+            ),
             "schema_version": HARMONIZATION_CHECKPOINT_SCHEMA_VERSION,
+            "fallback_schema_version": (
+                HARMONIZATION_FALLBACK_SCHEMA_VERSION if fallback is not None else None
+            ),
             "input_fingerprint": input_fingerprint,
             "completed_at": _now(),
             "prompt_chars": prompt_chars,
+            "request_mode": request_mode,
+            "request_performed": request_performed,
+            "validation_fallback": fallback is not None,
         },
     )
-    return plan
+    return plan, fallback, request_performed
 
 
 def _apply_one_harmonization_plan(
@@ -2758,12 +3214,15 @@ def _harmonize_training_extraction(
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], dict[str, Any]]:
     updated: list[dict[str, Any]] = []
     newly_requested: list[str] = []
+    fallbacks: list[dict[str, Any]] = []
+    mapping_normalizations: list[dict[str, Any]] = []
     for raw_feature in definitions:
         feature = dict(raw_feature)
         if str(feature.get("value_type") or "").strip().lower() == "continuous":
             observations = _mixed_value_observations(extracted, feature)
             if observations is not None:
                 prior_plan = feature.get("harmonization_plan")
+                prior_fallback = feature.get("harmonization_fallback")
                 if isinstance(prior_plan, Mapping):
                     observed_raw = {
                         str(row["raw_value"]) for row in observations["categorical_values"]
@@ -2774,19 +3233,19 @@ def _harmonize_training_extraction(
                             observations["categorical_values"].append(
                                 {"raw_value": raw_value, "count": 0}
                             )
-                plan: dict[str, Any] | None = None
-                if isinstance(prior_plan, Mapping):
-                    try:
-                        plan = _validate_harmonization_plan(
-                            prior_plan,
-                            feature=feature,
-                            observations=observations,
-                        )
-                    except ValueError:
-                        plan = None
-                if plan is None:
+                fallback: dict[str, Any] | None = None
+                request_performed = False
+                if (
+                    not isinstance(prior_plan, Mapping)
+                    and isinstance(prior_fallback, Mapping)
+                    and prior_fallback.get("status")
+                    == "hybrid_modeling_without_harmonization_plan"
+                ):
+                    plan = None
+                    fallback = dict(prior_fallback)
+                else:
                     feature_dir = output_dir / str(feature["feature_id"])
-                    plan = _request_harmonization_plan(
+                    plan, fallback, request_performed = _request_harmonization_plan(
                         feature=feature,
                         observations=observations,
                         prior_plan=(prior_plan if isinstance(prior_plan, Mapping) else None),
@@ -2794,9 +3253,50 @@ def _harmonize_training_extraction(
                         request_json=request_json,
                         max_prompt_chars=max_prompt_chars,
                     )
+                if request_performed:
                     newly_requested.append(str(feature["feature_id"]))
-                feature["harmonization_plan"] = plan
-                feature["modeling_strategy"] = str(plan["target_representation"])
+                if fallback is not None:
+                    feature["harmonization_fallback"] = copy.deepcopy(fallback)
+                    fallbacks.append(
+                        {
+                            **copy.deepcopy(fallback),
+                            "reused_from_prior_round": not request_performed,
+                        }
+                    )
+                elif request_performed:
+                    feature.pop("harmonization_fallback", None)
+                if plan is not None:
+                    feature["harmonization_plan"] = plan
+                    feature["modeling_strategy"] = str(plan["target_representation"])
+                    normalization = plan.get("categorical_value_map_normalization")
+                    if isinstance(normalization, Mapping):
+                        mapping_normalizations.append(
+                            {
+                                "feature_id": str(feature["feature_id"]),
+                                "name": str(feature["name"]),
+                                **copy.deepcopy(normalization),
+                            }
+                        )
+                else:
+                    feature.pop("harmonization_plan", None)
+                    if (
+                        fallback is not None
+                        and fallback.get("status")
+                        == "hybrid_modeling_without_harmonization_plan"
+                        and (
+                            request_performed
+                            or not isinstance(prior_fallback, Mapping)
+                        )
+                    ):
+                        feature["modeling_strategy"] = (
+                            "continuous_with_categorical_fallback"
+                        )
+                    elif str(feature.get("modeling_strategy") or "").strip().lower() not in (
+                        CONTINUOUS_MODELING_STRATEGIES
+                    ):
+                        feature["modeling_strategy"] = (
+                            "continuous_with_categorical_fallback"
+                        )
         updated.append(_normalized_feature_modeling_definition(feature))
     harmonized, application = _apply_harmonization_plans(
         extracted,
@@ -2807,6 +3307,13 @@ def _harmonize_training_extraction(
         **application,
         "plans_requested_from_llm": len(newly_requested),
         "features_requested_from_llm": newly_requested,
+        "harmonization_validation_fallbacks": len(fallbacks),
+        "features_with_harmonization_validation_fallback": [
+            str(fallback["feature_id"]) for fallback in fallbacks
+        ],
+        "fallbacks": fallbacks,
+        "normalized_categorical_value_maps": len(mapping_normalizations),
+        "categorical_value_map_normalizations": mapping_normalizations,
     }
     _write_frame(output_dir / "extracted_harmonized.csv", harmonized)
     _write_json(output_dir / "harmonization.json", report)
@@ -3913,6 +4420,19 @@ def _review_prompt(
                 )
                 else []
             ),
+            *(
+                [
+                    "A harmonization_fallback means no validated common plan was "
+                    "available after bounded repairs. Keep the current safe modeling "
+                    "strategy unless the training summaries support another declared "
+                    "strategy; never invent a value mapping."
+                ]
+                if any(
+                    isinstance(feature.get("harmonization_fallback"), Mapping)
+                    for feature in definitions
+                )
+                else []
+            ),
             "Use revise only to clarify how the same evidence-supported measurement is extracted.",
             "For a revised binary variable, provide exactly two distinct scalar ontology values as separate categories_or_unit array items.",
             "For a revised categorical or ordinal variable, provide at least two distinct scalar ontology values as separate categories_or_unit array items.",
@@ -3941,6 +4461,21 @@ def _review_prompt(
                         }
                     }
                     if isinstance(feature.get("harmonization_plan"), Mapping)
+                    else {}
+                ),
+                **(
+                    {
+                        "harmonization_fallback": {
+                            key: copy.deepcopy(feature["harmonization_fallback"].get(key))
+                            for key in (
+                                "status",
+                                "retained_prior_plan",
+                                "unresolved_value_rule",
+                                "modeling_strategy",
+                            )
+                        }
+                    }
+                    if isinstance(feature.get("harmonization_fallback"), Mapping)
                     else {}
                 ),
             }
@@ -4437,6 +4972,7 @@ def _apply_review(
         if decision["action"] == "revise":
             measurement_changed = True
             updated.pop("harmonization_plan", None)
+            updated.pop("harmonization_fallback", None)
             for key in (
                 "value_type",
                 "categories_or_unit",
@@ -4904,6 +5440,7 @@ def _request_ontology_refinements(
             after = {key: copy.deepcopy(feature.get(key)) for key in before}
             if _value_fingerprint(before) != _value_fingerprint(after):
                 feature.pop("harmonization_plan", None)
+                feature.pop("harmonization_fallback", None)
                 changed_names.append(name)
         updated.append(feature)
 
@@ -5310,6 +5847,9 @@ def run_fold_analysis(
     evaluation_rounds = 0
     ontology_refinement_rounds = 0
     selection_history: dict[str, list[dict[str, Any]]] = {}
+    review_converged = False
+    final_round_definitions_changed: bool | None = None
+    final_round_selection_complete: bool | None = None
     screening_trees = int(getattr(config, "screening_trees", DEFAULT_SCREENING_TREES))
     selection_policy = _stability_selection_policy(config)
     maximum_evaluation_rounds = int(
@@ -5476,6 +6016,9 @@ def run_fold_analysis(
         )
         _write_json(round_dir / "signal_pruning.json", signal_pruning)
         definitions_changed = _value_fingerprint(current) != _value_fingerprint(updated)
+        selection_complete = bool(signal_pruning.get("selection_complete", True))
+        final_round_definitions_changed = definitions_changed
+        final_round_selection_complete = selection_complete
         final_fit_extraction = extracted
         final_fit_definitions = extraction_definitions
         current = updated
@@ -5492,15 +6035,45 @@ def run_fold_analysis(
                 ),
                 "review_input_fingerprint": review_input_fingerprint,
                 "definitions_changed": definitions_changed,
+                "selection_complete": selection_complete,
                 "features_retained": len(current),
             },
         )
-        if not definitions_changed and bool(signal_pruning.get("selection_complete", True)):
+        if not definitions_changed and selection_complete:
+            review_converged = True
             break
-    else:  # pragma: no cover - finite feature/role changes should converge first
-        raise RuntimeError(
+    pending_conditions = []
+    if final_round_definitions_changed:
+        pending_conditions.append("definitions_changed_in_final_round")
+    if final_round_selection_complete is False:
+        pending_conditions.append("stability_selection_incomplete")
+    review_convergence = {
+        "schema_version": REVIEW_CONVERGENCE_SCHEMA_VERSION,
+        "status": "converged" if review_converged else "non_converged",
+        "converged": review_converged,
+        "recorded_at": _now(),
+        "evaluation_rounds": evaluation_rounds,
+        "max_evaluation_rounds": maximum_evaluation_rounds,
+        "definitions_changed_in_final_round": final_round_definitions_changed,
+        "selection_complete_in_final_round": final_round_selection_complete,
+        "features_retained_at_review_exit": len(current),
+        "reason": None if review_converged else "max_evaluation_rounds_reached",
+        "pending_conditions": pending_conditions,
+        "continued_after_non_convergence": not review_converged,
+        "continuation_policy": (
+            "use_converged_definitions"
+            if review_converged
+            else "use_latest_retained_definitions"
+        ),
+    }
+    _write_json(output_dir / "review" / "convergence.json", review_convergence)
+    if not review_converged:
+        LOGGER.warning(
             "Stage 2 empirical feature pruning did not converge within "
-            f"max_evaluation_rounds={maximum_evaluation_rounds}"
+            "max_evaluation_rounds=%s; continuing with the latest retained "
+            "definitions and flagging the fold (pending=%s)",
+            maximum_evaluation_rounds,
+            pending_conditions or ["convergence_criteria_not_met"],
         )
 
     if final_fit_extraction is None or final_fit_definitions is None:
@@ -5567,16 +6140,28 @@ def run_fold_analysis(
             fit_selected,
         )
         names = [str(feature["name"]) for feature in current]
+    harmonization_validation_fallbacks = [
+        {
+            "feature_id": str(feature["feature_id"]),
+            "name": str(feature["name"]),
+            **copy.deepcopy(feature["harmonization_fallback"]),
+        }
+        for feature in current
+        if isinstance(feature.get("harmonization_fallback"), Mapping)
+    ]
     _write_json(
         output_dir / "final_definitions.json",
         {
             "features": current,
             "review_rounds": agent_review_rounds,
             "evaluation_rounds": evaluation_rounds,
+            "review_converged": review_converged,
+            "review_convergence": review_convergence,
             "ontology_refinement_rounds": ontology_refinement_rounds,
             "screening_model_family": "random_forest",
             "screening_trees": screening_trees,
             "stability_selection_policy": selection_policy,
+            "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
         },
     )
     _assert_extraction_health(
@@ -5641,10 +6226,13 @@ def run_fold_analysis(
         "features": current,
         "review_rounds": agent_review_rounds,
         "evaluation_rounds": evaluation_rounds,
+        "review_converged": review_converged,
+        "review_convergence": review_convergence,
         "ontology_refinement_rounds": ontology_refinement_rounds,
         "screening_model_family": "random_forest",
         "screening_trees": screening_trees,
         "stability_selection_policy": selection_policy,
+        "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
         "estimation": diagnostics,
     }
 

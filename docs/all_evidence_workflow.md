@@ -746,15 +746,30 @@ change starts another evaluation round. Evaluation-only convergence rounds may
 therefore extend beyond `max_review_rounds`, which limits language-model reviews
 rather than final empirical certification. They may not extend beyond
 `max_evaluation_rounds` (10 by default); hitting that absolute per-fold cap
-without convergence raises an error. Each round records the full votes, margins,
-deterministic decisions, and per-role evidence in `signal_pruning.json`.
+without convergence records `review/convergence.json` and continues with the
+latest retained definitions. The same non-convergence status is propagated to
+`final_definitions.json`, the outer-fold completion record, and the run-level
+`nonconverged_outer_folds` list. If the definitions changed in the capped final
+round, Stage 2 refreshes the final training extraction before estimating on the
+held-out rows. Each round records the full votes, margins, deterministic
+decisions, and per-role evidence in `signal_pruning.json`.
 
 When a continuous extraction contains both numeric and categorical values, a
 separate LLM request receives only the feature ontology and aggregated
 outer-training values. It chooses one validated continuous mapping or an
 exhaustive categorical binning plan. That plan is frozen in the feature
 definition and applied deterministically to final training and held-out values;
-held-out values and outcomes are never sent back for harmonization.
+held-out values and outcomes are never sent back for harmonization. Later
+outer-training tokens extend only the frozen value map rather than regenerating
+the full ontology. Mapping bookkeeping defects are normalized conservatively and
+recorded, with missing or conflicting mappings assigned null. If bounded repairs
+still fail, the feature-level `fallback.json` records the validation error and
+the fold continues. A safe prior plan is retained with unresolved new tokens
+mapped to null; without a prior plan, raw mixed values remain available to the
+`continuous_with_categorical_fallback` encoder. The round-level
+`harmonization.json` reports all normalized maps and validation fallbacks; final
+fold definitions, fold completion records, and the root summary propagate the
+same fallback audit trail.
 
 Every single-patient extraction writes `extraction_issues.json`, including
 feature-attributable invalid scalar/type values and values outside a declared
