@@ -1815,6 +1815,19 @@ def test_interpretation_prompt_inverts_noisy_text_evidence_without_temporal_filt
     assert "longitudinal information as clinical context" in rules
     assert "do not perform temporal eligibility filtering" in rules
     assert "prefer atomic clinical variables" in rules
+    assert "exhaustively enumerate every distinct atomic patient-level clinical feature" in rules
+    assert "apparent topic, dominant concept, or consensus theme" in rules
+    assert "read every string in an evidence item's text array" in rules
+    assert "do not limit an evidence item to one candidate" in rules
+    assert "multiple independently varying patient attributes" in rules
+    assert "a separate atomic candidate for each attribute" in rules
+    assert "attributes belonging to relatives, specimens, clinicians" in rules
+    assert "corresponding patient feature" in rules
+    assert "multiple exemplar patients with different observed values" in rules
+    assert "community's apparent topic or most salient feature" in messages[0][
+        "content"
+    ].lower()
+    assert re.search(r"\bage\b", instructions) is None
     assert "one coherent ontology" in rules
     assert "list, set, tuple, mapping, concatenated code" in rules
     assert "open-ended family is present" in rules
@@ -1892,6 +1905,16 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
         messages[0]["content"].lower()
     )
     assert "prefer atomic clinical variables" in rules
+    assert "exhaustively enumerate every distinct atomic patient-level clinical feature" in rules
+    assert "read every string in an evidence item's text array" in rules
+    assert "do not limit an evidence item to one candidate" in rules
+    assert "multiple independently varying patient attributes" in rules
+    assert "a separate atomic candidate for each attribute" in rules
+    assert "attributes belonging to relatives, specimens, clinicians" in rules
+    assert "including secondary features outside the dominant topic" in messages[0][
+        "content"
+    ].lower()
+    assert re.search(r"\bage\b", instructions) is None
     assert "return no candidate rather than a vague catch-all" in rules
     assert "longitudinal information as clinical context" in rules
     assert "pretreatment" not in instructions

@@ -122,8 +122,10 @@ EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
 OPERATIONALIZATION_SCHEMA_VERSION = (
     "feature_name_bounded_supporting_text_v6_continuous_category_fallback"
 )
-INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v9_request_policy"
-INTERPRETATION_AUDIT_SCHEMA_VERSION = "rejected_packet_text_only_ordinals_v6_request_policy"
+INTERPRETATION_SCHEMA_VERSION = "clinical_feature_text_only_ordinals_v10_exhaustive_decomposition"
+INTERPRETATION_AUDIT_SCHEMA_VERSION = (
+    "rejected_packet_text_only_ordinals_v7_exhaustive_decomposition"
+)
 CANDIDATE_SELECTION_SCHEMA_VERSION = (
     "fold_candidate_registry_late_interaction_axis_top_n_v1"
 )
@@ -2363,6 +2365,12 @@ def _atomic_feature_interpretation_rules() -> list[str]:
     """Return shared rules that keep discovered variables specific and scalar."""
 
     return [
+        "Exhaustively enumerate every distinct atomic patient-level clinical feature explicitly stated or unambiguously encoded anywhere in each evidence item's text. Do not restrict candidates to the item's apparent topic, dominant concept, or consensus theme.",
+        "Read every string in an evidence item's text array. Treat both consensus phrases and every representative excerpt as evidence; consensus phrases are not an exhaustive label for the variables present in the excerpts.",
+        "Do not stop after finding the most salient feature, and do not limit an evidence item to one candidate. Inspect demographic clauses, headers, timepoint labels, laboratory lines, biomarker statements, diagnoses, symptoms, and other embedded fields separately.",
+        "When one clause, header, or line explicitly states multiple independently varying patient attributes, return a separate atomic candidate for each attribute.",
+        "Attribute each feature to the correct subject. Attributes belonging to relatives, specimens, clinicians, or other people do not support the corresponding patient feature.",
+        "When an item contains multiple exemplar patients with different observed values of the same field, treat that as support for one reusable patient-level feature. Do not encode exemplar values or patient identities in the candidate name.",
         "Prefer atomic clinical variables.",
         "A candidate is atomic only when a downstream extractor could assign exactly one patient-level value under one coherent ontology. It must not require returning a list, set, tuple, mapping, concatenated code, profile, inventory, or ad hoc aggregation of independently varying values. Collapsing whether any member of an open-ended family is present into one indicator does not make that family atomic.",
         "Use the narrowest stable and reusable clinical construct directly supported by the cited evidence. Do not use a parent domain, umbrella label, or catch-all concept when the evidence supports separately measurable attributes.",
@@ -2398,8 +2406,9 @@ def _interpretation_prompt(
     body = {
         "job": "infer_clinical_features_from_text_evidence",
         "task": (
-            "Identify patient-level clinical features supported by the supplied text. Some "
-            "items may support multiple features or no valid feature."
+            "Identify all patient-level clinical features supported anywhere in each supplied "
+            "item's consensus text and representative excerpts. Enumerate every distinct "
+            "feature atomically; some items may support multiple features or no valid feature."
         ),
         "rules": [
             "Each candidate must represent one patient-level clinical variable with one value per patient. It must be assignable by examining one patient's record without comparing or aggregating across patients.",
@@ -2419,8 +2428,9 @@ def _interpretation_prompt(
         {
             "role": "system",
             "content": (
-                "Identify patient-level clinical features supported by the supplied text. "
-                "Return JSON only."
+                "Exhaustively decompose every evidence item into all explicitly stated or "
+                "unambiguously encoded atomic patient-level clinical features. Do not stop at "
+                "the community's apparent topic or most salient feature. Return JSON only."
             ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
@@ -2438,8 +2448,9 @@ def _rejected_packet_audit_prompt(
     body = {
         "job": "audit_unmapped_text_evidence_for_missed_clinical_features",
         "task": (
-            "The supplied text was not cited by an initial review. Re-examine every item for "
-            "patient-level clinical features that may have been missed."
+            "The supplied text was not cited by an initial review. Re-examine every string in "
+            "every item and enumerate all atomic patient-level clinical features that may have "
+            "been missed, including features embedded outside the apparent community topic."
         ),
         "rules": [
             "Review every evidence item independently. One clear item is sufficient to support a candidate; a clue does not need to recur.",
@@ -2460,10 +2471,11 @@ def _rejected_packet_audit_prompt(
         {
             "role": "system",
             "content": (
-                "Re-examine the supplied text for missed patient-level clinical features. "
-                "Favor recall by exhaustively identifying supported atomic variables, not "
-                "by creating umbrella, inventory, or composite candidates. Return no "
-                "candidate for input or analysis artifacts. Return JSON only."
+                "Re-examine every supplied text string for missed patient-level clinical "
+                "features. Favor recall by exhaustively identifying all supported atomic "
+                "variables, including secondary features outside the dominant topic, not by "
+                "creating umbrella, inventory, or composite candidates. Return no candidate "
+                "for input or analysis artifacts. Return JSON only."
             ),
         },
         {"role": "user", "content": json.dumps(body, sort_keys=True)},
