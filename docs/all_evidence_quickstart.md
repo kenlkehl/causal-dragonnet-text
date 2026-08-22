@@ -92,6 +92,8 @@ All Stage 2 completion requests send `repetition_penalty: 1.1` by default.
 Stage 2 probes `/models`, recognizes Qwen 3 (including 3.8), Gemma 4, and LFM
 2.5 IDs, and sends family-appropriate per-request thinking controls. It accepts
 either server-parsed reasoning fields or inline reasoning delimiters.
+For Qwen 3.8, configured `high` is sent as `reasoning_effort: "xhigh"`;
+thinking-off extraction requests omit that enabled-only wire enum.
 The selected IDs are persisted in `stage2/model_identity.json`: endpoint URL
 changes may resume, but changing either running model ID raises an error.
 Invalid completed responses receive up to 10 validator-guided repair retries.

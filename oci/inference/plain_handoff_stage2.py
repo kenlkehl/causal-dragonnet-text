@@ -1976,14 +1976,15 @@ def _openai_optional_parameter_error(exc: Exception) -> bool:
     if status_code not in {400, 422}:
         return False
     text = str(exc).lower()
+    normalized_text = re.sub(r"[_-]+", " ", text)
     parameter_names = (
-        "reasoning_effort",
-        "enable_thinking",
+        "reasoning effort",
+        "enable thinking",
         "enablethinking",
-        "chat_template_kwargs",
-        "response_format",
-        "repetition_penalty",
-        "extra_body",
+        "chat template kwargs",
+        "response format",
+        "repetition penalty",
+        "extra body",
     )
     rejection_words = (
         "unknown",
@@ -1995,9 +1996,35 @@ def _openai_optional_parameter_error(exc: Exception) -> bool:
         "unexpected",
         "invalid parameter",
     )
-    return any(name in text for name in parameter_names) and any(
-        word in text for word in rejection_words
+    return any(name in normalized_text for name in parameter_names) and any(
+        word in normalized_text for word in rejection_words
     )
+
+
+def _wire_reasoning_effort(
+    *,
+    configured_effort: str,
+    model_family: str,
+) -> str | None:
+    """Translate the pipeline policy to one endpoint's accepted wire values."""
+
+    effort = str(configured_effort).strip().lower()
+    enabled = _reasoning_enabled(effort)
+    if model_family in {"qwen3", "gemma4", "lfm2.5"} and not enabled:
+        # These families have an explicit hard switch in extra_body (and a
+        # prompt fallback). Sending reasoning_effort="none" as well breaks
+        # endpoints whose enum contains only enabled reasoning levels.
+        return None
+    if model_family == "qwen3":
+        # Qwen 3.8 exposes low/medium/xhigh. Keep the public pipeline policy
+        # model-agnostic while translating high-strength requests to its wire
+        # vocabulary. Older Qwen 3 servers can reject this optional field and
+        # fall through to the enable_thinking switch below.
+        if effort in {"high", "xhigh", "max"}:
+            return "xhigh"
+        if effort in {"low", "medium"}:
+            return effort
+    return effort
 
 
 def _openai_request_variants(
@@ -2009,6 +2036,10 @@ def _openai_request_variants(
     """Prefer hard thinking controls, then degrade across compatible APIs."""
 
     enabled = _reasoning_enabled(str(request_policy["reasoning_effort"]))
+    wire_reasoning_effort = _wire_reasoning_effort(
+        configured_effort=str(request_policy["reasoning_effort"]),
+        model_family=model_family,
+    )
     repetition = float(request_policy["repetition_penalty"])
     family_bodies: list[dict[str, Any]] = []
     if model_family in {"qwen3", "gemma4", "lfm2.5"}:
@@ -2035,14 +2066,15 @@ def _openai_request_variants(
 
     variants: list[dict[str, Any]] = []
     seen: set[str] = set()
+    reasoning_variants = (True, False) if wire_reasoning_effort is not None else (False,)
     for extra_body in family_bodies:
-        for include_reasoning in (True, False):
+        for include_reasoning in reasoning_variants:
             candidate = {
                 **dict(base_kwargs),
                 "response_format": {"type": "json_object"},
             }
             if include_reasoning:
-                candidate["reasoning_effort"] = request_policy["reasoning_effort"]
+                candidate["reasoning_effort"] = wire_reasoning_effort
             if extra_body:
                 candidate["extra_body"] = extra_body
             key = json.dumps(candidate, sort_keys=True, default=str)
@@ -2116,6 +2148,10 @@ def _openai_completion(
     )
     request_policy = _stage2_request_policy(config)
     model_family = config.runtime_model_family or _stage2_model_family(config.model)
+    wire_reasoning_effort = _wire_reasoning_effort(
+        configured_effort=str(request_policy["reasoning_effort"]),
+        model_family=model_family,
+    )
     controlled_messages = _reasoning_controlled_messages(
         messages,
         model_family=model_family,
@@ -2137,13 +2173,15 @@ def _openai_completion(
         )
     LOGGER.info(
         "Stage 2 request kind=%s endpoint=%s model=%s prompt_chars=%s "
-        "family=%s reasoning_effort=%s max_tokens=%s repetition_penalty=%s",
+        "family=%s reasoning_effort=%s wire_reasoning_effort=%s "
+        "max_tokens=%s repetition_penalty=%s",
         request_policy["request_kind"],
         config.endpoint,
         config.model,
         prompt_chars,
         model_family,
         request_policy["reasoning_effort"],
+        wire_reasoning_effort,
         request_policy["max_tokens"],
         request_policy["repetition_penalty"],
     )

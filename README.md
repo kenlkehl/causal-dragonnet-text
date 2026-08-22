@@ -790,6 +790,9 @@ inline reasoning delimiters. The two efforts are recorded as
 `interpretation_reasoning_effort` and `extraction_reasoning_effort` in the
 Stage 2 configuration. Every Stage 2 completion request also sends the
 configured `repetition_penalty` (1.1 by default).
+For Qwen 3.8, the model-agnostic `high` policy is translated to the endpoint's
+`reasoning_effort: "xhigh"` wire value. Disabled extraction thinking omits the
+wire-level effort enum and uses the family-specific hard-off controls.
 
 A completed response that fails JSON parsing or schema validation receives up
 to `max_response_repairs` validator-guided retries (10 by default), each with

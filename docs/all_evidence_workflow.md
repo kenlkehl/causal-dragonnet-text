@@ -348,6 +348,9 @@ with progressively more standard request fields. Responses are accepted whether
 reasoning is separated into `reasoning_content` or remains inline in Qwen/LFM
 `<think>` blocks or Gemma thought channels. The configured fields are
 `interpretation_reasoning_effort` and `extraction_reasoning_effort`.
+Qwen 3.8 translates the configured `high` policy to its accepted wire value
+`xhigh`; thinking-off extraction requests omit the enabled-only effort enum and
+use the template switch and prompt fallback.
 
 A completed response that fails JSON parsing or schema validation receives up
 to `max_response_repairs` validator-guided retries (10 by default). Every retry

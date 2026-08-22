@@ -3286,10 +3286,10 @@ def test_openai_completion_sends_request_scoped_reasoning_and_token_cap(
 
 
 @pytest.mark.parametrize(
-    ("request_kind", "enabled", "soft_switch"),
+    ("request_kind", "enabled", "soft_switch", "wire_reasoning_effort"),
     [
-        ("extraction", False, "/no_think"),
-        ("interpretation", True, "/think"),
+        ("extraction", False, "/no_think", None),
+        ("interpretation", True, "/think", "xhigh"),
     ],
 )
 def test_qwen38_requests_use_hard_and_soft_thinking_controls(
@@ -3297,6 +3297,7 @@ def test_qwen38_requests_use_hard_and_soft_thinking_controls(
     request_kind,
     enabled,
     soft_switch,
+    wire_reasoning_effort,
 ):
     request_kwargs = {}
 
@@ -3333,6 +3334,32 @@ def test_qwen38_requests_use_hard_and_soft_thinking_controls(
     assert request_kwargs["extra_body"]["chat_template_kwargs"] == {
         "enable_thinking": enabled
     }
+    if wire_reasoning_effort is None:
+        assert "reasoning_effort" not in request_kwargs
+    else:
+        assert request_kwargs["reasoning_effort"] == wire_reasoning_effort
+
+
+@pytest.mark.parametrize(
+    ("configured_effort", "wire_effort"),
+    [
+        ("none", None),
+        ("minimal", None),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "xhigh"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+    ],
+)
+def test_qwen38_reasoning_effort_uses_supported_wire_vocabulary(
+    configured_effort,
+    wire_effort,
+):
+    assert stage2_workflow._wire_reasoning_effort(
+        configured_effort=configured_effort,
+        model_family="qwen3",
+    ) == wire_effort
 
 
 def test_openai_completion_falls_back_when_reasoning_effort_is_not_supported(
@@ -3349,7 +3376,7 @@ def test_openai_completion_falls_back_when_reasoning_effort_is_not_supported(
             calls.append(kwargs)
             if "reasoning_effort" in kwargs:
                 raise UnsupportedParameterError(
-                    "unsupported parameter reasoning_effort"
+                    "Unexpected reasoning effort high. Supported types are xhigh, medium, and low."
                 )
             message = type("Message", (), {"content": '{"ok": true}'})()
             choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
