@@ -36,8 +36,14 @@ fi
             "OCI_PYTHON": str(fake_python),
             "PHYSICAL_GPUS": "also-not-a-number",
             "STAGE2_ENDPOINT": "http://stage2.test/v1",
+            "STAGE2_EXTRACTION_ENDPOINT": "http://small-stage2.test/v1",
             "STAGE2_EXTRACTION_FEATURE_BATCH_SIZE": "7",
-            "STAGE2_MAX_EVALUATION_ROUNDS": "12",
+            "STAGE2_SELECTION_WORKERS": "6",
+            "STAGE2_MAX_TOKENS": "150000",
+            "STAGE2_CONFOUNDER_P_VALUE_THRESHOLD": "0.01",
+            "STAGE2_CONFOUNDER_MIN_INNER_FOLD_FRACTION": "0.8",
+            "STAGE2_EFFECT_MODIFIER_P_VALUE_THRESHOLD": "0.02",
+            "STAGE2_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION": "0.6",
             "STAGE2_WORKERS": "",
             "STAGE2_VLLM_SERVERS": "0",
         }
@@ -71,8 +77,14 @@ fi
     assert "--stage2-only" in invocations[1]
     assert "--devices cpu" in invocations[1]
     assert "stage2.workers=32" in invocations[1]
+    assert "--stage2-extraction-endpoint http://small-stage2.test/v1" in invocations[1]
     assert "--stage2-extraction-feature-batch-size 7" in invocations[1]
-    assert "--stage2-max-evaluation-rounds 12" in invocations[1]
+    assert "--stage2-selection-workers 6" in invocations[1]
+    assert "--stage2-max-tokens 150000" in invocations[1]
+    assert "--stage2-confounder-p-value-threshold 0.01" in invocations[1]
+    assert "--stage2-confounder-min-inner-fold-fraction 0.8" in invocations[1]
+    assert "--stage2-effect-modifier-p-value-threshold 0.02" in invocations[1]
+    assert "--stage2-effect-modifier-min-inner-fold-fraction 0.6" in invocations[1]
     assert "CUDA devices:   not required for endpoint-backed Stage 2" in completed.stdout
     assert "HTR modeling:   not run during Stage 2-only resume" in completed.stdout
 
@@ -103,9 +115,10 @@ fi
             "OCI_PYTHON": str(fake_python),
             "PHYSICAL_GPUS": "",
             "STAGE2_ENDPOINT": "",
+            "STAGE2_EXTRACTION_ENDPOINT": "http://small-stage2.test/v1",
+            "STAGE2_EXTRACTION_MODEL": "small-extractor",
             "STAGE2_EXTRACTION_FEATURE_BATCH_SIZE": "",
-            "STAGE2_MAX_EVALUATION_ROUNDS": "",
-            "STAGE2_MODEL": "Qwen/Qwen3-32B",
+            "STAGE2_MODEL": "Qwen/Qwen3.8-27B",
             "STAGE2_VLLM_DOWNLOAD_DIR": "",
             "STAGE2_VLLM_EXTRA_ARGS_JSON": "",
             "STAGE2_VLLM_GPUS": "",
@@ -143,7 +156,9 @@ fi
     assert "research_all_evidence_workflow" in invocations[3]
     assert "--stage2-vllm-servers 2" in invocations[3]
     assert r"--stage2-vllm-gpus cuda:0\,cuda:1" in invocations[3]
-    assert "--stage2-model Qwen/Qwen3-32B" in invocations[3]
+    assert "--stage2-model Qwen/Qwen3.8-27B" in invocations[3]
+    assert "--stage2-extraction-endpoint http://small-stage2.test/v1" in invocations[3]
+    assert "--stage2-extraction-model small-extractor" in invocations[3]
     assert "stage2.workers=32" in invocations[3]
     assert "--stage2-only" not in invocations[3]
     assert "Stage 2:        managed vLLM: 2 servers on cuda:0,cuda:1" in completed.stdout

@@ -81,14 +81,14 @@ def test_managed_gemma_defaults_use_request_scoped_reasoning():
 def test_managed_qwen_defaults_can_be_overridden():
     default_config = plain_stage2_config_from_mapping(
         {
-            "model": "Qwen/Qwen3-32B",
+            "model": "Qwen/Qwen3.8-27B",
             "vllm": {"server_count": 2, "gpus": "0,1"},
         },
         default_workers=4,
     )
     overridden = plain_stage2_config_from_mapping(
         {
-            "model": "Qwen/Qwen3-32B",
+            "model": "Qwen/Qwen3.8-27B",
             "interpretation_reasoning_effort": "low",
             "vllm": {
                 "server_count": 2,
@@ -137,7 +137,7 @@ def test_managed_qwen_defaults_can_be_overridden():
 def test_managed_vllm_rejects_unsafe_or_ambiguous_layouts(vllm, message):
     with pytest.raises(ValueError, match=message):
         plain_stage2_config_from_mapping(
-            {"model": "Qwen/Qwen3-32B", "vllm": vllm},
+            {"model": "Qwen/Qwen3.8-27B", "vllm": vllm},
             default_workers=4,
         )
 
@@ -147,7 +147,7 @@ def test_external_endpoint_and_managed_pool_are_mutually_exclusive():
         plain_stage2_config_from_mapping(
             {
                 "endpoint": "http://stage2.test/v1",
-                "model": "Qwen/Qwen3-32B",
+                "model": "Qwen/Qwen3.8-27B",
                 "vllm": {"server_count": 1, "gpus": [0]},
             },
             default_workers=4,
@@ -163,7 +163,7 @@ def test_managed_vllm_cli_options_compile_into_stage2_config(tmp_path):
             str(tmp_path / "output"),
             "--stage2-only",
             "--stage2-model",
-            "Qwen/Qwen3-32B",
+            "Qwen/Qwen3.8-27B",
             "--stage2-vllm-servers",
             "2",
             "--stage2-vllm-gpus",
@@ -224,6 +224,11 @@ def test_stage2_round_robins_requests_and_transport_retries_across_endpoints(mon
         return "{}"
 
     monkeypatch.setattr(stage2_workflow, "_openai_completion", fake_openai_completion)
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda _config: ["test-model"],
+    )
     config = PlainHandoffStage2Config(
         endpoint="http://127.0.0.1:8010/v1",
         model="test-model",
@@ -307,7 +312,7 @@ def test_run_wrapper_keeps_managed_servers_alive_for_stage2_and_cleans_up(
 ):
     config = plain_stage2_config_from_mapping(
         {
-            "model": "Qwen/Qwen3-32B",
+            "model": "Qwen/Qwen3.8-27B",
             "vllm": {"server_count": 2, "gpus": [0, 1]},
         },
         default_workers=4,
@@ -332,6 +337,11 @@ def test_run_wrapper_keeps_managed_servers_alive_for_stage2_and_cleans_up(
 
     monkeypatch.setattr(stage2_workflow, "launch_managed_vllm_servers", fake_launch)
     monkeypatch.setattr(PlainHandoffStage2, "run", fake_run)
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda _config: ["Qwen/Qwen3.8-27B"],
+    )
 
     result = run_plain_handoff_stage2(
         handoff_path=tmp_path / "handoff.jsonl",
@@ -386,7 +396,7 @@ def test_managed_pool_launches_one_process_per_gpu_and_writes_a_redacted_manifes
     monkeypatch.setattr(
         server_pool,
         "_server_model_ids",
-        lambda *_args, **_kwargs: ["Qwen/Qwen3-32B"],
+        lambda *_args, **_kwargs: ["Qwen/Qwen3.8-27B"],
     )
     monkeypatch.setattr(server_pool.subprocess, "Popen", FakeProcess)
 
@@ -411,7 +421,7 @@ def test_managed_pool_launches_one_process_per_gpu_and_writes_a_redacted_manifes
     )
     pool = ManagedVLLMServerPool(
         config=config,
-        model="Qwen/Qwen3-32B",
+        model="Qwen/Qwen3.8-27B",
         api_key="super-secret",
         output_dir=tmp_path / "servers",
     )
@@ -488,7 +498,7 @@ def test_managed_pool_cleans_up_other_servers_when_one_exits_during_startup(
     monkeypatch.setattr(
         server_pool,
         "_server_model_ids",
-        lambda *_args, **_kwargs: ["Qwen/Qwen3-32B"],
+        lambda *_args, **_kwargs: ["Qwen/Qwen3.8-27B"],
     )
     monkeypatch.setattr(server_pool.subprocess, "Popen", FakeProcess)
 
@@ -511,7 +521,7 @@ def test_managed_pool_cleans_up_other_servers_when_one_exits_during_startup(
             gpus=("cuda:0", "cuda:1"),
             startup_poll_interval=0.01,
         ),
-        model="Qwen/Qwen3-32B",
+        model="Qwen/Qwen3.8-27B",
         api_key="EMPTY",
         output_dir=tmp_path / "servers",
     )

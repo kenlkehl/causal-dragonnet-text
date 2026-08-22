@@ -2,8 +2,9 @@
 
 This module intentionally treats a directory as the checkpoint.  It reads the
 ordinary JSONL handoff, defines and extracts patient-level variables, reviews
-them using training-fold performance, and produces cross-fitted causal
-estimates.  It has no bundle format, artifact authentication, immutable
+small-model extraction aggregates with a separate primary model, selects roles
+with fold-local statistical screens, and produces causal-forest estimates.  It
+has no bundle format, artifact authentication, immutable
 request, content hashes, or checkpoint adoption.
 """
 
@@ -33,12 +34,6 @@ from .plain_handoff_stage2_evidence import (
     SUPPORTED_STAGE2_ARCHITECTURES,
     compile_stage2_handoff_evidence,
 )
-from .stage2_evidence_communities import (
-    EVIDENCE_COMMUNITY_ARCHITECTURE,
-    EVIDENCE_COMMUNITY_SCHEMA_VERSION,
-    Stage2EvidenceCommunityConfig,
-    distill_stage2_evidence_communities,
-)
 from .plain_handoff_stage2_analysis import run_fold_analysis
 from .vllm_server_pool import (
     ManagedVLLMConfig,
@@ -57,11 +52,14 @@ ALLOWED_EVIDENCE_AXES = {
     "semantic",
     "unclear",
 }
-ALLOWED_ROLES = {"confounder", "prognostic", "effect_modifier"}
+ALLOWED_ROLES = {"confounder", "effect_modifier"}
 DEFAULT_MAX_RESPONSE_REPAIRS = 10
 DEFAULT_THINKING_AFTER_RESPONSE_REPAIRS = 5
 THINKING_RESPONSE_REPAIR_EFFORT = "high"
-DEFAULT_MAX_TOKENS = 50_000
+# This is an output ceiling, not a requested output length. Models still stop
+# normally at EOS as soon as the validated JSON object is complete.
+MINIMUM_MAX_TOKENS = 100_000
+DEFAULT_MAX_TOKENS = MINIMUM_MAX_TOKENS
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_INTERPRETATION_REASONING_EFFORT = "high"
 DEFAULT_EXTRACTION_REASONING_EFFORT = "none"
@@ -79,46 +77,23 @@ DEFAULT_CONSOLIDATION_SHUFFLE_ROUNDS = 50
 DEFAULT_CONSOLIDATION_MAX_ROUNDS = (
     DEFAULT_CONSOLIDATION_ALPHABETICAL_ROUNDS + DEFAULT_CONSOLIDATION_SHUFFLE_ROUNDS
 )
-DEFAULT_CANDIDATE_SELECTION_TOP_N = 50
-DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_DEVICE = "cpu"
-DEFAULT_CANDIDATE_REGISTRY_SIMILARITY_THRESHOLD = 0.94
-DEFAULT_CANDIDATE_SELECTION_METHOD = "late_interaction"
-DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_MODEL = (
-    "answerdotai/answerai-colbert-small-v1"
-)
-DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_DEVICE = "cpu"
-DEFAULT_CANDIDATE_SELECTION_TOP_EVIDENCE_PACKETS = 3
-DEFAULT_CANDIDATE_SELECTION_DOCUMENT_CHUNK_OVERLAP_TOKENS = 32
-DEFAULT_EVIDENCE_COMMUNITY_ENABLED = True
-DEFAULT_EVIDENCE_COMMUNITY_MODEL = "answerdotai/answerai-colbert-small-v1"
-DEFAULT_EVIDENCE_COMMUNITY_DEVICE = "cpu"
-DEFAULT_EVIDENCE_COMMUNITY_MAX_PACKETS = 75
-DEFAULT_EVIDENCE_COMMUNITY_MIN_PER_CAUSAL_LANE = 30
-DEFAULT_EVIDENCE_COMMUNITY_MAX_ATOM_WORDS = 16
-DEFAULT_EVIDENCE_COMMUNITY_ATOM_OVERLAP_WORDS = 4
-DEFAULT_EVIDENCE_COMMUNITY_CANDIDATE_NEIGHBORS = 40
-DEFAULT_EVIDENCE_COMMUNITY_RECIPROCAL_NEIGHBORS = 5
-DEFAULT_EVIDENCE_COMMUNITY_LOUVAIN_RESOLUTION = 2.5
-DEFAULT_EVIDENCE_COMMUNITY_MAX_EXEMPLARS = 3
-DEFAULT_EVIDENCE_COMMUNITY_MAX_CONSENSUS_PHRASES = 20
-DEFAULT_EVIDENCE_COMMUNITY_INNER_FOLD_SATURATION = 5
-DEFAULT_EVIDENCE_COMMUNITY_ARCHITECTURE_SATURATION = 4
-DEFAULT_EVIDENCE_COMMUNITY_HIERARCHY_TARGET_COMMUNITIES = (300, 75)
-DEFAULT_CANDIDATE_DISCOVERY_SOURCE = "compiled_packets"
-DEFAULT_CANDIDATE_SELECTION_HIERARCHICAL_COLBERT = True
-DEFAULT_CANDIDATE_SELECTION_HIERARCHY_TOP_COMMUNITIES = 3
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
-DEFAULT_SCREENING_TREES = 200
-DEFAULT_MAX_EVALUATION_ROUNDS = 10
-DEFAULT_STABILITY_SELECTION_ROUNDS = 3
-DEFAULT_STABILITY_SELECTION_FREQUENCY = 2.0 / 3.0
-DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION = 0.01
-DEFAULT_EFFECT_MODIFIER_NEGATIVE_FOLD_FRACTION = 0.6
-CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v15_request_scoped_reasoning"
+DEFAULT_CONFOUNDER_P_VALUE_THRESHOLD = 0.05
+DEFAULT_CONFOUNDER_MIN_INNER_FOLD_FRACTION = 0.75
+DEFAULT_EFFECT_MODIFIER_P_VALUE_THRESHOLD = 0.05
+DEFAULT_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION = 0.75
+DEFAULT_SELECTION_WORKERS = 4
+MODEL_IDENTITY_SCHEMA_VERSION = "stage2_endpoint_model_identity_v1"
+# Kept only so historical, non-exported candidate-funnel helpers remain
+# importable while old checkpoints can be inspected. The Stage 2 execution
+# path never calls them.
+DEFAULT_CANDIDATE_SELECTION_HIERARCHY_TOP_COMMUNITIES = 3
+CANDIDATE_SELECTION_SCHEMA_VERSION = "retired_colbert_candidate_selection"
+_CANDIDATE_SELECTION_ENCODING_LOCK = threading.Lock()
+CONSOLIDATION_SCHEMA_VERSION = "global_candidate_pool_v16_exhaustive_cards"
 GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION = (
-    "alphabetical_then_seeded_shuffle_candidate_batches_v9_atomic_merge_only"
+    "alphabetical_then_seeded_shuffle_candidate_batches_v10_no_prefilter"
 )
 EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
     "training_failure_ontology_refinement_v1_explicit_feature_invariants"
@@ -126,18 +101,11 @@ EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
 OPERATIONALIZATION_SCHEMA_VERSION = (
     "feature_name_bounded_supporting_text_v6_continuous_category_fallback"
 )
-INTERPRETATION_SCHEMA_VERSION = (
-    "candidate_first_compiled_evidence_v11_exhaustive_decomposition"
-)
+INTERPRETATION_SCHEMA_VERSION = "semantic_cards_exhaustive_feature_discovery_v12"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = (
     "rejected_packet_text_only_ordinals_v7_exhaustive_decomposition"
 )
-CANDIDATE_SELECTION_SCHEMA_VERSION = (
-    "candidate_first_hierarchical_colbert_axis_top_n_v2"
-)
 CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE = "configured_explicit_feature"
-
-_CANDIDATE_SELECTION_ENCODING_LOCK = threading.Lock()
 
 _CONCEPT_IDENTITY_STOPWORDS = {
     "a",
@@ -545,9 +513,14 @@ class Stage2ExplicitFeature:
             raw_roles = [raw_roles]
         if not isinstance(raw_roles, Sequence) or isinstance(raw_roles, (bytes, bytearray)):
             raise ValueError(f"stage2 explicit feature {name!r} roles must be a list")
-        roles = list(
-            dict.fromkeys(str(role).strip().lower() for role in raw_roles if str(role).strip())
-        )
+        roles: list[str] = []
+        for raw_role in raw_roles:
+            role = str(raw_role).strip().lower()
+            if role == "both":
+                roles.extend(["confounder", "effect_modifier"])
+            elif role:
+                roles.append(role)
+        roles = list(dict.fromkeys(roles))
         if not roles:
             raise ValueError(f"stage2 explicit feature {name!r} requires at least one causal role")
         unsupported_roles = sorted(set(roles) - ALLOWED_ROLES)
@@ -669,6 +642,36 @@ def _stage2_explicit_features_from_value(raw: Any) -> tuple[Stage2ExplicitFeatur
 
 
 @dataclass(frozen=True)
+class Stage2ExtractionLLMConfig:
+    """Small-model transport used only for patient value extraction."""
+
+    endpoint: str
+    model: str = ""
+    api_key: str = "EMPTY"
+    workers: int = 4
+
+    def validate(self, *, require_model: bool = True) -> None:
+        parsed = urlparse(self.endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "stage2.extraction_llm.endpoint must be one HTTP(S) "
+                "OpenAI-compatible base URL"
+            )
+        if require_model and not self.model.strip():
+            raise ValueError("stage2.extraction_llm.model must be nonempty")
+        if isinstance(self.workers, bool) or not isinstance(self.workers, int) or self.workers < 1:
+            raise ValueError("stage2.extraction_llm.workers must be a positive integer")
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "endpoint": self.endpoint,
+            "model": self.model,
+            "api_key": "<redacted>",
+            "workers": self.workers,
+        }
+
+
+@dataclass(frozen=True)
 class PlainHandoffStage2Config:
     endpoint: str
     model: str = ""
@@ -681,9 +684,8 @@ class PlainHandoffStage2Config:
     # request-kind policy.
     max_response_repairs: int = DEFAULT_MAX_RESPONSE_REPAIRS
     thinking_after_response_repairs: int = DEFAULT_THINKING_AFTER_RESPONSE_REPAIRS
-    # Patient-level extraction remains output-bounded. Interpretation-class
-    # requests deliberately omit max_tokens and may use the model's remaining
-    # context window.
+    # Every request receives this generous output ceiling. It never forces the
+    # model to generate this many tokens; normal EOS/stop behavior is unchanged.
     max_tokens: int = DEFAULT_MAX_TOKENS
     interpretation_reasoning_effort: str = DEFAULT_INTERPRETATION_REASONING_EFFORT
     extraction_reasoning_effort: str = DEFAULT_EXTRACTION_REASONING_EFFORT
@@ -708,109 +710,23 @@ class PlainHandoffStage2Config:
     evidence_max_cards_per_fold: int = 400
     evidence_max_exemplars_per_card: int = 4
     evidence_max_exemplar_chars: int = 2_400
-    # Candidate discovery defaults to every compiled evidence packet. The old
-    # community-gated behavior remains an explicit compatibility mode.
-    candidate_discovery_source: str = DEFAULT_CANDIDATE_DISCOVERY_SOURCE
-    # Independently organize compiled evidence into reciprocal ColBERT
-    # communities for post-discovery routing. Independent confounder/modifier
-    # reserves are deduplicated before global fill.
-    evidence_community_enabled: bool = DEFAULT_EVIDENCE_COMMUNITY_ENABLED
-    evidence_community_model: str = DEFAULT_EVIDENCE_COMMUNITY_MODEL
-    evidence_community_device: str = DEFAULT_EVIDENCE_COMMUNITY_DEVICE
-    evidence_community_max_packets: int = DEFAULT_EVIDENCE_COMMUNITY_MAX_PACKETS
-    evidence_community_min_per_causal_lane: int = (
-        DEFAULT_EVIDENCE_COMMUNITY_MIN_PER_CAUSAL_LANE
-    )
-    evidence_community_max_atom_words: int = DEFAULT_EVIDENCE_COMMUNITY_MAX_ATOM_WORDS
-    evidence_community_atom_overlap_words: int = (
-        DEFAULT_EVIDENCE_COMMUNITY_ATOM_OVERLAP_WORDS
-    )
-    evidence_community_candidate_neighbors: int = (
-        DEFAULT_EVIDENCE_COMMUNITY_CANDIDATE_NEIGHBORS
-    )
-    evidence_community_reciprocal_neighbors: int = (
-        DEFAULT_EVIDENCE_COMMUNITY_RECIPROCAL_NEIGHBORS
-    )
-    evidence_community_louvain_resolution: float = (
-        DEFAULT_EVIDENCE_COMMUNITY_LOUVAIN_RESOLUTION
-    )
-    evidence_community_max_exemplars: int = DEFAULT_EVIDENCE_COMMUNITY_MAX_EXEMPLARS
-    evidence_community_max_consensus_phrases: int = (
-        DEFAULT_EVIDENCE_COMMUNITY_MAX_CONSENSUS_PHRASES
-    )
-    evidence_community_inner_fold_saturation: int = (
-        DEFAULT_EVIDENCE_COMMUNITY_INNER_FOLD_SATURATION
-    )
-    evidence_community_architecture_saturation: int = (
-        DEFAULT_EVIDENCE_COMMUNITY_ARCHITECTURE_SATURATION
-    )
-    evidence_community_hierarchy_target_communities: tuple[int, ...] = (
-        DEFAULT_EVIDENCE_COMMUNITY_HIERARCHY_TARGET_COMMUNITIES
-    )
-    # Hard downstream cardinality cap after fold-local candidate registry and
-    # evidence ranking. Investigator-configured features are added later and
-    # are never subject to this discovery cap.
-    max_candidates_per_fold: int = 50
-    # Accepted for compatibility with existing run files. Consolidation no
-    # longer uses a progressive or oversampled feature beam.
-    consolidation_oversample_factor: int = 4
-    # Retain the best discovered candidates within each evidence axis, then
-    # take their union subject to max_candidates_per_fold.
-    candidate_selection_top_n: int = DEFAULT_CANDIDATE_SELECTION_TOP_N
-    # Exact normalized names are collapsed first. Dense embeddings are then
-    # used only for conservative, lexically anchored semantic registry merges.
-    candidate_registry_embedding_model: str = DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_MODEL
-    candidate_registry_embedding_device: str = DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_DEVICE
-    candidate_registry_similarity_threshold: float = (
-        DEFAULT_CANDIDATE_REGISTRY_SIMILARITY_THRESHOLD
-    )
-    # Late interaction is the default relevance scorer. Dense cosine remains
-    # available as an explicit fallback and reuses the registry encoder.
-    candidate_selection_method: str = DEFAULT_CANDIDATE_SELECTION_METHOD
-    candidate_selection_late_interaction_model: str = (
-        DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_MODEL
-    )
-    candidate_selection_late_interaction_device: str = (
-        DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_DEVICE
-    )
-    candidate_selection_top_evidence_packets: int = (
-        DEFAULT_CANDIDATE_SELECTION_TOP_EVIDENCE_PACKETS
-    )
-    candidate_selection_document_chunk_overlap_tokens: int = (
-        DEFAULT_CANDIDATE_SELECTION_DOCUMENT_CHUNK_OVERLAP_TOKENS
-    )
-    # Score candidate queries against final community routers, descend through
-    # their source-packet lineage, and rerank the resulting compiled packets.
-    candidate_selection_hierarchical_colbert: bool = (
-        DEFAULT_CANDIDATE_SELECTION_HIERARCHICAL_COLBERT
-    )
-    candidate_selection_hierarchy_top_communities: int = (
-        DEFAULT_CANDIDATE_SELECTION_HIERARCHY_TOP_COMMUNITIES
-    )
     workers: int = 4
-    # Limits language-model reviews. Deterministic evaluation-only convergence
-    # rounds may continue after this many reviews when the last review changes
-    # the retained features, causal roles, or modeling representation.
+    # Process workers used only by the fold-local statistical screens.
+    selection_workers: int = DEFAULT_SELECTION_WORKERS
+    extraction_llm: Stage2ExtractionLLMConfig | None = None
+    # Limits aggregate ontology-supervisor reviews. These reviews cannot add,
+    # drop, rename, or assign roles to candidate features.
     max_review_rounds: int = 2
-    # Absolute per-outer-fold cap across reviewed and evaluation-only rounds.
-    # A fold that has not achieved stability by this point is flagged and
-    # continues with its latest retained definitions.
-    max_evaluation_rounds: int = DEFAULT_MAX_EVALUATION_ROUNDS
     ontology_refinement_min_failure_patients: int = DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS
     max_ontology_refinement_rounds: int = DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS
-    # Use the same nonlinear model family during training-fold screening that
-    # is used for the frozen outer-fold estimate. This applies to propensity,
-    # outcome, and treatment-effect models whenever feature columns exist.
-    screening_trees: int = DEFAULT_SCREENING_TREES
-    # Repeated forest screens provide stability-selection votes. Ordinary
-    # causal roles must earn stable positive support; effect modifiers use an
-    # asymmetric, conservative removal rule configured below.
-    stability_selection_rounds: int = DEFAULT_STABILITY_SELECTION_ROUNDS
-    stability_selection_frequency: float = DEFAULT_STABILITY_SELECTION_FREQUENCY
-    effect_modifier_negative_margin_fraction: float = (
-        DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION
+    confounder_p_value_threshold: float = DEFAULT_CONFOUNDER_P_VALUE_THRESHOLD
+    confounder_min_inner_fold_fraction: float = (
+        DEFAULT_CONFOUNDER_MIN_INNER_FOLD_FRACTION
     )
-    effect_modifier_negative_fold_fraction: float = DEFAULT_EFFECT_MODIFIER_NEGATIVE_FOLD_FRACTION
+    effect_modifier_p_value_threshold: float = DEFAULT_EFFECT_MODIFIER_P_VALUE_THRESHOLD
+    effect_modifier_min_inner_fold_fraction: float = (
+        DEFAULT_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION
+    )
     estimation_trees: int = 200
     propensity_clip: float = 0.02
     min_nonmissing_fraction: float = 0.05
@@ -829,6 +745,9 @@ class PlainHandoffStage2Config:
     # A bounded repair may temporarily strengthen the request-level reasoning
     # policy. This override is transport state, not scientific configuration.
     runtime_reasoning_effort: str | None = None
+    # Detected from the live endpoint's model record (including its backing
+    # root when available) so served aliases still receive the right controls.
+    runtime_model_family: str = ""
 
     def validate(
         self,
@@ -869,9 +788,12 @@ class PlainHandoffStage2Config:
         if (
             isinstance(self.max_tokens, bool)
             or not isinstance(self.max_tokens, int)
-            or self.max_tokens < 1
+            or self.max_tokens < MINIMUM_MAX_TOKENS
         ):
-            raise ValueError("stage2.max_tokens must be a positive integer")
+            raise ValueError(
+                "stage2.max_tokens must be an integer of at least "
+                f"{MINIMUM_MAX_TOKENS}; it is an output ceiling, not a minimum length"
+            )
         for field_name, effort in (
             ("interpretation_reasoning_effort", self.interpretation_reasoning_effort),
             ("extraction_reasoning_effort", self.extraction_reasoning_effort),
@@ -893,6 +815,8 @@ class PlainHandoffStage2Config:
                 "stage2.runtime_reasoning_effort must be null or one of "
                 f"{sorted(SUPPORTED_REASONING_EFFORTS)}"
             )
+        if self.runtime_model_family not in {"", "qwen3", "gemma4", "lfm2.5", "other"}:
+            raise ValueError("stage2.runtime_model_family is not recognized")
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.consolidation_max_prompt_chars < 4_000:
@@ -950,149 +874,54 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.evidence_max_exemplars_per_card must be positive")
         if self.evidence_max_exemplar_chars < 256:
             raise ValueError("stage2.evidence_max_exemplar_chars must be at least 256")
-        if self.candidate_discovery_source not in {
-            "compiled_packets",
-            "community_packets",
-        }:
-            raise ValueError(
-                "stage2.candidate_discovery_source must be compiled_packets or "
-                "community_packets"
-            )
-        if not isinstance(self.evidence_community_enabled, bool):
-            raise ValueError("stage2.evidence_community_enabled must be true or false")
-        if (
-            self.candidate_discovery_source == "community_packets"
-            and not self.evidence_community_enabled
-        ):
-            raise ValueError(
-                "stage2.candidate_discovery_source=community_packets requires "
-                "stage2.evidence_community_enabled=true"
-            )
-        try:
-            Stage2EvidenceCommunityConfig(
-                model_name=self.evidence_community_model,
-                device=self.evidence_community_device,
-                max_communities=self.evidence_community_max_packets,
-                min_per_causal_lane=self.evidence_community_min_per_causal_lane,
-                max_atom_words=self.evidence_community_max_atom_words,
-                atom_overlap_words=self.evidence_community_atom_overlap_words,
-                candidate_neighbors=self.evidence_community_candidate_neighbors,
-                reciprocal_neighbors=self.evidence_community_reciprocal_neighbors,
-                louvain_resolution=self.evidence_community_louvain_resolution,
-                max_exemplars=self.evidence_community_max_exemplars,
-                max_consensus_phrases=self.evidence_community_max_consensus_phrases,
-                inner_fold_saturation=self.evidence_community_inner_fold_saturation,
-                architecture_saturation=self.evidence_community_architecture_saturation,
-                hierarchy_target_communities=(
-                    self.evidence_community_hierarchy_target_communities
-                ),
-            ).validate()
-        except ValueError as exc:
-            raise ValueError(f"stage2.{exc}") from exc
-        if self.max_candidates_per_fold < 1:
-            raise ValueError("stage2.max_candidates_per_fold must be positive")
-        if self.consolidation_oversample_factor < 1:
-            raise ValueError("stage2.consolidation_oversample_factor must be positive")
-        if (
-            isinstance(self.candidate_selection_top_n, bool)
-            or not isinstance(self.candidate_selection_top_n, int)
-            or self.candidate_selection_top_n < 1
-        ):
-            raise ValueError("stage2.candidate_selection_top_n must be a positive integer")
-        if not str(self.candidate_registry_embedding_model).strip():
-            raise ValueError("stage2.candidate_registry_embedding_model must be nonempty")
-        if not str(self.candidate_registry_embedding_device).strip():
-            raise ValueError("stage2.candidate_registry_embedding_device must be nonempty")
-        if (
-            isinstance(self.candidate_registry_similarity_threshold, bool)
-            or not isinstance(self.candidate_registry_similarity_threshold, (int, float))
-            or not math.isfinite(float(self.candidate_registry_similarity_threshold))
-            or not 0.0 < float(self.candidate_registry_similarity_threshold) <= 1.0
-        ):
-            raise ValueError(
-                "stage2.candidate_registry_similarity_threshold must be between 0 and 1"
-            )
-        if self.candidate_selection_method not in {"late_interaction", "dense_cosine"}:
-            raise ValueError(
-                "stage2.candidate_selection_method must be late_interaction or dense_cosine"
-            )
-        if not str(self.candidate_selection_late_interaction_model).strip():
-            raise ValueError(
-                "stage2.candidate_selection_late_interaction_model must be nonempty"
-            )
-        if not str(self.candidate_selection_late_interaction_device).strip():
-            raise ValueError(
-                "stage2.candidate_selection_late_interaction_device must be nonempty"
-            )
-        if (
-            isinstance(self.candidate_selection_top_evidence_packets, bool)
-            or not isinstance(self.candidate_selection_top_evidence_packets, int)
-            or self.candidate_selection_top_evidence_packets < 1
-        ):
-            raise ValueError(
-                "stage2.candidate_selection_top_evidence_packets must be a positive integer"
-            )
-        if (
-            isinstance(self.candidate_selection_document_chunk_overlap_tokens, bool)
-            or not isinstance(
-                self.candidate_selection_document_chunk_overlap_tokens,
-                int,
-            )
-            or self.candidate_selection_document_chunk_overlap_tokens < 0
-        ):
-            raise ValueError(
-                "stage2.candidate_selection_document_chunk_overlap_tokens must be a "
-                "nonnegative integer"
-            )
-        if not isinstance(self.candidate_selection_hierarchical_colbert, bool):
-            raise ValueError(
-                "stage2.candidate_selection_hierarchical_colbert must be true or false"
-            )
-        if (
-            isinstance(self.candidate_selection_hierarchy_top_communities, bool)
-            or not isinstance(
-                self.candidate_selection_hierarchy_top_communities,
-                int,
-            )
-            or self.candidate_selection_hierarchy_top_communities < 1
-        ):
-            raise ValueError(
-                "stage2.candidate_selection_hierarchy_top_communities must be a "
-                "positive integer"
-            )
         if self.workers < 1:
             raise ValueError("stage2.workers must be positive")
+        if (
+            isinstance(self.selection_workers, bool)
+            or not isinstance(self.selection_workers, int)
+            or self.selection_workers < 1
+        ):
+            raise ValueError("stage2.selection_workers must be a positive integer")
+        if self.extraction_llm is not None:
+            if not isinstance(self.extraction_llm, Stage2ExtractionLLMConfig):
+                raise ValueError(
+                    "stage2.extraction_llm must be a Stage2ExtractionLLMConfig object"
+                )
+            self.extraction_llm.validate(require_model=require_model)
         if self.max_review_rounds < 1:
             raise ValueError("stage2.max_review_rounds must be positive")
-        if (
-            isinstance(self.max_evaluation_rounds, bool)
-            or not isinstance(self.max_evaluation_rounds, int)
-            or self.max_evaluation_rounds < 1
-        ):
-            raise ValueError("stage2.max_evaluation_rounds must be a positive integer")
-        if self.max_evaluation_rounds < self.stability_selection_rounds:
-            raise ValueError(
-                "stage2.max_evaluation_rounds must be at least "
-                "stage2.stability_selection_rounds"
-            )
         if self.ontology_refinement_min_failure_patients < 2:
             raise ValueError("stage2.ontology_refinement_min_failure_patients must be at least 2")
         if self.max_ontology_refinement_rounds < 0:
             raise ValueError("stage2.max_ontology_refinement_rounds must be nonnegative")
-        if self.screening_trees < 10:
-            raise ValueError("stage2.screening_trees must be at least 10")
-        if self.stability_selection_rounds < 2:
-            raise ValueError("stage2.stability_selection_rounds must be at least 2")
-        if not 0.5 <= self.stability_selection_frequency <= 1.0:
-            raise ValueError("stage2.stability_selection_frequency must be between 0.5 and 1")
-        if not 0.0 < self.effect_modifier_negative_margin_fraction < 1.0:
-            raise ValueError(
-                "stage2.effect_modifier_negative_margin_fraction must be between 0 and 1"
-            )
-        if not 0.5 <= self.effect_modifier_negative_fold_fraction <= 1.0:
-            raise ValueError(
-                "stage2.effect_modifier_negative_fold_fraction must be between 0.5 and 1"
-            )
+        for field_name, value in (
+            ("confounder_p_value_threshold", self.confounder_p_value_threshold),
+            ("effect_modifier_p_value_threshold", self.effect_modifier_p_value_threshold),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 < float(value) < 1.0
+            ):
+                raise ValueError(f"stage2.{field_name} must be strictly between 0 and 1")
+        for field_name, value in (
+            (
+                "confounder_min_inner_fold_fraction",
+                self.confounder_min_inner_fold_fraction,
+            ),
+            (
+                "effect_modifier_min_inner_fold_fraction",
+                self.effect_modifier_min_inner_fold_fraction,
+            ),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 < float(value) <= 1.0
+            ):
+                raise ValueError(f"stage2.{field_name} must be in (0, 1]")
         if self.estimation_trees < 10:
             raise ValueError("stage2.estimation_trees must be at least 10")
         if not 0.0 < self.propensity_clip < 0.5:
@@ -1128,9 +957,13 @@ class PlainHandoffStage2Config:
     def public_dict(self) -> dict[str, Any]:
         values = asdict(self)
         values["api_key"] = "<redacted>"
+        values["extraction_llm"] = (
+            self.extraction_llm.public_dict() if self.extraction_llm is not None else None
+        )
         values.pop("runtime_endpoints", None)
         values.pop("runtime_request_kind", None)
         values.pop("runtime_reasoning_effort", None)
+        values.pop("runtime_model_family", None)
         values["explicit_features"] = [
             feature.as_definition() for feature in self.explicit_features
         ]
@@ -1174,22 +1007,6 @@ def plain_stage2_config_from_mapping(
             return tuple(part.strip() for part in value.split(",") if part.strip())
         return tuple(value)
 
-    def integer_tuple(value: Any, *, field_name: str) -> tuple[int, ...]:
-        if isinstance(value, str):
-            raw_values: Sequence[Any] = [
-                part.strip() for part in value.split(",") if part.strip()
-            ]
-        elif isinstance(value, Sequence):
-            raw_values = value
-        else:
-            raise ValueError(f"stage2.{field_name} must be an array or comma-separated string")
-        if any(isinstance(item, bool) for item in raw_values):
-            raise ValueError(f"stage2.{field_name} must contain integers")
-        try:
-            return tuple(int(item) for item in raw_values)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"stage2.{field_name} must contain integers") from exc
-
     if "interpretation_reasoning_effort" in raw:
         interpretation_reasoning_effort = (
             str(raw["interpretation_reasoning_effort"]).strip().lower()
@@ -1216,21 +1033,60 @@ def plain_stage2_config_from_mapping(
         .strip()
         .lower()
     )
-    evidence_community_enabled = raw.get(
-        "evidence_community_enabled",
-        DEFAULT_EVIDENCE_COMMUNITY_ENABLED,
+
+    retired_keys = sorted(
+        key
+        for key in raw
+        if key == "candidate_discovery_source"
+        or key == "max_candidates_per_fold"
+        or key == "consolidation_oversample_factor"
+        or key == "screening_trees"
+        or key == "max_evaluation_rounds"
+        or key.startswith("evidence_community_")
+        or key.startswith("candidate_registry_")
+        or key.startswith("candidate_selection_")
+        or key.startswith("stability_selection_")
+        or key.startswith("effect_modifier_negative_")
     )
-    if not isinstance(evidence_community_enabled, bool):
-        raise ValueError("stage2.evidence_community_enabled must be true or false")
-    candidate_selection_hierarchical_colbert = raw.get(
-        "candidate_selection_hierarchical_colbert",
-        DEFAULT_CANDIDATE_SELECTION_HIERARCHICAL_COLBERT,
-    )
-    if not isinstance(candidate_selection_hierarchical_colbert, bool):
-        raise ValueError(
-            "stage2.candidate_selection_hierarchical_colbert must be true or false"
+    if retired_keys:
+        LOGGER.warning(
+            "ignoring retired Stage 2 ColBERT/forest-screening settings: %s",
+            ", ".join(f"stage2.{key}" for key in retired_keys),
         )
 
+    raw_extraction_llm = raw.get("extraction_llm")
+    if raw_extraction_llm is None:
+        extraction_llm = None
+    elif not isinstance(raw_extraction_llm, Mapping):
+        raise ValueError("stage2.extraction_llm must be an object")
+    else:
+        extraction_endpoint = str(raw_extraction_llm.get("endpoint") or "").strip().rstrip("/")
+        if not extraction_endpoint:
+            raise ValueError("stage2.extraction_llm.endpoint is required")
+        extraction_llm = Stage2ExtractionLLMConfig(
+            endpoint=extraction_endpoint,
+            model=str(raw_extraction_llm.get("model") or "").strip(),
+            api_key=str(
+                raw_extraction_llm.get("api_key")
+                or os.environ.get("OCI_STAGE2_EXTRACTION_API_KEY")
+                or "EMPTY"
+            ),
+            workers=max(
+                1,
+                int(
+                    raw_extraction_llm.get(
+                        "workers",
+                        min(4, max(1, default_workers)),
+                    )
+                ),
+            ),
+        )
+        extraction_llm.validate(require_model=False)
+
+    configured_workers = max(
+        1,
+        int(raw.get("workers", min(4, max(1, default_workers)))),
+    )
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
         model=model,
@@ -1299,159 +1155,13 @@ def plain_stage2_config_from_mapping(
         evidence_max_cards_per_fold=int(raw.get("evidence_max_cards_per_fold", 400)),
         evidence_max_exemplars_per_card=int(raw.get("evidence_max_exemplars_per_card", 4)),
         evidence_max_exemplar_chars=int(raw.get("evidence_max_exemplar_chars", 2_400)),
-        candidate_discovery_source=str(
-            raw.get("candidate_discovery_source", DEFAULT_CANDIDATE_DISCOVERY_SOURCE)
-        ).strip().lower(),
-        evidence_community_enabled=evidence_community_enabled,
-        evidence_community_model=str(
-            raw.get("evidence_community_model", DEFAULT_EVIDENCE_COMMUNITY_MODEL)
-        ).strip(),
-        evidence_community_device=str(
-            raw.get("evidence_community_device", DEFAULT_EVIDENCE_COMMUNITY_DEVICE)
-        ).strip(),
-        evidence_community_max_packets=int(
-            raw.get(
-                "evidence_community_max_packets",
-                DEFAULT_EVIDENCE_COMMUNITY_MAX_PACKETS,
-            )
+        workers=configured_workers,
+        selection_workers=max(
+            1,
+            int(raw.get("selection_workers", configured_workers)),
         ),
-        evidence_community_min_per_causal_lane=int(
-            raw.get(
-                "evidence_community_min_per_causal_lane",
-                DEFAULT_EVIDENCE_COMMUNITY_MIN_PER_CAUSAL_LANE,
-            )
-        ),
-        evidence_community_max_atom_words=int(
-            raw.get(
-                "evidence_community_max_atom_words",
-                DEFAULT_EVIDENCE_COMMUNITY_MAX_ATOM_WORDS,
-            )
-        ),
-        evidence_community_atom_overlap_words=int(
-            raw.get(
-                "evidence_community_atom_overlap_words",
-                DEFAULT_EVIDENCE_COMMUNITY_ATOM_OVERLAP_WORDS,
-            )
-        ),
-        evidence_community_candidate_neighbors=int(
-            raw.get(
-                "evidence_community_candidate_neighbors",
-                DEFAULT_EVIDENCE_COMMUNITY_CANDIDATE_NEIGHBORS,
-            )
-        ),
-        evidence_community_reciprocal_neighbors=int(
-            raw.get(
-                "evidence_community_reciprocal_neighbors",
-                DEFAULT_EVIDENCE_COMMUNITY_RECIPROCAL_NEIGHBORS,
-            )
-        ),
-        evidence_community_louvain_resolution=float(
-            raw.get(
-                "evidence_community_louvain_resolution",
-                DEFAULT_EVIDENCE_COMMUNITY_LOUVAIN_RESOLUTION,
-            )
-        ),
-        evidence_community_max_exemplars=int(
-            raw.get(
-                "evidence_community_max_exemplars",
-                DEFAULT_EVIDENCE_COMMUNITY_MAX_EXEMPLARS,
-            )
-        ),
-        evidence_community_max_consensus_phrases=int(
-            raw.get(
-                "evidence_community_max_consensus_phrases",
-                DEFAULT_EVIDENCE_COMMUNITY_MAX_CONSENSUS_PHRASES,
-            )
-        ),
-        evidence_community_inner_fold_saturation=int(
-            raw.get(
-                "evidence_community_inner_fold_saturation",
-                DEFAULT_EVIDENCE_COMMUNITY_INNER_FOLD_SATURATION,
-            )
-        ),
-        evidence_community_architecture_saturation=int(
-            raw.get(
-                "evidence_community_architecture_saturation",
-                DEFAULT_EVIDENCE_COMMUNITY_ARCHITECTURE_SATURATION,
-            )
-        ),
-        evidence_community_hierarchy_target_communities=integer_tuple(
-            raw.get(
-                "evidence_community_hierarchy_target_communities",
-                DEFAULT_EVIDENCE_COMMUNITY_HIERARCHY_TARGET_COMMUNITIES,
-            ),
-            field_name="evidence_community_hierarchy_target_communities",
-        ),
-        max_candidates_per_fold=int(raw.get("max_candidates_per_fold", 50)),
-        consolidation_oversample_factor=int(raw.get("consolidation_oversample_factor", 4)),
-        candidate_selection_top_n=int(
-            raw.get("candidate_selection_top_n", DEFAULT_CANDIDATE_SELECTION_TOP_N)
-        ),
-        candidate_registry_embedding_model=str(
-            raw.get(
-                "candidate_registry_embedding_model",
-                raw.get(
-                    "candidate_selection_embedding_model",
-                    DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_MODEL,
-                ),
-            )
-        ).strip(),
-        candidate_registry_embedding_device=str(
-            raw.get(
-                "candidate_registry_embedding_device",
-                raw.get(
-                    "candidate_selection_embedding_device",
-                    DEFAULT_CANDIDATE_REGISTRY_EMBEDDING_DEVICE,
-                ),
-            )
-        ).strip(),
-        candidate_registry_similarity_threshold=float(
-            raw.get(
-                "candidate_registry_similarity_threshold",
-                DEFAULT_CANDIDATE_REGISTRY_SIMILARITY_THRESHOLD,
-            )
-        ),
-        candidate_selection_method=str(
-            raw.get("candidate_selection_method", DEFAULT_CANDIDATE_SELECTION_METHOD)
-        ).strip(),
-        candidate_selection_late_interaction_model=str(
-            raw.get(
-                "candidate_selection_late_interaction_model",
-                DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_MODEL,
-            )
-        ).strip(),
-        candidate_selection_late_interaction_device=str(
-            raw.get(
-                "candidate_selection_late_interaction_device",
-                DEFAULT_CANDIDATE_SELECTION_LATE_INTERACTION_DEVICE,
-            )
-        ).strip(),
-        candidate_selection_top_evidence_packets=int(
-            raw.get(
-                "candidate_selection_top_evidence_packets",
-                DEFAULT_CANDIDATE_SELECTION_TOP_EVIDENCE_PACKETS,
-            )
-        ),
-        candidate_selection_document_chunk_overlap_tokens=int(
-            raw.get(
-                "candidate_selection_document_chunk_overlap_tokens",
-                DEFAULT_CANDIDATE_SELECTION_DOCUMENT_CHUNK_OVERLAP_TOKENS,
-            )
-        ),
-        candidate_selection_hierarchical_colbert=(
-            candidate_selection_hierarchical_colbert
-        ),
-        candidate_selection_hierarchy_top_communities=int(
-            raw.get(
-                "candidate_selection_hierarchy_top_communities",
-                DEFAULT_CANDIDATE_SELECTION_HIERARCHY_TOP_COMMUNITIES,
-            )
-        ),
-        workers=max(1, int(raw.get("workers", min(4, max(1, default_workers))))),
+        extraction_llm=extraction_llm,
         max_review_rounds=int(raw.get("max_review_rounds", 2)),
-        max_evaluation_rounds=int(
-            raw.get("max_evaluation_rounds", DEFAULT_MAX_EVALUATION_ROUNDS)
-        ),
         ontology_refinement_min_failure_patients=int(
             raw.get(
                 "ontology_refinement_min_failure_patients",
@@ -1464,29 +1174,28 @@ def plain_stage2_config_from_mapping(
                 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS,
             )
         ),
-        screening_trees=int(raw.get("screening_trees", DEFAULT_SCREENING_TREES)),
-        stability_selection_rounds=int(
+        confounder_p_value_threshold=float(
             raw.get(
-                "stability_selection_rounds",
-                DEFAULT_STABILITY_SELECTION_ROUNDS,
+                "confounder_p_value_threshold",
+                DEFAULT_CONFOUNDER_P_VALUE_THRESHOLD,
             )
         ),
-        stability_selection_frequency=float(
+        confounder_min_inner_fold_fraction=float(
             raw.get(
-                "stability_selection_frequency",
-                DEFAULT_STABILITY_SELECTION_FREQUENCY,
+                "confounder_min_inner_fold_fraction",
+                DEFAULT_CONFOUNDER_MIN_INNER_FOLD_FRACTION,
             )
         ),
-        effect_modifier_negative_margin_fraction=float(
+        effect_modifier_p_value_threshold=float(
             raw.get(
-                "effect_modifier_negative_margin_fraction",
-                DEFAULT_EFFECT_MODIFIER_NEGATIVE_MARGIN_FRACTION,
+                "effect_modifier_p_value_threshold",
+                DEFAULT_EFFECT_MODIFIER_P_VALUE_THRESHOLD,
             )
         ),
-        effect_modifier_negative_fold_fraction=float(
+        effect_modifier_min_inner_fold_fraction=float(
             raw.get(
-                "effect_modifier_negative_fold_fraction",
-                DEFAULT_EFFECT_MODIFIER_NEGATIVE_FOLD_FRACTION,
+                "effect_modifier_min_inner_fold_fraction",
+                DEFAULT_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION,
             )
         ),
         estimation_trees=int(raw.get("estimation_trees", 200)),
@@ -1503,6 +1212,14 @@ def plain_stage2_config_from_mapping(
         require_endpoint=managed_vllm is None,
     )
     return config
+
+
+class _ServedModelIds(list[str]):
+    """Model IDs plus stable optional metadata returned by richer servers."""
+
+    def __init__(self, values: Iterable[str], *, records: Sequence[Mapping[str, Any]]):
+        super().__init__(values)
+        self.records = tuple(dict(record) for record in records)
 
 
 def _served_model_ids(config: PlainHandoffStage2Config) -> list[str]:
@@ -1525,12 +1242,32 @@ def _served_model_ids(config: PlainHandoffStage2Config) -> list[str]:
         ) from exc
     finally:
         client.close()
-    model_ids = {
-        str(getattr(model, "id", "")).strip()
-        for model in response.data
-        if str(getattr(model, "id", "")).strip()
-    }
-    return sorted(model_ids)
+    records_by_id: dict[str, dict[str, Any]] = {}
+    for model in response.data:
+        model_id = str(getattr(model, "id", "") or "").strip()
+        if not model_id:
+            continue
+        extras = getattr(model, "model_extra", None)
+        extras = extras if isinstance(extras, Mapping) else {}
+
+        def stable_field(name: str) -> str | None:
+            value = getattr(model, name, None)
+            if value is None:
+                value = extras.get(name)
+            rendered = str(value or "").strip()
+            return rendered or None
+
+        records_by_id[model_id] = {
+            "id": model_id,
+            "root": stable_field("root"),
+            "parent": stable_field("parent"),
+            "revision": stable_field("revision") or stable_field("model_revision"),
+        }
+    records = [records_by_id[model_id] for model_id in sorted(records_by_id)]
+    return _ServedModelIds(
+        (record["id"] for record in records),
+        records=records,
+    )
 
 
 def _resolve_stage2_model(config: PlainHandoffStage2Config) -> PlainHandoffStage2Config:
@@ -1554,6 +1291,195 @@ def _resolve_stage2_model(config: PlainHandoffStage2Config) -> PlainHandoffStage
         config.endpoint,
     )
     return resolved
+
+
+def _resolve_extraction_llm_model(
+    config: PlainHandoffStage2Config,
+) -> PlainHandoffStage2Config:
+    """Resolve and persist the model identity for the independent extractor."""
+
+    extraction = config.extraction_llm
+    if extraction is None or extraction.model.strip():
+        return config
+    transport_config = replace(
+        config,
+        endpoint=extraction.endpoint,
+        model="",
+        api_key=extraction.api_key,
+        workers=extraction.workers,
+        extraction_llm=None,
+        vllm=None,
+        runtime_endpoints=(),
+    )
+    resolved = _resolve_stage2_model(transport_config)
+    LOGGER.info(
+        "auto-discovered Stage 2 extraction model=%s from %s/models",
+        resolved.model,
+        extraction.endpoint,
+    )
+    return replace(config, extraction_llm=replace(extraction, model=resolved.model))
+
+
+def _stage2_model_family(model: str) -> str:
+    """Classify model IDs only where Stage 2 has a concrete reasoning control."""
+
+    compact = re.sub(r"[^a-z0-9]+", "", str(model).strip().lower())
+    if "qwen3" in compact:
+        # Covers hybrid Qwen 3 releases as well as the 3.5/3.6/3.8 naming
+        # convention. Dedicated -Instruct/-Thinking variants are harmlessly
+        # handled by the same output parser even if their switch is fixed.
+        return "qwen3"
+    if "gemma4" in compact:
+        return "gemma4"
+    if "lfm25" in compact:
+        return "lfm2.5"
+    return "other"
+
+
+def _endpoint_model_identity(
+    config: PlainHandoffStage2Config,
+    *,
+    endpoints: Sequence[str],
+    role: str,
+    verify_live_endpoint: bool,
+) -> dict[str, Any]:
+    """Record the selected model and, for live transports, verify every replica."""
+
+    selected_model = str(config.model).strip()
+    if not selected_model:
+        raise RuntimeError(f"Stage 2 {role} model identity is unresolved")
+    observations: list[dict[str, Any]] = []
+    actual_identities: list[dict[str, Any]] = []
+    normalized_endpoints = tuple(
+        dict.fromkeys(str(endpoint).strip().rstrip("/") for endpoint in endpoints)
+    )
+    for endpoint in normalized_endpoints:
+        if verify_live_endpoint:
+            advertised = _served_model_ids(replace(config, endpoint=endpoint))
+            if selected_model not in advertised:
+                raise RuntimeError(
+                    f"Stage 2 {role} endpoint {endpoint}/models advertises {advertised}, "
+                    f"not the selected model {selected_model!r}. Refusing to run because "
+                    "the actual served model does not match the configured/resolved identity."
+                )
+            advertised_records = [
+                dict(record)
+                for record in getattr(advertised, "records", ())
+                if str(record.get("id") or "") == selected_model
+            ]
+            selected_record = (
+                advertised_records[0]
+                if advertised_records
+                else {
+                    "id": selected_model,
+                    "root": None,
+                    "parent": None,
+                    "revision": None,
+                }
+            )
+        else:
+            # Custom completion callbacks have no standard endpoint to probe.
+            advertised = []
+            selected_record = None
+        if selected_record is not None:
+            actual_identities.append(
+                {
+                    "served_id": selected_model,
+                    "root": str(selected_record.get("root") or selected_model),
+                    "parent": selected_record.get("parent"),
+                    "revision": selected_record.get("revision"),
+                }
+            )
+        observations.append(
+            {
+                "endpoint": endpoint,
+                "advertised_model_ids": list(advertised),
+                "selected_model_advertised": (
+                    selected_model in advertised if verify_live_endpoint else None
+                ),
+                "selected_model_record": selected_record,
+            }
+        )
+    distinct_actual = {
+        json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        for identity in actual_identities
+    }
+    if len(distinct_actual) > 1:
+        raise RuntimeError(
+            f"Stage 2 {role} replicas advertise inconsistent backing model "
+            f"identities: {actual_identities}"
+        )
+    family_source = (
+        str(actual_identities[0].get("root") or selected_model)
+        if actual_identities
+        else selected_model
+    )
+    return {
+        "role": role,
+        "selected_model": selected_model,
+        "model_family": _stage2_model_family(family_source),
+        "actual_model_identity": actual_identities[0] if actual_identities else None,
+        "live_endpoint_verified": bool(verify_live_endpoint),
+        "endpoint_observations": observations,
+    }
+
+
+def _scientific_model_identity(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a model manifest onto identities that may affect saved science."""
+
+    def role_identity(role: str) -> dict[str, Any] | None:
+        raw = value.get(role)
+        if not isinstance(raw, Mapping):
+            return None
+        selected = str(raw.get("selected_model") or "").strip()
+        if not selected:
+            return None
+        identity: dict[str, Any] = {
+            "selected_model": selected,
+            "model_family": str(raw.get("model_family") or _stage2_model_family(selected)),
+        }
+        actual = raw.get("actual_model_identity")
+        if isinstance(actual, Mapping):
+            identity["actual_model_identity"] = {
+                "served_id": str(actual.get("served_id") or selected),
+                "root": str(actual.get("root") or selected),
+                "parent": actual.get("parent"),
+                "revision": actual.get("revision"),
+            }
+        return identity
+
+    return {
+        "primary": role_identity("primary"),
+        "extraction": role_identity("extraction"),
+    }
+
+
+def _model_identities_compatible(
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> bool:
+    """Allow adoption of old ID-only manifests, then compare rich identities."""
+
+    for role in ("primary", "extraction"):
+        old = previous.get(role)
+        new = current.get(role)
+        if old is None or new is None:
+            if old is not new:
+                return False
+            continue
+        if not isinstance(old, Mapping) or not isinstance(new, Mapping):
+            return False
+        if str(old.get("selected_model") or "") != str(new.get("selected_model") or ""):
+            return False
+        old_actual = old.get("actual_model_identity")
+        new_actual = new.get("actual_model_identity")
+        if (
+            isinstance(old_actual, Mapping)
+            and isinstance(new_actual, Mapping)
+            and dict(old_actual) != dict(new_actual)
+        ):
+            return False
+    return True
 
 
 _DROP_KEYS = {
@@ -1968,7 +1894,7 @@ def _stage2_request_policy(
     config: PlainHandoffStage2Config,
     request_kind: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve one request's reasoning mode and optional output cap."""
+    """Resolve one request's reasoning mode and generous output ceiling."""
 
     kind = str(request_kind or config.runtime_request_kind).strip().lower()
     if kind not in STAGE2_REQUEST_KINDS:
@@ -1979,17 +1905,10 @@ def _stage2_request_policy(
         else config.interpretation_reasoning_effort
     )
     reasoning_effort = config.runtime_reasoning_effort or configured_reasoning_effort
-    if kind == "extraction":
-        return {
-            "request_kind": kind,
-            "reasoning_effort": reasoning_effort,
-            "max_tokens": int(config.max_tokens),
-            "repetition_penalty": float(config.repetition_penalty),
-        }
     return {
         "request_kind": kind,
         "reasoning_effort": reasoning_effort,
-        "max_tokens": None,
+        "max_tokens": int(config.max_tokens),
         "repetition_penalty": float(config.repetition_penalty),
     }
 
@@ -2000,6 +1919,185 @@ def _thinking_response_repair_effort(configured_effort: str) -> str:
     if configured_effort in {"high", "xhigh", "max"}:
         return configured_effort
     return THINKING_RESPONSE_REPAIR_EFFORT
+
+
+def _reasoning_enabled(reasoning_effort: str) -> bool:
+    return str(reasoning_effort).strip().lower() not in {"none", "minimal"}
+
+
+def _reasoning_controlled_messages(
+    messages: Sequence[Mapping[str, str]],
+    *,
+    model_family: str,
+    enable_thinking: bool,
+    max_prompt_chars: int,
+) -> list[dict[str, str]]:
+    """Add a portable prompt fallback without violating the prompt budget."""
+
+    controlled = [dict(message) for message in messages]
+    if model_family not in {"qwen3", "gemma4", "lfm2.5"}:
+        return controlled
+    if model_family == "qwen3":
+        directive = "/think" if enable_thinking else "/no_think"
+    elif enable_thinking:
+        directive = (
+            "Enable the model's thinking mode for this request, but return only the "
+            "final JSON object in response content."
+        )
+    else:
+        directive = "Disable thinking for this request and return only the final JSON object."
+    target_index = next(
+        (
+            index
+            for index in range(len(controlled) - 1, -1, -1)
+            if str(controlled[index].get("role") or "")
+            == ("user" if model_family == "qwen3" else "system")
+        ),
+        None,
+    )
+    if target_index is None:
+        target_index = len(controlled) - 1 if controlled else None
+    candidate = [dict(message) for message in controlled]
+    if target_index is None:
+        candidate.append({"role": "system", "content": directive})
+    else:
+        prior = str(candidate[target_index].get("content") or "")
+        candidate[target_index]["content"] = f"{prior}\n\n{directive}".strip()
+    candidate_chars = sum(
+        len(str(message.get("content") or "")) for message in candidate
+    )
+    return candidate if candidate_chars <= int(max_prompt_chars) else controlled
+
+
+def _openai_optional_parameter_error(exc: Exception) -> bool:
+    """Recognize a server rejecting nonstandard OpenAI-compatible controls."""
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code not in {400, 422}:
+        return False
+    text = str(exc).lower()
+    parameter_names = (
+        "reasoning_effort",
+        "enable_thinking",
+        "enablethinking",
+        "chat_template_kwargs",
+        "response_format",
+        "repetition_penalty",
+        "extra_body",
+    )
+    rejection_words = (
+        "unknown",
+        "unsupported",
+        "unrecognized",
+        "not permitted",
+        "not allowed",
+        "extra input",
+        "unexpected",
+        "invalid parameter",
+    )
+    return any(name in text for name in parameter_names) and any(
+        word in text for word in rejection_words
+    )
+
+
+def _openai_request_variants(
+    *,
+    base_kwargs: Mapping[str, Any],
+    request_policy: Mapping[str, Any],
+    model_family: str,
+) -> list[dict[str, Any]]:
+    """Prefer hard thinking controls, then degrade across compatible APIs."""
+
+    enabled = _reasoning_enabled(str(request_policy["reasoning_effort"]))
+    repetition = float(request_policy["repetition_penalty"])
+    family_bodies: list[dict[str, Any]] = []
+    if model_family in {"qwen3", "gemma4", "lfm2.5"}:
+        if model_family == "lfm2.5":
+            family_bodies.append(
+                {
+                    "repetition_penalty": repetition,
+                    "enableThinking": enabled,
+                }
+            )
+        family_bodies.extend(
+            [
+                {
+                    "repetition_penalty": repetition,
+                    "chat_template_kwargs": {"enable_thinking": enabled},
+                },
+                {
+                    "repetition_penalty": repetition,
+                    "enable_thinking": enabled,
+                },
+            ]
+        )
+    family_bodies.extend([{"repetition_penalty": repetition}, {}])
+
+    variants: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for extra_body in family_bodies:
+        for include_reasoning in (True, False):
+            candidate = {
+                **dict(base_kwargs),
+                "response_format": {"type": "json_object"},
+            }
+            if include_reasoning:
+                candidate["reasoning_effort"] = request_policy["reasoning_effort"]
+            if extra_body:
+                candidate["extra_body"] = extra_body
+            key = json.dumps(candidate, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                variants.append(candidate)
+    # Last-resort OpenAI-compatible endpoints may support neither structured
+    # output nor any reasoning/sampling extension. The prompt still requires JSON.
+    bare = dict(base_kwargs)
+    key = json.dumps(bare, sort_keys=True, default=str)
+    if key not in seen:
+        variants.append(bare)
+    return variants
+
+
+def _message_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, Mapping):
+                text = part.get("text") or part.get("content")
+            else:
+                text = getattr(part, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _response_message_text(message: Any) -> str:
+    """Read final content whether reasoning was parsed separately or left inline."""
+
+    content = _message_text(
+        message.get("content") if isinstance(message, Mapping) else getattr(message, "content", None)
+    )
+    if content.strip():
+        return content
+    containers: list[Mapping[str, Any]] = []
+    if isinstance(message, Mapping):
+        containers.append(message)
+    model_extra = getattr(message, "model_extra", None)
+    if isinstance(model_extra, Mapping):
+        containers.append(model_extra)
+    for field_name in ("reasoning_content", "reasoningContent", "reasoning"):
+        direct = getattr(message, field_name, None)
+        text = _message_text(direct)
+        if text.strip():
+            return text
+        for container in containers:
+            text = _message_text(container.get(field_name))
+            if text.strip():
+                return text
+    return ""
 
 
 def _openai_completion(
@@ -2017,18 +2115,19 @@ def _openai_completion(
         max_retries=0,
     )
     request_policy = _stage2_request_policy(config)
-    kwargs: dict[str, Any] = {
+    model_family = config.runtime_model_family or _stage2_model_family(config.model)
+    controlled_messages = _reasoning_controlled_messages(
+        messages,
+        model_family=model_family,
+        enable_thinking=_reasoning_enabled(str(request_policy["reasoning_effort"])),
+        max_prompt_chars=int(config.max_prompt_chars),
+    )
+    base_kwargs: dict[str, Any] = {
         "model": config.model,
-        "messages": list(messages),
+        "messages": controlled_messages,
         "temperature": config.temperature,
-        "reasoning_effort": request_policy["reasoning_effort"],
-        "response_format": {"type": "json_object"},
-        "extra_body": {
-            "repetition_penalty": request_policy["repetition_penalty"],
-        },
+        "max_tokens": request_policy["max_tokens"],
     }
-    if request_policy["max_tokens"] is not None:
-        kwargs["max_tokens"] = request_policy["max_tokens"]
     prompt_chars = sum(len(str(message.get("content") or "")) for message in messages)
     if prompt_chars > int(config.max_prompt_chars):
         raise ValueError(
@@ -2038,29 +2137,55 @@ def _openai_completion(
         )
     LOGGER.info(
         "Stage 2 request kind=%s endpoint=%s model=%s prompt_chars=%s "
-        "reasoning_effort=%s max_tokens=%s repetition_penalty=%s",
+        "family=%s reasoning_effort=%s max_tokens=%s repetition_penalty=%s",
         request_policy["request_kind"],
         config.endpoint,
         config.model,
         prompt_chars,
+        model_family,
         request_policy["reasoning_effort"],
         request_policy["max_tokens"],
         request_policy["repetition_penalty"],
     )
+    variants = _openai_request_variants(
+        base_kwargs=base_kwargs,
+        request_policy=request_policy,
+        model_family=model_family,
+    )
     try:
-        response = client.chat.completions.create(**kwargs)
+        response = None
+        for variant_index, kwargs in enumerate(variants, start=1):
+            try:
+                response = client.chat.completions.create(**kwargs)
+                break
+            except Exception as exc:
+                if (
+                    variant_index == len(variants)
+                    or not _openai_optional_parameter_error(exc)
+                ):
+                    raise
+                LOGGER.warning(
+                    "Stage 2 endpoint rejected optional request controls; trying "
+                    "compatibility variant %s/%s (%s: %s)",
+                    variant_index + 1,
+                    len(variants),
+                    type(exc).__name__,
+                    exc,
+                )
+        if response is None:  # pragma: no cover - loop either returns or raises
+            raise RuntimeError("Stage 2 request compatibility negotiation failed")
     finally:
         client.close()
     choice = response.choices[0]
     finish_reason = str(getattr(choice, "finish_reason", "") or "")
-    if finish_reason == "length":
+    if finish_reason in {"length", "max_tokens"}:
         raise _Stage2OutputLengthError(
-            "Stage 2 server stopped the response with finish_reason=length"
+            f"Stage 2 server stopped the response with finish_reason={finish_reason}"
         )
-    content = choice.message.content
+    content = _response_message_text(choice.message)
     if not content:
         raise _RetryableStage2ResponseError("Stage 2 model returned an empty response")
-    return str(content)
+    return content
 
 
 class _RoundRobinOpenAICompletion:
@@ -2145,12 +2270,37 @@ def _completion_with_transport_retries(
 
 def _parse_json_object(text: str) -> dict[str, Any]:
     stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = stripped.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    value = json.loads(stripped)
-    if not isinstance(value, dict):
-        raise ValueError("Stage 2 response must be one JSON object")
-    return value
+    try:
+        direct = json.loads(stripped)
+    except json.JSONDecodeError:
+        direct = None
+    else:
+        if isinstance(direct, dict):
+            return direct
+        raise ValueError("Stage 2 response must be one JSON object, not an array or scalar")
+
+    # Inline Qwen/LFM <think> blocks and Gemma <|channel>thought channels may
+    # surround the final object. Scanning with JSONDecoder is safe around braces
+    # inside valid JSON strings and also handles an unclosed reasoning prefix.
+    decoder = json.JSONDecoder()
+    decoded: list[tuple[int, int, dict[str, Any]]] = []
+    for start, character in enumerate(stripped):
+        if character != "{":
+            continue
+        try:
+            value, consumed = decoder.raw_decode(stripped[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            decoded.append((start + consumed, start, value))
+    if decoded:
+        # Prefer the object ending latest in the response; when nested objects
+        # share an end position, prefer the outermost (earliest-starting) one.
+        _end, _start, value = max(decoded, key=lambda item: (item[0], -item[1]))
+        return value
+    raise ValueError(
+        "Stage 2 response must contain one final JSON object after any reasoning content"
+    )
 
 
 def _compact_json_messages(
@@ -2382,6 +2532,9 @@ def _checkpointed_request_json(
     checkpoint_input = {
         **dict(input_value),
         "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+        "llm_identity": {
+            "model": config.model,
+        },
         "request_policy": _stage2_request_policy(config, "interpretation"),
     }
     input_fingerprint = _value_fingerprint(checkpoint_input)
@@ -3264,7 +3417,6 @@ def _candidate_architectures(candidate: Mapping[str, Any]) -> list[str]:
     if primary in {
         "deterministic_candidate_group",
         "bounded_multi_architecture_consolidation",
-        EVIDENCE_COMMUNITY_ARCHITECTURE,
     }:
         primary = ""
     if primary == CONFIGURED_EXPLICIT_FEATURE_ARCHITECTURE:
@@ -3475,10 +3627,7 @@ def _materialize_candidate_group(
         ontology_packet_ids = [
             packet_id
             for member in members
-            for packet_id in (
-                _string_values(member.get("ontology_packet_ids"))
-                or _string_values(member.get("supporting_packet_ids"))[:1]
-            )
+            for packet_id in _string_values(member.get("supporting_packet_ids"))
         ]
     return {
         "candidate_id": candidate_id,
@@ -3545,7 +3694,6 @@ def _materialize_exact_name_groups(
                     canonical.get("description") or name,
                     max_chars=2_000,
                 ),
-                ontology_packet_ids=_string_values(canonical.get("supporting_packet_ids"))[:1],
             )
         )
     return materialized
@@ -4046,7 +4194,7 @@ def _operationalization_prompt(
             "Specify a reproducible extraction target from a complete patient record.",
             "Do not invent an ad hoc score, formula, or index to force multiple distinct measurements into one scalar.",
             "Prefer value_type continuous, with a clinically meaningful unit when applicable, when the named feature can realistically be extracted as a numeric measurement. Use categorical or ordinal only when continuous measurement is infeasible or would misrepresent the feature.",
-            "A continuous ontology may preserve a categorical or threshold report when a patient record lacks an exact number. Describe those evidence-supported fallback representations in the measurement rule; a later training-fold review will choose continuous, categorical, or hybrid modeling from the observed distribution.",
+            "A continuous ontology may preserve a categorical or threshold report when a patient record lacks an exact number. Describe those evidence-supported fallback representations in the measurement rule; aggregate outer-training values will later determine continuous, categorical, or hybrid modeling.",
             "For categorical or ordinal variables, enumerate the extraction ontology; for continuous variables, provide the unit when applicable.",
             "For a binary variable, categories_or_unit must contain exactly two distinct extractable scalar values as separate array items.",
             "For a categorical or ordinal variable, categories_or_unit must contain at least two distinct extractable scalar values as separate array items.",
@@ -5332,16 +5480,125 @@ class PlainHandoffStage2:
         config: PlainHandoffStage2Config,
         clinical_question: str,
         completion: CompletionFunction | None = None,
+        extraction_completion: CompletionFunction | None = None,
     ) -> None:
         config = _resolve_stage2_model(config)
+        config = _resolve_extraction_llm_model(config)
+        config.validate()
+        endpoints = config.runtime_endpoints or (config.endpoint,)
+        primary_identity = _endpoint_model_identity(
+            config,
+            endpoints=endpoints,
+            role="primary",
+            verify_live_endpoint=completion is None,
+        )
+        config = replace(
+            config,
+            runtime_model_family=str(primary_identity["model_family"]),
+        )
         config.validate()
         self.config = config
         self.clinical_question = str(clinical_question)
-        endpoints = config.runtime_endpoints or (config.endpoint,)
         routed_completion = completion or _RoundRobinOpenAICompletion(endpoints)
         self.completion = _ConcurrencyLimitedCompletion(
             routed_completion,
             max_concurrency=config.workers,
+        )
+        self.extraction_request_config: PlainHandoffStage2Config | None = None
+        self.extraction_completion: CompletionFunction | None = None
+        if config.extraction_llm is not None:
+            extraction = config.extraction_llm
+            extraction_request_config = replace(
+                config,
+                endpoint=extraction.endpoint,
+                model=extraction.model,
+                api_key=extraction.api_key,
+                workers=extraction.workers,
+                runtime_endpoints=(),
+                runtime_model_family="",
+            )
+            routed_extraction = extraction_completion or completion
+            extraction_identity = _endpoint_model_identity(
+                extraction_request_config,
+                endpoints=(extraction.endpoint,),
+                role="extraction",
+                verify_live_endpoint=routed_extraction is None,
+            )
+            self.extraction_request_config = replace(
+                extraction_request_config,
+                runtime_model_family=str(extraction_identity["model_family"]),
+            )
+            if routed_extraction is None:
+                routed_extraction = _RoundRobinOpenAICompletion((extraction.endpoint,))
+            self.extraction_completion = _ConcurrencyLimitedCompletion(
+                routed_extraction,
+                max_concurrency=extraction.workers,
+            )
+        else:
+            extraction_identity = None
+        self.model_identity = {
+            "schema_version": MODEL_IDENTITY_SCHEMA_VERSION,
+            "primary": primary_identity,
+            "extraction": extraction_identity,
+            "endpoint_urls_are_transport_only": True,
+        }
+
+    def _check_and_record_model_identity(self, output_dir: Path) -> None:
+        """Fail closed on model changes while permitting endpoint URL changes."""
+
+        identity_path = output_dir / "model_identity.json"
+        current_scientific = _scientific_model_identity(self.model_identity)
+        previous_scientific: dict[str, Any] | None = None
+        if identity_path.is_file():
+            previous = json.loads(identity_path.read_text(encoding="utf-8"))
+            previous_scientific = _scientific_model_identity(previous)
+        else:
+            # Adopt pre-manifest Stage 2 output only when its persisted resolved
+            # model IDs agree. Endpoint URLs intentionally do not participate.
+            config_path = output_dir / "config.json"
+            if config_path.is_file():
+                previous_config = json.loads(config_path.read_text(encoding="utf-8"))
+                primary_model = str(previous_config.get("model") or "").strip()
+                raw_extraction = previous_config.get("extraction_llm")
+                extraction_model = (
+                    str(raw_extraction.get("model") or "").strip()
+                    if isinstance(raw_extraction, Mapping)
+                    else ""
+                )
+                previous_scientific = {
+                    "primary": (
+                        {
+                            "selected_model": primary_model,
+                            "model_family": _stage2_model_family(primary_model),
+                        }
+                        if primary_model
+                        else None
+                    ),
+                    "extraction": (
+                        {
+                            "selected_model": extraction_model,
+                            "model_family": _stage2_model_family(extraction_model),
+                        }
+                        if extraction_model
+                        else None
+                    ),
+                }
+        if previous_scientific is not None and not _model_identities_compatible(
+            previous_scientific,
+            current_scientific,
+        ):
+            raise RuntimeError(
+                "Stage 2 cannot resume because the actual running model identity changed. "
+                f"Previous={previous_scientific}; current={current_scientific}. Preserve "
+                "the existing output for audit and use a fresh Stage 2 output directory."
+            )
+        _write_json(
+            identity_path,
+            {
+                **self.model_identity,
+                "checked_at": _now(),
+                "scientific_identity": current_scientific,
+            },
         )
 
     def _load_or_compile_evidence(
@@ -5779,6 +6036,9 @@ class PlainHandoffStage2:
     ) -> Mapping[str, Any]:
         input_value = {
             "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
+            "llm_identity": {
+                "model": self.config.model,
+            },
             "architecture": architecture,
             "packets": list(packets),
         }
@@ -6033,15 +6293,12 @@ class PlainHandoffStage2:
                 validation_error=exc,
             ),
         )
-        roles = _group_roles(group)
-        if not roles:
-            raise ValueError(
-                f"Stage 2 group {group.get('name')!r} has no evidence-supported causal role"
-            )
         return {
             "name": str(group["name"]),
             **operational,
-            "roles": roles,
+            # Discovered candidates receive causal roles only from the
+            # fold-local statistical screens. Evidence never pre-selects a role.
+            "roles": [],
             "supporting_packet_ids": _string_values(group.get("supporting_packet_ids")),
             "supporting_architectures": _string_values(group.get("supporting_architectures")),
         }
@@ -6421,7 +6678,7 @@ class PlainHandoffStage2:
             len(all_candidates),
             len(groups),
         )
-        retained_before_role_filter = self._consolidate_candidate_pool(
+        retained_groups = self._consolidate_candidate_pool(
             outer_fold=outer_fold,
             groups=groups,
             output_dir=(
@@ -6429,21 +6686,6 @@ class PlainHandoffStage2:
             ),
             seed=seed,
         )
-        retained_groups, exclusions, role_filter_decisions = (
-            _filter_candidate_groups_by_causal_role(retained_before_role_filter)
-        )
-        if output_dir is not None:
-            _write_json(
-                output_dir / "causal_role_filter.json",
-                {
-                    "phase": "post_consolidation_causal_role_filter",
-                    "input_groups": len(retained_before_role_filter),
-                    "retained_groups": len(retained_groups),
-                    "excluded_groups": len(retained_before_role_filter) - len(retained_groups),
-                    "decisions": role_filter_decisions,
-                },
-            )
-
         features_by_group_id: dict[str, dict[str, Any]] = {}
         if retained_groups:
             with concurrent.futures.ThreadPoolExecutor(
@@ -6466,22 +6708,13 @@ class PlainHandoffStage2:
                     features_by_group_id[futures[future]] = future.result()
         features = [features_by_group_id[str(group["candidate_id"])] for group in retained_groups]
 
-        dispositions: dict[str, dict[str, str]] = {
-            candidate_id: {
-                "status": "excluded",
-                "feature_name": "",
-                "reason": exclusions.get(
-                    candidate_id,
-                    "Excluded before final Stage 2 operationalization.",
-                ),
-            }
-            for candidate_id in original_ids
-        }
+        dispositions: dict[str, dict[str, str]] = {}
+        original_id_set = set(original_ids)
         for group, feature in zip(retained_groups, features):
             origins = [
                 origin
                 for origin in _string_values(group.get("origin_candidate_ids"))
-                if origin in dispositions
+                if origin in original_id_set
             ]
             for origin_index, origin in enumerate(origins):
                 dispositions[origin] = {
@@ -6493,6 +6726,12 @@ class PlainHandoffStage2:
                         else "Merged with candidates describing the same scalar measurement."
                     ),
                 }
+        missing_origins = sorted(original_id_set - set(dispositions))
+        if missing_origins:
+            raise RuntimeError(
+                "merge-only Stage 2 consolidation lost candidate origin IDs: "
+                f"{missing_origins[:8]}"
+            )
         return {"features": features, "candidate_dispositions": dispositions}
 
     def _run_outer_fold(
@@ -6500,7 +6739,6 @@ class PlainHandoffStage2:
         *,
         outer_fold: int,
         packets: Sequence[Mapping[str, Any]],
-        support_packets: Sequence[Mapping[str, Any]] | None = None,
         output_dir: Path,
         dataset: pd.DataFrame | None = None,
         split: Mapping[str, Any] | None = None,
@@ -6513,26 +6751,26 @@ class PlainHandoffStage2:
         seed: int = 42,
     ) -> Mapping[str, Any]:
         discovery_packets = list(packets)
-        hierarchy_packets = list(support_packets or [])
         complete_path = output_dir / "complete.json"
         features_path = output_dir / "feature_definitions.json"
         final_features_path = output_dir / "final_definitions.json"
         definitions_complete_path = output_dir / "definitions_complete.json"
         interpreted_candidates_path = output_dir / "interpreted_candidates.json"
-        selected_candidates_path = output_dir / "selected_candidates.json"
-        candidate_selection_path = output_dir / "candidate_registry_selection.json"
         definition_inputs = {
             "outer_fold": int(outer_fold),
             "compiler": self.config.evidence_compiler,
-            "candidate_discovery_source": self.config.candidate_discovery_source,
-            "evidence_community_schema": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
-            "evidence_community_enabled": self.config.evidence_community_enabled,
-            "evidence_community_config": (
-                self._evidence_community_config().public_dict()
-                if self.config.evidence_community_enabled
+            "candidate_discovery_source": "all_semantic_evidence_cards",
+            "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
+            "primary_llm": {
+                "model": self.config.model,
+            },
+            "extraction_llm": (
+                {
+                    "model": self.config.extraction_llm.model,
+                }
+                if self.config.extraction_llm is not None
                 else None
             ),
-            "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
             "interpretation_request_policy": _stage2_request_policy(
                 self.config,
                 "interpretation",
@@ -6546,37 +6784,6 @@ class PlainHandoffStage2:
             "consolidation_alphabetical_rounds": int(self.config.consolidation_alphabetical_rounds),
             "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
             "consolidation_seed": int(seed),
-            "candidate_selection_schema": CANDIDATE_SELECTION_SCHEMA_VERSION,
-            "candidate_selection_top_n": int(self.config.candidate_selection_top_n),
-            "max_candidates_per_fold": int(self.config.max_candidates_per_fold),
-            "candidate_registry_embedding_model": (
-                self.config.candidate_registry_embedding_model
-            ),
-            "candidate_registry_embedding_device": (
-                self.config.candidate_registry_embedding_device
-            ),
-            "candidate_registry_similarity_threshold": float(
-                self.config.candidate_registry_similarity_threshold
-            ),
-            "candidate_selection_method": self.config.candidate_selection_method,
-            "candidate_selection_late_interaction_model": (
-                self.config.candidate_selection_late_interaction_model
-            ),
-            "candidate_selection_late_interaction_device": (
-                self.config.candidate_selection_late_interaction_device
-            ),
-            "candidate_selection_top_evidence_packets": int(
-                self.config.candidate_selection_top_evidence_packets
-            ),
-            "candidate_selection_document_chunk_overlap_tokens": int(
-                self.config.candidate_selection_document_chunk_overlap_tokens
-            ),
-            "candidate_selection_hierarchical_colbert": (
-                self.config.candidate_selection_hierarchical_colbert
-            ),
-            "candidate_selection_hierarchy_top_communities": int(
-                self.config.candidate_selection_hierarchy_top_communities
-            ),
             "extraction_ontology_feedback_schema": (EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION),
             "ontology_refinement_min_failure_patients": int(
                 self.config.ontology_refinement_min_failure_patients
@@ -6587,7 +6794,6 @@ class PlainHandoffStage2:
                 feature.as_definition() for feature in self.config.explicit_features
             ],
             "discovery_packets": discovery_packets,
-            "hierarchy_packets": hierarchy_packets,
         }
         evidence_input_fingerprint = _value_fingerprint(
             {
@@ -6659,34 +6865,11 @@ class PlainHandoffStage2:
             }
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_jsonl(output_dir / "input_packets.jsonl", discovery_packets)
-        _write_jsonl(output_dir / "colbert_support_packets.jsonl", hierarchy_packets)
 
         by_architecture: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
         for packet in discovery_packets:
             by_architecture[str(packet["architecture"])].append(packet)
         candidates: list[dict[str, Any]] | None = None
-        candidate_selection: dict[str, Any] | None = None
-        if (
-            not features_path.is_file()
-            and interpreted_candidates_path.is_file()
-            and selected_candidates_path.is_file()
-            and candidate_selection_path.is_file()
-        ):
-            saved_selection = json.loads(candidate_selection_path.read_text(encoding="utf-8"))
-            if saved_selection.get("evidence_input_fingerprint") == evidence_input_fingerprint:
-                saved_candidates = json.loads(selected_candidates_path.read_text(encoding="utf-8"))
-                if not isinstance(saved_candidates, list):
-                    raise ValueError(
-                        f"Stage 2 outer fold {outer_fold} selected_candidates.json must "
-                        "contain a JSON list"
-                    )
-                candidates = [dict(candidate) for candidate in saved_candidates]
-                candidate_selection = dict(saved_selection)
-                LOGGER.info(
-                    "reuse completed Stage 2 candidate funnel outer_fold=%s retained=%s",
-                    outer_fold,
-                    len(candidates),
-                )
         if features_path.is_file():
             if definitions_state.get("evidence_input_fingerprint") == evidence_input_fingerprint:
                 final = json.loads(features_path.read_text(encoding="utf-8"))
@@ -6745,14 +6928,7 @@ class PlainHandoffStage2:
                 str(packet["packet_id"]): packet for packet in discovery_packets
             }
             if len(packet_by_id) != len(discovery_packets):
-                raise ValueError("Stage 2 candidate selection received duplicate packet IDs")
-            hierarchy_packet_by_id = {
-                str(packet["packet_id"]): packet for packet in hierarchy_packets
-            }
-            if len(hierarchy_packet_by_id) != len(hierarchy_packets):
-                raise ValueError(
-                    "Stage 2 candidate selection received duplicate hierarchy packet IDs"
-                )
+                raise ValueError("Stage 2 feature discovery received duplicate packet IDs")
             candidates = []
             for architecture, _batch_index, result in sorted(
                 results,
@@ -6795,53 +6971,10 @@ class PlainHandoffStage2:
                         }
                     )
             _write_json(interpreted_candidates_path, candidates)
-            candidates, candidate_selection = _build_and_select_candidate_registry(
-                candidates=candidates,
-                packet_by_id=packet_by_id,
-                hierarchy_packet_by_id=(
-                    hierarchy_packet_by_id
-                    if self.config.candidate_selection_hierarchical_colbert
-                    else None
-                ),
-                top_n_per_axis=self.config.candidate_selection_top_n,
-                max_candidates=self.config.max_candidates_per_fold,
-                registry_embedding_model=self.config.candidate_registry_embedding_model,
-                registry_embedding_device=self.config.candidate_registry_embedding_device,
-                registry_similarity_threshold=(
-                    self.config.candidate_registry_similarity_threshold
-                ),
-                scoring_method=self.config.candidate_selection_method,
-                late_interaction_model=(
-                    self.config.candidate_selection_late_interaction_model
-                ),
-                late_interaction_device=(
-                    self.config.candidate_selection_late_interaction_device
-                ),
-                top_evidence_packets=(
-                    self.config.candidate_selection_top_evidence_packets
-                ),
-                document_chunk_overlap_tokens=(
-                    self.config.candidate_selection_document_chunk_overlap_tokens
-                ),
-                hierarchy_top_communities=(
-                    self.config.candidate_selection_hierarchy_top_communities
-                ),
-            )
-            candidate_selection["evidence_input_fingerprint"] = evidence_input_fingerprint
-            _write_json(candidate_selection_path, candidate_selection)
-            _write_json(selected_candidates_path, candidates)
             LOGGER.info(
-                "Stage 2 candidate funnel outer_fold=%s raw=%s registry=%s retained=%s "
-                "associations_scored=%s top_n_per_axis=%s fold_cap=%s method=%s model=%s",
+                "Stage 2 exhaustive semantic-card discovery outer_fold=%s candidates=%s",
                 outer_fold,
-                candidate_selection["registry"]["raw_candidates"],
-                candidate_selection["registry"]["registry_candidates"],
-                candidate_selection["selection"]["retained_candidates"],
-                candidate_selection["selection"]["candidate_packet_associations_scored"],
-                candidate_selection["selection"]["top_n_per_evidence_axis"],
-                candidate_selection["selection"]["max_candidates_per_fold"],
-                candidate_selection["selection"]["scoring_method"],
-                candidate_selection["selection"]["scoring_model"],
+                len(candidates),
             )
 
         if candidates is not None:
@@ -6859,21 +6992,6 @@ class PlainHandoffStage2:
                     output_dir=output_dir / "consolidation",
                     seed=seed,
                 )
-                if candidate_selection is not None:
-                    for candidate_id in candidate_selection["selection"].get(
-                        "dropped_origin_candidate_ids", []
-                    ):
-                        consolidated["candidate_dispositions"].setdefault(
-                            str(candidate_id),
-                            {
-                                "status": "excluded",
-                                "feature_name": "",
-                                "reason": (
-                                    "Excluded by fold-level canonical candidate evidence "
-                                    "ranking before LLM consolidation."
-                                ),
-                            },
-                        )
                 features = []
                 for index, feature in enumerate(consolidated["features"], start=1):
                     features.append(
@@ -6896,37 +7014,7 @@ class PlainHandoffStage2:
                     "evidence_input_fingerprint": evidence_input_fingerprint,
                     "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                     "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
-                    "candidate_selection_schema": CANDIDATE_SELECTION_SCHEMA_VERSION,
-                    "candidate_selection_top_n": int(self.config.candidate_selection_top_n),
-                    "max_candidates_per_fold": int(self.config.max_candidates_per_fold),
-                    "candidate_registry_embedding_model": (
-                        self.config.candidate_registry_embedding_model
-                    ),
-                    "candidate_registry_embedding_device": (
-                        self.config.candidate_registry_embedding_device
-                    ),
-                    "candidate_registry_similarity_threshold": float(
-                        self.config.candidate_registry_similarity_threshold
-                    ),
-                    "candidate_selection_method": self.config.candidate_selection_method,
-                    "candidate_selection_late_interaction_model": (
-                        self.config.candidate_selection_late_interaction_model
-                    ),
-                    "candidate_selection_late_interaction_device": (
-                        self.config.candidate_selection_late_interaction_device
-                    ),
-                    "candidate_selection_top_evidence_packets": int(
-                        self.config.candidate_selection_top_evidence_packets
-                    ),
-                    "candidate_selection_document_chunk_overlap_tokens": int(
-                        self.config.candidate_selection_document_chunk_overlap_tokens
-                    ),
-                    "candidate_selection_hierarchical_colbert": (
-                        self.config.candidate_selection_hierarchical_colbert
-                    ),
-                    "candidate_selection_hierarchy_top_communities": int(
-                        self.config.candidate_selection_hierarchy_top_communities
-                    ),
+                    "candidate_selection": "none_exhaustive_discovery",
                     "consolidation_batch_size": int(self.config.consolidation_batch_size),
                     "consolidation_alphabetical_rounds": int(
                         self.config.consolidation_alphabetical_rounds
@@ -6944,7 +7032,6 @@ class PlainHandoffStage2:
                     "architectures": len(by_architecture),
                     "packets": len(discovery_packets),
                     "discovery_packets": len(discovery_packets),
-                    "hierarchy_packets": len(hierarchy_packets),
                     "features": len(final["features"]),
                 },
             )
@@ -6967,12 +7054,20 @@ class PlainHandoffStage2:
         # Analysis contains the high-context, one-patient extraction calls. Its
         # review planner still uses max_prompt_chars, but transport must accept
         # extraction prompts up to their independent limit.
-        analysis_request_config = replace(
+        primary_analysis_request_config = replace(
             self.config,
             max_prompt_chars=max(
                 self.config.max_prompt_chars,
                 self.config.extraction_max_prompt_chars,
             ),
+        )
+        extraction_analysis_request_config = (
+            replace(
+                self.extraction_request_config,
+                max_prompt_chars=self.config.extraction_max_prompt_chars,
+            )
+            if self.extraction_request_config is not None
+            else None
         )
 
         def request_analysis_json(
@@ -6981,10 +7076,23 @@ class PlainHandoffStage2:
             *,
             request_kind: str = "interpretation",
         ) -> dict[str, Any]:
+            if request_kind == "extraction":
+                if (
+                    extraction_analysis_request_config is None
+                    or self.extraction_completion is None
+                ):
+                    raise RuntimeError(
+                        "Stage 2 extraction request attempted without stage2.extraction_llm"
+                    )
+                request_config = extraction_analysis_request_config
+                completion = self.extraction_completion
+            else:
+                request_config = primary_analysis_request_config
+                completion = self.completion
             return _request_json(
                 messages=messages,
-                config=analysis_request_config,
-                completion=self.completion,
+                config=request_config,
+                completion=completion,
                 validate=validate,
                 request_kind=request_kind,
             )
@@ -7057,34 +7165,26 @@ class PlainHandoffStage2:
     ) -> Mapping[str, Any]:
         handoff_path = Path(handoff_path)
         output_dir = Path(output_dir)
+        if dataset is not None and (
+            self.extraction_request_config is None or self.extraction_completion is None
+        ):
+            raise ValueError(
+                "dataset-backed Stage 2 requires stage2.extraction_llm so patient "
+                "value extraction is isolated from the primary review model"
+            )
         output_dir.mkdir(parents=True, exist_ok=True)
+        self._check_and_record_model_identity(output_dir)
         _write_json(output_dir / "config.json", self.config.public_dict())
         compiled_packets, compilation_summary = self._load_or_compile_evidence(
             handoff_path=handoff_path,
             output_dir=output_dir,
             seed=seed,
         )
-        community_packets, community_summary = self._load_or_distill_evidence_communities(
-            packets=compiled_packets,
-            output_dir=output_dir,
-            seed=seed,
-        )
-        discovery_packets = (
-            compiled_packets
-            if self.config.candidate_discovery_source == "compiled_packets"
-            else community_packets
-        )
+        discovery_packets = compiled_packets
 
         packets_by_outer: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
         for packet in discovery_packets:
             packets_by_outer[int(packet["outer_fold"])].append(packet)
-        hierarchy_packets_by_outer: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
-        if (
-            self.config.evidence_community_enabled
-            and self.config.candidate_selection_hierarchical_colbert
-        ):
-            for packet in community_packets:
-                hierarchy_packets_by_outer[int(packet["outer_fold"])].append(packet)
         splits: dict[int, dict[str, Any]] = {}
         if dataset is not None:
             dataset = dataset.reset_index(drop=True)
@@ -7135,7 +7235,6 @@ class PlainHandoffStage2:
                         self._run_outer_fold,
                         outer_fold=outer_fold,
                         packets=packets_by_outer[outer_fold],
-                        support_packets=hierarchy_packets_by_outer.get(outer_fold, []),
                         output_dir=output_dir / f"outer_{outer_fold:03d}",
                         dataset=dataset,
                         split=splits.get(outer_fold),
@@ -7164,22 +7263,13 @@ class PlainHandoffStage2:
             name_counts.update(names_in_fold)
         summary = {
             "outer_folds": len(fold_results),
-            "candidate_discovery_source": self.config.candidate_discovery_source,
+            "candidate_discovery_source": "all_semantic_evidence_cards",
             "evidence_packets": len(discovery_packets),
             "candidate_discovery_packets": len(discovery_packets),
-            "colbert_support_packets": sum(
-                len(values) for values in hierarchy_packets_by_outer.values()
-            ),
             "compiled_evidence_packets": len(compiled_packets),
             "evidence_compiler": self.config.evidence_compiler,
             "evidence_compilation_path": str(output_dir / "evidence_compilation"),
             "evidence_compilation": compilation_summary,
-            "evidence_communities_path": (
-                str(output_dir / "evidence_communities")
-                if self.config.evidence_community_enabled
-                else None
-            ),
-            "evidence_communities": community_summary,
             "features_by_fold": {
                 str(result["outer_fold"]): len(result["features"]) for result in fold_results
             },
@@ -7214,13 +7304,6 @@ class PlainHandoffStage2:
             str(output_dir / "features_by_outer_fold.jsonl"),
             str(output_dir / "summary.json"),
         ]
-        if self.config.evidence_community_enabled:
-            artifacts.extend(
-                [
-                    str(output_dir / "evidence_communities" / "packets.jsonl"),
-                    str(output_dir / "evidence_communities" / "summary.json"),
-                ]
-            )
         if dataset is not None:
             prediction_frames = []
             for result in fold_results:
@@ -7308,6 +7391,7 @@ def run_plain_handoff_stage2(
     clinical_question: str,
     config: PlainHandoffStage2Config,
     completion: CompletionFunction | None = None,
+    extraction_completion: CompletionFunction | None = None,
     dataset: pd.DataFrame | None = None,
     split_provenance_path: Path | None = None,
     unit_id_column: str = "patient_id",
@@ -7323,6 +7407,7 @@ def run_plain_handoff_stage2(
             config=runtime_config,
             clinical_question=clinical_question,
             completion=completion,
+            extraction_completion=extraction_completion,
         ).run(
             handoff_path=handoff_path,
             output_dir=output_dir,
@@ -7358,6 +7443,7 @@ __all__ = [
     "PlainHandoffStage2",
     "PlainHandoffStage2Config",
     "ManagedVLLMConfig",
+    "Stage2ExtractionLLMConfig",
     "Stage2ExplicitFeature",
     "packetize_handoff",
     "plain_stage2_config_from_mapping",

@@ -1888,6 +1888,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--stage2-api-key", help="endpoint key; defaults to OCI_STAGE2_API_KEY")
     parser.add_argument(
+        "--stage2-extraction-endpoint",
+        help=(
+            "OpenAI-compatible endpoint for the small extraction model; may equal "
+            "the primary endpoint"
+        ),
+    )
+    parser.add_argument(
+        "--stage2-extraction-model",
+        help="small extraction model; auto-discovered when the endpoint serves exactly one",
+    )
+    parser.add_argument(
+        "--stage2-extraction-api-key",
+        help="small-model key; defaults to OCI_STAGE2_EXTRACTION_API_KEY",
+    )
+    parser.add_argument(
+        "--stage2-extraction-workers",
+        type=int,
+        help="maximum concurrent small-model extraction requests",
+    )
+    parser.add_argument(
+        "--stage2-selection-workers",
+        type=int,
+        help="loky process workers for fold-local statistical feature selection",
+    )
+    parser.add_argument(
+        "--stage2-max-tokens",
+        type=int,
+        help=(
+            "completion-token ceiling sent to every Stage 2 LLM request; must be "
+            "at least 100000 and does not force responses to reach that length"
+        ),
+    )
+    parser.add_argument(
         "--stage2-vllm-servers",
         type=int,
         help="launch this many pipeline-owned vLLM servers for Stage 2",
@@ -1933,17 +1966,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage2-review-rounds",
         type=int,
         help=(
-            "maximum training-fold language-model review rounds; deterministic "
-            "evaluation-only convergence rounds may follow"
+            "maximum aggregate ontology-supervisor rounds"
         ),
     )
     parser.add_argument(
-        "--stage2-max-evaluation-rounds",
-        type=int,
-        help=(
-            "absolute per-fold extraction/evaluation round cap "
-            "(default: 10)"
-        ),
+        "--stage2-confounder-p-value-threshold",
+        type=float,
+        help="raw inner-fold p-value threshold for both confounder tests (default: 0.05)",
+    )
+    parser.add_argument(
+        "--stage2-confounder-min-inner-fold-fraction",
+        type=float,
+        help="inner-fold vote fraction required for confounders (default: 0.75)",
+    )
+    parser.add_argument(
+        "--stage2-effect-modifier-p-value-threshold",
+        type=float,
+        help="raw treatment-interaction p-value threshold (default: 0.05)",
+    )
+    parser.add_argument(
+        "--stage2-effect-modifier-min-inner-fold-fraction",
+        type=float,
+        help="inner-fold vote fraction required for modifiers (default: 0.75)",
     )
     parser.add_argument(
         "--stage2-extraction-feature-batch-size",
@@ -1956,7 +2000,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stage2-estimation-trees",
         type=int,
-        help="trees in the final effect-modification model",
+        help="trees in the final causal forest",
     )
     parser.add_argument(
         "--set",
@@ -2038,6 +2082,24 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
         value = getattr(args, f"stage2_{key}")
         if value is not None:
             stage2[key] = value
+    extraction_overrides = {
+        "endpoint": args.stage2_extraction_endpoint,
+        "model": args.stage2_extraction_model,
+        "api_key": args.stage2_extraction_api_key,
+        "workers": args.stage2_extraction_workers,
+    }
+    if any(value is not None for value in extraction_overrides.values()):
+        extraction_value = stage2.get("extraction_llm")
+        if extraction_value is None:
+            extraction_llm: MutableMapping[str, Any] = {}
+            stage2["extraction_llm"] = extraction_llm
+        elif isinstance(extraction_value, MutableMapping):
+            extraction_llm = extraction_value
+        else:
+            raise ValueError("stage2.extraction_llm must be a configuration object")
+        for key, value in extraction_overrides.items():
+            if value is not None:
+                extraction_llm[key] = value
     managed_vllm_overrides = {
         "server_count": args.stage2_vllm_servers,
         "gpus": args.stage2_vllm_gpus,
@@ -2076,10 +2138,21 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
             if value is not None:
                 vllm[key] = value
     stage2_numeric_overrides = {
+        "max_tokens": args.stage2_max_tokens,
+        "selection_workers": args.stage2_selection_workers,
         "max_review_rounds": args.stage2_review_rounds,
-        "max_evaluation_rounds": args.stage2_max_evaluation_rounds,
         "extraction_feature_batch_size": args.stage2_extraction_feature_batch_size,
         "estimation_trees": args.stage2_estimation_trees,
+        "confounder_p_value_threshold": args.stage2_confounder_p_value_threshold,
+        "confounder_min_inner_fold_fraction": (
+            args.stage2_confounder_min_inner_fold_fraction
+        ),
+        "effect_modifier_p_value_threshold": (
+            args.stage2_effect_modifier_p_value_threshold
+        ),
+        "effect_modifier_min_inner_fold_fraction": (
+            args.stage2_effect_modifier_min_inner_fold_fraction
+        ),
     }
     for key, value in stage2_numeric_overrides.items():
         if value is not None:

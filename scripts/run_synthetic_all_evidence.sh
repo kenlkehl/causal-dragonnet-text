@@ -23,6 +23,11 @@ physical_gpus="${PHYSICAL_GPUS:-}"
 stage1_workers="${STAGE1_WORKERS:-auto}"
 stage2_workers="${STAGE2_WORKERS:-32}"
 stage2_model="${STAGE2_MODEL:-}"
+stage2_extraction_endpoint="${STAGE2_EXTRACTION_ENDPOINT:-}"
+stage2_extraction_model="${STAGE2_EXTRACTION_MODEL:-}"
+stage2_extraction_workers="${STAGE2_EXTRACTION_WORKERS:-}"
+stage2_selection_workers="${STAGE2_SELECTION_WORKERS:-}"
+stage2_max_tokens="${STAGE2_MAX_TOKENS:-}"
 stage2_vllm_servers="${STAGE2_VLLM_SERVERS:-0}"
 stage2_vllm_gpus="${STAGE2_VLLM_GPUS:-}"
 stage2_vllm_download_dir="${STAGE2_VLLM_DOWNLOAD_DIR:-}"
@@ -34,7 +39,10 @@ stage2_consolidation_max_rounds="${STAGE2_CONSOLIDATION_MAX_ROUNDS:-}"
 stage2_extraction_feature_batch_size="${STAGE2_EXTRACTION_FEATURE_BATCH_SIZE:-}"
 stage2_ontology_refinement_min_failure_patients="${STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS:-}"
 stage2_max_ontology_refinement_rounds="${STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS:-}"
-stage2_max_evaluation_rounds="${STAGE2_MAX_EVALUATION_ROUNDS:-}"
+stage2_confounder_p_value_threshold="${STAGE2_CONFOUNDER_P_VALUE_THRESHOLD:-}"
+stage2_confounder_min_inner_fold_fraction="${STAGE2_CONFOUNDER_MIN_INNER_FOLD_FRACTION:-}"
+stage2_effect_modifier_p_value_threshold="${STAGE2_EFFECT_MODIFIER_P_VALUE_THRESHOLD:-}"
+stage2_effect_modifier_min_inner_fold_fraction="${STAGE2_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION:-}"
 stage1_architectures="${STAGE1_ARCHITECTURES:-}"
 min_free_gpu_gib="${MIN_FREE_GPU_GB:-20}"
 python_bin="${OCI_PYTHON:-}"
@@ -61,6 +69,10 @@ if (( stage2_vllm_servers > 0 )) && [[ -n "${stage2_endpoint}" ]]; then
 fi
 if (( stage2_vllm_servers > 0 )) && [[ -z "${stage2_model}" ]]; then
     echo "STAGE2_MODEL is required when STAGE2_VLLM_SERVERS is positive." >&2
+    exit 1
+fi
+if { (( stage2_vllm_servers > 0 )) || [[ -n "${stage2_endpoint}" ]]; } && [[ -z "${stage2_extraction_endpoint}" ]]; then
+    echo "STAGE2_EXTRACTION_ENDPOINT is required whenever Stage 2 is enabled." >&2
     exit 1
 fi
 if [[ "${disable_htr}" == "1" ]]; then
@@ -163,6 +175,21 @@ if [[ -z "${gpu_count}" || -z "${devices}" || -z "${worker_count}" ]]; then
 fi
 
 stage2_policy_args=()
+if [[ -n "${stage2_extraction_endpoint}" ]]; then
+    stage2_policy_args+=(
+        --stage2-extraction-endpoint "${stage2_extraction_endpoint}"
+        --stage2-extraction-workers "${stage2_extraction_workers:-${resolved_stage2_workers}}"
+    )
+    if [[ -n "${stage2_extraction_model}" ]]; then
+        stage2_policy_args+=(--stage2-extraction-model "${stage2_extraction_model}")
+    fi
+fi
+if [[ -n "${stage2_selection_workers}" ]]; then
+    stage2_policy_args+=(--stage2-selection-workers "${stage2_selection_workers}")
+fi
+if [[ -n "${stage2_max_tokens}" ]]; then
+    stage2_policy_args+=(--stage2-max-tokens "${stage2_max_tokens}")
+fi
 if [[ -n "${stage2_operationalization_max_prompt_chars}" ]]; then
     stage2_policy_args+=(
         --set "stage2.operationalization_max_prompt_chars=${stage2_operationalization_max_prompt_chars}"
@@ -198,10 +225,19 @@ if [[ -n "${stage2_max_ontology_refinement_rounds}" ]]; then
         --set "stage2.max_ontology_refinement_rounds=${stage2_max_ontology_refinement_rounds}"
     )
 fi
-if [[ -n "${stage2_max_evaluation_rounds}" ]]; then
+if [[ -n "${stage2_confounder_p_value_threshold}" ]]; then
     stage2_policy_args+=(
-        --stage2-max-evaluation-rounds "${stage2_max_evaluation_rounds}"
+        --stage2-confounder-p-value-threshold "${stage2_confounder_p_value_threshold}"
     )
+fi
+if [[ -n "${stage2_confounder_min_inner_fold_fraction}" ]]; then
+    stage2_policy_args+=(--stage2-confounder-min-inner-fold-fraction "${stage2_confounder_min_inner_fold_fraction}")
+fi
+if [[ -n "${stage2_effect_modifier_p_value_threshold}" ]]; then
+    stage2_policy_args+=(--stage2-effect-modifier-p-value-threshold "${stage2_effect_modifier_p_value_threshold}")
+fi
+if [[ -n "${stage2_effect_modifier_min_inner_fold_fraction}" ]]; then
+    stage2_policy_args+=(--stage2-effect-modifier-min-inner-fold-fraction "${stage2_effect_modifier_min_inner_fold_fraction}")
 fi
 
 if (( stage2_vllm_servers > 0 )); then

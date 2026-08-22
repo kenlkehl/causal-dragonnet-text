@@ -149,15 +149,16 @@ not treatment-effect estimates.
 
 **Stage 2 is evidence interpretation and causal operationalization.** It reviews
 the Stage 1 evidence within and across architectures, consolidates supported
-clinical concepts, assigns causal roles from the types of evidence that support
-each concept, defines how each variable will be measured in a complete patient
-record, extracts those values, and fits the study's final causal estimator.
+clinical concepts, defines how each variable will be measured in a complete
+patient record, extracts those values, statistically assigns causal roles, and
+fits the study's final causal forest.
 Stage 2 may be human-led, language-model-assisted, or a combination of the two.
-The simplified runner supplies the language-model-assisted path. It sends
-fold-scoped evidence to one configured OpenAI-compatible endpoint, saves the
-resulting feature definitions as ordinary JSON, extracts the variables, reviews
-their training-fold empirical performance, and completes cross-fitted causal
-estimation. Investigators remain responsible for judging the identification
+The simplified runner supplies the language-model-assisted path. A primary
+OpenAI-compatible endpoint exhaustively interprets fold-scoped semantic cards,
+performs merge-only consolidation, and supervises ontologies. A different small
+endpoint performs the many one-patient extraction calls. Inner-fold regression
+screens assign discovered confounder and modifier roles before cross-fitted
+causal-forest estimation. Investigators remain responsible for judging the identification
 assumptions, clinical validity, overlap, and sensitivity of the resulting
 estimate; the automated review is not a substitute for scientific review.
 
@@ -170,11 +171,12 @@ flowchart LR
     C1 --> D["Stage 1 handoff"]
     C2 --> D
     C3 --> D
-    D --> E["Interpret and reconcile concepts"]
-    E --> F["Define and extract patient-level variables"]
-    F --> G["Route adjustment variables to W and effect modifiers to X"]
-    G --> H["Cross-fitted causal estimation and review"]
-    H --> I["ATE, CATE or ITE estimates with diagnostics"]
+    D --> E["Exhaustively list and merge concepts"]
+    E --> F["Primary model defines ontologies"]
+    F --> G["Small model extracts patient-level values"]
+    G --> H["Inner-fold p-value screens assign roles"]
+    H --> J["Cross-fitted causal forest"]
+    J --> I["ATE, CATE or ITE estimates with diagnostics"]
 ```
 
 ### Why the stages are separated
@@ -209,22 +211,23 @@ A complete Stage 2 analysis ordinarily performs the following sequence:
    evidence family cannot erase a smaller one. Each compiled card is projected
    to a prompt-local integer and its readable text strings only. The model cites
    those simple integers, which Python maps back to full provenance; discovery
-   does not choose value types or extraction ontologies.
+   lists every supported clinical feature and does not choose causal roles,
+   value types, or extraction ontologies.
 2. It consolidates spelling variants and genuine aliases while preserving
-   clinically distinct measurements.
-3. It compares the resulting architecture-level dossiers and reviews the exact
-   supporting evidence for proposed cross-architecture merges.
-4. It routes grounded concepts to adjustment, prognostic, or treatment-effect
-   heterogeneity roles according to their treatment, outcome, residual-effect,
-   and matched-pair evidence.
-5. It extracts the proposed variables on outer-training records and measures
-   missingness, variation, nuisance-model performance, residual-effect loss,
-   and leave-one-variable-out contributions by inner validation.
-6. It permits a bounded clarification of the extraction definition and repeats
-   training-fold evaluation when a definition changes. The final review round
-   may retain or drop a variable but cannot introduce an unevaluated definition.
+   clinically distinct measurements. Consolidation is merge-only; there is no
+   retrieval filter or candidate cap.
+3. The primary model operationalizes every consolidated candidate as one
+   extractable patient-level scalar ontology.
+4. A separate small model extracts every candidate on the outer-training rows,
+   one patient per prompt.
+5. The primary model reviews only aggregate small-model outputs and validation
+   failures. It may revise the same ontology but cannot add, drop, rename, or
+   role-label a feature.
+6. Inner-fold regressions select discovered confounders from joint treatment and
+   outcome prediction and modifiers from treatment-interaction p-values.
+   Investigator-configured roles bypass these gates.
 7. It freezes the retained definitions, applies them to the outer-held-out
-   records, and fits the fold-honest nuisance and effect-modification models.
+   records, and fits the fold-honest nuisance models and causal forest.
 8. It combines held-out AIPW scores across outer folds to estimate the average
    treatment effect and writes row-level conditional effect estimates and
    overlap diagnostics.
@@ -611,8 +614,9 @@ The `run.devices` setting determines GPU-lane concurrency. `run.workers` is the
 overall CPU budget used by TF-IDF and divided among the concurrently active
 text-model lanes. If fewer workers than CUDA devices are requested, each active
 device still requires one controller worker. Stage 2 uses its own
-`stage2.workers` setting for concurrent interpretation requests and
-patient-extraction batches. Independent outer folds run concurrently, while a
+`stage2.workers` setting for primary requests,
+`stage2.extraction_llm.workers` for patient extraction, and
+`stage2.selection_workers` for loky statistical-screen processes. Independent outer folds run concurrently, while a
 shared request semaphore keeps their combined endpoint concurrency at
 `stage2.workers`. Review rounds within each fold remain ordered.
 Every Stage 1 context and every expensive Stage 2 batch writes its own
@@ -640,15 +644,18 @@ NUMEXPR_NUM_THREADS=1 \
 uv run python scripts/run_all_evidence.py \
   --config run.json \
   --stage2-only \
-  --stage2-endpoint http://127.0.0.1:8010/v1
+  --stage2-endpoint http://127.0.0.1:8010/v1 \
+  --stage2-extraction-endpoint http://127.0.0.1:8020/v1
 ```
 
 Set these thread limits before starting Python on high-core-count machines.
-Stage 2 already controls request concurrency with `stage2.workers`; allowing
+Stage 2 already controls primary-model request concurrency with `stage2.workers`
+and extraction concurrency with `stage2.extraction_llm.workers`; allowing
 OpenBLAS, OpenMP, MKL, or NumExpr to create another native thread pool per
 concurrent task can exhaust OpenBLAS's thread metadata or memory regions and
-terminate the process. A configured `stage2.model` is reused; otherwise the
-runner discovers the sole model advertised by the endpoint.
+terminate the process. Every live endpoint is probed through `/models`. An
+omitted model is resolved only when exactly one ID is advertised; an explicit
+model must be among the advertised IDs.
 
 A configured endpoint or managed vLLM pool makes the unflagged default a full
 Stage 1 and Stage 2 run. The API key may be stored in `stage2.api_key` or
@@ -658,10 +665,17 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
 {
   "stage2": {
     "endpoint": "http://127.0.0.1:8010/v1",
-    "model": "Qwen/Qwen3-32B",
+    "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
+    "selection_workers": 32,
+    "extraction_llm": {
+      "endpoint": "http://127.0.0.1:8020/v1",
+      "model": "Qwen/Qwen3-4B-Instruct-2507",
+      "api_key": "EMPTY",
+      "workers": 32
+    },
     "request_timeout": 7200,
-    "max_tokens": 50000,
+    "max_tokens": 100000,
     "max_response_repairs": 10,
     "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
@@ -671,29 +685,18 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "evidence_max_cards_per_fold": 400,
     "evidence_max_exemplars_per_card": 4,
     "evidence_max_exemplar_chars": 2400,
-    "candidate_discovery_source": "compiled_packets",
-    "evidence_community_enabled": true,
-    "evidence_community_model": "answerdotai/answerai-colbert-small-v1",
-    "evidence_community_device": "cpu",
-    "evidence_community_max_packets": 75,
-    "evidence_community_min_per_causal_lane": 30,
-    "evidence_community_hierarchy_target_communities": [300, 75],
-    "candidate_selection_hierarchical_colbert": true,
-    "candidate_selection_hierarchy_top_communities": 3,
     "operationalization_max_prompt_chars": 640000,
     "consolidation_batch_size": 20,
     "consolidation_alphabetical_rounds": 5,
     "consolidation_max_rounds": 55,
     "extraction_feature_batch_size": 10,
     "max_review_rounds": 2,
-    "max_evaluation_rounds": 10,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
-    "screening_trees": 200,
-    "stability_selection_rounds": 3,
-    "stability_selection_frequency": 0.6666666667,
-    "effect_modifier_negative_margin_fraction": 0.01,
-    "effect_modifier_negative_fold_fraction": 0.6,
+    "confounder_p_value_threshold": 0.05,
+    "confounder_min_inner_fold_fraction": 0.75,
+    "effect_modifier_p_value_threshold": 0.05,
+    "effect_modifier_min_inner_fold_fraction": 0.75,
     "estimation_trees": 200,
     "explicit_features": []
   },
@@ -706,7 +709,10 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
 `stage2.model` is optional. When it is empty or omitted, Stage 2 queries the
 endpoint's OpenAI-compatible `/models` API and uses the advertised model if
 exactly one model ID is returned. Configure `stage2.model` explicitly when the
-endpoint advertises multiple IDs.
+endpoint advertises multiple IDs. Dataset-backed Stage 2 also requires
+`stage2.extraction_llm`. Its endpoint may differ from the primary endpoint or
+may be the same multi-model endpoint. Its `model` is resolved by the same
+one-model rule when omitted.
 
 ### Pipeline-managed vLLM server pools
 
@@ -720,6 +726,11 @@ concurrent Stage 2 requests round-robin across them:
   "stage2": {
     "model": "google/gemma-4-31B-it",
     "workers": 32,
+    "extraction_llm": {
+      "endpoint": "http://127.0.0.1:8020/v1",
+      "model": "small-extractor",
+      "workers": 32
+    },
     "vllm": {
       "server_count": 8,
       "gpus": [
@@ -764,13 +775,18 @@ is explicitly overridden:
   `language_model_only: true`.
 
 Reasoning is selected in each Chat Completions payload instead of in the vLLM
-server command. Interpretation-class requests send
-`reasoning_effort: "high"` by default and omit `max_tokens`; this includes
+server command. Primary-model interpretation requests send
+`reasoning_effort: "high"` by default; this includes
 evidence interpretation and audit, consolidation, operationalization, feature
-review, and ontology refinement. Patient extraction and its category-repair
-requests send `reasoning_effort: "none"` and retain the configured
-`max_tokens` cap (50,000 by default). vLLM maps those request values to Gemma
-4's `enable_thinking` chat-template switch. The two efforts are recorded as
+ontology supervision, category mapping, and ontology refinement. One-patient
+value-extraction requests use the configured small model with
+`reasoning_effort: "none"`. Both models may share an endpoint. Every request
+receives the configured `max_tokens` output ceiling (100,000 by default); this
+permits long output but does not force generation to that length. Stage 2
+detects Qwen 3 (including 3.8), Gemma 4, and LFM 2.5 IDs and sends their
+template-level thinking switch, with portable prompt and request-field
+fallbacks for non-vLLM servers. It parses either separate reasoning fields or
+inline reasoning delimiters. The two efforts are recorded as
 `interpretation_reasoning_effort` and `extraction_reasoning_effort` in the
 Stage 2 configuration. Every Stage 2 completion request also sends the
 configured `repetition_penalty` (1.1 by default).
@@ -789,6 +805,8 @@ uv run python scripts/run_all_evidence.py \
   --config run.json \
   --stage2-only \
   --stage2-model google/gemma-4-31B-it \
+  --stage2-extraction-endpoint http://127.0.0.1:8020/v1 \
+  --stage2-extraction-model small-extractor \
   --stage2-vllm-servers 8 \
   --stage2-vllm-gpus cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7 \
   --stage2-vllm-download-dir /models/huggingface \
@@ -799,9 +817,12 @@ uv run python scripts/run_all_evidence.py \
 The runner waits until every server advertises a model at `/v1/models` before
 starting inference. Logs and the redacted process/GPU/endpoint manifest are
 written under `stage2/vllm_servers/`. On normal completion, interruption, or a
-Stage 2 error, it terminates every managed vLLM process group. The existing
-single external endpoint mode is unchanged, and `stage2.endpoint` and
-`stage2.vllm` are mutually exclusive.
+Stage 2 error, it terminates every managed vLLM process group. The primary model
+may still use one external endpoint, and `stage2.endpoint` and `stage2.vllm` are
+mutually exclusive. The extraction endpoint is always supplied separately and
+is not launched or stopped as part of the managed primary-model pool; it may
+still point at the same OpenAI-compatible service when that service exposes
+both selected models.
 
 To guarantee inclusion of an investigator-specified variable, populate
 `stage2.explicit_features` with complete definitions containing `name`,
@@ -810,8 +831,9 @@ To guarantee inclusion of an investigator-specified variable, populate
 same per-fold alias consolidation as discovered candidates. A discovered alias
 is merged into the configured feature and contributes provenance, but the
 configured name, roles, and ontology remain authoritative and no ontology-
-definition request is made for that group. Later empirical review diagnoses
-the feature but cannot drop it or revise its ontology. See
+definition request is made for that group. Aggregate ontology supervision and
+statistical screening cannot drop it, change its roles, or revise its ontology.
+See
 [`docs/all_evidence_workflow.md`](docs/all_evidence_workflow.md) for a complete
 example and validation rules.
 
@@ -819,7 +841,8 @@ Stage 2 extraction is permanently isolated to one patient per model prompt. It
 queries at most `stage2.extraction_feature_batch_size` definitions per prompt
 (10 by default), checkpoints each feature slice, and merges the slices before
 review. The CLI equivalent is `--stage2-extraction-feature-batch-size`.
-Concurrency is controlled by `stage2.workers`; patient batching is not configurable.
+Concurrency is controlled by `stage2.extraction_llm.workers`; patient batching
+is not configurable.
 
 Stage 2 preserves the outer-fold boundary throughout variable construction and
 estimation. Before the first LLM request, its default evidence compiler reuses
@@ -832,18 +855,12 @@ does not load another embedding model beside the serving process. The raw Stage
 reduction audit are written under `stage2/evidence_compilation/`. The compiled
 packet plan is cached and input-fingerprinted for fast, safe restarts.
 
-Stage 2 performs candidate discovery from every compiled evidence card. An
-independent deterministic ColBERT hierarchy then organizes evidence for
-post-discovery retrieval. Card representatives become overlapping 16-word atoms
-with exact member-manifest fold provenance. First-round neighbors are restricted
-to different Stage 1 architectures, reranked by symmetric document/document
-ColBERT MeanMaxSim, and connected only when their top-five relationship is
-reciprocal. By default, whole community documents retain all underlying atoms
-and undergo later ColBERT rounds targeting 300 and 75 communities. Named
-candidates query the final communities and then the compiled packets beneath
-their top routers. Atom, edge, community, hierarchy, packet, and resume audits
-are written under `stage2/evidence_communities/`; oracle metadata never
-participates in this organization.
+Stage 2 sends every compiled semantic evidence card to exhaustive feature
+discovery. The primary model must list every pretreatment patient-level clinical
+feature mentioned or implied by the supplied cards, and one evidence item may
+support many candidates. There is no ColBERT routing, evidence-community graph,
+candidate retrieval, candidate-count cap, or causal-role filter. All discovered
+candidates enter merge-only consolidation; oracle metadata never participates.
 
 `semantic_cluster_cards_v2` is the only supported Stage 2 evidence compiler.
 Before any interpretation request, it compares the architectures present in
@@ -870,13 +887,9 @@ candidate: every unmerged feature passes through unchanged. Explicit
 investigator-configured features are hard invariants in every round: they
 cannot be renamed, distinct configured features cannot be merged, and their
 supplied ontology and roles remain authoritative. Python deterministically carries supporting packets,
-architectures, evidence axes, causal roles, descriptions, and original-candidate
-dispositions through the rounds. Only after iterative consolidation does a
-separate deterministic filter remove groups without an evidence-supported
-causal role, recording its decisions in
-`consolidation/causal_role_filter.json`. There is no feature-count selection
-step, and causal roles are derived after iterative grouping so complementary
-evidence can combine. Finally, independent one-feature requests receive only the
+architectures, evidence axes, descriptions, and original-candidate dispositions
+through the rounds. Discovered features have no causal role at this point;
+roles are assigned only by the later statistical screens. Finally, independent one-feature requests receive only the
 canonical feature name and a deduplicated flat list of readable supporting-text
 strings. The model decides the value type, units or allowed categories,
 measurement rule, and missingness handling from that evidence; packet structure,
@@ -890,7 +903,7 @@ records the available, included, omitted, and truncated evidence counts plus a
 fingerprint of all available evidence. A malformed ontology still receives the
 bounded repair attempts; if it remains invalid, Python records an explicit
 fallback artifact and uses a conservative `ambiguous` ontology for training-fold
-extraction and review instead of aborting the outer fold.
+extraction and aggregate supervision instead of aborting the outer fold.
 Every consolidation round/batch and one-group operationalization request is
 input-fingerprinted separately, so a retry skips successful leaves instead of
 repeating the whole fan-out. Batch size and maximum rounds are configurable as
@@ -902,12 +915,13 @@ reused output omitted from its own merge inputs. Degenerate one-feature merges
 are ignored. If one batch remains structurally invalid after bounded repairs,
 that batch is recorded as a conservative passthrough and all its candidates are
 retained, so a malformed optional consolidation response cannot discard an
-explicit feature or abort the fold. Stage 2 then extracts the variables on the
-outer training rows and measures missingness, variation, treatment prediction,
-outcome prediction, and residual-effect performance by inner validation. A
+explicit feature or abort the fold.
+
+The small extraction endpoint then extracts every consolidated candidate on the
+outer-training records, one patient per prompt. A
 feature defined as continuous may preserve a documented category or threshold
 when the record has no exact number. When both numeric and categorical values
-appear, a separate LLM harmonization step sees only outer-training values and
+appear, a primary-model harmonization step sees only outer-training values and
 chooses one common continuous or categorical ontology. The validated plan is
 then frozen and applied deterministically to training and held-out rows;
 categorical ranges are not silently coerced to invented numeric midpoints.
@@ -920,28 +934,45 @@ a valid prior plan is retained with unresolved new tokens mapped to null, while
 a feature without a prior plan retains its raw mixed values under
 `continuous_with_categorical_fallback` modeling. Final fold definitions and the
 run summary retain these fallback records for audit.
-Leave-one-feature-out measurements show whether each variable improves or
-degrades the complete extracted feature set.
 
-Feature retention uses repeated random-forest screens scored only on
-inner-held-out rows. Confounder and prognostic roles must earn stable positive
-support. Because modifiers are harder to detect, an effect modifier is retained
-unless repeated screens show R-loss deterioration beyond the configured
-negative margin with consistent negative folds. An LLM drop cannot bypass this
-stability gate. Propensity, outcome, and treatment-effect models all use forests
-when feature columns exist. Investigator-configured features remain immutable.
-The language model may revise an extraction definition for at most
-`max_review_rounds`. Every definition, modeling-representation, role, or feature
-set change—including an ordinary drop—forces another extraction/evaluation
-round. After the final allowed language-model review, evaluation-only rounds
-continue until stability selection is complete and the retained feature set is
-unchanged, so the final set is always rescored. An outer fold is limited to
-`max_evaluation_rounds` total cycles (10 by default); reaching that cap without
-convergence writes a non-convergence flag to `review/convergence.json` and
-continues with the latest retained definitions. The flag is also carried in
-`final_definitions.json`, the outer-fold completion record, and the run summary's
-`nonconverged_outer_folds`; if the definitions changed in the capped final
-round, the final training extraction is refreshed before held-out estimation.
+The primary model then reviews each candidate's aggregate extracted values and
+validation failures. It receives no patient text, treatment or outcome values,
+causal-role evidence, performance metric, or p-value. It may keep or revise the
+same candidate's description, value type, categories or unit, measurement rule,
+and missingness rule, but cannot add, drop, split, merge, rename, or role-label a
+feature. Any revision triggers small-model re-extraction. This bounded
+supervision runs for at most `max_review_rounds` (two by default), and explicit
+investigator ontologies are locked.
+
+Feature selection is deliberately simple and auditable. Within each inner-fold
+training partition, Stage 2 fits one candidate-at-a-time regressions for
+treatment and outcome and records raw omnibus p-values plus separate rankings.
+A discovered feature becomes an outer-fold confounder only when both p-values
+are strictly below `confounder_p_value_threshold` (0.05 by default) in at least
+`confounder_min_inner_fold_fraction` of inner folds (0.75 by default, rounded up
+to a whole-fold vote count). Non-evaluable tests do not vote. Binary treatment
+and binary outcomes use logistic likelihood-ratio tests; continuous outcomes
+use the analogous partial-F test. The regression work is split into
+deterministic inner-fold/feature chunks and executed by joblib's `loky` backend.
+
+Modifier screening then fits one outcome model per candidate and inner-training
+partition. Each reduced model contains all selected confounders and observed
+binary treatment; the full model adds the candidate main effect and its
+treatment interaction. A categorical candidate contributes all estimable
+nonreference-level treatment interactions to one omnibus likelihood-ratio (or
+partial-F) test. A discovered candidate becomes an effect modifier when
+the raw interaction p-value is strictly below
+`effect_modifier_p_value_threshold` (0.05 by default) in at least
+`effect_modifier_min_inner_fold_fraction` of inner folds (0.75 by default).
+Candidates may receive both roles. Investigator-configured confounders and
+modifiers bypass every evidence and p-value gate and are always retained with
+their configured roles.
+
+Statistical selection writes its own input fingerprint and completion marker,
+so an interrupted run resumes it independently. Endpoint URLs are transport
+details and may change between resumes. The root `model_identity.json` records
+the model IDs advertised at startup, and a change to either selected model ID
+raises an error before existing checkpoints are reused.
 
 Each patient extraction also records feature-attributable validation failures.
 After the training patients finish, Stage 2 aggregates repeated failures across
@@ -955,24 +986,29 @@ or response-envelope failures are reported separately and never treated as
 ontology evidence. Explicit investigator-supplied ontologies remain immutable
 and are only audited when they repeatedly fail.
 
-Only after this review has ended is the final definition applied to the outer
-held-out records. Nuisance models for treatment and potential outcomes are fit
-without using those held-out outcomes. The fold result contains held-out
-propensities, potential-outcome predictions, AIPW scores, and conditional effect
-estimates. Combining the held-out rows across outer folds produces the final
-average treatment effect and its confidence interval.
+Only after supervision and inner-fold selection end are the retained definitions
+applied to outer-held-out records. The final heterogeneous-effect model is an
+honest `CausalForestDML`: effect modifiers form its heterogeneity matrix and
+pure confounders form its controls (a dual-role variable is represented once in
+the heterogeneity matrix). If no modifier survives, a constant effect design
+keeps the final model a causal forest. Separate nuisance forests are fit without
+using outer-held-out outcomes and produce held-out propensities, potential-outcome
+predictions, and AIPW scores. The causal forest supplies held-out conditional
+effects and confidence intervals; combining outer-held-out AIPW scores across
+folds supplies the reported cross-fitted average treatment effect and confidence
+interval.
 
 ```mermaid
 flowchart LR
-    A["Stage 1 evidence<br/>for one outer fold"] --> B["Operational variable definitions"]
-    B --> C["Extract outer-training records"]
-    C --> H["Aggregate repeated<br/>feature-level failures"]
-    H -->|"ontology revised"| C
-    H -->|"stable"| D["Inner-fold predictive and R-loss review"]
-    D -->|"revise, if another round remains"| B
-    D -->|"freeze"| E["Extract outer-held-out records"]
-    E --> F["Held-out nuisance predictions and AIPW score"]
-    F --> G["Aggregate all outer folds"]
+    A["Semantic evidence cards<br/>for one outer fold"] --> B["Exhaustive primary-model<br/>feature listing"]
+    B --> C["Merge-only consolidation<br/>and operationalization"]
+    C --> D["Small model extracts every candidate<br/>on outer-training records"]
+    D --> E["Primary model reviews<br/>aggregate ontology"]
+    E -->|"ontology revised"| D
+    E -->|"frozen"| F["Inner-fold p-value screens<br/>for roles"]
+    F --> G["Small model extracts retained<br/>outer-held-out variables"]
+    G --> H["Causal forest and<br/>held-out AIPW scores"]
+    H --> I["Aggregate all outer folds"]
 ```
 
 ### Output and interruption recovery
@@ -1031,29 +1067,25 @@ nsclc_all_evidence/
     evidence_compilation/
       packets.jsonl
       outer_001/{cards,members,lineage}.jsonl
-    evidence_communities/
-      packets.jsonl
-      summary.json
-      outer_001/
-        atoms.jsonl
-        edges.jsonl
-        communities.jsonl
-        packets.jsonl
-        complete.json
     outer_001/
       input_packets.jsonl
       interpretations/...
+      consolidation/...
       feature_definitions.json
-      review/
+      ontology_supervision/
         round_001/
-          extraction/extracted.csv
-          extraction_summary.json
-          performance.json
-          review.json
+          extraction/...
+          aggregate_extraction_summary.json
+          supervisor/...
           complete.json
+        convergence.json
+      selection/
+        statistical_selection.json
+        selected_definitions.json
       final_definitions.json
       extraction/
-        heldout/extracted.csv
+        fit/extracted.csv
+        heldout/harmonized.csv
         extracted_features.csv
       estimation/
         predictions.csv
@@ -1073,10 +1105,11 @@ nsclc_all_evidence/
 written to `logs/workflow.log`, and model-specific intermediate results are kept
 under `components/<name>/`. Stage 2's intermediate scientific results are under
 the current `stage2/outer_NNN/` directory: this is the direct place to inspect
-the variables, extraction summaries, performance measurements, and fold-level
-estimates. If a process is interrupted, rerunning the same command skips each
-completed interpretation batch, extraction batch, review round, and fold
-estimate, then re-enters the first incomplete directory.
+the candidates, aggregate ontology reviews, fold-local p-values and rankings,
+selected roles, extractions, and causal-forest estimates. If a process is
+interrupted, rerunning the same command skips each completed interpretation,
+consolidation, extraction, ontology-supervision, and estimation leaf, then
+re-enters the first incomplete directory.
 
 When the input dataset contains `true_ite_prob`, Stage 2 evaluates its frozen
 cross-fitted `estimated_cate` values against that oracle only after all modeling

@@ -24,23 +24,27 @@ from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 import numpy as np
 import pandas as pd
 
+from ..models.causal_forest_head import CausalForestHead
+from .stage2_statistical_selection import select_stage2_features
+
 LOGGER = logging.getLogger(__name__)
 
 EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_extraction_v4_continuous_category_fallback"
+    "stage2_single_patient_extraction_v5_independent_small_model"
 )
 EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_feature_batch_extraction_v3_continuous_category_fallback"
+    "stage2_single_patient_feature_batch_extraction_v4_independent_small_model"
 )
 PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_page_extraction_v3_continuous_category_fallback"
+    "stage2_single_patient_page_extraction_v4_independent_small_model"
 )
 PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_lossless_feature_partition_reconciliation_v4_continuous_category_fallback"
+    "stage2_lossless_feature_partition_reconciliation_v5_independent_small_model"
 )
-REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v4_stable_forest_pruning"
-REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_review_convergence_v1"
-ESTIMATION_CHECKPOINT_SCHEMA_VERSION = "stage2_outer_estimation_v3_all_forest_models"
+REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_aggregate_ontology_supervisor_v1"
+REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_ontology_supervisor_convergence_v1"
+ESTIMATION_CHECKPOINT_SCHEMA_VERSION = "stage2_outer_estimation_v4_causal_forest"
+STATISTICAL_SELECTION_SCHEMA_VERSION = "stage2_inner_fold_univariate_selection_v2_loky_omnibus"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
 ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_training_failure_ontology_refinement_v2_request_policy"
@@ -853,7 +857,9 @@ def _request_validated_extraction(
         corrections = request_json(
             _category_ontology_prompt(items),
             lambda value: _validate_category_ontology(value, items=items),
-            request_kind="extraction",
+            # This is ontology judgment over aggregate invalid values, not raw
+            # patient extraction, so it belongs to the primary supervisor.
+            request_kind="interpretation",
         )
         resolution = "llm_category_ontology"
     except ValueError as exc:
@@ -1503,10 +1509,12 @@ def extract_rows(
     workers: int,
     max_prompt_chars: int,
     feature_batch_size: int = DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE,
+    request_identity: Mapping[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Extract one patient per prompt in bounded feature slices, then merge them."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    extraction_request_identity = dict(request_identity or {})
     feature_names = [str(feature["name"]) for feature in definitions]
     definition_batches = _partition_feature_definitions(
         definitions,
@@ -1651,6 +1659,7 @@ def extract_rows(
             batch_input = {
                 "schema_version": EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION,
                 "parent_schema_version": parent_schema_version,
+                "request_identity": extraction_request_identity,
                 "definitions": _prompt_feature_definitions(batch_definitions),
                 "row": dict(row),
             }
@@ -1761,6 +1770,7 @@ def extract_rows(
         input_fingerprint = _value_fingerprint(
             {
                 "schema_version": EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                "request_identity": extraction_request_identity,
                 "definitions": extraction_definitions,
                 "rows": list(batch),
             }
@@ -1910,6 +1920,7 @@ def extract_rows(
         input_fingerprint = _value_fingerprint(
             {
                 "schema_version": PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                "request_identity": extraction_request_identity,
                 "definitions": extraction_definitions,
                 "row": dict(page),
             }
@@ -2018,6 +2029,7 @@ def extract_rows(
         reconciliation_fingerprint = _value_fingerprint(
             {
                 "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
+                "request_identity": extraction_request_identity,
                 "row_id": int(row_id),
                 "definitions": extraction_definitions,
                 "page_results": page_results,
@@ -2094,6 +2106,7 @@ def extract_rows(
             batch_stale_audit = _stale_category_ontology_audit(batch_ontology_audit_path)
             batch_input = {
                 "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
+                "request_identity": extraction_request_identity,
                 "row_id": int(row_id),
                 "definitions": _prompt_feature_definitions(batch_definitions),
                 "page_results": batch_page_results,
@@ -5154,7 +5167,6 @@ def _ontology_refinement_prompt(
                 "categories_or_unit",
                 "measurement_definition",
                 "missing_value_rule",
-                "roles",
             )
         },
         "repeated_failure_patterns": [
@@ -5258,6 +5270,229 @@ def _validate_ontology_refinement(
         }
     )
     return decision
+
+
+def _aggregate_ontology_supervisor_prompt(
+    *,
+    feature: Mapping[str, Any],
+    summary: Mapping[str, Any],
+    failure_patterns: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Ask the primary model to audit one small-model extraction schema."""
+
+    body = {
+        "job": "review_stage2_small_model_extraction_ontology",
+        "information_boundary": (
+            "Only aggregate extraction values and validation failures from outer-training "
+            "patients are supplied. No patient text, treatment values, outcome values, "
+            "causal-role evidence, model performance, or p-values are supplied."
+        ),
+        "feature": {
+            key: copy.deepcopy(feature.get(key))
+            for key in (
+                "feature_id",
+                "name",
+                "description",
+                "value_type",
+                "categories_or_unit",
+                "measurement_definition",
+                "missing_value_rule",
+            )
+        },
+        "aggregate_extraction_summary": copy.deepcopy(dict(summary)),
+        "aggregate_validation_failures": [
+            {
+                key: copy.deepcopy(pattern.get(key))
+                for key in (
+                    "failure_kind",
+                    "reason",
+                    "patient_count",
+                    "example_values",
+                    "allowed_categories",
+                )
+            }
+            for pattern in failure_patterns
+        ],
+        "rules": [
+            "Return keep unless the aggregates demonstrate a correctable extraction-schema mismatch.",
+            "You may revise only description, value_type, categories_or_unit, measurement_definition, and missing_value_rule.",
+            "Never add, drop, split, merge, or rename a feature and never infer or change a causal role.",
+            "A revision must remain one reusable pretreatment patient-level scalar variable.",
+            "Do not optimize for association with treatment or outcome; neither is available.",
+            "For binary variables return exactly two distinct scalar categories; for categorical or ordinal variables return at least two.",
+            "Return JSON only.",
+        ],
+        "response": {
+            "action": "keep|revise",
+            "reason": "schema-quality rationale",
+            "description": "required for revise",
+            "value_type": "binary|categorical|continuous|ordinal; required for revise",
+            "categories_or_unit": ["required for revise"],
+            "measurement_definition": "required for revise",
+            "missing_value_rule": "required for revise",
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You supervise extraction ontologies using aggregate small-model outputs. "
+                "You cannot select features or causal roles. Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True, ensure_ascii=False)},
+    ]
+
+
+def _request_aggregate_ontology_supervisor(
+    *,
+    definitions: Sequence[Mapping[str, Any]],
+    summaries: Sequence[Mapping[str, Any]],
+    failure_summary: Mapping[str, Any],
+    output_dir: Path,
+    request_json: RequestJSON,
+    workers: int,
+    request_identity: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
+    """Review all schemas without exposing treatment, outcome, or p-values."""
+
+    summaries_by_id = {str(row["feature_id"]): dict(row) for row in summaries}
+    failures_by_name: dict[str, list[dict[str, Any]]] = {}
+    for pattern in failure_summary.get("feature_failure_patterns") or []:
+        if isinstance(pattern, Mapping) and str(pattern.get("feature_name") or ""):
+            failures_by_name.setdefault(str(pattern["feature_name"]), []).append(dict(pattern))
+    identity = dict(request_identity or {})
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jobs: list[tuple[int, dict[str, Any]]] = []
+    decisions: dict[str, dict[str, Any]] = {}
+    for index, raw_feature in enumerate(definitions, start=1):
+        feature = dict(raw_feature)
+        feature_id = str(feature["feature_id"])
+        if feature.get("configured_explicit_feature") is True:
+            decisions[feature_id] = {
+                "feature_id": feature_id,
+                "feature_name": str(feature["name"]),
+                "action": "keep",
+                "reason": "Investigator-specified ontology is locked.",
+                "configured_explicit_feature": True,
+            }
+        else:
+            jobs.append((index, feature))
+
+    def request_one(job: tuple[int, dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        index, feature = job
+        feature_id = str(feature["feature_id"])
+        summary = summaries_by_id.get(feature_id, {})
+        failures = failures_by_name.get(str(feature["name"]), [])
+        input_value = {
+            "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+            "primary_request_identity": identity,
+            "feature": {
+                key: copy.deepcopy(feature.get(key))
+                for key in (
+                    "feature_id",
+                    "name",
+                    "description",
+                    "value_type",
+                    "categories_or_unit",
+                    "measurement_definition",
+                    "missing_value_rule",
+                )
+            },
+            "aggregate_extraction_summary": summary,
+            "aggregate_validation_failures": failures,
+        }
+        fingerprint = _value_fingerprint(input_value)
+        feature_dir = output_dir / f"feature_{index:04d}"
+        result_path = feature_dir / "result.json"
+        complete_path = feature_dir / "complete.json"
+        if result_path.is_file() and complete_path.is_file():
+            try:
+                completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                if completion.get("input_fingerprint") == fingerprint:
+                    cached = json.loads(result_path.read_text(encoding="utf-8"))
+                    return feature_id, _validate_ontology_refinement(cached, feature=feature)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(feature_dir / "input.json", {**input_value, "input_fingerprint": fingerprint})
+        try:
+            decision = request_json(
+                _aggregate_ontology_supervisor_prompt(
+                    feature=feature,
+                    summary=summary,
+                    failure_patterns=failures,
+                ),
+                lambda value: _validate_ontology_refinement(value, feature=feature),
+                request_kind="interpretation",
+            )
+        except ValueError as exc:
+            decision = {
+                "feature_id": feature_id,
+                "feature_name": str(feature["name"]),
+                "action": "keep",
+                "reason": f"Invalid supervisor response; conservative keep: {exc}",
+                "validation_fallback": True,
+            }
+        _write_json(result_path, decision)
+        _write_json(
+            complete_path,
+            {
+                "status": "complete",
+                "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+                "input_fingerprint": fingerprint,
+                "completed_at": _now(),
+                "action": decision["action"],
+            },
+        )
+        return feature_id, decision
+
+    if jobs:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(int(workers), len(jobs)))
+        ) as executor:
+            futures = [executor.submit(request_one, job) for job in jobs]
+            for future in concurrent.futures.as_completed(futures):
+                feature_id, decision = future.result()
+                decisions[feature_id] = decision
+
+    updated: list[dict[str, Any]] = []
+    changed_ids: list[str] = []
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        decision = decisions[str(feature["feature_id"])]
+        if decision["action"] == "revise":
+            before = {
+                key: copy.deepcopy(feature.get(key))
+                for key in (
+                    "description",
+                    "value_type",
+                    "categories_or_unit",
+                    "measurement_definition",
+                    "missing_value_rule",
+                )
+            }
+            for key in before:
+                feature[key] = copy.deepcopy(decision[key])
+            after = {key: copy.deepcopy(feature.get(key)) for key in before}
+            if _value_fingerprint(before) != _value_fingerprint(after):
+                feature.pop("harmonization_plan", None)
+                feature.pop("harmonization_fallback", None)
+                changed_ids.append(str(feature["feature_id"]))
+        updated.append(feature)
+
+    report = {
+        "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+        "completed_at": _now(),
+        "features_reviewed": len(definitions),
+        "model_requested_features": len(jobs),
+        "changed_feature_ids": changed_ids,
+        "decisions": [decisions[str(feature["feature_id"])] for feature in definitions],
+        "prohibited_information_supplied": False,
+    }
+    _write_json(output_dir / "result.json", {"definitions": updated, **report})
+    _write_json(output_dir / "complete.json", {"status": "complete", **report})
+    return updated, bool(changed_ids), report
 
 
 def _repeated_ontology_failure_patterns(
@@ -5480,6 +5715,7 @@ def _extract_training_with_ontology_feedback(
     feature_batch_size: int,
     minimum_failure_patients: int,
     max_refinement_rounds: int,
+    request_identity: Mapping[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], int]:
     """Extract training rows and re-extract after repeated-failure ontology repairs."""
 
@@ -5499,6 +5735,7 @@ def _extract_training_with_ontology_feedback(
             workers=workers,
             max_prompt_chars=max_prompt_chars,
             feature_batch_size=feature_batch_size,
+            request_identity=request_identity,
         )
         summary = json.loads((extraction_dir / "failure_summary.json").read_text(encoding="utf-8"))
         repeated = _repeated_ontology_failure_patterns(
@@ -5547,6 +5784,10 @@ def _extract_training_with_ontology_feedback(
         "rounds": rounds,
         "definitions": current,
     }
+    final_failure_summary = json.loads(
+        (extraction_dir / "failure_summary.json").read_text(encoding="utf-8")
+    )
+    _write_json(feedback_dir / "final_failure_summary.json", final_failure_summary)
     _write_json(feedback_dir / "result.json", feedback_result)
     _write_json(feedback_dir / "complete.json", {"status": "complete", **feedback_result})
     return extracted, current, len(rounds)
@@ -5673,22 +5914,7 @@ def estimate_outer_fold(
     output_dir.mkdir(parents=True, exist_ok=True)
     fit_ids = [int(value) for value in split["fit_row_ids"]]
     heldout_ids = [int(value) for value in split["heldout_row_ids"]]
-    inner = list(split.get("inner_splits") or []) or _fallback_inner_splits(
-        fit_ids, folds=inner_folds, seed=seed
-    )
     binary = str(outcome_type) == "binary"
-    e_oof, mu0_oof, mu1_oof = _cross_fitted_nuisance(
-        dataset=dataset,
-        extracted=extracted_fit,
-        definitions=definitions,
-        fit_ids=fit_ids,
-        inner_splits=inner,
-        treatment_column=treatment_column,
-        outcome_column=outcome_column,
-        binary=binary,
-        seed=seed,
-        forest_trees=estimation_trees,
-    )
     fit_data = dataset.iloc[fit_ids]
     heldout_data = dataset.iloc[heldout_ids]
     t_fit = fit_data[treatment_column].to_numpy(dtype=float)
@@ -5698,15 +5924,24 @@ def estimate_outer_fold(
 
     propensity_defs = _definitions_for_roles(definitions, {"confounder"})
     effect_defs = _definitions_for_roles(definitions, {"effect_modifier"})
+    effect_ids = {str(feature["feature_id"]) for feature in effect_defs}
+    pure_confounder_defs = [
+        feature
+        for feature in propensity_defs
+        if str(feature["feature_id"]) not in effect_ids
+    ]
     t_encoder = _FeatureEncoder(propensity_defs).fit(extracted_fit)
     y_encoder = _FeatureEncoder(definitions).fit(extracted_fit)
     effect_encoder = _FeatureEncoder(effect_defs).fit(extracted_fit)
+    control_encoder = _FeatureEncoder(pure_confounder_defs).fit(extracted_fit)
     x_t_fit = t_encoder.transform(extracted_fit)
     x_t_heldout = t_encoder.transform(extracted_heldout)
     x_y_fit = y_encoder.transform(extracted_fit)
     x_y_heldout = y_encoder.transform(extracted_heldout)
     x_effect_fit = effect_encoder.transform(extracted_fit)
     x_effect_heldout = effect_encoder.transform(extracted_heldout)
+    w_fit = control_encoder.transform(extracted_fit)
+    w_heldout = control_encoder.transform(extracted_heldout)
     treatment_model = _fit_classifier(
         x_t_fit,
         t_fit,
@@ -5723,21 +5958,58 @@ def estimate_outer_fold(
     )
     propensity = _predict_probability(treatment_model, x_t_heldout)
     mu0, mu1 = _predict_outcomes(outcome_models, x_y_heldout)
-    pseudo_fit = _dr_score(
-        y_fit,
-        t_fit,
-        mu0_oof,
-        mu1_oof,
-        e_oof,
-        clip=propensity_clip,
+    if x_effect_fit.shape[1] == 0:
+        # EconML requires X for heterogeneous-effect prediction. A constant X
+        # yields one fold-level treatment effect when no modifier survived.
+        x_effect_fit = np.ones((len(extracted_fit), 1), dtype=float)
+        x_effect_heldout = np.ones((len(extracted_heldout), 1), dtype=float)
+        constant_effect_design = True
+    else:
+        constant_effect_design = False
+    controls_fit = w_fit if w_fit.shape[1] else None
+    causal_forest = CausalForestHead(
+        n_estimators=int(estimation_trees),
+        max_depth=None,
+        min_samples_leaf=10,
+        max_features="sqrt",
+        honest=True,
+        inference=True,
+        random_state=seed + 20_000,
+        tune_model=False,
+        subforest_size=next(
+            size for size in (4, 3, 2, 1) if int(estimation_trees) % size == 0
+        ),
+        n_jobs=1,
     )
-    effect_model = _fit_effect_model(
+    causal_forest.fit(
         x_effect_fit,
-        pseudo_fit,
-        seed=seed + 20_000,
-        trees=estimation_trees,
+        t_fit,
+        y_fit,
+        W=controls_fit,
     )
-    cate = effect_model.predict(x_effect_heldout)
+    causal_forest_predictions = causal_forest.predict(
+        x_effect_heldout,
+        return_ci=True,
+    )
+    cate = np.asarray(causal_forest_predictions["tau_pred"], dtype=float)
+    cate_lower = causal_forest_predictions.get("tau_lower")
+    cate_upper = causal_forest_predictions.get("tau_upper")
+    cate_std = causal_forest_predictions.get("tau_std")
+    cate_lower_values = (
+        np.asarray(cate_lower, dtype=float)
+        if cate_lower is not None
+        else np.full(len(cate), np.nan)
+    )
+    cate_upper_values = (
+        np.asarray(cate_upper, dtype=float)
+        if cate_upper is not None
+        else np.full(len(cate), np.nan)
+    )
+    cate_std_values = (
+        np.asarray(cate_std, dtype=float)
+        if cate_std is not None
+        else np.full(len(cate), np.nan)
+    )
     aipw = _dr_score(
         y_heldout,
         t_heldout,
@@ -5757,6 +6029,9 @@ def estimate_outer_fold(
             "mu1": mu1,
             "aipw_score": aipw,
             "estimated_cate": cate,
+            "estimated_cate_lower_95": cate_lower_values,
+            "estimated_cate_upper_95": cate_upper_values,
+            "estimated_cate_standard_error": cate_std_values,
         }
     )
     _write_frame(output_dir / "predictions.csv", predictions)
@@ -5768,13 +6043,27 @@ def estimate_outer_fold(
         float(np.std(finite, ddof=1) / math.sqrt(len(finite))) if len(finite) > 1 else None
     )
     diagnostics = {
-        "model_family": "random_forest",
-        "forest_trees": int(estimation_trees),
+        "model_family": "causal_forest_dml",
+        "primary_ate_estimator": "outer_cross_fitted_aipw",
+        "causal_forest_trees": int(estimation_trees),
+        "causal_forest_honest": True,
+        "causal_forest_inference": True,
+        "causal_forest_tuned": False,
+        "causal_forest_fit_audit": causal_forest.fit_audit(),
         "rows": len(heldout_ids),
         "fit_rows": len(fit_ids),
         "features": len(definitions),
         "confounders": len(propensity_defs),
         "effect_modifiers": len(effect_defs),
+        "pure_confounders_in_w": len(pure_confounder_defs),
+        "dual_role_features_in_x_only": len(
+            [
+                feature
+                for feature in propensity_defs
+                if str(feature["feature_id"]) in effect_ids
+            ]
+        ),
+        "constant_effect_design": constant_effect_design,
         "ate_aipw": ate,
         "standard_error": standard_error,
         "confidence_interval_95": (
@@ -5783,6 +6072,17 @@ def estimate_outer_fold(
             else None
         ),
         "mean_estimated_cate": float(np.mean(cate)) if len(cate) else None,
+        "mean_causal_forest_effect": float(np.mean(cate)) if len(cate) else None,
+        "mean_causal_forest_lower_95": (
+            float(np.nanmean(cate_lower_values))
+            if np.isfinite(cate_lower_values).any()
+            else None
+        ),
+        "mean_causal_forest_upper_95": (
+            float(np.nanmean(cate_upper_values))
+            if np.isfinite(cate_upper_values).any()
+            else None
+        ),
         "propensity_min": float(np.min(propensity)) if len(propensity) else None,
         "propensity_max": float(np.max(propensity)) if len(propensity) else None,
         "propensity_clip": propensity_clip,
@@ -5804,7 +6104,7 @@ def estimate_outer_fold(
     return diagnostics
 
 
-def run_fold_analysis(
+def _run_fold_analysis_legacy(
     *,
     dataset: pd.DataFrame,
     definitions: Sequence[Mapping[str, Any]],
@@ -6232,6 +6532,413 @@ def run_fold_analysis(
         "screening_model_family": "random_forest",
         "screening_trees": screening_trees,
         "stability_selection_policy": selection_policy,
+        "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
+        "estimation": diagnostics,
+    }
+
+
+def run_fold_analysis(
+    *,
+    dataset: pd.DataFrame,
+    definitions: Sequence[Mapping[str, Any]],
+    split: Mapping[str, Any],
+    clinical_question: str,
+    unit_id_column: str,
+    text_column: str,
+    treatment_column: str,
+    outcome_column: str,
+    outcome_type: str,
+    inner_folds: int,
+    seed: int,
+    output_dir: Path,
+    request_json: RequestJSON,
+    config: Any,
+) -> dict[str, Any]:
+    """Run extraction supervision, fold-local selection, and causal-forest estimation."""
+
+    del clinical_question  # Deliberately excluded from extraction-supervisor prompts.
+    (
+        ontology_refinement_min_failure_patients,
+        max_ontology_refinement_rounds,
+    ) = _ontology_refinement_limits(config)
+    extraction_feature_batch_size = _configured_extraction_feature_batch_size(config)
+    fit_ids = [int(value) for value in split["fit_row_ids"]]
+    heldout_ids = [int(value) for value in split["heldout_row_ids"]]
+    inner_splits = list(split.get("inner_splits") or []) or _fallback_inner_splits(
+        fit_ids,
+        folds=inner_folds,
+        seed=seed,
+    )
+    extraction_llm = getattr(config, "extraction_llm", None)
+    extraction_identity = {
+        "model": str(getattr(extraction_llm, "model", "")),
+    }
+    primary_identity = {
+        "model": str(getattr(config, "model", "")),
+    }
+    extraction_workers = int(
+        getattr(extraction_llm, "workers", getattr(config, "workers", 1))
+    )
+
+    current: list[dict[str, Any]] = []
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        value_type = str(feature.get("value_type") or "ambiguous").strip().lower()
+        if value_type in {"binary", "categorical", "ordinal"}:
+            feature["categories_or_unit"] = _validated_closed_category_values(
+                value_type=value_type,
+                values=feature.get("categories_or_unit") or [],
+                source=f"feature {feature.get('name')!r}",
+            )
+        current.append(_normalized_feature_modeling_definition(feature))
+
+    review_rounds = 0
+    ontology_refinement_rounds = 0
+    review_converged = False
+    review_history: list[dict[str, Any]] = []
+    final_fit_all: pd.DataFrame | None = None
+    final_fit_definitions: list[dict[str, Any]] | None = None
+    maximum_review_rounds = int(getattr(config, "max_review_rounds", 1))
+
+    for round_index in range(1, maximum_review_rounds + 1):
+        review_rounds = round_index
+        round_dir = output_dir / "ontology_supervision" / f"round_{round_index:03d}"
+        _write_json(round_dir / "definitions_before_extraction.json", {"features": current})
+        extracted, extracted_definitions, feedback_rounds = (
+            _extract_training_with_ontology_feedback(
+                dataset=dataset,
+                row_ids=fit_ids,
+                text_column=text_column,
+                definitions=current,
+                output_dir=round_dir / "extraction",
+                feedback_dir=round_dir / "failure_ontology_refinement",
+                request_json=request_json,
+                workers=extraction_workers,
+                max_prompt_chars=int(config.extraction_max_prompt_chars),
+                feature_batch_size=extraction_feature_batch_size,
+                minimum_failure_patients=ontology_refinement_min_failure_patients,
+                max_refinement_rounds=max_ontology_refinement_rounds,
+                request_identity=extraction_identity,
+            )
+        )
+        ontology_refinement_rounds += feedback_rounds
+        extracted_definitions = [
+            _normalized_feature_modeling_definition(feature)
+            for feature in extracted_definitions
+        ]
+        extracted, extracted_definitions, harmonization = _harmonize_training_extraction(
+            extracted=extracted,
+            definitions=extracted_definitions,
+            output_dir=round_dir / "harmonization",
+            request_json=request_json,
+            max_prompt_chars=int(config.max_prompt_chars),
+        )
+        summaries = feature_summaries(extracted, extracted_definitions)
+        failure_summary = json.loads(
+            (
+                round_dir
+                / "failure_ontology_refinement"
+                / "final_failure_summary.json"
+            ).read_text(encoding="utf-8")
+        )
+        _write_json(round_dir / "aggregate_extraction_summary.json", summaries)
+        reviewed, changed, review_report = _request_aggregate_ontology_supervisor(
+            definitions=extracted_definitions,
+            summaries=summaries,
+            failure_summary=failure_summary,
+            output_dir=round_dir / "supervisor",
+            request_json=request_json,
+            workers=int(getattr(config, "workers", 1)),
+            request_identity=primary_identity,
+        )
+        final_fit_all = extracted
+        final_fit_definitions = extracted_definitions
+        current = [
+            _normalized_feature_modeling_definition(feature) for feature in reviewed
+        ]
+        review_history.append(
+            {
+                "round": round_index,
+                "failure_ontology_refinement_rounds": feedback_rounds,
+                "harmonization": harmonization,
+                "supervisor_changed_feature_ids": list(
+                    review_report["changed_feature_ids"]
+                ),
+            }
+        )
+        _write_json(
+            round_dir / "complete.json",
+            {
+                "status": "complete",
+                "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "ontology_changed": changed,
+                "features": len(current),
+            },
+        )
+        if not changed:
+            review_converged = True
+            break
+
+    if final_fit_all is None or final_fit_definitions is None:
+        raise RuntimeError("Stage 2 ontology supervision did not perform extraction")
+
+    # A revision in the last allowed supervisor round has not yet been applied
+    # to patient text. Re-extract all candidates before any statistical test.
+    if _value_fingerprint(final_fit_definitions) != _value_fingerprint(current):
+        final_fit_all, current, feedback_rounds = _extract_training_with_ontology_feedback(
+            dataset=dataset,
+            row_ids=fit_ids,
+            text_column=text_column,
+            definitions=current,
+            output_dir=output_dir / "extraction" / "all_candidates_fit",
+            feedback_dir=output_dir / "extraction" / "all_candidates_fit_refinement",
+            request_json=request_json,
+            workers=extraction_workers,
+            max_prompt_chars=int(config.extraction_max_prompt_chars),
+            feature_batch_size=extraction_feature_batch_size,
+            minimum_failure_patients=ontology_refinement_min_failure_patients,
+            max_refinement_rounds=max_ontology_refinement_rounds,
+            request_identity=extraction_identity,
+        )
+        ontology_refinement_rounds += feedback_rounds
+        final_fit_all, current, _ = _harmonize_training_extraction(
+            extracted=final_fit_all,
+            definitions=current,
+            output_dir=output_dir / "extraction" / "all_candidates_fit_harmonization",
+            request_json=request_json,
+            max_prompt_chars=int(config.max_prompt_chars),
+        )
+    else:
+        _write_frame(
+            output_dir / "extraction" / "all_candidates_fit" / "extracted.csv",
+            final_fit_all,
+        )
+
+    selection_dir = output_dir / "selection"
+    selection_input = {
+        "schema_version": STATISTICAL_SELECTION_SCHEMA_VERSION,
+        "extracted_fit_fingerprint": _frame_fingerprint(final_fit_all),
+        "treatment_outcome_fingerprint": _frame_fingerprint(
+            dataset.iloc[fit_ids][[treatment_column, outcome_column]].reset_index(drop=True)
+        ),
+        "definitions": current,
+        "inner_splits": inner_splits,
+        "outcome_type": outcome_type,
+        "confounder_p_value_threshold": float(config.confounder_p_value_threshold),
+        "confounder_min_inner_fold_fraction": float(
+            config.confounder_min_inner_fold_fraction
+        ),
+        "effect_modifier_p_value_threshold": float(
+            config.effect_modifier_p_value_threshold
+        ),
+        "effect_modifier_min_inner_fold_fraction": float(
+            config.effect_modifier_min_inner_fold_fraction
+        ),
+    }
+    selection_fingerprint = _value_fingerprint(selection_input)
+    selection_report_path = selection_dir / "statistical_selection.json"
+    selected_path = selection_dir / "selected_definitions.json"
+    selection_complete_path = selection_dir / "complete.json"
+    selection_input_path = selection_dir / "input.json"
+    selection_report: dict[str, Any] | None = None
+    selected: list[dict[str, Any]] | None = None
+    if (
+        selection_report_path.is_file()
+        and selected_path.is_file()
+        and selection_complete_path.is_file()
+        and selection_input_path.is_file()
+    ):
+        try:
+            completion = json.loads(selection_complete_path.read_text(encoding="utf-8"))
+            prior_input = json.loads(selection_input_path.read_text(encoding="utf-8"))
+            cached_report = json.loads(selection_report_path.read_text(encoding="utf-8"))
+            cached_selected = json.loads(selected_path.read_text(encoding="utf-8"))
+            if (
+                completion.get("input_fingerprint") == selection_fingerprint
+                and prior_input.get("input_fingerprint") == selection_fingerprint
+                and cached_report.get("schema_version")
+                == STATISTICAL_SELECTION_SCHEMA_VERSION
+                and isinstance(cached_selected.get("features"), list)
+            ):
+                selection_report = dict(cached_report)
+                selected = [dict(feature) for feature in cached_selected["features"]]
+                LOGGER.info("skip completed Stage 2 statistical selection: %s", selection_dir)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            selection_report = None
+            selected = None
+    if selection_report is None or selected is None:
+        _write_json(
+            selection_input_path,
+            {**selection_input, "input_fingerprint": selection_fingerprint},
+        )
+        selected, selection_report = select_stage2_features(
+            dataset=dataset,
+            extracted_fit=final_fit_all,
+            definitions=current,
+            inner_splits=inner_splits,
+            treatment_column=treatment_column,
+            outcome_column=outcome_column,
+            outcome_type=outcome_type,
+            confounder_p_value_threshold=float(config.confounder_p_value_threshold),
+            confounder_min_inner_fold_fraction=float(
+                config.confounder_min_inner_fold_fraction
+            ),
+            effect_modifier_p_value_threshold=float(
+                config.effect_modifier_p_value_threshold
+            ),
+            effect_modifier_min_inner_fold_fraction=float(
+                config.effect_modifier_min_inner_fold_fraction
+            ),
+            workers=int(getattr(config, "selection_workers", 1)),
+        )
+        _write_json(selection_report_path, selection_report)
+        _write_json(selected_path, {"features": selected})
+        _write_json(
+            selection_complete_path,
+            {
+                "status": "complete",
+                "schema_version": STATISTICAL_SELECTION_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "input_fingerprint": selection_fingerprint,
+                "retained_features": len(selected),
+            },
+        )
+
+    selected_names = [str(feature["name"]) for feature in selected]
+    fit_selected = final_fit_all[["_oci_row_id", *selected_names]].copy()
+    _write_frame(output_dir / "extraction" / "fit" / "extracted.csv", fit_selected)
+    _write_frame(output_dir / "extraction" / "fit" / "harmonized.csv", fit_selected)
+    if selected:
+        _assert_extraction_health(
+            fit_selected,
+            selected,
+            scope="training",
+            minimum_row_nonmissing_fraction=float(config.min_nonmissing_fraction),
+            audit_path=output_dir / "extraction" / "fit_health.json",
+        )
+    else:
+        _write_json(
+            output_dir / "extraction" / "fit_health.json",
+            {
+                "schema_version": "stage2_final_extraction_health_v1",
+                "status": "not_applicable_no_selected_features",
+                "scope": "training",
+                "rows": len(fit_selected),
+                "features": 0,
+            },
+        )
+
+    heldout_raw = extract_rows(
+        dataset=dataset,
+        row_ids=heldout_ids,
+        text_column=text_column,
+        definitions=selected,
+        output_dir=output_dir / "extraction" / "heldout",
+        request_json=request_json,
+        workers=extraction_workers,
+        max_prompt_chars=int(config.extraction_max_prompt_chars),
+        feature_batch_size=extraction_feature_batch_size,
+        request_identity=extraction_identity,
+    )
+    heldout_extraction, heldout_harmonization = _apply_harmonization_plans(
+        heldout_raw,
+        selected,
+        scope="outer_heldout",
+    )
+    _write_frame(
+        output_dir / "extraction" / "heldout" / "harmonized.csv",
+        heldout_extraction,
+    )
+    _write_json(
+        output_dir / "extraction" / "heldout" / "harmonization.json",
+        heldout_harmonization,
+    )
+    if selected:
+        _assert_extraction_health(
+            heldout_extraction,
+            selected,
+            scope="heldout",
+            minimum_row_nonmissing_fraction=float(config.min_nonmissing_fraction),
+            audit_path=output_dir / "extraction" / "heldout_health.json",
+        )
+    else:
+        _write_json(
+            output_dir / "extraction" / "heldout_health.json",
+            {
+                "schema_version": "stage2_final_extraction_health_v1",
+                "status": "not_applicable_no_selected_features",
+                "scope": "heldout",
+                "rows": len(heldout_extraction),
+                "features": 0,
+            },
+        )
+
+    harmonization_validation_fallbacks = [
+        {
+            "feature_id": str(feature["feature_id"]),
+            "name": str(feature["name"]),
+            **copy.deepcopy(feature["harmonization_fallback"]),
+        }
+        for feature in selected
+        if isinstance(feature.get("harmonization_fallback"), Mapping)
+    ]
+    review_convergence = {
+        "schema_version": REVIEW_CONVERGENCE_SCHEMA_VERSION,
+        "status": "converged" if review_converged else "maximum_rounds_reached",
+        "converged": review_converged,
+        "review_rounds": review_rounds,
+        "maximum_review_rounds": maximum_review_rounds,
+        "continued_with_latest_ontology": not review_converged,
+        "history": review_history,
+    }
+    _write_json(output_dir / "ontology_supervision" / "convergence.json", review_convergence)
+    _write_json(
+        output_dir / "final_definitions.json",
+        {
+            "schema_version": STATISTICAL_SELECTION_SCHEMA_VERSION,
+            "features": selected,
+            "all_candidate_features": len(current),
+            "review_rounds": review_rounds,
+            "evaluation_rounds": review_rounds,
+            "review_converged": review_converged,
+            "review_convergence": review_convergence,
+            "ontology_refinement_rounds": ontology_refinement_rounds,
+            "selection_artifact": str(selection_dir / "statistical_selection.json"),
+            "screening_model_family": "univariate_logistic_or_linear_nested_tests",
+            "final_model_family": "causal_forest_dml",
+            "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
+        },
+    )
+    combined = pd.concat([fit_selected, heldout_extraction], ignore_index=True).sort_values(
+        "_oci_row_id"
+    )
+    _write_frame(output_dir / "extraction" / "extracted_features.csv", combined)
+    diagnostics = estimate_outer_fold(
+        dataset=dataset,
+        extracted_fit=fit_selected,
+        extracted_heldout=heldout_extraction,
+        definitions=selected,
+        split=split,
+        unit_id_column=unit_id_column,
+        treatment_column=treatment_column,
+        outcome_column=outcome_column,
+        outcome_type=outcome_type,
+        inner_folds=inner_folds,
+        seed=seed,
+        propensity_clip=float(config.propensity_clip),
+        estimation_trees=int(config.estimation_trees),
+        output_dir=output_dir / "estimation",
+    )
+    return {
+        "features": selected,
+        "review_rounds": review_rounds,
+        "evaluation_rounds": review_rounds,
+        "review_converged": review_converged,
+        "review_convergence": review_convergence,
+        "ontology_refinement_rounds": ontology_refinement_rounds,
+        "screening_model_family": "univariate_logistic_or_linear_nested_tests",
+        "selection": selection_report,
         "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
         "estimation": diagnostics,
     }
