@@ -396,6 +396,9 @@ if (( stage2_managed_extractor )); then
         extractor_server_description="auto replicas"
     fi
     stage2_description+="; managed extractor vLLM: ${extractor_server_description} on ${stage2_extraction_vllm_gpus} (${stage2_extraction_workers:-${resolved_stage2_workers}} concurrent requests)"
+    if (( stage2_managed_orchestrator )); then
+        stage2_description+="; orchestrator uses both managed GPU allocations before extraction"
+    fi
 elif [[ -n "${stage2_extraction_endpoint}" && "${stage2_enabled}" == "1" ]]; then
     stage2_description+="; extractor ${stage2_extraction_endpoint} (${stage2_extraction_workers:-${resolved_stage2_workers}} concurrent requests)"
 fi

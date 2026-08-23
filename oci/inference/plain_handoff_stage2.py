@@ -1592,6 +1592,7 @@ def _has_extraction_dependent_checkpoints(output_dir: Path) -> bool:
     if any((output_dir / name).exists() for name in root_outputs):
         return True
     extraction_science_names = (
+        "extraction",
         "ontology_supervision",
         "review",
         "selection",
@@ -7618,6 +7619,59 @@ class PlainHandoffStage2:
         }
 
 
+def _all_gpu_interpretation_vllm_config(
+    primary: ManagedVLLMConfig,
+    extraction: ManagedVLLMConfig,
+) -> ManagedVLLMConfig:
+    """Expand the pre-extraction primary pool across both managed GPU sets."""
+
+    primary.validate()
+    extraction.validate()
+    all_gpus = tuple(dict.fromkeys((*primary.gpus, *extraction.gpus)))
+    if all_gpus == primary.gpus:
+        return primary
+
+    primary_width = primary.effective_gpus_per_server()
+    if len(all_gpus) % primary_width == 0:
+        gpus_per_server = primary_width
+        server_count = len(all_gpus) // gpus_per_server
+    else:
+        # Equal-width replicas cannot consume the complete union in this case.
+        # A single tensor-parallel server is the only homogeneous layout that
+        # both uses every GPU and remains representable by ManagedVLLMConfig.
+        gpus_per_server = len(all_gpus)
+        server_count = 1
+        LOGGER.info(
+            "pre-extraction orchestrator GPU count=%s is not divisible by its "
+            "dedicated tensor-parallel width=%s; using one all-GPU server",
+            len(all_gpus),
+            primary_width,
+        )
+
+    existing_ports = list(primary.effective_ports())
+    ports = existing_ports[:server_count]
+    next_port = max(existing_ports) + 1
+    while len(ports) < server_count:
+        if next_port > 65_535:
+            raise ValueError(
+                "Stage 2 cannot allocate enough pre-extraction orchestrator ports "
+                "below 65536"
+            )
+        if next_port not in ports:
+            ports.append(next_port)
+        next_port += 1
+
+    combined = replace(
+        primary,
+        server_count=server_count,
+        gpus=all_gpus,
+        gpus_per_server=gpus_per_server,
+        ports=tuple(ports),
+    )
+    combined.validate()
+    return combined
+
+
 def run_plain_handoff_stage2(
     *,
     handoff_path: Path,
@@ -7636,16 +7690,21 @@ def run_plain_handoff_stage2(
     inner_folds: int = 5,
     seed: int = 42,
 ) -> Mapping[str, Any]:
-    def run_with_config(runtime_config: PlainHandoffStage2Config) -> Mapping[str, Any]:
+    def run_with_config(
+        runtime_config: PlainHandoffStage2Config,
+        *,
+        runtime_dataset: pd.DataFrame | None,
+        runtime_extraction_completion: CompletionFunction | None,
+    ) -> Mapping[str, Any]:
         return PlainHandoffStage2(
             config=runtime_config,
             clinical_question=clinical_question,
             completion=completion,
-            extraction_completion=extraction_completion,
+            extraction_completion=runtime_extraction_completion,
         ).run(
             handoff_path=handoff_path,
             output_dir=output_dir,
-            dataset=dataset,
+            dataset=runtime_dataset,
             split_provenance_path=split_provenance_path,
             unit_id_column=unit_id_column,
             text_column=text_column,
@@ -7659,9 +7718,76 @@ def run_plain_handoff_stage2(
     extraction = config.extraction_llm
     extraction_vllm = extraction.vllm if extraction is not None else None
     if config.vllm is None and extraction_vllm is None:
-        return run_with_config(config)
+        return run_with_config(
+            config,
+            runtime_dataset=dataset,
+            runtime_extraction_completion=extraction_completion,
+        )
 
     managed_root = Path(output_dir) / "vllm_servers"
+    if config.vllm is not None and extraction_vllm is not None:
+        # Complete the interpretation/feature-definition phase before starting
+        # extraction. This gives the primary model the union of both managed GPU
+        # allocations without ever stopping a server beneath an in-flight
+        # request. The ordinary fold checkpoints make the second pass resume at
+        # extraction and later orchestration work.
+        extraction_has_started = bool(
+            dataset is not None and _has_extraction_dependent_checkpoints(output_dir)
+        )
+        if not extraction_has_started:
+            all_gpu_config = _all_gpu_interpretation_vllm_config(
+                config.vllm,
+                extraction_vllm,
+            )
+            LOGGER.info(
+                "start managed Stage 2 all-GPU interpretation phase gpus=%s "
+                "replicas=%s tensor_parallel_size=%s",
+                list(all_gpu_config.gpus),
+                all_gpu_config.server_count,
+                all_gpu_config.effective_gpus_per_server(),
+            )
+            with launch_managed_vllm_servers(
+                config=all_gpu_config,
+                model=config.model,
+                api_key=config.api_key,
+                output_dir=managed_root / "orchestrator_all_gpus",
+            ) as interpretation_endpoints:
+                interpretation_config = replace(
+                    config,
+                    endpoint=interpretation_endpoints[0],
+                    runtime_endpoints=tuple(interpretation_endpoints),
+                )
+
+                def extraction_not_started(
+                    _messages: Sequence[Mapping[str, str]],
+                    _request_config: PlainHandoffStage2Config,
+                ) -> str:
+                    raise RuntimeError(
+                        "managed Stage 2 extraction cannot start during the "
+                        "all-GPU interpretation phase"
+                    )
+
+                interpretation_result = run_with_config(
+                    interpretation_config,
+                    runtime_dataset=None,
+                    # Avoid probing or starting the managed extractor while
+                    # retaining its configured scientific model identity.
+                    runtime_extraction_completion=(
+                        extraction_completion or extraction_not_started
+                    ),
+                )
+            if dataset is None:
+                return interpretation_result
+            LOGGER.info(
+                "completed managed Stage 2 interpretation phase; switching to "
+                "dedicated orchestrator and extractor GPU pools"
+            )
+        else:
+            LOGGER.info(
+                "resume managed Stage 2 with dedicated GPU pools because "
+                "extraction-dependent checkpoints already exist"
+            )
+
     with ExitStack() as stack:
         runtime_config = config
         if config.vllm is not None:
@@ -7696,7 +7822,11 @@ def run_plain_handoff_stage2(
                 runtime_config,
                 extraction_llm=runtime_extraction,
             )
-        return run_with_config(runtime_config)
+        return run_with_config(
+            runtime_config,
+            runtime_dataset=dataset,
+            runtime_extraction_completion=extraction_completion,
+        )
 
 
 __all__ = [

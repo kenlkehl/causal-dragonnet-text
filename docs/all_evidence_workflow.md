@@ -296,12 +296,27 @@ For example:
 The pipeline interprets both GPU lists as logical CUDA indices. When its parent
 environment has `CUDA_VISIBLE_DEVICES=4,6`, for example, managed logical GPUs 0
 and 1 are mapped to physical selections 4 and 6 for the child processes. The
-list for each role is divided into equal groups in supplied order and the
-tensor-parallel size is `gpus_per_server`. The replica count is derived from
-the list length; an explicit `server_count` is optional but must agree. Uneven
-division, duplicate devices within one pool, or more servers than GPUs is
-rejected before launch. The pools are simultaneous, so overlapping the two GPU
-lists should be done only with deliberate per-process memory limits.
+list for each dedicated role is divided into equal groups in supplied order and
+the tensor-parallel size is `gpus_per_server`. The replica count is derived
+from the list length; an explicit `server_count` is optional but must agree.
+Uneven division, duplicate devices within one pool, or more servers than GPUs
+is rejected before launch.
+
+When both roles are pipeline-managed, their lifecycle is staged. Interpretation
+and feature definition first run to completion for every outer fold with only
+the orchestrator model loaded. That temporary pool uses the ordered union of
+both roles' GPU lists. If the union divides evenly by the orchestrator's
+configured tensor-parallel width, Stage 2 preserves that width and adds
+replicas. Otherwise it launches one tensor-parallel orchestrator across the
+complete union, which requires the selected model to support that
+tensor-parallel size. Added temporary replicas use consecutive ports after the
+highest configured orchestrator port. Once the feature-definition checkpoints
+are complete, Stage 2 stops the temporary pool and starts the two dedicated
+pools using their exact configured allocations. The dedicated pools are
+simultaneous, so overlapping their GPU lists should be done only with deliberate
+per-process memory limits. A feature-definition-only run never starts the
+extractor, and a resumed run with any extraction-dependent checkpoint starts
+directly in dedicated mode.
 
 The runner checks every requested port before launch, starts all replicas with
 separate `CUDA_VISIBLE_DEVICES` values, and waits for each `/v1/models` API to
@@ -312,9 +327,12 @@ does not receive every retry of the same request. Extraction requests use an
 independent round-robin router and `stage2.extraction_llm.workers` ceiling.
 Server logs and redacted manifests containing commands, PIDs, endpoints, GPU
 assignments, and exit codes are stored in
-`stage2/vllm_servers/orchestrator/` and `stage2/vllm_servers/extractor/`. All
-managed process groups are terminated when Stage 2 succeeds, fails, or is
-interrupted. Either role can independently remain endpoint-backed instead.
+`stage2/vllm_servers/orchestrator_all_gpus/`,
+`stage2/vllm_servers/orchestrator/`, and
+`stage2/vllm_servers/extractor/`, as applicable. All managed process groups are
+terminated when Stage 2 succeeds, fails, or is interrupted. Either role can
+independently remain endpoint-backed instead; all-GPU staging applies only when
+both roles are managed by this pipeline.
 
 The managed vLLM fields are:
 

@@ -159,6 +159,56 @@ def test_dual_managed_pools_derive_independent_replica_layouts():
     assert config.extraction_llm.vllm.internal_port_base == 40_000
 
 
+def test_pre_extraction_pool_uses_union_with_primary_tensor_parallel_width():
+    primary = ManagedVLLMConfig(
+        server_count=1,
+        gpus=("cuda:0", "cuda:1"),
+        gpus_per_server=2,
+        ports=(9010,),
+    )
+    extraction = ManagedVLLMConfig(
+        server_count=2,
+        gpus=("cuda:2", "cuda:3"),
+        gpus_per_server=1,
+    )
+
+    combined = stage2_workflow._all_gpu_interpretation_vllm_config(
+        primary,
+        extraction,
+    )
+
+    assert combined.gpus == ("cuda:0", "cuda:1", "cuda:2", "cuda:3")
+    assert combined.gpus_per_server == 2
+    assert combined.gpu_groups() == (
+        ("cuda:0", "cuda:1"),
+        ("cuda:2", "cuda:3"),
+    )
+    assert combined.effective_ports() == (9010, 9011)
+
+
+def test_pre_extraction_pool_widens_one_server_when_union_is_not_even():
+    primary = ManagedVLLMConfig(
+        server_count=1,
+        gpus=("cuda:0", "cuda:1"),
+        gpus_per_server=2,
+    )
+    extraction = ManagedVLLMConfig(
+        server_count=1,
+        gpus=("cuda:2",),
+        gpus_per_server=1,
+    )
+
+    combined = stage2_workflow._all_gpu_interpretation_vllm_config(
+        primary,
+        extraction,
+    )
+
+    assert combined.server_count == 1
+    assert combined.gpus_per_server == 3
+    assert combined.gpu_groups() == (("cuda:0", "cuda:1", "cuda:2"),)
+    assert combined.effective_ports() == (8010,)
+
+
 @pytest.mark.parametrize(
     ("vllm", "message"),
     [
@@ -478,6 +528,129 @@ def test_run_wrapper_keeps_managed_servers_alive_for_stage2_and_cleans_up(
     )
 
 
+def test_feature_definition_only_run_never_starts_managed_extractor(
+    tmp_path,
+    monkeypatch,
+):
+    config = plain_stage2_config_from_mapping(
+        {
+            "model": "large-reviewer",
+            "vllm": {"gpus": [0], "gpus_per_server": 1},
+            "extraction_llm": {
+                "model": "small-extractor",
+                "vllm": {"gpus": [1], "gpus_per_server": 1},
+            },
+        },
+        default_workers=4,
+    )
+    assert config is not None
+    lifecycle: list[str] = []
+
+    @contextmanager
+    def fake_launch(**kwargs):
+        role = kwargs["output_dir"].name
+        lifecycle.append(f"start-{role}")
+        endpoints = tuple(
+            f"http://127.0.0.1:{port}/v1"
+            for port in kwargs["config"].effective_ports()
+        )
+        try:
+            yield endpoints
+        finally:
+            lifecycle.append(f"stop-{role}")
+
+    def fake_run(self, **kwargs):
+        assert kwargs["dataset"] is None
+        lifecycle.append("stage2")
+        return {"phase": "feature_definitions"}
+
+    monkeypatch.setattr(stage2_workflow, "launch_managed_vllm_servers", fake_launch)
+    monkeypatch.setattr(PlainHandoffStage2, "run", fake_run)
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda request_config: [request_config.model],
+    )
+
+    result = run_plain_handoff_stage2(
+        handoff_path=tmp_path / "handoff.jsonl",
+        output_dir=tmp_path / "stage2",
+        clinical_question="test",
+        config=config,
+    )
+
+    assert result == {"phase": "feature_definitions"}
+    assert lifecycle == [
+        "start-orchestrator_all_gpus",
+        "stage2",
+        "stop-orchestrator_all_gpus",
+    ]
+
+
+def test_managed_resume_after_extraction_starts_uses_dedicated_pools_immediately(
+    tmp_path,
+    monkeypatch,
+):
+    config = plain_stage2_config_from_mapping(
+        {
+            "model": "large-reviewer",
+            "vllm": {"gpus": [0], "gpus_per_server": 1},
+            "extraction_llm": {
+                "model": "small-extractor",
+                "vllm": {"gpus": [1], "gpus_per_server": 1},
+            },
+        },
+        default_workers=4,
+    )
+    assert config is not None
+    output_dir = tmp_path / "stage2"
+    (output_dir / "outer_001" / "extraction").mkdir(parents=True)
+    lifecycle: list[str] = []
+
+    @contextmanager
+    def fake_launch(**kwargs):
+        role = kwargs["output_dir"].name
+        lifecycle.append(f"start-{role}")
+        endpoints = tuple(
+            f"http://127.0.0.1:{port}/v1"
+            for port in kwargs["config"].effective_ports()
+        )
+        try:
+            yield endpoints
+        finally:
+            lifecycle.append(f"stop-{role}")
+
+    def fake_run(self, **kwargs):
+        assert kwargs["dataset"] is not None
+        lifecycle.append("stage2")
+        return {"phase": "causal_estimation"}
+
+    monkeypatch.setattr(stage2_workflow, "launch_managed_vllm_servers", fake_launch)
+    monkeypatch.setattr(PlainHandoffStage2, "run", fake_run)
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda request_config: [request_config.model],
+    )
+
+    result = run_plain_handoff_stage2(
+        handoff_path=tmp_path / "handoff.jsonl",
+        output_dir=output_dir,
+        clinical_question="test",
+        config=config,
+        dataset=object(),
+    )
+
+    assert result == {"phase": "causal_estimation"}
+    assert lifecycle == [
+        "start-orchestrator",
+        "start-extractor",
+        "stage2",
+        "stop-extractor",
+        "stop-orchestrator",
+    ]
+
+
 def test_run_wrapper_manages_and_round_robins_independent_model_pools(
     tmp_path,
     monkeypatch,
@@ -503,7 +676,26 @@ def test_run_wrapper_manages_and_round_robins_independent_model_pools(
     def fake_launch(**kwargs):
         role = kwargs["output_dir"].name
         lifecycle.append(f"start-{role}")
-        if role == "orchestrator":
+        if role == "orchestrator_all_gpus":
+            assert kwargs["model"] == "large-reviewer"
+            assert kwargs["config"].gpus == (
+                "cuda:0",
+                "cuda:1",
+                "cuda:2",
+                "cuda:3",
+                "cuda:4",
+            )
+            assert kwargs["config"].gpu_groups() == (
+                ("cuda:0",),
+                ("cuda:1",),
+                ("cuda:2",),
+                ("cuda:3",),
+                ("cuda:4",),
+            )
+            endpoints = tuple(
+                f"http://127.0.0.1:{port}/v1" for port in range(8010, 8015)
+            )
+        elif role == "orchestrator":
             assert kwargs["model"] == "large-reviewer"
             endpoints = (
                 "http://127.0.0.1:8010/v1",
@@ -527,11 +719,17 @@ def test_run_wrapper_manages_and_round_robins_independent_model_pools(
         calls.append((request_config.model, request_config.endpoint))
         return "{}"
 
-    def fake_run(self, **_kwargs):
-        lifecycle.append("stage2")
-        captured["config"] = self.config
+    def fake_run(self, **kwargs):
         assert self.extraction_completion is not None
         assert self.extraction_request_config is not None
+        if kwargs["dataset"] is None:
+            lifecycle.append("stage2-interpretation")
+            captured["interpretation_config"] = self.config
+            for _ in range(4):
+                self.completion([], self.config)
+            return {"phase": "feature_definitions"}
+        lifecycle.append("stage2-analysis")
+        captured["config"] = self.config
         for _ in range(4):
             self.completion([], self.config)
         for _ in range(5):
@@ -552,23 +750,33 @@ def test_run_wrapper_manages_and_round_robins_independent_model_pools(
         output_dir=tmp_path / "stage2",
         clinical_question="test",
         config=config,
+        dataset=object(),
     )
 
     assert result == {"ok": True}
     assert lifecycle == [
+        "start-orchestrator_all_gpus",
+        "stage2-interpretation",
+        "stop-orchestrator_all_gpus",
         "start-orchestrator",
         "start-extractor",
-        "stage2",
+        "stage2-analysis",
         "stop-extractor",
         "stop-orchestrator",
     ]
     assert calls[:4] == [
         ("large-reviewer", "http://127.0.0.1:8010/v1"),
         ("large-reviewer", "http://127.0.0.1:8011/v1"),
+        ("large-reviewer", "http://127.0.0.1:8012/v1"),
+        ("large-reviewer", "http://127.0.0.1:8013/v1"),
+    ]
+    assert calls[4:8] == [
+        ("large-reviewer", "http://127.0.0.1:8010/v1"),
+        ("large-reviewer", "http://127.0.0.1:8011/v1"),
         ("large-reviewer", "http://127.0.0.1:8010/v1"),
         ("large-reviewer", "http://127.0.0.1:8011/v1"),
     ]
-    assert calls[4:] == [
+    assert calls[8:] == [
         ("small-extractor", "http://127.0.0.1:8110/v1"),
         ("small-extractor", "http://127.0.0.1:8111/v1"),
         ("small-extractor", "http://127.0.0.1:8112/v1"),

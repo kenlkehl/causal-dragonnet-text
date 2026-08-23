@@ -155,13 +155,18 @@ use GPUs 2 and 3:
 }
 ```
 
-Stage 2 starts both pools, waits for every model endpoint, independently
-round-robins orchestrator and extraction work, and stops both pools on exit.
-`gpus_per_server` sets each role's tensor-parallel width and derives the replica
-count; an explicit `server_count` must agree. Gemma defaults to the `gemma4`
-reasoning parser, Qwen to `qwen3`, and both default to language-model-only mode.
-See the complete workflow guide for GPU partition rules and all managed-server
-settings.
+When both roles are managed, Stage 2 initially starts only the orchestrator
+model and gives it the ordered union of the orchestrator and extractor GPU
+lists. It completes every fold's interpretation and feature definitions, stops
+that all-GPU pool, and only then starts the separately configured orchestrator
+and extractor pools for patient extraction and later review. A
+feature-definition-only run therefore never loads the extractor. If extraction
+checkpoints already exist on resume, Stage 2 starts directly with the dedicated
+pools. `gpus_per_server` sets each role's dedicated tensor-parallel width and
+derives its replica count; an explicit `server_count` must agree. Gemma defaults
+to the `gemma4` reasoning parser, Qwen to `qwen3`, and both default to
+language-model-only mode. See the complete workflow guide for pre-extraction
+pool derivation, GPU partition rules, and all managed-server settings.
 
 Stage 2 compiles the raw handoff into fold-local, provenance-preserving semantic
 cards under `stage2/evidence_compilation/`, and candidate discovery reads all of

@@ -756,15 +756,26 @@ on GPUs 0-1 and two one-GPU extractor replicas on GPUs 2-3:
 }
 ```
 
-Each pool has its own GPU list and `gpus_per_server` tensor-parallel width. The
-replica count is derived as `len(gpus) / gpus_per_server`; `server_count` may
-also be supplied, but must agree. GPU indices use the pipeline's current
-logical CUDA namespace. If the parent has `CUDA_VISIBLE_DEVICES`, each child
-assignment is mapped through it. Uneven divisions, duplicate GPUs within a
-pool, inconsistent counts, and more servers than GPUs are rejected before any
-process starts. The two pools run simultaneously; overlapping their GPU lists
-is allowed only for users deliberately configuring enough memory for both
-models.
+Each dedicated pool has its own GPU list and `gpus_per_server` tensor-parallel
+width. The replica count is derived as `len(gpus) / gpus_per_server`;
+`server_count` may also be supplied, but must agree. GPU indices use the
+pipeline's current logical CUDA namespace. If the parent has
+`CUDA_VISIBLE_DEVICES`, each child assignment is mapped through it. Uneven
+divisions, duplicate GPUs within a pool, inconsistent counts, and more servers
+than GPUs are rejected before any process starts.
+
+When both models are managed, Stage 2 first loads only the orchestrator across
+the union of both GPU lists and completes interpretation and feature definition
+for every fold. It preserves the orchestrator's tensor-parallel width and adds
+replicas when that width evenly divides the union; otherwise it uses one
+tensor-parallel server across the complete union. It then stops that temporary
+pool and starts the two configured dedicated pools for extraction and later
+orchestration. Added temporary replicas receive consecutive ports after the
+highest configured orchestrator port. Feature-definition-only runs never load
+the extractor. Resumes with extraction-dependent checkpoints start directly
+with the dedicated pools. Those dedicated pools run simultaneously, so
+overlapping their GPU lists is appropriate only when enough memory has
+deliberately been reserved for both models.
 
 Both nested managed configurations accept `host`, `base_port` (or an exact
 `ports` list), `internal_port_base`, and `gpus_per_server`. The settings
@@ -832,14 +843,16 @@ uv run python scripts/run_all_evidence.py \
   --stage2-extraction-vllm-extra-arg=0.80
 ```
 
-The runner waits until every server in both pools advertises its configured
-model at `/v1/models` before inference. Logs and redacted manifests are written
-under `stage2/vllm_servers/orchestrator/` and
-`stage2/vllm_servers/extractor/`. On normal completion, interruption, startup
-failure, or a Stage 2 error, it terminates every managed process group. Either
-role may instead use an external endpoint, so managed/external combinations are
-supported independently. Within each role, its endpoint and vLLM pool are
-mutually exclusive.
+The runner waits until every server in the active pool or pools advertises its
+configured model at `/v1/models` before inference. Logs and redacted manifests
+are written under `stage2/vllm_servers/orchestrator_all_gpus/`,
+`stage2/vllm_servers/orchestrator/`, and
+`stage2/vllm_servers/extractor/`, as applicable. On normal completion,
+interruption, startup failure, or a Stage 2 error, it terminates every managed
+process group. Either role may instead use an external endpoint, so
+managed/external combinations are supported independently. All-GPU staging
+applies only when both roles are pipeline-managed. Within each role, its
+endpoint and vLLM pool are mutually exclusive.
 
 The synthetic-run shell wrappers expose the same split through
 `STAGE2_VLLM_GPUS` and `STAGE2_VLLM_GPUS_PER_SERVER` for the orchestrator, and
