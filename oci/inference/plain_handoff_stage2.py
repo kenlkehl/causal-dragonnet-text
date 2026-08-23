@@ -66,6 +66,7 @@ DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_INTERPRETATION_REASONING_EFFORT = "high"
 DEFAULT_EXTRACTION_REASONING_EFFORT = "none"
 STAGE2_REQUEST_KINDS = frozenset({"interpretation", "extraction"})
+MANAGED_MODEL_PHASE_SCHEMA_VERSION = "stage2_managed_model_phase_v1"
 SUPPORTED_REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
@@ -2021,6 +2022,17 @@ class _Stage2OutputLengthError(ValueError):
 
 class _Stage2ResponseValidationError(ValueError):
     """A response remained structurally invalid after bounded repairs."""
+
+
+class _ManagedStage2ModelSwitch(RuntimeError):
+    """Signal that a checkpointed managed run needs the other model loaded."""
+
+    def __init__(self, required_role: str) -> None:
+        role = str(required_role).strip().lower()
+        if role not in STAGE2_REQUEST_KINDS:
+            raise ValueError(f"unknown managed Stage 2 model role: {required_role!r}")
+        self.required_role = role
+        super().__init__(f"managed Stage 2 requires the {role} model")
 
 
 def _stage2_request_policy(
@@ -5735,7 +5747,9 @@ class PlainHandoffStage2:
             config,
             endpoints=endpoints,
             role="primary",
-            verify_live_endpoint=completion is None,
+            verify_live_endpoint=(
+                completion is None or isinstance(completion, _RoundRobinOpenAICompletion)
+            ),
         )
         config = replace(
             config,
@@ -5770,7 +5784,10 @@ class PlainHandoffStage2:
                 extraction_request_config,
                 endpoints=extraction_endpoints,
                 role="extraction",
-                verify_live_endpoint=routed_extraction is None,
+                verify_live_endpoint=(
+                    routed_extraction is None
+                    or isinstance(routed_extraction, _RoundRobinOpenAICompletion)
+                ),
             )
             self.extraction_request_config = replace(
                 extraction_request_config,
@@ -5797,9 +5814,10 @@ class PlainHandoffStage2:
         identity_path = output_dir / "model_identity.json"
         current_scientific = _scientific_model_identity(self.model_identity)
         previous_scientific: dict[str, Any] | None = None
+        previous_identity: Mapping[str, Any] | None = None
         if identity_path.is_file():
-            previous = json.loads(identity_path.read_text(encoding="utf-8"))
-            previous_scientific = _scientific_model_identity(previous)
+            previous_identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            previous_scientific = _scientific_model_identity(previous_identity)
         else:
             # Adopt pre-manifest Stage 2 output only when its persisted resolved
             # model IDs agree. Endpoint URLs intentionally do not participate.
@@ -5861,12 +5879,45 @@ class PlainHandoffStage2:
                     "Stage 2 extraction model changed before any extraction-dependent "
                     "checkpoint; preserving completed interpretation and feature definitions"
                 )
+        recorded_identity = dict(self.model_identity)
+        if previous_identity is not None:
+            # Alternating managed phases intentionally cannot probe the inactive
+            # model. Preserve its last verified backing identity so the audit
+            # manifest retains verification for both scientific roles.
+            for role in ("primary", "extraction"):
+                current_role = recorded_identity.get(role)
+                previous_role = previous_identity.get(role)
+                if not isinstance(current_role, Mapping) or not isinstance(
+                    previous_role, Mapping
+                ):
+                    continue
+                if str(current_role.get("selected_model") or "") != str(
+                    previous_role.get("selected_model") or ""
+                ):
+                    continue
+                if isinstance(current_role.get("actual_model_identity"), Mapping):
+                    continue
+                prior_actual = previous_role.get("actual_model_identity")
+                if not isinstance(prior_actual, Mapping):
+                    continue
+                merged_role = dict(current_role)
+                merged_role["actual_model_identity"] = dict(prior_actual)
+                merged_role["previous_live_endpoint_verification"] = {
+                    "live_endpoint_verified": bool(
+                        previous_role.get("live_endpoint_verified")
+                    ),
+                    "endpoint_observations": list(
+                        previous_role.get("endpoint_observations") or []
+                    ),
+                }
+                recorded_identity[role] = merged_role
+        self.model_identity = recorded_identity
         _write_json(
             identity_path,
             {
-                **self.model_identity,
+                **recorded_identity,
                 "checked_at": _now(),
-                "scientific_identity": current_scientific,
+                "scientific_identity": _scientific_model_identity(recorded_identity),
             },
         )
 
@@ -7619,21 +7670,23 @@ class PlainHandoffStage2:
         }
 
 
-def _all_gpu_interpretation_vllm_config(
-    primary: ManagedVLLMConfig,
-    extraction: ManagedVLLMConfig,
+def _all_gpu_managed_vllm_config(
+    active: ManagedVLLMConfig,
+    other: ManagedVLLMConfig,
+    *,
+    role: str,
 ) -> ManagedVLLMConfig:
-    """Expand the pre-extraction primary pool across both managed GPU sets."""
+    """Expand one alternately loaded model across both allowed managed GPU sets."""
 
-    primary.validate()
-    extraction.validate()
-    all_gpus = tuple(dict.fromkeys((*primary.gpus, *extraction.gpus)))
-    if all_gpus == primary.gpus:
-        return primary
+    active.validate()
+    other.validate()
+    all_gpus = tuple(dict.fromkeys((*active.gpus, *other.gpus)))
+    if all_gpus == active.gpus:
+        return active
 
-    primary_width = primary.effective_gpus_per_server()
-    if len(all_gpus) % primary_width == 0:
-        gpus_per_server = primary_width
+    active_width = active.effective_gpus_per_server()
+    if len(all_gpus) % active_width == 0:
+        gpus_per_server = active_width
         server_count = len(all_gpus) // gpus_per_server
     else:
         # Equal-width replicas cannot consume the complete union in this case.
@@ -7642,27 +7695,27 @@ def _all_gpu_interpretation_vllm_config(
         gpus_per_server = len(all_gpus)
         server_count = 1
         LOGGER.info(
-            "pre-extraction orchestrator GPU count=%s is not divisible by its "
-            "dedicated tensor-parallel width=%s; using one all-GPU server",
+            "managed Stage 2 %s GPU count=%s is not divisible by its "
+            "configured tensor-parallel width=%s; using one all-GPU server",
+            role,
             len(all_gpus),
-            primary_width,
+            active_width,
         )
 
-    existing_ports = list(primary.effective_ports())
+    existing_ports = list(active.effective_ports())
     ports = existing_ports[:server_count]
     next_port = max(existing_ports) + 1
     while len(ports) < server_count:
         if next_port > 65_535:
             raise ValueError(
-                "Stage 2 cannot allocate enough pre-extraction orchestrator ports "
-                "below 65536"
+                f"Stage 2 cannot allocate enough all-GPU {role} ports below 65536"
             )
         if next_port not in ports:
             ports.append(next_port)
         next_port += 1
 
     combined = replace(
-        primary,
+        active,
         server_count=server_count,
         gpus=all_gpus,
         gpus_per_server=gpus_per_server,
@@ -7670,6 +7723,32 @@ def _all_gpu_interpretation_vllm_config(
     )
     combined.validate()
     return combined
+
+
+def _all_gpu_interpretation_vllm_config(
+    primary: ManagedVLLMConfig,
+    extraction: ManagedVLLMConfig,
+) -> ManagedVLLMConfig:
+    """Expand the alternately loaded primary model across all allowed GPUs."""
+
+    return _all_gpu_managed_vllm_config(
+        primary,
+        extraction,
+        role="interpretation",
+    )
+
+
+def _all_gpu_extraction_vllm_config(
+    primary: ManagedVLLMConfig,
+    extraction: ManagedVLLMConfig,
+) -> ManagedVLLMConfig:
+    """Expand the alternately loaded extraction model across all allowed GPUs."""
+
+    return _all_gpu_managed_vllm_config(
+        extraction,
+        primary,
+        role="extraction",
+    )
 
 
 def run_plain_handoff_stage2(
@@ -7694,12 +7773,13 @@ def run_plain_handoff_stage2(
         runtime_config: PlainHandoffStage2Config,
         *,
         runtime_dataset: pd.DataFrame | None,
+        runtime_primary_completion: CompletionFunction | None,
         runtime_extraction_completion: CompletionFunction | None,
     ) -> Mapping[str, Any]:
         return PlainHandoffStage2(
             config=runtime_config,
             clinical_question=clinical_question,
-            completion=completion,
+            completion=runtime_primary_completion,
             extraction_completion=runtime_extraction_completion,
         ).run(
             handoff_path=handoff_path,
@@ -7721,72 +7801,201 @@ def run_plain_handoff_stage2(
         return run_with_config(
             config,
             runtime_dataset=dataset,
+            runtime_primary_completion=completion,
             runtime_extraction_completion=extraction_completion,
         )
 
     managed_root = Path(output_dir) / "vllm_servers"
     if config.vllm is not None and extraction_vllm is not None:
-        # Complete the interpretation/feature-definition phase before starting
-        # extraction. This gives the primary model the union of both managed GPU
-        # allocations without ever stopping a server beneath an in-flight
-        # request. The ordinary fold checkpoints make the second pass resume at
-        # extraction and later orchestration work.
+        all_gpu_interpretation = _all_gpu_interpretation_vllm_config(
+            config.vllm,
+            extraction_vllm,
+        )
+        all_gpu_extraction = _all_gpu_extraction_vllm_config(
+            config.vllm,
+            extraction_vllm,
+        )
+        phase_path = managed_root / "model_phase.json"
+
+        def unavailable_model(required_role: str) -> CompletionFunction:
+            def request_switch(
+                _messages: Sequence[Mapping[str, str]],
+                _request_config: PlainHandoffStage2Config,
+            ) -> str:
+                raise _ManagedStage2ModelSwitch(required_role)
+
+            return request_switch
+
+        def record_phase(
+            *,
+            status: str,
+            active_role: str,
+            transition: int,
+        ) -> None:
+            role_config = (
+                all_gpu_interpretation
+                if active_role == "interpretation"
+                else all_gpu_extraction
+            )
+            role_model = config.model if active_role == "interpretation" else extraction.model
+            _write_json(
+                phase_path,
+                {
+                    "schema_version": MANAGED_MODEL_PHASE_SCHEMA_VERSION,
+                    "status": status,
+                    "active_role": active_role,
+                    "model": role_model,
+                    "gpus": list(role_config.gpus),
+                    "transition": int(transition),
+                    "recorded_at": _now(),
+                },
+            )
+
+        def saved_role() -> str | None:
+            if not phase_path.is_file():
+                return None
+            try:
+                state = json.loads(phase_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if state.get("schema_version") != MANAGED_MODEL_PHASE_SCHEMA_VERSION:
+                return None
+            role = str(state.get("active_role") or "").strip().lower()
+            return role if role in STAGE2_REQUEST_KINDS else None
+
+        def run_managed_role(
+            active_role: str,
+            *,
+            runtime_dataset: pd.DataFrame | None,
+            transition: int,
+        ) -> Mapping[str, Any]:
+            record_phase(
+                status="running",
+                active_role=active_role,
+                transition=transition,
+            )
+            if active_role == "interpretation":
+                role_config = all_gpu_interpretation
+                role_model = config.model
+                role_api_key = config.api_key
+                role_output_dir = managed_root / "orchestrator_all_gpus"
+            else:
+                role_config = all_gpu_extraction
+                role_model = extraction.model
+                role_api_key = extraction.api_key
+                role_output_dir = managed_root / "extractor_all_gpus"
+            LOGGER.info(
+                "start managed Stage 2 all-GPU %s phase transition=%s gpus=%s "
+                "replicas=%s tensor_parallel_size=%s",
+                active_role,
+                transition,
+                list(role_config.gpus),
+                role_config.server_count,
+                role_config.effective_gpus_per_server(),
+            )
+            with launch_managed_vllm_servers(
+                config=role_config,
+                model=role_model,
+                api_key=role_api_key,
+                output_dir=role_output_dir,
+            ) as active_endpoints:
+                if active_role == "interpretation":
+                    runtime_config = replace(
+                        config,
+                        endpoint=active_endpoints[0],
+                        runtime_endpoints=tuple(active_endpoints),
+                    )
+                    primary_completion = completion
+                    runtime_extraction_completion = unavailable_model("extraction")
+                else:
+                    runtime_extraction = replace(
+                        extraction,
+                        endpoint=active_endpoints[0],
+                        runtime_endpoints=tuple(active_endpoints),
+                    )
+                    runtime_config = replace(
+                        config,
+                        # The primary completion is a role-switch sentinel in
+                        # this phase, but the top-level config still requires a
+                        # syntactically valid transport URL.
+                        endpoint=active_endpoints[0],
+                        runtime_endpoints=tuple(active_endpoints),
+                        extraction_llm=runtime_extraction,
+                    )
+                    primary_completion = unavailable_model("interpretation")
+                    runtime_extraction_completion = (
+                        extraction_completion
+                        or _RoundRobinOpenAICompletion(tuple(active_endpoints))
+                    )
+                return run_with_config(
+                    runtime_config,
+                    runtime_dataset=runtime_dataset,
+                    runtime_primary_completion=primary_completion,
+                    runtime_extraction_completion=runtime_extraction_completion,
+                )
+
+        # Feature discovery and operationalization are an interpretation-only
+        # phase. Finish them first, then use ordinary request checkpoints to
+        # alternate the two models without ever keeping both resident.
         extraction_has_started = bool(
             dataset is not None and _has_extraction_dependent_checkpoints(output_dir)
         )
         if not extraction_has_started:
-            all_gpu_config = _all_gpu_interpretation_vllm_config(
-                config.vllm,
-                extraction_vllm,
+            interpretation_result = run_managed_role(
+                "interpretation",
+                runtime_dataset=None,
+                transition=0,
             )
-            LOGGER.info(
-                "start managed Stage 2 all-GPU interpretation phase gpus=%s "
-                "replicas=%s tensor_parallel_size=%s",
-                list(all_gpu_config.gpus),
-                all_gpu_config.server_count,
-                all_gpu_config.effective_gpus_per_server(),
-            )
-            with launch_managed_vllm_servers(
-                config=all_gpu_config,
-                model=config.model,
-                api_key=config.api_key,
-                output_dir=managed_root / "orchestrator_all_gpus",
-            ) as interpretation_endpoints:
-                interpretation_config = replace(
-                    config,
-                    endpoint=interpretation_endpoints[0],
-                    runtime_endpoints=tuple(interpretation_endpoints),
-                )
-
-                def extraction_not_started(
-                    _messages: Sequence[Mapping[str, str]],
-                    _request_config: PlainHandoffStage2Config,
-                ) -> str:
-                    raise RuntimeError(
-                        "managed Stage 2 extraction cannot start during the "
-                        "all-GPU interpretation phase"
-                    )
-
-                interpretation_result = run_with_config(
-                    interpretation_config,
-                    runtime_dataset=None,
-                    # Avoid probing or starting the managed extractor while
-                    # retaining its configured scientific model identity.
-                    runtime_extraction_completion=(
-                        extraction_completion or extraction_not_started
-                    ),
-                )
             if dataset is None:
+                record_phase(
+                    status="complete",
+                    active_role="interpretation",
+                    transition=0,
+                )
                 return interpretation_result
-            LOGGER.info(
-                "completed managed Stage 2 interpretation phase; switching to "
-                "dedicated orchestrator and extractor GPU pools"
-            )
+            active_role = "extraction"
+            transition = 1
         else:
+            active_role = saved_role() or "extraction"
+            transition = 0
             LOGGER.info(
-                "resume managed Stage 2 with dedicated GPU pools because "
-                "extraction-dependent checkpoints already exist"
+                "resume alternating managed Stage 2 role=%s because "
+                "extraction-dependent checkpoints already exist",
+                active_role,
             )
+
+        while True:
+            try:
+                result = run_managed_role(
+                    active_role,
+                    runtime_dataset=dataset,
+                    transition=transition,
+                )
+            except _ManagedStage2ModelSwitch as switch:
+                if switch.required_role == active_role:
+                    raise RuntimeError(
+                        "managed Stage 2 requested a switch to the model that is "
+                        f"already active: {active_role}"
+                    ) from switch
+                LOGGER.info(
+                    "checkpointed managed Stage 2 %s phase; switching all GPUs to %s",
+                    active_role,
+                    switch.required_role,
+                )
+                active_role = switch.required_role
+                transition += 1
+                record_phase(
+                    status="switch_required",
+                    active_role=active_role,
+                    transition=transition,
+                )
+                continue
+            record_phase(
+                status="complete",
+                active_role=active_role,
+                transition=transition,
+            )
+            return result
 
     with ExitStack() as stack:
         runtime_config = config
@@ -7825,6 +8034,7 @@ def run_plain_handoff_stage2(
         return run_with_config(
             runtime_config,
             runtime_dataset=dataset,
+            runtime_primary_completion=completion,
             runtime_extraction_completion=extraction_completion,
         )
 

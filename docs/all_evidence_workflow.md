@@ -302,21 +302,21 @@ from the list length; an explicit `server_count` is optional but must agree.
 Uneven division, duplicate devices within one pool, or more servers than GPUs
 is rejected before launch.
 
-When both roles are pipeline-managed, their lifecycle is staged. Interpretation
+When both roles are pipeline-managed, their lifecycle alternates. Interpretation
 and feature definition first run to completion for every outer fold with only
-the orchestrator model loaded. That temporary pool uses the ordered union of
-both roles' GPU lists. If the union divides evenly by the orchestrator's
+the orchestrator model loaded across the ordered union of both roles' GPU lists.
+Stage 2 then checkpoints and unloads it before loading the extractor across the
+same union. At an ontology-supervision barrier it checkpoints extraction,
+unloads the extractor, and reloads the orchestrator; it switches back whenever
+re-extraction or held-out extraction is required. The two models are never
+resident simultaneously. For each role, if the union divides evenly by its
 configured tensor-parallel width, Stage 2 preserves that width and adds
-replicas. Otherwise it launches one tensor-parallel orchestrator across the
-complete union, which requires the selected model to support that
-tensor-parallel size. Added temporary replicas use consecutive ports after the
-highest configured orchestrator port. Once the feature-definition checkpoints
-are complete, Stage 2 stops the temporary pool and starts the two dedicated
-pools using their exact configured allocations. The dedicated pools are
-simultaneous, so overlapping their GPU lists should be done only with deliberate
-per-process memory limits. A feature-definition-only run never starts the
-extractor, and a resumed run with any extraction-dependent checkpoint starts
-directly in dedicated mode.
+replicas. Otherwise it launches one tensor-parallel server across the complete
+union, which requires that model to support the resulting tensor-parallel size.
+Added replicas use consecutive ports after the highest configured port for that
+role. A feature-definition-only run never starts the extractor. Resumes use the
+persisted managed-model phase together with ordinary request checkpoints; an
+older run with extraction artifacts safely resumes with the extractor first.
 
 The runner checks every requested port before launch, starts all replicas with
 separate `CUDA_VISIBLE_DEVICES` values, and waits for each `/v1/models` API to
@@ -328,6 +328,7 @@ independent round-robin router and `stage2.extraction_llm.workers` ceiling.
 Server logs and redacted manifests containing commands, PIDs, endpoints, GPU
 assignments, and exit codes are stored in
 `stage2/vllm_servers/orchestrator_all_gpus/`,
+`stage2/vllm_servers/extractor_all_gpus/`,
 `stage2/vllm_servers/orchestrator/`, and
 `stage2/vllm_servers/extractor/`, as applicable. All managed process groups are
 terminated when Stage 2 succeeds, fails, or is interrupted. Either role can

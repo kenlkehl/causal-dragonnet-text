@@ -756,26 +756,27 @@ on GPUs 0-1 and two one-GPU extractor replicas on GPUs 2-3:
 }
 ```
 
-Each dedicated pool has its own GPU list and `gpus_per_server` tensor-parallel
-width. The replica count is derived as `len(gpus) / gpus_per_server`;
+Each managed role has its own allowed GPU list and `gpus_per_server`
+tensor-parallel width. The configured replica count is derived as
+`len(gpus) / gpus_per_server`;
 `server_count` may also be supplied, but must agree. GPU indices use the
 pipeline's current logical CUDA namespace. If the parent has
 `CUDA_VISIBLE_DEVICES`, each child assignment is mapped through it. Uneven
 divisions, duplicate GPUs within a pool, inconsistent counts, and more servers
 than GPUs are rejected before any process starts.
 
-When both models are managed, Stage 2 first loads only the orchestrator across
-the union of both GPU lists and completes interpretation and feature definition
-for every fold. It preserves the orchestrator's tensor-parallel width and adds
-replicas when that width evenly divides the union; otherwise it uses one
-tensor-parallel server across the complete union. It then stops that temporary
-pool and starts the two configured dedicated pools for extraction and later
-orchestration. Added temporary replicas receive consecutive ports after the
-highest configured orchestrator port. Feature-definition-only runs never load
-the extractor. Resumes with extraction-dependent checkpoints start directly
-with the dedicated pools. Those dedicated pools run simultaneously, so
-overlapping their GPU lists is appropriate only when enough memory has
-deliberately been reserved for both models.
+When both models are managed, Stage 2 keeps only one model resident at a time.
+It loads the orchestrator across the ordered union of both GPU lists for
+interpretation and feature definition, checkpoints that work, unloads it, and
+loads the extractor across the same union. Later ontology-supervision barriers
+switch the complete union back to the orchestrator; revised ontologies and
+held-out extraction switch it back to the extractor as needed. Each role
+preserves its configured tensor-parallel width and adds replicas when that width
+evenly divides the union; otherwise it uses one tensor-parallel server across
+the complete union. Added replicas receive consecutive ports in that role's
+configured range. Feature-definition-only runs never load the extractor.
+Resumes use `stage2/vllm_servers/model_phase.json` plus ordinary scientific
+checkpoints to reload the required role.
 
 Both nested managed configurations accept `host`, `base_port` (or an exact
 `ports` list), `internal_port_base`, and `gpus_per_server`. The settings
@@ -843,9 +844,10 @@ uv run python scripts/run_all_evidence.py \
   --stage2-extraction-vllm-extra-arg=0.80
 ```
 
-The runner waits until every server in the active pool or pools advertises its
+The runner waits until every server in the active pool advertises its
 configured model at `/v1/models` before inference. Logs and redacted manifests
 are written under `stage2/vllm_servers/orchestrator_all_gpus/`,
+`stage2/vllm_servers/extractor_all_gpus/`,
 `stage2/vllm_servers/orchestrator/`, and
 `stage2/vllm_servers/extractor/`, as applicable. On normal completion,
 interruption, startup failure, or a Stage 2 error, it terminates every managed

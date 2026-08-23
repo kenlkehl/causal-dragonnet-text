@@ -1928,6 +1928,87 @@ def test_extraction_uses_note_free_category_ontology_after_ten_failed_repairs(
     assert audit["corrections"][0]["value"] == "documented"
 
 
+def test_pending_category_ontology_resumes_without_repeating_extraction(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame({"clinical_text": ["Prior immunotherapy was documented."]})
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "prior_immunotherapy_history",
+        "description": "Whether prior immunotherapy was documented.",
+        "value_type": "binary",
+        "categories_or_unit": ["not documented", "documented"],
+        "measurement_definition": "Extract pretreatment immunotherapy history.",
+        "missing_value_rule": "Return null when unavailable.",
+    }
+    output = tmp_path / "extraction"
+    first_calls = []
+
+    def extraction_then_switch(messages, validate, *, request_kind="interpretation"):
+        first_calls.append(request_kind)
+        if request_kind == "extraction":
+            return validate(
+                {
+                    "rows": [
+                        {
+                            "row_id": 0,
+                            "values": {"prior_immunotherapy_history": 1},
+                        }
+                    ]
+                }
+            )
+        raise RuntimeError("switch to the interpretation model")
+
+    with pytest.raises(RuntimeError, match="switch to the interpretation model"):
+        extract_rows(
+            dataset=dataset,
+            row_ids=[0],
+            text_column="clinical_text",
+            definitions=[definition],
+            output_dir=output,
+            request_json=extraction_then_switch,
+            workers=1,
+            max_prompt_chars=10_000,
+        )
+
+    batch = output / "batches" / "batch_00001"
+    pending_path = batch / "pending_category_ontology.json"
+    assert first_calls == ["extraction", "interpretation"]
+    assert pending_path.is_file()
+    resumed_calls = []
+
+    def resume_interpretation(messages, validate, *, request_kind="interpretation"):
+        resumed_calls.append(request_kind)
+        assert request_kind == "interpretation"
+        item = json.loads(messages[1]["content"])["items"][0]
+        return validate(
+            {
+                "corrections": [
+                    {
+                        "mapping_id": item["mapping_id"],
+                        "value": "documented",
+                    }
+                ]
+            }
+        )
+
+    frame = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        output_dir=output,
+        request_json=resume_interpretation,
+        workers=1,
+        max_prompt_chars=10_000,
+    )
+
+    assert resumed_calls == ["interpretation"]
+    assert frame.loc[0, "prior_immunotherapy_history"] == "documented"
+    assert not pending_path.exists()
+    assert (batch / "complete.json").is_file()
+
+
 def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
     tmp_path: Path,
 ):

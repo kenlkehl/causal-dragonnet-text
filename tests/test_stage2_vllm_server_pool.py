@@ -209,6 +209,35 @@ def test_pre_extraction_pool_widens_one_server_when_union_is_not_even():
     assert combined.effective_ports() == (8010,)
 
 
+def test_extraction_pool_uses_union_with_extractor_replica_width():
+    primary = ManagedVLLMConfig(
+        server_count=1,
+        gpus=("cuda:0", "cuda:1"),
+        gpus_per_server=2,
+    )
+    extraction = ManagedVLLMConfig(
+        server_count=2,
+        gpus=("cuda:2", "cuda:3"),
+        gpus_per_server=1,
+        ports=(9110, 9111),
+    )
+
+    combined = stage2_workflow._all_gpu_extraction_vllm_config(
+        primary,
+        extraction,
+    )
+
+    assert combined.gpus == ("cuda:2", "cuda:3", "cuda:0", "cuda:1")
+    assert combined.gpus_per_server == 1
+    assert combined.gpu_groups() == (
+        ("cuda:2",),
+        ("cuda:3",),
+        ("cuda:0",),
+        ("cuda:1",),
+    )
+    assert combined.effective_ports() == (9110, 9111, 9112, 9113)
+
+
 @pytest.mark.parametrize(
     ("vllm", "message"),
     [
@@ -587,7 +616,7 @@ def test_feature_definition_only_run_never_starts_managed_extractor(
     ]
 
 
-def test_managed_resume_after_extraction_starts_uses_dedicated_pools_immediately(
+def test_managed_resume_after_extraction_starts_loads_all_gpu_extractor_immediately(
     tmp_path,
     monkeypatch,
 ):
@@ -611,6 +640,8 @@ def test_managed_resume_after_extraction_starts_uses_dedicated_pools_immediately
     def fake_launch(**kwargs):
         role = kwargs["output_dir"].name
         lifecycle.append(f"start-{role}")
+        assert role == "extractor_all_gpus"
+        assert kwargs["config"].gpus == ("cuda:1", "cuda:0")
         endpoints = tuple(
             f"http://127.0.0.1:{port}/v1"
             for port in kwargs["config"].effective_ports()
@@ -643,15 +674,82 @@ def test_managed_resume_after_extraction_starts_uses_dedicated_pools_immediately
 
     assert result == {"phase": "causal_estimation"}
     assert lifecycle == [
-        "start-orchestrator",
-        "start-extractor",
+        "start-extractor_all_gpus",
         "stage2",
-        "stop-extractor",
-        "stop-orchestrator",
+        "stop-extractor_all_gpus",
     ]
 
 
-def test_run_wrapper_manages_and_round_robins_independent_model_pools(
+def test_managed_resume_honors_persisted_interpretation_switch(tmp_path, monkeypatch):
+    config = plain_stage2_config_from_mapping(
+        {
+            "model": "large-reviewer",
+            "vllm": {"gpus": [0], "gpus_per_server": 1},
+            "extraction_llm": {
+                "model": "small-extractor",
+                "vllm": {"gpus": [1], "gpus_per_server": 1},
+            },
+        },
+        default_workers=4,
+    )
+    assert config is not None
+    output_dir = tmp_path / "stage2"
+    (output_dir / "outer_001" / "extraction").mkdir(parents=True)
+    phase_path = output_dir / "vllm_servers" / "model_phase.json"
+    phase_path.parent.mkdir(parents=True)
+    phase_path.write_text(
+        json.dumps(
+            {
+                "schema_version": stage2_workflow.MANAGED_MODEL_PHASE_SCHEMA_VERSION,
+                "status": "switch_required",
+                "active_role": "interpretation",
+            }
+        ),
+        encoding="utf-8",
+    )
+    lifecycle = []
+
+    @contextmanager
+    def fake_launch(**kwargs):
+        role = kwargs["output_dir"].name
+        lifecycle.append(f"start-{role}")
+        assert role == "orchestrator_all_gpus"
+        assert kwargs["config"].gpus == ("cuda:0", "cuda:1")
+        try:
+            yield ("http://127.0.0.1:8010/v1", "http://127.0.0.1:8011/v1")
+        finally:
+            lifecycle.append(f"stop-{role}")
+
+    def fake_run(self, **kwargs):
+        assert kwargs["dataset"] is not None
+        lifecycle.append("stage2")
+        return {"phase": "causal_estimation"}
+
+    monkeypatch.setattr(stage2_workflow, "launch_managed_vllm_servers", fake_launch)
+    monkeypatch.setattr(PlainHandoffStage2, "run", fake_run)
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda request_config: [request_config.model],
+    )
+
+    result = run_plain_handoff_stage2(
+        handoff_path=tmp_path / "handoff.jsonl",
+        output_dir=output_dir,
+        clinical_question="test",
+        config=config,
+        dataset=object(),
+    )
+
+    assert result == {"phase": "causal_estimation"}
+    assert lifecycle == [
+        "start-orchestrator_all_gpus",
+        "stage2",
+        "stop-orchestrator_all_gpus",
+    ]
+
+
+def test_run_wrapper_alternates_all_gpu_model_pools_and_round_robins_each(
     tmp_path,
     monkeypatch,
 ):
@@ -695,20 +793,19 @@ def test_run_wrapper_manages_and_round_robins_independent_model_pools(
             endpoints = tuple(
                 f"http://127.0.0.1:{port}/v1" for port in range(8010, 8015)
             )
-        elif role == "orchestrator":
-            assert kwargs["model"] == "large-reviewer"
-            endpoints = (
-                "http://127.0.0.1:8010/v1",
-                "http://127.0.0.1:8011/v1",
-            )
         else:
-            assert role == "extractor"
+            assert role == "extractor_all_gpus"
             assert kwargs["model"] == "small-extractor"
             assert kwargs["config"].internal_port_base == 40_000
-            endpoints = (
-                "http://127.0.0.1:8110/v1",
-                "http://127.0.0.1:8111/v1",
-                "http://127.0.0.1:8112/v1",
+            assert kwargs["config"].gpus == (
+                "cuda:2",
+                "cuda:3",
+                "cuda:4",
+                "cuda:0",
+                "cuda:1",
+            )
+            endpoints = tuple(
+                f"http://127.0.0.1:{port}/v1" for port in range(8110, 8115)
             )
         try:
             yield endpoints
@@ -728,12 +825,17 @@ def test_run_wrapper_manages_and_round_robins_independent_model_pools(
             for _ in range(4):
                 self.completion([], self.config)
             return {"phase": "feature_definitions"}
-        lifecycle.append("stage2-analysis")
+        if self.extraction_request_config.endpoint.startswith("http://127.0.0.1:8110"):
+            lifecycle.append("stage2-extraction")
+            captured["extraction_config"] = self.config
+            for _ in range(5):
+                self.extraction_completion([], self.extraction_request_config)
+            self.completion([], self.config)
+            raise AssertionError("inactive primary completion should request a model switch")
+        lifecycle.append("stage2-orchestration")
         captured["config"] = self.config
         for _ in range(4):
             self.completion([], self.config)
-        for _ in range(5):
-            self.extraction_completion([], self.extraction_request_config)
         return {"ok": True}
 
     monkeypatch.setattr(stage2_workflow, "launch_managed_vllm_servers", fake_launch)
@@ -758,11 +860,12 @@ def test_run_wrapper_manages_and_round_robins_independent_model_pools(
         "start-orchestrator_all_gpus",
         "stage2-interpretation",
         "stop-orchestrator_all_gpus",
-        "start-orchestrator",
-        "start-extractor",
-        "stage2-analysis",
-        "stop-extractor",
-        "stop-orchestrator",
+        "start-extractor_all_gpus",
+        "stage2-extraction",
+        "stop-extractor_all_gpus",
+        "start-orchestrator_all_gpus",
+        "stage2-orchestration",
+        "stop-orchestrator_all_gpus",
     ]
     assert calls[:4] == [
         ("large-reviewer", "http://127.0.0.1:8010/v1"),
@@ -770,25 +873,27 @@ def test_run_wrapper_manages_and_round_robins_independent_model_pools(
         ("large-reviewer", "http://127.0.0.1:8012/v1"),
         ("large-reviewer", "http://127.0.0.1:8013/v1"),
     ]
-    assert calls[4:8] == [
-        ("large-reviewer", "http://127.0.0.1:8010/v1"),
-        ("large-reviewer", "http://127.0.0.1:8011/v1"),
-        ("large-reviewer", "http://127.0.0.1:8010/v1"),
-        ("large-reviewer", "http://127.0.0.1:8011/v1"),
-    ]
-    assert calls[8:] == [
+    assert calls[4:9] == [
         ("small-extractor", "http://127.0.0.1:8110/v1"),
         ("small-extractor", "http://127.0.0.1:8111/v1"),
         ("small-extractor", "http://127.0.0.1:8112/v1"),
-        ("small-extractor", "http://127.0.0.1:8110/v1"),
-        ("small-extractor", "http://127.0.0.1:8111/v1"),
+        ("small-extractor", "http://127.0.0.1:8113/v1"),
+        ("small-extractor", "http://127.0.0.1:8114/v1"),
     ]
-    runtime_extraction = captured["config"].extraction_llm
+    assert calls[9:] == [
+        ("large-reviewer", "http://127.0.0.1:8010/v1"),
+        ("large-reviewer", "http://127.0.0.1:8011/v1"),
+        ("large-reviewer", "http://127.0.0.1:8012/v1"),
+        ("large-reviewer", "http://127.0.0.1:8013/v1"),
+    ]
+    runtime_extraction = captured["extraction_config"].extraction_llm
     assert runtime_extraction is not None
     assert runtime_extraction.runtime_endpoints == (
         "http://127.0.0.1:8110/v1",
         "http://127.0.0.1:8111/v1",
         "http://127.0.0.1:8112/v1",
+        "http://127.0.0.1:8113/v1",
+        "http://127.0.0.1:8114/v1",
     )
 
 

@@ -49,6 +49,7 @@ REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_ontology_supervisor_convergence_v1"
 ESTIMATION_CHECKPOINT_SCHEMA_VERSION = "stage2_outer_estimation_v4_causal_forest"
 STATISTICAL_SELECTION_SCHEMA_VERSION = "stage2_inner_fold_univariate_selection_v2_loky_omnibus"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
+PENDING_CATEGORY_ONTOLOGY_SCHEMA_VERSION = "stage2_pending_category_ontology_v1"
 ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_training_failure_ontology_refinement_v2_request_policy"
 )
@@ -859,9 +860,63 @@ def _request_validated_extraction(
     """Extract rows, then recover closed-category failures without resending notes."""
 
     issue_audit_path = ontology_audit_path.with_name("extraction_issues.json")
+    pending_path = ontology_audit_path.with_name("pending_category_ontology.json")
+    pending_input_fingerprint = _value_fingerprint(
+        {
+            "row_ids": [int(row_id) for row_id in row_ids],
+            "definitions": _prompt_feature_definitions(definitions),
+        }
+    )
     issue_events: list[dict[str, Any]] = []
-    try:
-        validated = request_json(
+    pending_value_repair_audit: dict[str, Any] | None = None
+
+    def request_or_resume_pending_category() -> dict[str, Any]:
+        nonlocal pending_value_repair_audit
+        if pending_path.is_file():
+            try:
+                pending = json.loads(pending_path.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(pending, Mapping)
+                    or pending.get("schema_version")
+                    != PENDING_CATEGORY_ONTOLOGY_SCHEMA_VERSION
+                    or pending.get("input_fingerprint") != pending_input_fingerprint
+                    or not isinstance(pending.get("issues"), list)
+                    or not isinstance(pending.get("response"), Mapping)
+                ):
+                    raise ValueError("incompatible pending category ontology checkpoint")
+                prior_events = pending.get("prior_issue_events") or []
+                if not isinstance(prior_events, list):
+                    raise ValueError("invalid pending category issue events")
+                issue_events.extend(
+                    dict(event) for event in prior_events if isinstance(event, Mapping)
+                )
+                raw_value_repair = pending.get("value_repair_audit")
+                pending_value_repair_audit = (
+                    dict(raw_value_repair)
+                    if isinstance(raw_value_repair, Mapping)
+                    else None
+                )
+                LOGGER.info(
+                    "resume pending Stage 2 category ontology mapping without "
+                    "repeating patient-note extraction: %s",
+                    pending_path,
+                )
+                pending_issues = [
+                    dict(issue)
+                    for issue in pending["issues"]
+                    if isinstance(issue, Mapping)
+                ]
+                if not pending_issues:
+                    raise ValueError("pending category ontology checkpoint has no issues")
+                raise _ExtractionCategoryError(
+                    issues=pending_issues,
+                    response=pending["response"],
+                )
+            except _ExtractionCategoryError:
+                raise
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                pending_path.unlink(missing_ok=True)
+        validated_response = request_json(
             messages,
             lambda value: _validate_extraction(
                 value,
@@ -870,6 +925,11 @@ def _request_validated_extraction(
             ),
             request_kind="extraction",
         )
+        pending_path.unlink(missing_ok=True)
+        return validated_response
+
+    try:
+        validated = request_or_resume_pending_category()
         _write_json(
             issue_audit_path,
             {
@@ -881,7 +941,7 @@ def _request_validated_extraction(
         return validated
     except ValueError as exc:
         value_error = _value_error_from_exception(exc)
-        value_repair_audit: dict[str, Any] | None = None
+        value_repair_audit: dict[str, Any] | None = pending_value_repair_audit
         category_error = _category_error_from_exception(exc)
         if value_error is not None:
             issue_events.extend(
@@ -1001,6 +1061,23 @@ def _request_validated_extraction(
         len(category_error.issues),
     )
     ontology_error: str | None = None
+    _write_json(
+        pending_path,
+        {
+            "schema_version": PENDING_CATEGORY_ONTOLOGY_SCHEMA_VERSION,
+            "status": "awaiting_interpretation",
+            "input_fingerprint": pending_input_fingerprint,
+            "recorded_at": _now(),
+            "issues": [dict(issue) for issue in category_error.issues],
+            "response": copy.deepcopy(category_error.response),
+            "prior_issue_events": [
+                copy.deepcopy(event)
+                for event in issue_events
+                if event.get("failure_kind") != "out_of_ontology_category"
+            ],
+            "value_repair_audit": copy.deepcopy(value_repair_audit),
+        },
+    )
     try:
         corrections = request_json(
             _category_ontology_prompt(items),
@@ -1060,6 +1137,7 @@ def _request_validated_extraction(
             "events": issue_events,
         },
     )
+    pending_path.unlink(missing_ok=True)
     return validated
 
 

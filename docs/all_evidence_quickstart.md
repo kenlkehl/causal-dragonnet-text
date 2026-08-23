@@ -124,10 +124,10 @@ nonreference-level interaction terms and receive one omnibus likelihood-ratio
 test. The default for both p-values is `0.05`, and the default for both fold
 fractions is `0.75` (rounded up to a whole-fold count).
 
-For independently managed orchestrator and extractor pools, replace both
-endpoints in the example above with nested vLLM configurations. Here the
-orchestrator uses tensor parallelism over GPUs 0-1, while two extractor replicas
-use GPUs 2 and 3:
+For pipeline-managed orchestrator and extractor roles, replace both endpoints
+in the example above with nested vLLM configurations. Their GPU lists define the
+allowed union used by each alternately loaded model. Here the orchestrator's
+tensor-parallel width is two, while the extractor's width is one:
 
 ```json
 {
