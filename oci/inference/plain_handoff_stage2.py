@@ -106,7 +106,7 @@ EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION = (
     "training_failure_ontology_refinement_v1_explicit_feature_invariants"
 )
 OPERATIONALIZATION_SCHEMA_VERSION = (
-    "feature_name_bounded_supporting_text_v6_continuous_category_fallback"
+    "feature_name_bounded_supporting_text_v7_conflict_resolution"
 )
 INTERPRETATION_SCHEMA_VERSION = "semantic_cards_exhaustive_feature_discovery_v12"
 INTERPRETATION_AUDIT_SCHEMA_VERSION = (
@@ -469,6 +469,7 @@ class Stage2ExplicitFeature:
     roles: tuple[str, ...]
     stability_summary: str = ""
     caveats: str = ""
+    conflict_resolution: Mapping[str, Any] | str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str):
@@ -536,6 +537,19 @@ class Stage2ExplicitFeature:
                 f"stage2 explicit feature {name!r} contains unsupported roles: "
                 f"{unsupported_roles}; allowed roles are {sorted(ALLOWED_ROLES)}"
             )
+        from .plain_handoff_stage2_analysis import _resolved_conflict_resolution
+
+        resolved_conflict = _resolved_conflict_resolution(
+            {
+                "name": name,
+                "description": description,
+                "value_type": value_type,
+                "categories_or_unit": categories,
+                "measurement_definition": measurement_definition,
+                "missing_value_rule": missing_value_rule,
+                "conflict_resolution": self.conflict_resolution,
+            }
+        )
 
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "description", description)
@@ -544,6 +558,14 @@ class Stage2ExplicitFeature:
         object.__setattr__(self, "measurement_definition", measurement_definition)
         object.__setattr__(self, "missing_value_rule", missing_value_rule)
         object.__setattr__(self, "roles", tuple(roles))
+        object.__setattr__(
+            self,
+            "conflict_resolution",
+            {
+                "strategy": resolved_conflict["strategy"],
+                "positive_category": resolved_conflict["positive_category"],
+            },
+        )
         object.__setattr__(self, "stability_summary", str(self.stability_summary or "").strip())
         object.__setattr__(self, "caveats", str(self.caveats or "").strip())
 
@@ -555,6 +577,7 @@ class Stage2ExplicitFeature:
             "categories_or_unit": list(self.categories_or_unit),
             "measurement_definition": self.measurement_definition,
             "missing_value_rule": self.missing_value_rule,
+            "conflict_resolution": dict(self.conflict_resolution or {}),
             "roles": list(self.roles),
             "stability_summary": self.stability_summary,
             "caveats": self.caveats,
@@ -606,6 +629,7 @@ def _stage2_explicit_feature_from_mapping(
         measurement_definition=required_value("measurement_definition"),
         missing_value_rule=required_value("missing_value_rule"),
         roles=tuple(role for role in raw_roles if role is not None),
+        conflict_resolution=combined.get("conflict_resolution"),
         stability_summary=str(combined.get("stability_summary") or ""),
         caveats=str(combined.get("caveats") or ""),
     )
@@ -4389,6 +4413,9 @@ def _operationalization_prompt(
             "List each category exactly once. Categories that differ only by capitalization, punctuation, underscores, or spacing are duplicates and must not both appear.",
             "Never use a type label such as binary or categorical, or a combined phrase such as present-or-absent, as one ontology value.",
             "Define how absent, ambiguous, and conflicting documentation is represented.",
+            "Choose one conflict_resolution strategy for multiple longitudinal observations: latest, earliest, maximum, minimum, mode, any_positive, or single_or_null.",
+            "Use maximum or minimum only for continuous measurements. Use any_positive only for a binary ontology and provide its exact affirmative category as positive_category.",
+            "Use single_or_null when conflicting supported values cannot be scientifically resolved by a reproducible patient-level rule.",
             "Return one flat JSON object with every response field shown below; measurement_definition and missing_value_rule are required nonempty strings.",
         ],
         "response": {
@@ -4397,6 +4424,10 @@ def _operationalization_prompt(
             "categories_or_unit": ["categories or one unit string"],
             "measurement_definition": "what to extract from the pretreatment record",
             "missing_value_rule": "how missing or ambiguous documentation is represented",
+            "conflict_resolution": {
+                "strategy": "latest|earliest|maximum|minimum|mode|any_positive|single_or_null",
+                "positive_category": "exact affirmative binary category, otherwise null",
+            },
             "stability_summary": "scientific support summary without provenance identifiers",
             "caveats": "remaining scientific limitations",
         },
@@ -5432,6 +5463,10 @@ def _ambiguous_operationalization_fallback(
             "Return null when the pretreatment record does not explicitly document one "
             "unambiguous scalar value."
         ),
+        "conflict_resolution": {
+            "strategy": "single_or_null",
+            "positive_category": None,
+        },
         "stability_summary": "Model-authored ontology required a conservative fallback.",
         "caveats": " ".join(value for value in (existing_caveats, fallback_caveat) if value),
         "validation_fallback_error": str(validation_error),
@@ -5545,6 +5580,23 @@ def _validate_operationalization(
             "Return null when the pretreatment record does not explicitly document "
             "a single unambiguous value."
         )
+    from .plain_handoff_stage2_analysis import _resolved_conflict_resolution
+
+    conflict_resolution = _resolved_conflict_resolution(
+        {
+            "name": str(group.get("name") or ""),
+            "description": description,
+            "value_type": value_type,
+            "categories_or_unit": categories,
+            "measurement_definition": measurement_definition,
+            "missing_value_rule": missing_value_rule,
+            "conflict_resolution": (
+                normalized.get("conflict_resolution")
+                or normalized.get("longitudinal_resolution")
+                or normalized.get("conflict_rule")
+            ),
+        }
+    )
     architecture_count = len(_candidate_architectures(group))
     packet_count = len(_string_values(group.get("supporting_packet_ids")))
     stability_summary = str(
@@ -5564,6 +5616,10 @@ def _validate_operationalization(
         "categories_or_unit": categories,
         "measurement_definition": measurement_definition,
         "missing_value_rule": missing_value_rule,
+        "conflict_resolution": {
+            "strategy": conflict_resolution["strategy"],
+            "positive_category": conflict_resolution["positive_category"],
+        },
         "stability_summary": stability_summary,
         "caveats": str(
             normalized.get("caveats") or normalized.get("limitations") or group.get("caveats") or ""

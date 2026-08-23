@@ -36,10 +36,13 @@ EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_single_patient_feature_batch_extraction_v4_independent_small_model"
 )
 PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_page_extraction_v4_independent_small_model"
+    "stage2_single_patient_page_observations_v5_provenance"
+)
+PAGE_OBSERVATION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_single_patient_page_observation_feature_batch_v1_provenance"
 )
 PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_lossless_feature_partition_reconciliation_v5_independent_small_model"
+    "stage2_deterministic_page_reconciliation_v6_provenance"
 )
 REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_aggregate_ontology_supervisor_v1"
 REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_ontology_supervisor_convergence_v1"
@@ -83,6 +86,18 @@ _SCALAR_EXTRACTION_RULES = (
     "instead of discarding it or inventing a number. From a composite such as 147/93, use "
     "only a component explicitly named by the feature; if the definition requests multiple "
     "components, return null rather than a ratio string or aggregate.",
+)
+
+CONFLICT_RESOLUTION_STRATEGIES = frozenset(
+    {
+        "latest",
+        "earliest",
+        "maximum",
+        "minimum",
+        "mode",
+        "any_positive",
+        "single_or_null",
+    }
 )
 
 CONTINUOUS_MODELING_STRATEGIES = frozenset(
@@ -356,6 +371,139 @@ def _prompt_feature_definitions(
             )
         output.append(row)
     return output
+
+
+def _likely_positive_category(categories: Sequence[str]) -> str | None:
+    """Return the affirmative member of a binary ontology when identifiable."""
+
+    if len(categories) != 2:
+        return None
+    negative = re.compile(
+        r"^(?:0|false|no|none|never|absent|negative|not\s+(?:present|documented|detected)|"
+        r"undocumented|unknown)$",
+        flags=re.IGNORECASE,
+    )
+    negative_matches = [category for category in categories if negative.fullmatch(category.strip())]
+    if len(negative_matches) != 1:
+        return None
+    return next(category for category in categories if category != negative_matches[0])
+
+
+def _resolved_conflict_resolution(definition: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a validated, explicit rule for reducing longitudinal observations.
+
+    New ontologies persist ``conflict_resolution``.  Historical definitions are
+    interpreted conservatively from their measurement text so completed
+    interpretation checkpoints remain reusable.
+    """
+
+    raw = definition.get("conflict_resolution")
+    if isinstance(raw, str):
+        raw = {"strategy": raw}
+    if raw is not None and not isinstance(raw, Mapping):
+        raise ValueError("conflict_resolution must be an object or strategy string")
+
+    value_type = str(definition.get("value_type") or "ambiguous").strip().lower()
+    categories = _declared_categories(definition)
+    measurement_text = " ".join(
+        str(definition.get(key) or "")
+        for key in ("measurement_definition", "description", "missing_value_rule")
+    ).lower()
+
+    strategy_source = "explicit_ontology"
+    strategy = str((raw or {}).get("strategy") or "").strip().lower().replace("-", "_")
+    strategy_aliases = {
+        "most_recent": "latest",
+        "last": "latest",
+        "first": "earliest",
+        "max": "maximum",
+        "min": "minimum",
+        "majority": "mode",
+        "present_if_ever": "any_positive",
+        "null_on_conflict": "single_or_null",
+    }
+    strategy = strategy_aliases.get(strategy, strategy)
+    if not strategy:
+        strategy_source = "inferred_measurement_definition"
+        if re.search(r"\b(?:maximum|maximal|highest|peak)\b", measurement_text):
+            strategy = "maximum"
+        elif re.search(r"\b(?:minimum|minimal|lowest)\b", measurement_text):
+            strategy = "minimum"
+        elif re.search(r"\b(?:earliest|first)\b", measurement_text):
+            strategy = "earliest"
+        elif re.search(r"\b(?:mode|most frequent|majority)\b", measurement_text):
+            strategy = "mode"
+        elif (
+            value_type == "binary"
+            and re.search(r"\b(?:ever|history of|any occurrence|presence or absence)\b", measurement_text)
+            and _likely_positive_category(categories) is not None
+        ):
+            strategy = "any_positive"
+        elif re.search(r"\b(?:single unambiguous|conflict[^.]{0,40}(?:null|missing))\b", measurement_text):
+            strategy = "single_or_null"
+        else:
+            # The historical behavior used document order.  Make that fallback
+            # explicit and auditable while preferring verified dates when present.
+            strategy = "latest"
+            strategy_source = "compatibility_default_latest"
+
+    if strategy not in CONFLICT_RESOLUTION_STRATEGIES:
+        raise ValueError(
+            "conflict_resolution.strategy must be one of "
+            f"{sorted(CONFLICT_RESOLUTION_STRATEGIES)}; received {strategy!r}"
+        )
+    if strategy in {"maximum", "minimum"} and value_type != "continuous":
+        if raw is not None:
+            raise ValueError(
+                f"conflict_resolution strategy {strategy!r} requires a continuous feature"
+            )
+        strategy = "latest"
+        strategy_source = "compatibility_default_latest_incompatible_inference"
+
+    positive_category: str | None = None
+    if strategy == "any_positive":
+        raw_positive = str((raw or {}).get("positive_category") or "").strip()
+        if raw_positive:
+            positive_category = _canonical_category(raw_positive, categories)
+        else:
+            positive_category = _likely_positive_category(categories)
+        if positive_category is None:
+            raise ValueError(
+                "any_positive conflict resolution requires one exact positive_category "
+                "from a binary ontology"
+            )
+
+    return {
+        "strategy": strategy,
+        "positive_category": positive_category,
+        "strategy_source": strategy_source,
+        "dated_observations_precede_undated": strategy in {"latest", "earliest"},
+        "source_order_tie_breaker": "last" if strategy != "earliest" else "first",
+    }
+
+
+def _page_prompt_feature_definitions(
+    definitions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project definitions to the richer oversized-note observation contract."""
+
+    projected = _prompt_feature_definitions(definitions)
+    for source, row in zip(definitions, projected):
+        row["conflict_resolution"] = _resolved_conflict_resolution(source)
+    return projected
+
+
+def _refresh_conflict_resolution(definition: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-derive and persist a policy after a measurement ontology is revised."""
+
+    refreshed = dict(definition)
+    refreshed.pop("conflict_resolution", None)
+    policy = _resolved_conflict_resolution(refreshed)
+    refreshed["conflict_resolution"] = {
+        "strategy": policy["strategy"],
+        "positive_category": policy["positive_category"],
+    }
+    return refreshed
 
 
 def _stale_category_ontology_audit(path: Path) -> dict[str, Any] | None:
@@ -1069,40 +1217,47 @@ def _extraction_prompt(
     ]
 
 
-def _prompt_chars(messages: Sequence[Mapping[str, str]]) -> int:
-    """Return the exact rendered content characters sent to the endpoint."""
-
-    return sum(len(str(message.get("content") or "")) for message in messages)
-
-
-def _page_reconciliation_prompt(
+def _page_extraction_prompt(
     *,
     definitions: Sequence[Mapping[str, Any]],
-    row_id: int,
-    page_results: Sequence[Mapping[str, Any]],
+    row: Mapping[str, Any],
 ) -> list[dict[str, str]]:
+    """Request every supported page observation with verifiable provenance."""
+
     body = {
-        "job": "reconcile_stage2_patient_variable_pages",
+        "job": "extract_stage2_patient_variable_observations",
         "rules": [
-            "Every supplied page was extracted from a lossless contiguous span of one note.",
-            "Review every page result and apply each feature's measurement and missing-value rules.",
-            "A null page does not override a supported value on another page.",
-            "Resolve multiple supported values using document order and the specified temporal or aggregation rule.",
-            "Do not invent evidence that is absent from all page results.",
-            "For a binary, categorical, or ordinal feature, return one declared category exactly.",
-            "Do not substitute 0/1 or true/false for a declared category unless that "
-            "exact value is declared.",
-            *_SCALAR_EXTRACTION_RULES,
-            "Return every feature exactly once for the original row_id.",
+            "Use only the supplied clinical-text page for this patient.",
+            "Return every distinct explicitly supported observation for every supplied feature; do not collapse conflicting or repeated longitudinal values.",
+            "conflict_resolution is applied later by deterministic code. Do not apply it within this page and do not discard an otherwise supported observation because another value is newer, earlier, larger, smaller, or more frequent.",
+            "Do not return an observation when the page does not support a nonmissing value.",
+            "Each value must be one scalar. For closed ontologies, use one declared category exactly.",
+            "For each observation, quote a short exact contiguous evidence substring from patient.text.",
+            "evidence_start and evidence_end are zero-based Python-style character offsets into patient.text, with evidence_end exclusive.",
+            "Set recorded_at only when a date or time explicitly governs that observation, such as an encounter, specimen, measurement, or result date.",
+            "When recorded_at is set, normalize it to ISO-8601 and provide the exact source date text plus its offsets. Do not borrow an unrelated date.",
+            "Use null for recorded_at and recorded_at_evidence when no governing date is explicit on this page.",
+            "Return an empty observations array when no supplied feature has supported evidence on this page.",
         ],
-        "features": _prompt_feature_definitions(definitions),
-        "row_id": int(row_id),
-        "page_results": list(page_results),
+        "features": _page_prompt_feature_definitions(definitions),
+        "patient": dict(row),
         "response": {
             "rows": [
                 {
-                    "row_id": int(row_id),
-                    "values": {"every supplied feature name": "scalar value or null"},
+                    "row_id": "the supplied integer row_id",
+                    "observations": [
+                        {
+                            "feature_name": "one supplied feature name",
+                            "value": "one supported scalar value",
+                            "evidence": "exact quote from patient.text",
+                            "evidence_start": "zero-based inclusive integer",
+                            "evidence_end": "zero-based exclusive integer",
+                            "recorded_at": "ISO-8601 date/time, year-month, year, or null",
+                            "recorded_at_evidence": "exact source date/time quote or null",
+                            "recorded_at_start": "inclusive integer or null",
+                            "recorded_at_end": "exclusive integer or null",
+                        }
+                    ],
                 }
             ]
         },
@@ -1111,31 +1266,18 @@ def _page_reconciliation_prompt(
         {
             "role": "system",
             "content": (
-                "You reconcile complete-note page extractions without dropping any page. "
-                "Return JSON only."
+                "You extract all supported clinical variable observations with exact "
+                "source provenance. Return JSON only."
             ),
         },
-        {
-            "role": "user",
-            "content": json.dumps(body, sort_keys=True, ensure_ascii=False),
-        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True, ensure_ascii=False)},
     ]
 
 
-def _page_results_for_definitions(
-    page_results: Sequence[Mapping[str, Any]],
-    definitions: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Retain every page while projecting values to one feature subset."""
+def _prompt_chars(messages: Sequence[Mapping[str, str]]) -> int:
+    """Return the exact rendered content characters sent to the endpoint."""
 
-    feature_names = [str(definition["name"]) for definition in definitions]
-    return [
-        {
-            **{key: value for key, value in page.items() if key != "values"},
-            "values": {name: dict(page.get("values") or {}).get(name) for name in feature_names},
-        }
-        for page in page_results
-    ]
+    return sum(len(str(message.get("content") or "")) for message in messages)
 
 
 def _partition_feature_definitions(
@@ -1155,52 +1297,6 @@ def _partition_feature_definitions(
         list(definitions[start : start + feature_batch_size])
         for start in range(0, len(definitions), feature_batch_size)
     ]
-
-
-def _partition_page_reconciliation_definitions(
-    *,
-    definitions: Sequence[Mapping[str, Any]],
-    row_id: int,
-    page_results: Sequence[Mapping[str, Any]],
-    max_prompt_chars: int,
-    feature_batch_size: int,
-) -> list[list[Mapping[str, Any]]]:
-    """Partition only features; every batch continues to see every note page."""
-
-    batches: list[list[Mapping[str, Any]]] = []
-    current: list[Mapping[str, Any]] = []
-    for definition in definitions:
-        singleton_results = _page_results_for_definitions(page_results, [definition])
-        singleton_messages = _page_reconciliation_prompt(
-            definitions=[definition],
-            row_id=row_id,
-            page_results=singleton_results,
-        )
-        singleton_prompt_chars = _prompt_chars(singleton_messages)
-        if singleton_prompt_chars > int(max_prompt_chars):
-            raise ValueError(
-                "Stage 2 cannot reconcile every lossless note page for one feature "
-                f"within max_prompt_chars ({singleton_prompt_chars} > {max_prompt_chars}); "
-                "increase the prompt budget"
-            )
-        proposed = [*current, definition]
-        proposed_results = _page_results_for_definitions(page_results, proposed)
-        messages = _page_reconciliation_prompt(
-            definitions=proposed,
-            row_id=row_id,
-            page_results=proposed_results,
-        )
-        prompt_chars = _prompt_chars(messages)
-        if current and (
-            len(proposed) > int(feature_batch_size) or prompt_chars > int(max_prompt_chars)
-        ):
-            batches.append(current)
-            current = [definition]
-        else:
-            current = proposed
-    if current:
-        batches.append(current)
-    return batches
 
 
 def _validate_extraction(
@@ -1306,6 +1402,643 @@ def _validate_extraction(
     return normalized_response
 
 
+class _PageObservationValidationError(ValueError):
+    """Invalid provenance rows while retaining every independently valid observation."""
+
+    def __init__(
+        self,
+        *,
+        issues: Sequence[Mapping[str, Any]],
+        response: Mapping[str, Any],
+    ) -> None:
+        self.issues = tuple(dict(issue) for issue in issues)
+        self.response = copy.deepcopy(dict(response))
+        first = self.issues[0]
+        suffix = f"; {len(self.issues) - 1} additional issue(s)" if len(self.issues) > 1 else ""
+        super().__init__(
+            f"page observation {first.get('observation_index')} for feature "
+            f"{first.get('feature_name')!r} is invalid: {first.get('reason')}{suffix}"
+        )
+
+
+def _page_observation_error_from_exception(
+    exc: BaseException,
+) -> _PageObservationValidationError | None:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, _PageObservationValidationError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _exact_quote_span(
+    *,
+    text: str,
+    quote: Any,
+    reported_start: Any,
+    reported_end: Any,
+    label: str,
+) -> tuple[str, int, int, str]:
+    """Resolve a model-provided exact quote to deterministic page offsets."""
+
+    if not isinstance(quote, str) or not quote:
+        raise ValueError(f"{label} must be a nonempty exact quote")
+    start: int | None = None
+    end: int | None = None
+    if not isinstance(reported_start, bool) and isinstance(reported_start, int):
+        start = int(reported_start)
+    if not isinstance(reported_end, bool) and isinstance(reported_end, int):
+        end = int(reported_end)
+    if (
+        start is not None
+        and end is not None
+        and 0 <= start < end <= len(text)
+        and text[start:end] == quote
+    ):
+        return quote, start, end, "reported_exact"
+
+    matches: list[int] = []
+    cursor = 0
+    while True:
+        match = text.find(quote, cursor)
+        if match < 0:
+            break
+        matches.append(match)
+        cursor = match + 1
+    if not matches:
+        raise ValueError(f"{label} is not an exact substring of the supplied page")
+    if start is None:
+        if len(matches) != 1:
+            raise ValueError(
+                f"{label} occurs more than once; exact offsets are required to prove provenance"
+            )
+        selected = matches[0]
+        method = "unique_exact_match"
+    else:
+        ranked = sorted(matches, key=lambda candidate: (abs(candidate - start), candidate))
+        if len(ranked) > 1 and abs(ranked[0] - start) == abs(ranked[1] - start):
+            raise ValueError(
+                f"{label} offsets are equidistant from repeated exact quotes; "
+                "return the exact occurrence offsets"
+            )
+        selected = ranked[0]
+        method = "nearest_exact_match"
+    return quote, selected, selected + len(quote), method
+
+
+def _canonical_observation_time(value: Any) -> str | None:
+    if value is None or _is_missing_scalar(value):
+        return None
+    if not isinstance(value, str):
+        raise ValueError("recorded_at must be an ISO-8601 string or null")
+    text = value.strip()
+    if re.fullmatch(r"\d{4}", text):
+        return text
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        try:
+            datetime.strptime(text, "%Y-%m")
+        except ValueError as exc:
+            raise ValueError("recorded_at must be a valid ISO-8601 month") from exc
+        return text
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            datetime.fromisoformat(text)
+        except ValueError as exc:  # pragma: no cover - guarded by datetime
+            raise ValueError("recorded_at must be a valid ISO-8601 date") from exc
+        return text
+    rendered = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(rendered)
+    except ValueError as exc:
+        raise ValueError("recorded_at must be a valid ISO-8601 date or datetime") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def _canonical_time_evidence(value: str) -> str:
+    """Normalize an exact source date quote locally instead of trusting the model."""
+
+    text = value.strip()
+    if re.fullmatch(r"\d{4}", text):
+        return text
+    if re.fullmatch(r"\d{4}[-/]\d{1,2}", text):
+        year, month = (int(part) for part in re.split(r"[-/]", text))
+        if not 1 <= month <= 12:
+            raise ValueError("recorded_at_evidence contains an invalid calendar month")
+        return f"{year:04d}-{month:02d}"
+    numeric_month_year = re.fullmatch(r"(\d{1,2})[-/](\d{4})", text)
+    if numeric_month_year is not None:
+        month, year = (int(part) for part in numeric_month_year.groups())
+        if not 1 <= month <= 12:
+            raise ValueError("recorded_at_evidence contains an invalid calendar month")
+        return f"{year:04d}-{month:02d}"
+    month_year = re.fullmatch(
+        r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"
+        r"Dec(?:ember)?)\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if month_year is not None:
+        parsed_month = datetime.strptime(month_year.group(1)[:3].title(), "%b").month
+        return f"{int(month_year.group(2)):04d}-{parsed_month:02d}"
+    try:
+        parsed = pd.to_datetime(text, errors="raise", utc=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "recorded_at_evidence must itself be a parseable date or datetime quote"
+        ) from exc
+    if isinstance(parsed, pd.DatetimeIndex):
+        if len(parsed) != 1:  # pragma: no cover - scalar input invariant
+            raise ValueError("recorded_at_evidence must contain one date or datetime")
+        parsed = parsed[0]
+    timestamp = pd.Timestamp(parsed)
+    if not re.search(r"\d{1,2}:\d{2}", text):
+        return timestamp.date().isoformat()
+    return timestamp.isoformat().replace("+00:00", "Z")
+
+
+def _validate_page_observations(
+    value: Mapping[str, Any],
+    *,
+    page: Mapping[str, Any],
+    definitions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate values and prove each observation against an exact page quote."""
+
+    rows = value.get("rows")
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+        raise ValueError("page extraction response requires exactly one row object")
+    expected_row_id = int(page["row_id"])
+    try:
+        row_id = int(rows[0].get("row_id"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("page extraction row_id must be the supplied integer") from exc
+    if row_id != expected_row_id:
+        raise ValueError("page extraction returned an unknown row_id")
+    raw_observations = rows[0].get("observations")
+    if not isinstance(raw_observations, list):
+        raise ValueError("page extraction row requires an observations array")
+
+    text = str(page.get("text") or "")
+    page_meta = dict(page.get("page") or {})
+    page_index = int(page_meta.get("page_index"))
+    page_char_start = int(page_meta.get("char_start"))
+    definition_by_name = {str(definition["name"]): definition for definition in definitions}
+    normalized: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+
+    for observation_index, raw in enumerate(raw_observations, start=1):
+        feature_name = ""
+        try:
+            if not isinstance(raw, Mapping):
+                raise ValueError("observation must be an object")
+            feature_name = str(raw.get("feature_name") or "")
+            if feature_name not in definition_by_name:
+                raise ValueError("feature_name is not one of the supplied features")
+            scalar_response = _validate_extraction(
+                {
+                    "rows": [
+                        {
+                            "row_id": row_id,
+                            "values": {feature_name: raw.get("value")},
+                        }
+                    ]
+                },
+                row_ids=[row_id],
+                definitions=[definition_by_name[feature_name]],
+            )
+            scalar = scalar_response["rows"][0]["values"][feature_name]
+            if scalar is None:
+                raise ValueError("a page observation must contain a supported nonmissing value")
+
+            evidence, evidence_start, evidence_end, evidence_offset_resolution = (
+                _exact_quote_span(
+                    text=text,
+                    quote=raw.get("evidence"),
+                    reported_start=raw.get("evidence_start"),
+                    reported_end=raw.get("evidence_end"),
+                    label="evidence",
+                )
+            )
+            recorded_at = _canonical_observation_time(raw.get("recorded_at"))
+            recorded_at_evidence: str | None = None
+            recorded_at_start: int | None = None
+            recorded_at_end: int | None = None
+            recorded_at_offset_resolution: str | None = None
+            if recorded_at is not None:
+                (
+                    recorded_at_evidence,
+                    recorded_at_start,
+                    recorded_at_end,
+                    recorded_at_offset_resolution,
+                ) = _exact_quote_span(
+                    text=text,
+                    quote=raw.get("recorded_at_evidence"),
+                    reported_start=raw.get("recorded_at_start"),
+                    reported_end=raw.get("recorded_at_end"),
+                    label="recorded_at_evidence",
+                )
+                source_recorded_at = _canonical_time_evidence(recorded_at_evidence)
+                if recorded_at != source_recorded_at:
+                    raise ValueError(
+                        "recorded_at does not match its exact recorded_at_evidence quote"
+                    )
+                recorded_at = source_recorded_at
+            elif any(
+                raw.get(key) is not None
+                for key in (
+                    "recorded_at_evidence",
+                    "recorded_at_start",
+                    "recorded_at_end",
+                )
+            ):
+                raise ValueError(
+                    "recorded_at evidence and offsets must be null when recorded_at is null"
+                )
+
+            identity_value = {
+                "row_id": row_id,
+                "feature_name": feature_name,
+                "value": scalar,
+                "source_start": page_char_start + evidence_start,
+                "source_end": page_char_start + evidence_end,
+                "recorded_at": recorded_at,
+            }
+            normalized.append(
+                {
+                    "observation_id": f"observation_{_value_fingerprint(identity_value)[:20]}",
+                    "feature_name": feature_name,
+                    "value": scalar,
+                    "evidence": evidence,
+                    "evidence_start": evidence_start,
+                    "evidence_end": evidence_end,
+                    "source_start": page_char_start + evidence_start,
+                    "source_end": page_char_start + evidence_end,
+                    "page_index": page_index,
+                    "recorded_at": recorded_at,
+                    "recorded_at_evidence": recorded_at_evidence,
+                    "recorded_at_start": recorded_at_start,
+                    "recorded_at_end": recorded_at_end,
+                    "recorded_at_source_start": (
+                        page_char_start + recorded_at_start
+                        if recorded_at_start is not None
+                        else None
+                    ),
+                    "recorded_at_source_end": (
+                        page_char_start + recorded_at_end
+                        if recorded_at_end is not None
+                        else None
+                    ),
+                    "offset_resolution": evidence_offset_resolution,
+                    "recorded_at_offset_resolution": recorded_at_offset_resolution,
+                }
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            issues.append(
+                {
+                    "observation_index": observation_index,
+                    "feature_name": feature_name or None,
+                    "reason": str(exc),
+                    "raw_observation": copy.deepcopy(raw),
+                }
+            )
+
+    by_id = {str(observation["observation_id"]): observation for observation in normalized}
+    normalized_response = {
+        "rows": [
+            {
+                "row_id": row_id,
+                "observations": sorted(
+                    by_id.values(),
+                    key=lambda observation: (
+                        int(observation["source_start"]),
+                        str(observation["feature_name"]),
+                        str(observation["observation_id"]),
+                    ),
+                ),
+            }
+        ]
+    }
+    if issues:
+        raise _PageObservationValidationError(issues=issues, response=normalized_response)
+    return normalized_response
+
+
+def _request_validated_page_observations(
+    *,
+    messages: Sequence[Mapping[str, str]],
+    page: Mapping[str, Any],
+    definitions: Sequence[Mapping[str, Any]],
+    request_json: RequestJSON,
+    audit_dir: Path,
+) -> dict[str, Any]:
+    """Request page observations, retaining valid provenance after exhausted repairs."""
+
+    issue_path = audit_dir / "extraction_issues.json"
+    try:
+        validated = request_json(
+            messages,
+            lambda candidate: _validate_page_observations(
+                candidate,
+                page=page,
+                definitions=definitions,
+            ),
+            request_kind="extraction",
+        )
+        _write_json(
+            issue_path,
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [],
+            },
+        )
+        return validated
+    except ValueError as exc:
+        observation_error = _page_observation_error_from_exception(exc)
+        row_id = int(page["row_id"])
+        if observation_error is not None:
+            events = [
+                {
+                    "failure_kind": "invalid_page_observation_provenance",
+                    "row_id": row_id,
+                    "feature_name": issue.get("feature_name"),
+                    "reason": str(issue.get("reason") or ""),
+                    "observation_index": int(issue.get("observation_index") or 0),
+                }
+                for issue in observation_error.issues
+            ]
+            _write_json(
+                audit_dir / "invalid_page_observation_repair.json",
+                {
+                    "schema_version": "stage2_invalid_page_observation_repair_v1",
+                    "resolution": "retain_valid_drop_unverifiable",
+                    "original_validation_error": str(exc),
+                    "issues": [dict(issue) for issue in observation_error.issues],
+                },
+            )
+            _write_json(
+                issue_path,
+                {
+                    "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                    "completed_at": _now(),
+                    "events": events,
+                },
+            )
+            LOGGER.warning(
+                "Stage 2 page extraction retained valid observations and dropped %s "
+                "unverifiable observation(s) for row %s",
+                len(observation_error.issues),
+                row_id,
+            )
+            return copy.deepcopy(observation_error.response)
+
+        conservative = {"rows": [{"row_id": row_id, "observations": []}]}
+        _write_json(
+            audit_dir / "extraction_failure.json",
+            {
+                "schema_version": "stage2_page_observation_failure_v1",
+                "resolution": "conservative_no_observations",
+                "failed_at": _now(),
+                "row_id": row_id,
+                "feature_names": [str(definition["name"]) for definition in definitions],
+                "validation_error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        _write_json(
+            issue_path,
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [
+                    {
+                        "failure_kind": "structural_page_observation_failure",
+                        "row_id": row_id,
+                        "feature_name": None,
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+                ],
+            },
+        )
+        LOGGER.warning(
+            "Stage 2 page observation response remained structurally invalid; "
+            "using no observations for row %s (%s: %s)",
+            row_id,
+            type(exc).__name__,
+            exc,
+        )
+        return conservative
+
+
+def _observation_value_key(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _observation_time_sort_value(observation: Mapping[str, Any]) -> int | None:
+    recorded_at = observation.get("recorded_at")
+    if not recorded_at:
+        return None
+    timestamp = pd.Timestamp(str(recorded_at))
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return int(timestamp.value)
+
+
+def _select_temporal_observation(
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    latest: bool,
+) -> tuple[dict[str, Any], str]:
+    dated = [
+        (observation, _observation_time_sort_value(observation))
+        for observation in observations
+        if observation.get("recorded_at")
+    ]
+    if dated:
+        if latest:
+            selected, _timestamp = max(
+                dated,
+                key=lambda item: (
+                    int(item[1]),
+                    int(item[0]["source_end"]),
+                    str(item[0]["observation_id"]),
+                ),
+            )
+        else:
+            selected, _timestamp = min(
+                dated,
+                key=lambda item: (
+                    int(item[1]),
+                    int(item[0]["source_start"]),
+                    str(item[0]["observation_id"]),
+                ),
+            )
+        return dict(selected), "verified_recorded_at"
+    selected = (max if latest else min)(
+        observations,
+        key=lambda observation: (
+            int(observation["source_end"] if latest else observation["source_start"]),
+            str(observation["observation_id"]),
+        ),
+    )
+    return dict(selected), "absolute_source_order"
+
+
+def _resolve_feature_observations(
+    *,
+    definition: Mapping[str, Any],
+    observations: Sequence[Mapping[str, Any]],
+) -> tuple[Any, dict[str, Any]]:
+    policy = _resolved_conflict_resolution(definition)
+    unique = {
+        str(observation["observation_id"]): dict(observation) for observation in observations
+    }
+    ordered = sorted(
+        unique.values(),
+        key=lambda observation: (
+            int(observation["source_start"]),
+            int(observation["source_end"]),
+            str(observation["observation_id"]),
+        ),
+    )
+    decision: dict[str, Any] = {
+        "feature_name": str(definition["name"]),
+        "policy": policy,
+        "observation_count": len(ordered),
+        "distinct_value_count": len(
+            {_observation_value_key(observation.get("value")) for observation in ordered}
+        ),
+        "observations": ordered,
+        "selected_observation_id": None,
+        "resolution": "no_observations",
+        "value": None,
+    }
+    if not ordered:
+        return None, decision
+
+    values_by_key: dict[str, list[dict[str, Any]]] = {}
+    for observation in ordered:
+        values_by_key.setdefault(_observation_value_key(observation["value"]), []).append(
+            observation
+        )
+    if len(values_by_key) == 1:
+        selected, basis = _select_temporal_observation(ordered, latest=True)
+        decision.update(
+            {
+                "selected_observation_id": selected["observation_id"],
+                "resolution": "unanimous_value",
+                "selection_basis": basis,
+                "value": selected["value"],
+            }
+        )
+        return selected["value"], decision
+
+    strategy = str(policy["strategy"])
+    selected: dict[str, Any] | None = None
+    basis = ""
+    if strategy in {"latest", "earliest"}:
+        selected, basis = _select_temporal_observation(
+            ordered,
+            latest=strategy == "latest",
+        )
+    elif strategy in {"maximum", "minimum"}:
+        numeric = [
+            observation
+            for observation in ordered
+            if isinstance(observation.get("value"), (int, float))
+            and not isinstance(observation.get("value"), bool)
+        ]
+        if numeric:
+            target_value = (max if strategy == "maximum" else min)(
+                float(observation["value"]) for observation in numeric
+            )
+            extrema = [
+                observation
+                for observation in numeric
+                if float(observation["value"]) == target_value
+            ]
+            selected, temporal_basis = _select_temporal_observation(extrema, latest=True)
+            basis = f"{strategy}_numeric_then_{temporal_basis}"
+    elif strategy == "mode":
+        largest_count = max(len(group) for group in values_by_key.values())
+        modal = [
+            observation
+            for group in values_by_key.values()
+            if len(group) == largest_count
+            for observation in group
+        ]
+        selected, temporal_basis = _select_temporal_observation(modal, latest=True)
+        basis = f"mode_then_{temporal_basis}"
+    elif strategy == "any_positive":
+        positive = str(policy["positive_category"])
+        matching = [observation for observation in ordered if observation["value"] == positive]
+        selected, temporal_basis = _select_temporal_observation(
+            matching or ordered,
+            latest=True,
+        )
+        basis = (
+            f"any_positive_then_{temporal_basis}"
+            if matching
+            else f"no_positive_then_{temporal_basis}"
+        )
+    elif strategy == "single_or_null":
+        basis = "conflicting_values_are_null"
+
+    if selected is None:
+        decision.update(
+            {
+                "resolution": "conflict_null",
+                "selection_basis": basis or "no_valid_deterministic_selection",
+            }
+        )
+        return None, decision
+    decision.update(
+        {
+            "selected_observation_id": selected["observation_id"],
+            "resolution": "selected_by_policy",
+            "selection_basis": basis,
+            "value": selected["value"],
+        }
+    )
+    return selected["value"], decision
+
+
+def _resolve_page_observations(
+    *,
+    definitions: Sequence[Mapping[str, Any]],
+    page_results: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    observations_by_feature: dict[str, list[dict[str, Any]]] = {
+        str(definition["name"]): [] for definition in definitions
+    }
+    for page_result in page_results:
+        for observation in page_result.get("observations") or []:
+            feature_name = str(observation.get("feature_name") or "")
+            if feature_name not in observations_by_feature:
+                raise ValueError("page result contains an observation for an unknown feature")
+            observations_by_feature[feature_name].append(dict(observation))
+
+    values: dict[str, Any] = {}
+    decisions: dict[str, Any] = {}
+    for definition in definitions:
+        feature_name = str(definition["name"])
+        value, decision = _resolve_feature_observations(
+            definition=definition,
+            observations=observations_by_feature[feature_name],
+        )
+        values[feature_name] = value
+        decisions[feature_name] = decision
+    return values, decisions
+
+
 def _partition_rows_for_prompt(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -1337,6 +2070,28 @@ def _partition_rows_for_prompt(
         else:
             batches.append([row])
     return batches, oversized
+
+
+def _preferred_lossless_page_end(source: str, *, start: int, hard_end: int) -> tuple[int, str]:
+    """Prefer a nearby clinical-note or text boundary without dropping characters."""
+
+    if hard_end >= len(source):
+        return len(source), "document_end"
+    width = hard_end - start
+    if width <= 1:
+        return hard_end, "hard_character_limit"
+    minimum = start + max(1, int(width * 0.8))
+    for separator, label in (
+        ("\n\n<new_note>\n\n", "new_note_separator"),
+        ("\n\n", "paragraph_boundary"),
+        ("\n", "line_boundary"),
+        (". ", "sentence_boundary"),
+        (" ", "word_boundary"),
+    ):
+        position = source.rfind(separator, minimum, hard_end)
+        if position >= minimum:
+            return position + len(separator), label
+    return hard_end, "hard_character_limit"
 
 
 def _lossless_extraction_pages(
@@ -1374,9 +2129,9 @@ def _lossless_extraction_pages(
             }
             prompt_sizes = (
                 _prompt_chars(
-                    _extraction_prompt(
+                    _page_extraction_prompt(
                         definitions=batch_definitions,
-                        rows=[candidate],
+                        row=candidate,
                     )
                 )
                 for batch_definitions in definition_batches
@@ -1392,6 +2147,22 @@ def _lossless_extraction_pages(
                 "one source character; increase stage2.extraction_max_prompt_chars or "
                 "shorten the feature definitions"
             )
+        preferred_end, _boundary = _preferred_lossless_page_end(
+            source,
+            start=cursor,
+            hard_end=int(best["page"]["char_end"]),
+        )
+        if preferred_end != int(best["page"]["char_end"]):
+            best = {
+                "row_id": row_id,
+                "text": source[cursor:preferred_end],
+                "page": {
+                    "page_index": len(pages) + 1,
+                    "char_start": cursor,
+                    "char_end": preferred_end,
+                    "document_chars": len(source),
+                },
+            }
         pages.append(best)
         cursor = int(best["page"]["char_end"])
     if "".join(str(page["text"]) for page in pages) != source:
@@ -1550,6 +2321,7 @@ def extract_rows(
         for row_id in row_ids
     ]
     extraction_definitions = _prompt_feature_definitions(definitions)
+    page_extraction_definitions = _page_prompt_feature_definitions(definitions)
     batches, oversized_rows = _partition_rows_for_prompt(
         request_rows,
         max_prompt_chars=int(max_prompt_chars),
@@ -1759,6 +2531,118 @@ def extract_rows(
         )
         return merged
 
+    def request_page_feature_batches(
+        *,
+        parent_dir: Path,
+        page: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Extract provenance observations for each feature slice of one page."""
+
+        if len(definition_batches) < 2:  # pragma: no cover - caller invariant
+            raise RuntimeError("page feature batching requires multiple feature batches")
+        row_id = int(page["row_id"])
+        merged_observations: list[dict[str, Any]] = []
+        for feature_batch_index, batch_definitions in enumerate(
+            definition_batches,
+            start=1,
+        ):
+            feature_dir = parent_dir / "feature_batches" / f"batch_{feature_batch_index:05d}"
+            result_path = feature_dir / "result.json"
+            complete_path = feature_dir / "complete.json"
+            batch_input = {
+                "schema_version": PAGE_OBSERVATION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION,
+                "parent_schema_version": PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                "request_identity": extraction_request_identity,
+                "definitions": _page_prompt_feature_definitions(batch_definitions),
+                "page": dict(page),
+            }
+            input_fingerprint = _value_fingerprint(batch_input)
+            result: dict[str, Any] | None = None
+            if complete_path.is_file() and result_path.is_file():
+                try:
+                    completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                    cached = json.loads(result_path.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(completion, Mapping)
+                        and completion.get("schema_version")
+                        == PAGE_OBSERVATION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION
+                        and completion.get("input_fingerprint") == input_fingerprint
+                        and isinstance(cached, Mapping)
+                    ):
+                        result = _validate_page_observations(
+                            cached,
+                            page=page,
+                            definitions=batch_definitions,
+                        )
+                        _ensure_extraction_issue_audit(feature_dir)
+                except (
+                    KeyError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    result = None
+                if result is None:
+                    LOGGER.info(
+                        "rerun incompatible Stage 2 page observation feature batch: %s",
+                        feature_dir,
+                    )
+            if result is None:
+                feature_dir.mkdir(parents=True, exist_ok=True)
+                _write_json(
+                    feature_dir / "input.json",
+                    {**batch_input, "input_fingerprint": input_fingerprint},
+                )
+                messages = _page_extraction_prompt(
+                    definitions=batch_definitions,
+                    row=page,
+                )
+                if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+                    raise RuntimeError(
+                        "Stage 2 page observation planner emitted an oversized feature batch"
+                    )
+                result = _request_validated_page_observations(
+                    messages=messages,
+                    page=page,
+                    definitions=batch_definitions,
+                    request_json=request_json,
+                    audit_dir=feature_dir,
+                )
+                _write_json(result_path, result)
+                _write_json(
+                    complete_path,
+                    {
+                        "status": "complete",
+                        "schema_version": (
+                            PAGE_OBSERVATION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION
+                        ),
+                        "input_fingerprint": input_fingerprint,
+                        "completed_at": _now(),
+                        "row_id": row_id,
+                        "features": len(batch_definitions),
+                        "feature_batch": feature_batch_index,
+                        "observations": len(result["rows"][0]["observations"]),
+                    },
+                )
+            merged_observations.extend(result["rows"][0]["observations"])
+
+        merged = _validate_page_observations(
+            {"rows": [{"row_id": row_id, "observations": merged_observations}]},
+            page=page,
+            definitions=definitions,
+        )
+        _write_json(
+            parent_dir / "extraction_issues.json",
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [],
+                "delegated_to_page_feature_batches": True,
+            },
+        )
+        return merged
+
     def run_batch(index: int, batch: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         if len(batch) != 1:  # pragma: no cover - enforced by the planner
             raise RuntimeError("Stage 2 extraction planner created a multi-patient batch")
@@ -1921,8 +2805,8 @@ def extract_rows(
             {
                 "schema_version": PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
                 "request_identity": extraction_request_identity,
-                "definitions": extraction_definitions,
-                "row": dict(page),
+                "definitions": page_extraction_definitions,
+                "page": dict(page),
             }
         )
         stale_audit = _stale_category_ontology_audit(ontology_audit_path)
@@ -1934,9 +2818,9 @@ def extract_rows(
                     completion.get("schema_version") == PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION
                     and completion.get("input_fingerprint") == input_fingerprint
                 ):
-                    validated = _validate_extraction(
+                    validated = _validate_page_observations(
                         stored,
-                        row_ids=[row_id],
+                        page=page,
                         definitions=definitions,
                     )
                     _ensure_extraction_issue_audit(page_dir)
@@ -1949,24 +2833,25 @@ def extract_rows(
         page_dir.mkdir(parents=True, exist_ok=True)
         _write_json(page_dir / "page.json", page_meta)
         if len(definition_batches) == 1:
-            messages = _extraction_prompt(
+            messages = _page_extraction_prompt(
                 definitions=definitions,
-                rows=[page],
+                row=page,
             )
             if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
-                raise RuntimeError("Stage 2 extraction planner emitted an oversized page")
-            result = _request_validated_extraction(
+                raise RuntimeError(
+                    "Stage 2 page observation planner emitted an oversized page"
+                )
+            result = _request_validated_page_observations(
                 messages=messages,
-                row_ids=[row_id],
+                page=page,
                 definitions=definitions,
                 request_json=request_json,
-                ontology_audit_path=ontology_audit_path,
+                audit_dir=page_dir,
             )
         else:
-            result = request_feature_batches(
+            result = request_page_feature_batches(
                 parent_dir=page_dir,
-                row=page,
-                parent_schema_version=PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                page=page,
             )
         _write_json(result_path, result)
         _supersede_stale_category_ontology_audit(
@@ -1983,6 +2868,7 @@ def extract_rows(
                 "features": len(definitions),
                 "feature_batches": len(definition_batches),
                 "feature_batch_size": feature_batch_size,
+                "observations": len(result["rows"][0]["observations"]),
                 **page_meta,
             },
         )
@@ -2019,30 +2905,35 @@ def extract_rows(
     ) -> dict[str, Any]:
         reconciliation_dir = output_dir / "pages" / f"row_{row_id:08d}" / "reconciliation"
         result_path = reconciliation_dir / "result.json"
+        decisions_path = reconciliation_dir / "decisions.json"
         complete_path = reconciliation_dir / "complete.json"
-        ontology_audit_path = reconciliation_dir / "category_ontology_repair.json"
-        stale_audit = _stale_category_ontology_audit(ontology_audit_path)
         ordered = sorted(page_values, key=lambda item: int(item[0]["page_index"]))
         page_results = [
-            {**dict(meta), "values": dict(result["values"])} for meta, result in ordered
+            {
+                **dict(meta),
+                "observations": [dict(value) for value in result["observations"]],
+            }
+            for meta, result in ordered
         ]
         reconciliation_fingerprint = _value_fingerprint(
             {
                 "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
                 "request_identity": extraction_request_identity,
                 "row_id": int(row_id),
-                "definitions": extraction_definitions,
+                "definitions": page_extraction_definitions,
                 "page_results": page_results,
             }
         )
-        if complete_path.is_file() and result_path.is_file() and stale_audit is None:
+        if complete_path.is_file() and result_path.is_file() and decisions_path.is_file():
             try:
                 completion = json.loads(complete_path.read_text(encoding="utf-8"))
                 stored = json.loads(result_path.read_text(encoding="utf-8"))
+                decisions = json.loads(decisions_path.read_text(encoding="utf-8"))
                 if (
                     completion.get("schema_version")
                     == PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION
                     and completion.get("input_fingerprint") == reconciliation_fingerprint
+                    and isinstance(decisions, Mapping)
                 ):
                     validated = _validate_extraction(
                         stored,
@@ -2057,121 +2948,10 @@ def extract_rows(
                 "rerun incompatible Stage 2 page reconciliation: %s",
                 reconciliation_dir,
             )
-        if stale_audit is not None:
-            LOGGER.info(
-                "retry stale Stage 2 category ontology reconciliation: %s",
-                reconciliation_dir,
-            )
-        definition_batches = _partition_page_reconciliation_definitions(
+        merged_values, decisions = _resolve_page_observations(
             definitions=definitions,
-            row_id=row_id,
             page_results=page_results,
-            max_prompt_chars=int(max_prompt_chars),
-            feature_batch_size=feature_batch_size,
         )
-        if len(definition_batches) > 1:
-            LOGGER.info(
-                "Stage 2 lossless page reconciliation row_id=%s pages=%s features=%s "
-                "feature_batches=%s",
-                row_id,
-                len(page_results),
-                len(definitions),
-                len(definition_batches),
-            )
-
-        merged_values: dict[str, Any] = {}
-        for batch_index, batch_definitions in enumerate(definition_batches, start=1):
-            batch_page_results = _page_results_for_definitions(
-                page_results,
-                batch_definitions,
-            )
-            messages = _page_reconciliation_prompt(
-                definitions=batch_definitions,
-                row_id=row_id,
-                page_results=batch_page_results,
-            )
-            prompt_chars = _prompt_chars(messages)
-            if prompt_chars > int(max_prompt_chars):  # pragma: no cover - planner invariant
-                raise RuntimeError(
-                    "Stage 2 feature-partitioned page reconciliation exceeded " "max_prompt_chars"
-                )
-            if len(definition_batches) == 1:
-                batch_dir = reconciliation_dir
-                batch_ontology_audit_path = ontology_audit_path
-            else:
-                batch_dir = reconciliation_dir / "feature_batches" / f"batch_{batch_index:05d}"
-                batch_ontology_audit_path = batch_dir / "category_ontology_repair.json"
-            batch_result_path = batch_dir / "result.json"
-            batch_complete_path = batch_dir / "complete.json"
-            batch_stale_audit = _stale_category_ontology_audit(batch_ontology_audit_path)
-            batch_input = {
-                "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
-                "request_identity": extraction_request_identity,
-                "row_id": int(row_id),
-                "definitions": _prompt_feature_definitions(batch_definitions),
-                "page_results": batch_page_results,
-            }
-            batch_fingerprint = _value_fingerprint(batch_input)
-            batch_result: dict[str, Any] | None = None
-            if (
-                batch_complete_path.is_file()
-                and batch_result_path.is_file()
-                and batch_stale_audit is None
-            ):
-                try:
-                    completion = json.loads(batch_complete_path.read_text(encoding="utf-8"))
-                    cached = json.loads(batch_result_path.read_text(encoding="utf-8"))
-                    if completion.get("input_fingerprint") == batch_fingerprint:
-                        batch_result = _validate_extraction(
-                            cached,
-                            row_ids=[row_id],
-                            definitions=batch_definitions,
-                        )
-                        _ensure_extraction_issue_audit(batch_dir)
-                except (
-                    KeyError,
-                    OSError,
-                    TypeError,
-                    ValueError,
-                    json.JSONDecodeError,
-                ):
-                    batch_result = None
-            if batch_result is None:
-                if batch_stale_audit is not None:
-                    LOGGER.info(
-                        "retry stale Stage 2 category ontology reconciliation batch: %s",
-                        batch_dir,
-                    )
-                batch_dir.mkdir(parents=True, exist_ok=True)
-                _write_json(
-                    batch_dir / "input.json",
-                    {**batch_input, "input_fingerprint": batch_fingerprint},
-                )
-                batch_result = _request_validated_extraction(
-                    messages=messages,
-                    row_ids=[row_id],
-                    definitions=batch_definitions,
-                    request_json=request_json,
-                    ontology_audit_path=batch_ontology_audit_path,
-                )
-                _write_json(batch_result_path, batch_result)
-                _supersede_stale_category_ontology_audit(
-                    batch_ontology_audit_path,
-                    previous=batch_stale_audit,
-                )
-                _write_json(
-                    batch_complete_path,
-                    {
-                        "status": "complete",
-                        "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
-                        "input_fingerprint": batch_fingerprint,
-                        "completed_at": _now(),
-                        "pages": len(batch_page_results),
-                        "features": len(batch_definitions),
-                    },
-                )
-            merged_values.update(dict(batch_result["rows"][0]["values"]))
-
         result = _validate_extraction(
             {"rows": [{"row_id": int(row_id), "values": merged_values}]},
             row_ids=[row_id],
@@ -2179,10 +2959,23 @@ def extract_rows(
         )
         reconciliation_dir.mkdir(parents=True, exist_ok=True)
         _write_json(reconciliation_dir / "page_manifest.json", page_results)
+        _write_json(
+            decisions_path,
+            {
+                "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
+                "row_id": int(row_id),
+                "decisions": decisions,
+            },
+        )
         _write_json(result_path, result)
-        _supersede_stale_category_ontology_audit(
-            ontology_audit_path,
-            previous=stale_audit,
+        _write_json(
+            reconciliation_dir / "extraction_issues.json",
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [],
+                "deterministic_reconciliation": True,
+            },
         )
         _write_json(
             complete_path,
@@ -2192,8 +2985,19 @@ def extract_rows(
                 "input_fingerprint": reconciliation_fingerprint,
                 "completed_at": _now(),
                 "pages": len(page_results),
-                "feature_batches": len(definition_batches),
-                "feature_batch_size": feature_batch_size,
+                "observations": sum(
+                    len(page_result["observations"]) for page_result in page_results
+                ),
+                "features": len(definitions),
+                "conflicts": sum(
+                    int(decision["distinct_value_count"] > 1)
+                    for decision in decisions.values()
+                ),
+                "null_conflicts": sum(
+                    int(decision["resolution"] == "conflict_null")
+                    for decision in decisions.values()
+                ),
+                "reconciliation_method": "deterministic_provenance",
             },
         )
         return dict(result["rows"][0]["values"])
@@ -4993,6 +5797,7 @@ def _apply_review(
                 "missing_value_rule",
             ):
                 updated[key] = decision[key]
+            updated = _refresh_conflict_resolution(updated)
         if "modeling_strategy" in decision:
             updated["modeling_strategy"] = decision["modeling_strategy"]
         revised.append(_normalized_feature_modeling_definition(updated))
@@ -5478,6 +6283,7 @@ def _request_aggregate_ontology_supervisor(
             if _value_fingerprint(before) != _value_fingerprint(after):
                 feature.pop("harmonization_plan", None)
                 feature.pop("harmonization_fallback", None)
+                feature = _refresh_conflict_resolution(feature)
                 changed_ids.append(str(feature["feature_id"]))
         updated.append(feature)
 
@@ -5676,6 +6482,7 @@ def _request_ontology_refinements(
             if _value_fingerprint(before) != _value_fingerprint(after):
                 feature.pop("harmonization_plan", None)
                 feature.pop("harmonization_fallback", None)
+                feature = _refresh_conflict_resolution(feature)
                 changed_names.append(name)
         updated.append(feature)
 

@@ -611,9 +611,19 @@ feature level, so one invalid field can be set to null without throwing away
 valid fields from the same patient.
 
 If a patient note is too large for one prompt, Stage 2 splits it into contiguous,
-lossless pages. It extracts every page and then reconciles the page results
-under the same measurement rules. A null on one page does not overwrite a
-supported value on another page, and no page is silently dropped.
+lossless pages and prefers nearby note, paragraph, line, sentence, or word
+boundaries. Page extraction returns every supported observation with an exact
+evidence quote, verified page-relative and document-relative character offsets,
+and a locally normalized date backed by an exact source quote when one is
+explicit. It does not collapse conflicting longitudinal values within a page.
+
+Reconciliation is then local and deterministic rather than another LLM call.
+The frozen feature ontology specifies latest, earliest, maximum, minimum, mode,
+any-positive, or conservative null-on-conflict behavior. Verified dates take
+precedence for temporal rules, source order is the explicit fallback, and the
+complete observation set and selected observation ID are written to an audit
+file. A missing observation on one page cannot overwrite evidence from another,
+and no page is silently dropped.
 
 Work is checkpointed at the patient, feature-slice, page, repair, and
 reconciliation levels. An interrupted run can reuse successful calls.

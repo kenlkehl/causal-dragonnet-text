@@ -479,7 +479,26 @@ generation target or minimum. A response that reaches that ceiling enters
 Stage 2's bounded repair or fallback path.
 Extraction always sends exactly one patient's text per request and never sends
 more than the configured feature batch; oversized notes are split into lossless
-contiguous pages. Clinical
+contiguous pages, preferring nearby note, paragraph, line, sentence, or word
+boundaries when they fit. Page extraction returns every supported observation
+rather than prematurely collapsing a longitudinal record. Each observation
+must include one scalar value, an exact evidence quote, verified page-relative
+and document-relative character offsets, and an ISO-8601 measurement/specimen/
+encounter date plus its exact source quote when such a governing date is
+explicit. Unverifiable quotes are rejected while independently valid
+observations are retained.
+
+Cross-page reconciliation is local and deterministic; it does not make another
+LLM request. Each frozen ontology carries a conflict strategy (`latest`,
+`earliest`, `maximum`, `minimum`, `mode`, `any_positive`, or
+`single_or_null`). Verified dates take precedence for temporal strategies and
+absolute source order is the documented fallback. Stage 2 writes every
+observation, the selected observation ID, policy, and selection basis to the
+patient's `reconciliation/decisions.json`. Historical feature definitions
+without the structured field receive an explicit, audited compatibility rule
+derived from their measurement definition.
+
+Clinical
 text remains Unicode instead of expanding into token-heavy ASCII escape
 sequences. Independent outer folds execute concurrently. `stage2.workers`
 controls combined primary-model concurrency, including consolidation and
