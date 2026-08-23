@@ -824,6 +824,58 @@ def test_model_identity_resume_allows_endpoint_change_but_rejects_model_change(
         changed._check_and_record_model_identity(tmp_path)
 
 
+def test_model_identity_resume_allows_extractor_change_before_extraction(
+    tmp_path: Path,
+):
+    completion = lambda _messages, _config: "{}"
+
+    def runner(extraction_model):
+        return PlainHandoffStage2(
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="same-primary",
+                extraction_llm=Stage2ExtractionLLMConfig(
+                    endpoint="http://extract.test/v1",
+                    model=extraction_model,
+                ),
+            ),
+            clinical_question="Identify confounders.",
+            completion=completion,
+        )
+
+    runner("extractor-a")._check_and_record_model_identity(tmp_path)
+    runner("extractor-b")._check_and_record_model_identity(tmp_path)
+
+    identity = json.loads((tmp_path / "model_identity.json").read_text(encoding="utf-8"))
+    assert identity["extraction"]["selected_model"] == "extractor-b"
+
+
+def test_model_identity_resume_rejects_extractor_change_with_extraction_checkpoints(
+    tmp_path: Path,
+):
+    completion = lambda _messages, _config: "{}"
+
+    def runner(extraction_model):
+        return PlainHandoffStage2(
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="same-primary",
+                extraction_llm=Stage2ExtractionLLMConfig(
+                    endpoint="http://extract.test/v1",
+                    model=extraction_model,
+                ),
+            ),
+            clinical_question="Identify confounders.",
+            completion=completion,
+        )
+
+    runner("extractor-a")._check_and_record_model_identity(tmp_path)
+    (tmp_path / "outer_001" / "ontology_supervision").mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="extraction-dependent checkpoints remain"):
+        runner("extractor-b")._check_and_record_model_identity(tmp_path)
+
+
 def test_model_identity_detects_changed_backing_root_behind_same_served_alias(
     tmp_path: Path,
     monkeypatch,
@@ -7386,6 +7438,83 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path, monkeypatch):
             config=config,
             completion=_fake_completion(calls),
         )
+
+
+def test_feature_definitions_resume_without_llm_calls_after_extractor_change(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _install_test_candidate_scorer(monkeypatch)
+    handoff = tmp_path / "handoff.jsonl"
+    handoff.write_text(
+        json.dumps(
+            {
+                "source": "tfidf",
+                "outer_fold": 1,
+                "inner_fold": None,
+                "scope": "full_outer_train",
+                "evidence": {
+                    "architecture": "tfidf_topic_contrast",
+                    "evidence_id": "treatment-ecog",
+                    "objective": "treatment",
+                    "terms": ["ECOG", "poor performance status"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "stage2"
+    calls = []
+
+    def config(extraction_model):
+        return PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="same-primary",
+            max_prompt_chars=8_000,
+            workers=2,
+            required_architectures=(),
+            extraction_llm=Stage2ExtractionLLMConfig(
+                endpoint="http://extract.test/v1",
+                model=extraction_model,
+                workers=1,
+            ),
+        )
+
+    run_plain_handoff_stage2(
+        handoff_path=handoff,
+        output_dir=output,
+        clinical_question="Identify confounders.",
+        config=config("extractor-a"),
+        completion=_fake_completion(calls),
+    )
+    first_call_count = len(calls)
+    first_completion = json.loads(
+        (output / "outer_001" / "definitions_complete.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    run_plain_handoff_stage2(
+        handoff_path=handoff,
+        output_dir=output,
+        clinical_question="Identify confounders.",
+        config=config("extractor-b"),
+        completion=_fake_completion(calls),
+    )
+
+    second_completion = json.loads(
+        (output / "outer_001" / "definitions_complete.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    identity = json.loads((output / "model_identity.json").read_text(encoding="utf-8"))
+    assert len(calls) == first_call_count
+    assert (
+        second_completion["evidence_input_fingerprint"]
+        == first_completion["evidence_input_fingerprint"]
+    )
+    assert identity["extraction"]["selected_model"] == "extractor-b"
 
 
 def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(

@@ -89,6 +89,9 @@ DEFAULT_SELECTION_WORKERS = 4
 DEFAULT_EXTRACTION_VLLM_BASE_PORT = 8110
 DEFAULT_EXTRACTION_VLLM_INTERNAL_PORT_BASE = 40_000
 MODEL_IDENTITY_SCHEMA_VERSION = "stage2_endpoint_model_identity_v1"
+FEATURE_DEFINITION_INPUT_SCHEMA_VERSION = (
+    "stage2_feature_definition_inputs_v2_primary_model_only"
+)
 # Kept only so historical, non-exported candidate-funnel helpers remain
 # importable while old checkpoints can be inspected. The Stage 2 execution
 # path never calls them.
@@ -1538,6 +1541,55 @@ def _model_identities_compatible(
     return True
 
 
+def _model_role_identity_compatible(
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any],
+    *,
+    role: str,
+) -> bool:
+    """Compare one persisted model role without coupling independent roles."""
+
+    return _model_identities_compatible(
+        {"primary": previous.get(role), "extraction": None},
+        {"primary": current.get(role), "extraction": None},
+    )
+
+
+def _has_extraction_dependent_checkpoints(output_dir: Path) -> bool:
+    """Return whether saved science depends on the configured extractor model."""
+
+    output_dir = Path(output_dir)
+    root_outputs = (
+        "causal_estimate.json",
+        "cross_fitted_predictions.csv",
+        "posthoc_oracle_ite_metrics.json",
+        "posthoc_predictions_with_oracle_ite.csv",
+    )
+    if any((output_dir / name).exists() for name in root_outputs):
+        return True
+    extraction_science_names = (
+        "ontology_supervision",
+        "review",
+        "selection",
+        "estimation",
+        "final_definitions.json",
+    )
+    for outer_dir in output_dir.glob("outer_*"):
+        if not outer_dir.is_dir():
+            continue
+        if any((outer_dir / name).exists() for name in extraction_science_names):
+            return True
+        complete_path = outer_dir / "complete.json"
+        if complete_path.is_file():
+            try:
+                completion = json.loads(complete_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return True
+            if completion.get("phase") == "causal_estimation":
+                return True
+    return False
+
+
 _DROP_KEYS = {
     "artifacts",
     "artifact_inventory",
@@ -1966,6 +2018,48 @@ def _stage2_request_policy(
         "reasoning_effort": reasoning_effort,
         "max_tokens": int(config.max_tokens),
         "repetition_penalty": float(config.repetition_penalty),
+    }
+
+
+def _feature_definition_input_value(
+    *,
+    config: PlainHandoffStage2Config,
+    clinical_question: str,
+    outer_fold: int,
+    discovery_packets: Sequence[Mapping[str, Any]],
+    seed: int,
+) -> dict[str, Any]:
+    """Fingerprint only inputs that can affect discovery and operationalization."""
+
+    return {
+        "feature_definition_input_schema": FEATURE_DEFINITION_INPUT_SCHEMA_VERSION,
+        "outer_fold": int(outer_fold),
+        "compiler": config.evidence_compiler,
+        "candidate_discovery_source": "all_semantic_evidence_cards",
+        "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
+        "primary_llm": {
+            "model": config.model,
+        },
+        "interpretation_request_policy": _stage2_request_policy(
+            config,
+            "interpretation",
+        ),
+        "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
+        "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
+        "consolidation_batch_size": int(config.consolidation_batch_size),
+        "consolidation_alphabetical_rounds": int(config.consolidation_alphabetical_rounds),
+        "consolidation_max_rounds": int(config.consolidation_max_rounds),
+        "consolidation_seed": int(seed),
+        "extraction_ontology_feedback_schema": EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION,
+        "ontology_refinement_min_failure_patients": int(
+            config.ontology_refinement_min_failure_patients
+        ),
+        "max_ontology_refinement_rounds": int(config.max_ontology_refinement_rounds),
+        "clinical_question": str(clinical_question),
+        "explicit_features": [
+            feature.as_definition() for feature in config.explicit_features
+        ],
+        "discovery_packets": list(discovery_packets),
     }
 
 
@@ -5680,15 +5774,36 @@ class PlainHandoffStage2:
                         else None
                     ),
                 }
-        if previous_scientific is not None and not _model_identities_compatible(
-            previous_scientific,
-            current_scientific,
-        ):
-            raise RuntimeError(
-                "Stage 2 cannot resume because the actual running model identity changed. "
-                f"Previous={previous_scientific}; current={current_scientific}. Preserve "
-                "the existing output for audit and use a fresh Stage 2 output directory."
-            )
+        if previous_scientific is not None:
+            if not _model_role_identity_compatible(
+                previous_scientific,
+                current_scientific,
+                role="primary",
+            ):
+                raise RuntimeError(
+                    "Stage 2 cannot resume because the actual running model identity "
+                    "changed for the primary role. "
+                    f"Previous={previous_scientific}; current={current_scientific}. "
+                    "Preserve the existing output for audit and use a fresh Stage 2 "
+                    "output directory."
+                )
+            if not _model_role_identity_compatible(
+                previous_scientific,
+                current_scientific,
+                role="extraction",
+            ):
+                if _has_extraction_dependent_checkpoints(output_dir):
+                    raise RuntimeError(
+                        "Stage 2 cannot resume because the actual running model identity "
+                        "changed for the extraction role while extraction-dependent checkpoints "
+                        "remain. Remove the outer-fold extraction-and-later artifacts "
+                        "before resuming with a new extractor. "
+                        f"Previous={previous_scientific}; current={current_scientific}."
+                    )
+                LOGGER.info(
+                    "Stage 2 extraction model changed before any extraction-dependent "
+                    "checkpoint; preserving completed interpretation and feature definitions"
+                )
         _write_json(
             identity_path,
             {
@@ -6853,51 +6968,14 @@ class PlainHandoffStage2:
         final_features_path = output_dir / "final_definitions.json"
         definitions_complete_path = output_dir / "definitions_complete.json"
         interpreted_candidates_path = output_dir / "interpreted_candidates.json"
-        definition_inputs = {
-            "outer_fold": int(outer_fold),
-            "compiler": self.config.evidence_compiler,
-            "candidate_discovery_source": "all_semantic_evidence_cards",
-            "interpretation_schema": INTERPRETATION_SCHEMA_VERSION,
-            "primary_llm": {
-                "model": self.config.model,
-            },
-            "extraction_llm": (
-                {
-                    "model": self.config.extraction_llm.model,
-                }
-                if self.config.extraction_llm is not None
-                else None
-            ),
-            "interpretation_request_policy": _stage2_request_policy(
-                self.config,
-                "interpretation",
-            ),
-            "extraction_request_policy": _stage2_request_policy(
-                self.config,
-                "extraction",
-            ),
-            "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
-            "consolidation_batch_size": int(self.config.consolidation_batch_size),
-            "consolidation_alphabetical_rounds": int(self.config.consolidation_alphabetical_rounds),
-            "consolidation_max_rounds": int(self.config.consolidation_max_rounds),
-            "consolidation_seed": int(seed),
-            "extraction_ontology_feedback_schema": (EXTRACTION_ONTOLOGY_FEEDBACK_SCHEMA_VERSION),
-            "ontology_refinement_min_failure_patients": int(
-                self.config.ontology_refinement_min_failure_patients
-            ),
-            "max_ontology_refinement_rounds": int(self.config.max_ontology_refinement_rounds),
-            "clinical_question": self.clinical_question,
-            "explicit_features": [
-                feature.as_definition() for feature in self.config.explicit_features
-            ],
-            "discovery_packets": discovery_packets,
-        }
-        evidence_input_fingerprint = _value_fingerprint(
-            {
-                **definition_inputs,
-                "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
-            }
+        definition_inputs = _feature_definition_input_value(
+            config=self.config,
+            clinical_question=self.clinical_question,
+            outer_fold=outer_fold,
+            discovery_packets=discovery_packets,
+            seed=seed,
         )
+        evidence_input_fingerprint = _value_fingerprint(definition_inputs)
         definitions_state = (
             json.loads(definitions_complete_path.read_text(encoding="utf-8"))
             if definitions_complete_path.is_file()
@@ -7109,6 +7187,9 @@ class PlainHandoffStage2:
                     "status": "complete",
                     "completed_at": _now(),
                     "evidence_input_fingerprint": evidence_input_fingerprint,
+                    "feature_definition_input_schema": (
+                        FEATURE_DEFINITION_INPUT_SCHEMA_VERSION
+                    ),
                     "consolidation_schema": CONSOLIDATION_SCHEMA_VERSION,
                     "global_candidate_pool_schema": GLOBAL_CANDIDATE_POOL_SCHEMA_VERSION,
                     "candidate_selection": "none_exhaustive_discovery",

@@ -997,8 +997,11 @@ their configured roles.
 Statistical selection writes its own input fingerprint and completion marker,
 so an interrupted run resumes it independently. Endpoint URLs are transport
 details and may change between resumes. The root `model_identity.json` records
-the model IDs advertised at startup, and a change to either selected model ID
-raises an error before existing checkpoints are reused.
+the model IDs advertised at startup. A primary-model change raises an error
+before interpretation checkpoints are reused. The extractor model may change
+after extraction-and-later outer-fold artifacts are removed; completed
+interpretation, consolidation, and operationalized feature definitions remain
+reusable because their fingerprints do not depend on the extractor identity.
 
 Each patient extraction also records feature-attributable validation failures.
 After the training patients finish, Stage 2 aggregates repeated failures across

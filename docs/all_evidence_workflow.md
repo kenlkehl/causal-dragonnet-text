@@ -797,8 +797,11 @@ without evidence or statistical support.
 Both screens run as deterministic inner-fold/feature chunks on joblib's `loky`
 backend and are checkpointed under `selection/`. Changing only endpoint URLs
 does not invalidate completed scientific checkpoints. `model_identity.json`
-records the model IDs actually advertised at startup; changing either selected
-model ID on a resume raises an error before any checkpoint is reused.
+records the model IDs actually advertised at startup. Changing the primary
+model raises an error before interpretation checkpoints are reused. The
+extraction model may change after extraction-and-later outer-fold artifacts are
+removed; completed interpretation, consolidation, and feature-definition
+checkpoints do not depend on the extractor identity and are retained.
 
 Continuous definitions accept either a numeric scalar or a documented
 categorical/threshold scalar when no exact number is reported. The extraction
