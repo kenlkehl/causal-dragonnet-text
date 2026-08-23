@@ -1930,9 +1930,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated logical GPUs assigned across managed vLLM servers",
     )
     parser.add_argument(
+        "--stage2-vllm-gpus-per-server",
+        type=int,
+        help=(
+            "logical GPUs assigned to each managed primary-model server; derives "
+            "the replica count when --stage2-vllm-servers is omitted"
+        ),
+    )
+    parser.add_argument(
         "--stage2-vllm-base-port",
         type=int,
         help="first port for pipeline-owned vLLM servers (default: 8010)",
+    )
+    parser.add_argument(
+        "--stage2-vllm-internal-port-base",
+        type=int,
+        help="first internal vLLM rendezvous-port range (default: 20000)",
     )
     parser.add_argument(
         "--stage2-vllm-download-dir",
@@ -1960,6 +1973,61 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "one additional vLLM CLI token; repeat for flags and values, "
             "using --stage2-vllm-extra-arg=--flag for tokens beginning with --"
+        ),
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-servers",
+        type=int,
+        help="launch this many pipeline-owned extraction-model vLLM servers",
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-gpus",
+        help="comma-separated logical GPUs assigned to extraction-model servers",
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-gpus-per-server",
+        type=int,
+        help=(
+            "logical GPUs assigned to each managed extraction-model server; derives "
+            "the replica count when its server count is omitted"
+        ),
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-base-port",
+        type=int,
+        help="first port for pipeline-owned extraction servers (default: 8110)",
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-internal-port-base",
+        type=int,
+        help="first internal extraction-vLLM rendezvous range (default: 40000)",
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-download-dir",
+        help="Hugging Face model download/cache directory for extraction vLLM",
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-reasoning-parser",
+        help="extraction vLLM reasoning parser; family-specific when omitted",
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-language-model-only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="enable or disable extraction vLLM's language-model-only mode",
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-default-chat-template-kwargs",
+        help="JSON object passed to extraction vLLM --default-chat-template-kwargs",
+    )
+    parser.add_argument(
+        "--stage2-extraction-vllm-extra-arg",
+        action="append",
+        default=None,
+        metavar="TOKEN",
+        help=(
+            "one additional extraction-vLLM CLI token; repeat for flags and values, "
+            "using --stage2-extraction-vllm-extra-arg=--flag for tokens beginning with --"
         ),
     )
     parser.add_argument(
@@ -2103,7 +2171,9 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
     managed_vllm_overrides = {
         "server_count": args.stage2_vllm_servers,
         "gpus": args.stage2_vllm_gpus,
+        "gpus_per_server": args.stage2_vllm_gpus_per_server,
         "base_port": args.stage2_vllm_base_port,
+        "internal_port_base": args.stage2_vllm_internal_port_base,
         "download_dir": args.stage2_vllm_download_dir,
         "reasoning_parser": args.stage2_vllm_reasoning_parser,
         "language_model_only": args.stage2_vllm_language_model_only,
@@ -2137,6 +2207,54 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
         for key, value in managed_vllm_overrides.items():
             if value is not None:
                 vllm[key] = value
+    extraction_vllm_overrides = {
+        "server_count": args.stage2_extraction_vllm_servers,
+        "gpus": args.stage2_extraction_vllm_gpus,
+        "gpus_per_server": args.stage2_extraction_vllm_gpus_per_server,
+        "base_port": args.stage2_extraction_vllm_base_port,
+        "internal_port_base": args.stage2_extraction_vllm_internal_port_base,
+        "download_dir": args.stage2_extraction_vllm_download_dir,
+        "reasoning_parser": args.stage2_extraction_vllm_reasoning_parser,
+        "language_model_only": args.stage2_extraction_vllm_language_model_only,
+        "extra_args": args.stage2_extraction_vllm_extra_arg,
+    }
+    if args.stage2_extraction_vllm_default_chat_template_kwargs is not None:
+        try:
+            extraction_default_chat_template_kwargs = json.loads(
+                args.stage2_extraction_vllm_default_chat_template_kwargs
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "--stage2-extraction-vllm-default-chat-template-kwargs must be valid JSON"
+            ) from exc
+        if not isinstance(extraction_default_chat_template_kwargs, Mapping):
+            raise ValueError(
+                "--stage2-extraction-vllm-default-chat-template-kwargs must contain "
+                "one JSON object"
+            )
+        extraction_vllm_overrides["default_chat_template_kwargs"] = (
+            extraction_default_chat_template_kwargs
+        )
+    if any(value is not None for value in extraction_vllm_overrides.values()):
+        extraction_value = stage2.get("extraction_llm")
+        if extraction_value is None:
+            extraction_llm = {}
+            stage2["extraction_llm"] = extraction_llm
+        elif isinstance(extraction_value, MutableMapping):
+            extraction_llm = extraction_value
+        else:
+            raise ValueError("stage2.extraction_llm must be a configuration object")
+        extraction_vllm_value = extraction_llm.get("vllm")
+        if extraction_vllm_value is None:
+            extraction_vllm: MutableMapping[str, Any] = {}
+            extraction_llm["vllm"] = extraction_vllm
+        elif isinstance(extraction_vllm_value, MutableMapping):
+            extraction_vllm = extraction_vllm_value
+        else:
+            raise ValueError("stage2.extraction_llm.vllm must be a configuration object")
+        for key, value in extraction_vllm_overrides.items():
+            if value is not None:
+                extraction_vllm[key] = value
     stage2_numeric_overrides = {
         "max_tokens": args.stage2_max_tokens,
         "selection_workers": args.stage2_selection_workers,

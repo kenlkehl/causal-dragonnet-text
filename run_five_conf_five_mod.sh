@@ -8,6 +8,11 @@
 #   GPU_COUNT=2 ./run_five_conf_five_mod.sh
 #   PHYSICAL_GPUS=1,3 STAGE2_ENDPOINT=http://127.0.0.1:8010/v1 ./run_five_conf_five_mod.sh
 #   GPU_COUNT=8 STAGE2_VLLM_SERVERS=8 STAGE2_MODEL=google/gemma-4-31B-it ./run_five_conf_five_mod.sh
+#   PHYSICAL_GPUS=0,1,2 STAGE2_ENDPOINT= STAGE2_MODEL=Qwen/Qwen3.8-27B \
+#     STAGE2_VLLM_GPUS=0,1 STAGE2_VLLM_GPUS_PER_SERVER=2 \
+#     STAGE2_EXTRACTION_MODEL=LiquidAI/LFM2.5-2.6B \
+#     STAGE2_EXTRACTION_VLLM_GPUS=2 STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER=1 \
+#     ./run_five_conf_five_mod.sh
 #   STAGE1_ARCHITECTURES=bow_nuisance,tfidf_topics ./run_five_conf_five_mod.sh
 #   STAGE2_CONSOLIDATION_MAX_ROUNDS=12 ./run_five_conf_five_mod.sh
 #   ./run_five_conf_five_mod.sh /persistent/results/my_run

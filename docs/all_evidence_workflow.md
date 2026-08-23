@@ -247,34 +247,40 @@ visibly rather than silently dropping or redefining it.
 OpenAI-compatible `/models` endpoint once at startup and uses the result when
 exactly one model ID is advertised. If the server advertises multiple model
 IDs, set `stage2.model` explicitly to avoid an ambiguous selection.
-The same rule applies independently to `stage2.extraction_llm.model`. The
-extraction model configuration must be supplied for dataset-backed Stage 2,
-but its endpoint may be the same as the primary endpoint; its API key may be
-set in the nested config or `OCI_STAGE2_EXTRACTION_API_KEY`.
+The same rule applies independently to an external
+`stage2.extraction_llm.model`. Pipeline-managed pools require an explicit model
+because the pipeline must launch it. The extraction model configuration must be
+supplied for dataset-backed Stage 2, but its external endpoint may be the same
+as the primary endpoint; its API key may be set in the nested config or
+`OCI_STAGE2_EXTRACTION_API_KEY`.
 
 ### Pipeline-managed vLLM replicas
 
-`stage2.vllm` tells the same pipeline process to own the local vLLM server
-lifecycle. In this mode `stage2.model` is required and `stage2.endpoint` must be
-empty or omitted, and the workflow environment must include the `local-llm`
-optional dependency group. For example:
+`stage2.vllm` tells the pipeline to own the orchestrator vLLM lifecycle, while
+`stage2.extraction_llm.vllm` independently does the same for the extractor. A
+managed role requires its model and must omit its corresponding endpoint. The
+workflow environment must include the `local-llm` optional dependency group.
+For example:
 
 ```json
 {
   "stage2": {
-    "model": "google/gemma-4-31B-it",
+    "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
     "extraction_llm": {
-      "endpoint": "http://127.0.0.1:8020/v1",
-      "model": "small-extractor",
-      "workers": 32
+      "model": "LiquidAI/LFM2.5-2.6B",
+      "workers": 64,
+      "vllm": {
+        "gpus": ["cuda:2", "cuda:3"],
+        "gpus_per_server": 1,
+        "base_port": 8110,
+        "download_dir": "/models/huggingface",
+        "extra_args": ["--gpu-memory-utilization", "0.80"]
+      }
     },
     "vllm": {
-      "server_count": 8,
-      "gpus": [
-        "cuda:0", "cuda:1", "cuda:2", "cuda:3",
-        "cuda:4", "cuda:5", "cuda:6", "cuda:7"
-      ],
+      "gpus": ["cuda:0", "cuda:1"],
+      "gpus_per_server": 2,
       "base_port": 8010,
       "download_dir": "/models/huggingface",
       "startup_timeout": 7200,
@@ -287,36 +293,41 @@ optional dependency group. For example:
 }
 ```
 
-The pipeline interprets the GPU values as logical CUDA indices. When its parent
+The pipeline interprets both GPU lists as logical CUDA indices. When its parent
 environment has `CUDA_VISIBLE_DEVICES=4,6`, for example, managed logical GPUs 0
 and 1 are mapped to physical selections 4 and 6 for the child processes. The
-list is divided into equal, nonoverlapping groups in its supplied order and the
-tensor-parallel size of each server is set to its group size. Thus eight
-servers over eight GPUs produces eight one-GPU replicas; four servers over
-eight GPUs produces four two-GPU replicas. Uneven division, duplicate devices,
-or more servers than GPUs is rejected before launch.
+list for each role is divided into equal groups in supplied order and the
+tensor-parallel size is `gpus_per_server`. The replica count is derived from
+the list length; an explicit `server_count` is optional but must agree. Uneven
+division, duplicate devices within one pool, or more servers than GPUs is
+rejected before launch. The pools are simultaneous, so overlapping the two GPU
+lists should be done only with deliberate per-process memory limits.
 
 The runner checks every requested port before launch, starts all replicas with
 separate `CUDA_VISIBLE_DEVICES` values, and waits for each `/v1/models` API to
 advertise a model. `stage2.workers` remains the total primary-model request concurrency; a
 thread-safe round-robin router spreads those requests over the ready endpoints.
 A retry advances to the next endpoint, so one transiently unhealthy replica
-does not receive every retry of the same request. Server logs and a redacted
-manifest containing commands, PIDs, endpoints, GPU assignments, and exit codes
-are stored in `stage2/vllm_servers/`. All managed process groups are terminated
-when Stage 2 succeeds, fails, or is interrupted.
-
-That managed pool serves only the primary model. The separately configured
-small extraction transport is not launched or stopped by this pool and uses
-its own worker limit.
+does not receive every retry of the same request. Extraction requests use an
+independent round-robin router and `stage2.extraction_llm.workers` ceiling.
+Server logs and redacted manifests containing commands, PIDs, endpoints, GPU
+assignments, and exit codes are stored in
+`stage2/vllm_servers/orchestrator/` and `stage2/vllm_servers/extractor/`. All
+managed process groups are terminated when Stage 2 succeeds, fails, or is
+interrupted. Either role can independently remain endpoint-backed instead.
 
 The managed vLLM fields are:
 
 - `server_count`: number of server replicas. If omitted, it defaults to one per
-  supplied GPU.
+  supplied GPU unless `gpus_per_server` is supplied.
 - `gpus`: required list or comma-separated string of logical CUDA indices.
+- `gpus_per_server`: tensor-parallel width. When supplied, the replica count is
+  derived as `len(gpus) / gpus_per_server`; an explicit `server_count` must agree.
 - `host`, `base_port`, or `ports`: bind address and either consecutive or exact
-  ports. Defaults are `127.0.0.1` and ports beginning at 8010.
+  ports. Defaults are `127.0.0.1`, orchestrator ports beginning at 8010, and
+  extractor ports beginning at 8110.
+- `internal_port_base`: start of disjoint vLLM engine rendezvous ranges. It
+  defaults to 20000 for the orchestrator and 40000 for the extractor.
 - `startup_timeout`, `startup_poll_interval`, and `shutdown_timeout`: lifecycle
   timing controls in seconds.
 - `download_dir`, `reasoning_parser`, `language_model_only`, and
@@ -431,7 +442,8 @@ still returns an invalid ontology after all bounded repairs, Stage 2 writes
 extraction and aggregate supervision rather than aborting the fold.
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
-operational controls include `request_timeout`, `transport_max_attempts`,
+operational controls include `request_timeout`, `transport_max_attempts` (10 by
+default),
 `transport_retry_backoff`, `max_response_repairs`,
 `thinking_after_response_repairs`, `max_tokens`, `max_prompt_chars`,
 `consolidation_max_prompt_chars`,
@@ -449,7 +461,7 @@ operational controls include `request_timeout`, `transport_max_attempts`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
 `temperature`, `repetition_penalty`, `interpretation_reasoning_effort`, and
 `extraction_reasoning_effort`, and `selection_workers`. The nested `extraction_llm` object controls its
-endpoint, model, API key, and workers. A configured primary endpoint or managed
+endpoint or managed `vllm` pool, model, API key, and workers. A configured primary endpoint or managed
 vLLM pool makes the default mode `full`. The modes can always be made explicit:
 
 Each candidate-consolidation batch uses the independent

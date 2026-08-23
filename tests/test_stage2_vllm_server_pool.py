@@ -113,6 +113,52 @@ def test_managed_qwen_defaults_can_be_overridden():
     assert overridden.interpretation_reasoning_effort == "low"
 
 
+def test_dual_managed_pools_derive_independent_replica_layouts():
+    config = plain_stage2_config_from_mapping(
+        {
+            "model": "Qwen/Qwen3.8-27B",
+            "workers": 12,
+            "vllm": {
+                "gpus": [0, 1, 2, 3],
+                "gpus_per_server": 2,
+            },
+            "extraction_llm": {
+                "model": "LiquidAI/LFM2.5-2.6B",
+                "workers": 40,
+                "vllm": {
+                    "gpus": [4, 5, 6],
+                    "gpus_per_server": 1,
+                },
+            },
+        },
+        default_workers=4,
+    )
+
+    assert config is not None and config.vllm is not None
+    assert config.endpoint == ""
+    assert config.vllm.server_count == 2
+    assert config.vllm.effective_gpus_per_server() == 2
+    assert config.vllm.gpu_groups() == (
+        ("cuda:0", "cuda:1"),
+        ("cuda:2", "cuda:3"),
+    )
+    assert config.vllm.effective_ports() == (8010, 8011)
+    assert config.vllm.internal_port_base == 20_000
+    assert config.extraction_llm is not None
+    assert config.extraction_llm.endpoint == ""
+    assert config.extraction_llm.workers == 40
+    assert config.extraction_llm.vllm is not None
+    assert config.extraction_llm.vllm.server_count == 3
+    assert config.extraction_llm.vllm.effective_gpus_per_server() == 1
+    assert config.extraction_llm.vllm.gpu_groups() == (
+        ("cuda:4",),
+        ("cuda:5",),
+        ("cuda:6",),
+    )
+    assert config.extraction_llm.vllm.effective_ports() == (8110, 8111, 8112)
+    assert config.extraction_llm.vllm.internal_port_base == 40_000
+
+
 @pytest.mark.parametrize(
     ("vllm", "message"),
     [
@@ -131,6 +177,10 @@ def test_managed_qwen_defaults_can_be_overridden():
         (
             {"server_count": 1, "gpus": [0], "extra_args": ["--port=9000"]},
             "cannot override",
+        ),
+        (
+            {"server_count": 2, "gpus": [0, 1, 2, 3], "gpus_per_server": 1},
+            "disagree",
         ),
     ],
 )
@@ -154,6 +204,22 @@ def test_external_endpoint_and_managed_pool_are_mutually_exclusive():
         )
 
 
+def test_extraction_endpoint_and_managed_pool_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="either stage2.extraction_llm.endpoint"):
+        plain_stage2_config_from_mapping(
+            {
+                "endpoint": "http://stage2.test/v1",
+                "model": "large-model",
+                "extraction_llm": {
+                    "endpoint": "http://extract.test/v1",
+                    "model": "small-model",
+                    "vllm": {"gpus": [0], "gpus_per_server": 1},
+                },
+            },
+            default_workers=4,
+        )
+
+
 def test_managed_vllm_cli_options_compile_into_stage2_config(tmp_path):
     args = build_parser().parse_args(
         [
@@ -168,6 +234,8 @@ def test_managed_vllm_cli_options_compile_into_stage2_config(tmp_path):
             "2",
             "--stage2-vllm-gpus",
             "cuda:0,cuda:1",
+            "--stage2-vllm-gpus-per-server",
+            "1",
             "--stage2-vllm-base-port",
             "9100",
             "--stage2-vllm-download-dir",
@@ -188,12 +256,64 @@ def test_managed_vllm_cli_options_compile_into_stage2_config(tmp_path):
     assert config.stage2 is not None and config.stage2.vllm is not None
     assert config.stage2.vllm.server_count == 2
     assert config.stage2.vllm.gpus == ("cuda:0", "cuda:1")
+    assert config.stage2.vllm.gpus_per_server == 1
     assert config.stage2.vllm.effective_ports() == (9100, 9101)
     assert config.stage2.vllm.download_dir == "/models/cache"
     assert config.stage2.vllm.reasoning_parser == "custom-qwen"
     assert config.stage2.vllm.language_model_only is False
     assert config.stage2.vllm.default_chat_template_kwargs == {"enable_thinking": True}
     assert config.stage2.vllm.extra_args == ("--max-model-len", "65536")
+
+
+def test_managed_extraction_vllm_cli_options_compile_into_nested_config(tmp_path):
+    args = build_parser().parse_args(
+        [
+            "--dataset",
+            str(tmp_path / "cohort.parquet"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--stage2-only",
+            "--stage2-endpoint",
+            "http://review.test/v1",
+            "--stage2-model",
+            "large-reviewer",
+            "--stage2-extraction-model",
+            "LiquidAI/LFM2.5-2.6B",
+            "--stage2-extraction-workers",
+            "48",
+            "--stage2-extraction-vllm-gpus",
+            "cuda:4,cuda:5,cuda:6,cuda:7",
+            "--stage2-extraction-vllm-gpus-per-server",
+            "2",
+            "--stage2-extraction-vllm-base-port",
+            "9200",
+            "--stage2-extraction-vllm-internal-port-base",
+            "45000",
+            "--stage2-extraction-vllm-download-dir",
+            "/extractor/cache",
+            "--stage2-extraction-vllm-extra-arg=--gpu-memory-utilization",
+            "--stage2-extraction-vllm-extra-arg=0.75",
+        ]
+    )
+    raw, config_dir = _raw_config_from_args(args)
+    config = compile_config(raw, config_dir=config_dir)
+
+    assert config.stage2 is not None
+    extraction = config.stage2.extraction_llm
+    assert extraction is not None and extraction.vllm is not None
+    assert extraction.endpoint == ""
+    assert extraction.model == "LiquidAI/LFM2.5-2.6B"
+    assert extraction.workers == 48
+    assert extraction.vllm.server_count == 2
+    assert extraction.vllm.gpus_per_server == 2
+    assert extraction.vllm.gpu_groups() == (
+        ("cuda:4", "cuda:5"),
+        ("cuda:6", "cuda:7"),
+    )
+    assert extraction.vllm.effective_ports() == (9200, 9201)
+    assert extraction.vllm.internal_port_base == 45_000
+    assert extraction.vllm.download_dir == "/extractor/cache"
+    assert extraction.vllm.extra_args == ("--gpu-memory-utilization", "0.75")
 
 
 def test_visible_gpu_mapping_respects_parent_cuda_remapping():
@@ -324,7 +444,7 @@ def test_run_wrapper_keeps_managed_servers_alive_for_stage2_and_cleans_up(
     @contextmanager
     def fake_launch(**kwargs):
         lifecycle.append("started")
-        assert kwargs["output_dir"] == tmp_path / "stage2" / "vllm_servers"
+        assert kwargs["output_dir"] == tmp_path / "stage2" / "vllm_servers" / "orchestrator"
         try:
             yield ("http://127.0.0.1:8010/v1", "http://127.0.0.1:8011/v1")
         finally:
@@ -355,6 +475,112 @@ def test_run_wrapper_keeps_managed_servers_alive_for_stage2_and_cleans_up(
     assert captured["config"].runtime_endpoints == (
         "http://127.0.0.1:8010/v1",
         "http://127.0.0.1:8011/v1",
+    )
+
+
+def test_run_wrapper_manages_and_round_robins_independent_model_pools(
+    tmp_path,
+    monkeypatch,
+):
+    config = plain_stage2_config_from_mapping(
+        {
+            "model": "large-reviewer",
+            "vllm": {"gpus": [0, 1], "gpus_per_server": 1},
+            "extraction_llm": {
+                "model": "small-extractor",
+                "workers": 8,
+                "vllm": {"gpus": [2, 3, 4], "gpus_per_server": 1},
+            },
+        },
+        default_workers=4,
+    )
+    assert config is not None
+    lifecycle: list[str] = []
+    calls: list[tuple[str, str]] = []
+    captured = {}
+
+    @contextmanager
+    def fake_launch(**kwargs):
+        role = kwargs["output_dir"].name
+        lifecycle.append(f"start-{role}")
+        if role == "orchestrator":
+            assert kwargs["model"] == "large-reviewer"
+            endpoints = (
+                "http://127.0.0.1:8010/v1",
+                "http://127.0.0.1:8011/v1",
+            )
+        else:
+            assert role == "extractor"
+            assert kwargs["model"] == "small-extractor"
+            assert kwargs["config"].internal_port_base == 40_000
+            endpoints = (
+                "http://127.0.0.1:8110/v1",
+                "http://127.0.0.1:8111/v1",
+                "http://127.0.0.1:8112/v1",
+            )
+        try:
+            yield endpoints
+        finally:
+            lifecycle.append(f"stop-{role}")
+
+    def fake_completion(_messages, request_config):
+        calls.append((request_config.model, request_config.endpoint))
+        return "{}"
+
+    def fake_run(self, **_kwargs):
+        lifecycle.append("stage2")
+        captured["config"] = self.config
+        assert self.extraction_completion is not None
+        assert self.extraction_request_config is not None
+        for _ in range(4):
+            self.completion([], self.config)
+        for _ in range(5):
+            self.extraction_completion([], self.extraction_request_config)
+        return {"ok": True}
+
+    monkeypatch.setattr(stage2_workflow, "launch_managed_vllm_servers", fake_launch)
+    monkeypatch.setattr(stage2_workflow, "_openai_completion", fake_completion)
+    monkeypatch.setattr(PlainHandoffStage2, "run", fake_run)
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda request_config: [request_config.model],
+    )
+
+    result = run_plain_handoff_stage2(
+        handoff_path=tmp_path / "handoff.jsonl",
+        output_dir=tmp_path / "stage2",
+        clinical_question="test",
+        config=config,
+    )
+
+    assert result == {"ok": True}
+    assert lifecycle == [
+        "start-orchestrator",
+        "start-extractor",
+        "stage2",
+        "stop-extractor",
+        "stop-orchestrator",
+    ]
+    assert calls[:4] == [
+        ("large-reviewer", "http://127.0.0.1:8010/v1"),
+        ("large-reviewer", "http://127.0.0.1:8011/v1"),
+        ("large-reviewer", "http://127.0.0.1:8010/v1"),
+        ("large-reviewer", "http://127.0.0.1:8011/v1"),
+    ]
+    assert calls[4:] == [
+        ("small-extractor", "http://127.0.0.1:8110/v1"),
+        ("small-extractor", "http://127.0.0.1:8111/v1"),
+        ("small-extractor", "http://127.0.0.1:8112/v1"),
+        ("small-extractor", "http://127.0.0.1:8110/v1"),
+        ("small-extractor", "http://127.0.0.1:8111/v1"),
+    ]
+    runtime_extraction = captured["config"].extraction_llm
+    assert runtime_extraction is not None
+    assert runtime_extraction.runtime_endpoints == (
+        "http://127.0.0.1:8110/v1",
+        "http://127.0.0.1:8111/v1",
+        "http://127.0.0.1:8112/v1",
     )
 
 

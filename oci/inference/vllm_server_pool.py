@@ -83,11 +83,17 @@ def _model_family_defaults(model: str) -> tuple[str, bool | None, Mapping[str, A
     return "", None, None
 
 
-def _vllm_internal_port_bases(server_count: int) -> tuple[int, ...]:
+def _vllm_internal_port_bases(
+    server_count: int,
+    *,
+    internal_port_base: int = _VLLM_INTERNAL_PORT_BASE,
+) -> tuple[int, ...]:
     bases = tuple(
-        _VLLM_INTERNAL_PORT_BASE + index * _VLLM_INTERNAL_PORT_STRIDE
+        int(internal_port_base) + index * _VLLM_INTERNAL_PORT_STRIDE
         for index in range(int(server_count))
     )
+    if bases and bases[0] < 1:
+        raise ValueError("stage2.vllm.internal_port_base must be between 1 and 65535")
     if bases and bases[-1] + _VLLM_INTERNAL_PORT_STRIDE - 1 > 65_535:
         raise ValueError(
             "stage2.vllm.server_count is too large to allocate disjoint internal "
@@ -102,9 +108,15 @@ class ManagedVLLMConfig:
 
     server_count: int
     gpus: tuple[str, ...]
+    # When supplied, this is an explicit tensor-parallel width and must agree
+    # with server_count. The mapping parser can derive server_count from it.
+    gpus_per_server: int | None = None
     host: str = "127.0.0.1"
     base_port: int = 8010
     ports: tuple[int, ...] = ()
+    # Distinct pools must use distinct ranges because vLLM engine subprocesses
+    # bind rendezvous ports independently of their public HTTP ports.
+    internal_port_base: int = _VLLM_INTERNAL_PORT_BASE
     startup_timeout: float = 7_200.0
     startup_poll_interval: float = 2.0
     shutdown_timeout: float = 30.0
@@ -129,6 +141,19 @@ class ManagedVLLMConfig:
             raise ValueError(
                 "stage2.vllm.gpus must divide evenly across stage2.vllm.server_count"
             )
+        effective_gpus_per_server = len(self.gpus) // self.server_count
+        if self.gpus_per_server is not None:
+            if (
+                isinstance(self.gpus_per_server, bool)
+                or not isinstance(self.gpus_per_server, int)
+                or self.gpus_per_server < 1
+            ):
+                raise ValueError("stage2.vllm.gpus_per_server must be a positive integer")
+            if self.gpus_per_server != effective_gpus_per_server:
+                raise ValueError(
+                    "stage2.vllm.gpus_per_server must agree with the supplied GPU list "
+                    "and stage2.vllm.server_count"
+                )
         if not str(self.host).strip():
             raise ValueError("stage2.vllm.host must be nonempty")
         effective_ports = self.effective_ports()
@@ -136,6 +161,10 @@ class ManagedVLLMConfig:
             raise ValueError("stage2.vllm ports must be unique")
         if any(port < 1 or port > 65_535 for port in effective_ports):
             raise ValueError("stage2.vllm ports must be between 1 and 65535")
+        _vllm_internal_port_bases(
+            self.server_count,
+            internal_port_base=self.internal_port_base,
+        )
         if self.startup_timeout <= 0:
             raise ValueError("stage2.vllm.startup_timeout must be positive")
         if self.startup_poll_interval <= 0:
@@ -170,11 +199,14 @@ class ManagedVLLMConfig:
 
     def gpu_groups(self) -> tuple[tuple[str, ...], ...]:
         self.validate()
-        per_server = len(self.gpus) // self.server_count
+        per_server = self.effective_gpus_per_server()
         return tuple(
             tuple(self.gpus[start : start + per_server])
             for start in range(0, len(self.gpus), per_server)
         )
+
+    def effective_gpus_per_server(self) -> int:
+        return len(self.gpus) // self.server_count
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -184,6 +216,8 @@ def managed_vllm_config_from_mapping(
     raw: Any,
     *,
     model: str,
+    default_base_port: int = 8010,
+    default_internal_port_base: int = _VLLM_INTERNAL_PORT_BASE,
 ) -> ManagedVLLMConfig | None:
     if raw is None:
         return None
@@ -203,7 +237,27 @@ def managed_vllm_config_from_mapping(
     gpus = tuple(_normalized_gpu(value) for value in raw_gpus)
 
     raw_server_count = raw.get("server_count", raw.get("servers"))
-    server_count = len(gpus) if raw_server_count is None else int(raw_server_count)
+    raw_gpus_per_server = raw.get("gpus_per_server")
+    gpus_per_server = (
+        None if raw_gpus_per_server is None else int(raw_gpus_per_server)
+    )
+    if gpus_per_server is not None:
+        if gpus_per_server < 1:
+            raise ValueError("stage2.vllm.gpus_per_server must be a positive integer")
+        if len(gpus) % gpus_per_server:
+            raise ValueError(
+                "stage2.vllm.gpus must divide evenly across "
+                "stage2.vllm.gpus_per_server"
+            )
+        derived_server_count = len(gpus) // gpus_per_server
+        if raw_server_count is not None and int(raw_server_count) != derived_server_count:
+            raise ValueError(
+                "stage2.vllm.server_count and stage2.vllm.gpus_per_server disagree "
+                "for the supplied GPU list"
+            )
+        server_count = derived_server_count
+    else:
+        server_count = len(gpus) if raw_server_count is None else int(raw_server_count)
 
     raw_ports = raw.get("ports", ())
     if isinstance(raw_ports, str):
@@ -241,9 +295,13 @@ def managed_vllm_config_from_mapping(
     config = ManagedVLLMConfig(
         server_count=server_count,
         gpus=gpus,
+        gpus_per_server=gpus_per_server,
         host=str(raw.get("host", "127.0.0.1")).strip(),
-        base_port=int(raw.get("base_port", 8010)),
+        base_port=int(raw.get("base_port", default_base_port)),
         ports=tuple(int(port) for port in raw_ports),
+        internal_port_base=int(
+            raw.get("internal_port_base", default_internal_port_base)
+        ),
         startup_timeout=float(raw.get("startup_timeout", 7_200.0)),
         startup_poll_interval=float(raw.get("startup_poll_interval", 2.0)),
         shutdown_timeout=float(raw.get("shutdown_timeout", 30.0)),
@@ -424,7 +482,7 @@ class ManagedVLLMServerPool:
     ) -> None:
         config.validate()
         if not str(model).strip():
-            raise ValueError("stage2.model is required for pipeline-managed vLLM servers")
+            raise ValueError("a model is required for pipeline-managed vLLM servers")
         self.config = config
         self.model = str(model).strip()
         self.api_key = str(api_key)
@@ -479,7 +537,10 @@ class ManagedVLLMServerPool:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         ports = self.config.effective_ports()
         gpu_groups = self.config.gpu_groups()
-        internal_port_bases = _vllm_internal_port_bases(self.config.server_count)
+        internal_port_bases = _vllm_internal_port_bases(
+            self.config.server_count,
+            internal_port_base=self.config.internal_port_base,
+        )
         parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         for port in ports:
             _assert_port_available(self.config.host, port)

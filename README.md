@@ -716,27 +716,32 @@ one-model rule when omitted.
 
 ### Pipeline-managed vLLM server pools
 
-To let the pipeline start and stop vLLM itself, omit `stage2.endpoint`, provide
-`stage2.model`, and add `stage2.vllm`. This example launches eight independent
-model replicas, one on each of eight logical GPUs, then distributes all
-concurrent Stage 2 requests round-robin across them:
+The pipeline can independently own the orchestrator and extractor vLLM
+lifecycles. For the orchestrator, omit `stage2.endpoint`, provide
+`stage2.model`, and add `stage2.vllm`. For the extractor, omit
+`stage2.extraction_llm.endpoint`, provide its `model`, and add the nested
+`stage2.extraction_llm.vllm`. This example runs one tensor-parallel orchestrator
+on GPUs 0-1 and two one-GPU extractor replicas on GPUs 2-3:
 
 ```json
 {
   "stage2": {
-    "model": "google/gemma-4-31B-it",
+    "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
     "extraction_llm": {
-      "endpoint": "http://127.0.0.1:8020/v1",
-      "model": "small-extractor",
-      "workers": 32
+      "model": "LiquidAI/LFM2.5-2.6B",
+      "workers": 64,
+      "vllm": {
+        "gpus": ["cuda:2", "cuda:3"],
+        "gpus_per_server": 1,
+        "base_port": 8110,
+        "download_dir": "/models/huggingface",
+        "extra_args": ["--gpu-memory-utilization", "0.80"]
+      }
     },
     "vllm": {
-      "server_count": 8,
-      "gpus": [
-        "cuda:0", "cuda:1", "cuda:2", "cuda:3",
-        "cuda:4", "cuda:5", "cuda:6", "cuda:7"
-      ],
+      "gpus": ["cuda:0", "cuda:1"],
+      "gpus_per_server": 2,
       "base_port": 8010,
       "download_dir": "/models/huggingface",
       "extra_args": [
@@ -751,14 +756,18 @@ concurrent Stage 2 requests round-robin across them:
 }
 ```
 
-The GPU list contains indices in the pipeline's current logical CUDA namespace.
-If the parent was started with `CUDA_VISIBLE_DEVICES`, each child assignment is
-mapped through that setting. GPUs are split into equal, nonoverlapping groups:
-eight servers over eight GPUs gives tensor parallel size 1, while four servers
-over eight GPUs gives tensor parallel size 2. Uneven divisions, duplicate GPUs,
-and more servers than GPUs are rejected before any process starts.
+Each pool has its own GPU list and `gpus_per_server` tensor-parallel width. The
+replica count is derived as `len(gpus) / gpus_per_server`; `server_count` may
+also be supplied, but must agree. GPU indices use the pipeline's current
+logical CUDA namespace. If the parent has `CUDA_VISIBLE_DEVICES`, each child
+assignment is mapped through it. Uneven divisions, duplicate GPUs within a
+pool, inconsistent counts, and more servers than GPUs are rejected before any
+process starts. The two pools run simultaneously; overlapping their GPU lists
+is allowed only for users deliberately configuring enough memory for both
+models.
 
-The managed settings `host`, `base_port` (or an exact `ports` list),
+Both nested managed configurations accept `host`, `base_port` (or an exact
+`ports` list), `internal_port_base`, and `gpus_per_server`. The settings
 `startup_timeout`, `startup_poll_interval`, and `shutdown_timeout` control the
 server lifecycle. `download_dir`, `reasoning_parser`, `language_model_only`, and
 `default_chat_template_kwargs` map directly to their vLLM options. Any remaining
@@ -794,7 +803,8 @@ For Qwen 3.8, the model-agnostic `high` policy is translated to the endpoint's
 `reasoning_effort: "xhigh"` wire value. Disabled extraction thinking omits the
 wire-level effort enum and uses the family-specific hard-off controls.
 
-A completed response that fails JSON parsing or schema validation receives up
+A transport failure receives up to `transport_max_attempts` attempts (10 by
+default). A completed response that fails JSON parsing or schema validation receives up
 to `max_response_repairs` validator-guided retries (10 by default), each with
 the concrete validation error. Repair attempts through
 `thinking_after_response_repairs` (5 by default) retain the request's normal
@@ -807,25 +817,38 @@ The equivalent direct CLI invocation is:
 uv run python scripts/run_all_evidence.py \
   --config run.json \
   --stage2-only \
-  --stage2-model google/gemma-4-31B-it \
-  --stage2-extraction-endpoint http://127.0.0.1:8020/v1 \
-  --stage2-extraction-model small-extractor \
-  --stage2-vllm-servers 8 \
-  --stage2-vllm-gpus cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7 \
+  --stage2-model Qwen/Qwen3.8-27B \
+  --stage2-vllm-gpus cuda:0,cuda:1 \
+  --stage2-vllm-gpus-per-server 2 \
   --stage2-vllm-download-dir /models/huggingface \
   --stage2-vllm-extra-arg=--gpu-memory-utilization \
-  --stage2-vllm-extra-arg=0.90
+  --stage2-vllm-extra-arg=0.90 \
+  --stage2-extraction-model LiquidAI/LFM2.5-2.6B \
+  --stage2-extraction-workers 64 \
+  --stage2-extraction-vllm-gpus cuda:2,cuda:3 \
+  --stage2-extraction-vllm-gpus-per-server 1 \
+  --stage2-extraction-vllm-download-dir /models/huggingface \
+  --stage2-extraction-vllm-extra-arg=--gpu-memory-utilization \
+  --stage2-extraction-vllm-extra-arg=0.80
 ```
 
-The runner waits until every server advertises a model at `/v1/models` before
-starting inference. Logs and the redacted process/GPU/endpoint manifest are
-written under `stage2/vllm_servers/`. On normal completion, interruption, or a
-Stage 2 error, it terminates every managed vLLM process group. The primary model
-may still use one external endpoint, and `stage2.endpoint` and `stage2.vllm` are
-mutually exclusive. The extraction endpoint is always supplied separately and
-is not launched or stopped as part of the managed primary-model pool; it may
-still point at the same OpenAI-compatible service when that service exposes
-both selected models.
+The runner waits until every server in both pools advertises its configured
+model at `/v1/models` before inference. Logs and redacted manifests are written
+under `stage2/vllm_servers/orchestrator/` and
+`stage2/vllm_servers/extractor/`. On normal completion, interruption, startup
+failure, or a Stage 2 error, it terminates every managed process group. Either
+role may instead use an external endpoint, so managed/external combinations are
+supported independently. Within each role, its endpoint and vLLM pool are
+mutually exclusive.
+
+The synthetic-run shell wrappers expose the same split through
+`STAGE2_VLLM_GPUS` and `STAGE2_VLLM_GPUS_PER_SERVER` for the orchestrator, and
+`STAGE2_EXTRACTION_VLLM_GPUS` plus
+`STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER` for the extractor. Positive
+`STAGE2_VLLM_SERVERS` and `STAGE2_EXTRACTION_VLLM_SERVERS` values may be used
+instead of deriving replica counts, provided they agree with the selected GPU
+lists and GPUs-per-server settings. Their default public port ranges begin at
+8010 and 8110, respectively.
 
 To guarantee inclusion of an investigator-specified variable, populate
 `stage2.explicit_features` with complete definitions containing `name`,

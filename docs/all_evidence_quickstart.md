@@ -96,6 +96,7 @@ For Qwen 3.8, configured `high` is sent as `reasoning_effort: "xhigh"`;
 thinking-off extraction requests omit that enabled-only wire enum.
 The selected IDs are persisted in `stage2/model_identity.json`: endpoint URL
 changes may resume, but changing either running model ID raises an error.
+Transport failures receive up to 10 attempts by default.
 Invalid completed responses receive up to 10 validator-guided repair retries.
 The first five repairs retain the request's normal reasoning policy; repairs
 6–10 force `reasoning_effort` to at least `high`, enabling thinking.
@@ -123,22 +124,30 @@ nonreference-level interaction terms and receive one omnibus likelihood-ratio
 test. The default for both p-values is `0.05`, and the default for both fold
 fractions is `0.75` (rounded up to a whole-fold count).
 
-For eight independent vLLM replicas on eight GPUs, replace `endpoint` in the
-example above with:
+For independently managed orchestrator and extractor pools, replace both
+endpoints in the example above with nested vLLM configurations. Here the
+orchestrator uses tensor parallelism over GPUs 0-1, while two extractor replicas
+use GPUs 2 and 3:
 
 ```json
 {
   "stage2": {
-    "model": "google/gemma-4-31B-it",
+    "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
     "extraction_llm": {
-      "endpoint": "http://127.0.0.1:8020/v1",
-      "model": "small-extractor",
-      "workers": 32
+      "model": "LiquidAI/LFM2.5-2.6B",
+      "workers": 64,
+      "vllm": {
+        "gpus": [2, 3],
+        "gpus_per_server": 1,
+        "base_port": 8110,
+        "extra_args": ["--gpu-memory-utilization", "0.80"]
+      }
     },
     "vllm": {
-      "server_count": 8,
-      "gpus": [0, 1, 2, 3, 4, 5, 6, 7],
+      "gpus": [0, 1],
+      "gpus_per_server": 2,
+      "base_port": 8010,
       "download_dir": "/models/huggingface",
       "extra_args": ["--gpu-memory-utilization", "0.90"]
     }
@@ -146,12 +155,13 @@ example above with:
 }
 ```
 
-Stage 2 starts the servers, waits for all eight model endpoints, round-robins
-work across them, and stops them on exit. Gemma defaults to the `gemma4`
-reasoning parser and language-model-only mode; thinking is selected per request
-as described above. Qwen defaults to the `qwen3` reasoning parser and
-language-model-only mode. See the complete
-workflow guide for GPU partition rules and all managed-server settings.
+Stage 2 starts both pools, waits for every model endpoint, independently
+round-robins orchestrator and extraction work, and stops both pools on exit.
+`gpus_per_server` sets each role's tensor-parallel width and derives the replica
+count; an explicit `server_count` must agree. Gemma defaults to the `gemma4`
+reasoning parser, Qwen to `qwen3`, and both default to language-model-only mode.
+See the complete workflow guide for GPU partition rules and all managed-server
+settings.
 
 Stage 2 compiles the raw handoff into fold-local, provenance-preserving semantic
 cards under `stage2/evidence_compilation/`, and candidate discovery reads all of

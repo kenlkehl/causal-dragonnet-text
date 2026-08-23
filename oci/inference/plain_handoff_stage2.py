@@ -20,6 +20,7 @@ import re
 import threading
 import time
 from collections import Counter, defaultdict
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +56,7 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "effect_modifier"}
 DEFAULT_MAX_RESPONSE_REPAIRS = 10
 DEFAULT_THINKING_AFTER_RESPONSE_REPAIRS = 5
+DEFAULT_TRANSPORT_MAX_ATTEMPTS = 10
 THINKING_RESPONSE_REPAIR_EFFORT = "high"
 # This is an output ceiling, not a requested output length. Models still stop
 # normally at EOS as soon as the validated JSON object is complete.
@@ -84,6 +86,8 @@ DEFAULT_CONFOUNDER_MIN_INNER_FOLD_FRACTION = 0.75
 DEFAULT_EFFECT_MODIFIER_P_VALUE_THRESHOLD = 0.05
 DEFAULT_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION = 0.75
 DEFAULT_SELECTION_WORKERS = 4
+DEFAULT_EXTRACTION_VLLM_BASE_PORT = 8110
+DEFAULT_EXTRACTION_VLLM_INTERNAL_PORT_BASE = 40_000
 MODEL_IDENTITY_SCHEMA_VERSION = "stage2_endpoint_model_identity_v1"
 # Kept only so historical, non-exported candidate-funnel helpers remain
 # importable while old checkpoints can be inspected. The Stage 2 execution
@@ -645,18 +649,44 @@ def _stage2_explicit_features_from_value(raw: Any) -> tuple[Stage2ExplicitFeatur
 class Stage2ExtractionLLMConfig:
     """Small-model transport used only for patient value extraction."""
 
-    endpoint: str
+    endpoint: str = ""
     model: str = ""
     api_key: str = "EMPTY"
     workers: int = 4
+    vllm: ManagedVLLMConfig | None = None
+    # Populated only while an extractor pool owned by this pipeline is alive.
+    runtime_endpoints: tuple[str, ...] = ()
 
     def validate(self, *, require_model: bool = True) -> None:
-        parsed = urlparse(self.endpoint)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if self.endpoint and self.vllm is not None and not self.runtime_endpoints:
             raise ValueError(
-                "stage2.extraction_llm.endpoint must be one HTTP(S) "
-                "OpenAI-compatible base URL"
+                "configure either stage2.extraction_llm.endpoint or "
+                "stage2.extraction_llm.vllm, not both"
             )
+        if self.endpoint:
+            parsed = urlparse(self.endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError(
+                    "stage2.extraction_llm.endpoint must be one HTTP(S) "
+                    "OpenAI-compatible base URL"
+                )
+        elif self.vllm is None:
+            raise ValueError(
+                "stage2.extraction_llm requires either endpoint or vllm"
+            )
+        if self.vllm is not None:
+            self.vllm.validate()
+            if not self.model.strip():
+                raise ValueError(
+                    "stage2.extraction_llm.model is required when its vllm pool is configured"
+                )
+        for runtime_endpoint in self.runtime_endpoints:
+            parsed = urlparse(runtime_endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError(
+                    "stage2.extraction_llm.runtime_endpoints must contain HTTP(S) "
+                    "OpenAI-compatible base URLs"
+                )
         if require_model and not self.model.strip():
             raise ValueError("stage2.extraction_llm.model must be nonempty")
         if isinstance(self.workers, bool) or not isinstance(self.workers, int) or self.workers < 1:
@@ -668,6 +698,7 @@ class Stage2ExtractionLLMConfig:
             "model": self.model,
             "api_key": "<redacted>",
             "workers": self.workers,
+            "vllm": self.vllm.public_dict() if self.vllm is not None else None,
         }
 
 
@@ -677,7 +708,7 @@ class PlainHandoffStage2Config:
     model: str = ""
     api_key: str = "EMPTY"
     request_timeout: float = 7_200.0
-    transport_max_attempts: int = 3
+    transport_max_attempts: int = DEFAULT_TRANSPORT_MAX_ATTEMPTS
     transport_retry_backoff: float = 2.0
     # Invalid completed responses receive validator-guided repair requests.
     # Later repairs turn reasoning on without changing the initial request's
@@ -1061,11 +1092,29 @@ def plain_stage2_config_from_mapping(
         raise ValueError("stage2.extraction_llm must be an object")
     else:
         extraction_endpoint = str(raw_extraction_llm.get("endpoint") or "").strip().rstrip("/")
-        if not extraction_endpoint:
-            raise ValueError("stage2.extraction_llm.endpoint is required")
+        extraction_model = str(raw_extraction_llm.get("model") or "").strip()
+        extraction_vllm = managed_vllm_config_from_mapping(
+            raw_extraction_llm.get("vllm"),
+            model=extraction_model,
+            default_base_port=DEFAULT_EXTRACTION_VLLM_BASE_PORT,
+            default_internal_port_base=DEFAULT_EXTRACTION_VLLM_INTERNAL_PORT_BASE,
+        )
+        if extraction_endpoint and extraction_vllm is not None:
+            raise ValueError(
+                "configure either stage2.extraction_llm.endpoint or "
+                "stage2.extraction_llm.vllm, not both"
+            )
+        if not extraction_endpoint and extraction_vllm is None:
+            raise ValueError(
+                "stage2.extraction_llm requires either endpoint or vllm"
+            )
+        if extraction_vllm is not None and not extraction_model:
+            raise ValueError(
+                "stage2.extraction_llm.model is required when its vllm pool is configured"
+            )
         extraction_llm = Stage2ExtractionLLMConfig(
             endpoint=extraction_endpoint,
-            model=str(raw_extraction_llm.get("model") or "").strip(),
+            model=extraction_model,
             api_key=str(
                 raw_extraction_llm.get("api_key")
                 or os.environ.get("OCI_STAGE2_EXTRACTION_API_KEY")
@@ -1080,6 +1129,7 @@ def plain_stage2_config_from_mapping(
                     )
                 ),
             ),
+            vllm=extraction_vllm,
         )
         extraction_llm.validate(require_model=False)
 
@@ -1092,7 +1142,9 @@ def plain_stage2_config_from_mapping(
         model=model,
         api_key=api_key,
         request_timeout=float(raw.get("request_timeout", 7_200.0)),
-        transport_max_attempts=int(raw.get("transport_max_attempts", 3)),
+        transport_max_attempts=int(
+            raw.get("transport_max_attempts", DEFAULT_TRANSPORT_MAX_ATTEMPTS)
+        ),
         transport_retry_backoff=float(raw.get("transport_retry_backoff", 2.0)),
         max_response_repairs=int(
             raw.get("max_response_repairs", DEFAULT_MAX_RESPONSE_REPAIRS)
@@ -1301,6 +1353,10 @@ def _resolve_extraction_llm_model(
     extraction = config.extraction_llm
     if extraction is None or extraction.model.strip():
         return config
+    if extraction.vllm is not None:
+        raise ValueError(
+            "stage2.extraction_llm.model is required when its vllm pool is configured"
+        )
     transport_config = replace(
         config,
         endpoint=extraction.endpoint,
@@ -5546,19 +5602,22 @@ class PlainHandoffStage2:
         self.extraction_completion: CompletionFunction | None = None
         if config.extraction_llm is not None:
             extraction = config.extraction_llm
+            extraction_endpoints = extraction.runtime_endpoints or (extraction.endpoint,)
             extraction_request_config = replace(
                 config,
-                endpoint=extraction.endpoint,
+                endpoint=extraction_endpoints[0],
                 model=extraction.model,
                 api_key=extraction.api_key,
                 workers=extraction.workers,
+                extraction_llm=None,
+                vllm=None,
                 runtime_endpoints=(),
                 runtime_model_family="",
             )
             routed_extraction = extraction_completion or completion
             extraction_identity = _endpoint_model_identity(
                 extraction_request_config,
-                endpoints=(extraction.endpoint,),
+                endpoints=extraction_endpoints,
                 role="extraction",
                 verify_live_endpoint=routed_extraction is None,
             )
@@ -5567,7 +5626,7 @@ class PlainHandoffStage2:
                 runtime_model_family=str(extraction_identity["model_family"]),
             )
             if routed_extraction is None:
-                routed_extraction = _RoundRobinOpenAICompletion((extraction.endpoint,))
+                routed_extraction = _RoundRobinOpenAICompletion(extraction_endpoints)
             self.extraction_completion = _ConcurrencyLimitedCompletion(
                 routed_extraction,
                 max_concurrency=extraction.workers,
@@ -7460,20 +7519,46 @@ def run_plain_handoff_stage2(
             seed=seed,
         )
 
-    if config.vllm is None:
+    extraction = config.extraction_llm
+    extraction_vllm = extraction.vllm if extraction is not None else None
+    if config.vllm is None and extraction_vllm is None:
         return run_with_config(config)
 
-    with launch_managed_vllm_servers(
-        config=config.vllm,
-        model=config.model,
-        api_key=config.api_key,
-        output_dir=Path(output_dir) / "vllm_servers",
-    ) as endpoints:
-        runtime_config = replace(
-            config,
-            endpoint=endpoints[0],
-            runtime_endpoints=tuple(endpoints),
-        )
+    managed_root = Path(output_dir) / "vllm_servers"
+    with ExitStack() as stack:
+        runtime_config = config
+        if config.vllm is not None:
+            primary_endpoints = stack.enter_context(
+                launch_managed_vllm_servers(
+                    config=config.vllm,
+                    model=config.model,
+                    api_key=config.api_key,
+                    output_dir=managed_root / "orchestrator",
+                )
+            )
+            runtime_config = replace(
+                runtime_config,
+                endpoint=primary_endpoints[0],
+                runtime_endpoints=tuple(primary_endpoints),
+            )
+        if extraction is not None and extraction_vllm is not None:
+            extraction_endpoints = stack.enter_context(
+                launch_managed_vllm_servers(
+                    config=extraction_vllm,
+                    model=extraction.model,
+                    api_key=extraction.api_key,
+                    output_dir=managed_root / "extractor",
+                )
+            )
+            runtime_extraction = replace(
+                extraction,
+                endpoint=extraction_endpoints[0],
+                runtime_endpoints=tuple(extraction_endpoints),
+            )
+            runtime_config = replace(
+                runtime_config,
+                extraction_llm=runtime_extraction,
+            )
         return run_with_config(runtime_config)
 
 

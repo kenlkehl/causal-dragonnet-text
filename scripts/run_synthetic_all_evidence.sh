@@ -30,8 +30,18 @@ stage2_selection_workers="${STAGE2_SELECTION_WORKERS:-}"
 stage2_max_tokens="${STAGE2_MAX_TOKENS:-}"
 stage2_vllm_servers="${STAGE2_VLLM_SERVERS:-0}"
 stage2_vllm_gpus="${STAGE2_VLLM_GPUS:-}"
+stage2_vllm_gpus_per_server="${STAGE2_VLLM_GPUS_PER_SERVER:-}"
+stage2_vllm_base_port="${STAGE2_VLLM_BASE_PORT:-}"
+stage2_vllm_internal_port_base="${STAGE2_VLLM_INTERNAL_PORT_BASE:-}"
 stage2_vllm_download_dir="${STAGE2_VLLM_DOWNLOAD_DIR:-}"
 stage2_vllm_extra_args_json="${STAGE2_VLLM_EXTRA_ARGS_JSON:-}"
+stage2_extraction_vllm_servers="${STAGE2_EXTRACTION_VLLM_SERVERS:-0}"
+stage2_extraction_vllm_gpus="${STAGE2_EXTRACTION_VLLM_GPUS:-}"
+stage2_extraction_vllm_gpus_per_server="${STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER:-}"
+stage2_extraction_vllm_base_port="${STAGE2_EXTRACTION_VLLM_BASE_PORT:-}"
+stage2_extraction_vllm_internal_port_base="${STAGE2_EXTRACTION_VLLM_INTERNAL_PORT_BASE:-}"
+stage2_extraction_vllm_download_dir="${STAGE2_EXTRACTION_VLLM_DOWNLOAD_DIR:-}"
+stage2_extraction_vllm_extra_args_json="${STAGE2_EXTRACTION_VLLM_EXTRA_ARGS_JSON:-}"
 stage2_operationalization_max_prompt_chars="${STAGE2_OPERATIONALIZATION_MAX_PROMPT_CHARS:-}"
 stage2_consolidation_batch_size="${STAGE2_CONSOLIDATION_BATCH_SIZE:-}"
 stage2_consolidation_alphabetical_rounds="${STAGE2_CONSOLIDATION_ALPHABETICAL_ROUNDS:-}"
@@ -57,22 +67,68 @@ if [[ ! "${stage2_vllm_servers}" =~ ^[0-9]+$ ]]; then
     echo "STAGE2_VLLM_SERVERS must be a nonnegative integer." >&2
     exit 1
 fi
+if [[ ! "${stage2_extraction_vllm_servers}" =~ ^[0-9]+$ ]]; then
+    echo "STAGE2_EXTRACTION_VLLM_SERVERS must be a nonnegative integer." >&2
+    exit 1
+fi
+if [[ -n "${stage2_vllm_gpus_per_server}" && ! "${stage2_vllm_gpus_per_server}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "STAGE2_VLLM_GPUS_PER_SERVER must be a positive integer." >&2
+    exit 1
+fi
+if [[ -n "${stage2_extraction_vllm_gpus_per_server}" && ! "${stage2_extraction_vllm_gpus_per_server}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER must be a positive integer." >&2
+    exit 1
+fi
 stage2_vllm_servers=$((10#${stage2_vllm_servers}))
-if (( stage2_vllm_servers > 0 )); then
+stage2_extraction_vllm_servers=$((10#${stage2_extraction_vllm_servers}))
+stage2_managed_orchestrator=0
+if (( stage2_vllm_servers > 0 )) || [[ -n "${stage2_vllm_gpus_per_server}" ]]; then
+    stage2_managed_orchestrator=1
+fi
+stage2_managed_extractor=0
+if (( stage2_extraction_vllm_servers > 0 )) || [[ -n "${stage2_extraction_vllm_gpus_per_server}" ]]; then
+    stage2_managed_extractor=1
+fi
+stage2_managed_any=$((stage2_managed_orchestrator || stage2_managed_extractor))
+if (( stage2_managed_orchestrator )); then
     stage2_endpoint="${STAGE2_ENDPOINT:-}"
 else
     stage2_endpoint="${STAGE2_ENDPOINT-http://127.0.0.1:8010/v1}"
 fi
-if (( stage2_vllm_servers > 0 )) && [[ -n "${stage2_endpoint}" ]]; then
-    echo "Set either STAGE2_ENDPOINT or STAGE2_VLLM_SERVERS, not both." >&2
+if (( stage2_managed_orchestrator )) && [[ -n "${stage2_endpoint}" ]]; then
+    echo "Set either STAGE2_ENDPOINT or managed orchestrator vLLM settings, not both." >&2
     exit 1
 fi
-if (( stage2_vllm_servers > 0 )) && [[ -z "${stage2_model}" ]]; then
-    echo "STAGE2_MODEL is required when STAGE2_VLLM_SERVERS is positive." >&2
+if (( stage2_managed_orchestrator )) && [[ -z "${stage2_model}" ]]; then
+    echo "STAGE2_MODEL is required for managed orchestrator vLLM." >&2
     exit 1
 fi
-if { (( stage2_vllm_servers > 0 )) || [[ -n "${stage2_endpoint}" ]]; } && [[ -z "${stage2_extraction_endpoint}" ]]; then
-    echo "STAGE2_EXTRACTION_ENDPOINT is required whenever Stage 2 is enabled." >&2
+if (( stage2_managed_extractor )) && [[ -n "${stage2_extraction_endpoint}" ]]; then
+    echo "Set either STAGE2_EXTRACTION_ENDPOINT or managed extraction vLLM settings, not both." >&2
+    exit 1
+fi
+if (( stage2_managed_extractor )) && [[ -z "${stage2_extraction_model}" ]]; then
+    echo "STAGE2_EXTRACTION_MODEL is required for managed extraction vLLM." >&2
+    exit 1
+fi
+if (( stage2_managed_extractor )) && [[ -z "${stage2_extraction_vllm_gpus}" ]]; then
+    echo "STAGE2_EXTRACTION_VLLM_GPUS is required for managed extraction vLLM." >&2
+    exit 1
+fi
+if (( stage2_managed_orchestrator && stage2_managed_extractor )) && [[ -z "${stage2_vllm_gpus}" ]]; then
+    echo "STAGE2_VLLM_GPUS is required when both managed model pools are enabled." >&2
+    exit 1
+fi
+stage2_enabled=0
+if (( stage2_managed_orchestrator )) || [[ -n "${stage2_endpoint}" ]]; then
+    stage2_enabled=1
+fi
+if (( stage2_managed_extractor && ! stage2_enabled )); then
+    echo "Managed extraction vLLM also requires an external or managed orchestrator." >&2
+    exit 1
+fi
+if (( stage2_enabled && ! stage2_managed_extractor )) && [[ -z "${stage2_extraction_endpoint}" ]]; then
+    echo "STAGE2_EXTRACTION_ENDPOINT or managed extraction vLLM settings are required whenever Stage 2 is enabled." >&2
     exit 1
 fi
 if [[ "${disable_htr}" == "1" ]]; then
@@ -86,6 +142,7 @@ output_dir="${requested_output_dir:-${default_output_dir}}"
 stage2_only=0
 if [[
     -n "${stage2_endpoint}"
+    && "${stage2_managed_any}" == "0"
     && -f "${output_dir}/handoff/evidence.jsonl"
     && -f "${output_dir}/handoff/complete.json"
 ]]; then
@@ -127,7 +184,7 @@ if [[ -z "${python_bin}" ]]; then
         exit 1
     fi
     echo "Synchronizing ${repo_root}/.venv from the lockfile..."
-    if (( stage2_vllm_servers > 0 )); then
+    if (( stage2_managed_any )); then
         uv sync --frozen --extra local-llm
     else
         uv sync --frozen
@@ -143,7 +200,7 @@ fi
 if (( ! stage2_only )); then
     "${python_bin}" -c 'from sentence_transformers import SentenceTransformer'
 fi
-if (( stage2_vllm_servers > 0 )); then
+if (( stage2_managed_any )); then
     if ! "${python_bin}" -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
         echo "Managed Stage 2 requires vLLM in OCI_PYTHON (install .[local-llm])." >&2
         exit 1
@@ -175,7 +232,43 @@ if [[ -z "${gpu_count}" || -z "${devices}" || -z "${worker_count}" ]]; then
 fi
 
 stage2_policy_args=()
-if [[ -n "${stage2_extraction_endpoint}" ]]; then
+if (( stage2_managed_extractor )); then
+    stage2_policy_args+=(
+        --stage2-extraction-model "${stage2_extraction_model}"
+        --stage2-extraction-workers "${stage2_extraction_workers:-${resolved_stage2_workers}}"
+        --stage2-extraction-vllm-gpus "${stage2_extraction_vllm_gpus}"
+    )
+    if (( stage2_extraction_vllm_servers > 0 )); then
+        stage2_policy_args+=(
+            --stage2-extraction-vllm-servers "${stage2_extraction_vllm_servers}"
+        )
+    fi
+    if [[ -n "${stage2_extraction_vllm_gpus_per_server}" ]]; then
+        stage2_policy_args+=(
+            --stage2-extraction-vllm-gpus-per-server "${stage2_extraction_vllm_gpus_per_server}"
+        )
+    fi
+    if [[ -n "${stage2_extraction_vllm_base_port}" ]]; then
+        stage2_policy_args+=(
+            --stage2-extraction-vllm-base-port "${stage2_extraction_vllm_base_port}"
+        )
+    fi
+    if [[ -n "${stage2_extraction_vllm_internal_port_base}" ]]; then
+        stage2_policy_args+=(
+            --stage2-extraction-vllm-internal-port-base "${stage2_extraction_vllm_internal_port_base}"
+        )
+    fi
+    if [[ -n "${stage2_extraction_vllm_download_dir}" ]]; then
+        stage2_policy_args+=(
+            --stage2-extraction-vllm-download-dir "${stage2_extraction_vllm_download_dir}"
+        )
+    fi
+    if [[ -n "${stage2_extraction_vllm_extra_args_json}" ]]; then
+        stage2_policy_args+=(
+            --set "stage2.extraction_llm.vllm.extra_args=${stage2_extraction_vllm_extra_args_json}"
+        )
+    fi
+elif [[ -n "${stage2_extraction_endpoint}" ]]; then
     stage2_policy_args+=(
         --stage2-extraction-endpoint "${stage2_extraction_endpoint}"
         --stage2-extraction-workers "${stage2_extraction_workers:-${resolved_stage2_workers}}"
@@ -240,22 +333,41 @@ if [[ -n "${stage2_effect_modifier_min_inner_fold_fraction}" ]]; then
     stage2_policy_args+=(--stage2-effect-modifier-min-inner-fold-fraction "${stage2_effect_modifier_min_inner_fold_fraction}")
 fi
 
-if (( stage2_vllm_servers > 0 )); then
+if (( stage2_managed_orchestrator )); then
     resolved_stage2_vllm_gpus="${stage2_vllm_gpus:-${devices}}"
     stage_mode_args=(
         --stage2-model "${stage2_model}"
-        --stage2-vllm-servers "${stage2_vllm_servers}"
         --stage2-vllm-gpus "${resolved_stage2_vllm_gpus}"
         --set "stage2.workers=${resolved_stage2_workers}"
         "${stage2_policy_args[@]}"
     )
+    if (( stage2_vllm_servers > 0 )); then
+        stage_mode_args+=(--stage2-vllm-servers "${stage2_vllm_servers}")
+    fi
+    if [[ -n "${stage2_vllm_gpus_per_server}" ]]; then
+        stage_mode_args+=(
+            --stage2-vllm-gpus-per-server "${stage2_vllm_gpus_per_server}"
+        )
+    fi
+    if [[ -n "${stage2_vllm_base_port}" ]]; then
+        stage_mode_args+=(--stage2-vllm-base-port "${stage2_vllm_base_port}")
+    fi
+    if [[ -n "${stage2_vllm_internal_port_base}" ]]; then
+        stage_mode_args+=(
+            --stage2-vllm-internal-port-base "${stage2_vllm_internal_port_base}"
+        )
+    fi
     if [[ -n "${stage2_vllm_download_dir}" ]]; then
         stage_mode_args+=(--stage2-vllm-download-dir "${stage2_vllm_download_dir}")
     fi
     if [[ -n "${stage2_vllm_extra_args_json}" ]]; then
         stage_mode_args+=(--set "stage2.vllm.extra_args=${stage2_vllm_extra_args_json}")
     fi
-    stage2_description="managed vLLM: ${stage2_vllm_servers} servers on ${resolved_stage2_vllm_gpus} (${resolved_stage2_workers} concurrent requests)"
+    orchestrator_server_description="${stage2_vllm_servers} servers"
+    if (( stage2_vllm_servers == 0 )); then
+        orchestrator_server_description="auto replicas"
+    fi
+    stage2_description="managed orchestrator vLLM: ${orchestrator_server_description} on ${resolved_stage2_vllm_gpus} (${resolved_stage2_workers} concurrent requests)"
 elif [[ -z "${stage2_endpoint}" ]]; then
     stage_mode_args=(--stage1-only)
     stage2_description="disabled (STAGE2_ENDPOINT is empty)"
@@ -277,6 +389,15 @@ else
     else
         stage2_description="${stage2_endpoint} (${resolved_stage2_workers} concurrent requests)"
     fi
+fi
+if (( stage2_managed_extractor )); then
+    extractor_server_description="${stage2_extraction_vllm_servers} servers"
+    if (( stage2_extraction_vllm_servers == 0 )); then
+        extractor_server_description="auto replicas"
+    fi
+    stage2_description+="; managed extractor vLLM: ${extractor_server_description} on ${stage2_extraction_vllm_gpus} (${stage2_extraction_workers:-${resolved_stage2_workers}} concurrent requests)"
+elif [[ -n "${stage2_extraction_endpoint}" && "${stage2_enabled}" == "1" ]]; then
+    stage2_description+="; extractor ${stage2_extraction_endpoint} (${stage2_extraction_workers:-${resolved_stage2_workers}} concurrent requests)"
 fi
 
 if [[ -n "${stage1_architectures}" ]]; then

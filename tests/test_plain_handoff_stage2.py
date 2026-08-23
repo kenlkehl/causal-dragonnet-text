@@ -69,7 +69,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.endpoint == "http://stage2.test/v1"
     assert config.model == ""
     assert config.request_timeout == 7_200.0
-    assert config.transport_max_attempts == 3
+    assert config.transport_max_attempts == 10
     assert config.max_response_repairs == 10
     assert config.thinking_after_response_repairs == 5
     assert config.max_tokens == 100_000
@@ -3208,6 +3208,42 @@ def test_stage2_retries_retryable_transport_errors_without_using_repair_turns(
     assert result == {"ok": True}
     assert calls[0] == calls[1] == calls[2]
     assert delays == [0.25, 0.5]
+
+
+def test_stage2_default_transport_policy_allows_ten_attempts(monkeypatch):
+    class RetryableTransportError(Exception):
+        pass
+
+    calls = []
+
+    def completion(messages, _config):
+        calls.append([dict(message) for message in messages])
+        if len(calls) < 10:
+            raise RetryableTransportError("temporary timeout")
+        return '{"ok": true}'
+
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_is_retryable_transport_error",
+        lambda exc: isinstance(exc, RetryableTransportError),
+    )
+    monkeypatch.setattr(stage2_workflow.time, "sleep", lambda _delay: None)
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        transport_retry_backoff=0.0,
+    )
+
+    result = stage2_workflow._request_json(
+        messages=[{"role": "user", "content": "Return JSON."}],
+        config=config,
+        completion=completion,
+        validate=lambda value: dict(value),
+    )
+
+    assert result == {"ok": True}
+    assert len(calls) == 10
+    assert all(call == calls[0] for call in calls)
 
 
 def test_openai_timeout_is_a_retryable_transport_error():
