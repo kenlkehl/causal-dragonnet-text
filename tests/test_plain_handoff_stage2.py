@@ -1186,12 +1186,10 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
         "categories_or_unit",
         "measurement_definition",
         "missing_value_rule",
-    }
-    assert set(extraction["features"][0]) == expected_extraction_fields
-    assert set(page_extraction["features"][0]) == {
-        *expected_extraction_fields,
         "conflict_resolution",
     }
+    assert set(extraction["features"][0]) == expected_extraction_fields
+    assert set(page_extraction["features"][0]) == expected_extraction_fields
     assert "clinical_question" not in extraction
     assert "clinical_question" not in page_extraction
     assert any("Do not substitute 0/1" in rule for rule in extraction["rules"])
@@ -1219,6 +1217,43 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
     assert "component explicitly named by the feature" in composite_rule
     assert "requests multiple components, return null" in composite_rule
     assert "rather than a ratio string or aggregate" in composite_rule
+
+
+def test_normal_extraction_prompt_applies_explicit_conflict_resolution():
+    definition = {
+        "name": "age",
+        "description": "The patient's age in years.",
+        "value_type": "continuous",
+        "categories_or_unit": ["years"],
+        "measurement_definition": (
+            "Extract the age from the pretreatment record or earliest available encounter."
+        ),
+        "missing_value_rule": "Return null when age is undocumented.",
+        "conflict_resolution": {"strategy": "latest", "positive_category": None},
+    }
+
+    prompt = json.loads(
+        stage2_analysis._extraction_prompt(
+            definitions=[definition],
+            rows=[
+                {
+                    "row_id": 7,
+                    "text": "At age 68 the patient was diagnosed. At age 72 treatment was considered.",
+                }
+            ],
+        )[1]["content"]
+    )
+
+    policy = prompt["features"][0]["conflict_resolution"]
+    rules = " ".join(prompt["rules"])
+    assert policy["strategy"] == "latest"
+    assert policy["strategy_source"] == "explicit_ontology"
+    assert policy["dated_observations_precede_undated"] is True
+    assert policy["source_order_tie_breaker"] == "last"
+    assert "Consider every explicitly supported observation" in rules
+    assert "conflict_resolution policy governs" in rules
+    assert "use clinical-text source order" in rules
+    assert "do not treat the first mention" in rules
 
 
 def test_continuous_extraction_preserves_categorical_fallback_for_modeling_review():
