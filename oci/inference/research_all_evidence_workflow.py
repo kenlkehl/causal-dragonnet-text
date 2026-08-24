@@ -1916,8 +1916,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage2-max-tokens",
         type=int,
         help=(
-            "completion-token ceiling sent to every Stage 2 LLM request; must be "
-            "at least 100000 and does not force responses to reach that length"
+            "completion-token ceiling sent to primary-model Stage 2 requests; must "
+            "be at least 100000 and does not force responses to reach that length"
+        ),
+    )
+    parser.add_argument(
+        "--stage2-extraction-max-tokens",
+        type=int,
+        help=(
+            "completion-token ceiling sent to patient-extraction requests; must be "
+            "at least 60000 and defaults to 60000"
         ),
     )
     parser.add_argument(
@@ -2257,6 +2265,7 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
                 extraction_vllm[key] = value
     stage2_numeric_overrides = {
         "max_tokens": args.stage2_max_tokens,
+        "extraction_max_tokens": args.stage2_extraction_max_tokens,
         "selection_workers": args.stage2_selection_workers,
         "max_review_rounds": args.stage2_review_rounds,
         "extraction_feature_batch_size": args.stage2_extraction_feature_batch_size,

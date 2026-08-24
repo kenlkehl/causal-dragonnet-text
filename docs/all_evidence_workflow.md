@@ -175,6 +175,7 @@ An external endpoint configuration is:
     },
     "request_timeout": 7200,
     "max_tokens": 100000,
+    "extraction_max_tokens": 60000,
     "max_response_repairs": 10,
     "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
@@ -364,10 +365,11 @@ Stage 2 selects reasoning per Chat Completions request. Evidence interpretation
 and audit, consolidation, operationalization, category mapping, aggregate
 ontology supervision, and ontology refinement go to the primary model with
 `reasoning_effort: "high"` by default. Only one-patient value extraction goes
-to the small model with `reasoning_effort: "none"` initially. Every request
-receives the configured `max_tokens` ceiling (100,000 by default). This permits
-a long response but does not request a minimum length; the model still stops at
-EOS as soon as its JSON is complete.
+to the small model with `reasoning_effort: "none"` initially. Primary-model
+requests receive the configured `max_tokens` ceiling (100,000 by default), while
+patient extraction receives `extraction_max_tokens` (60,000 by default). These
+permit long responses but do not request minimum lengths; each model still stops
+at EOS as soon as its JSON is complete.
 Every Stage 2 completion request also sends the configured
 `repetition_penalty` (1.1 by default).
 Stage 2 first verifies each live endpoint's selected model through `/models`.
@@ -464,7 +466,8 @@ The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
 operational controls include `request_timeout`, `transport_max_attempts` (10 by
 default),
 `transport_retry_backoff`, `max_response_repairs`,
-`thinking_after_response_repairs`, `max_tokens`, `max_prompt_chars`,
+`thinking_after_response_repairs`, `max_tokens`, `extraction_max_tokens`,
+`max_prompt_chars`,
 `consolidation_max_prompt_chars`,
 `operationalization_max_prompt_chars`,
 `consolidation_batch_size`, `consolidation_alphabetical_rounds`,
@@ -492,10 +495,13 @@ contains one patient and at most `extraction_feature_batch_size` frozen feature
 definitions (10 by default); Stage 2 checkpoints and merges the feature batches.
 `max_prompt_chars`
 continues to bound interpretation and ontology-supervision planning. These character limits
-are safety/planning guards, not claims about the model's token context. Every
-completion sends `max_tokens` as a 100,000-token output ceiling. This is not a
-generation target or minimum. A response that reaches that ceiling enters
-Stage 2's bounded repair or fallback path.
+are safety/planning guards, not claims about the model's token context. Primary
+completions send `max_tokens` as a 100,000-token output ceiling; patient
+extraction sends `extraction_max_tokens` as a 60,000-token ceiling. Neither is a
+generation target or minimum. A response that reaches its ceiling enters Stage
+2's bounded repair or fallback path. The extraction-only ceiling is transport
+policy and does not invalidate completed feature-definition checkpoints when it
+changes, so an interrupted extraction can resume under a safer ceiling.
 Extraction always sends exactly one patient's text per request and never sends
 more than the configured feature batch; oversized notes are split into lossless
 contiguous pages, preferring nearby note, paragraph, line, sentence, or word
@@ -543,8 +549,9 @@ The same choice can be stored as `run.mode: "full"`, `"stage1"`, or
 values can also be supplied as `--stage2-endpoint` and `--stage2-model`.
 The small model has `--stage2-extraction-endpoint`,
 `--stage2-extraction-model`, `--stage2-extraction-api-key`, and
-`--stage2-extraction-workers`. Statistical processes and the output ceiling use
-`--stage2-selection-workers` and `--stage2-max-tokens`.
+`--stage2-extraction-workers`. Statistical processes and the two output ceilings
+use `--stage2-selection-workers`, `--stage2-max-tokens`, and
+`--stage2-extraction-max-tokens`.
 Managed mode additionally has `--stage2-vllm-servers`,
 `--stage2-vllm-gpus`, `--stage2-vllm-base-port`,
 `--stage2-vllm-download-dir`, `--stage2-vllm-reasoning-parser`,
@@ -578,6 +585,7 @@ uv run python scripts/run_all_evidence.py \
   --stage2-extraction-model small-extractor \
   --stage2-selection-workers 16 \
   --stage2-max-tokens 100000 \
+  --stage2-extraction-max-tokens 60000 \
   --stage2-review-rounds 2 \
   --stage2-confounder-p-value-threshold 0.05 \
   --stage2-confounder-min-inner-fold-fraction 0.75 \

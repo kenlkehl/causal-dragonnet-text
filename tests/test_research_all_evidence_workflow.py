@@ -893,6 +893,8 @@ def test_saved_run_config_can_start_stage2_with_endpoint_only(tmp_path):
             "6",
             "--stage2-max-tokens",
             "150000",
+            "--stage2-extraction-max-tokens",
+            "70000",
         ]
     )
 
@@ -907,6 +909,7 @@ def test_saved_run_config_can_start_stage2_with_endpoint_only(tmp_path):
     assert resumed.stage2.extraction_feature_batch_size == 7
     assert resumed.stage2.selection_workers == 6
     assert resumed.stage2.max_tokens == 150_000
+    assert resumed.stage2.extraction_max_tokens == 70_000
     assert resumed.clinical_question == original.clinical_question
     assert resumed.unit_id_column == original.unit_id_column
     assert resumed.htr_enabled == original.htr_enabled

@@ -40,6 +40,7 @@ fi
             "STAGE2_EXTRACTION_FEATURE_BATCH_SIZE": "7",
             "STAGE2_SELECTION_WORKERS": "6",
             "STAGE2_MAX_TOKENS": "150000",
+            "STAGE2_EXTRACTION_MAX_TOKENS": "70000",
             "STAGE2_CONFOUNDER_P_VALUE_THRESHOLD": "0.01",
             "STAGE2_CONFOUNDER_MIN_INNER_FOLD_FRACTION": "0.8",
             "STAGE2_EFFECT_MODIFIER_P_VALUE_THRESHOLD": "0.02",
@@ -81,6 +82,7 @@ fi
     assert "--stage2-extraction-feature-batch-size 7" in invocations[1]
     assert "--stage2-selection-workers 6" in invocations[1]
     assert "--stage2-max-tokens 150000" in invocations[1]
+    assert "--stage2-extraction-max-tokens 70000" in invocations[1]
     assert "--stage2-confounder-p-value-threshold 0.01" in invocations[1]
     assert "--stage2-confounder-min-inner-fold-fraction 0.8" in invocations[1]
     assert "--stage2-effect-modifier-p-value-threshold 0.02" in invocations[1]

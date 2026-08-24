@@ -33,6 +33,7 @@
       "workers": 32
     },
     "max_tokens": 100000,
+    "extraction_max_tokens": 60000,
     "max_response_repairs": 10,
     "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,

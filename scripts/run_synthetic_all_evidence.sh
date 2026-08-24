@@ -28,6 +28,7 @@ stage2_extraction_model="${STAGE2_EXTRACTION_MODEL:-}"
 stage2_extraction_workers="${STAGE2_EXTRACTION_WORKERS:-}"
 stage2_selection_workers="${STAGE2_SELECTION_WORKERS:-}"
 stage2_max_tokens="${STAGE2_MAX_TOKENS:-}"
+stage2_extraction_max_tokens="${STAGE2_EXTRACTION_MAX_TOKENS:-}"
 stage2_vllm_servers="${STAGE2_VLLM_SERVERS:-0}"
 stage2_vllm_gpus="${STAGE2_VLLM_GPUS:-}"
 stage2_vllm_gpus_per_server="${STAGE2_VLLM_GPUS_PER_SERVER:-}"
@@ -282,6 +283,11 @@ if [[ -n "${stage2_selection_workers}" ]]; then
 fi
 if [[ -n "${stage2_max_tokens}" ]]; then
     stage2_policy_args+=(--stage2-max-tokens "${stage2_max_tokens}")
+fi
+if [[ -n "${stage2_extraction_max_tokens}" ]]; then
+    stage2_policy_args+=(
+        --stage2-extraction-max-tokens "${stage2_extraction_max_tokens}"
+    )
 fi
 if [[ -n "${stage2_operationalization_max_prompt_chars}" ]]; then
     stage2_policy_args+=(

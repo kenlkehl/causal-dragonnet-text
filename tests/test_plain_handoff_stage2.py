@@ -102,6 +102,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.max_response_repairs == 10
     assert config.thinking_after_response_repairs == 5
     assert config.max_tokens == 100_000
+    assert config.extraction_max_tokens == 60_000
     assert config.repetition_penalty == 1.1
     assert config.interpretation_reasoning_effort == "high"
     assert config.extraction_reasoning_effort == "none"
@@ -130,6 +131,38 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.selection_workers == config.workers == 4
 
 
+def test_extraction_token_cap_does_not_invalidate_completed_feature_definitions():
+    prior_config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="primary-model",
+        extraction_max_tokens=100_000,
+    )
+    resumed_config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="primary-model",
+        extraction_max_tokens=60_000,
+    )
+
+    def definition_inputs(config):
+        return stage2_workflow._feature_definition_input_value(
+            config=config,
+            clinical_question="Identify confounders.",
+            outer_fold=1,
+            discovery_packets=[],
+            seed=42,
+        )
+
+    assert definition_inputs(resumed_config) == definition_inputs(prior_config)
+    assert stage2_workflow._stage2_request_policy(
+        prior_config,
+        "extraction",
+    )["max_tokens"] == 100_000
+    assert stage2_workflow._stage2_request_policy(
+        resumed_config,
+        "extraction",
+    )["max_tokens"] == 60_000
+
+
 def test_stage2_analysis_defaults_pre_refinement_config_fields(caplog):
     class PreRefinementConfig:
         pass
@@ -145,6 +178,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
         {
             "endpoint": "http://stage2.test/v1",
             "max_tokens": 148_000,
+            "extraction_max_tokens": 72_000,
             "max_response_repairs": 8,
             "thinking_after_response_repairs": 3,
             "repetition_penalty": 1.15,
@@ -177,6 +211,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
 
     assert config is not None
     assert config.max_tokens == 148_000
+    assert config.extraction_max_tokens == 72_000
     assert config.max_response_repairs == 8
     assert config.thinking_after_response_repairs == 3
     assert config.repetition_penalty == 1.15
@@ -201,6 +236,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.effect_modifier_min_inner_fold_fraction == 0.8
     assert config.selection_workers == 6
     assert config.public_dict()["max_tokens"] == 148_000
+    assert config.public_dict()["extraction_max_tokens"] == 72_000
     assert config.public_dict()["max_response_repairs"] == 8
     assert config.public_dict()["thinking_after_response_repairs"] == 3
     assert config.public_dict()["repetition_penalty"] == 1.15
@@ -527,6 +563,22 @@ def test_stage2_config_rejects_invalid_max_tokens(max_tokens):
             endpoint="http://stage2.test/v1",
             model="test-model",
             max_tokens=max_tokens,
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "extraction_max_tokens",
+    [0, -1, 59_999, True, 1.5, "60000"],
+)
+def test_stage2_config_rejects_invalid_extraction_max_tokens(extraction_max_tokens):
+    with pytest.raises(
+        ValueError,
+        match="extraction_max_tokens must be an integer of at least 60000",
+    ):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_max_tokens=extraction_max_tokens,
         ).validate()
 
 
@@ -3482,7 +3534,7 @@ def test_empty_model_response_is_a_retryable_call_failure():
     ("request_kind", "reasoning_effort", "max_tokens"),
     [
         ("interpretation", "high", 100_000),
-        ("extraction", "none", 100_000),
+        ("extraction", "none", 60_000),
     ],
 )
 def test_openai_completion_sends_request_scoped_reasoning_and_token_cap(
@@ -3537,10 +3589,16 @@ def test_openai_completion_sends_request_scoped_reasoning_and_token_cap(
 
 
 @pytest.mark.parametrize(
-    ("request_kind", "enabled", "soft_switch", "wire_reasoning_effort"),
+    (
+        "request_kind",
+        "enabled",
+        "soft_switch",
+        "wire_reasoning_effort",
+        "expected_max_tokens",
+    ),
     [
-        ("extraction", False, "/no_think", None),
-        ("interpretation", True, "/think", "xhigh"),
+        ("extraction", False, "/no_think", None, 60_000),
+        ("interpretation", True, "/think", "xhigh", 100_000),
     ],
 )
 def test_qwen38_requests_use_hard_and_soft_thinking_controls(
@@ -3549,6 +3607,7 @@ def test_qwen38_requests_use_hard_and_soft_thinking_controls(
     enabled,
     soft_switch,
     wire_reasoning_effort,
+    expected_max_tokens,
 ):
     request_kwargs = {}
 
@@ -3580,7 +3639,7 @@ def test_qwen38_requests_use_hard_and_soft_thinking_controls(
     )
 
     assert result == '{"ok": true}'
-    assert request_kwargs["max_tokens"] == 100_000
+    assert request_kwargs["max_tokens"] == expected_max_tokens
     assert request_kwargs["messages"][-1]["content"].endswith(soft_switch)
     assert request_kwargs["extra_body"]["chat_template_kwargs"] == {
         "enable_thinking": enabled
@@ -7856,7 +7915,7 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path, monkeypatch):
         )
 
 
-def test_feature_definitions_resume_without_llm_calls_after_extractor_change(
+def test_feature_definitions_resume_without_llm_calls_after_extractor_transport_change(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -7883,10 +7942,11 @@ def test_feature_definitions_resume_without_llm_calls_after_extractor_change(
     output = tmp_path / "stage2"
     calls = []
 
-    def config(extraction_model):
+    def config(extraction_model, extraction_max_tokens):
         return PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
             model="same-primary",
+            extraction_max_tokens=extraction_max_tokens,
             max_prompt_chars=8_000,
             workers=2,
             required_architectures=(),
@@ -7901,7 +7961,7 @@ def test_feature_definitions_resume_without_llm_calls_after_extractor_change(
         handoff_path=handoff,
         output_dir=output,
         clinical_question="Identify confounders.",
-        config=config("extractor-a"),
+        config=config("extractor-a", 100_000),
         completion=_fake_completion(calls),
     )
     first_call_count = len(calls)
@@ -7915,7 +7975,7 @@ def test_feature_definitions_resume_without_llm_calls_after_extractor_change(
         handoff_path=handoff,
         output_dir=output,
         clinical_question="Identify confounders.",
-        config=config("extractor-b"),
+        config=config("extractor-b", 60_000),
         completion=_fake_completion(calls),
     )
 
@@ -7925,12 +7985,14 @@ def test_feature_definitions_resume_without_llm_calls_after_extractor_change(
         )
     )
     identity = json.loads((output / "model_identity.json").read_text(encoding="utf-8"))
+    resumed_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     assert len(calls) == first_call_count
     assert (
         second_completion["evidence_input_fingerprint"]
         == first_completion["evidence_input_fingerprint"]
     )
     assert identity["extraction"]["selected_model"] == "extractor-b"
+    assert resumed_config["extraction_max_tokens"] == 60_000
 
 
 def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(

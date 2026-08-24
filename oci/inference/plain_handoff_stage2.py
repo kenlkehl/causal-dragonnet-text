@@ -62,6 +62,11 @@ THINKING_RESPONSE_REPAIR_EFFORT = "high"
 # normally at EOS as soon as the validated JSON object is complete.
 MINIMUM_MAX_TOKENS = 100_000
 DEFAULT_MAX_TOKENS = MINIMUM_MAX_TOKENS
+# The small Gemma 4 E2B/E4B extractors have a 131,072-token context window.
+# Keep enough room for the one-patient prompt while retaining a generous
+# completion ceiling for validated JSON extraction.
+MINIMUM_EXTRACTION_MAX_TOKENS = 60_000
+DEFAULT_EXTRACTION_MAX_TOKENS = MINIMUM_EXTRACTION_MAX_TOKENS
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_INTERPRETATION_REASONING_EFFORT = "high"
 DEFAULT_EXTRACTION_REASONING_EFFORT = "none"
@@ -743,9 +748,15 @@ class PlainHandoffStage2Config:
     # request-kind policy.
     max_response_repairs: int = DEFAULT_MAX_RESPONSE_REPAIRS
     thinking_after_response_repairs: int = DEFAULT_THINKING_AFTER_RESPONSE_REPAIRS
-    # Every request receives this generous output ceiling. It never forces the
-    # model to generate this many tokens; normal EOS/stop behavior is unchanged.
+    # Primary-model interpretation requests receive this generous output
+    # ceiling. It never forces the model to generate this many tokens; normal
+    # EOS/stop behavior is unchanged.
     max_tokens: int = DEFAULT_MAX_TOKENS
+    # Patient extraction uses a smaller model and an independent ceiling so a
+    # long patient prompt plus the allowed completion fits smaller contexts.
+    # This transport-only limit is deliberately absent from feature-definition
+    # fingerprints, allowing completed discovery to resume under a safer cap.
+    extraction_max_tokens: int = DEFAULT_EXTRACTION_MAX_TOKENS
     interpretation_reasoning_effort: str = DEFAULT_INTERPRETATION_REASONING_EFFORT
     extraction_reasoning_effort: str = DEFAULT_EXTRACTION_REASONING_EFFORT
     max_prompt_chars: int = 100_000
@@ -852,6 +863,16 @@ class PlainHandoffStage2Config:
             raise ValueError(
                 "stage2.max_tokens must be an integer of at least "
                 f"{MINIMUM_MAX_TOKENS}; it is an output ceiling, not a minimum length"
+            )
+        if (
+            isinstance(self.extraction_max_tokens, bool)
+            or not isinstance(self.extraction_max_tokens, int)
+            or self.extraction_max_tokens < MINIMUM_EXTRACTION_MAX_TOKENS
+        ):
+            raise ValueError(
+                "stage2.extraction_max_tokens must be an integer of at least "
+                f"{MINIMUM_EXTRACTION_MAX_TOKENS}; it is an output ceiling, not a "
+                "minimum length"
             )
         for field_name, effort in (
             ("interpretation_reasoning_effort", self.interpretation_reasoning_effort),
@@ -1184,6 +1205,9 @@ def plain_stage2_config_from_mapping(
             )
         ),
         max_tokens=int(raw.get("max_tokens", DEFAULT_MAX_TOKENS)),
+        extraction_max_tokens=int(
+            raw.get("extraction_max_tokens", DEFAULT_EXTRACTION_MAX_TOKENS)
+        ),
         interpretation_reasoning_effort=interpretation_reasoning_effort,
         extraction_reasoning_effort=extraction_reasoning_effort,
         max_prompt_chars=int(raw.get("max_prompt_chars", 100_000)),
@@ -2039,7 +2063,7 @@ def _stage2_request_policy(
     config: PlainHandoffStage2Config,
     request_kind: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve one request's reasoning mode and generous output ceiling."""
+    """Resolve one request's reasoning mode and role-specific output ceiling."""
 
     kind = str(request_kind or config.runtime_request_kind).strip().lower()
     if kind not in STAGE2_REQUEST_KINDS:
@@ -2053,7 +2077,9 @@ def _stage2_request_policy(
     return {
         "request_kind": kind,
         "reasoning_effort": reasoning_effort,
-        "max_tokens": int(config.max_tokens),
+        "max_tokens": int(
+            config.extraction_max_tokens if kind == "extraction" else config.max_tokens
+        ),
         "repetition_penalty": float(config.repetition_penalty),
     }
 

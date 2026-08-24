@@ -107,6 +107,7 @@ at most two refinement rounds. Override these with
 `STAGE2_CONSOLIDATION_MAX_ROUNDS`,
 `STAGE2_OPERATIONALIZATION_MAX_PROMPT_CHARS`,
 `STAGE2_EXTRACTION_FEATURE_BATCH_SIZE`,
+`STAGE2_MAX_TOKENS`, `STAGE2_EXTRACTION_MAX_TOKENS`,
 `STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS`, and
 `STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS`.
 
@@ -676,6 +677,7 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     },
     "request_timeout": 7200,
     "max_tokens": 100000,
+    "extraction_max_tokens": 60000,
     "max_response_repairs": 10,
     "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
@@ -801,9 +803,11 @@ server command. Primary-model interpretation requests send
 evidence interpretation and audit, consolidation, operationalization, feature
 ontology supervision, category mapping, and ontology refinement. One-patient
 value-extraction requests use the configured small model with
-`reasoning_effort: "none"`. Both models may share an endpoint. Every request
-receives the configured `max_tokens` output ceiling (100,000 by default); this
-permits long output but does not force generation to that length. Stage 2
+`reasoning_effort: "none"`. Both models may share an endpoint. Primary-model
+requests receive the configured `max_tokens` output ceiling (100,000 by
+default), while patient extraction receives `extraction_max_tokens` (60,000 by
+default). These ceilings permit long output but do not force generation to
+their limits. Stage 2
 detects Qwen 3 (including 3.8), Gemma 4, and LFM 2.5 IDs and sends their
 template-level thinking switch, with portable prompt and request-field
 fallbacks for non-vLLM servers. It parses either separate reasoning fields or

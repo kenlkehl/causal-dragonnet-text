@@ -62,6 +62,7 @@ are:
       "workers": 32
     },
     "max_tokens": 100000,
+    "extraction_max_tokens": 60000,
     "max_response_repairs": 10,
     "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
@@ -86,8 +87,10 @@ aggregate ontology-review requests go to the primary model with
 `reasoning_effort: "high"`. One-patient value extraction alone goes to the
 configured `extraction_llm` model with `reasoning_effort: "none"`. The two
 models may use different endpoints or the same multi-model endpoint.
-`max_tokens` is a 100,000-token output ceiling on every request; it does not ask
-or force a model to generate that many tokens, and normal EOS stopping applies.
+`max_tokens` is the primary model's 100,000-token output ceiling;
+`extraction_max_tokens` is the patient extractor's 60,000-token ceiling. Neither
+asks nor forces a model to generate that many tokens, and normal EOS stopping
+applies.
 All Stage 2 completion requests send `repetition_penalty: 1.1` by default.
 Stage 2 probes `/models`, recognizes Qwen 3 (including 3.8), Gemma 4, and LFM
 2.5 IDs, and sends family-appropriate per-request thinking controls. It accepts
