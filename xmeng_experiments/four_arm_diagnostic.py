@@ -246,14 +246,14 @@ def run_four_arm(
     df_est = None
     if has_estimated:
         df_est = pd.read_parquet(estimated_features_path)
-        # Align by patient_id if present
+        # Align by patient_id if present; keep all extracted feature columns
+        EST_PREFIXES = ("explicit_feat_", "llm_extracted_")
         if "patient_id" in df.columns and "patient_id" in df_est.columns:
-            df_est = df.merge(
-                df_est[["patient_id"] + [c for c in df_est.columns
-                                         if c.startswith("explicit_feat_")]],
-                on="patient_id",
-                how="left",
-            )
+            est_cols = ["patient_id"] + [
+                c for c in df_est.columns
+                if any(c.startswith(p) for p in EST_PREFIXES)
+            ]
+            df_est = df.merge(df_est[est_cols], on="patient_id", how="left")
         else:
             df_est = df_est.reset_index(drop=True)
         print(f"Estimated features: {estimated_features_path}")
