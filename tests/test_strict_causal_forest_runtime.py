@@ -113,6 +113,16 @@ def _runtime(*, n_jobs=1):
     return StrictCausalForestRuntimeConfig.from_mapping(_runtime_mapping(n_jobs=n_jobs))
 
 
+def _binary_runtime(*, n_jobs=1):
+    mapping = _runtime_mapping(n_jobs=n_jobs)
+    mapping["causal_forest"]["discrete_outcome"] = True
+    outcome_model = copy.deepcopy(mapping["causal_forest"]["treatment_model"])
+    outcome_model["criterion"] = "log_loss"
+    outcome_model["max_features"] = 1.0
+    mapping["causal_forest"]["outcome_model"] = outcome_model
+    return StrictCausalForestRuntimeConfig.from_mapping(mapping)
+
+
 def _data():
     rng = np.random.RandomState(91)
     n = 96
@@ -357,6 +367,35 @@ def test_real_strict_fit_audits_attributes_clones_grfs_and_split_hashes():
         )
 
 
+def test_real_strict_binary_outcome_uses_classifier_and_joint_stratification():
+    effect, control, treatment, outcome = _data()
+    config = _binary_runtime()
+
+    head = CausalForestHead(runtime_config=config).fit(
+        X=effect,
+        W=control,
+        T=treatment,
+        Y=outcome,
+    )
+    audit = head.fit_audit()
+
+    assert type(head.model.model_y) is RandomForestClassifier
+    assert head.model.discrete_outcome is True
+    assert audit["outcome_model_contract"] == {
+        "outcome_type": "binary",
+        "discrete_outcome": True,
+        "model_class": "sklearn.ensemble.RandomForestClassifier",
+        "prediction_interface": "predict_proba",
+        "criterion": "log_loss",
+    }
+    assert audit["crossfit_split_audit"] == config.split_audit(treatment, outcome)
+    fitted = audit["fitted_estimator_audit"]
+    assert all(
+        model["criterion"] == "log_loss"
+        for model in fitted["fitted_outcome_models"][0]
+    )
+
+
 def test_prediction_calls_explicit_binary_treatment_contrast():
     class EffectSpy:
         def __init__(self):
@@ -374,6 +413,56 @@ def test_prediction_calls_explicit_binary_treatment_contrast():
     result = head.predict(values, return_ci=False)
     np.testing.assert_array_equal(result["tau_pred"], np.zeros(3))
     assert head.model.calls[0][1] == {"T0": 0, "T1": 1}
+
+
+@pytest.mark.parametrize(
+    ("outcome_type", "expected_class", "discrete_outcome", "prediction_interface"),
+    [
+        ("binary", RandomForestClassifier, True, "predict_proba"),
+        ("continuous", RandomForestRegressor, False, "predict"),
+    ],
+)
+def test_convenience_head_uses_outcome_typed_nuisance_model(
+    outcome_type,
+    expected_class,
+    discrete_outcome,
+    prediction_interface,
+):
+    head = CausalForestHead(
+        outcome_type=outcome_type,
+        n_estimators=8,
+        subforest_size=4,
+        min_samples_leaf=2,
+        nuisance_n_estimators=5,
+        tune_model=False,
+        n_jobs=1,
+    )
+
+    model = head._create_model()
+
+    assert type(model.model_y) is expected_class
+    assert model.discrete_outcome is discrete_outcome
+    assert head._configured_forest_parameters()["discrete_outcome"] is discrete_outcome
+    assert (
+        head._configured_nuisance_parameters()["outcome_model_contract"][
+            "prediction_interface"
+        ]
+        == prediction_interface
+    )
+
+
+def test_binary_convenience_head_rejects_nonbinary_outcomes():
+    head = CausalForestHead(
+        outcome_type="binary",
+        n_estimators=8,
+        subforest_size=4,
+        tune_model=False,
+    )
+    effect = np.ones((4, 1), dtype=float)
+    treatment = np.array([0, 1, 0, 1], dtype=float)
+
+    with pytest.raises(ValueError, match="must contain exactly both 0 and 1"):
+        head.fit(effect, treatment, np.array([0.0, 0.2, 0.8, 1.0]))
 
 
 def test_explicit_crossfit_preserves_implicit_cv2_predictions_and_n_jobs():
@@ -412,6 +501,7 @@ def test_explicit_crossfit_preserves_implicit_cv2_predictions_and_n_jobs():
         nuisance_treatment_max_features="sqrt",
         nuisance_outcome_max_features=1.0,
         n_jobs=1,
+        outcome_type="continuous",
     ).fit(
         X=effect,
         W=control,
@@ -434,6 +524,7 @@ def test_explicit_crossfit_preserves_implicit_cv2_predictions_and_n_jobs():
         nuisance_treatment_max_features="sqrt",
         nuisance_outcome_max_features=1.0,
         n_jobs=2,
+        outcome_type="continuous",
     ).fit(
         X=effect,
         W=control,

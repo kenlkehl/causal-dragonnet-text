@@ -1521,6 +1521,7 @@ class MultiModelForestStage1Runner:
             honest=self.cf_config.honest,
             inference=self.cf_config.inference,
             random_state=42 + int(outer_fold),
+            outcome_type=self.config.outcome_type,
         )
         forest.fit(X=x_train, T=t_train, Y=y_train, W=w_train)
         cf_preds = forest.predict(x_test, return_ci=True)

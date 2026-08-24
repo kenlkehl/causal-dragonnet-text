@@ -8472,10 +8472,39 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
         )
     )
     assert diagnostics["model_family"] == "causal_forest_dml"
+    assert diagnostics["causal_forest_fit_audit"]["outcome_model_contract"] == {
+        "outcome_type": "binary",
+        "discrete_outcome": True,
+        "model_class": "sklearn.ensemble.RandomForestClassifier",
+        "prediction_interface": "predict_proba",
+        "criterion": "gini",
+    }
     assert "extract_stage2_patient_variables" not in primary_calls
     assert extraction_calls
     assert set(extraction_calls) == {"extract_stage2_patient_variables"}
     calls_after_first = (len(primary_calls), len(extraction_calls))
+    extraction_path = output / "outer_001" / "extraction" / "extracted_features.csv"
+    selection_bytes = selection_path.read_bytes()
+    extraction_bytes = extraction_path.read_bytes()
+    estimation_complete_path = output / "outer_001" / "estimation" / "complete.json"
+    old_estimation_completion = json.loads(
+        estimation_complete_path.read_text(encoding="utf-8")
+    )
+    old_estimation_completion["schema_version"] = (
+        "stage2_outer_estimation_v4_causal_forest"
+    )
+    estimation_complete_path.write_text(
+        json.dumps(old_estimation_completion),
+        encoding="utf-8",
+    )
+    forest_fits = []
+    original_forest_fit = stage2_analysis.CausalForestHead.fit
+
+    def tracked_forest_fit(self, *args, **kwargs):
+        forest_fits.append(self.outcome_type)
+        return original_forest_fit(self, *args, **kwargs)
+
+    monkeypatch.setattr(stage2_analysis.CausalForestHead, "fit", tracked_forest_fit)
 
     second = run_plain_handoff_stage2(
         handoff_path=handoff,
@@ -8492,6 +8521,15 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
 
     assert second["causal_estimate"]["rows"] == 40
     assert (len(primary_calls), len(extraction_calls)) == calls_after_first
+    assert forest_fits == ["binary"]
+    assert selection_path.read_bytes() == selection_bytes
+    assert extraction_path.read_bytes() == extraction_bytes
+    resumed_estimation_completion = json.loads(
+        estimation_complete_path.read_text(encoding="utf-8")
+    )
+    assert resumed_estimation_completion["schema_version"] == (
+        stage2_analysis.ESTIMATION_CHECKPOINT_SCHEMA_VERSION
+    )
 
 
 def test_aggregate_supervisor_can_revise_then_reextract_a_definition(

@@ -30,6 +30,15 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_outcome_type(value: Any) -> str:
+    if not isinstance(value, str):
+        raise TypeError("outcome_type must be a string")
+    normalized = value.strip().lower()
+    if normalized not in {"binary", "continuous"}:
+        raise ValueError("outcome_type must be exactly 'binary' or 'continuous'")
+    return normalized
+
+
 def _validate_max_features(value: Any, *, name: str, allow_none: bool) -> None:
     if value is None:
         if allow_none:
@@ -112,6 +121,7 @@ class CausalForestHead:
         nuisance_outcome_max_features: Any = 1.0,
         n_jobs: int = -1,
         runtime_config: Optional[StrictCausalForestRuntimeConfig] = None,
+        outcome_type: Optional[str] = None,
     ):
         """
         Initialize Causal Forest head.
@@ -136,9 +146,14 @@ class CausalForestHead:
             nuisance_treatment_max_features: Feature sampling policy for the
                 treatment nuisance classifier.
             nuisance_outcome_max_features: Feature sampling policy for the
-                outcome nuisance regressor.
+                outcome nuisance model.
             n_jobs: Operational CPU parallelism for all three forests.  This
                 setting does not change the portable scientific identity.
+            outcome_type: ``"binary"`` selects a random-forest classifier and
+                EconML's discrete-outcome probability contract;
+                ``"continuous"`` selects a random-forest regressor. ``None``
+                preserves the historical convenience-path default of binary,
+                or derives the value from a strict runtime configuration.
 
         Note: Nuisance functions (propensity, outcome) are estimated using sklearn
         random forests on the neural network's learned features.
@@ -152,8 +167,21 @@ class CausalForestHead:
             if not isinstance(runtime_config, StrictCausalForestRuntimeConfig):
                 raise TypeError("runtime_config must be StrictCausalForestRuntimeConfig")
             scientific = runtime_config.causal_forest
+            strict_outcome_type = (
+                "binary" if bool(scientific.discrete_outcome) else "continuous"
+            )
+            if (
+                outcome_type is not None
+                and _normalize_outcome_type(outcome_type) != strict_outcome_type
+            ):
+                raise ValueError(
+                    "outcome_type disagrees with "
+                    "runtime_config.causal_forest.discrete_outcome"
+                )
             self.runtime_config = runtime_config
             self.runtime_mode = "portable_strict_runtime_config_v1"
+            self.outcome_type = strict_outcome_type
+            self.discrete_outcome = bool(scientific.discrete_outcome)
             self.n_estimators = int(scientific.n_estimators)
             self.max_depth = scientific.max_depth
             self.min_samples_leaf = scientific.min_samples_leaf
@@ -253,6 +281,9 @@ class CausalForestHead:
             name="nuisance_outcome_max_features",
             allow_none=True,
         )
+        normalized_outcome_type = _normalize_outcome_type(
+            "binary" if outcome_type is None else outcome_type
+        )
 
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -269,6 +300,8 @@ class CausalForestHead:
         self.nuisance_treatment_max_features = nuisance_treatment_max_features
         self.nuisance_outcome_max_features = nuisance_outcome_max_features
         self.n_jobs = n_jobs
+        self.outcome_type = normalized_outcome_type
+        self.discrete_outcome = normalized_outcome_type == "binary"
         self.requested_host_cpu_budget = None
         self.runtime_config = None
         self.runtime_mode = "legacy_compatibility_shim_v1"
@@ -294,6 +327,26 @@ class CausalForestHead:
             "inference": bool(self.inference),
             "subforest_size": int(self.subforest_size),
             "random_state": int(self.random_state),
+            "discrete_outcome": bool(self.discrete_outcome),
+        }
+
+    def _outcome_model_contract(self) -> Dict[str, Any]:
+        binary = self.outcome_type == "binary"
+        criterion = (
+            self.runtime_config.causal_forest.outcome_model.criterion
+            if self.runtime_config is not None
+            else ("gini" if binary else "squared_error")
+        )
+        return {
+            "outcome_type": self.outcome_type,
+            "discrete_outcome": bool(self.discrete_outcome),
+            "model_class": (
+                "sklearn.ensemble.RandomForestClassifier"
+                if binary
+                else "sklearn.ensemble.RandomForestRegressor"
+            ),
+            "prediction_interface": "predict_proba" if binary else "predict",
+            "criterion": criterion,
         }
 
     def _configured_nuisance_parameters(self) -> Dict[str, Any]:
@@ -304,6 +357,7 @@ class CausalForestHead:
             "treatment_max_features": self.nuisance_treatment_max_features,
             "outcome_max_features": self.nuisance_outcome_max_features,
             "random_state": int(self.random_state),
+            "outcome_model_contract": self._outcome_model_contract(),
         }
 
     def _operational_parameters(self) -> Dict[str, Any]:
@@ -339,7 +393,22 @@ class CausalForestHead:
             "treatment_max_features": self._estimator_parameter(model_t, "max_features"),
             "outcome_max_features": self._estimator_parameter(model_y, "max_features"),
             "random_state": self._estimator_parameter(model_t, "random_state"),
+            "outcome_model_contract": self._outcome_model_contract(),
         }
+        expected_outcome_class = (
+            RandomForestClassifier if self.discrete_outcome else RandomForestRegressor
+        )
+        if type(model_y) is not expected_outcome_class:
+            raise RuntimeError(
+                "outcome nuisance model class does not match the configured outcome_type"
+            )
+        if (
+            self._estimator_parameter(model_y, "criterion")
+            != result["outcome_model_contract"]["criterion"]
+        ):
+            raise RuntimeError(
+                "outcome nuisance criterion does not match the configured outcome_type"
+            )
         for shared_name in (
             "n_estimators",
             "max_depth",
@@ -398,19 +467,28 @@ class CausalForestHead:
         )
         logger.info("Using random forest for propensity estimation (on neural features)")
 
-        model_y = RandomForestRegressor(
+        outcome_model_class = (
+            RandomForestClassifier if self.discrete_outcome else RandomForestRegressor
+        )
+        model_y = outcome_model_class(
             n_estimators=self.nuisance_n_estimators,
+            criterion=self._outcome_model_contract()["criterion"],
             max_depth=self.nuisance_max_depth,
             min_samples_leaf=self.nuisance_min_samples_leaf,
             max_features=self.nuisance_outcome_max_features,
             random_state=self.random_state,
             n_jobs=self.n_jobs,
         )
-        logger.info("Using random forest for outcome estimation (on neural features)")
+        logger.info(
+            "Using %s for %s outcome estimation (on neural features)",
+            outcome_model_class.__name__,
+            self.outcome_type,
+        )
 
         model = CausalForestDML(
             model_t=model_t,
             model_y=model_y,
+            discrete_outcome=self.discrete_outcome,
             discrete_treatment=True,  # Binary treatment indicator
             n_estimators=self.n_estimators,
             max_depth=self.max_depth,
@@ -437,14 +515,18 @@ class CausalForestHead:
 
         if self.runtime_config is None:
             raise RuntimeError("strict model creation requires runtime_config")
+        outcome_forest_class = (
+            RandomForestClassifier if self.discrete_outcome else RandomForestRegressor
+        )
         assert_supported_constructor_signatures(
             causal_forest_class=CausalForestDML,
             treatment_forest_class=RandomForestClassifier,
-            outcome_forest_class=RandomForestRegressor,
+            outcome_forest_class=outcome_forest_class,
             stratified_crossfit_class=StratifiedKFold,
+            outcome_forest_is_classifier=self.discrete_outcome,
         )
         model_t = RandomForestClassifier(**self.runtime_config.treatment_constructor_kwargs())
-        model_y = RandomForestRegressor(**self.runtime_config.outcome_constructor_kwargs())
+        model_y = outcome_forest_class(**self.runtime_config.outcome_constructor_kwargs())
         crossfit = StratifiedKFold(**self.runtime_config.crossfit_constructor_kwargs())
         model = CausalForestDML(
             **self.runtime_config.causal_forest_constructor_kwargs(
@@ -458,7 +540,7 @@ class CausalForestHead:
             config=self.runtime_config,
             causal_forest_class=CausalForestDML,
             treatment_forest_class=RandomForestClassifier,
-            outcome_forest_class=RandomForestRegressor,
+            outcome_forest_class=outcome_forest_class,
             stratified_crossfit_class=StratifiedKFold,
         )
         return model
@@ -479,7 +561,7 @@ class CausalForestHead:
             X: Effect-modifier feature matrix, shape (n_samples, n_features), or None
             W: Optional control/confounder feature matrix passed to EconML W
             T: Binary treatment indicator, shape (n_samples,)
-            Y: Binary outcome indicator, shape (n_samples,)
+            Y: Binary or continuous outcome, as declared by ``outcome_type``.
             propensity: Optional propensity scores from neural network P(T=1|X)
             outcome_pred: Optional outcome predictions from neural network E[Y|X]
 
@@ -496,6 +578,16 @@ class CausalForestHead:
         # Ensure arrays are the right shape
         T = np.asarray(T).flatten()
         Y = np.asarray(Y).flatten()
+        if len(T) != len(Y):
+            raise ValueError("treatment and outcome must have the same number of rows")
+        if not np.isfinite(T).all() or not np.isfinite(Y).all():
+            raise ValueError("treatment and outcome must be finite")
+        if set(np.unique(T).tolist()) != {0, 1}:
+            raise ValueError("causal forest treatment must contain exactly 0 and 1")
+        if self.discrete_outcome and set(np.unique(Y).tolist()) != {0, 1}:
+            raise ValueError(
+                "binary causal forest outcome must contain exactly both 0 and 1"
+            )
         if self.runtime_config is not None:
             strict_x = np.asarray(X, dtype=float)
             strict_w = None if W is None else np.asarray(W, dtype=float)
@@ -505,7 +597,7 @@ class CausalForestHead:
                 treatment=T,
                 outcome=Y,
             )
-            self.crossfit_split_audit_ = self.runtime_config.split_audit(T)
+            self.crossfit_split_audit_ = self.runtime_config.split_audit(T, Y)
 
         self.model = self._create_model()
         self.tuning_attempted_ = bool(self.tune_model)
@@ -528,6 +620,9 @@ class CausalForestHead:
         # fit-time channel so no labels, weights, groups, or cached values can
         # arrive through an implicit call-site convention.
         if self.runtime_config is not None:
+            outcome_forest_class = (
+                RandomForestClassifier if self.discrete_outcome else RandomForestRegressor
+            )
             self.model.fit(
                 Y=Y,
                 T=T,
@@ -543,7 +638,7 @@ class CausalForestHead:
                 config=self.runtime_config,
                 causal_forest_class=CausalForestDML,
                 treatment_forest_class=RandomForestClassifier,
-                outcome_forest_class=RandomForestRegressor,
+                outcome_forest_class=outcome_forest_class,
                 stratified_crossfit_class=StratifiedKFold,
                 grf_class=EconMLCausalForest,
             )
@@ -583,6 +678,7 @@ class CausalForestHead:
                 )
             return {
                 "configuration_mode": self.runtime_mode,
+                "outcome_model_contract": self._outcome_model_contract(),
                 "runtime_schema_version": (self.runtime_config.schema_version),
                 "scientific_identity": (self.runtime_config.scientific_identity()),
                 "scientific_identity_sha256": (self.runtime_config.scientific_identity_sha256()),
@@ -614,6 +710,7 @@ class CausalForestHead:
             raise RuntimeError("CausalForestHead must be fit before requesting its audit")
         return {
             "configuration_mode": self.runtime_mode,
+            "outcome_model_contract": self._outcome_model_contract(),
             "configured_parameters": self._configured_forest_parameters(),
             "configured_nuisance_parameters": (self._configured_nuisance_parameters()),
             "operational_parameters": self._operational_parameters(),
@@ -724,6 +821,9 @@ class CausalForestHead:
             "n_jobs": self.n_jobs,
             "requested_host_cpu_budget": self.requested_host_cpu_budget,
             "runtime_mode": self.runtime_mode,
+            "outcome_type": self.outcome_type,
+            "discrete_outcome": self.discrete_outcome,
+            "outcome_model_contract": self._outcome_model_contract(),
             "runtime_config": (
                 None if self.runtime_config is None else self.runtime_config.as_dict()
             ),

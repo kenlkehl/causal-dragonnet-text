@@ -46,7 +46,9 @@ PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
 )
 REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_aggregate_ontology_supervisor_v1"
 REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_ontology_supervisor_convergence_v1"
-ESTIMATION_CHECKPOINT_SCHEMA_VERSION = "stage2_outer_estimation_v4_causal_forest"
+ESTIMATION_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_outer_estimation_v5_outcome_typed_causal_forest"
+)
 STATISTICAL_SELECTION_SCHEMA_VERSION = "stage2_inner_fold_univariate_selection_v2_loky_omnibus"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
 PENDING_CATEGORY_ONTOLOGY_SCHEMA_VERSION = "stage2_pending_category_ontology_v1"
@@ -7537,6 +7539,7 @@ def estimate_outer_fold(
             size for size in (4, 3, 2, 1) if int(estimation_trees) % size == 0
         ),
         n_jobs=1,
+        outcome_type=outcome_type,
     )
     causal_forest.fit(
         x_effect_fit,
@@ -7654,6 +7657,10 @@ def estimate_outer_fold(
             "status": "complete",
             "schema_version": ESTIMATION_CHECKPOINT_SCHEMA_VERSION,
             "input_fingerprint": estimation_input_fingerprint,
+            "outcome_type": outcome_type,
+            "outcome_model_contract": diagnostics["causal_forest_fit_audit"][
+                "outcome_model_contract"
+            ],
             "completed_at": _now(),
             "rows": len(heldout_ids),
         },

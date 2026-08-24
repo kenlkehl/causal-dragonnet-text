@@ -5705,6 +5705,7 @@ class AgenticAttentionVariableForestRunner:
             honest=self.cf_config.honest,
             inference=self.cf_config.inference,
             random_state=42 + fold_id,
+            outcome_type=self.config.outcome_type,
         )
         forest.fit(X=X_train, W=W_train, T=train_T, Y=train_Y)
         cf_preds = forest.predict(X_test, return_ci=True)

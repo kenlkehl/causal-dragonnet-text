@@ -35,7 +35,11 @@ from .plain_handoff_stage2_evidence import (
     SUPPORTED_STAGE2_ARCHITECTURES,
     compile_stage2_handoff_evidence,
 )
-from .plain_handoff_stage2_analysis import prompt_token_count, run_fold_analysis
+from .plain_handoff_stage2_analysis import (
+    ESTIMATION_CHECKPOINT_SCHEMA_VERSION,
+    prompt_token_count,
+    run_fold_analysis,
+)
 from .vllm_server_pool import (
     ManagedVLLMConfig,
     launch_managed_vllm_servers,
@@ -7290,10 +7294,21 @@ class PlainHandoffStage2:
         completion = (
             json.loads(complete_path.read_text(encoding="utf-8")) if complete_path.is_file() else {}
         )
+        estimation_complete_path = output_dir / "estimation" / "complete.json"
+        try:
+            estimation_completion = (
+                json.loads(estimation_complete_path.read_text(encoding="utf-8"))
+                if estimation_complete_path.is_file()
+                else {}
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            estimation_completion = {}
         if (
             completion.get("phase") == "causal_estimation"
             and final_features_path.is_file()
-            and (output_dir / "estimation" / "complete.json").is_file()
+            and estimation_completion.get("schema_version")
+            == ESTIMATION_CHECKPOINT_SCHEMA_VERSION
+            and estimation_completion.get("outcome_type") == outcome_type
         ):
             if definitions_state.get("evidence_input_fingerprint") != evidence_input_fingerprint:
                 raise RuntimeError(

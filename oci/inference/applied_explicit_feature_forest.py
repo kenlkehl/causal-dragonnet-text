@@ -150,6 +150,7 @@ def _fit_predict_split(
         f"W={0 if W_train is None else W_train.shape[1]}"
     )
 
+    outcome_type = getattr(config, "outcome_type", "binary")
     forest = CausalForestHead(
         n_estimators=cf_config.n_estimators,
         max_depth=cf_config.max_depth,
@@ -158,12 +159,12 @@ def _fit_predict_split(
         honest=cf_config.honest,
         inference=cf_config.inference,
         random_state=42,
+        outcome_type=outcome_type,
     )
     forest.fit(X_train, train_T, train_Y, W=W_train)
     cf_preds = forest.predict(X_test, return_ci=True)
     tau = cf_preds["tau_pred"]
 
-    outcome_type = getattr(config, "outcome_type", "binary")
     prop_rf = RandomForestClassifier(
         n_estimators=max(50, cf_config.n_estimators // 2),
         max_depth=cf_config.max_depth,

@@ -29,6 +29,7 @@ STRICT_CAUSAL_FOREST_OPERATIONAL_SCHEMA = "strict_causal_forest_operational_atte
 
 CAUSAL_FOREST_IMPLEMENTATION = "econml.dml.CausalForestDML"
 TREATMENT_FOREST_IMPLEMENTATION = "sklearn.ensemble.RandomForestClassifier"
+OUTCOME_CLASSIFIER_IMPLEMENTATION = "sklearn.ensemble.RandomForestClassifier"
 OUTCOME_FOREST_IMPLEMENTATION = "sklearn.ensemble.RandomForestRegressor"
 STRATIFIED_CROSSFIT_IMPLEMENTATION = "sklearn.model_selection.StratifiedKFold"
 
@@ -491,6 +492,25 @@ class StrictRandomForestClassifierSpec:
 
 
 @dataclass(frozen=True)
+class StrictOutcomeRandomForestClassifierSpec(StrictRandomForestClassifierSpec):
+    """Closed classifier specification used for a discrete outcome nuisance."""
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+    ) -> "StrictOutcomeRandomForestClassifierSpec":
+        fields = tuple(cls.__dataclass_fields__)
+        return cls(
+            **_closed_mapping(
+                value,
+                required=fields,
+                path="outcome_model",
+            )
+        )
+
+
+@dataclass(frozen=True)
 class StrictRandomForestRegressorSpec:
     implementation: str
     n_estimators: int
@@ -652,7 +672,9 @@ class StrictCausalForestDMLSpec:
     random_seed: int
     allow_missing: bool
     treatment_model: StrictRandomForestClassifierSpec
-    outcome_model: StrictRandomForestRegressorSpec
+    outcome_model: (
+        StrictOutcomeRandomForestClassifierSpec | StrictRandomForestRegressorSpec
+    )
 
     def __post_init__(self) -> None:
         _exact_literal(
@@ -666,14 +688,10 @@ class StrictCausalForestDMLSpec:
             raise ValueError("causal_forest.featurizer must be null")
         if self.treatment_featurizer is not None:
             raise ValueError("causal_forest.treatment_featurizer must be null")
-        if _bool(
+        discrete_outcome = _bool(
             self.discrete_outcome,
             name="causal_forest.discrete_outcome",
-        ):
-            raise ValueError(
-                "strict binary-outcome probability estimation preserves "
-                "discrete_outcome=false nuisance semantics"
-            )
+        )
         if not _bool(
             self.discrete_treatment,
             name="causal_forest.discrete_treatment",
@@ -774,8 +792,17 @@ class StrictCausalForestDMLSpec:
             raise ValueError("strict v1 requires allow_missing=false")
         if not isinstance(self.treatment_model, StrictRandomForestClassifierSpec):
             raise TypeError("causal_forest.treatment_model has the wrong type")
-        if not isinstance(self.outcome_model, StrictRandomForestRegressorSpec):
-            raise TypeError("causal_forest.outcome_model has the wrong type")
+        expected_outcome_spec = (
+            StrictOutcomeRandomForestClassifierSpec
+            if discrete_outcome
+            else StrictRandomForestRegressorSpec
+        )
+        if type(self.outcome_model) is not expected_outcome_spec:
+            expected_family = "classifier" if discrete_outcome else "regressor"
+            raise TypeError(
+                "causal_forest.outcome_model must be a random-forest "
+                f"{expected_family} when discrete_outcome={discrete_outcome}"
+            )
 
     def scientific_constructor_kwargs(self) -> dict[str, Any]:
         return {
@@ -831,7 +858,12 @@ class StrictCausalForestDMLSpec:
         data["treatment_model"] = StrictRandomForestClassifierSpec.from_mapping(
             data["treatment_model"]
         )
-        data["outcome_model"] = StrictRandomForestRegressorSpec.from_mapping(data["outcome_model"])
+        outcome_spec = (
+            StrictOutcomeRandomForestClassifierSpec
+            if _bool(data["discrete_outcome"], name="causal_forest.discrete_outcome")
+            else StrictRandomForestRegressorSpec
+        )
+        data["outcome_model"] = outcome_spec.from_mapping(data["outcome_model"])
         return cls(**data)
 
 
@@ -944,7 +976,12 @@ class StrictCausalForestRuntimeConfig:
         result = self.causal_forest.outcome_model.scientific_kwargs()
         result["n_jobs"] = 1
         result["verbose"] = int(self.operational.verbose)
-        return {name: result[name] for name in _OUTCOME_FOREST_SIGNATURE}
+        signature = (
+            _TREATMENT_FOREST_SIGNATURE
+            if self.causal_forest.discrete_outcome
+            else _OUTCOME_FOREST_SIGNATURE
+        )
+        return {name: result[name] for name in signature}
 
     def crossfit_constructor_kwargs(self) -> dict[str, Any]:
         return {
@@ -1002,14 +1039,21 @@ class StrictCausalForestRuntimeConfig:
             raise ValueError("strict causal forest labels must be finite")
         if set(np.unique(t).tolist()) != {0, 1}:
             raise ValueError("strict causal forest treatment must contain exactly 0 and 1")
-        if not set(np.unique(y).tolist()).issubset({0, 1}):
-            raise ValueError("strict v1 binary outcome must contain only 0 and 1")
-        class_counts = np.bincount(t.astype(np.int64), minlength=2)
+        if self.causal_forest.discrete_outcome and set(np.unique(y).tolist()) != {0, 1}:
+            raise ValueError("strict binary outcome must contain exactly both 0 and 1")
+        strata = _strict_crossfit_strata(
+            treatment=t,
+            outcome=y,
+            discrete_outcome=bool(self.causal_forest.discrete_outcome),
+        )
+        _, class_counts = np.unique(strata, return_counts=True)
         n_splits = int(self.causal_forest.crossfit.n_splits)
         if int(class_counts.min()) < n_splits:
-            raise ValueError("crossfit.n_splits exceeds the smallest treatment-class count")
-        if self.causal_forest.outcome_model.criterion == "poisson" and (
-            (y < 0).any() or float(y.sum()) <= 0.0
+            raise ValueError("crossfit.n_splits exceeds the smallest discrete-stratum count")
+        if (
+            isinstance(self.causal_forest.outcome_model, StrictRandomForestRegressorSpec)
+            and self.causal_forest.outcome_model.criterion == "poisson"
+            and ((y < 0).any() or float(y.sum()) <= 0.0)
         ):
             raise ValueError(
                 "Poisson nuisance outcome fitting requires nonnegative "
@@ -1039,7 +1083,12 @@ class StrictCausalForestRuntimeConfig:
                 "the fit rows when inference is enabled"
             )
         smallest_crossfit_train = min(
-            len(train) for train, _ in _crossfit_splits(self, treatment=t.astype(np.int64))
+            len(train)
+            for train, _ in _crossfit_splits(
+                self,
+                treatment=t.astype(np.int64),
+                outcome=y,
+            )
         )
         for label, spec in (
             ("treatment_model", self.causal_forest.treatment_model),
@@ -1053,8 +1102,12 @@ class StrictCausalForestRuntimeConfig:
                     f"integer {label}.max_samples exceeds a cross-fit " "training partition"
                 )
 
-    def split_audit(self, treatment: np.ndarray) -> dict[str, Any]:
-        splits = _crossfit_splits(self, treatment=treatment)
+    def split_audit(
+        self,
+        treatment: np.ndarray,
+        outcome: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        splits = _crossfit_splits(self, treatment=treatment, outcome=outcome)
         records = []
         for fold_index, (train, test) in enumerate(splits):
             records.append(
@@ -1092,10 +1145,16 @@ def _crossfit_splits(
     config: StrictCausalForestRuntimeConfig,
     *,
     treatment: np.ndarray,
+    outcome: np.ndarray | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     from sklearn.model_selection import StratifiedKFold
 
     vector = np.asarray(treatment).reshape(-1)
+    strata = _strict_crossfit_strata(
+        treatment=vector,
+        outcome=outcome,
+        discrete_outcome=bool(config.causal_forest.discrete_outcome),
+    )
     splitter = StratifiedKFold(**config.crossfit_constructor_kwargs())
     return [
         (
@@ -1104,9 +1163,34 @@ def _crossfit_splits(
         )
         for train, test in splitter.split(
             np.zeros((len(vector), 1), dtype=np.uint8),
-            vector,
+            strata,
         )
     ]
+
+
+def _strict_crossfit_strata(
+    *,
+    treatment: np.ndarray,
+    outcome: np.ndarray | None,
+    discrete_outcome: bool,
+) -> np.ndarray:
+    """Match EconML's deterministic encoding of its discrete stratification arrays."""
+
+    treatment_vector = np.asarray(treatment).reshape(-1)
+    arrays = []
+    if discrete_outcome:
+        if outcome is None:
+            raise ValueError("outcome is required to audit discrete-outcome cross-fitting")
+        outcome_vector = np.asarray(outcome).reshape(-1)
+        if len(outcome_vector) != len(treatment_vector):
+            raise ValueError("outcome must align to treatment for cross-fitting")
+        arrays.append(outcome_vector)
+    arrays.append(treatment_vector)
+    strata = np.zeros(len(treatment_vector), dtype=np.int64)
+    for values in arrays:
+        classes, encoded = np.unique(values, return_inverse=True)
+        strata = encoded + strata * len(classes)
+    return strata
 
 
 def _index_sha256(values: np.ndarray) -> str:
@@ -1128,13 +1212,18 @@ def assert_supported_constructor_signatures(
     treatment_forest_class: type[Any],
     outcome_forest_class: type[Any],
     stratified_crossfit_class: type[Any],
+    outcome_forest_is_classifier: bool = False,
 ) -> dict[str, tuple[str, ...]]:
     """Fail if an installed constructor parameter has not been classified."""
 
     expected = {
         "causal_forest": _CAUSAL_FOREST_SIGNATURE,
         "treatment_forest": _TREATMENT_FOREST_SIGNATURE,
-        "outcome_forest": _OUTCOME_FOREST_SIGNATURE,
+        "outcome_forest": (
+            _TREATMENT_FOREST_SIGNATURE
+            if outcome_forest_is_classifier
+            else _OUTCOME_FOREST_SIGNATURE
+        ),
         "stratified_crossfit": _STRATIFIED_CROSSFIT_SIGNATURE,
     }
     actual = {
@@ -1146,7 +1235,11 @@ def assert_supported_constructor_signatures(
     expected_kinds = {
         "causal_forest": _CAUSAL_FOREST_SIGNATURE_KINDS,
         "treatment_forest": _TREATMENT_FOREST_SIGNATURE_KINDS,
-        "outcome_forest": _OUTCOME_FOREST_SIGNATURE_KINDS,
+        "outcome_forest": (
+            _TREATMENT_FOREST_SIGNATURE_KINDS
+            if outcome_forest_is_classifier
+            else _OUTCOME_FOREST_SIGNATURE_KINDS
+        ),
         "stratified_crossfit": (_STRATIFIED_CROSSFIT_SIGNATURE_KINDS),
     }
     owners = {
@@ -1453,6 +1546,7 @@ def audit_strict_fitted_estimator(
 
 __all__ = [
     "CAUSAL_FOREST_IMPLEMENTATION",
+    "OUTCOME_CLASSIFIER_IMPLEMENTATION",
     "OUTCOME_FOREST_IMPLEMENTATION",
     "STRICT_CAUSAL_FOREST_OPERATIONAL_SCHEMA",
     "STRICT_CAUSAL_FOREST_RUNTIME_SCHEMA",
@@ -1462,6 +1556,7 @@ __all__ = [
     "StrictCausalForestOperationalSpec",
     "StrictCausalForestRuntimeConfig",
     "StrictRandomForestClassifierSpec",
+    "StrictOutcomeRandomForestClassifierSpec",
     "StrictRandomForestRegressorSpec",
     "StrictStratifiedKFoldSpec",
     "TREATMENT_FOREST_IMPLEMENTATION",
