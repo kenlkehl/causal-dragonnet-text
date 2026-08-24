@@ -23,6 +23,35 @@ from oci.inference.plain_handoff_stage2 import (
 from oci.inference.plain_handoff_stage2_analysis import extract_rows, run_fold_analysis
 
 
+class _CharacterChatTokenizer:
+    """Deterministic test tokenizer with one token per rendered character."""
+
+    def __call__(
+        self,
+        text,
+        *,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    ):
+        del add_special_tokens, return_attention_mask
+        return {"input_ids": list(range(len(str(text))))}
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize=True,
+        add_generation_prompt=True,
+    ):
+        assert tokenize is True
+        rendered = "".join(
+            f"<{message['role']}>{message['content']}" for message in messages
+        )
+        if add_generation_prompt:
+            rendered += "<assistant>"
+        return list(range(len(rendered)))
+
+
 def _original_evidence_packets(packet_ids):
     return [
         {
@@ -102,7 +131,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.max_response_repairs == 10
     assert config.thinking_after_response_repairs == 5
     assert config.max_tokens == 100_000
-    assert config.extraction_max_tokens == 60_000
+    assert config.extraction_max_tokens == 75_000
     assert config.repetition_penalty == 1.1
     assert config.interpretation_reasoning_effort == "high"
     assert config.extraction_reasoning_effort == "none"
@@ -119,6 +148,9 @@ def test_stage2_config_allows_endpoint_without_model():
     )
     assert config.extraction_max_prompt_chars == 640_000
     assert config.extraction_feature_batch_size == 10
+    assert config.extraction_chunk_size_tokens == 50_000
+    assert config.extraction_context_window_tokens == 131_072
+    assert config.extraction_context_margin_tokens == 1_024
     assert config.ontology_refinement_min_failure_patients == 3
     assert config.max_ontology_refinement_rounds == 2
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
@@ -192,6 +224,9 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "consolidation_max_rounds": 7,
             "extraction_max_prompt_chars": 500_000,
             "extraction_feature_batch_size": 7,
+            "extraction_chunk_size_tokens": 41_000,
+            "extraction_context_window_tokens": 160_000,
+            "extraction_context_margin_tokens": 2_000,
             "extraction_llm": {
                 "endpoint": "http://extract.test/v1",
                 "model": "small-model",
@@ -225,6 +260,9 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.consolidation_max_rounds == 7
     assert config.extraction_max_prompt_chars == 500_000
     assert config.extraction_feature_batch_size == 7
+    assert config.extraction_chunk_size_tokens == 41_000
+    assert config.extraction_context_window_tokens == 160_000
+    assert config.extraction_context_margin_tokens == 2_000
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
     assert config.extraction_llm.endpoint == "http://extract.test/v1"
@@ -249,6 +287,9 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.public_dict()["consolidation_max_rounds"] == 7
     assert config.public_dict()["extraction_max_prompt_chars"] == 500_000
     assert config.public_dict()["extraction_feature_batch_size"] == 7
+    assert config.public_dict()["extraction_chunk_size_tokens"] == 41_000
+    assert config.public_dict()["extraction_context_window_tokens"] == 160_000
+    assert config.public_dict()["extraction_context_margin_tokens"] == 2_000
     assert config.public_dict()["ontology_refinement_min_failure_patients"] == 4
     assert config.public_dict()["max_ontology_refinement_rounds"] == 3
     assert config.public_dict()["extraction_llm"]["api_key"] == "<redacted>"
@@ -476,6 +517,20 @@ def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
             endpoint="http://stage2.test/v1",
             model="test-model",
             extraction_feature_batch_size=0,
+        ).validate()
+
+    with pytest.raises(ValueError, match="extraction_chunk_size_tokens"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_chunk_size_tokens=0,
+        ).validate()
+
+    with pytest.raises(ValueError, match="context window must exceed"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_context_window_tokens=76_024,
         ).validate()
 
 
@@ -1119,6 +1174,47 @@ def test_json_repair_enables_thinking_after_five_repairs():
         )
 
 
+def test_extraction_repairs_dynamically_cap_output_to_the_remaining_context():
+    attempts = []
+
+    def counter(messages):
+        return 10 + sum(len(message["content"]) for message in messages)
+
+    def completion(messages, request_config):
+        prompt_tokens = counter(messages)
+        output_cap = stage2_workflow._stage2_request_policy(request_config)["max_tokens"]
+        attempts.append((prompt_tokens, output_cap))
+        return "{}" if len(attempts) == 1 else '{"ok": true}'
+
+    result = stage2_workflow._request_json(
+        messages=[
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": "x" * 300},
+        ],
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_max_tokens=75_000,
+            max_prompt_chars=4_000,
+        ),
+        completion=completion,
+        validate=lambda value: (
+            dict(value)
+            if value.get("ok") is True
+            else (_ for _ in ()).throw(ValueError("missing ok=true"))
+        ),
+        request_kind="extraction",
+        prompt_token_counter=counter,
+        context_window_tokens=1_000,
+        context_margin_tokens=100,
+    )
+
+    assert result == {"ok": True}
+    assert len(attempts) == 2
+    assert all(prompt + output + 100 <= 1_000 for prompt, output in attempts)
+    assert all(output < 75_000 for _prompt, output in attempts)
+
+
 def test_output_length_repair_explicitly_requests_a_shorter_complete_object():
     message = stage2_workflow._repair_message(
         stage2_workflow._Stage2OutputLengthError(
@@ -1560,6 +1656,173 @@ def test_stage2_extraction_batches_features_by_default_and_accepts_override(
         max_prompt_chars=100_000,
     )
     pd.testing.assert_frame_equal(resumed, frame)
+
+
+def test_stage2_serial_extraction_carries_state_across_lossless_token_chunks_and_resumes(
+    tmp_path: Path,
+):
+    definitions = [
+        {
+            "name": f"feature_{index}",
+            "description": "A clinical score.",
+            "value_type": "continuous",
+            "categories_or_unit": ["score"],
+            "measurement_definition": "Extract the documented score.",
+            "missing_value_rule": "Return null when undocumented.",
+            "conflict_resolution": {
+                "strategy": "latest",
+                "positive_category": None,
+            },
+        }
+        for index in range(3)
+    ]
+    note = ("a" * 450) + " EVIDENCE " + ("b" * 450)
+    output = tmp_path / "serial"
+    tokenizer = _CharacterChatTokenizer()
+    bodies = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        assert request_kind == "extraction"
+        body = json.loads(messages[1]["content"])
+        assert body["job"] == "update_stage2_patient_variables_serially"
+        bodies.append(body)
+        patient = body["patient"]
+        prior = patient["prior_extraction"]
+        prior_state = patient["prior_feature_state"]
+        values = {
+            name: (
+                int(name.removeprefix("feature_"))
+                if "EVIDENCE" in patient["current_chunk"]
+                else prior[name]
+            )
+            for name in prior
+        }
+        state = {
+            name: (
+                "documented in the EVIDENCE chunk"
+                if "EVIDENCE" in patient["current_chunk"]
+                else prior_state[name]
+            )
+            for name in prior
+        }
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "values": values,
+                        "carry_forward_state": state,
+                    }
+                ]
+            }
+        )
+
+    kwargs = {
+        "dataset": pd.DataFrame({"clinical_text": [note]}),
+        "row_ids": [0],
+        "text_column": "clinical_text",
+        "definitions": definitions,
+        "output_dir": output,
+        "workers": 1,
+        "max_prompt_chars": 100_000,
+        "feature_batch_size": 2,
+        "tokenizer": tokenizer,
+        "chunk_size_tokens": 200,
+        "context_window_tokens": 6_000,
+        "max_output_tokens": 500,
+        "context_margin_tokens": 200,
+    }
+    frame = extract_rows(request_json=request_json, **kwargs)
+
+    assert frame.loc[0, "feature_0"] == 0.0
+    assert frame.loc[0, "feature_1"] == 1.0
+    assert frame.loc[0, "feature_2"] == 2.0
+    assert len(bodies) > 2
+    assert all(
+        body["patient"]["prior_extraction"][name] == int(name.removeprefix("feature_"))
+        for body in bodies
+        for name in body["patient"]["prior_extraction"]
+        if body["patient"]["chunk"]["char_start"] > note.index("EVIDENCE") + len("EVIDENCE")
+    )
+    assert all(
+        body["patient"]["prior_feature_state"][name]
+        == "documented in the EVIDENCE chunk"
+        for body in bodies
+        for name in body["patient"]["prior_feature_state"]
+        if body["patient"]["chunk"]["char_start"]
+        > note.index("EVIDENCE") + len("EVIDENCE")
+    )
+
+    feature_dirs = sorted(
+        (output / "batches" / "batch_00001" / "feature_batches").glob("batch_*")
+    )
+    assert len(feature_dirs) == 2
+    for feature_dir in feature_dirs:
+        inputs = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted((feature_dir / "serial_chunks").glob("chunk_*/input.json"))
+        ]
+        assert "".join(value["chunk"]["text"] for value in inputs) == note
+        assert all(value["chunk"]["source_tokens"] <= 200 for value in inputs)
+        assert all(value["chunk"]["prompt_tokens"] <= 5_300 for value in inputs)
+        manifest = json.loads(
+            (feature_dir / "serial_extraction.json").read_text(encoding="utf-8")
+        )
+        assert manifest["lossless_source_coverage"] is True
+
+    def unexpected_request(_messages, _validate, *, request_kind="interpretation"):
+        raise AssertionError("completed serial chunks should be reused")
+
+    parent_dir = output / "batches" / "batch_00001"
+    (parent_dir / "complete.json").unlink()
+    (parent_dir / "result.json").unlink()
+    resumed = extract_rows(request_json=unexpected_request, **kwargs)
+    pd.testing.assert_frame_equal(resumed, frame)
+
+
+def test_stage2_tokenizer_keeps_short_patient_extraction_one_shot(tmp_path: Path):
+    jobs = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        body = json.loads(messages[1]["content"])
+        jobs.append(body["job"])
+        patient = body["patients"][0]
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "values": {"age": 67},
+                    }
+                ]
+            }
+        )
+
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": ["Age 67."]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[
+            {
+                "name": "age",
+                "value_type": "continuous",
+                "categories_or_unit": ["years"],
+            }
+        ],
+        output_dir=tmp_path / "short",
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=100_000,
+        tokenizer=_CharacterChatTokenizer(),
+        chunk_size_tokens=50_000,
+        context_window_tokens=10_000,
+        max_output_tokens=1_000,
+        context_margin_tokens=200,
+    )
+
+    assert jobs == ["extract_stage2_patient_variables"]
+    assert frame.loc[0, "age"] == 67.0
+    assert not list((tmp_path / "short").glob("**/serial_complete.json"))
 
 
 def test_stage2_extraction_prompt_does_not_ascii_escape_clinical_text():
@@ -3532,9 +3795,9 @@ def test_empty_model_response_is_a_retryable_call_failure():
 
 @pytest.mark.parametrize(
     ("request_kind", "reasoning_effort", "max_tokens"),
-    [
-        ("interpretation", "high", 100_000),
-        ("extraction", "none", 60_000),
+        [
+            ("interpretation", "high", 100_000),
+            ("extraction", "none", 75_000),
     ],
 )
 def test_openai_completion_sends_request_scoped_reasoning_and_token_cap(
@@ -3596,8 +3859,8 @@ def test_openai_completion_sends_request_scoped_reasoning_and_token_cap(
         "wire_reasoning_effort",
         "expected_max_tokens",
     ),
-    [
-        ("extraction", False, "/no_think", None, 60_000),
+        [
+            ("extraction", False, "/no_think", None, 75_000),
         ("interpretation", True, "/think", "xhigh", 100_000),
     ],
 )

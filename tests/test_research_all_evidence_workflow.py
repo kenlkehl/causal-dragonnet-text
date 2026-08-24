@@ -895,6 +895,12 @@ def test_saved_run_config_can_start_stage2_with_endpoint_only(tmp_path):
             "150000",
             "--stage2-extraction-max-tokens",
             "70000",
+            "--stage2-extraction-chunk-size-tokens",
+            "45000",
+            "--stage2-extraction-context-window-tokens",
+            "140000",
+            "--stage2-extraction-context-margin-tokens",
+            "1500",
         ]
     )
 
@@ -910,6 +916,9 @@ def test_saved_run_config_can_start_stage2_with_endpoint_only(tmp_path):
     assert resumed.stage2.selection_workers == 6
     assert resumed.stage2.max_tokens == 150_000
     assert resumed.stage2.extraction_max_tokens == 70_000
+    assert resumed.stage2.extraction_chunk_size_tokens == 45_000
+    assert resumed.stage2.extraction_context_window_tokens == 140_000
+    assert resumed.stage2.extraction_context_margin_tokens == 1_500
     assert resumed.clinical_question == original.clinical_question
     assert resumed.unit_id_column == original.unit_id_column
     assert resumed.htr_enabled == original.htr_enabled

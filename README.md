@@ -677,7 +677,7 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     },
     "request_timeout": 7200,
     "max_tokens": 100000,
-    "extraction_max_tokens": 60000,
+    "extraction_max_tokens": 75000,
     "max_response_repairs": 10,
     "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
@@ -692,6 +692,9 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "consolidation_alphabetical_rounds": 5,
     "consolidation_max_rounds": 55,
     "extraction_feature_batch_size": 10,
+    "extraction_chunk_size_tokens": 50000,
+    "extraction_context_window_tokens": 131072,
+    "extraction_context_margin_tokens": 1024,
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
@@ -805,9 +808,10 @@ ontology supervision, category mapping, and ontology refinement. One-patient
 value-extraction requests use the configured small model with
 `reasoning_effort: "none"`. Both models may share an endpoint. Primary-model
 requests receive the configured `max_tokens` output ceiling (100,000 by
-default), while patient extraction receives `extraction_max_tokens` (60,000 by
+default), while patient extraction receives `extraction_max_tokens` (75,000 by
 default). These ceilings permit long output but do not force generation to
-their limits. Stage 2
+their limits. Extraction dynamically lowers that ceiling for a repair attempt
+when retaining it would exceed the remaining context. Stage 2
 detects Qwen 3 (including 3.8), Gemma 4, and LFM 2.5 IDs and sends their
 template-level thinking switch, with portable prompt and request-field
 fallbacks for non-vLLM servers. It parses either separate reasoning fields or
@@ -885,7 +889,17 @@ example and validation rules.
 Stage 2 extraction is permanently isolated to one patient per model prompt. It
 queries at most `stage2.extraction_feature_batch_size` definitions per prompt
 (10 by default), checkpoints each feature slice, and merges the slices before
-review. The CLI equivalent is `--stage2-extraction-feature-batch-size`.
+review. A record longer than the available prompt envelope is processed in
+source order with lossless contiguous chunks capped by
+`stage2.extraction_chunk_size_tokens` (50,000 by default). Each validated
+structured extraction becomes the prior state for the next chunk. The planner
+counts the extraction model's chat tokens and shrinks a chunk when definitions
+or carried state need more room under `extraction_context_window_tokens`
+(131,072) and `extraction_context_margin_tokens` (1,024). Chunk results are
+independently checkpointed, so a restart resumes at the first unfinished chunk.
+The extraction model's tokenizer must therefore be available locally under its
+configured model ID (the managed vLLM download directory or Hugging Face cache).
+The CLI equivalents begin with `--stage2-extraction-*`.
 Concurrency is controlled by `stage2.extraction_llm.workers`; patient batching
 is not configurable.
 

@@ -29,6 +29,9 @@ stage2_extraction_workers="${STAGE2_EXTRACTION_WORKERS:-}"
 stage2_selection_workers="${STAGE2_SELECTION_WORKERS:-}"
 stage2_max_tokens="${STAGE2_MAX_TOKENS:-}"
 stage2_extraction_max_tokens="${STAGE2_EXTRACTION_MAX_TOKENS:-}"
+stage2_extraction_chunk_size_tokens="${STAGE2_EXTRACTION_CHUNK_SIZE_TOKENS:-}"
+stage2_extraction_context_window_tokens="${STAGE2_EXTRACTION_CONTEXT_WINDOW_TOKENS:-}"
+stage2_extraction_context_margin_tokens="${STAGE2_EXTRACTION_CONTEXT_MARGIN_TOKENS:-}"
 stage2_vllm_servers="${STAGE2_VLLM_SERVERS:-0}"
 stage2_vllm_gpus="${STAGE2_VLLM_GPUS:-}"
 stage2_vllm_gpus_per_server="${STAGE2_VLLM_GPUS_PER_SERVER:-}"
@@ -287,6 +290,21 @@ fi
 if [[ -n "${stage2_extraction_max_tokens}" ]]; then
     stage2_policy_args+=(
         --stage2-extraction-max-tokens "${stage2_extraction_max_tokens}"
+    )
+fi
+if [[ -n "${stage2_extraction_chunk_size_tokens}" ]]; then
+    stage2_policy_args+=(
+        --stage2-extraction-chunk-size-tokens "${stage2_extraction_chunk_size_tokens}"
+    )
+fi
+if [[ -n "${stage2_extraction_context_window_tokens}" ]]; then
+    stage2_policy_args+=(
+        --stage2-extraction-context-window-tokens "${stage2_extraction_context_window_tokens}"
+    )
+fi
+if [[ -n "${stage2_extraction_context_margin_tokens}" ]]; then
+    stage2_policy_args+=(
+        --stage2-extraction-context-margin-tokens "${stage2_extraction_context_margin_tokens}"
     )
 fi
 if [[ -n "${stage2_operationalization_max_prompt_chars}" ]]; then

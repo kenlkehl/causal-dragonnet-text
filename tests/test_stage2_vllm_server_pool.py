@@ -653,6 +653,10 @@ def test_managed_resume_after_extraction_starts_loads_all_gpu_extractor_immediat
 
     def fake_run(self, **kwargs):
         assert kwargs["dataset"] is not None
+        assert isinstance(
+            self.extraction_tokenizer,
+            stage2_workflow._LazyStage2ExtractionTokenizer,
+        )
         lifecycle.append("stage2")
         return {"phase": "causal_estimation"}
 

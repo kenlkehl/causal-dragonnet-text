@@ -61,6 +61,17 @@ HARMONIZATION_FALLBACK_SCHEMA_VERSION = "stage2_mixed_value_harmonization_fallba
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE = 10
+DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS = 50_000
+DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS = 131_072
+DEFAULT_EXTRACTION_MAX_TOKENS = 75_000
+DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS = 1_024
+SERIAL_EXTRACTION_CHUNK_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_serial_patient_feature_chunk_v1_carried_validated_state"
+)
+SERIAL_EXTRACTION_MANIFEST_SCHEMA_VERSION = (
+    "stage2_serial_patient_feature_extraction_v1_lossless_ordered_chunks"
+)
+MAX_SERIAL_FEATURE_STATE_CHARS = 2_048
 DEFAULT_SCREENING_TREES = 200
 DEFAULT_MAX_EVALUATION_ROUNDS = 10
 DEFAULT_STABILITY_SELECTION_ROUNDS = 3
@@ -182,6 +193,27 @@ def _configured_extraction_feature_batch_size(config: Any) -> int:
             DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE,
         )
     )
+
+
+def _configured_serial_extraction(config: Any) -> dict[str, int]:
+    """Read token-window settings from current or pre-serial configs."""
+
+    defaults = {
+        "chunk_size_tokens": DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS,
+        "context_window_tokens": DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS,
+        "max_output_tokens": DEFAULT_EXTRACTION_MAX_TOKENS,
+        "context_margin_tokens": DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS,
+    }
+    names = {
+        "chunk_size_tokens": "extraction_chunk_size_tokens",
+        "context_window_tokens": "extraction_context_window_tokens",
+        "max_output_tokens": "extraction_max_tokens",
+        "context_margin_tokens": "extraction_context_margin_tokens",
+    }
+    return {
+        key: int(getattr(config, attribute, defaults[key]))
+        for key, attribute in names.items()
+    }
 
 
 def _value_fingerprint(value: Any) -> str:
@@ -859,6 +891,7 @@ def _request_validated_extraction(
     definitions: Sequence[Mapping[str, Any]],
     request_json: RequestJSON,
     ontology_audit_path: Path,
+    validate_response: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Extract rows, then recover closed-category failures without resending notes."""
 
@@ -872,6 +905,15 @@ def _request_validated_extraction(
     )
     issue_events: list[dict[str, Any]] = []
     pending_value_repair_audit: dict[str, Any] | None = None
+
+    def validate_candidate(value: Mapping[str, Any]) -> dict[str, Any]:
+        if validate_response is not None:
+            return validate_response(value)
+        return _validate_extraction(
+            value,
+            row_ids=row_ids,
+            definitions=definitions,
+        )
 
     def request_or_resume_pending_category() -> dict[str, Any]:
         nonlocal pending_value_repair_audit
@@ -921,11 +963,7 @@ def _request_validated_extraction(
                 pending_path.unlink(missing_ok=True)
         validated_response = request_json(
             messages,
-            lambda value: _validate_extraction(
-                value,
-                row_ids=row_ids,
-                definitions=definitions,
-            ),
+            validate_candidate,
             request_kind="extraction",
         )
         pending_path.unlink(missing_ok=True)
@@ -965,11 +1003,7 @@ def _request_validated_extraction(
                 "issues": [dict(issue) for issue in value_error.issues],
             }
             try:
-                validated = _validate_extraction(
-                    patched,
-                    row_ids=row_ids,
-                    definitions=definitions,
-                )
+                validated = validate_candidate(patched)
             except _ExtractionCategoryError as patched_category_error:
                 category_error = patched_category_error
             else:
@@ -1110,11 +1144,7 @@ def _request_validated_extraction(
         corrections=corrections,
         targets=targets,
     )
-    validated = _validate_extraction(
-        patched,
-        row_ids=row_ids,
-        definitions=definitions,
-    )
+    validated = validate_candidate(patched)
     if value_repair_audit is not None:
         _write_json(
             ontology_audit_path.with_name("invalid_feature_value_repair.json"),
@@ -1308,6 +1338,78 @@ def _extraction_prompt(
     ]
 
 
+def _serial_extraction_prompt(
+    *,
+    definitions: Sequence[Mapping[str, Any]],
+    row_id: int,
+    chunk_text: str,
+    prior_values: Mapping[str, Any],
+    prior_feature_state: Mapping[str, Any],
+    chunk_index: int,
+    char_start: int,
+    char_end: int,
+    document_chars: int,
+) -> list[dict[str, str]]:
+    """Update one validated cumulative extraction with the next source chunk."""
+
+    body = {
+        "job": "update_stage2_patient_variables_serially",
+        "rules": [
+            "Process this clinical-text chunk after every earlier chunk and before every later chunk.",
+            "prior_extraction contains the validated cumulative scalar values from all earlier contiguous chunks; it is state, not additional clinical text.",
+            "prior_feature_state contains concise decision metadata retained from earlier chunks, such as the governing date and source order for latest/earliest or value counts for mode.",
+            "Use only prior_extraction and the supplied current_chunk. Never infer evidence from a feature description or from chunk metadata.",
+            "For each feature, combine supported evidence in the current chunk with the prior cumulative value and apply that feature's conflict_resolution policy literally.",
+            "Preserve a nonnull prior value exactly when this chunk supplies no evidence that changes the policy-selected cumulative value.",
+            "A null prior value means no supported cumulative value has been retained yet; it is not evidence of a negative clinical finding.",
+            "For latest or earliest, compare explicit governing dates when available. Otherwise treat current_chunk as later in source order than prior_extraction and apply source_order_tie_breaker.",
+            "For maximum, minimum, mode, any_positive, and single_or_null, update the cumulative value according to the named policy rather than automatically preferring the current chunk.",
+            "Return carry_forward_state for every feature as a concise string or null. Preserve enough metadata to apply its conflict policy in later chunks, but do not quote or summarize unrelated record text.",
+            f"Each carry_forward_state string must be at most {MAX_SERIAL_FEATURE_STATE_CHARS} characters.",
+            "For a binary, categorical, or ordinal feature, return one declared category exactly.",
+            "Do not substitute 0/1 or true/false for a declared category unless that exact value is declared.",
+            *_SCALAR_EXTRACTION_RULES,
+            "Return null only when the combined prior state and current chunk do not support a retained value under the feature policy.",
+            "Return the row and every supplied feature exactly once.",
+        ],
+        "features": _prompt_feature_definitions(definitions),
+        "patient": {
+            "row_id": int(row_id),
+            "prior_extraction": dict(prior_values),
+            "prior_feature_state": dict(prior_feature_state),
+            "current_chunk": chunk_text,
+            "chunk": {
+                "chunk_index": int(chunk_index),
+                "char_start": int(char_start),
+                "char_end": int(char_end),
+                "document_chars": int(document_chars),
+                "is_final_chunk": int(char_end) == int(document_chars),
+            },
+        },
+        "response": {
+            "rows": [
+                {
+                    "row_id": "the supplied integer row_id",
+                    "values": {"every supplied feature name": "cumulative scalar value or null"},
+                    "carry_forward_state": {
+                        "every supplied feature name": "concise policy state string or null"
+                    },
+                }
+            ]
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You update a validated structured patient extraction from consecutive "
+                "clinical-record chunks. Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True, ensure_ascii=False)},
+    ]
+
+
 def _page_extraction_prompt(
     *,
     definitions: Sequence[Mapping[str, Any]],
@@ -1369,6 +1471,54 @@ def _prompt_chars(messages: Sequence[Mapping[str, str]]) -> int:
     """Return the exact rendered content characters sent to the endpoint."""
 
     return sum(len(str(message.get("content") or "")) for message in messages)
+
+
+def _token_id_count(encoded: Any) -> int:
+    """Count one unbatched token-id sequence from common tokenizer outputs."""
+
+    if isinstance(encoded, Mapping):
+        encoded = encoded.get("input_ids")
+    shape = getattr(encoded, "shape", None)
+    if shape is not None and len(shape):
+        return int(shape[-1])
+    if hasattr(encoded, "tolist") and not isinstance(encoded, list):
+        encoded = encoded.tolist()
+    if isinstance(encoded, Sequence) and not isinstance(encoded, (str, bytes, bytearray)):
+        if encoded and isinstance(encoded[0], Sequence):
+            return len(encoded[0])
+        return len(encoded)
+    raise TypeError("tokenizer did not return a countable input_ids sequence")
+
+
+def prompt_token_count(
+    tokenizer: Any,
+    messages: Sequence[Mapping[str, str]],
+) -> int:
+    """Count the endpoint-ready chat prompt, including generation framing."""
+
+    if tokenizer is None:
+        raise ValueError("a tokenizer is required for token-bounded Stage 2 extraction")
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(apply_chat_template):
+        raise TypeError(
+            "the extraction tokenizer must implement apply_chat_template so Stage 2 "
+            "can enforce the model context window exactly"
+        )
+    encoded = apply_chat_template(
+        [dict(message) for message in messages],
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    return _token_id_count(encoded)
+
+
+def _text_token_count(tokenizer: Any, text: str) -> int:
+    encoded = tokenizer(
+        text,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    )
+    return _token_id_count(encoded)
 
 
 def _partition_feature_definitions(
@@ -1480,6 +1630,10 @@ def _validate_extraction(
                     extracted = canonical
             clean_values[name] = extracted
         by_row[row_id] = {"row_id": row_id, "values": clean_values}
+        if "carry_forward_state" in raw:
+            by_row[row_id]["carry_forward_state"] = copy.deepcopy(
+                raw.get("carry_forward_state")
+            )
     if set(by_row) != expected_rows:
         raise ValueError("extraction response omitted one or more supplied rows")
     normalized_response = {"rows": [by_row[int(row_id)] for row_id in row_ids]}
@@ -1491,6 +1645,49 @@ def _validate_extraction(
     if category_issues:
         raise _ExtractionCategoryError(issues=category_issues, response=normalized_response)
     return normalized_response
+
+
+def _validate_serial_extraction(
+    value: Mapping[str, Any],
+    *,
+    row_id: int,
+    definitions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate cumulative values plus bounded policy metadata for the next chunk."""
+
+    validated = _validate_extraction(
+        value,
+        row_ids=[row_id],
+        definitions=definitions,
+    )
+    feature_names = [str(definition["name"]) for definition in definitions]
+    row = validated["rows"][0]
+    raw_state = row.get("carry_forward_state")
+    if not isinstance(raw_state, Mapping):
+        raise ValueError("serial extraction row requires a carry_forward_state object")
+    if set(map(str, raw_state)) != set(feature_names):
+        raise ValueError(
+            "serial extraction carry_forward_state must contain every supplied feature exactly"
+        )
+    state: dict[str, str | None] = {}
+    for name in feature_names:
+        raw = raw_state.get(name)
+        if raw is None:
+            state[name] = None
+            continue
+        if not isinstance(raw, str):
+            raise ValueError(
+                f"serial carry_forward_state for {name!r} must be one string or null"
+            )
+        rendered = raw.strip()
+        if len(rendered) > MAX_SERIAL_FEATURE_STATE_CHARS:
+            raise ValueError(
+                f"serial carry_forward_state for {name!r} exceeds "
+                f"{MAX_SERIAL_FEATURE_STATE_CHARS} characters"
+            )
+        state[name] = rendered or None
+    row["carry_forward_state"] = state
+    return validated
 
 
 class _PageObservationValidationError(ValueError):
@@ -2261,6 +2458,379 @@ def _lossless_extraction_pages(
     return pages
 
 
+def _serial_extraction_required(
+    *,
+    row: Mapping[str, Any],
+    definitions: Sequence[Mapping[str, Any]],
+    tokenizer: Any,
+    chunk_size_tokens: int,
+    input_token_budget: int,
+    max_prompt_chars: int,
+) -> bool:
+    """Return whether one patient/feature slice needs an ordered serial pass."""
+
+    text = str(row.get("text") or "")
+    messages = _extraction_prompt(definitions=definitions, rows=[row])
+    return (
+        _text_token_count(tokenizer, text) > int(chunk_size_tokens)
+        or prompt_token_count(tokenizer, messages) > int(input_token_budget)
+        or _prompt_chars(messages) > int(max_prompt_chars)
+    )
+
+
+def _next_serial_extraction_chunk(
+    *,
+    source: str,
+    cursor: int,
+    row_id: int,
+    definitions: Sequence[Mapping[str, Any]],
+    prior_values: Mapping[str, Any],
+    prior_feature_state: Mapping[str, Any],
+    chunk_index: int,
+    tokenizer: Any,
+    chunk_size_tokens: int,
+    input_token_budget: int,
+    max_prompt_chars: int,
+) -> dict[str, Any]:
+    """Find the largest exact contiguous source prefix inside every prompt cap."""
+
+    def candidate(end: int) -> dict[str, Any]:
+        chunk_text = source[cursor:end]
+        messages = _serial_extraction_prompt(
+            definitions=definitions,
+            row_id=row_id,
+            chunk_text=chunk_text,
+            prior_values=prior_values,
+            prior_feature_state=prior_feature_state,
+            chunk_index=chunk_index,
+            char_start=cursor,
+            char_end=end,
+            document_chars=len(source),
+        )
+        return {
+            "text": chunk_text,
+            "char_start": int(cursor),
+            "char_end": int(end),
+            "source_tokens": _text_token_count(tokenizer, chunk_text),
+            "prompt_tokens": prompt_token_count(tokenizer, messages),
+            "prompt_chars": _prompt_chars(messages),
+            "messages": messages,
+        }
+
+    def fits(value: Mapping[str, Any]) -> bool:
+        return (
+            int(value["source_tokens"]) <= int(chunk_size_tokens)
+            and int(value["prompt_tokens"]) <= int(input_token_budget)
+            and int(value["prompt_chars"]) <= int(max_prompt_chars)
+        )
+
+    low = int(cursor) + 1
+    high = len(source)
+    best: dict[str, Any] | None = None
+    while low <= high:
+        end = (low + high) // 2
+        value = candidate(end)
+        if fits(value):
+            best = value
+            low = end + 1
+        else:
+            high = end - 1
+    if best is None:
+        empty = candidate(cursor)
+        raise ValueError(
+            "Stage 2 serial extraction prompt leaves no room for one source character: "
+            f"empty_prompt_tokens={empty['prompt_tokens']}, "
+            f"input_token_budget={input_token_budget}, "
+            f"empty_prompt_chars={empty['prompt_chars']}, "
+            f"max_prompt_chars={max_prompt_chars}. Reduce the feature batch size or "
+            "extraction_max_tokens, or increase the configured context window."
+        )
+
+    preferred_end, boundary = _preferred_lossless_page_end(
+        source,
+        start=cursor,
+        hard_end=int(best["char_end"]),
+    )
+    if preferred_end != int(best["char_end"]):
+        preferred = candidate(preferred_end)
+        if fits(preferred):
+            best = preferred
+        else:  # Token counts can very rarely be non-monotonic at a BPE boundary.
+            boundary = "hard_token_limit"
+    else:
+        boundary = "document_end" if preferred_end == len(source) else "hard_token_limit"
+    best["boundary"] = boundary
+    return best
+
+
+def _serial_extract_feature_batch(
+    *,
+    parent_dir: Path,
+    row: Mapping[str, Any],
+    definitions: Sequence[Mapping[str, Any]],
+    request_json: RequestJSON,
+    request_identity: Mapping[str, Any],
+    tokenizer: Any,
+    chunk_size_tokens: int,
+    context_window_tokens: int,
+    max_output_tokens: int,
+    context_margin_tokens: int,
+    max_prompt_chars: int,
+) -> dict[str, Any]:
+    """Process one patient's feature slice serially with resumable carried state."""
+
+    input_token_budget = (
+        int(context_window_tokens)
+        - int(max_output_tokens)
+        - int(context_margin_tokens)
+    )
+    if input_token_budget < 1:
+        raise ValueError(
+            "Stage 2 extraction context window leaves no input-token budget after "
+            "reserving the configured output ceiling and safety margin"
+        )
+    row_id = int(row["row_id"])
+    source = str(row.get("text") or "")
+    feature_names = [str(definition["name"]) for definition in definitions]
+    prior_values: dict[str, Any] = {name: None for name in feature_names}
+    prior_feature_state: dict[str, str | None] = {
+        name: None for name in feature_names
+    }
+    serial_input = {
+        "schema_version": SERIAL_EXTRACTION_MANIFEST_SCHEMA_VERSION,
+        "request_identity": dict(request_identity),
+        "definitions": _prompt_feature_definitions(definitions),
+        "row_id": row_id,
+        "document_chars": len(source),
+        "document_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "chunk_size_tokens": int(chunk_size_tokens),
+        "context_window_tokens": int(context_window_tokens),
+        "max_output_tokens": int(max_output_tokens),
+        "context_margin_tokens": int(context_margin_tokens),
+        "input_token_budget": int(input_token_budget),
+        "max_prompt_chars": int(max_prompt_chars),
+    }
+    serial_fingerprint = _value_fingerprint(serial_input)
+    if not source:
+        raise ValueError(
+            "an empty Stage 2 record exceeded the one-shot token envelope before "
+            "clinical text was added; reduce the feature batch size or extraction output cap"
+        )
+
+    cursor = 0
+    chunk_index = 1
+    chunk_manifest: list[dict[str, Any]] = []
+    while cursor < len(source):
+        planned = _next_serial_extraction_chunk(
+            source=source,
+            cursor=cursor,
+            row_id=row_id,
+            definitions=definitions,
+            prior_values=prior_values,
+            prior_feature_state=prior_feature_state,
+            chunk_index=chunk_index,
+            tokenizer=tokenizer,
+            chunk_size_tokens=chunk_size_tokens,
+            input_token_budget=input_token_budget,
+            max_prompt_chars=max_prompt_chars,
+        )
+        chunk_dir = parent_dir / "serial_chunks" / f"chunk_{chunk_index:05d}"
+        result_path = chunk_dir / "result.json"
+        complete_path = chunk_dir / "complete.json"
+        input_path = chunk_dir / "input.json"
+        ontology_audit_path = chunk_dir / "category_ontology_repair.json"
+        failure_path = chunk_dir / "extraction_failure.json"
+        chunk_input = {
+            "schema_version": SERIAL_EXTRACTION_CHUNK_CHECKPOINT_SCHEMA_VERSION,
+            "serial_input_fingerprint": serial_fingerprint,
+            "request_identity": dict(request_identity),
+            "definitions": _prompt_feature_definitions(definitions),
+            "row_id": row_id,
+            "prior_values": copy.deepcopy(prior_values),
+            "prior_feature_state": copy.deepcopy(prior_feature_state),
+            "chunk": {
+                "chunk_index": chunk_index,
+                "char_start": int(planned["char_start"]),
+                "char_end": int(planned["char_end"]),
+                "document_chars": len(source),
+                "source_tokens": int(planned["source_tokens"]),
+                "prompt_tokens": int(planned["prompt_tokens"]),
+                "prompt_chars": int(planned["prompt_chars"]),
+                "boundary": str(planned["boundary"]),
+                "text": str(planned["text"]),
+            },
+        }
+        input_fingerprint = _value_fingerprint(chunk_input)
+        stale_audit = _stale_category_ontology_audit(ontology_audit_path)
+        result: dict[str, Any] | None = None
+        if complete_path.is_file() and result_path.is_file() and stale_audit is None:
+            try:
+                completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                cached = json.loads(result_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(completion, Mapping)
+                    and completion.get("schema_version")
+                    == SERIAL_EXTRACTION_CHUNK_CHECKPOINT_SCHEMA_VERSION
+                    and completion.get("input_fingerprint") == input_fingerprint
+                    and isinstance(cached, Mapping)
+                ):
+                    result = _validate_extraction(
+                        cached,
+                        row_ids=[row_id],
+                        definitions=definitions,
+                    )
+                    result = _validate_serial_extraction(
+                        result,
+                        row_id=row_id,
+                        definitions=definitions,
+                    )
+                    _ensure_extraction_issue_audit(chunk_dir)
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                result = None
+            if result is None:
+                LOGGER.info("rerun incompatible Stage 2 serial chunk: %s", chunk_dir)
+        if result is None:
+            same_incomplete_input = False
+            if input_path.is_file():
+                try:
+                    prior_input = json.loads(input_path.read_text(encoding="utf-8"))
+                    same_incomplete_input = (
+                        isinstance(prior_input, Mapping)
+                        and prior_input.get("input_fingerprint") == input_fingerprint
+                    )
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            if not same_incomplete_input:
+                for stale_name in (
+                    "category_ontology_repair.json",
+                    "extraction_failure.json",
+                    "extraction_issues.json",
+                    "invalid_feature_value_repair.json",
+                    "pending_category_ontology.json",
+                ):
+                    (chunk_dir / stale_name).unlink(missing_ok=True)
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(input_path, {**chunk_input, "input_fingerprint": input_fingerprint})
+            result = _request_validated_extraction(
+                messages=planned["messages"],
+                row_ids=[row_id],
+                definitions=definitions,
+                request_json=request_json,
+                ontology_audit_path=ontology_audit_path,
+                validate_response=lambda value: _validate_serial_extraction(
+                    value,
+                    row_id=row_id,
+                    definitions=definitions,
+                ),
+            )
+            if failure_path.is_file():
+                # A malformed later response must not erase validated state from
+                # earlier chunks. The failure remains in its audit ledger.
+                result = _validate_serial_extraction(
+                    {
+                        "rows": [
+                            {
+                                "row_id": row_id,
+                                "values": prior_values,
+                                "carry_forward_state": prior_feature_state,
+                            }
+                        ]
+                    },
+                    row_id=row_id,
+                    definitions=definitions,
+                )
+            _write_json(result_path, result)
+            _supersede_stale_category_ontology_audit(
+                ontology_audit_path,
+                previous=stale_audit,
+            )
+            _write_json(
+                complete_path,
+                {
+                    "status": "complete",
+                    "schema_version": SERIAL_EXTRACTION_CHUNK_CHECKPOINT_SCHEMA_VERSION,
+                    "input_fingerprint": input_fingerprint,
+                    "completed_at": _now(),
+                    "row_id": row_id,
+                    "chunk_index": chunk_index,
+                    "char_start": int(planned["char_start"]),
+                    "char_end": int(planned["char_end"]),
+                    "source_tokens": int(planned["source_tokens"]),
+                    "prompt_tokens": int(planned["prompt_tokens"]),
+                    "structural_failure_carried_prior_state": failure_path.is_file(),
+                },
+            )
+        prior_values = dict(result["rows"][0]["values"])
+        prior_feature_state = dict(result["rows"][0]["carry_forward_state"])
+        chunk_manifest.append(
+            {
+                "chunk_index": chunk_index,
+                "char_start": int(planned["char_start"]),
+                "char_end": int(planned["char_end"]),
+                "source_tokens": int(planned["source_tokens"]),
+                "prompt_tokens": int(planned["prompt_tokens"]),
+                "boundary": str(planned["boundary"]),
+                "input_fingerprint": input_fingerprint,
+            }
+        )
+        cursor = int(planned["char_end"])
+        chunk_index += 1
+
+    result = _validate_extraction(
+        {"rows": [{"row_id": row_id, "values": prior_values}]},
+        row_ids=[row_id],
+        definitions=definitions,
+    )
+    lossless_source_coverage = (
+        bool(chunk_manifest)
+        and int(chunk_manifest[0]["char_start"]) == 0
+        and int(chunk_manifest[-1]["char_end"]) == len(source)
+        and all(
+            int(left["char_end"]) == int(right["char_start"])
+            for left, right in zip(chunk_manifest, chunk_manifest[1:])
+        )
+    )
+    if not lossless_source_coverage:  # pragma: no cover - planner invariant
+        raise RuntimeError("Stage 2 serial extraction did not cover the source contiguously")
+    _write_json(
+        parent_dir / "serial_extraction.json",
+        {
+            **serial_input,
+            "input_fingerprint": serial_fingerprint,
+            "chunks": chunk_manifest,
+            "lossless_source_coverage": lossless_source_coverage,
+        },
+    )
+    _write_json(
+        parent_dir / "serial_complete.json",
+        {
+            "status": "complete",
+            "schema_version": SERIAL_EXTRACTION_MANIFEST_SCHEMA_VERSION,
+            "input_fingerprint": serial_fingerprint,
+            "completed_at": _now(),
+            "row_id": row_id,
+            "chunks": len(chunk_manifest),
+            "document_chars": len(source),
+        },
+    )
+    _write_json(
+        parent_dir / "extraction_issues.json",
+        {
+            "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+            "completed_at": _now(),
+            "events": [],
+            "delegated_to_serial_chunks": True,
+        },
+    )
+    return result
+
+
 def _summarize_extraction_failures(
     *,
     output_dir: Path,
@@ -2372,8 +2942,13 @@ def extract_rows(
     max_prompt_chars: int,
     feature_batch_size: int = DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE,
     request_identity: Mapping[str, Any] | None = None,
+    tokenizer: Any | None = None,
+    chunk_size_tokens: int = DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS,
+    context_window_tokens: int = DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS,
+    max_output_tokens: int = DEFAULT_EXTRACTION_MAX_TOKENS,
+    context_margin_tokens: int = DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS,
 ) -> pd.DataFrame:
-    """Extract one patient per prompt in bounded feature slices, then merge them."""
+    """Extract one patient at a time, serializing long records across token chunks."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
     extraction_request_identity = dict(request_identity or {})
@@ -2413,11 +2988,28 @@ def extract_rows(
     ]
     extraction_definitions = _prompt_feature_definitions(definitions)
     page_extraction_definitions = _page_prompt_feature_definitions(definitions)
-    batches, oversized_rows = _partition_rows_for_prompt(
-        request_rows,
-        max_prompt_chars=int(max_prompt_chars),
-        definition_batches=definition_batches,
-    )
+    if tokenizer is not None:
+        if int(chunk_size_tokens) < 1:
+            raise ValueError("chunk_size_tokens must be positive")
+        if int(context_margin_tokens) < 0:
+            raise ValueError("context_margin_tokens must be nonnegative")
+        if int(context_window_tokens) - int(max_output_tokens) - int(
+            context_margin_tokens
+        ) < 1:
+            raise ValueError(
+                "serial extraction context window leaves no input-token budget"
+            )
+        # Token-aware serial extraction supersedes the older character-page
+        # fallback. Every patient remains one independent outer task; chunks
+        # within that task execute strictly in source order.
+        batches = [[row] for row in request_rows]
+        oversized_rows: list[Mapping[str, Any]] = []
+    else:
+        batches, oversized_rows = _partition_rows_for_prompt(
+            request_rows,
+            max_prompt_chars=int(max_prompt_chars),
+            definition_batches=definition_batches,
+        )
 
     page_requests: list[dict[str, Any]] = []
     for row in oversized_rows:
@@ -2570,21 +3162,48 @@ def extract_rows(
                     feature_dir / "input.json",
                     {**batch_input, "input_fingerprint": input_fingerprint},
                 )
-                messages = _extraction_prompt(
+                use_serial = tokenizer is not None and _serial_extraction_required(
+                    row=row,
                     definitions=batch_definitions,
-                    rows=[row],
+                    tokenizer=tokenizer,
+                    chunk_size_tokens=int(chunk_size_tokens),
+                    input_token_budget=(
+                        int(context_window_tokens)
+                        - int(max_output_tokens)
+                        - int(context_margin_tokens)
+                    ),
+                    max_prompt_chars=int(max_prompt_chars),
                 )
-                if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
-                    raise RuntimeError(
-                        "Stage 2 extraction planner emitted an oversized feature batch"
+                if use_serial:
+                    result = _serial_extract_feature_batch(
+                        parent_dir=feature_dir,
+                        row=row,
+                        definitions=batch_definitions,
+                        request_json=request_json,
+                        request_identity=extraction_request_identity,
+                        tokenizer=tokenizer,
+                        chunk_size_tokens=int(chunk_size_tokens),
+                        context_window_tokens=int(context_window_tokens),
+                        max_output_tokens=int(max_output_tokens),
+                        context_margin_tokens=int(context_margin_tokens),
+                        max_prompt_chars=int(max_prompt_chars),
                     )
-                result = _request_validated_extraction(
-                    messages=messages,
-                    row_ids=[row_id],
-                    definitions=batch_definitions,
-                    request_json=request_json,
-                    ontology_audit_path=ontology_audit_path,
-                )
+                else:
+                    messages = _extraction_prompt(
+                        definitions=batch_definitions,
+                        rows=[row],
+                    )
+                    if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+                        raise RuntimeError(
+                            "Stage 2 extraction planner emitted an oversized feature batch"
+                        )
+                    result = _request_validated_extraction(
+                        messages=messages,
+                        row_ids=[row_id],
+                        definitions=batch_definitions,
+                        request_json=request_json,
+                        ontology_audit_path=ontology_audit_path,
+                    )
                 _write_json(result_path, result)
                 _supersede_stale_category_ontology_audit(
                     ontology_audit_path,
@@ -2845,19 +3464,46 @@ def extract_rows(
         batch_dir.mkdir(parents=True, exist_ok=True)
         _write_json(batch_dir / "row_ids.json", row_ids)
         if len(definition_batches) == 1:
-            messages = _extraction_prompt(
+            use_serial = tokenizer is not None and _serial_extraction_required(
+                row=batch[0],
                 definitions=definitions,
-                rows=batch,
+                tokenizer=tokenizer,
+                chunk_size_tokens=int(chunk_size_tokens),
+                input_token_budget=(
+                    int(context_window_tokens)
+                    - int(max_output_tokens)
+                    - int(context_margin_tokens)
+                ),
+                max_prompt_chars=int(max_prompt_chars),
             )
-            result = _request_validated_extraction(
-                messages=messages,
-                row_ids=row_ids,
-                definitions=definitions,
-                request_json=request_json,
-                ontology_audit_path=ontology_audit_path,
-            )
-            if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
-                raise RuntimeError("Stage 2 extraction planner emitted an oversized batch")
+            if use_serial:
+                result = _serial_extract_feature_batch(
+                    parent_dir=batch_dir,
+                    row=batch[0],
+                    definitions=definitions,
+                    request_json=request_json,
+                    request_identity=extraction_request_identity,
+                    tokenizer=tokenizer,
+                    chunk_size_tokens=int(chunk_size_tokens),
+                    context_window_tokens=int(context_window_tokens),
+                    max_output_tokens=int(max_output_tokens),
+                    context_margin_tokens=int(context_margin_tokens),
+                    max_prompt_chars=int(max_prompt_chars),
+                )
+            else:
+                messages = _extraction_prompt(
+                    definitions=definitions,
+                    rows=batch,
+                )
+                result = _request_validated_extraction(
+                    messages=messages,
+                    row_ids=row_ids,
+                    definitions=definitions,
+                    request_json=request_json,
+                    ontology_audit_path=ontology_audit_path,
+                )
+                if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+                    raise RuntimeError("Stage 2 extraction planner emitted an oversized batch")
         else:
             result = request_feature_batches(
                 parent_dir=batch_dir,
@@ -3127,6 +3773,9 @@ def extract_rows(
             "batches": len(batches),
             "paged_rows": len(oversized_rows),
             "pages": len(page_requests),
+            "serial_patient_feature_passes": len(
+                list((output_dir / "batches").glob("**/serial_complete.json"))
+            ),
             "feature_failure_patterns": len(failure_summary["feature_failure_patterns"]),
             "structural_failure_patients": failure_summary["structural_failure_patient_count"],
         },
@@ -6614,6 +7263,11 @@ def _extract_training_with_ontology_feedback(
     minimum_failure_patients: int,
     max_refinement_rounds: int,
     request_identity: Mapping[str, Any] | None = None,
+    tokenizer: Any | None = None,
+    chunk_size_tokens: int = DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS,
+    context_window_tokens: int = DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS,
+    max_output_tokens: int = DEFAULT_EXTRACTION_MAX_TOKENS,
+    context_margin_tokens: int = DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], int]:
     """Extract training rows and re-extract after repeated-failure ontology repairs."""
 
@@ -6634,6 +7288,11 @@ def _extract_training_with_ontology_feedback(
             max_prompt_chars=max_prompt_chars,
             feature_batch_size=feature_batch_size,
             request_identity=request_identity,
+            tokenizer=tokenizer,
+            chunk_size_tokens=chunk_size_tokens,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            context_margin_tokens=context_margin_tokens,
         )
         summary = json.loads((extraction_dir / "failure_summary.json").read_text(encoding="utf-8"))
         repeated = _repeated_ontology_failure_patterns(
@@ -7451,6 +8110,7 @@ def run_fold_analysis(
     output_dir: Path,
     request_json: RequestJSON,
     config: Any,
+    extraction_tokenizer: Any | None = None,
 ) -> dict[str, Any]:
     """Run extraction supervision, fold-local selection, and causal-forest estimation."""
 
@@ -7460,6 +8120,7 @@ def run_fold_analysis(
         max_ontology_refinement_rounds,
     ) = _ontology_refinement_limits(config)
     extraction_feature_batch_size = _configured_extraction_feature_batch_size(config)
+    serial_extraction = _configured_serial_extraction(config)
     fit_ids = [int(value) for value in split["fit_row_ids"]]
     heldout_ids = [int(value) for value in split["heldout_row_ids"]]
     inner_splits = list(split.get("inner_splits") or []) or _fallback_inner_splits(
@@ -7517,6 +8178,8 @@ def run_fold_analysis(
                 minimum_failure_patients=ontology_refinement_min_failure_patients,
                 max_refinement_rounds=max_ontology_refinement_rounds,
                 request_identity=extraction_identity,
+                tokenizer=extraction_tokenizer,
+                **serial_extraction,
             )
         )
         ontology_refinement_rounds += feedback_rounds
@@ -7598,6 +8261,8 @@ def run_fold_analysis(
             minimum_failure_patients=ontology_refinement_min_failure_patients,
             max_refinement_rounds=max_ontology_refinement_rounds,
             request_identity=extraction_identity,
+            tokenizer=extraction_tokenizer,
+            **serial_extraction,
         )
         ontology_refinement_rounds += feedback_rounds
         final_fit_all, current, _ = _harmonize_training_extraction(
@@ -7738,6 +8403,8 @@ def run_fold_analysis(
         max_prompt_chars=int(config.extraction_max_prompt_chars),
         feature_batch_size=extraction_feature_batch_size,
         request_identity=extraction_identity,
+        tokenizer=extraction_tokenizer,
+        **serial_extraction,
     )
     heldout_extraction, heldout_harmonization = _apply_harmonization_plans(
         heldout_raw,

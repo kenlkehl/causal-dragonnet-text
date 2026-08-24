@@ -175,7 +175,7 @@ An external endpoint configuration is:
     },
     "request_timeout": 7200,
     "max_tokens": 100000,
-    "extraction_max_tokens": 60000,
+    "extraction_max_tokens": 75000,
     "max_response_repairs": 10,
     "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
@@ -190,6 +190,9 @@ An external endpoint configuration is:
     "consolidation_alphabetical_rounds": 5,
     "consolidation_max_rounds": 55,
     "extraction_feature_batch_size": 10,
+    "extraction_chunk_size_tokens": 50000,
+    "extraction_context_window_tokens": 131072,
+    "extraction_context_margin_tokens": 1024,
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
@@ -367,9 +370,11 @@ ontology supervision, and ontology refinement go to the primary model with
 `reasoning_effort: "high"` by default. Only one-patient value extraction goes
 to the small model with `reasoning_effort: "none"` initially. Primary-model
 requests receive the configured `max_tokens` ceiling (100,000 by default), while
-patient extraction receives `extraction_max_tokens` (60,000 by default). These
+patient extraction receives `extraction_max_tokens` (75,000 by default). These
 permit long responses but do not request minimum lengths; each model still stops
-at EOS as soon as its JSON is complete.
+at EOS as soon as its JSON is complete. A repair request dynamically lowers the
+ceiling when necessary to keep its prompt, output allowance, and safety margin
+inside the extraction model's context window.
 Every Stage 2 completion request also sends the configured
 `repetition_penalty` (1.1 by default).
 Stage 2 first verifies each live endpoint's selected model through `/models`.
@@ -473,6 +478,8 @@ default),
 `consolidation_batch_size`, `consolidation_alphabetical_rounds`,
 `consolidation_max_rounds`,
 `extraction_max_prompt_chars`, `extraction_feature_batch_size`,
+`extraction_chunk_size_tokens`, `extraction_context_window_tokens`,
+`extraction_context_margin_tokens`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
 `max_review_rounds`,
@@ -497,21 +504,23 @@ definitions (10 by default); Stage 2 checkpoints and merges the feature batches.
 continues to bound interpretation and ontology-supervision planning. These character limits
 are safety/planning guards, not claims about the model's token context. Primary
 completions send `max_tokens` as a 100,000-token output ceiling; patient
-extraction sends `extraction_max_tokens` as a 60,000-token ceiling. Neither is a
+extraction sends `extraction_max_tokens` as a 75,000-token ceiling. Neither is a
 generation target or minimum. A response that reaches its ceiling enters Stage
 2's bounded repair or fallback path. The extraction-only ceiling is transport
 policy and does not invalidate completed feature-definition checkpoints when it
 changes, so an interrupted extraction can resume under a safer ceiling.
-Extraction always sends exactly one patient's text per request and never sends
-more than the configured feature batch; oversized notes are split into lossless
-contiguous pages, preferring nearby note, paragraph, line, sentence, or word
-boundaries when they fit. Page extraction returns every supported observation
-rather than prematurely collapsing a longitudinal record. Each observation
-must include one scalar value, an exact evidence quote, verified page-relative
-and document-relative character offsets, and an ISO-8601 measurement/specimen/
-encounter date plus its exact source quote when such a governing date is
-explicit. Unverifiable quotes are rejected while independently valid
-observations are retained.
+Extraction always isolates one patient and never sends more than the configured
+feature batch. Long records are read in ordered, lossless contiguous chunks of
+at most `extraction_chunk_size_tokens` (50,000 by default), preferring nearby
+note, paragraph, line, sentence, or word boundaries. Each chunk receives the
+validated cumulative scalar extraction from all earlier chunks and returns the
+updated structured state. The planner uses the extraction model's own chat
+tokenizer and reduces the source chunk when definitions or prior state need
+more of the 131,072-token context. Per-chunk inputs, results, and completion
+markers are checkpointed, and fingerprints include the prior state, so restarts
+continue at the first unfinished compatible chunk without dropping source text.
+The exact extraction tokenizer must be present locally under the configured
+model ID, either in the managed vLLM download directory or Hugging Face cache.
 
 Cross-page reconciliation is local and deterministic; it does not make another
 LLM request. Each frozen ontology carries a conflict strategy (`latest`,
@@ -585,7 +594,8 @@ uv run python scripts/run_all_evidence.py \
   --stage2-extraction-model small-extractor \
   --stage2-selection-workers 16 \
   --stage2-max-tokens 100000 \
-  --stage2-extraction-max-tokens 60000 \
+  --stage2-extraction-max-tokens 75000 \
+  --stage2-extraction-chunk-size-tokens 50000 \
   --stage2-review-rounds 2 \
   --stage2-confounder-p-value-threshold 0.05 \
   --stage2-confounder-min-inner-fold-fraction 0.75 \

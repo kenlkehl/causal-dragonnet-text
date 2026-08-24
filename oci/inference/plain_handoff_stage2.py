@@ -35,7 +35,7 @@ from .plain_handoff_stage2_evidence import (
     SUPPORTED_STAGE2_ARCHITECTURES,
     compile_stage2_handoff_evidence,
 )
-from .plain_handoff_stage2_analysis import run_fold_analysis
+from .plain_handoff_stage2_analysis import prompt_token_count, run_fold_analysis
 from .vllm_server_pool import (
     ManagedVLLMConfig,
     launch_managed_vllm_servers,
@@ -66,7 +66,7 @@ DEFAULT_MAX_TOKENS = MINIMUM_MAX_TOKENS
 # Keep enough room for the one-patient prompt while retaining a generous
 # completion ceiling for validated JSON extraction.
 MINIMUM_EXTRACTION_MAX_TOKENS = 60_000
-DEFAULT_EXTRACTION_MAX_TOKENS = MINIMUM_EXTRACTION_MAX_TOKENS
+DEFAULT_EXTRACTION_MAX_TOKENS = 75_000
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_INTERPRETATION_REASONING_EFFORT = "high"
 DEFAULT_EXTRACTION_REASONING_EFFORT = "none"
@@ -77,6 +77,9 @@ SUPPORTED_REASONING_EFFORTS = frozenset(
 )
 DEFAULT_EXTRACTION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE = 10
+DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS = 50_000
+DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS = 131_072
+DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS = 1_024
 DEFAULT_CONSOLIDATION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_OPERATIONALIZATION_MAX_PROMPT_CHARS = 640_000
 DEFAULT_CONSOLIDATION_BATCH_SIZE = 20
@@ -774,6 +777,12 @@ class PlainHandoffStage2Config:
     # so discovery batching and its evidence-compilation fingerprints remain stable.
     extraction_max_prompt_chars: int = DEFAULT_EXTRACTION_MAX_PROMPT_CHARS
     extraction_feature_batch_size: int = DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE
+    # Long records are processed in ordered, lossless source chunks. This is a
+    # token cap rather than a target: the planner shrinks a chunk when feature
+    # definitions and carried-forward state need more of the context window.
+    extraction_chunk_size_tokens: int = DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS
+    extraction_context_window_tokens: int = DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS
+    extraction_context_margin_tokens: int = DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS
     evidence_compiler: str = EVIDENCE_COMPILER_VERSION
     required_architectures: tuple[str, ...] = SUPPORTED_STAGE2_ARCHITECTURES
     included_architectures: tuple[str, ...] | None = None
@@ -917,6 +926,30 @@ class PlainHandoffStage2Config:
             or self.extraction_feature_batch_size < 1
         ):
             raise ValueError("stage2.extraction_feature_batch_size must be a positive integer")
+        for field_name, value in (
+            ("extraction_chunk_size_tokens", self.extraction_chunk_size_tokens),
+            ("extraction_context_window_tokens", self.extraction_context_window_tokens),
+            ("extraction_context_margin_tokens", self.extraction_context_margin_tokens),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < (0 if field_name == "extraction_context_margin_tokens" else 1)
+            ):
+                qualifier = (
+                    "a nonnegative integer"
+                    if field_name == "extraction_context_margin_tokens"
+                    else "a positive integer"
+                )
+                raise ValueError(f"stage2.{field_name} must be {qualifier}")
+        if (
+            self.extraction_max_tokens + self.extraction_context_margin_tokens
+            >= self.extraction_context_window_tokens
+        ):
+            raise ValueError(
+                "stage2 extraction context window must exceed extraction_max_tokens "
+                "plus extraction_context_margin_tokens"
+            )
         if self.evidence_compiler != EVIDENCE_COMPILER_VERSION:
             raise ValueError(
                 f"stage2.evidence_compiler must be {EVIDENCE_COMPILER_VERSION}; "
@@ -1245,6 +1278,24 @@ def plain_stage2_config_from_mapping(
             raw.get(
                 "extraction_feature_batch_size",
                 DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE,
+            )
+        ),
+        extraction_chunk_size_tokens=int(
+            raw.get(
+                "extraction_chunk_size_tokens",
+                DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS,
+            )
+        ),
+        extraction_context_window_tokens=int(
+            raw.get(
+                "extraction_context_window_tokens",
+                DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS,
+            )
+        ),
+        extraction_context_margin_tokens=int(
+            raw.get(
+                "extraction_context_margin_tokens",
+                DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS,
             )
         ),
         evidence_compiler=str(raw.get("evidence_compiler", EVIDENCE_COMPILER_VERSION)).strip(),
@@ -2059,6 +2110,57 @@ class _ManagedStage2ModelSwitch(RuntimeError):
         super().__init__(f"managed Stage 2 requires the {role} model")
 
 
+class _LazyStage2ExtractionTokenizer:
+    """Load the exact extraction-model tokenizer only when patient work begins."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        cache_dir: str = "",
+        chat_template_kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.model = str(model)
+        self.cache_dir = str(cache_dir)
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
+        self._tokenizer: Any | None = None
+        self._lock = threading.Lock()
+
+    def _load(self) -> Any:
+        if self._tokenizer is not None:
+            return self._tokenizer
+        with self._lock:
+            if self._tokenizer is None:
+                try:
+                    from transformers import AutoTokenizer
+
+                    kwargs: dict[str, Any] = {
+                        "trust_remote_code": True,
+                        "use_fast": True,
+                    }
+                    if self.cache_dir:
+                        kwargs["cache_dir"] = self.cache_dir
+                    self._tokenizer = AutoTokenizer.from_pretrained(
+                        self.model,
+                        **kwargs,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Stage 2 cannot enforce serial extraction token limits because "
+                        f"the extraction tokenizer {self.model!r} could not be loaded. "
+                        "Make the tokenizer available in the extraction vLLM download "
+                        "directory or the Hugging Face cache."
+                    ) from exc
+        return self._tokenizer
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._load()(*args, **kwargs)
+
+    def apply_chat_template(self, *args: Any, **kwargs: Any) -> Any:
+        template_kwargs = {**self.chat_template_kwargs, **kwargs}
+        return self._load().apply_chat_template(*args, **template_kwargs)
+
+
 def _stage2_request_policy(
     config: PlainHandoffStage2Config,
     request_kind: str | None = None,
@@ -2622,6 +2724,9 @@ def _request_json(
     completion: CompletionFunction,
     validate: Callable[[Mapping[str, Any]], dict[str, Any]],
     request_kind: str = "interpretation",
+    prompt_token_counter: Callable[[Sequence[Mapping[str, str]]], int] | None = None,
+    context_window_tokens: int | None = None,
+    context_margin_tokens: int = 0,
 ) -> dict[str, Any]:
     request_policy = _stage2_request_policy(config, request_kind)
     request_config = replace(
@@ -2634,6 +2739,15 @@ def _request_json(
     first_error: Exception | None = None
     max_repairs = int(config.max_response_repairs)
     max_attempts = 1 + max_repairs
+
+    def token_window_fits(candidate: Sequence[Mapping[str, str]]) -> bool:
+        if prompt_token_counter is None or context_window_tokens is None:
+            return True
+        return (
+            int(prompt_token_counter(candidate)) + int(context_margin_tokens)
+            < int(context_window_tokens)
+        )
+
     for attempt in range(max_attempts):
         response: str | None = None
         prompt_chars = sum(len(str(message.get("content") or "")) for message in conversation)
@@ -2658,6 +2772,34 @@ def _request_json(
                         attempt,
                         max_repairs,
                         attempt_config.runtime_reasoning_effort,
+                    )
+            if prompt_token_counter is not None and context_window_tokens is not None:
+                prompt_tokens = int(prompt_token_counter(conversation))
+                available_output_tokens = (
+                    int(context_window_tokens)
+                    - prompt_tokens
+                    - int(context_margin_tokens)
+                )
+                if available_output_tokens < 1:
+                    raise ValueError(
+                        "Stage 2 extraction repair prompt leaves no model output context: "
+                        f"prompt_tokens={prompt_tokens}, "
+                        f"context_window_tokens={context_window_tokens}, "
+                        f"context_margin_tokens={context_margin_tokens}"
+                    )
+                dynamic_output_ceiling = min(
+                    int(request_policy["max_tokens"]),
+                    available_output_tokens,
+                )
+                if request_policy["request_kind"] == "extraction":
+                    attempt_config = replace(
+                        attempt_config,
+                        extraction_max_tokens=dynamic_output_ceiling,
+                    )
+                else:  # pragma: no cover - token counting is extraction-only today
+                    attempt_config = replace(
+                        attempt_config,
+                        max_tokens=dynamic_output_ceiling,
                     )
             response = _completion_with_transport_retries(
                 conversation,
@@ -2685,7 +2827,10 @@ def _request_json(
             for candidate_context in (repair_context, base_conversation):
                 repaired = [*candidate_context, repair_message]
                 repaired_chars = sum(len(str(message.get("content") or "")) for message in repaired)
-                if repaired_chars <= int(config.max_prompt_chars):
+                if (
+                    repaired_chars <= int(config.max_prompt_chars)
+                    and token_window_fits(repaired)
+                ):
                     conversation = repaired
                     break
             else:
@@ -2698,15 +2843,19 @@ def _request_json(
             # the same explicit validation error.
             compact_context = _compact_json_messages(repair_context)
             compact_repaired = [*compact_context, repair_message]
-            if sum(len(str(message.get("content") or "")) for message in compact_repaired) <= int(
-                config.max_prompt_chars
+            if (
+                sum(len(str(message.get("content") or "")) for message in compact_repaired)
+                <= int(config.max_prompt_chars)
+                and token_window_fits(compact_repaired)
             ):
                 conversation = compact_repaired
                 continue
             compact_base = _compact_json_messages(base_conversation)
             compact_repaired = [*compact_base, repair_message]
-            if sum(len(str(message.get("content") or "")) for message in compact_repaired) <= int(
-                config.max_prompt_chars
+            if (
+                sum(len(str(message.get("content") or "")) for message in compact_repaired)
+                <= int(config.max_prompt_chars)
+                and token_window_fits(compact_repaired)
             ):
                 conversation = compact_repaired
                 continue
@@ -5764,6 +5913,7 @@ class PlainHandoffStage2:
         clinical_question: str,
         completion: CompletionFunction | None = None,
         extraction_completion: CompletionFunction | None = None,
+        extraction_tokenizer: Any | None = None,
     ) -> None:
         config = _resolve_stage2_model(config)
         config = _resolve_extraction_llm_model(config)
@@ -5791,6 +5941,7 @@ class PlainHandoffStage2:
         )
         self.extraction_request_config: PlainHandoffStage2Config | None = None
         self.extraction_completion: CompletionFunction | None = None
+        self.extraction_tokenizer: Any | None = None
         if config.extraction_llm is not None:
             extraction = config.extraction_llm
             extraction_endpoints = extraction.runtime_endpoints or (extraction.endpoint,)
@@ -5806,6 +5957,10 @@ class PlainHandoffStage2:
                 runtime_model_family="",
             )
             routed_extraction = extraction_completion or completion
+            uses_default_extraction_transport = (
+                routed_extraction is None
+                or isinstance(routed_extraction, _RoundRobinOpenAICompletion)
+            )
             extraction_identity = _endpoint_model_identity(
                 extraction_request_config,
                 endpoints=extraction_endpoints,
@@ -5825,6 +5980,23 @@ class PlainHandoffStage2:
                 routed_extraction,
                 max_concurrency=extraction.workers,
             )
+            if extraction_tokenizer is not None:
+                self.extraction_tokenizer = extraction_tokenizer
+            elif uses_default_extraction_transport:
+                extraction_vllm = extraction.vllm
+                self.extraction_tokenizer = _LazyStage2ExtractionTokenizer(
+                    model=extraction.model,
+                    cache_dir=(
+                        str(extraction_vllm.download_dir)
+                        if extraction_vllm is not None
+                        else ""
+                    ),
+                    chat_template_kwargs=(
+                        extraction_vllm.default_chat_template_kwargs
+                        if extraction_vllm is not None
+                        else None
+                    ),
+                )
         else:
             extraction_identity = None
         self.model_identity = {
@@ -7407,6 +7579,27 @@ class PlainHandoffStage2:
                 completion=completion,
                 validate=validate,
                 request_kind=request_kind,
+                prompt_token_counter=(
+                    (
+                        lambda candidate: prompt_token_count(
+                            self.extraction_tokenizer,
+                            candidate,
+                        )
+                    )
+                    if request_kind == "extraction"
+                    and self.extraction_tokenizer is not None
+                    else None
+                ),
+                context_window_tokens=(
+                    self.config.extraction_context_window_tokens
+                    if request_kind == "extraction"
+                    else None
+                ),
+                context_margin_tokens=(
+                    self.config.extraction_context_margin_tokens
+                    if request_kind == "extraction"
+                    else 0
+                ),
             )
 
         analysis = run_fold_analysis(
@@ -7424,6 +7617,7 @@ class PlainHandoffStage2:
             output_dir=output_dir,
             request_json=request_analysis_json,
             config=self.config,
+            extraction_tokenizer=self.extraction_tokenizer,
         )
         completed = {
             "outer_fold": outer_fold,
@@ -7785,6 +7979,7 @@ def run_plain_handoff_stage2(
     config: PlainHandoffStage2Config,
     completion: CompletionFunction | None = None,
     extraction_completion: CompletionFunction | None = None,
+    extraction_tokenizer: Any | None = None,
     dataset: pd.DataFrame | None = None,
     split_provenance_path: Path | None = None,
     unit_id_column: str = "patient_id",
@@ -7807,6 +8002,7 @@ def run_plain_handoff_stage2(
             clinical_question=clinical_question,
             completion=runtime_primary_completion,
             extraction_completion=runtime_extraction_completion,
+            extraction_tokenizer=extraction_tokenizer,
         ).run(
             handoff_path=handoff_path,
             output_dir=output_dir,

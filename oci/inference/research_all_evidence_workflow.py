@@ -1925,8 +1925,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help=(
             "completion-token ceiling sent to patient-extraction requests; must be "
-            "at least 60000 and defaults to 60000"
+            "at least 60000 and defaults to 75000"
         ),
+    )
+    parser.add_argument(
+        "--stage2-extraction-chunk-size-tokens",
+        type=int,
+        help="maximum source tokens per ordered patient-record chunk (default: 50000)",
+    )
+    parser.add_argument(
+        "--stage2-extraction-context-window-tokens",
+        type=int,
+        help="extraction model context window used for exact request planning (default: 131072)",
+    )
+    parser.add_argument(
+        "--stage2-extraction-context-margin-tokens",
+        type=int,
+        help="tokens reserved beyond prompt plus completion for extraction safety (default: 1024)",
     )
     parser.add_argument(
         "--stage2-vllm-servers",
@@ -2266,6 +2281,13 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
     stage2_numeric_overrides = {
         "max_tokens": args.stage2_max_tokens,
         "extraction_max_tokens": args.stage2_extraction_max_tokens,
+        "extraction_chunk_size_tokens": args.stage2_extraction_chunk_size_tokens,
+        "extraction_context_window_tokens": (
+            args.stage2_extraction_context_window_tokens
+        ),
+        "extraction_context_margin_tokens": (
+            args.stage2_extraction_context_margin_tokens
+        ),
         "selection_workers": args.stage2_selection_workers,
         "max_review_rounds": args.stage2_review_rounds,
         "extraction_feature_batch_size": args.stage2_extraction_feature_batch_size,
