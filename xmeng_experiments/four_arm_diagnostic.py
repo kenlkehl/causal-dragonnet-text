@@ -91,29 +91,44 @@ def _true_pdl1_dicts(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 
 def _est_age_dicts(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Build feature dicts for age from explicit_feat_age column."""
+    """Build feature dicts for age from extracted age column.
+
+    Supports both llm_extracted_age (from dataset_with_extraction.parquet)
+    and explicit_feat_age (from full OCI Stage I/II output).
+    """
+    col = "llm_extracted_age" if "llm_extracted_age" in df.columns else "explicit_feat_age"
+    missing_col = f"{col}_missing" if f"{col}_missing" in df.columns else None
     result = []
     for _, row in df.iterrows():
-        val = row.get("explicit_feat_age")
-        missing_flag = row.get("explicit_feat_age_missing", None)
-        if missing_flag is None:
-            missing = val is None or (isinstance(val, float) and np.isnan(val))
+        val = row.get(col)
+        if missing_col:
+            missing = bool(row.get(missing_col, False))
         else:
-            missing = bool(missing_flag)
+            missing = val is None or (isinstance(val, float) and np.isnan(val))
         result.append({"age": None if missing else float(val), "age_missing": missing})
     return result
 
 
 def _est_pdl1_dicts(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """Build feature dicts for pdl1_expression from explicit_feat_pdl1_expression column."""
+    """Build feature dicts for pdl1_expression from extracted pdl1 column.
+
+    Supports both llm_extracted_pdl1_expression (dataset_with_extraction.parquet)
+    and explicit_feat_pdl1_expression (full OCI Stage I/II output).
+    Treats 'unknown' as missing.
+    """
+    col = ("llm_extracted_pdl1_expression"
+           if "llm_extracted_pdl1_expression" in df.columns
+           else "explicit_feat_pdl1_expression")
+    missing_col = f"{col}_missing" if f"{col}_missing" in df.columns else None
     result = []
     for _, row in df.iterrows():
-        val = row.get("explicit_feat_pdl1_expression")
-        missing_flag = row.get("explicit_feat_pdl1_expression_missing", None)
-        if missing_flag is None:
-            missing = val is None or (isinstance(val, float) and np.isnan(val))
+        val = row.get(col)
+        if missing_col:
+            missing = bool(row.get(missing_col, False))
         else:
-            missing = bool(missing_flag)
+            missing = (val is None
+                       or (isinstance(val, float) and np.isnan(val))
+                       or str(val).lower() == "unknown")
         result.append({
             "pdl1_expression": None if missing else str(val),
             "pdl1_expression_missing": missing,
@@ -242,8 +257,10 @@ def run_four_arm(
         else:
             df_est = df_est.reset_index(drop=True)
         print(f"Estimated features: {estimated_features_path}")
-        est_age_cols = [c for c in df_est.columns if "age" in c and "explicit" in c]
-        est_pdl1_cols = [c for c in df_est.columns if "pdl1" in c and "explicit" in c]
+        est_age_cols = [c for c in df_est.columns if "age" in c and
+                        ("explicit" in c or "llm_extracted" in c)]
+        est_pdl1_cols = [c for c in df_est.columns if "pdl1" in c and
+                         ("explicit" in c or "llm_extracted" in c)]
         print(f"  age cols: {est_age_cols}")
         print(f"  pdl1 cols: {est_pdl1_cols}")
     else:
