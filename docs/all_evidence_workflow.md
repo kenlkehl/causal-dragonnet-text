@@ -173,7 +173,9 @@ An external endpoint configuration is:
       "api_key": "EMPTY",
       "workers": 32
     },
-    "request_timeout": 7200,
+    "request_timeout": 900,
+    "request_attempt_timeout": 300,
+    "transport_max_attempts": 3,
     "max_tokens": 100000,
     "extraction_max_tokens": 75000,
     "max_response_repairs": 10,
@@ -404,7 +406,11 @@ Qwen 3.8 translates the configured `high` policy to its accepted wire value
 `xhigh`; thinking-off extraction requests omit the enabled-only effort enum and
 use the template switch and prompt fallback.
 
-A completed response that fails JSON parsing or schema validation receives up
+A complete logical request is bounded by `request_timeout` (900 seconds by
+default), including transport retries and response-repair turns. Individual
+HTTP calls are bounded by `request_attempt_timeout` (300 seconds by default),
+and retryable transport failures receive at most `transport_max_attempts` (3 by
+default). A completed response that fails JSON parsing or schema validation receives up
 to `max_response_repairs` validator-guided retries (10 by default). Every retry
 includes the concrete validation error. Repairs through
 `thinking_after_response_repairs` (5 by default) retain the normal request
@@ -483,8 +489,9 @@ still returns an invalid ontology after all bounded repairs, Stage 2 writes
 extraction and aggregate supervision rather than aborting the fold.
 
 The API key may be set as `stage2.api_key` or in `OCI_STAGE2_API_KEY`. Other
-operational controls include `request_timeout`, `transport_max_attempts` (10 by
-default),
+operational controls include `request_timeout` (900 seconds by default),
+`request_attempt_timeout` (300 seconds by default),
+`transport_max_attempts` (3 by default),
 `transport_retry_backoff`, `max_response_repairs`,
 `thinking_after_response_repairs`, `max_tokens`, `extraction_max_tokens`,
 `max_prompt_chars`,

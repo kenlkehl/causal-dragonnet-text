@@ -61,6 +61,9 @@ are:
       "model": "small-extractor",
       "workers": 32
     },
+    "request_timeout": 900,
+    "request_attempt_timeout": 300,
+    "transport_max_attempts": 3,
     "max_tokens": 100000,
     "extraction_max_tokens": 75000,
     "max_response_repairs": 10,

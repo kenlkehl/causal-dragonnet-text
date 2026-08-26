@@ -37,6 +37,7 @@ from .plain_handoff_stage2_evidence import (
 )
 from .plain_handoff_stage2_analysis import (
     ESTIMATION_CHECKPOINT_SCHEMA_VERSION,
+    Stage2RequestExhaustedError,
     prompt_token_count,
     run_fold_analysis,
 )
@@ -60,7 +61,9 @@ ALLOWED_EVIDENCE_AXES = {
 ALLOWED_ROLES = {"confounder", "effect_modifier"}
 DEFAULT_MAX_RESPONSE_REPAIRS = 10
 DEFAULT_THINKING_AFTER_RESPONSE_REPAIRS = 5
-DEFAULT_TRANSPORT_MAX_ATTEMPTS = 10
+DEFAULT_REQUEST_TIMEOUT = 15 * 60.0
+DEFAULT_REQUEST_ATTEMPT_TIMEOUT = 5 * 60.0
+DEFAULT_TRANSPORT_MAX_ATTEMPTS = 3
 THINKING_RESPONSE_REPAIR_EFFORT = "high"
 # This is an output ceiling, not a requested output length. Models still stop
 # normally at EOS as soon as the validated JSON object is complete.
@@ -749,7 +752,12 @@ class PlainHandoffStage2Config:
     endpoint: str
     model: str = ""
     api_key: str = "EMPTY"
-    request_timeout: float = 7_200.0
+    # Total wall-clock budget for one logical JSON request, including transport
+    # retries and validator-guided repair turns.
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT
+    # Each individual HTTP attempt gets a smaller timeout so a straggling
+    # endpoint can be abandoned and retried within the logical request budget.
+    request_attempt_timeout: float = DEFAULT_REQUEST_ATTEMPT_TIMEOUT
     transport_max_attempts: int = DEFAULT_TRANSPORT_MAX_ATTEMPTS
     transport_retry_backoff: float = 2.0
     # Invalid completed responses receive validator-guided repair requests.
@@ -863,8 +871,17 @@ class PlainHandoffStage2Config:
             raise ValueError(
                 "stage2.vllm_rapid_switch_seconds must be a finite nonnegative number"
             )
-        if self.request_timeout <= 0:
-            raise ValueError("stage2.request_timeout must be positive")
+        for field_name, value in (
+            ("request_timeout", self.request_timeout),
+            ("request_attempt_timeout", self.request_attempt_timeout),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                raise ValueError(f"stage2.{field_name} must be a finite positive number")
         if self.transport_max_attempts < 1:
             raise ValueError("stage2.transport_max_attempts must be positive")
         if self.transport_retry_backoff < 0:
@@ -1242,7 +1259,10 @@ def plain_stage2_config_from_mapping(
         endpoint=endpoint.rstrip("/"),
         model=model,
         api_key=api_key,
-        request_timeout=float(raw.get("request_timeout", 7_200.0)),
+        request_timeout=float(raw.get("request_timeout", DEFAULT_REQUEST_TIMEOUT)),
+        request_attempt_timeout=float(
+            raw.get("request_attempt_timeout", DEFAULT_REQUEST_ATTEMPT_TIMEOUT)
+        ),
         transport_max_attempts=int(
             raw.get("transport_max_attempts", DEFAULT_TRANSPORT_MAX_ATTEMPTS)
         ),
@@ -2632,6 +2652,47 @@ class _ConcurrencyLimitedCompletion:
             return self.completion(messages, config)
 
 
+class _InterruptibleCompletion:
+    """Cooperatively stop same-role calls after another role is requested."""
+
+    def __init__(
+        self,
+        completion: CompletionFunction,
+        *,
+        required_role: str,
+        switch_event: threading.Event,
+    ) -> None:
+        self.completion = completion
+        self.required_role = str(required_role)
+        self.switch_event = switch_event
+        self.uses_default_transport = isinstance(
+            completion,
+            _RoundRobinOpenAICompletion,
+        )
+
+    def __call__(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        config: PlainHandoffStage2Config,
+    ) -> str:
+        if self.switch_event.is_set():
+            raise _ManagedStage2ModelSwitch(self.required_role)
+        return self.completion(messages, config)
+
+
+def _uses_default_openai_transport(
+    completion: CompletionFunction | None,
+) -> bool:
+    return bool(
+        completion is None
+        or isinstance(completion, _RoundRobinOpenAICompletion)
+        or (
+            isinstance(completion, _InterruptibleCompletion)
+            and completion.uses_default_transport
+        )
+    )
+
+
 def _is_retryable_transport_error(exc: Exception) -> bool:
     """Return whether a failed OpenAI-compatible request is safe to retry."""
 
@@ -2653,15 +2714,44 @@ def _completion_with_transport_retries(
     messages: Sequence[Mapping[str, str]],
     config: PlainHandoffStage2Config,
     completion: CompletionFunction,
+    *,
+    deadline: float | None = None,
 ) -> str:
+    logical_deadline = (
+        float(deadline)
+        if deadline is not None
+        else time.monotonic() + float(config.request_timeout)
+    )
     max_attempts = max(1, int(config.transport_max_attempts))
     for attempt in range(1, max_attempts + 1):
+        remaining = logical_deadline - time.monotonic()
+        if remaining <= 0:
+            raise Stage2RequestExhaustedError(
+                "Stage 2 logical request deadline expired before a transport attempt"
+            )
+        attempt_config = replace(
+            config,
+            request_timeout=min(float(config.request_attempt_timeout), remaining),
+        )
         try:
-            return completion(messages, config)
+            return completion(messages, attempt_config)
         except Exception as exc:
-            if not _is_retryable_transport_error(exc) or attempt == max_attempts:
+            if not _is_retryable_transport_error(exc):
                 raise
+            if attempt == max_attempts:
+                raise Stage2RequestExhaustedError(
+                    f"Stage 2 transport exhausted {max_attempts} attempt(s)"
+                ) from exc
+            remaining = logical_deadline - time.monotonic()
+            if remaining <= 0:
+                raise Stage2RequestExhaustedError(
+                    "Stage 2 logical request deadline expired after a transport failure"
+                ) from exc
             delay = float(config.transport_retry_backoff) * (2 ** (attempt - 1))
+            if delay >= remaining:
+                raise Stage2RequestExhaustedError(
+                    "Stage 2 logical request deadline would expire during retry backoff"
+                ) from exc
             LOGGER.warning(
                 "Stage 2 transport failed; retrying request attempt %s/%s " "after %.1fs (%s: %s)",
                 attempt + 1,
@@ -2793,6 +2883,7 @@ def _request_json(
     first_error: Exception | None = None
     max_repairs = int(config.max_response_repairs)
     max_attempts = 1 + max_repairs
+    logical_deadline = time.monotonic() + float(config.request_timeout)
 
     def token_window_fits(candidate: Sequence[Mapping[str, str]]) -> bool:
         if prompt_token_counter is None or context_window_tokens is None:
@@ -2803,6 +2894,10 @@ def _request_json(
         )
 
     for attempt in range(max_attempts):
+        if time.monotonic() >= logical_deadline:
+            raise Stage2RequestExhaustedError(
+                "Stage 2 logical request deadline expired across response repairs"
+            )
         response: str | None = None
         prompt_chars = sum(len(str(message.get("content") or "")) for message in conversation)
         if prompt_chars > int(config.max_prompt_chars):
@@ -2859,6 +2954,7 @@ def _request_json(
                 conversation,
                 attempt_config,
                 completion,
+                deadline=logical_deadline,
             )
             return validate(_parse_json_object(response))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -5977,9 +6073,7 @@ class PlainHandoffStage2:
             config,
             endpoints=endpoints,
             role="primary",
-            verify_live_endpoint=(
-                completion is None or isinstance(completion, _RoundRobinOpenAICompletion)
-            ),
+            verify_live_endpoint=_uses_default_openai_transport(completion),
         )
         config = replace(
             config,
@@ -6011,18 +6105,14 @@ class PlainHandoffStage2:
                 runtime_model_family="",
             )
             routed_extraction = extraction_completion or completion
-            uses_default_extraction_transport = (
-                routed_extraction is None
-                or isinstance(routed_extraction, _RoundRobinOpenAICompletion)
+            uses_default_extraction_transport = _uses_default_openai_transport(
+                routed_extraction
             )
             extraction_identity = _endpoint_model_identity(
                 extraction_request_config,
                 endpoints=extraction_endpoints,
                 role="extraction",
-                verify_live_endpoint=(
-                    routed_extraction is None
-                    or isinstance(routed_extraction, _RoundRobinOpenAICompletion)
-                ),
+                verify_live_endpoint=_uses_default_openai_transport(routed_extraction),
             )
             self.extraction_request_config = replace(
                 extraction_request_config,
@@ -8153,11 +8243,15 @@ def run_plain_handoff_stage2(
             rapid_switch_seconds=float(config.vllm_rapid_switch_seconds)
         )
 
-        def unavailable_model(required_role: str) -> CompletionFunction:
+        def unavailable_model(
+            required_role: str,
+            switch_event: threading.Event,
+        ) -> CompletionFunction:
             def request_switch(
                 _messages: Sequence[Mapping[str, str]],
                 _request_config: PlainHandoffStage2Config,
             ) -> str:
+                switch_event.set()
                 raise _ManagedStage2ModelSwitch(required_role)
 
             return request_switch
@@ -8272,6 +8366,7 @@ def run_plain_handoff_stage2(
             runtime_dataset: pd.DataFrame | None,
             transition: int,
         ) -> Mapping[str, Any]:
+            switch_event = threading.Event()
             record_phase(
                 status="running",
                 active_role=active_role,
@@ -8308,8 +8403,18 @@ def run_plain_handoff_stage2(
                         endpoint=active_endpoints[0],
                         runtime_endpoints=tuple(active_endpoints),
                     )
-                    primary_completion = completion
-                    runtime_extraction_completion = unavailable_model("extraction")
+                    routed_primary = completion or _RoundRobinOpenAICompletion(
+                        tuple(active_endpoints)
+                    )
+                    primary_completion = _InterruptibleCompletion(
+                        routed_primary,
+                        required_role="extraction",
+                        switch_event=switch_event,
+                    )
+                    runtime_extraction_completion = unavailable_model(
+                        "extraction",
+                        switch_event,
+                    )
                 else:
                     runtime_extraction = replace(
                         extraction,
@@ -8325,10 +8430,18 @@ def run_plain_handoff_stage2(
                         runtime_endpoints=tuple(active_endpoints),
                         extraction_llm=runtime_extraction,
                     )
-                    primary_completion = unavailable_model("interpretation")
-                    runtime_extraction_completion = (
+                    primary_completion = unavailable_model(
+                        "interpretation",
+                        switch_event,
+                    )
+                    routed_extraction = (
                         extraction_completion
                         or _RoundRobinOpenAICompletion(tuple(active_endpoints))
+                    )
+                    runtime_extraction_completion = _InterruptibleCompletion(
+                        routed_extraction,
+                        required_role="interpretation",
+                        switch_event=switch_event,
                     )
                 return run_with_config(
                     runtime_config,

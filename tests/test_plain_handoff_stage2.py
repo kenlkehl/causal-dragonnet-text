@@ -126,8 +126,9 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config is not None
     assert config.endpoint == "http://stage2.test/v1"
     assert config.model == ""
-    assert config.request_timeout == 7_200.0
-    assert config.transport_max_attempts == 10
+    assert config.request_timeout == 900.0
+    assert config.request_attempt_timeout == 300.0
+    assert config.transport_max_attempts == 3
     assert config.max_response_repairs == 10
     assert config.thinking_after_response_repairs == 5
     assert config.max_tokens == 100_000
@@ -210,6 +211,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     config = plain_stage2_config_from_mapping(
         {
             "endpoint": "http://stage2.test/v1",
+            "request_timeout": 1_200,
+            "request_attempt_timeout": 120,
             "max_tokens": 148_000,
             "extraction_max_tokens": 72_000,
             "max_response_repairs": 8,
@@ -247,6 +250,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     )
 
     assert config is not None
+    assert config.request_timeout == 1_200.0
+    assert config.request_attempt_timeout == 120.0
     assert config.max_tokens == 148_000
     assert config.extraction_max_tokens == 72_000
     assert config.max_response_repairs == 8
@@ -277,6 +282,8 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.effect_modifier_min_inner_fold_fraction == 0.8
     assert config.selection_workers == 6
     assert config.public_dict()["max_tokens"] == 148_000
+    assert config.public_dict()["request_timeout"] == 1_200.0
+    assert config.public_dict()["request_attempt_timeout"] == 120.0
     assert config.public_dict()["extraction_max_tokens"] == 72_000
     assert config.public_dict()["max_response_repairs"] == 8
     assert config.public_dict()["thinking_after_response_repairs"] == 3
@@ -485,6 +492,26 @@ def test_stage2_config_rejects_invalid_vllm_rapid_switch_seconds(
             endpoint="http://stage2.test/v1",
             model="test-model",
             vllm_rapid_switch_seconds=rapid_switch_seconds,
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("request_timeout", 0),
+        ("request_timeout", float("inf")),
+        ("request_timeout", True),
+        ("request_attempt_timeout", -1),
+        ("request_attempt_timeout", float("nan")),
+        ("request_attempt_timeout", "300"),
+    ],
+)
+def test_stage2_config_rejects_invalid_request_timeouts(field_name, value):
+    with pytest.raises(ValueError, match=field_name):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            **{field_name: value},
         ).validate()
 
 
@@ -1799,6 +1826,111 @@ def test_stage2_serial_extraction_carries_state_across_lossless_token_chunks_and
     pd.testing.assert_frame_equal(resumed, frame)
 
 
+def test_serial_ontology_repair_normalizes_numeric_carry_forward_state(
+    tmp_path: Path,
+):
+    definitions = [
+        {
+            "feature_id": "outer_001_feature_207",
+            "name": "metastasis_sites",
+            "description": "Documented sites of distant metastasis.",
+            "value_type": "categorical",
+            "categories_or_unit": ["Brain", "Bone", "Liver", "Adrenal Gland"],
+            "measurement_definition": "Extract one declared metastatic site.",
+            "missing_value_rule": "Return null when unavailable.",
+            "conflict_resolution": {"strategy": "latest", "positive_category": None},
+        },
+        {
+            "feature_id": "outer_001_feature_208",
+            "name": "metastasis_size",
+            "description": "Documented metastatic lesion size.",
+            "value_type": "continuous",
+            "categories_or_unit": ["cm"],
+            "measurement_definition": "Extract the documented lesion size.",
+            "missing_value_rule": "Return null when unavailable.",
+            "conflict_resolution": {"strategy": "latest", "positive_category": None},
+        },
+    ]
+    note = "metastatic disease " + ("x" * 450)
+    observed_prior_states = []
+    extraction_calls = 0
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        nonlocal extraction_calls
+        body = json.loads(messages[1]["content"])
+        if request_kind == "interpretation":
+            item = body["items"][0]
+            return validate(
+                {
+                    "corrections": [
+                        {"mapping_id": item["mapping_id"], "value": None}
+                    ]
+                }
+            )
+
+        extraction_calls += 1
+        patient = body["patient"]
+        observed_prior_states.append(dict(patient["prior_feature_state"]))
+        if extraction_calls == 1:
+            values = {
+                "metastasis_sites": "Adrenal Gland, Bone",
+                "metastasis_size": 4.5,
+            }
+            state = {
+                "metastasis_sites": "Adrenal Gland and bone are documented.",
+                # This is the exact malformed metadata shape from the failed run.
+                "metastasis_size": 4.5,
+            }
+        else:
+            values = dict(patient["prior_extraction"])
+            state = dict(patient["prior_feature_state"])
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "values": values,
+                        "carry_forward_state": state,
+                    }
+                ]
+            }
+        )
+
+    output = tmp_path / "serial_ontology_repair"
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": [note]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=100_000,
+        tokenizer=_CharacterChatTokenizer(),
+        chunk_size_tokens=200,
+        context_window_tokens=6_000,
+        max_output_tokens=500,
+        context_margin_tokens=200,
+    )
+
+    assert extraction_calls > 1
+    assert pd.isna(frame.loc[0, "metastasis_sites"])
+    assert frame.loc[0, "metastasis_size"] == 4.5
+    assert observed_prior_states[1]["metastasis_size"] == "4.5"
+    first_chunk = (
+        output
+        / "batches"
+        / "batch_00001"
+        / "serial_chunks"
+        / "chunk_00001"
+    )
+    audit = json.loads(
+        (first_chunk / "category_ontology_repair.json").read_text(encoding="utf-8")
+    )
+    assert audit["resolution"] == "llm_category_ontology"
+    assert (output / "complete.json").is_file()
+
+
 def test_stage2_tokenizer_keeps_short_patient_extraction_one_shot(tmp_path: Path):
     jobs = []
 
@@ -2375,6 +2507,46 @@ def test_pending_category_ontology_resumes_without_repeating_extraction(
     assert resumed_calls == ["interpretation"]
     assert frame.loc[0, "prior_immunotherapy_history"] == "documented"
     assert not pending_path.exists()
+    assert (batch / "complete.json").is_file()
+
+
+def test_extraction_request_exhaustion_is_audited_and_does_not_block_fold(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame({"clinical_text": ["No usable response returned."]})
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "performance_status",
+        "description": "Pretreatment performance status.",
+        "value_type": "continuous",
+        "categories_or_unit": ["ECOG score"],
+        "measurement_definition": "Extract the documented ECOG score.",
+        "missing_value_rule": "Return null when unavailable.",
+    }
+    output = tmp_path / "extraction"
+
+    def exhausted_request(_messages, _validate, *, request_kind="interpretation"):
+        assert request_kind == "extraction"
+        raise stage2_analysis.Stage2RequestExhaustedError(
+            "logical request deadline expired"
+        )
+
+    frame = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        output_dir=output,
+        request_json=exhausted_request,
+        workers=1,
+        max_prompt_chars=10_000,
+    )
+
+    assert pd.isna(frame.loc[0, "performance_status"])
+    batch = output / "batches" / "batch_00001"
+    failure = json.loads((batch / "extraction_failure.json").read_text(encoding="utf-8"))
+    assert failure["resolution"] == "conservative_all_null"
+    assert "Stage2RequestExhaustedError" in failure["validation_error"]
     assert (batch / "complete.json").is_file()
 
 
@@ -3759,7 +3931,7 @@ def test_stage2_retries_retryable_transport_errors_without_using_repair_turns(
     assert delays == [0.25, 0.5]
 
 
-def test_stage2_default_transport_policy_allows_ten_attempts(monkeypatch):
+def test_stage2_default_transport_policy_allows_three_attempts(monkeypatch):
     class RetryableTransportError(Exception):
         pass
 
@@ -3767,7 +3939,7 @@ def test_stage2_default_transport_policy_allows_ten_attempts(monkeypatch):
 
     def completion(messages, _config):
         calls.append([dict(message) for message in messages])
-        if len(calls) < 10:
+        if len(calls) < 3:
             raise RetryableTransportError("temporary timeout")
         return '{"ok": true}'
 
@@ -3791,8 +3963,54 @@ def test_stage2_default_transport_policy_allows_ten_attempts(monkeypatch):
     )
 
     assert result == {"ok": True}
-    assert len(calls) == 10
+    assert len(calls) == 3
     assert all(call == calls[0] for call in calls)
+
+
+def test_stage2_logical_request_deadline_bounds_transport_retries(monkeypatch):
+    class RetryableTransportError(Exception):
+        pass
+
+    clock = [0.0]
+    attempt_timeouts = []
+
+    def completion(_messages, request_config):
+        attempt_timeouts.append(request_config.request_timeout)
+        raise RetryableTransportError("straggling endpoint")
+
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_is_retryable_transport_error",
+        lambda exc: isinstance(exc, RetryableTransportError),
+    )
+    monkeypatch.setattr(stage2_workflow.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        stage2_workflow.time,
+        "sleep",
+        lambda delay: clock.__setitem__(0, clock[0] + delay),
+    )
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        request_timeout=2.5,
+        request_attempt_timeout=1.0,
+        transport_max_attempts=10,
+        transport_retry_backoff=1.0,
+    )
+
+    with pytest.raises(
+        stage2_analysis.Stage2RequestExhaustedError,
+        match="deadline",
+    ):
+        stage2_workflow._request_json(
+            messages=[{"role": "user", "content": "Return JSON."}],
+            config=config,
+            completion=completion,
+            validate=lambda value: dict(value),
+        )
+
+    assert attempt_timeouts == [1.0, 1.0]
+    assert clock[0] == 1.0
 
 
 def test_openai_timeout_is_a_retryable_transport_error():

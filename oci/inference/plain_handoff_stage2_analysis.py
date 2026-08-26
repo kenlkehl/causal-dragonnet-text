@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,6 +91,14 @@ class RequestJSON(Protocol):
         *,
         request_kind: str = "interpretation",
     ) -> dict[str, Any]: ...
+
+
+class Stage2RequestExhaustedError(RuntimeError):
+    """A retryable Stage 2 request exhausted its bounded attempt/deadline budget."""
+
+
+class _ExtractionCancelledError(RuntimeError):
+    """Cooperatively stop sibling extraction tasks after one task fails."""
 
 
 _SCALAR_EXTRACTION_RULES = (
@@ -982,7 +991,7 @@ def _request_validated_extraction(
             },
         )
         return validated
-    except ValueError as exc:
+    except (ValueError, Stage2RequestExhaustedError) as exc:
         value_error = _value_error_from_exception(exc)
         value_repair_audit: dict[str, Any] | None = pending_value_repair_audit
         category_error = _category_error_from_exception(exc)
@@ -1126,7 +1135,7 @@ def _request_validated_extraction(
             request_kind="interpretation",
         )
         resolution = "llm_category_ontology"
-    except ValueError as exc:
+    except (ValueError, Stage2RequestExhaustedError) as exc:
         ontology_error = f"{type(exc).__name__}: {exc}"
         resolution = "conservative_null"
         corrections = {
@@ -1677,10 +1686,19 @@ def _validate_serial_extraction(
         if raw is None:
             state[name] = None
             continue
+        if isinstance(raw, bool):
+            raw = "true" if raw else "false"
+        elif isinstance(raw, int):
+            raw = str(raw)
+        elif isinstance(raw, float) and math.isfinite(raw):
+            raw = json.dumps(raw, ensure_ascii=False, allow_nan=False)
         if not isinstance(raw, str):
-            raise ValueError(
-                f"serial carry_forward_state for {name!r} must be one string or null"
-            )
+            # Carry-forward state is bounded prompt metadata, not an extracted
+            # scientific value. Preserve scalar evidence losslessly as text and
+            # conservatively drop malformed containers/non-finite values rather
+            # than crashing after an otherwise valid ontology correction.
+            state[name] = None
+            continue
         rendered = raw.strip()
         if len(rendered) > MAX_SERIAL_FEATURE_STATE_CHARS:
             raise ValueError(
@@ -2050,7 +2068,7 @@ def _request_validated_page_observations(
             },
         )
         return validated
-    except ValueError as exc:
+    except (ValueError, Stage2RequestExhaustedError) as exc:
         observation_error = _page_observation_error_from_exception(exc)
         row_id = int(page["row_id"])
         if observation_error is not None:
@@ -2953,6 +2971,23 @@ def extract_rows(
     """Extract one patient at a time, serializing long records across token chunks."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    cancellation = threading.Event()
+
+    def guarded_request_json(
+        messages: Sequence[Mapping[str, str]],
+        validate: Callable[[Mapping[str, Any]], dict[str, Any]],
+        *,
+        request_kind: str = "interpretation",
+    ) -> dict[str, Any]:
+        if cancellation.is_set():
+            raise _ExtractionCancelledError(
+                "Stage 2 extraction cancelled after a sibling task failed"
+            )
+        return request_json(
+            messages,
+            validate,
+            request_kind=request_kind,
+        )
     extraction_request_identity = dict(request_identity or {})
     feature_names = [str(feature["name"]) for feature in definitions]
     definition_batches = _partition_feature_definitions(
@@ -3181,7 +3216,7 @@ def extract_rows(
                         parent_dir=feature_dir,
                         row=row,
                         definitions=batch_definitions,
-                        request_json=request_json,
+                        request_json=guarded_request_json,
                         request_identity=extraction_request_identity,
                         tokenizer=tokenizer,
                         chunk_size_tokens=int(chunk_size_tokens),
@@ -3203,7 +3238,7 @@ def extract_rows(
                         messages=messages,
                         row_ids=[row_id],
                         definitions=batch_definitions,
-                        request_json=request_json,
+                        request_json=guarded_request_json,
                         ontology_audit_path=ontology_audit_path,
                     )
                 _write_json(result_path, result)
@@ -3318,7 +3353,7 @@ def extract_rows(
                     messages=messages,
                     page=page,
                     definitions=batch_definitions,
-                    request_json=request_json,
+                    request_json=guarded_request_json,
                     audit_dir=feature_dir,
                 )
                 _write_json(result_path, result)
@@ -3483,7 +3518,7 @@ def extract_rows(
                     parent_dir=batch_dir,
                     row=batch[0],
                     definitions=definitions,
-                    request_json=request_json,
+                    request_json=guarded_request_json,
                     request_identity=extraction_request_identity,
                     tokenizer=tokenizer,
                     chunk_size_tokens=int(chunk_size_tokens),
@@ -3501,7 +3536,7 @@ def extract_rows(
                     messages=messages,
                     row_ids=row_ids,
                     definitions=definitions,
-                    request_json=request_json,
+                    request_json=guarded_request_json,
                     ontology_audit_path=ontology_audit_path,
                 )
                 if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
@@ -3584,7 +3619,7 @@ def extract_rows(
                 messages=messages,
                 page=page,
                 definitions=definitions,
-                request_json=request_json,
+                request_json=guarded_request_json,
                 audit_dir=page_dir,
             )
         else:
@@ -3626,12 +3661,19 @@ def extract_rows(
         page_futures = {
             executor.submit(run_page, page): int(page["row_id"]) for page in page_requests
         }
-        for future in concurrent.futures.as_completed([*batch_futures, *page_futures]):
-            if future in batch_futures:
-                completed.append((batch_futures[future], future.result()))
-            else:
-                row_id = page_futures[future]
-                completed_pages.setdefault(row_id, []).append(future.result())
+        all_futures = [*batch_futures, *page_futures]
+        try:
+            for future in concurrent.futures.as_completed(all_futures):
+                if future in batch_futures:
+                    completed.append((batch_futures[future], future.result()))
+                else:
+                    row_id = page_futures[future]
+                    completed_pages.setdefault(row_id, []).append(future.result())
+        except BaseException:
+            cancellation.set()
+            for pending in all_futures:
+                pending.cancel()
+            raise
     values_by_row = {
         int(row["row_id"]): dict(row["values"])
         for _index, rows in sorted(completed)
@@ -4608,7 +4650,7 @@ def _request_harmonization_plan(
                 ),
                 request_kind="interpretation",
             )
-    except ValueError as exc:
+    except (ValueError, Stage2RequestExhaustedError) as exc:
         validation_error = exc
 
     fallback: dict[str, Any] | None = None
@@ -6973,7 +7015,7 @@ def _request_aggregate_ontology_supervisor(
                 lambda value: _validate_ontology_refinement(value, feature=feature),
                 request_kind="interpretation",
             )
-        except ValueError as exc:
+        except (ValueError, Stage2RequestExhaustedError) as exc:
             decision = {
                 "feature_id": feature_id,
                 "feature_name": str(feature["name"]),
@@ -7154,7 +7196,7 @@ def _request_ontology_refinements(
                 messages,
                 lambda value: _validate_ontology_refinement(value, feature=feature),
             )
-        except ValueError as exc:
+        except (ValueError, Stage2RequestExhaustedError) as exc:
             decision = {
                 "feature_id": str(feature["feature_id"]),
                 "feature_name": name,

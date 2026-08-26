@@ -675,7 +675,9 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
       "api_key": "EMPTY",
       "workers": 32
     },
-    "request_timeout": 7200,
+    "request_timeout": 900,
+    "request_attempt_timeout": 300,
+    "transport_max_attempts": 3,
     "max_tokens": 100000,
     "extraction_max_tokens": 75000,
     "max_response_repairs": 10,
@@ -831,10 +833,14 @@ For Qwen 3.8, the model-agnostic `high` policy is translated to the endpoint's
 `reasoning_effort: "xhigh"` wire value. Disabled extraction thinking omits the
 wire-level effort enum and uses the family-specific hard-off controls.
 
-A transport failure receives up to `transport_max_attempts` attempts (10 by
-default). A completed response that fails JSON parsing or schema validation receives up
-to `max_response_repairs` validator-guided retries (10 by default), each with
-the concrete validation error. Repair attempts through
+A logical request, including transport retries and validator-guided repair
+turns, is bounded by `request_timeout` (900 seconds by default). Each HTTP call
+is bounded by `request_attempt_timeout` (300 seconds by default), so a
+straggling endpoint can be abandoned and retried. A transport failure receives
+up to `transport_max_attempts` attempts (3 by default). A completed response
+that fails JSON parsing or schema validation receives up to
+`max_response_repairs` validator-guided retries (10 by default), each with the
+concrete validation error. Repair attempts through
 `thinking_after_response_repairs` (5 by default) retain the request's normal
 reasoning policy; later repairs force `reasoning_effort` to at least `high`,
 which enables thinking for the managed vLLM reasoning parsers.
