@@ -35,6 +35,7 @@ stage2_extraction_context_margin_tokens="${STAGE2_EXTRACTION_CONTEXT_MARGIN_TOKE
 stage2_vllm_servers="${STAGE2_VLLM_SERVERS:-0}"
 stage2_vllm_gpus="${STAGE2_VLLM_GPUS:-}"
 stage2_vllm_gpus_per_server="${STAGE2_VLLM_GPUS_PER_SERVER:-}"
+stage2_vllm_rapid_switch_seconds="${STAGE2_VLLM_RAPID_SWITCH_SECONDS:-}"
 stage2_vllm_base_port="${STAGE2_VLLM_BASE_PORT:-}"
 stage2_vllm_internal_port_base="${STAGE2_VLLM_INTERNAL_PORT_BASE:-}"
 stage2_vllm_download_dir="${STAGE2_VLLM_DOWNLOAD_DIR:-}"
@@ -373,6 +374,11 @@ if (( stage2_managed_orchestrator )); then
             --stage2-vllm-gpus-per-server "${stage2_vllm_gpus_per_server}"
         )
     fi
+    if [[ -n "${stage2_vllm_rapid_switch_seconds}" ]]; then
+        stage_mode_args+=(
+            --stage2-vllm-rapid-switch-seconds "${stage2_vllm_rapid_switch_seconds}"
+        )
+    fi
     if [[ -n "${stage2_vllm_base_port}" ]]; then
         stage_mode_args+=(--stage2-vllm-base-port "${stage2_vllm_base_port}")
     fi
@@ -421,7 +427,7 @@ if (( stage2_managed_extractor )); then
     fi
     stage2_description+="; managed extractor vLLM: ${extractor_server_description} on ${stage2_extraction_vllm_gpus} (${stage2_extraction_workers:-${resolved_stage2_workers}} concurrent requests)"
     if (( stage2_managed_orchestrator )); then
-        stage2_description+="; models alternate across the union of both managed GPU allocations"
+        stage2_description+="; models alternate across the GPU union with adaptive configured-split fallback"
     fi
 elif [[ -n "${stage2_extraction_endpoint}" && "${stage2_enabled}" == "1" ]]; then
     stage2_description+="; extractor ${stage2_extraction_endpoint} (${stage2_extraction_workers:-${resolved_stage2_workers}} concurrent requests)"

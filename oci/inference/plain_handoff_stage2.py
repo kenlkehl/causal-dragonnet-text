@@ -76,6 +76,8 @@ DEFAULT_INTERPRETATION_REASONING_EFFORT = "high"
 DEFAULT_EXTRACTION_REASONING_EFFORT = "none"
 STAGE2_REQUEST_KINDS = frozenset({"interpretation", "extraction"})
 MANAGED_MODEL_PHASE_SCHEMA_VERSION = "stage2_managed_model_phase_v1"
+DEFAULT_VLLM_RAPID_SWITCH_SECONDS = 15 * 60.0
+MANAGED_VLLM_ALLOCATION_MODES = frozenset({"all_gpus", "configured_split"})
 SUPPORTED_REASONING_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
@@ -818,6 +820,10 @@ class PlainHandoffStage2Config:
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY
     explicit_features: tuple[Stage2ExplicitFeature, ...] = ()
     vllm: ManagedVLLMConfig | None = None
+    # When two pipeline-managed models request each other again within this
+    # interval, keep both resident on their configured GPU splits for the rest
+    # of the run. Zero retains all-GPU alternation unconditionally.
+    vllm_rapid_switch_seconds: float = DEFAULT_VLLM_RAPID_SWITCH_SECONDS
     # Populated only while pipeline-owned servers are alive. It is deliberately
     # excluded from the persisted scientific configuration; the server-pool
     # manifest records the concrete endpoints and process/GPU assignments.
@@ -848,6 +854,15 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.model must be nonempty")
         if self.vllm is not None:
             self.vllm.validate()
+        if (
+            isinstance(self.vllm_rapid_switch_seconds, bool)
+            or not isinstance(self.vllm_rapid_switch_seconds, (int, float))
+            or not math.isfinite(float(self.vllm_rapid_switch_seconds))
+            or self.vllm_rapid_switch_seconds < 0
+        ):
+            raise ValueError(
+                "stage2.vllm_rapid_switch_seconds must be a finite nonnegative number"
+            )
         if self.request_timeout <= 0:
             raise ValueError("stage2.request_timeout must be positive")
         if self.transport_max_attempts < 1:
@@ -1365,6 +1380,12 @@ def plain_stage2_config_from_mapping(
         repetition_penalty=float(raw.get("repetition_penalty", DEFAULT_REPETITION_PENALTY)),
         explicit_features=explicit_features,
         vllm=managed_vllm,
+        vllm_rapid_switch_seconds=float(
+            raw.get(
+                "vllm_rapid_switch_seconds",
+                DEFAULT_VLLM_RAPID_SWITCH_SECONDS,
+            )
+        ),
     )
     config.validate(
         require_model=False,
@@ -2112,6 +2133,35 @@ class _ManagedStage2ModelSwitch(RuntimeError):
             raise ValueError(f"unknown managed Stage 2 model role: {required_role!r}")
         self.required_role = role
         super().__init__(f"managed Stage 2 requires the {role} model")
+
+
+@dataclass
+class _ManagedStage2SwitchTracker:
+    """Track model-role switches with a monotonic in-process clock."""
+
+    rapid_switch_seconds: float
+    last_switch_monotonic: float | None = None
+    last_switch_at: str | None = None
+    previous_switch_elapsed_seconds: float | None = None
+
+    def mark_switch(self) -> float | None:
+        switched_at = time.monotonic()
+        elapsed = (
+            None
+            if self.last_switch_monotonic is None
+            else max(0.0, switched_at - self.last_switch_monotonic)
+        )
+        self.last_switch_monotonic = switched_at
+        self.last_switch_at = _now()
+        self.previous_switch_elapsed_seconds = elapsed
+        return elapsed
+
+    def is_rapid(self, elapsed: float | None) -> bool:
+        return bool(
+            self.rapid_switch_seconds > 0
+            and elapsed is not None
+            and elapsed < self.rapid_switch_seconds
+        )
 
 
 class _LazyStage2ExtractionTokenizer:
@@ -8043,16 +8093,65 @@ def run_plain_handoff_stage2(
         )
 
     managed_root = Path(output_dir) / "vllm_servers"
-    if config.vllm is not None and extraction_vllm is not None:
+
+    def run_configured_managed_pools() -> Mapping[str, Any]:
+        """Run with each managed model on its exact configured allocation."""
+
+        with ExitStack() as stack:
+            runtime_config = config
+            if config.vllm is not None:
+                primary_endpoints = stack.enter_context(
+                    launch_managed_vllm_servers(
+                        config=config.vllm,
+                        model=config.model,
+                        api_key=config.api_key,
+                        output_dir=managed_root / "orchestrator",
+                    )
+                )
+                runtime_config = replace(
+                    runtime_config,
+                    endpoint=primary_endpoints[0],
+                    runtime_endpoints=tuple(primary_endpoints),
+                )
+            if extraction is not None and extraction_vllm is not None:
+                extraction_endpoints = stack.enter_context(
+                    launch_managed_vllm_servers(
+                        config=extraction_vllm,
+                        model=extraction.model,
+                        api_key=extraction.api_key,
+                        output_dir=managed_root / "extractor",
+                    )
+                )
+                runtime_extraction = replace(
+                    extraction,
+                    endpoint=extraction_endpoints[0],
+                    runtime_endpoints=tuple(extraction_endpoints),
+                )
+                runtime_config = replace(
+                    runtime_config,
+                    extraction_llm=runtime_extraction,
+                )
+            return run_with_config(
+                runtime_config,
+                runtime_dataset=dataset,
+                runtime_primary_completion=completion,
+                runtime_extraction_completion=extraction_completion,
+            )
+
+    primary_vllm = config.vllm
+    if primary_vllm is not None and extraction_vllm is not None:
         all_gpu_interpretation = _all_gpu_interpretation_vllm_config(
-            config.vllm,
+            primary_vllm,
             extraction_vllm,
         )
         all_gpu_extraction = _all_gpu_extraction_vllm_config(
-            config.vllm,
+            primary_vllm,
             extraction_vllm,
         )
         phase_path = managed_root / "model_phase.json"
+        switch_tracker = _ManagedStage2SwitchTracker(
+            rapid_switch_seconds=float(config.vllm_rapid_switch_seconds)
+        )
 
         def unavailable_model(required_role: str) -> CompletionFunction:
             def request_switch(
@@ -8068,12 +8167,27 @@ def run_plain_handoff_stage2(
             status: str,
             active_role: str,
             transition: int,
+            allocation_mode: str = "all_gpus",
+            rapid_switch_trigger_elapsed_seconds: float | None = None,
         ) -> None:
-            role_config = (
-                all_gpu_interpretation
-                if active_role == "interpretation"
-                else all_gpu_extraction
-            )
+            if active_role not in STAGE2_REQUEST_KINDS:
+                raise ValueError(f"unknown managed Stage 2 role: {active_role!r}")
+            if allocation_mode not in MANAGED_VLLM_ALLOCATION_MODES:
+                raise ValueError(
+                    f"unknown managed Stage 2 allocation mode: {allocation_mode!r}"
+                )
+            if allocation_mode == "all_gpus":
+                role_config = (
+                    all_gpu_interpretation
+                    if active_role == "interpretation"
+                    else all_gpu_extraction
+                )
+            else:
+                role_config = (
+                    primary_vllm
+                    if active_role == "interpretation"
+                    else extraction_vllm
+                )
             role_model = config.model if active_role == "interpretation" else extraction.model
             _write_json(
                 phase_path,
@@ -8081,24 +8195,76 @@ def run_plain_handoff_stage2(
                     "schema_version": MANAGED_MODEL_PHASE_SCHEMA_VERSION,
                     "status": status,
                     "active_role": active_role,
+                    "allocation_mode": allocation_mode,
                     "model": role_model,
                     "gpus": list(role_config.gpus),
+                    "configured_gpu_allocations": {
+                        "interpretation": list(primary_vllm.gpus),
+                        "extraction": list(extraction_vllm.gpus),
+                    },
                     "transition": int(transition),
+                    "rapid_switch_seconds": float(config.vllm_rapid_switch_seconds),
+                    "last_switch_at": switch_tracker.last_switch_at,
+                    "previous_switch_elapsed_seconds": (
+                        switch_tracker.previous_switch_elapsed_seconds
+                    ),
+                    "rapid_switch_trigger_elapsed_seconds": (
+                        rapid_switch_trigger_elapsed_seconds
+                    ),
                     "recorded_at": _now(),
                 },
             )
 
-        def saved_role() -> str | None:
+        def saved_phase() -> Mapping[str, Any] | None:
             if not phase_path.is_file():
                 return None
             try:
                 state = json.loads(phase_path.read_text(encoding="utf-8"))
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 return None
+            if not isinstance(state, Mapping):
+                return None
             if state.get("schema_version") != MANAGED_MODEL_PHASE_SCHEMA_VERSION:
+                return None
+            return state
+
+        def phase_role(state: Mapping[str, Any] | None) -> str | None:
+            if state is None:
                 return None
             role = str(state.get("active_role") or "").strip().lower()
             return role if role in STAGE2_REQUEST_KINDS else None
+
+        def configured_split_result(
+            *,
+            active_role: str,
+            transition: int,
+            trigger_elapsed_seconds: float | None,
+            resumed: bool,
+        ) -> Mapping[str, Any]:
+            status = "running_configured_split"
+            record_phase(
+                status=status,
+                active_role=active_role,
+                transition=transition,
+                allocation_mode="configured_split",
+                rapid_switch_trigger_elapsed_seconds=trigger_elapsed_seconds,
+            )
+            LOGGER.info(
+                "%s managed Stage 2 configured-split mode; keeping interpretation "
+                "gpus=%s and extraction gpus=%s resident concurrently",
+                "resume" if resumed else "enter",
+                list(primary_vllm.gpus),
+                list(extraction_vllm.gpus),
+            )
+            result = run_configured_managed_pools()
+            record_phase(
+                status="complete",
+                active_role=active_role,
+                transition=transition,
+                allocation_mode="configured_split",
+                rapid_switch_trigger_elapsed_seconds=trigger_elapsed_seconds,
+            )
+            return result
 
         def run_managed_role(
             active_role: str,
@@ -8171,9 +8337,62 @@ def run_plain_handoff_stage2(
                     runtime_extraction_completion=runtime_extraction_completion,
                 )
 
+        saved_state = saved_phase()
+        if saved_state is not None:
+            saved_last_switch_at = str(
+                saved_state.get("last_switch_at") or ""
+            ).strip()
+            if saved_last_switch_at:
+                switch_tracker.last_switch_at = saved_last_switch_at
+            raw_previous_elapsed = saved_state.get(
+                "previous_switch_elapsed_seconds"
+            )
+            if isinstance(raw_previous_elapsed, (int, float)) and not isinstance(
+                raw_previous_elapsed, bool
+            ):
+                switch_tracker.previous_switch_elapsed_seconds = max(
+                    0.0, float(raw_previous_elapsed)
+                )
+        saved_allocation_mode = (
+            str(saved_state.get("allocation_mode") or "all_gpus").strip().lower()
+            if saved_state is not None
+            else "all_gpus"
+        )
+        saved_transition = 0
+        if saved_state is not None:
+            try:
+                saved_transition = max(0, int(saved_state.get("transition", 0)))
+            except (TypeError, ValueError):
+                saved_transition = 0
+        saved_trigger_elapsed: float | None = None
+        if saved_state is not None:
+            raw_saved_elapsed = saved_state.get(
+                "rapid_switch_trigger_elapsed_seconds"
+            )
+            if isinstance(raw_saved_elapsed, (int, float)) and not isinstance(
+                raw_saved_elapsed, bool
+            ):
+                saved_trigger_elapsed = max(0.0, float(raw_saved_elapsed))
+
+        # Once rapid alternation has selected the configured split, retain it
+        # across process restarts. Setting the cutoff to zero explicitly opts
+        # back into unconditional all-GPU alternation.
+        if (
+            dataset is not None
+            and config.vllm_rapid_switch_seconds > 0
+            and saved_allocation_mode == "configured_split"
+        ):
+            return configured_split_result(
+                active_role=phase_role(saved_state) or "extraction",
+                transition=saved_transition,
+                trigger_elapsed_seconds=saved_trigger_elapsed,
+                resumed=True,
+            )
+
         # Feature discovery and operationalization are an interpretation-only
         # phase. Finish them first, then use ordinary request checkpoints to
-        # alternate the two models without ever keeping both resident.
+        # alternate the two models while phases remain long enough to justify
+        # reloading them over the complete GPU union.
         extraction_has_started = bool(
             dataset is not None and _has_extraction_dependent_checkpoints(output_dir)
         )
@@ -8192,9 +8411,19 @@ def run_plain_handoff_stage2(
                 return interpretation_result
             active_role = "extraction"
             transition = 1
+            switch_tracker.mark_switch()
+            record_phase(
+                status="switch_required",
+                active_role=active_role,
+                transition=transition,
+            )
         else:
-            active_role = saved_role() or "extraction"
-            transition = 0
+            active_role = phase_role(saved_state) or "extraction"
+            transition = saved_transition
+            # A resumed all-GPU role load is the start of a new residency
+            # interval even though the previous process's monotonic clock is
+            # intentionally not reused.
+            switch_tracker.mark_switch()
             LOGGER.info(
                 "resume alternating managed Stage 2 role=%s because "
                 "extraction-dependent checkpoints already exist",
@@ -8214,13 +8443,39 @@ def run_plain_handoff_stage2(
                         "managed Stage 2 requested a switch to the model that is "
                         f"already active: {active_role}"
                     ) from switch
+                elapsed = switch_tracker.mark_switch()
+                transition += 1
+                if switch_tracker.is_rapid(elapsed):
+                    LOGGER.info(
+                        "checkpointed managed Stage 2 %s phase after %.1f seconds "
+                        "(< %.1f); keeping both models resident on their configured "
+                        "GPU allocations",
+                        active_role,
+                        elapsed,
+                        config.vllm_rapid_switch_seconds,
+                    )
+                    active_role = switch.required_role
+                    record_phase(
+                        status="rapid_switch_fallback",
+                        active_role=active_role,
+                        transition=transition,
+                        allocation_mode="configured_split",
+                        rapid_switch_trigger_elapsed_seconds=elapsed,
+                    )
+                    return configured_split_result(
+                        active_role=active_role,
+                        transition=transition,
+                        trigger_elapsed_seconds=elapsed,
+                        resumed=False,
+                    )
                 LOGGER.info(
-                    "checkpointed managed Stage 2 %s phase; switching all GPUs to %s",
+                    "checkpointed managed Stage 2 %s phase after %s seconds; "
+                    "switching all GPUs to %s",
                     active_role,
+                    f"{elapsed:.1f}" if elapsed is not None else "an untracked interval",
                     switch.required_role,
                 )
                 active_role = switch.required_role
-                transition += 1
                 record_phase(
                     status="switch_required",
                     active_role=active_role,
@@ -8234,46 +8489,7 @@ def run_plain_handoff_stage2(
             )
             return result
 
-    with ExitStack() as stack:
-        runtime_config = config
-        if config.vllm is not None:
-            primary_endpoints = stack.enter_context(
-                launch_managed_vllm_servers(
-                    config=config.vllm,
-                    model=config.model,
-                    api_key=config.api_key,
-                    output_dir=managed_root / "orchestrator",
-                )
-            )
-            runtime_config = replace(
-                runtime_config,
-                endpoint=primary_endpoints[0],
-                runtime_endpoints=tuple(primary_endpoints),
-            )
-        if extraction is not None and extraction_vllm is not None:
-            extraction_endpoints = stack.enter_context(
-                launch_managed_vllm_servers(
-                    config=extraction_vllm,
-                    model=extraction.model,
-                    api_key=extraction.api_key,
-                    output_dir=managed_root / "extractor",
-                )
-            )
-            runtime_extraction = replace(
-                extraction,
-                endpoint=extraction_endpoints[0],
-                runtime_endpoints=tuple(extraction_endpoints),
-            )
-            runtime_config = replace(
-                runtime_config,
-                extraction_llm=runtime_extraction,
-            )
-        return run_with_config(
-            runtime_config,
-            runtime_dataset=dataset,
-            runtime_primary_completion=completion,
-            runtime_extraction_completion=extraction_completion,
-        )
+    return run_configured_managed_pools()
 
 
 __all__ = [

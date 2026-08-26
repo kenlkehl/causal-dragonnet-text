@@ -200,6 +200,7 @@ fi
             "STAGE2_VLLM_SERVERS": "1",
             "STAGE2_VLLM_GPUS": "cuda:0,cuda:1",
             "STAGE2_VLLM_GPUS_PER_SERVER": "2",
+            "STAGE2_VLLM_RAPID_SWITCH_SECONDS": "1200",
             "STAGE2_VLLM_BASE_PORT": "9010",
             "STAGE2_EXTRACTION_ENDPOINT": "",
             "STAGE2_EXTRACTION_MODEL": "LiquidAI/LFM2.5-2.6B",
@@ -240,6 +241,7 @@ fi
     assert "--stage2-vllm-servers 1" in workflow
     assert r"--stage2-vllm-gpus cuda:0\,cuda:1" in workflow
     assert "--stage2-vllm-gpus-per-server 2" in workflow
+    assert "--stage2-vllm-rapid-switch-seconds 1200" in workflow
     assert "--stage2-vllm-base-port 9010" in workflow
     assert "--stage2-extraction-model LiquidAI/LFM2.5-2.6B" in workflow
     assert "--stage2-extraction-vllm-servers 2" in workflow

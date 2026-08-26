@@ -238,6 +238,33 @@ def test_extraction_pool_uses_union_with_extractor_replica_width():
     assert combined.effective_ports() == (9110, 9111, 9112, 9113)
 
 
+def test_managed_switch_tracker_only_marks_intervals_below_the_cutoff_as_rapid(
+    monkeypatch,
+):
+    monotonic_values = iter((100.0, 159.9, 230.0))
+    monkeypatch.setattr(
+        stage2_workflow.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+    tracker = stage2_workflow._ManagedStage2SwitchTracker(
+        rapid_switch_seconds=60.0
+    )
+
+    assert tracker.mark_switch() is None
+    rapid_elapsed = tracker.mark_switch()
+    assert rapid_elapsed == pytest.approx(59.9)
+    assert tracker.is_rapid(rapid_elapsed)
+    slow_elapsed = tracker.mark_switch()
+    assert slow_elapsed == pytest.approx(70.1)
+    assert not tracker.is_rapid(slow_elapsed)
+
+    disabled = stage2_workflow._ManagedStage2SwitchTracker(
+        rapid_switch_seconds=0.0
+    )
+    assert not disabled.is_rapid(0.0)
+
+
 @pytest.mark.parametrize(
     ("vllm", "message"),
     [
@@ -315,6 +342,8 @@ def test_managed_vllm_cli_options_compile_into_stage2_config(tmp_path):
             "cuda:0,cuda:1",
             "--stage2-vllm-gpus-per-server",
             "1",
+            "--stage2-vllm-rapid-switch-seconds",
+            "1200",
             "--stage2-vllm-base-port",
             "9100",
             "--stage2-vllm-download-dir",
@@ -336,6 +365,7 @@ def test_managed_vllm_cli_options_compile_into_stage2_config(tmp_path):
     assert config.stage2.vllm.server_count == 2
     assert config.stage2.vllm.gpus == ("cuda:0", "cuda:1")
     assert config.stage2.vllm.gpus_per_server == 1
+    assert config.stage2.vllm_rapid_switch_seconds == 1_200.0
     assert config.stage2.vllm.effective_ports() == (9100, 9101)
     assert config.stage2.vllm.download_dir == "/models/cache"
     assert config.stage2.vllm.reasoning_parser == "custom-qwen"
@@ -753,7 +783,94 @@ def test_managed_resume_honors_persisted_interpretation_switch(tmp_path, monkeyp
     ]
 
 
-def test_run_wrapper_alternates_all_gpu_model_pools_and_round_robins_each(
+def test_managed_resume_retains_persisted_configured_split(tmp_path, monkeypatch):
+    config = plain_stage2_config_from_mapping(
+        {
+            "model": "large-reviewer",
+            "vllm": {"gpus": [0], "gpus_per_server": 1},
+            "extraction_llm": {
+                "model": "small-extractor",
+                "vllm": {"gpus": [1], "gpus_per_server": 1},
+            },
+        },
+        default_workers=4,
+    )
+    assert config is not None
+    output_dir = tmp_path / "stage2"
+    (output_dir / "outer_001" / "extraction").mkdir(parents=True)
+    phase_path = output_dir / "vllm_servers" / "model_phase.json"
+    phase_path.parent.mkdir(parents=True)
+    phase_path.write_text(
+        json.dumps(
+            {
+                "schema_version": stage2_workflow.MANAGED_MODEL_PHASE_SCHEMA_VERSION,
+                "status": "running_configured_split",
+                "active_role": "interpretation",
+                "allocation_mode": "configured_split",
+                "transition": 4,
+                "rapid_switch_trigger_elapsed_seconds": 42.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    lifecycle: list[str] = []
+
+    @contextmanager
+    def fake_launch(**kwargs):
+        role = kwargs["output_dir"].name
+        lifecycle.append(f"start-{role}")
+        if role == "orchestrator":
+            assert kwargs["config"].gpus == ("cuda:0",)
+            endpoints = ("http://127.0.0.1:8010/v1",)
+        else:
+            assert role == "extractor"
+            assert kwargs["config"].gpus == ("cuda:1",)
+            endpoints = ("http://127.0.0.1:8110/v1",)
+        try:
+            yield endpoints
+        finally:
+            lifecycle.append(f"stop-{role}")
+
+    def fake_run(self, **kwargs):
+        assert kwargs["dataset"] is not None
+        assert self.config.endpoint == "http://127.0.0.1:8010/v1"
+        assert self.extraction_request_config is not None
+        assert self.extraction_request_config.endpoint == "http://127.0.0.1:8110/v1"
+        lifecycle.append("stage2")
+        return {"phase": "causal_estimation"}
+
+    monkeypatch.setattr(stage2_workflow, "launch_managed_vllm_servers", fake_launch)
+    monkeypatch.setattr(PlainHandoffStage2, "run", fake_run)
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda request_config: [request_config.model],
+    )
+
+    result = run_plain_handoff_stage2(
+        handoff_path=tmp_path / "handoff.jsonl",
+        output_dir=output_dir,
+        clinical_question="test",
+        config=config,
+        dataset=object(),
+    )
+
+    assert result == {"phase": "causal_estimation"}
+    assert lifecycle == [
+        "start-orchestrator",
+        "start-extractor",
+        "stage2",
+        "stop-extractor",
+        "stop-orchestrator",
+    ]
+    phase = json.loads(phase_path.read_text(encoding="utf-8"))
+    assert phase["status"] == "complete"
+    assert phase["allocation_mode"] == "configured_split"
+    assert phase["transition"] == 4
+    assert phase["rapid_switch_trigger_elapsed_seconds"] == 42.0
+
+
+def test_rapid_managed_switch_falls_back_to_concurrent_configured_pools(
     tmp_path,
     monkeypatch,
 ):
@@ -766,6 +883,7 @@ def test_run_wrapper_alternates_all_gpu_model_pools_and_round_robins_each(
                 "workers": 8,
                 "vllm": {"gpus": [2, 3, 4], "gpus_per_server": 1},
             },
+            "vllm_rapid_switch_seconds": 60,
         },
         default_workers=4,
     )
@@ -797,8 +915,7 @@ def test_run_wrapper_alternates_all_gpu_model_pools_and_round_robins_each(
             endpoints = tuple(
                 f"http://127.0.0.1:{port}/v1" for port in range(8010, 8015)
             )
-        else:
-            assert role == "extractor_all_gpus"
+        elif role == "extractor_all_gpus":
             assert kwargs["model"] == "small-extractor"
             assert kwargs["config"].internal_port_base == 40_000
             assert kwargs["config"].gpus == (
@@ -810,6 +927,22 @@ def test_run_wrapper_alternates_all_gpu_model_pools_and_round_robins_each(
             )
             endpoints = tuple(
                 f"http://127.0.0.1:{port}/v1" for port in range(8110, 8115)
+            )
+        elif role == "orchestrator":
+            assert kwargs["model"] == "large-reviewer"
+            assert kwargs["config"].gpus == ("cuda:0", "cuda:1")
+            endpoints = (
+                "http://127.0.0.1:8010/v1",
+                "http://127.0.0.1:8011/v1",
+            )
+        else:
+            assert role == "extractor"
+            assert kwargs["model"] == "small-extractor"
+            assert kwargs["config"].gpus == ("cuda:2", "cuda:3", "cuda:4")
+            endpoints = (
+                "http://127.0.0.1:8110/v1",
+                "http://127.0.0.1:8111/v1",
+                "http://127.0.0.1:8112/v1",
             )
         try:
             yield endpoints
@@ -829,22 +962,38 @@ def test_run_wrapper_alternates_all_gpu_model_pools_and_round_robins_each(
             for _ in range(4):
                 self.completion([], self.config)
             return {"phase": "feature_definitions"}
-        if self.extraction_request_config.endpoint.startswith("http://127.0.0.1:8110"):
+        if self.config.endpoint.startswith("http://127.0.0.1:8110"):
             lifecycle.append("stage2-extraction")
-            captured["extraction_config"] = self.config
+            captured["all_gpu_extraction_config"] = self.config
             for _ in range(5):
                 self.extraction_completion([], self.extraction_request_config)
             self.completion([], self.config)
             raise AssertionError("inactive primary completion should request a model switch")
-        lifecycle.append("stage2-orchestration")
-        captured["config"] = self.config
+        if not self.extraction_request_config.endpoint:
+            lifecycle.append("stage2-orchestration")
+            for _ in range(4):
+                self.completion([], self.config)
+            self.extraction_completion([], self.extraction_request_config)
+            raise AssertionError("inactive extraction completion should request a model switch")
+        lifecycle.append("stage2-concurrent")
+        captured["configured_split"] = self.config
         for _ in range(4):
             self.completion([], self.config)
+        for _ in range(5):
+            self.extraction_completion([], self.extraction_request_config)
         return {"ok": True}
 
     monkeypatch.setattr(stage2_workflow, "launch_managed_vllm_servers", fake_launch)
     monkeypatch.setattr(stage2_workflow, "_openai_completion", fake_completion)
     monkeypatch.setattr(PlainHandoffStage2, "run", fake_run)
+    # The extraction-to-interpretation interval is long enough to preserve
+    # all-GPU alternation. The next transition is rapid and selects the split.
+    monotonic_values = iter((100.0, 200.0, 230.0))
+    monkeypatch.setattr(
+        stage2_workflow.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
     monkeypatch.setattr(
         stage2_workflow,
         "_served_model_ids",
@@ -870,6 +1019,11 @@ def test_run_wrapper_alternates_all_gpu_model_pools_and_round_robins_each(
         "start-orchestrator_all_gpus",
         "stage2-orchestration",
         "stop-orchestrator_all_gpus",
+        "start-orchestrator",
+        "start-extractor",
+        "stage2-concurrent",
+        "stop-extractor",
+        "stop-orchestrator",
     ]
     assert calls[:4] == [
         ("large-reviewer", "http://127.0.0.1:8010/v1"),
@@ -884,21 +1038,47 @@ def test_run_wrapper_alternates_all_gpu_model_pools_and_round_robins_each(
         ("small-extractor", "http://127.0.0.1:8113/v1"),
         ("small-extractor", "http://127.0.0.1:8114/v1"),
     ]
-    assert calls[9:] == [
+    assert calls[9:13] == [
         ("large-reviewer", "http://127.0.0.1:8010/v1"),
         ("large-reviewer", "http://127.0.0.1:8011/v1"),
         ("large-reviewer", "http://127.0.0.1:8012/v1"),
         ("large-reviewer", "http://127.0.0.1:8013/v1"),
     ]
-    runtime_extraction = captured["extraction_config"].extraction_llm
+    assert calls[13:17] == [
+        ("large-reviewer", "http://127.0.0.1:8010/v1"),
+        ("large-reviewer", "http://127.0.0.1:8011/v1"),
+        ("large-reviewer", "http://127.0.0.1:8010/v1"),
+        ("large-reviewer", "http://127.0.0.1:8011/v1"),
+    ]
+    assert calls[17:] == [
+        ("small-extractor", "http://127.0.0.1:8110/v1"),
+        ("small-extractor", "http://127.0.0.1:8111/v1"),
+        ("small-extractor", "http://127.0.0.1:8112/v1"),
+        ("small-extractor", "http://127.0.0.1:8110/v1"),
+        ("small-extractor", "http://127.0.0.1:8111/v1"),
+    ]
+    runtime_extraction = captured["configured_split"].extraction_llm
     assert runtime_extraction is not None
     assert runtime_extraction.runtime_endpoints == (
         "http://127.0.0.1:8110/v1",
         "http://127.0.0.1:8111/v1",
         "http://127.0.0.1:8112/v1",
-        "http://127.0.0.1:8113/v1",
-        "http://127.0.0.1:8114/v1",
     )
+    phase = json.loads(
+        (tmp_path / "stage2" / "vllm_servers" / "model_phase.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert phase["status"] == "complete"
+    assert phase["allocation_mode"] == "configured_split"
+    assert phase["rapid_switch_seconds"] == 60.0
+    assert phase["last_switch_at"].endswith("Z")
+    assert phase["previous_switch_elapsed_seconds"] == 30.0
+    assert phase["rapid_switch_trigger_elapsed_seconds"] == 30.0
+    assert phase["configured_gpu_allocations"] == {
+        "interpretation": ["cuda:0", "cuda:1"],
+        "extraction": ["cuda:2", "cuda:3", "cuda:4"],
+    }
 
 
 def test_managed_pool_launches_one_process_per_gpu_and_writes_a_redacted_manifest(

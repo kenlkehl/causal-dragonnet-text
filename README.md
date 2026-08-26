@@ -733,6 +733,7 @@ on GPUs 0-1 and two one-GPU extractor replicas on GPUs 2-3:
   "stage2": {
     "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
+    "vllm_rapid_switch_seconds": 900,
     "extraction_llm": {
       "model": "LiquidAI/LFM2.5-2.6B",
       "workers": 64,
@@ -770,8 +771,8 @@ pipeline's current logical CUDA namespace. If the parent has
 divisions, duplicate GPUs within a pool, inconsistent counts, and more servers
 than GPUs are rejected before any process starts.
 
-When both models are managed, Stage 2 keeps only one model resident at a time.
-It loads the orchestrator across the ordered union of both GPU lists for
+When both models are managed, Stage 2 initially keeps only one model resident at
+a time. It loads the orchestrator across the ordered union of both GPU lists for
 interpretation and feature definition, checkpoints that work, unloads it, and
 loads the extractor across the same union. Later ontology-supervision barriers
 switch the complete union back to the orchestrator; revised ontologies and
@@ -779,9 +780,16 @@ held-out extraction switch it back to the extractor as needed. Each role
 preserves its configured tensor-parallel width and adds replicas when that width
 evenly divides the union; otherwise it uses one tensor-parallel server across
 the complete union. Added replicas receive consecutive ports in that role's
-configured range. Feature-definition-only runs never load the extractor.
-Resumes use `stage2/vllm_servers/model_phase.json` plus ordinary scientific
-checkpoints to reload the required role.
+configured range.
+
+The runner measures each interval between switches. If consecutive switches are
+less than `stage2.vllm_rapid_switch_seconds` apart (900 seconds by default), it
+stops all-GPU alternation and keeps both models resident for the rest of the run.
+In that fallback, each role uses its exact configured `gpus`,
+`gpus_per_server`, replica count, and ports. Set the value to `0` to disable the
+fallback. Feature-definition-only runs never load the extractor. Resumes use
+`stage2/vllm_servers/model_phase.json` plus ordinary scientific checkpoints to
+reload the required role or retain a previously selected concurrent split.
 
 Both nested managed configurations accept `host`, `base_port` (or an exact
 `ports` list), `internal_port_base`, and `gpus_per_server`. The settings
@@ -840,6 +848,7 @@ uv run python scripts/run_all_evidence.py \
   --stage2-model Qwen/Qwen3.8-27B \
   --stage2-vllm-gpus cuda:0,cuda:1 \
   --stage2-vllm-gpus-per-server 2 \
+  --stage2-vllm-rapid-switch-seconds 900 \
   --stage2-vllm-download-dir /models/huggingface \
   --stage2-vllm-extra-arg=--gpu-memory-utilization \
   --stage2-vllm-extra-arg=0.90 \
@@ -870,8 +879,9 @@ The synthetic-run shell wrappers expose the same split through
 `STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER` for the extractor. Positive
 `STAGE2_VLLM_SERVERS` and `STAGE2_EXTRACTION_VLLM_SERVERS` values may be used
 instead of deriving replica counts, provided they agree with the selected GPU
-lists and GPUs-per-server settings. Their default public port ranges begin at
-8010 and 8110, respectively.
+lists and GPUs-per-server settings. `STAGE2_VLLM_RAPID_SWITCH_SECONDS` controls
+the adaptive fallback cutoff. Their default public port ranges begin at 8010
+and 8110, respectively.
 
 To guarantee inclusion of an investigator-specified variable, populate
 `stage2.explicit_features` with complete definitions containing `name`,

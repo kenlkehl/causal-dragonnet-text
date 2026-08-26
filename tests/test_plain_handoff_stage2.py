@@ -151,6 +151,7 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.extraction_chunk_size_tokens == 50_000
     assert config.extraction_context_window_tokens == 131_072
     assert config.extraction_context_margin_tokens == 1_024
+    assert config.vllm_rapid_switch_seconds == 900.0
     assert config.ontology_refinement_min_failure_patients == 3
     assert config.max_ontology_refinement_rounds == 2
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
@@ -227,6 +228,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "extraction_chunk_size_tokens": 41_000,
             "extraction_context_window_tokens": 160_000,
             "extraction_context_margin_tokens": 2_000,
+            "vllm_rapid_switch_seconds": 1_200,
             "extraction_llm": {
                 "endpoint": "http://extract.test/v1",
                 "model": "small-model",
@@ -263,6 +265,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.extraction_chunk_size_tokens == 41_000
     assert config.extraction_context_window_tokens == 160_000
     assert config.extraction_context_margin_tokens == 2_000
+    assert config.vllm_rapid_switch_seconds == 1_200.0
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
     assert config.extraction_llm.endpoint == "http://extract.test/v1"
@@ -290,6 +293,7 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.public_dict()["extraction_chunk_size_tokens"] == 41_000
     assert config.public_dict()["extraction_context_window_tokens"] == 160_000
     assert config.public_dict()["extraction_context_margin_tokens"] == 2_000
+    assert config.public_dict()["vllm_rapid_switch_seconds"] == 1_200.0
     assert config.public_dict()["ontology_refinement_min_failure_patients"] == 4
     assert config.public_dict()["max_ontology_refinement_rounds"] == 3
     assert config.public_dict()["extraction_llm"]["api_key"] == "<redacted>"
@@ -466,6 +470,21 @@ def test_stage2_config_rejects_invalid_selection_workers(selection_workers):
             endpoint="http://stage2.test/v1",
             model="test-model",
             selection_workers=selection_workers,
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "rapid_switch_seconds",
+    [-1, True, float("inf"), float("nan"), "900"],
+)
+def test_stage2_config_rejects_invalid_vllm_rapid_switch_seconds(
+    rapid_switch_seconds,
+):
+    with pytest.raises(ValueError, match="vllm_rapid_switch_seconds"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            vllm_rapid_switch_seconds=rapid_switch_seconds,
         ).validate()
 
 

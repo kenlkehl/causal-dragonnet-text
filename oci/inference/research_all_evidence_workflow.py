@@ -1961,6 +1961,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--stage2-vllm-rapid-switch-seconds",
+        type=float,
+        help=(
+            "after two managed-model switches closer than this interval, keep "
+            "both Stage 2 vLLM roles resident on their configured GPU splits "
+            "(default: 900; 0 disables the fallback)"
+        ),
+    )
+    parser.add_argument(
         "--stage2-vllm-base-port",
         type=int,
         help="first port for pipeline-owned vLLM servers (default: 8010)",
@@ -2281,6 +2290,7 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
     stage2_numeric_overrides = {
         "max_tokens": args.stage2_max_tokens,
         "extraction_max_tokens": args.stage2_extraction_max_tokens,
+        "vllm_rapid_switch_seconds": args.stage2_vllm_rapid_switch_seconds,
         "extraction_chunk_size_tokens": args.stage2_extraction_chunk_size_tokens,
         "extraction_context_window_tokens": (
             args.stage2_extraction_context_window_tokens

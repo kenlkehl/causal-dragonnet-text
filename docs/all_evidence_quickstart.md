@@ -143,6 +143,7 @@ tensor-parallel width is two, while the extractor's width is one:
   "stage2": {
     "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
+    "vllm_rapid_switch_seconds": 900,
     "extraction_llm": {
       "model": "LiquidAI/LFM2.5-2.6B",
       "workers": 64,
@@ -166,16 +167,18 @@ tensor-parallel width is two, while the extractor's width is one:
 
 When both roles are managed, Stage 2 initially starts only the orchestrator
 model and gives it the ordered union of the orchestrator and extractor GPU
-lists. It completes every fold's interpretation and feature definitions, stops
-that all-GPU pool, and only then starts the separately configured orchestrator
-and extractor pools for patient extraction and later review. A
-feature-definition-only run therefore never loads the extractor. If extraction
-checkpoints already exist on resume, Stage 2 starts directly with the dedicated
-pools. `gpus_per_server` sets each role's dedicated tensor-parallel width and
-derives its replica count; an explicit `server_count` must agree. Gemma defaults
-to the `gemma4` reasoning parser, Qwen to `qwen3`, and both default to
-language-model-only mode. See the complete workflow guide for pre-extraction
-pool derivation, GPU partition rules, and all managed-server settings.
+lists. It completes every fold's interpretation and feature definitions, then
+alternates the extractor and orchestrator over that union as checkpoints require
+each model. If two switches occur less than
+`vllm_rapid_switch_seconds` apart (15 minutes by default), Stage 2 instead keeps
+both servers resident on their original configured GPU allocations for the
+rest of the run and on resume. Set the cutoff to `0` to always alternate. A
+feature-definition-only run never loads the extractor. `gpus_per_server` sets
+each role's configured tensor-parallel width and derives its replica count; an
+explicit `server_count` must agree. Gemma defaults to the `gemma4` reasoning
+parser, Qwen to `qwen3`, and both default to language-model-only mode. See the
+complete workflow guide for all-GPU pool derivation, GPU partition rules, and
+all managed-server settings.
 
 Stage 2 compiles the raw handoff into fold-local, provenance-preserving semantic
 cards under `stage2/evidence_compilation/`, and candidate discovery reads all of

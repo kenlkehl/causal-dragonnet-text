@@ -271,6 +271,7 @@ For example:
   "stage2": {
     "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
+    "vllm_rapid_switch_seconds": 900,
     "extraction_llm": {
       "model": "LiquidAI/LFM2.5-2.6B",
       "workers": 64,
@@ -306,21 +307,31 @@ from the list length; an explicit `server_count` is optional but must agree.
 Uneven division, duplicate devices within one pool, or more servers than GPUs
 is rejected before launch.
 
-When both roles are pipeline-managed, their lifecycle alternates. Interpretation
-and feature definition first run to completion for every outer fold with only
-the orchestrator model loaded across the ordered union of both roles' GPU lists.
-Stage 2 then checkpoints and unloads it before loading the extractor across the
-same union. At an ontology-supervision barrier it checkpoints extraction,
-unloads the extractor, and reloads the orchestrator; it switches back whenever
-re-extraction or held-out extraction is required. The two models are never
-resident simultaneously. For each role, if the union divides evenly by its
-configured tensor-parallel width, Stage 2 preserves that width and adds
-replicas. Otherwise it launches one tensor-parallel server across the complete
-union, which requires that model to support the resulting tensor-parallel size.
-Added replicas use consecutive ports after the highest configured port for that
-role. A feature-definition-only run never starts the extractor. Resumes use the
-persisted managed-model phase together with ordinary request checkpoints; an
-older run with extraction artifacts safely resumes with the extractor first.
+When both roles are pipeline-managed, their lifecycle initially alternates.
+Interpretation and feature definition first run to completion for every outer
+fold with only the orchestrator model loaded across the ordered union of both
+roles' GPU lists. Stage 2 then checkpoints and unloads it before loading the
+extractor across the same union. At an ontology-supervision barrier it
+checkpoints extraction, unloads the extractor, and reloads the orchestrator; it
+switches back whenever re-extraction or held-out extraction is required. For
+each role, if the union divides evenly by its configured tensor-parallel width,
+Stage 2 preserves that width and adds replicas. Otherwise it launches one
+tensor-parallel server across the complete union, which requires that model to
+support the resulting tensor-parallel size. Added replicas use consecutive
+ports after the highest configured port for that role.
+
+Stage 2 tracks the monotonic elapsed time between those transitions. When two
+consecutive switches are less than `stage2.vllm_rapid_switch_seconds` apart
+(900 seconds by default), it treats the workload as rapidly alternating and
+keeps both models resident from then on. The orchestrator and extractor use
+their exact separately configured GPU lists, tensor-parallel widths, replica
+counts, and ports in this concurrent fallback. A value of `0` disables the
+fallback. The phase file records the last switch time, elapsed interval,
+cutoff, allocation mode, and configured GPU allocations. A
+feature-definition-only run never starts the extractor. Resumes use the
+persisted managed-model phase together with ordinary request checkpoints; they
+retain a previously selected concurrent split, while an older run with
+extraction artifacts safely resumes with the extractor first.
 
 The runner checks every requested port before launch, starts all replicas with
 separate `CUDA_VISIBLE_DEVICES` values, and waits for each `/v1/models` API to
@@ -358,6 +369,10 @@ The managed vLLM fields are:
 - `extra_args`: a list of remaining raw vLLM CLI tokens, such as
   `["--gpu-memory-utilization", "0.90"]`. Orchestration-owned and named options
   cannot be duplicated here.
+
+The cross-pool `stage2.vllm_rapid_switch_seconds` setting is top-level because
+it controls the lifecycle relationship between the two managed pools rather
+than either individual vLLM server.
 
 Unless explicitly overridden, any model name containing `gemma` uses
 `reasoning_parser: "gemma4"` and `language_model_only: true`; it does not set a
@@ -480,6 +495,7 @@ default),
 `extraction_max_prompt_chars`, `extraction_feature_batch_size`,
 `extraction_chunk_size_tokens`, `extraction_context_window_tokens`,
 `extraction_context_margin_tokens`,
+`vllm_rapid_switch_seconds`,
 `evidence_compiler`, `evidence_max_cards_per_fold`,
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
 `max_review_rounds`,
@@ -562,7 +578,8 @@ The small model has `--stage2-extraction-endpoint`,
 use `--stage2-selection-workers`, `--stage2-max-tokens`, and
 `--stage2-extraction-max-tokens`.
 Managed mode additionally has `--stage2-vllm-servers`,
-`--stage2-vllm-gpus`, `--stage2-vllm-base-port`,
+`--stage2-vllm-gpus`, `--stage2-vllm-rapid-switch-seconds`,
+`--stage2-vllm-base-port`,
 `--stage2-vllm-download-dir`, `--stage2-vllm-reasoning-parser`,
 `--stage2-vllm-language-model-only` (and its `--no-` form),
 `--stage2-vllm-default-chat-template-kwargs`, and repeatable
