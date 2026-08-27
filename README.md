@@ -8,6 +8,49 @@ matched-patient models in Stage 1, then uses Stage 2 to interpret that evidence,
 define measurable patient variables, extract them without crossing patient or
 fold boundaries, and estimate causal effects with diagnostics.
 
+## Quickstart: 8× RTX Pro 6000
+
+After cloning OCI and installing its system CUDA and FFmpeg prerequisites, this
+is the managed-vLLM configuration for an eight-GPU RTX Pro 6000 machine. The
+one-confounder, one-effect-modifier run configures GPUs 0–1 as the primary-model
+pool and GPUs 2–7 as the extraction pool:
+
+```bash
+STAGE2_WORKERS=96 \
+PHYSICAL_GPUS=0,1,2,3,4,5,6,7 \
+STAGE2_MODEL=nvidia/Gemma-4-31B-IT-NVFP4 \
+STAGE2_VLLM_GPUS=0,1 \
+STAGE2_VLLM_GPUS_PER_SERVER=1 \
+STAGE2_EXTRACTION_MODEL=google/gemma-4-E4B-it \
+STAGE2_EXTRACTION_VLLM_GPUS=2,3,4,5,6,7 \
+STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER=1 \
+STAGE2_EXTRACTION_WORKERS=128 \
+./run_one_conf_one_mod.sh artifacts/research_all_evidence/one_conf_one_mod_nsclc_full/
+```
+
+Use the same machine configuration for the five-confounder,
+five-effect-modifier run:
+
+```bash
+STAGE2_WORKERS=96 \
+PHYSICAL_GPUS=0,1,2,3,4,5,6,7 \
+STAGE2_MODEL=nvidia/Gemma-4-31B-IT-NVFP4 \
+STAGE2_VLLM_GPUS=0,1 \
+STAGE2_VLLM_GPUS_PER_SERVER=1 \
+STAGE2_EXTRACTION_MODEL=google/gemma-4-E4B-it \
+STAGE2_EXTRACTION_VLLM_GPUS=2,3,4,5,6,7 \
+STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER=1 \
+STAGE2_EXTRACTION_WORKERS=128 \
+./run_five_conf_five_mod.sh artifacts/research_all_evidence/five_conf_five_mod_nsclc_full/
+```
+
+Both wrappers default `MIN_FREE_GPU_GB` to `0`; default
+`OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and
+`NUMEXPR_NUM_THREADS` to `1`; and default `STAGE2_ENDPOINT` and
+`STAGE2_EXTRACTION_ENDPOINT` to empty. Those settings can still be overridden
+in the environment and therefore do not need to be repeated above. The explicit
+vLLM GPU settings enable managed Stage 2 despite the blank endpoint defaults.
+
 ## Installation
 
 OCI supports Python 3.12 and 3.13 and uses
@@ -39,19 +82,19 @@ libraries required by the chosen vLLM/Torch build.
 ## Try the complete Stage 1 → 2 workflow
 
 Stage 2 can use an already-running OpenAI-compatible server or launch its own
-pool of local vLLM servers. The example launcher retains the external-server
-default and expects it at `http://127.0.0.1:8010/v1`; it automatically uses the
-only model advertised by that server's `/models` endpoint. Then run the bundled
-one-confounder, one-effect-modifier NSCLC experiment:
+pool of local vLLM servers. The example launchers default both endpoint
+variables to empty, so a bare invocation runs Stage 1 only. Configure external
+or managed primary and extraction endpoints, as in the quickstart above, to run
+the complete workflow. To run the bundled one-confounder, one-effect-modifier
+NSCLC experiment with the defaults:
 
 ```bash
 ./run_one_conf_one_mod.sh
 ```
 
-That single command synchronizes the environment, discovers visible GPUs and
-their free VRAM, selects every GPU with at least 20 GiB free, sizes Stage 1 CPU
-workers and Stage 2 request concurrency, and runs or resumes the complete
-multi-model workflow. Results default to
+That command synchronizes the environment, discovers visible GPUs and
+their free VRAM, selects every visible GPU, sizes Stage 1 CPU workers, and runs
+or resumes Stage 1. Results default to
 `artifacts/research_all_evidence/one_conf_one_mod_nsclc_full/`.
 
 The most useful overrides are environment variables:
@@ -63,24 +106,30 @@ GPU_COUNT=2 ./run_one_conf_one_mod.sh
 # Use exact host GPU IDs; CUDA remaps these to logical devices for the run.
 PHYSICAL_GPUS=1,3 ./run_one_conf_one_mod.sh
 
-# Use a server on another port and bypass model autodiscovery if needed.
+# Use already-running primary and extraction servers.
 STAGE2_ENDPOINT=http://127.0.0.1:8010/v1 \
+STAGE2_EXTRACTION_ENDPOINT=http://127.0.0.1:8020/v1 \
 STAGE2_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4 \
 ./run_one_conf_one_mod.sh
 
-# Or let the launcher run one vLLM replica on each of eight selected GPUs.
+# Or manage the primary vLLM pool while using an external extractor.
 STAGE2_VLLM_SERVERS=8 \
 STAGE2_MODEL=google/gemma-4-31B-it \
+STAGE2_EXTRACTION_ENDPOINT=http://127.0.0.1:8020/v1 \
 GPU_COUNT=8 \
 ./run_one_conf_one_mod.sh
 ```
 
-`GPU_COUNT` and `PHYSICAL_GPUS` are mutually exclusive. Stage 2 runs independent
-outer folds concurrently and defaults to 32 globally bounded endpoint workers.
+`GPU_COUNT` and `PHYSICAL_GPUS` are mutually exclusive. The wrappers select all
+visible GPUs by default because their `MIN_FREE_GPU_GB` default is `0`. Stage 2
+runs independent outer folds concurrently and defaults to 32 globally bounded
+endpoint workers.
+
 Advanced overrides are `MIN_FREE_GPU_GB`, `STAGE1_WORKERS`, `STAGE2_WORKERS`,
-`DISABLE_HTR`, `STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (set it to an empty
-string for a Stage-1-only run). Managed mode accepts `STAGE2_VLLM_SERVERS`,
-optional `STAGE2_VLLM_GPUS` (the detected logical devices are the default),
+`DISABLE_HTR`, `STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (leave it empty and
+omit managed vLLM settings for a Stage-1-only run). Managed mode accepts
+`STAGE2_VLLM_SERVERS`, optional `STAGE2_VLLM_GPUS` (the detected logical devices
+are the default),
 `STAGE2_VLLM_DOWNLOAD_DIR`, and a JSON token list in
 `STAGE2_VLLM_EXTRA_ARGS_JSON`. Set
 `OCI_PYTHON` to an existing environment's interpreter to skip `uv sync`. An
@@ -649,7 +698,8 @@ uv run python scripts/run_all_evidence.py \
   --stage2-extraction-endpoint http://127.0.0.1:8020/v1
 ```
 
-Set these thread limits before starting Python on high-core-count machines.
+Set these thread limits before starting Python directly on high-core-count
+machines. The two synthetic wrapper scripts set all four to `1` by default.
 Stage 2 already controls primary-model request concurrency with `stage2.workers`
 and extraction concurrency with `stage2.extraction_llm.workers`; allowing
 OpenBLAS, OpenMP, MKL, or NumExpr to create another native thread pool per

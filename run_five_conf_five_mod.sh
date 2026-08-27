@@ -6,9 +6,11 @@
 # Usage:
 #   ./run_five_conf_five_mod.sh
 #   GPU_COUNT=2 ./run_five_conf_five_mod.sh
-#   PHYSICAL_GPUS=1,3 STAGE2_ENDPOINT=http://127.0.0.1:8010/v1 ./run_five_conf_five_mod.sh
-#   GPU_COUNT=8 STAGE2_VLLM_SERVERS=8 STAGE2_MODEL=google/gemma-4-31B-it ./run_five_conf_five_mod.sh
-#   PHYSICAL_GPUS=0,1,2,3 STAGE2_ENDPOINT= STAGE2_MODEL=Qwen/Qwen3.8-27B \
+#   PHYSICAL_GPUS=1,3 STAGE2_ENDPOINT=http://127.0.0.1:8010/v1 \
+#     STAGE2_EXTRACTION_ENDPOINT=http://127.0.0.1:8020/v1 ./run_five_conf_five_mod.sh
+#   GPU_COUNT=8 STAGE2_VLLM_SERVERS=8 STAGE2_MODEL=google/gemma-4-31B-it \
+#     STAGE2_EXTRACTION_ENDPOINT=http://127.0.0.1:8020/v1 ./run_five_conf_five_mod.sh
+#   PHYSICAL_GPUS=0,1,2,3 STAGE2_MODEL=Qwen/Qwen3.8-27B \
 #     STAGE2_VLLM_GPUS=0,1 STAGE2_VLLM_GPUS_PER_SERVER=2 \
 #     STAGE2_EXTRACTION_MODEL=LiquidAI/LFM2.5-2.6B \
 #     STAGE2_EXTRACTION_VLLM_GPUS=2,3 STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER=1 \
@@ -20,6 +22,16 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# Runtime defaults for the researcher-facing wrapper. Callers may override any
+# of these through the corresponding environment variable.
+export MIN_FREE_GPU_GB="${MIN_FREE_GPU_GB:-0}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export STAGE2_ENDPOINT="${STAGE2_ENDPOINT:-}"
+export STAGE2_EXTRACTION_ENDPOINT="${STAGE2_EXTRACTION_ENDPOINT:-}"
 
 # Stage 2 ontology preset for this example. Callers may override any setting
 # through the corresponding environment variable.
