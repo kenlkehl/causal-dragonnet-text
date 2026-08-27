@@ -717,13 +717,10 @@ my_stage1_run/
       outer_001_inner_001/...
       evidence.jsonl
       complete.json
-  stage1_architectures/
+  stage1_architectures/              # explicit selection or evaluator backfill
     manifest.json
     <architecture>/evidence.jsonl
   handoff/
-    text_models.jsonl
-    tfidf.jsonl
-    neural_queries.jsonl
     evidence.jsonl
     index.json
     complete.json
@@ -752,6 +749,7 @@ my_stage1_run/
       feature_definitions.json
       definitions_complete.json
       ontology_supervision/
+        supervisor_cache/<fingerprint-prefix>/<fingerprint>/...
         round_001/
           definitions_before_extraction.json
           extraction/
@@ -803,8 +801,9 @@ my_stage1_run/
 `progress.json` is the first place to look while a run is active. The model
 outputs are under `components/<name>/`. The plain Stage 2 boundary is
 `handoff/evidence.jsonl`; `handoff/index.json` explains the source files and
-the original per-family JSONL files remain beside it. Python consumers can
-stream the combined rows with:
+references the original per-family JSONL files under `components/` without
+adding separate per-family copies under `handoff/`. Python consumers can stream
+the combined rows with:
 
 ```python
 from oci.inference.research_all_evidence_workflow import iter_stage1_handoff
@@ -822,6 +821,11 @@ Completion has one intentionally simple rule:
 - if it does not exist, the component runs in the existing directory;
 - text-model and neural-query contexts use the same rule inside their context
   directories.
+
+A causal-estimation marker is not accepted as final when descendants contain a
+legacy request-exhaustion fallback. The runner preserves the old leaf files as
+`superseded_infrastructure_*`, retries only those affected extraction slices,
+and then rebuilds their dependent summaries and estimates.
 
 An interrupted component's partial files are left in place. There is no
 `--resume` flag. Rerun the same command. Stage 2 skips completed interpretation

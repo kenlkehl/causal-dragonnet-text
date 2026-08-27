@@ -96,6 +96,85 @@ def test_compiler_is_fold_local_and_preserves_exact_deduplication_lineage(
     )
 
 
+def test_neural_query_ngrams_are_compacted_before_exact_member_aggregation(
+    tmp_path: Path,
+):
+    rows = [
+        {
+            "source": "neural_queries",
+            "outer_fold": 1,
+            "inner_fold": None,
+            "scope": "full_outer_train",
+            "evidence": {
+                "evidence": [
+                    {
+                        "query_id": "treatment_query",
+                        "bank": "treatment",
+                        "fit_standardized_score": 2.0,
+                        "top_contrastive_ngrams": [
+                            {"term": "performance status", "loading": 0.6},
+                            {"term": "treatment wording", "loading": 0.4},
+                        ],
+                    },
+                    {
+                        "query_id": "outcome_query",
+                        "bank": "outcome",
+                        "fit_standardized_score": 3.0,
+                        "top_contrastive_ngrams": [
+                            {"term": "performance status", "loading": 0.8},
+                            {"term": "outcome wording", "loading": 0.5},
+                        ],
+                    },
+                ]
+            },
+        }
+    ]
+
+    compiled = compile_stage2_handoff_evidence(
+        rows,
+        handoff_path=tmp_path / "handoff" / "evidence.jsonl",
+        max_cards_per_outer_fold=16,
+        max_packet_chars=10_000,
+        required_architectures=(NEURAL_QUERY_MOMENTS,),
+    )
+
+    fold = compiled.summary["outer_folds"]["1"]
+    assert fold["raw_occurrences"] == 4
+    assert fold["compact_occurrence_records"] == 3
+    assert fold["exact_members"] == 3
+    assert fold["exact_duplicate_occurrences_removed"] == 1
+    assert fold["source_family_occurrences"][NEURAL_QUERY_MOMENTS] == 4
+    assert fold["architecture_occurrences"][NEURAL_QUERY_MOMENTS] == 4
+    repeated = [
+        member
+        for member in compiled.members_by_outer_fold[1]
+        if member["raw_occurrence_count"] == 2
+    ]
+    assert len(repeated) == 1
+    assert {row["query_id"] for row in repeated[0]["raw_references"]} == {
+        "treatment_query",
+        "outcome_query",
+    }
+    assert {
+        row["query_id"]: row["scores"]["fit_standardized_score"]
+        for row in repeated[0]["raw_references"]
+    } == {"treatment_query": 2.0, "outcome_query": 3.0}
+    assert sum(
+        row["occurrence_count"] for row in repeated[0]["raw_references"]
+    ) == 2
+    repeated_card_id = next(
+        row["card_id"]
+        for row in compiled.lineage_by_outer_fold[1]
+        if repeated[0]["member_id"] in row["member_ids"]
+    )
+    repeated_card = next(
+        card for card in compiled.cards_by_outer_fold[1]
+        if card["card_id"] == repeated_card_id
+    )
+    assert repeated_card["score_summary"]["loading"]["median"] == 0.7
+    assert repeated_card["score_summary"]["fit_standardized_score"]["median"] == 2.5
+
+
 def test_compiler_reuses_fusion_tfidf_allowlist_and_drops_large_score_arrays(
     tmp_path: Path,
 ):

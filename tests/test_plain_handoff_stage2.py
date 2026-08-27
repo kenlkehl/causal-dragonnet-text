@@ -1704,6 +1704,125 @@ def test_stage2_extraction_batches_features_by_default_and_accepts_override(
     pd.testing.assert_frame_equal(resumed, frame)
 
 
+def test_extraction_retries_only_legacy_infrastructure_failure_feature_batches(
+    tmp_path: Path,
+):
+    definitions = [
+        {
+            "name": f"feature_{index:02d}",
+            "description": f"Feature {index}",
+            "value_type": "continuous",
+            "categories_or_unit": ["score"],
+            "measurement_definition": f"Extract feature {index}.",
+            "missing_value_rule": "Return null when undocumented.",
+        }
+        for index in range(2)
+    ]
+    dataset = pd.DataFrame({"clinical_text": ["Both feature values are documented."]})
+    output = tmp_path / "extraction"
+    calls: list[list[str]] = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        assert request_kind == "extraction"
+        body = json.loads(messages[1]["content"])
+        names = [feature["name"] for feature in body["features"]]
+        calls.append(names)
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {
+                            name: int(name.removeprefix("feature_")) for name in names
+                        },
+                    }
+                ]
+            }
+        )
+
+    expected = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=100_000,
+        feature_batch_size=1,
+    )
+    calls.clear()
+
+    parent_dir = output / "batches" / "batch_00001"
+    failed_dir = parent_dir / "feature_batches" / "batch_00002"
+    (failed_dir / "result.json").write_text(
+        json.dumps({"rows": [{"row_id": 0, "values": {"feature_01": None}}]}),
+        encoding="utf-8",
+    )
+    (failed_dir / "extraction_failure.json").write_text(
+        json.dumps(
+            {
+                "resolution": "conservative_all_null",
+                "validation_error": (
+                    "Stage2RequestExhaustedError: transport attempts exhausted"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (failed_dir / "extraction_issues.json").write_text(
+        json.dumps(
+            {
+                "events": [
+                    {
+                        "failure_kind": "structural_response_failure",
+                        "reason": "Stage2RequestExhaustedError: transport attempts exhausted",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (parent_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {"feature_00": 0, "feature_01": None},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    repaired = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=100_000,
+        feature_batch_size=1,
+    )
+
+    pd.testing.assert_frame_equal(repaired, expected)
+    assert calls == [["feature_01"]]
+    assert (failed_dir / "superseded_infrastructure_extraction_failure.json").is_file()
+    assert (failed_dir / "superseded_infrastructure_result.json").is_file()
+    assert (parent_dir / "superseded_infrastructure_complete.json").is_file()
+    archived_failure = output / "_partial_backup_20260827" / "extraction_failure.json"
+    archived_failure.parent.mkdir()
+    archived_failure.write_text(
+        '{"validation_error":"Stage2RequestExhaustedError: archived"}',
+        encoding="utf-8",
+    )
+    assert stage2_analysis.infrastructure_failure_audit_paths(output) == ()
+
+
 def test_stage2_serial_extraction_carries_state_across_lossless_token_chunks_and_resumes(
     tmp_path: Path,
 ):
@@ -2510,7 +2629,7 @@ def test_pending_category_ontology_resumes_without_repeating_extraction(
     assert (batch / "complete.json").is_file()
 
 
-def test_extraction_request_exhaustion_is_audited_and_does_not_block_fold(
+def test_extraction_request_exhaustion_aborts_without_scientific_checkpoint(
     tmp_path: Path,
 ):
     dataset = pd.DataFrame({"clinical_text": ["No usable response returned."]})
@@ -2531,23 +2650,26 @@ def test_extraction_request_exhaustion_is_audited_and_does_not_block_fold(
             "logical request deadline expired"
         )
 
-    frame = extract_rows(
-        dataset=dataset,
-        row_ids=[0],
-        text_column="clinical_text",
-        definitions=[definition],
-        output_dir=output,
-        request_json=exhausted_request,
-        workers=1,
-        max_prompt_chars=10_000,
-    )
+    with pytest.raises(
+        stage2_analysis.Stage2RequestExhaustedError,
+        match="logical request deadline expired",
+    ):
+        extract_rows(
+            dataset=dataset,
+            row_ids=[0],
+            text_column="clinical_text",
+            definitions=[definition],
+            output_dir=output,
+            request_json=exhausted_request,
+            workers=1,
+            max_prompt_chars=10_000,
+        )
 
-    assert pd.isna(frame.loc[0, "performance_status"])
     batch = output / "batches" / "batch_00001"
-    failure = json.loads((batch / "extraction_failure.json").read_text(encoding="utf-8"))
-    assert failure["resolution"] == "conservative_all_null"
-    assert "Stage2RequestExhaustedError" in failure["validation_error"]
-    assert (batch / "complete.json").is_file()
+    assert not (batch / "extraction_failure.json").exists()
+    assert not (batch / "result.json").exists()
+    assert not (batch / "complete.json").exists()
+    assert not (output / "complete.json").exists()
 
 
 def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
@@ -2574,7 +2696,9 @@ def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
                     ]
                 }
             )
-        raise ValueError("category ontology response remained invalid")
+        raise stage2_analysis.Stage2ResponseValidationError(
+            "category ontology response remained invalid"
+        )
 
     output = tmp_path / "extraction"
     frame = extract_rows(
@@ -2612,7 +2736,7 @@ def test_extraction_defaults_structurally_invalid_response_to_audited_null(
     }
 
     def request_json(_messages, _validate, *, request_kind="interpretation"):
-        raise ValueError(
+        raise stage2_analysis.Stage2ResponseValidationError(
             "Stage 2 response remained invalid after 10 repairs: "
             "Unterminated string at character 104409"
         )
@@ -3929,6 +4053,27 @@ def test_stage2_retries_retryable_transport_errors_without_using_repair_turns(
     assert result == {"ok": True}
     assert calls[0] == calls[1] == calls[2]
     assert delays == [0.25, 0.5]
+
+
+def test_stage2_does_not_reclassify_a_pre_response_failure_as_invalid_science():
+    calls = []
+
+    def completion(_messages, _config):
+        calls.append("called")
+        raise ValueError("endpoint routing is misconfigured")
+
+    with pytest.raises(ValueError, match="endpoint routing is misconfigured"):
+        stage2_workflow._request_json(
+            messages=[{"role": "user", "content": "Return JSON."}],
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="test-model",
+            ),
+            completion=completion,
+            validate=lambda value: dict(value),
+        )
+
+    assert calls == ["called"]
 
 
 def test_stage2_default_transport_policy_allows_three_attempts(monkeypatch):
@@ -8167,7 +8312,9 @@ def test_harmonization_retains_prior_plan_and_nulls_failed_delta(tmp_path: Path)
     )
 
     def invalid_delta(*_args, **_kwargs):
-        raise ValueError("mapping response remained invalid after bounded repairs")
+        raise stage2_analysis.Stage2ResponseValidationError(
+            "mapping response remained invalid after bounded repairs"
+        )
 
     harmonized, definitions, report = stage2_analysis._harmonize_training_extraction(
         extracted=extracted,
@@ -8221,7 +8368,9 @@ def test_harmonization_uses_audited_hybrid_fallback_without_prior_plan(
     )
 
     def invalid_plan(*_args, **_kwargs):
-        raise ValueError("plan response remained invalid after bounded repairs")
+        raise stage2_analysis.Stage2ResponseValidationError(
+            "plan response remained invalid after bounded repairs"
+        )
 
     harmonized, definitions, report = stage2_analysis._harmonize_training_extraction(
         extracted=extracted,
@@ -8769,6 +8918,143 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
     )
 
 
+def test_aggregate_supervisor_reuses_identical_feature_review_across_rounds(
+    tmp_path: Path,
+):
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "performance_status",
+        "description": "Pretreatment performance status.",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0", "1", "2", "3", "4"],
+        "measurement_definition": "Extract the documented pretreatment ECOG score.",
+        "missing_value_rule": "Return null when it is undocumented.",
+    }
+    summary = {
+        "feature_id": definition["feature_id"],
+        "name": definition["name"],
+        "rows": 20,
+        "nonmissing": 18,
+        "nonmissing_fraction": 0.9,
+        "unique_nonmissing": 3,
+        "dominant_value_fraction": 0.5,
+        "most_common_values": {"1": 9, "0": 6, "2": 3},
+    }
+    calls = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        calls.append(json.loads(messages[1]["content"])["feature"]["feature_id"])
+        assert request_kind == "interpretation"
+        return validate(
+            {
+                "action": "keep",
+                "reason": "The aggregate extraction matches the declared ontology.",
+            }
+        )
+
+    supervision = tmp_path / "ontology_supervision"
+    first_definitions, first_changed, first_report = (
+        stage2_analysis._request_aggregate_ontology_supervisor(
+            definitions=[definition],
+            summaries=[summary],
+            failure_summary={"feature_failure_patterns": []},
+            output_dir=supervision / "round_001" / "supervisor",
+            request_json=request_json,
+            workers=1,
+            request_identity={"model": "primary-test-model"},
+        )
+    )
+    second_definitions, second_changed, second_report = (
+        stage2_analysis._request_aggregate_ontology_supervisor(
+            definitions=[definition],
+            summaries=[summary],
+            failure_summary={"feature_failure_patterns": []},
+            output_dir=supervision / "round_002" / "supervisor",
+            request_json=request_json,
+            workers=1,
+            request_identity={"model": "primary-test-model"},
+        )
+    )
+    changed_definition = {
+        **definition,
+        "measurement_definition": (
+            "Extract the last documented pretreatment ECOG score before treatment."
+        ),
+    }
+    _third_definitions, _third_changed, third_report = (
+        stage2_analysis._request_aggregate_ontology_supervisor(
+            definitions=[changed_definition],
+            summaries=[summary],
+            failure_summary={"feature_failure_patterns": []},
+            output_dir=supervision / "round_003" / "supervisor",
+            request_json=request_json,
+            workers=1,
+            request_identity={"model": "primary-test-model"},
+        )
+    )
+
+    assert calls == [definition["feature_id"], definition["feature_id"]]
+    assert first_definitions == second_definitions
+    assert first_changed is second_changed is False
+    assert first_report["model_requested_features"] == 1
+    assert first_report["cache_reused_features"] == 0
+    assert second_report["model_requested_features"] == 0
+    assert second_report["cache_reused_features"] == 1
+    assert third_report["model_requested_features"] == 1
+    assert third_report["cache_reused_features"] == 0
+    second_completion = json.loads(
+        (
+            supervision
+            / "round_002"
+            / "supervisor"
+            / "feature_0001"
+            / "complete.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert second_completion["reused"] is True
+    assert second_completion["reuse_source"] == "content_addressed_cache"
+
+
+def test_aggregate_supervisor_transport_exhaustion_is_not_checkpointed(
+    tmp_path: Path,
+):
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "performance_status",
+        "description": "Pretreatment performance status.",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0", "1", "2", "3", "4"],
+        "measurement_definition": "Extract the documented pretreatment ECOG score.",
+        "missing_value_rule": "Return null when it is undocumented.",
+    }
+
+    def exhausted(*_args, **_kwargs):
+        raise stage2_analysis.Stage2RequestExhaustedError("extractor endpoint unavailable")
+
+    output_dir = tmp_path / "ontology_supervision" / "round_001" / "supervisor"
+    with pytest.raises(
+        stage2_analysis.Stage2RequestExhaustedError,
+        match="endpoint unavailable",
+    ):
+        stage2_analysis._request_aggregate_ontology_supervisor(
+            definitions=[definition],
+            summaries=[
+                {
+                    "feature_id": definition["feature_id"],
+                    "name": definition["name"],
+                }
+            ],
+            failure_summary={"feature_failure_patterns": []},
+            output_dir=output_dir,
+            request_json=exhausted,
+            workers=1,
+        )
+
+    assert not (output_dir / "feature_0001" / "result.json").exists()
+    assert not (output_dir / "feature_0001" / "complete.json").exists()
+    assert not (output_dir / "complete.json").exists()
+
+
 def test_aggregate_supervisor_can_revise_then_reextract_a_definition(
     tmp_path: Path,
     monkeypatch,
@@ -9032,14 +9318,8 @@ def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
             )
         return validate(
             {
-                "feature_decisions": [
-                    {
-                        "feature_id": "outer_001_feature_001",
-                        "action": "keep",
-                        "reason": "The refined ontology extracted consistently.",
-                    }
-                ],
-                "overall_assessment": "Keep the refined feature.",
+                "action": "keep",
+                "reason": "The refined ontology extracted consistently.",
             }
         )
 

@@ -17,6 +17,7 @@ import math
 import os
 import re
 import threading
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,8 +97,16 @@ class RequestJSON(Protocol):
     ) -> dict[str, Any]: ...
 
 
-class Stage2RequestExhaustedError(RuntimeError):
-    """A retryable Stage 2 request exhausted its bounded attempt/deadline budget."""
+class Stage2InfrastructureError(RuntimeError):
+    """A Stage 2 request failed without producing a scientific response."""
+
+
+class Stage2RequestExhaustedError(Stage2InfrastructureError):
+    """A request exhausted its bounded transport or deadline budget."""
+
+
+class Stage2ResponseValidationError(ValueError):
+    """A completed model response remained semantically invalid after repairs."""
 
 
 class _ExtractionCancelledError(RuntimeError):
@@ -154,6 +163,102 @@ def _write_frame(path: Path, frame: pd.DataFrame) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     frame.to_csv(temporary, index=False)
     os.replace(temporary, path)
+
+
+_INFRASTRUCTURE_FAILURE_MARKERS = (
+    "Stage2InfrastructureError",
+    "Stage2RequestExhaustedError",
+    "Stage 2 logical request deadline",
+    "Stage 2 transport exhausted",
+)
+_INFRASTRUCTURE_AUDIT_FILENAMES = {
+    "extraction_failure.json",
+    "category_ontology_repair.json",
+    "fallback.json",
+}
+
+
+def _records_infrastructure_failure(path: Path) -> bool:
+    try:
+        rendered = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(marker in rendered for marker in _INFRASTRUCTURE_FAILURE_MARKERS)
+
+
+def _is_archived_audit_path(path: Path, *, root: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts[:-1]
+    except ValueError:
+        return False
+    for part in parts:
+        normalized = part.lower()
+        if "archive" in normalized or "backup" in normalized:
+            return True
+    return False
+
+
+def infrastructure_failure_audit_paths(root: Path) -> tuple[Path, ...]:
+    """Find legacy checkpoints that mislabeled request failure as model output."""
+
+    root = Path(root)
+    if not root.is_dir():
+        return ()
+    paths: list[Path] = []
+    for current, directory_names, filenames in os.walk(root):
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if "archive" not in name.lower() and "backup" not in name.lower()
+        ]
+        current_path = Path(current)
+        candidates = set(filenames).intersection(_INFRASTRUCTURE_AUDIT_FILENAMES)
+        if (
+            "result.json" in filenames
+            and current_path.name.startswith("feature_")
+            and current_path.parent.name == "supervisor"
+        ):
+            candidates.add("result.json")
+        for name in candidates:
+            path = current_path / name
+            if (
+                not _is_archived_audit_path(path, root=root)
+                and _records_infrastructure_failure(path)
+            ):
+                paths.append(path)
+    return tuple(sorted(paths))
+
+
+def _infrastructure_affected_directories(root: Path) -> set[Path]:
+    root = Path(root)
+    affected: set[Path] = set()
+    for audit_path in infrastructure_failure_audit_paths(root):
+        directory = audit_path.parent
+        while directory == root or root in directory.parents:
+            affected.add(directory)
+            if directory == root:
+                break
+            directory = directory.parent
+    return affected
+
+
+def _supersede_infrastructure_checkpoint(directory: Path) -> None:
+    """Retain a legacy bad leaf for audit while making it ineligible for reuse."""
+
+    for name in (
+        "complete.json",
+        "result.json",
+        "extraction_failure.json",
+        "extraction_issues.json",
+        "category_ontology_repair.json",
+        "fallback.json",
+    ):
+        path = directory / name
+        if path.is_file():
+            os.replace(
+                path,
+                path.with_name(f"superseded_infrastructure_{name}"),
+            )
 
 
 def _ontology_refinement_limits(config: Any) -> tuple[int, int]:
@@ -994,7 +1099,11 @@ def _request_validated_extraction(
             },
         )
         return validated
-    except (ValueError, Stage2RequestExhaustedError) as exc:
+    except (
+        Stage2ResponseValidationError,
+        _ExtractionCategoryError,
+        _ExtractionValueError,
+    ) as exc:
         value_error = _value_error_from_exception(exc)
         value_repair_audit: dict[str, Any] | None = pending_value_repair_audit
         category_error = _category_error_from_exception(exc)
@@ -1138,7 +1247,7 @@ def _request_validated_extraction(
             request_kind="interpretation",
         )
         resolution = "llm_category_ontology"
-    except (ValueError, Stage2RequestExhaustedError) as exc:
+    except Stage2ResponseValidationError as exc:
         ontology_error = f"{type(exc).__name__}: {exc}"
         resolution = "conservative_null"
         corrections = {
@@ -2071,7 +2180,7 @@ def _request_validated_page_observations(
             },
         )
         return validated
-    except (ValueError, Stage2RequestExhaustedError) as exc:
+    except (Stage2ResponseValidationError, _PageObservationValidationError) as exc:
         observation_error = _page_observation_error_from_exception(exc)
         row_id = int(page["row_id"])
         if observation_error is not None:
@@ -2663,6 +2772,15 @@ def _serial_extract_feature_batch(
         input_path = chunk_dir / "input.json"
         ontology_audit_path = chunk_dir / "category_ontology_repair.json"
         failure_path = chunk_dir / "extraction_failure.json"
+        if any(
+            _records_infrastructure_failure(chunk_dir / name)
+            for name in (
+                "extraction_failure.json",
+                "category_ontology_repair.json",
+                "fallback.json",
+            )
+        ):
+            _supersede_infrastructure_checkpoint(chunk_dir)
         chunk_input = {
             "schema_version": SERIAL_EXTRACTION_CHUNK_CHECKPOINT_SCHEMA_VERSION,
             "serial_input_fingerprint": serial_fingerprint,
@@ -2974,6 +3092,15 @@ def extract_rows(
     """Extract one patient at a time, serializing long records across token chunks."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    infrastructure_affected = _infrastructure_affected_directories(output_dir)
+    if infrastructure_affected:
+        LOGGER.warning(
+            "superseding legacy Stage 2 infrastructure-failure checkpoints "
+            "directories=%s root=%s",
+            len(infrastructure_affected),
+            output_dir,
+        )
+        _supersede_infrastructure_checkpoint(output_dir)
     cancellation = threading.Event()
 
     def guarded_request_json(
@@ -3080,6 +3207,9 @@ def extract_rows(
     for saved_dir in sorted((output_dir / "batches").glob("batch_*")):
         if not saved_dir.is_dir() or saved_dir.is_symlink():
             continue
+        if saved_dir in infrastructure_affected:
+            _supersede_infrastructure_checkpoint(saved_dir)
+            continue
         saved_complete_path = saved_dir / "complete.json"
         saved_result_path = saved_dir / "result.json"
         saved_manifest_path = saved_dir / "row_ids.json"
@@ -3148,6 +3278,8 @@ def extract_rows(
             start=1,
         ):
             feature_dir = parent_dir / "feature_batches" / f"batch_{feature_batch_index:05d}"
+            if feature_dir in infrastructure_affected:
+                _supersede_infrastructure_checkpoint(feature_dir)
             result_path = feature_dir / "result.json"
             complete_path = feature_dir / "complete.json"
             ontology_audit_path = feature_dir / "category_ontology_repair.json"
@@ -3297,6 +3429,8 @@ def extract_rows(
             start=1,
         ):
             feature_dir = parent_dir / "feature_batches" / f"batch_{feature_batch_index:05d}"
+            if feature_dir in infrastructure_affected:
+                _supersede_infrastructure_checkpoint(feature_dir)
             result_path = feature_dir / "result.json"
             complete_path = feature_dir / "complete.json"
             batch_input = {
@@ -3397,6 +3531,8 @@ def extract_rows(
         if len(batch) != 1:  # pragma: no cover - enforced by the planner
             raise RuntimeError("Stage 2 extraction planner created a multi-patient batch")
         batch_dir = output_dir / "batches" / f"batch_{index:05d}"
+        if batch_dir in infrastructure_affected:
+            _supersede_infrastructure_checkpoint(batch_dir)
         result_path = batch_dir / "result.json"
         complete_path = batch_dir / "complete.json"
         ontology_audit_path = batch_dir / "category_ontology_repair.json"
@@ -3575,6 +3711,8 @@ def extract_rows(
         row_id = int(page["row_id"])
         page_index = int(page_meta["page_index"])
         page_dir = output_dir / "pages" / f"row_{row_id:08d}" / f"page_{page_index:05d}"
+        if page_dir in infrastructure_affected:
+            _supersede_infrastructure_checkpoint(page_dir)
         result_path = page_dir / "result.json"
         complete_path = page_dir / "complete.json"
         ontology_audit_path = page_dir / "category_ontology_repair.json"
@@ -4523,6 +4661,8 @@ def _request_harmonization_plan(
     result_path = output_dir / "result.json"
     fallback_path = output_dir / "fallback.json"
     complete_path = output_dir / "complete.json"
+    if _records_infrastructure_failure(fallback_path):
+        _supersede_infrastructure_checkpoint(output_dir)
     if complete_path.is_file():
         try:
             completion = json.loads(complete_path.read_text(encoding="utf-8"))
@@ -4653,7 +4793,7 @@ def _request_harmonization_plan(
                 ),
                 request_kind="interpretation",
             )
-    except (ValueError, Stage2RequestExhaustedError) as exc:
+    except Stage2ResponseValidationError as exc:
         validation_error = exc
 
     fallback: dict[str, Any] | None = None
@@ -6945,8 +7085,9 @@ def _request_aggregate_ontology_supervisor(
     request_json: RequestJSON,
     workers: int,
     request_identity: Mapping[str, Any] | None = None,
+    cache_dir: Path | None = None,
 ) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
-    """Review all schemas without exposing treatment, outcome, or p-values."""
+    """Review changed schemas and reuse identical feature reviews across rounds."""
 
     summaries_by_id = {str(row["feature_id"]): dict(row) for row in summaries}
     failures_by_name: dict[str, list[dict[str, Any]]] = {}
@@ -6955,6 +7096,40 @@ def _request_aggregate_ontology_supervisor(
             failures_by_name.setdefault(str(pattern["feature_name"]), []).append(dict(pattern))
     identity = dict(request_identity or {})
     output_dir.mkdir(parents=True, exist_ok=True)
+    shared_cache_dir = (
+        Path(cache_dir)
+        if cache_dir is not None
+        else output_dir.parent.parent / "supervisor_cache"
+    )
+
+    # Adopt valid leaf checkpoints from earlier rounds as well as the new
+    # content-addressed cache.  This makes the optimization effective for a
+    # run that was started before the cache directory existed.
+    cached_dirs_by_fingerprint: dict[str, Path] = {}
+    supervision_root = output_dir.parent.parent
+    checkpoint_paths = [
+        *sorted(supervision_root.glob("round_*/supervisor/feature_*/complete.json")),
+        *sorted(shared_cache_dir.glob("*/*/complete.json")),
+    ]
+    for cached_complete_path in checkpoint_paths:
+        cached_feature_dir = cached_complete_path.parent
+        if cached_feature_dir == output_dir or output_dir in cached_feature_dir.parents:
+            continue
+        try:
+            cached_completion = json.loads(
+                cached_complete_path.read_text(encoding="utf-8")
+            )
+            cached_fingerprint = str(
+                cached_completion.get("input_fingerprint") or ""
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if cached_fingerprint:
+            cached_dirs_by_fingerprint.setdefault(
+                cached_fingerprint,
+                cached_feature_dir,
+            )
+
     jobs: list[tuple[int, dict[str, Any]]] = []
     decisions: dict[str, dict[str, Any]] = {}
     for index, raw_feature in enumerate(definitions, start=1):
@@ -6971,7 +7146,62 @@ def _request_aggregate_ontology_supervisor(
         else:
             jobs.append((index, feature))
 
-    def request_one(job: tuple[int, dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    def cached_decision(
+        directory: Path,
+        *,
+        fingerprint: str,
+        feature: Mapping[str, Any],
+        permit_validation_fallback: bool,
+    ) -> dict[str, Any] | None:
+        result_path = directory / "result.json"
+        complete_path = directory / "complete.json"
+        if not result_path.is_file() or not complete_path.is_file():
+            return None
+        if _records_infrastructure_failure(result_path):
+            _supersede_infrastructure_checkpoint(directory)
+            return None
+        try:
+            completion = json.loads(complete_path.read_text(encoding="utf-8"))
+            if completion.get("input_fingerprint") != fingerprint:
+                return None
+            cached = json.loads(result_path.read_text(encoding="utf-8"))
+            validated = _validate_ontology_refinement(cached, feature=feature)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not permit_validation_fallback and validated.get("validation_fallback") is True:
+            return None
+        return validated
+
+    def write_checkpoint(
+        directory: Path,
+        *,
+        input_value: Mapping[str, Any],
+        fingerprint: str,
+        decision: Mapping[str, Any],
+        reuse_source: str | None,
+    ) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            directory / "input.json",
+            {**dict(input_value), "input_fingerprint": fingerprint},
+        )
+        _write_json(directory / "result.json", decision)
+        _write_json(
+            directory / "complete.json",
+            {
+                "status": "complete",
+                "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+                "input_fingerprint": fingerprint,
+                "completed_at": _now(),
+                "action": decision["action"],
+                "reused": reuse_source is not None,
+                "reuse_source": reuse_source,
+            },
+        )
+
+    def request_one(
+        job: tuple[int, dict[str, Any]],
+    ) -> tuple[str, dict[str, Any], str]:
         index, feature = job
         feature_id = str(feature["feature_id"])
         summary = summaries_by_id.get(feature_id, {})
@@ -6996,16 +7226,53 @@ def _request_aggregate_ontology_supervisor(
         }
         fingerprint = _value_fingerprint(input_value)
         feature_dir = output_dir / f"feature_{index:04d}"
-        result_path = feature_dir / "result.json"
-        complete_path = feature_dir / "complete.json"
-        if result_path.is_file() and complete_path.is_file():
-            try:
-                completion = json.loads(complete_path.read_text(encoding="utf-8"))
-                if completion.get("input_fingerprint") == fingerprint:
-                    cached = json.loads(result_path.read_text(encoding="utf-8"))
-                    return feature_id, _validate_ontology_refinement(cached, feature=feature)
-            except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                pass
+        local = cached_decision(
+            feature_dir,
+            fingerprint=fingerprint,
+            feature=feature,
+            permit_validation_fallback=True,
+        )
+        if local is not None:
+            return feature_id, local, "local_checkpoint"
+
+        cache_feature_dir = (
+            shared_cache_dir / fingerprint[:2] / fingerprint
+        )
+        reusable = cached_decision(
+            cache_feature_dir,
+            fingerprint=fingerprint,
+            feature=feature,
+            permit_validation_fallback=False,
+        )
+        reuse_source = "content_addressed_cache"
+        if reusable is None:
+            adopted_dir = cached_dirs_by_fingerprint.get(fingerprint)
+            if adopted_dir is not None:
+                reusable = cached_decision(
+                    adopted_dir,
+                    fingerprint=fingerprint,
+                    feature=feature,
+                    permit_validation_fallback=False,
+                )
+                reuse_source = "prior_round_checkpoint"
+        if reusable is not None:
+            write_checkpoint(
+                feature_dir,
+                input_value=input_value,
+                fingerprint=fingerprint,
+                decision=reusable,
+                reuse_source=reuse_source,
+            )
+            if not (cache_feature_dir / "complete.json").is_file():
+                write_checkpoint(
+                    cache_feature_dir,
+                    input_value=input_value,
+                    fingerprint=fingerprint,
+                    decision=reusable,
+                    reuse_source=reuse_source,
+                )
+            return feature_id, reusable, reuse_source
+
         feature_dir.mkdir(parents=True, exist_ok=True)
         _write_json(feature_dir / "input.json", {**input_value, "input_fingerprint": fingerprint})
         try:
@@ -7018,7 +7285,7 @@ def _request_aggregate_ontology_supervisor(
                 lambda value: _validate_ontology_refinement(value, feature=feature),
                 request_kind="interpretation",
             )
-        except (ValueError, Stage2RequestExhaustedError) as exc:
+        except Stage2ResponseValidationError as exc:
             decision = {
                 "feature_id": feature_id,
                 "feature_name": str(feature["name"]),
@@ -7026,27 +7293,33 @@ def _request_aggregate_ontology_supervisor(
                 "reason": f"Invalid supervisor response; conservative keep: {exc}",
                 "validation_fallback": True,
             }
-        _write_json(result_path, decision)
-        _write_json(
-            complete_path,
-            {
-                "status": "complete",
-                "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
-                "input_fingerprint": fingerprint,
-                "completed_at": _now(),
-                "action": decision["action"],
-            },
+        write_checkpoint(
+            feature_dir,
+            input_value=input_value,
+            fingerprint=fingerprint,
+            decision=decision,
+            reuse_source=None,
         )
-        return feature_id, decision
+        if decision.get("validation_fallback") is not True:
+            write_checkpoint(
+                cache_feature_dir,
+                input_value=input_value,
+                fingerprint=fingerprint,
+                decision=decision,
+                reuse_source=None,
+            )
+        return feature_id, decision, "model"
 
+    request_sources: Counter[str] = Counter()
     if jobs:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, min(int(workers), len(jobs)))
         ) as executor:
             futures = [executor.submit(request_one, job) for job in jobs]
             for future in concurrent.futures.as_completed(futures):
-                feature_id, decision = future.result()
+                feature_id, decision, source = future.result()
                 decisions[feature_id] = decision
+                request_sources[source] += 1
 
     updated: list[dict[str, Any]] = []
     changed_ids: list[str] = []
@@ -7078,7 +7351,16 @@ def _request_aggregate_ontology_supervisor(
         "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
         "completed_at": _now(),
         "features_reviewed": len(definitions),
-        "model_requested_features": len(jobs),
+        "review_candidate_features": len(jobs),
+        "model_requested_features": int(request_sources["model"]),
+        "cache_reused_features": int(
+            request_sources["content_addressed_cache"]
+            + request_sources["prior_round_checkpoint"]
+        ),
+        "local_checkpoint_reused_features": int(
+            request_sources["local_checkpoint"]
+        ),
+        "review_request_sources": dict(sorted(request_sources.items())),
         "changed_feature_ids": changed_ids,
         "decisions": [decisions[str(feature["feature_id"])] for feature in definitions],
         "prohibited_information_supplied": False,
@@ -7182,6 +7464,8 @@ def _request_ontology_refinements(
         result_path = feature_dir / "result.json"
         complete_path = feature_dir / "complete.json"
         if result_path.is_file() and complete_path.is_file():
+            if _records_infrastructure_failure(result_path):
+                _supersede_infrastructure_checkpoint(feature_dir)
             try:
                 completion = json.loads(complete_path.read_text(encoding="utf-8"))
                 cached = json.loads(result_path.read_text(encoding="utf-8"))
@@ -7199,7 +7483,7 @@ def _request_ontology_refinements(
                 messages,
                 lambda value: _validate_ontology_refinement(value, feature=feature),
             )
-        except (ValueError, Stage2RequestExhaustedError) as exc:
+        except Stage2ResponseValidationError as exc:
             decision = {
                 "feature_id": str(feature["feature_id"]),
                 "feature_name": name,
@@ -8965,4 +9249,10 @@ def run_fold_analysis(
     }
 
 
-__all__ = ["run_fold_analysis"]
+__all__ = [
+    "Stage2InfrastructureError",
+    "Stage2RequestExhaustedError",
+    "Stage2ResponseValidationError",
+    "infrastructure_failure_audit_paths",
+    "run_fold_analysis",
+]

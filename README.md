@@ -1184,14 +1184,11 @@ nsclc_all_evidence/
       outer_001_inner_001/...
       evidence.jsonl
       complete.json
-  stage1_architectures/
+  stage1_architectures/              # explicit --architectures runs only
     manifest.json
     bow_nuisance/evidence.jsonl
     ...
   handoff/
-    text_models.jsonl
-    tfidf.jsonl
-    neural_queries.jsonl
     evidence.jsonl
     index.json
     complete.json
@@ -1213,6 +1210,7 @@ nsclc_all_evidence/
       consolidation/...
       feature_definitions.json
       ontology_supervision/
+        supervisor_cache/<fingerprint-prefix>/<fingerprint>/...
         round_001/
           extraction/...
           aggregate_extraction_summary.json
@@ -1249,7 +1247,12 @@ the candidates, aggregate ontology reviews, fold-local p-values and rankings,
 selected roles, extractions, and causal-forest estimates. If a process is
 interrupted, rerunning the same command skips each completed interpretation,
 consolidation, extraction, ontology-supervision, and estimation leaf, then
-re-enters the first incomplete directory.
+re-enters the first incomplete directory. Across ontology rounds, aggregate
+supervisor decisions are reused only when the feature definition, extraction
+summary, failure pattern, and request identity have the same fingerprint.
+Checkpoints produced by the former request-exhaustion-as-null behavior are
+retained under `superseded_infrastructure_*` names and only those affected
+leaves are requested again.
 
 When the input dataset contains `true_ite_prob`, Stage 2 evaluates its frozen
 cross-fitted `estimated_cate` values against that oracle only after all modeling
@@ -1261,9 +1264,10 @@ oracle-free; the joined audit data is written separately to
 the metrics file records that the evaluation is unavailable.
 
 The stable boundary between the stages is `handoff/evidence.jsonl`.
-`handoff/index.json` identifies the contributing files, and the uncombined
-per-component JSONL files remain beside it. Python consumers can stream the
-combined handoff without loading it into memory:
+`handoff/index.json` references the contributing component files in place, so
+the handoff retains only that combined boundary instead of adding three more
+full-size per-component copies. Python consumers can stream the combined
+handoff without loading it into memory:
 
 ```python
 from oci.inference.research_all_evidence_workflow import iter_stage1_handoff
@@ -1272,11 +1276,12 @@ for evidence_context in iter_stage1_handoff("/results/nsclc_all_evidence"):
     process(evidence_context)
 ```
 
-The additive `stage1_architectures/` contract is the architecture-oriented
-view of the same frozen evidence. Its manifest records the selected lanes,
-private support services, producer artifacts, hashes, and row-score sidecars.
-Targeted runs use these canonical envelopes as the handoff itself; legacy runs
-retain their existing component handoff and receive the sidecars additively.
+For an explicit `--architectures` selection, `stage1_architectures/` is the
+architecture-oriented view of the same frozen evidence. Its manifest records
+the selected lanes, private support services, producer artifacts, hashes, and
+row-score sidecars, and its compact canonical envelopes become the handoff.
+Legacy enable-flag runs stream the component evidence directly and skip this
+redundant materialization.
 
 To inspect status without starting work, use `--status`. To intentionally rerun
 a component, use `--rerun COMPONENT`. This removes completion markers but leaves

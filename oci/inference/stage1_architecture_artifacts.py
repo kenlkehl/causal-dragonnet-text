@@ -15,8 +15,8 @@ from .stage1_architectures import (
     resolve_support_services,
 )
 
-ARCHITECTURE_EVIDENCE_SCHEMA_VERSION = "stage1_architecture_evidence_v1"
-ARCHITECTURE_MANIFEST_SCHEMA_VERSION = "stage1_architecture_manifest_v1"
+ARCHITECTURE_EVIDENCE_SCHEMA_VERSION = "stage1_architecture_evidence_v2_compact_occurrences"
+ARCHITECTURE_MANIFEST_SCHEMA_VERSION = "stage1_architecture_manifest_v2_compact_occurrences"
 
 
 def _now() -> str:
@@ -108,7 +108,7 @@ def materialize_stage1_architecture_artifacts(
     from .plain_handoff_stage2_evidence import extract_stage1_architecture_occurrences
 
     by_outer = extract_stage1_architecture_occurrences(
-        list(raw_handoff_rows),
+        raw_handoff_rows,
         included_architectures=selected,
     )
     source_metadata = {
@@ -163,7 +163,11 @@ def materialize_stage1_architecture_artifacts(
         artifact_index[architecture] = {
             "evidence": os.path.relpath(evidence_path, start=Path(output_dir)),
             "evidence_sha256": _file_sha256(evidence_path),
-            "occurrences": len(evidence_rows),
+            "occurrences": sum(
+                int(row["occurrence"].get("raw_occurrence_count", 1))
+                for row in evidence_rows
+            ),
+            "compact_records": len(evidence_rows),
             "producer_component": STAGE1_ARCHITECTURE_REGISTRY[architecture].component,
             "support_services": list(STAGE1_ARCHITECTURE_REGISTRY[architecture].support_services),
             "score_artifacts": _score_artifacts(Path(output_dir), architecture),

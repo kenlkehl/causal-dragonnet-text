@@ -17,7 +17,6 @@ import copy
 import json
 import logging
 import os
-import shutil
 import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -33,6 +32,7 @@ from .plain_handoff_stage2 import (
     plain_stage2_config_from_mapping,
     run_plain_handoff_stage2,
 )
+from .plain_handoff_stage2_analysis import infrastructure_failure_audit_paths
 from .stage1_architectures import (
     BOW_NUISANCE,
     BOW_R_LOSS,
@@ -1280,6 +1280,15 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    if not path.is_file():
+        return
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
+
+
 def _handoff_component(
     context: Stage1RunContext,
     component_dir: Path,
@@ -1289,88 +1298,90 @@ def _handoff_component(
         "tfidf": context.component_dir("tfidf") / "evidence.jsonl",
         "neural_queries": context.component_dir("neural_queries") / "evidence.jsonl",
     }
-    combined: list[dict[str, Any]] = []
-    copied: dict[str, str] = {}
+    source_references: dict[str, str] = {}
     source_artifacts: dict[str, Path] = {}
     for source, source_path in sources.items():
-        rows = _load_jsonl(source_path)
-        if not rows:
+        # Remove obsolete full-size copies left by the legacy handoff writer.
+        (component_dir / f"{source}.jsonl").unlink(missing_ok=True)
+        if not source_path.is_file() or source_path.stat().st_size == 0:
             continue
         source_artifacts[source] = source_path
-        if context.config.stage1_architectures is None:
-            destination = component_dir / f"{source}.jsonl"
-            shutil.copyfile(source_path, destination)
-            copied[source] = destination.name
-        else:
-            copied[source] = os.path.relpath(source_path, start=component_dir)
-        for row in rows:
-            combined.append(
-                {
+        source_references[source] = os.path.relpath(source_path, start=component_dir)
+    if not source_artifacts:
+        raise RuntimeError("handoff has no completed Stage 1 evidence components")
+
+    def raw_combined_rows() -> Iterable[dict[str, Any]]:
+        for source, source_path in sources.items():
+            if source not in source_artifacts:
+                continue
+            for row in _iter_jsonl(source_path):
+                yield {
                     "source": source,
                     "outer_fold": row.get("outer_fold"),
                     "inner_fold": row.get("inner_fold"),
                     "scope": row.get("scope"),
                     "evidence": row,
                 }
+
+    architecture_manifest: Mapping[str, Any] | None = None
+    if context.config.stage1_architectures is not None:
+        from .stage1_architecture_artifacts import (
+            materialize_stage1_architecture_artifacts,
+        )
+
+        combined, architecture_manifest = materialize_stage1_architecture_artifacts(
+            output_dir=context.output_dir,
+            raw_handoff_rows=raw_combined_rows(),
+            selected_architectures=context.selected_architectures,
+            source_artifacts=source_artifacts,
+            selection_mode="explicit",
+        )
+        missing_architectures = [
+            architecture
+            for architecture in context.selected_architectures
+            if int(
+                architecture_manifest["architectures"][architecture]["occurrences"]
             )
-    if not combined:
-        raise RuntimeError("handoff has no completed Stage 1 evidence components")
+            == 0
+        ]
+        if missing_architectures:
+            raise RuntimeError(
+                "Stage 1 produced no evidence for selected architectures: "
+                f"{missing_architectures}"
+            )
+        row_count = len(combined)
+        rows_to_write: Iterable[Mapping[str, Any]] = combined
+    else:
+        row_count = 0
 
-    from .stage1_architecture_artifacts import (
-        materialize_stage1_architecture_artifacts,
-    )
+        def counted_raw_rows() -> Iterable[dict[str, Any]]:
+            nonlocal row_count
+            for row in raw_combined_rows():
+                row_count += 1
+                yield row
 
-    architecture_rows, architecture_manifest = materialize_stage1_architecture_artifacts(
-        output_dir=context.output_dir,
-        raw_handoff_rows=combined,
-        selected_architectures=context.selected_architectures,
-        source_artifacts=source_artifacts,
-        selection_mode=(
-            "legacy_inferred"
-            if context.config.stage1_architectures is None
-            else "explicit"
-        ),
-    )
-    missing_architectures = [
-        architecture
-        for architecture in context.selected_architectures
-        if int(
-            architecture_manifest["architectures"][architecture]["occurrences"]
-        )
-        == 0
-    ]
-    if context.config.stage1_architectures is not None and missing_architectures:
-        raise RuntimeError(
-            "Stage 1 produced no evidence for selected architectures: "
-            f"{missing_architectures}"
-        )
+        rows_to_write = counted_raw_rows()
 
-    if context.config.stage1_architectures is not None:
-        combined = architecture_rows
-
-    combined.sort(
-        key=lambda row: (
-            int(row.get("outer_fold") or 0),
-            int(row.get("inner_fold") or 0),
-            str(row["source"]),
-            str((row.get("evidence") or {}).get("architecture") or ""),
-        )
-    )
     evidence_path = component_dir / "evidence.jsonl"
-    _write_jsonl(evidence_path, combined)
+    _write_jsonl(evidence_path, rows_to_write)
+    if row_count == 0:
+        evidence_path.unlink(missing_ok=True)
+        raise RuntimeError("handoff has no completed Stage 1 evidence rows")
     index = {
-            "dataset": str(context.config.dataset),
-            "columns": {
-                "unit_id": context.config.unit_id_column,
-                "text": context.config.text_column,
-                "treatment": context.config.treatment_column,
-                "outcome": context.config.outcome_column,
-            },
-            "sources": copied,
-            "combined_evidence": evidence_path.name,
-            "rows": len(combined),
-        }
+        "dataset": str(context.config.dataset),
+        "columns": {
+            "unit_id": context.config.unit_id_column,
+            "text": context.config.text_column,
+            "treatment": context.config.treatment_column,
+            "outcome": context.config.outcome_column,
+        },
+        "sources": source_references,
+        "source_storage": "referenced_without_copy",
+        "combined_evidence": evidence_path.name,
+        "rows": row_count,
+    }
     if context.config.stage1_architectures is not None:
+        assert architecture_manifest is not None
         index.update(
             {
                 "schema_version": "stage1_architecture_handoff_v1",
@@ -1381,10 +1392,12 @@ def _handoff_component(
                 ),
             }
         )
+    else:
+        index["architecture_materialization"] = "skipped_for_legacy_raw_handoff"
     _write_json(component_dir / "index.json", index)
     return {
         "artifacts": [str(evidence_path), str(component_dir / "index.json")],
-        "rows": len(combined),
+        "rows": row_count,
     }
 
 
@@ -1748,6 +1761,23 @@ class ResearchAllEvidenceWorkflow:
                             "continue incomplete or legacy Stage 2 output: %s",
                             component_dir,
                         )
+                    infrastructure_audits = infrastructure_failure_audit_paths(
+                        component_dir
+                    )
+                    if infrastructure_audits:
+                        LOGGER.warning(
+                            "continue Stage 2 to repair %s legacy infrastructure "
+                            "failure checkpoint(s): %s",
+                            len(infrastructure_audits),
+                            component_dir,
+                        )
+                        os.replace(
+                            complete_path,
+                            complete_path.with_name(
+                                "superseded_infrastructure_complete.json"
+                            ),
+                        )
+                        stage2_is_final = False
                 if complete_path.is_file() and stage2_is_final:
                     LOGGER.info("component already complete: %s", name)
                     progress["components"][name] = {

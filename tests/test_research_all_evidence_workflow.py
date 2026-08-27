@@ -459,6 +459,53 @@ def test_stage2_handoff_reader_uses_the_obvious_output_path(tmp_path):
     ]
 
 
+def test_legacy_handoff_references_sources_without_copy_or_architecture_expansion(
+    tmp_path: Path,
+):
+    _raw, config = _inputs(tmp_path, components=())
+    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
+    assert context.config.stage1_architectures is None
+    source = context.component_dir("text_models") / "evidence.jsonl"
+    source.parent.mkdir(parents=True)
+    source_row = {
+        "outer_fold": 1,
+        "inner_fold": None,
+        "scope": "full_outer_train",
+        "importance": {"views": []},
+    }
+    source.write_text(json.dumps(source_row) + "\n", encoding="utf-8")
+    handoff_dir = context.component_dir("handoff")
+    handoff_dir.mkdir(parents=True)
+    obsolete_copies = [
+        handoff_dir / f"{source_name}.jsonl"
+        for source_name in ("text_models", "tfidf", "neural_queries")
+    ]
+    for obsolete_copy in obsolete_copies:
+        obsolete_copy.write_text("obsolete duplicate\n", encoding="utf-8")
+
+    result = all_evidence_workflow._handoff_component(context, handoff_dir)
+
+    assert result["rows"] == 1
+    assert all(not obsolete_copy.exists() for obsolete_copy in obsolete_copies)
+    assert not (context.output_dir / "stage1_architectures").exists()
+    index = json.loads((handoff_dir / "index.json").read_text(encoding="utf-8"))
+    assert index["source_storage"] == "referenced_without_copy"
+    assert index["architecture_materialization"] == "skipped_for_legacy_raw_handoff"
+    assert index["sources"] == {
+        "text_models": "../components/text_models/evidence.jsonl"
+    }
+    rows = list(iter_stage1_handoff(context.output_dir))
+    assert rows == [
+        {
+            "source": "text_models",
+            "outer_fold": 1,
+            "inner_fold": None,
+            "scope": "full_outer_train",
+            "evidence": source_row,
+        }
+    ]
+
+
 def test_other_evidence_families_reuse_visible_tfidf_splits(tmp_path):
     _raw, config = _inputs(tmp_path, components=("tfidf", "text_models"))
     split_path = config.output_dir / "components" / "tfidf" / "split_provenance.jsonl"
@@ -769,6 +816,70 @@ def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path, monkeypatch):
     second = workflow.run()
     assert second["components"]["stage2"]["status"] == "already_complete"
     assert len(calls) == 1
+
+
+def test_completed_stage2_with_legacy_infrastructure_missingness_is_repaired(
+    tmp_path,
+    monkeypatch,
+):
+    raw, _config = _inputs(tmp_path, components=())
+    raw["run"]["mode"] = "stage2"
+    raw["stage2"] = {
+        "endpoint": "http://stage2.test/v1",
+        "model": "test-model",
+    }
+    config = compile_config(raw, config_dir=tmp_path)
+    handoff = config.output_dir / "handoff" / "evidence.jsonl"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text('{"source":"tfidf"}\n', encoding="utf-8")
+    (handoff.parent / "complete.json").write_text("{}", encoding="utf-8")
+    stage2_dir = config.output_dir / "stage2"
+    stage2_dir.mkdir(parents=True)
+    for name, content in (
+        ("causal_estimate.json", "{}"),
+        ("cross_fitted_predictions.csv", "_oci_row_id,aipw_score\n"),
+        ("posthoc_oracle_ite_metrics.json", '{"available":false}\n'),
+    ):
+        (stage2_dir / name).write_text(content, encoding="utf-8")
+    (stage2_dir / "complete.json").write_text(
+        json.dumps({"phase": "causal_estimation"}),
+        encoding="utf-8",
+    )
+    failure = (
+        stage2_dir
+        / "outer_001"
+        / "extraction"
+        / "heldout"
+        / "batches"
+        / "batch_00001"
+        / "extraction_failure.json"
+    )
+    failure.parent.mkdir(parents=True)
+    failure.write_text(
+        json.dumps(
+            {
+                "resolution": "conservative_all_null",
+                "validation_error": "Stage2RequestExhaustedError: endpoint unavailable",
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def repair_stage2(*, output_dir, **kwargs):
+        calls.append(kwargs)
+        failure.rename(
+            failure.with_name("superseded_infrastructure_extraction_failure.json")
+        )
+        return {"phase": "causal_estimation"}
+
+    monkeypatch.setattr(all_evidence_workflow, "run_plain_handoff_stage2", repair_stage2)
+
+    result = ResearchAllEvidenceWorkflow(config).run()
+
+    assert result["components"]["stage2"]["status"] == "complete"
+    assert len(calls) == 1
+    assert (stage2_dir / "superseded_infrastructure_complete.json").is_file()
 
 
 def test_definition_only_stage2_marker_is_continued_after_upgrade(tmp_path, monkeypatch):

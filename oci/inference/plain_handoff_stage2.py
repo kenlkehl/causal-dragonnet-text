@@ -38,6 +38,8 @@ from .plain_handoff_stage2_evidence import (
 from .plain_handoff_stage2_analysis import (
     ESTIMATION_CHECKPOINT_SCHEMA_VERSION,
     Stage2RequestExhaustedError,
+    Stage2ResponseValidationError,
+    infrastructure_failure_audit_paths,
     prompt_token_count,
     run_fold_analysis,
 )
@@ -2140,10 +2142,6 @@ class _Stage2OutputLengthError(ValueError):
     """The server exhausted the available completion length."""
 
 
-class _Stage2ResponseValidationError(ValueError):
-    """A response remained structurally invalid after bounded repairs."""
-
-
 class _ManagedStage2ModelSwitch(RuntimeError):
     """Signal that a checkpointed managed run needs the other model loaded."""
 
@@ -2958,8 +2956,13 @@ def _request_json(
             )
             return validate(_parse_json_object(response))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            # Only a returned (or length-truncated) model response is eligible
+            # for semantic repair/fallback. Local prompt-budget, configuration,
+            # and transport exceptions must abort instead of becoming evidence.
+            if response is None and not isinstance(exc, _Stage2OutputLengthError):
+                raise
             if attempt == max_attempts - 1:
-                raise _Stage2ResponseValidationError(
+                raise Stage2ResponseValidationError(
                     f"Stage 2 response remained invalid after {max_attempts - 1} repairs: {exc}"
                 ) from exc
             first_error = exc
@@ -3049,12 +3052,12 @@ def _checkpointed_request_json(
     completion: CompletionFunction,
     validate: Callable[[Mapping[str, Any]], dict[str, Any]],
     validation_fallback: (
-        Callable[[_Stage2ResponseValidationError], Mapping[str, Any]] | None
+        Callable[[Stage2ResponseValidationError], Mapping[str, Any]] | None
     ) = None,
 ) -> dict[str, Any]:
     """Cache one validated LLM leaf by its complete deterministic input."""
 
-    def request_with_fallback() -> tuple[dict[str, Any], _Stage2ResponseValidationError | None]:
+    def request_with_fallback() -> tuple[dict[str, Any], Stage2ResponseValidationError | None]:
         try:
             return (
                 _request_json(
@@ -3065,7 +3068,7 @@ def _checkpointed_request_json(
                 ),
                 None,
             )
-        except _Stage2ResponseValidationError as exc:
+        except Stage2ResponseValidationError as exc:
             if validation_fallback is None:
                 raise
             result = validate(validation_fallback(exc))
@@ -5776,7 +5779,7 @@ def _pack_operationalization_supporting_evidence(
 def _ambiguous_operationalization_fallback(
     *,
     group: Mapping[str, Any],
-    validation_error: _Stage2ResponseValidationError,
+    validation_error: Stage2ResponseValidationError,
 ) -> dict[str, Any]:
     """Return a conservative extraction-ready ontology after exhausted repairs."""
 
@@ -7125,7 +7128,7 @@ class PlainHandoffStage2:
                         batch_number = futures[future]
                         try:
                             batch_responses[batch_number] = future.result()
-                        except _Stage2ResponseValidationError as exc:
+                        except Stage2ResponseValidationError as exc:
                             # Consolidation is an optional semantic reduction.
                             # Retaining every member of an invalid batch is the
                             # conservative, lossless fallback and necessarily
@@ -7443,6 +7446,23 @@ class PlainHandoffStage2:
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             estimation_completion = {}
+        infrastructure_audits = (
+            infrastructure_failure_audit_paths(output_dir)
+            if complete_path.is_file()
+            else ()
+        )
+        if infrastructure_audits and complete_path.is_file():
+            LOGGER.warning(
+                "rerun completed Stage 2 outer fold=%s because %s legacy "
+                "infrastructure failure(s) were checkpointed as scientific missingness",
+                outer_fold,
+                len(infrastructure_audits),
+            )
+            os.replace(
+                complete_path,
+                complete_path.with_name("superseded_infrastructure_complete.json"),
+            )
+            completion = {}
         if (
             completion.get("phase") == "causal_estimation"
             and final_features_path.is_file()
