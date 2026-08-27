@@ -128,6 +128,9 @@ values and validation failures to review and ontologize the small model's
 output; it receives no patient text, treatment or outcome values, causal-role
 evidence, performance metrics, or p-values. It may revise only the same
 candidate's extraction schema, and a revision triggers small-model re-extraction.
+Only candidates whose prompt-facing schema changed are re-extracted; unchanged
+raw columns are reused and merged with the refreshed columns. Extraction remains
+one patient per prompt, with the existing per-patient feature batching.
 
 Once ontologies are frozen, simple regressions inside the inner folds assign
 discovered confounder and effect-modifier roles. Explicit investigator variables
@@ -846,7 +849,8 @@ primary model sees per-feature counts and aggregate values plus validation
 failure patterns, but no patient text, treatment, outcome, causal-role evidence,
 model performance, or p-values. Its response is bounded to `keep` or a same-
 feature ontology revision. It cannot add, drop, split, merge, rename, or assign
-a role. Stage 2 re-extracts after a revision and repeats for at most
+a role. Stage 2 re-extracts only revised features, merges them into the cached
+raw training matrix, and repeats for at most
 `max_review_rounds`; `ontology_supervision/convergence.json` records whether the
 latest aggregate ontology was stable.
 
@@ -916,8 +920,9 @@ definition, aggregate count, and a bounded list of failed model outputs—but no
 patient text, treatment, outcome, or held-out information. It may keep the
 definition or revise only its description, value type, categories or unit,
 measurement rule, and missingness rule. The feature name, identity, roles, and
-support remain fixed. The training patients are then re-extracted and monitored
-again, for at most `max_ontology_refinement_rounds` revisions (2 by default),
+support remain fixed. The revised features are then re-extracted across the
+training patients and merged with cached unchanged-feature columns before
+monitoring runs again, for at most `max_ontology_refinement_rounds` revisions (2 by default),
 before aggregate ontology supervision proceeds. Investigator-configured explicit ontologies
 are immutable: their repeated failures are audited, but no refinement request is
 made. The held-out extraction begins only after

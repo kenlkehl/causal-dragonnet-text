@@ -56,6 +56,9 @@ PENDING_CATEGORY_ONTOLOGY_SCHEMA_VERSION = "stage2_pending_category_ontology_v1"
 ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_training_failure_ontology_refinement_v2_request_policy"
 )
+INCREMENTAL_REFINEMENT_EXTRACTION_SCHEMA_VERSION = (
+    "stage2_incremental_refinement_extraction_v1_feature_delta"
+)
 HARMONIZATION_CHECKPOINT_SCHEMA_VERSION = "stage2_mixed_value_harmonization_v1_llm_training_only"
 HARMONIZATION_FALLBACK_SCHEMA_VERSION = "stage2_mixed_value_harmonization_fallback_v1"
 # Compatibility defaults for Stage 2 config objects created before ontology
@@ -7292,6 +7295,343 @@ def _request_ontology_refinements(
     return updated, bool(changed_names), report
 
 
+def _feature_extraction_fingerprint(feature: Mapping[str, Any]) -> str:
+    """Fingerprint only fields that can change a patient extraction prompt."""
+
+    return _value_fingerprint(_prompt_feature_definitions([feature])[0])
+
+
+def _features_requiring_reextraction(
+    *,
+    prior_definitions: Sequence[Mapping[str, Any]],
+    definitions: Sequence[Mapping[str, Any]],
+    prior_extracted: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    """Return current definitions whose patient-measurement prompt changed."""
+
+    prior_by_id: dict[str, Mapping[str, Any]] = {}
+    for feature in prior_definitions:
+        feature_id = str(feature["feature_id"])
+        if feature_id in prior_by_id:
+            raise ValueError(f"duplicate prior feature_id {feature_id!r}")
+        prior_by_id[feature_id] = feature
+
+    changed: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        feature_id = str(feature["feature_id"])
+        name = str(feature["name"])
+        if feature_id in seen_ids:
+            raise ValueError(f"duplicate current feature_id {feature_id!r}")
+        if name in seen_names:
+            raise ValueError(f"duplicate current feature name {name!r}")
+        seen_ids.add(feature_id)
+        seen_names.add(name)
+        prior = prior_by_id.get(feature_id)
+        if (
+            prior is None
+            or str(prior.get("name") or "") != name
+            or name not in prior_extracted.columns
+            or _feature_extraction_fingerprint(prior)
+            != _feature_extraction_fingerprint(feature)
+        ):
+            changed.append(feature)
+    return changed
+
+
+def _validated_extraction_index(
+    frame: pd.DataFrame,
+    *,
+    row_ids: Sequence[int],
+    required_feature_names: Sequence[str],
+    source: str,
+) -> pd.DataFrame:
+    """Validate and index one extraction matrix without changing row identity."""
+
+    if "_oci_row_id" not in frame.columns:
+        raise ValueError(f"{source} extraction is missing _oci_row_id")
+    missing = [name for name in required_feature_names if name not in frame.columns]
+    if missing:
+        raise ValueError(f"{source} extraction is missing feature columns: {missing}")
+    indexed = frame.copy()
+    try:
+        indexed["_oci_row_id"] = indexed["_oci_row_id"].map(int)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source} extraction has invalid row identifiers") from exc
+    if indexed["_oci_row_id"].duplicated().any():
+        raise ValueError(f"{source} extraction has duplicate row identifiers")
+    expected = [int(row_id) for row_id in row_ids]
+    if len(expected) != len(set(expected)):
+        raise ValueError("refinement extraction received duplicate requested row identifiers")
+    observed = set(indexed["_oci_row_id"].tolist())
+    if observed != set(expected):
+        raise ValueError(
+            f"{source} extraction row identifiers do not match the requested patients"
+        )
+    return indexed.set_index("_oci_row_id", drop=False).loc[expected]
+
+
+def _merge_incremental_failure_summaries(
+    *,
+    prior_summary: Mapping[str, Any],
+    delta_summary: Mapping[str, Any],
+    current_feature_names: Sequence[str],
+    changed_feature_names: Sequence[str],
+) -> dict[str, Any]:
+    """Replace changed-feature failures while retaining reused-feature provenance."""
+
+    current = set(map(str, current_feature_names))
+    changed = set(map(str, changed_feature_names))
+    if not changed.issubset(current):
+        raise ValueError("changed refinement features are not present in current definitions")
+
+    patterns: list[dict[str, Any]] = []
+    for raw_pattern in prior_summary.get("feature_failure_patterns") or []:
+        if not isinstance(raw_pattern, Mapping):
+            continue
+        name = str(raw_pattern.get("feature_name") or "")
+        if name in current and name not in changed:
+            patterns.append(copy.deepcopy(dict(raw_pattern)))
+    for raw_pattern in delta_summary.get("feature_failure_patterns") or []:
+        if not isinstance(raw_pattern, Mapping):
+            continue
+        name = str(raw_pattern.get("feature_name") or "")
+        if name not in changed:
+            raise ValueError(
+                "delta extraction reported a failure for a feature that was not "
+                f"re-extracted: {name!r}"
+            )
+        patterns.append(copy.deepcopy(dict(raw_pattern)))
+    patterns.sort(
+        key=lambda pattern: (
+            -int(pattern.get("patient_count") or 0),
+            str(pattern.get("feature_name") or ""),
+            str(pattern.get("failure_kind") or ""),
+            str(pattern.get("reason") or ""),
+        )
+    )
+
+    structural_rows = {
+        int(row_id)
+        for summary in (prior_summary, delta_summary)
+        for row_id in summary.get("structural_failure_patient_row_ids") or []
+    }
+    return {
+        "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+        "completed_at": _now(),
+        "issue_files": int(prior_summary.get("issue_files") or 0)
+        + int(delta_summary.get("issue_files") or 0),
+        "feature_failure_patterns": patterns,
+        "structural_failure_patient_count": len(structural_rows),
+        "structural_failure_patient_row_ids": sorted(structural_rows),
+        "incremental_refinement": {
+            "schema_version": INCREMENTAL_REFINEMENT_EXTRACTION_SCHEMA_VERSION,
+            "reextracted_feature_names": sorted(changed),
+            "reused_feature_names": sorted(current - changed),
+            "structural_failure_policy": "union_reused_and_delta_patient_rows",
+        },
+    }
+
+
+def _has_legacy_full_refinement_checkpoints(output_dir: Path) -> bool:
+    """Detect a full re-extraction started by code predating feature deltas."""
+
+    if (output_dir / "changed_features").exists():
+        return False
+    return any(
+        (output_dir / name).exists()
+        for name in (
+            "batches",
+            "pages",
+            "extracted.csv",
+            "failure_summary.json",
+            "complete.json",
+        )
+    )
+
+
+def _extract_changed_features_and_merge(
+    *,
+    dataset: pd.DataFrame,
+    row_ids: Sequence[int],
+    text_column: str,
+    definitions: Sequence[Mapping[str, Any]],
+    prior_extracted: pd.DataFrame,
+    prior_definitions: Sequence[Mapping[str, Any]],
+    prior_failure_summary: Mapping[str, Any],
+    output_dir: Path,
+    request_json: RequestJSON,
+    workers: int,
+    max_prompt_chars: int,
+    feature_batch_size: int,
+    request_identity: Mapping[str, Any] | None,
+    tokenizer: Any | None,
+    chunk_size_tokens: int,
+    context_window_tokens: int,
+    max_output_tokens: int,
+    context_margin_tokens: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Extract changed features only and materialize a complete merged matrix."""
+
+    current = [dict(feature) for feature in definitions]
+    current_names = [str(feature["name"]) for feature in current]
+
+    # A long-running workflow may already have started a full pass under the
+    # historical directory layout.  Resume that work rather than abandoning
+    # valid checkpoints halfway through a patient cohort.
+    if _has_legacy_full_refinement_checkpoints(output_dir):
+        LOGGER.info(
+            "resume legacy full Stage 2 refinement extraction before enabling "
+            "feature-delta checkpoints: %s",
+            output_dir,
+        )
+        extracted = extract_rows(
+            dataset=dataset,
+            row_ids=row_ids,
+            text_column=text_column,
+            definitions=current,
+            output_dir=output_dir,
+            request_json=request_json,
+            workers=workers,
+            max_prompt_chars=max_prompt_chars,
+            feature_batch_size=feature_batch_size,
+            request_identity=request_identity,
+            tokenizer=tokenizer,
+            chunk_size_tokens=chunk_size_tokens,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            context_margin_tokens=context_margin_tokens,
+        )
+        summary = json.loads(
+            (output_dir / "failure_summary.json").read_text(encoding="utf-8")
+        )
+        return extracted, summary
+
+    changed_definitions = _features_requiring_reextraction(
+        prior_definitions=prior_definitions,
+        definitions=current,
+        prior_extracted=prior_extracted,
+    )
+    changed_names = [str(feature["name"]) for feature in changed_definitions]
+    delta_dir = output_dir / "changed_features"
+    LOGGER.info(
+        "Stage 2 incremental refinement re-extracting features=%s/%s names=%s",
+        len(changed_definitions),
+        len(current),
+        changed_names,
+    )
+    delta = extract_rows(
+        dataset=dataset,
+        row_ids=row_ids,
+        text_column=text_column,
+        definitions=changed_definitions,
+        output_dir=delta_dir,
+        request_json=request_json,
+        workers=workers,
+        max_prompt_chars=max_prompt_chars,
+        feature_batch_size=feature_batch_size,
+        request_identity=request_identity,
+        tokenizer=tokenizer,
+        chunk_size_tokens=chunk_size_tokens,
+        context_window_tokens=context_window_tokens,
+        max_output_tokens=max_output_tokens,
+        context_margin_tokens=context_margin_tokens,
+    )
+    prior_names = [str(feature["name"]) for feature in prior_definitions]
+    prior_indexed = _validated_extraction_index(
+        prior_extracted,
+        row_ids=row_ids,
+        required_feature_names=[
+            name for name in current_names if name not in set(changed_names)
+        ],
+        source="prior",
+    )
+    delta_indexed = _validated_extraction_index(
+        delta,
+        row_ids=row_ids,
+        required_feature_names=changed_names,
+        source="delta",
+    )
+    ordered_row_ids = [int(row_id) for row_id in row_ids]
+    merged = pd.DataFrame({"_oci_row_id": ordered_row_ids})
+    changed = set(changed_names)
+    for name in current_names:
+        source = delta_indexed if name in changed else prior_indexed
+        merged[name] = source.loc[ordered_row_ids, name].tolist()
+
+    delta_summary = json.loads(
+        (delta_dir / "failure_summary.json").read_text(encoding="utf-8")
+    )
+    merged_summary = _merge_incremental_failure_summaries(
+        prior_summary=prior_failure_summary,
+        delta_summary=delta_summary,
+        current_feature_names=current_names,
+        changed_feature_names=changed_names,
+    )
+    merge_input = {
+        "schema_version": INCREMENTAL_REFINEMENT_EXTRACTION_SCHEMA_VERSION,
+        "prior_definition_fingerprints": {
+            str(feature["feature_id"]): _feature_extraction_fingerprint(feature)
+            for feature in prior_definitions
+        },
+        "current_definition_fingerprints": {
+            str(feature["feature_id"]): _feature_extraction_fingerprint(feature)
+            for feature in current
+        },
+        "prior_feature_names": prior_names,
+        "current_feature_names": current_names,
+        "reextracted_feature_names": changed_names,
+        "prior_frame_fingerprint": _frame_fingerprint(prior_extracted),
+        "delta_frame_fingerprint": _frame_fingerprint(delta),
+    }
+    input_fingerprint = _value_fingerprint(merge_input)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        output_dir / "incremental_merge_input.json",
+        {**merge_input, "input_fingerprint": input_fingerprint},
+    )
+    _write_frame(output_dir / "extracted.csv", merged)
+    _write_json(output_dir / "failure_summary.json", merged_summary)
+    delta_completion = json.loads(
+        (delta_dir / "complete.json").read_text(encoding="utf-8")
+    )
+    _write_json(
+        output_dir / "complete.json",
+        {
+            "status": "complete",
+            "schema_version": INCREMENTAL_REFINEMENT_EXTRACTION_SCHEMA_VERSION,
+            "input_fingerprint": input_fingerprint,
+            "completed_at": _now(),
+            "rows": len(merged),
+            "features": len(current),
+            "reextraction_scope": "changed_features_only",
+            "reextracted_features": len(changed_names),
+            "reextracted_feature_names": changed_names,
+            "reused_features": len(current) - len(changed_names),
+            "feature_batch_size": feature_batch_size,
+            "feature_batches_per_patient": int(
+                delta_completion.get("feature_batches_per_patient") or 0
+            ),
+            "batches": int(delta_completion.get("batches") or len(row_ids)),
+            "paged_rows": int(delta_completion.get("paged_rows") or 0),
+            "pages": int(delta_completion.get("pages") or 0),
+            "serial_patient_feature_passes": int(
+                delta_completion.get("serial_patient_feature_passes") or 0
+            ),
+            "feature_failure_patterns": len(
+                merged_summary["feature_failure_patterns"]
+            ),
+            "structural_failure_patients": merged_summary[
+                "structural_failure_patient_count"
+            ],
+            "delta_extraction_dir": str(delta_dir),
+        },
+    )
+    return merged, merged_summary
+
+
 def _extract_training_with_ontology_feedback(
     *,
     dataset: pd.DataFrame,
@@ -7312,33 +7652,85 @@ def _extract_training_with_ontology_feedback(
     context_window_tokens: int = DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS,
     max_output_tokens: int = DEFAULT_EXTRACTION_MAX_TOKENS,
     context_margin_tokens: int = DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS,
+    prior_extracted: pd.DataFrame | None = None,
+    prior_definitions: Sequence[Mapping[str, Any]] | None = None,
+    prior_failure_summary: Mapping[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], int]:
-    """Extract training rows and re-extract after repeated-failure ontology repairs."""
+    """Extract training rows and incrementally repair changed feature ontologies."""
+
+    supplied_prior = (
+        prior_extracted is not None,
+        prior_definitions is not None,
+        prior_failure_summary is not None,
+    )
+    if any(supplied_prior) and not all(supplied_prior):
+        raise ValueError(
+            "incremental refinement requires prior_extracted, prior_definitions, "
+            "and prior_failure_summary together"
+        )
 
     current = [dict(feature) for feature in definitions]
     extraction_dir = output_dir
     rounds: list[dict[str, Any]] = []
     stopped_reason = "maximum_refinement_rounds_reached"
     extracted: pd.DataFrame | None = None
+    summary: dict[str, Any] | None = None
+    source_extracted = prior_extracted
+    source_definitions = (
+        [dict(feature) for feature in prior_definitions]
+        if prior_definitions is not None
+        else None
+    )
+    source_summary = (
+        copy.deepcopy(dict(prior_failure_summary))
+        if prior_failure_summary is not None
+        else None
+    )
     for pass_index in range(0, int(max_refinement_rounds) + 1):
-        extracted = extract_rows(
-            dataset=dataset,
-            row_ids=row_ids,
-            text_column=text_column,
-            definitions=current,
-            output_dir=extraction_dir,
-            request_json=request_json,
-            workers=workers,
-            max_prompt_chars=max_prompt_chars,
-            feature_batch_size=feature_batch_size,
-            request_identity=request_identity,
-            tokenizer=tokenizer,
-            chunk_size_tokens=chunk_size_tokens,
-            context_window_tokens=context_window_tokens,
-            max_output_tokens=max_output_tokens,
-            context_margin_tokens=context_margin_tokens,
-        )
-        summary = json.loads((extraction_dir / "failure_summary.json").read_text(encoding="utf-8"))
+        if source_extracted is None:
+            extracted = extract_rows(
+                dataset=dataset,
+                row_ids=row_ids,
+                text_column=text_column,
+                definitions=current,
+                output_dir=extraction_dir,
+                request_json=request_json,
+                workers=workers,
+                max_prompt_chars=max_prompt_chars,
+                feature_batch_size=feature_batch_size,
+                request_identity=request_identity,
+                tokenizer=tokenizer,
+                chunk_size_tokens=chunk_size_tokens,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                context_margin_tokens=context_margin_tokens,
+            )
+            summary = json.loads(
+                (extraction_dir / "failure_summary.json").read_text(encoding="utf-8")
+            )
+        else:
+            if source_definitions is None or source_summary is None:  # pragma: no cover
+                raise RuntimeError("incremental refinement source state is incomplete")
+            extracted, summary = _extract_changed_features_and_merge(
+                dataset=dataset,
+                row_ids=row_ids,
+                text_column=text_column,
+                definitions=current,
+                prior_extracted=source_extracted,
+                prior_definitions=source_definitions,
+                prior_failure_summary=source_summary,
+                output_dir=extraction_dir,
+                request_json=request_json,
+                workers=workers,
+                max_prompt_chars=max_prompt_chars,
+                feature_batch_size=feature_batch_size,
+                request_identity=request_identity,
+                tokenizer=tokenizer,
+                chunk_size_tokens=chunk_size_tokens,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                context_margin_tokens=context_margin_tokens,
+            )
         repeated = _repeated_ontology_failure_patterns(
             summary,
             minimum_patients=minimum_failure_patients,
@@ -7369,10 +7761,13 @@ def _extract_training_with_ontology_feedback(
         if not changed:
             stopped_reason = "no_ontology_changes"
             break
+        source_extracted = extracted
+        source_definitions = current
+        source_summary = summary
         current = updated
         extraction_dir = round_dir / "extraction"
 
-    if extracted is None:  # pragma: no cover - loop always runs once
+    if extracted is None or summary is None:  # pragma: no cover - loop always runs once
         raise RuntimeError("ontology feedback loop did not perform extraction")
     feedback_dir.mkdir(parents=True, exist_ok=True)
     feedback_result = {
@@ -7385,10 +7780,7 @@ def _extract_training_with_ontology_feedback(
         "rounds": rounds,
         "definitions": current,
     }
-    final_failure_summary = json.loads(
-        (extraction_dir / "failure_summary.json").read_text(encoding="utf-8")
-    )
-    _write_json(feedback_dir / "final_failure_summary.json", final_failure_summary)
+    _write_json(feedback_dir / "final_failure_summary.json", summary)
     _write_json(feedback_dir / "result.json", feedback_result)
     _write_json(feedback_dir / "complete.json", {"status": "complete", **feedback_result})
     return extracted, current, len(rounds)
@@ -8205,14 +8597,16 @@ def run_fold_analysis(
     review_converged = False
     review_history: list[dict[str, Any]] = []
     final_fit_all: pd.DataFrame | None = None
+    final_fit_raw: pd.DataFrame | None = None
     final_fit_definitions: list[dict[str, Any]] | None = None
+    final_fit_failure_summary: dict[str, Any] | None = None
     maximum_review_rounds = int(getattr(config, "max_review_rounds", 1))
 
     for round_index in range(1, maximum_review_rounds + 1):
         review_rounds = round_index
         round_dir = output_dir / "ontology_supervision" / f"round_{round_index:03d}"
         _write_json(round_dir / "definitions_before_extraction.json", {"features": current})
-        extracted, extracted_definitions, feedback_rounds = (
+        raw_extracted, extracted_definitions, feedback_rounds = (
             _extract_training_with_ontology_feedback(
                 dataset=dataset,
                 row_ids=fit_ids,
@@ -8228,6 +8622,9 @@ def run_fold_analysis(
                 max_refinement_rounds=max_ontology_refinement_rounds,
                 request_identity=extraction_identity,
                 tokenizer=extraction_tokenizer,
+                prior_extracted=final_fit_raw,
+                prior_definitions=final_fit_definitions,
+                prior_failure_summary=final_fit_failure_summary,
                 **serial_extraction,
             )
         )
@@ -8236,14 +8633,6 @@ def run_fold_analysis(
             _normalized_feature_modeling_definition(feature)
             for feature in extracted_definitions
         ]
-        extracted, extracted_definitions, harmonization = _harmonize_training_extraction(
-            extracted=extracted,
-            definitions=extracted_definitions,
-            output_dir=round_dir / "harmonization",
-            request_json=request_json,
-            max_prompt_chars=int(config.max_prompt_chars),
-        )
-        summaries = feature_summaries(extracted, extracted_definitions)
         failure_summary = json.loads(
             (
                 round_dir
@@ -8251,6 +8640,14 @@ def run_fold_analysis(
                 / "final_failure_summary.json"
             ).read_text(encoding="utf-8")
         )
+        extracted, extracted_definitions, harmonization = _harmonize_training_extraction(
+            extracted=raw_extracted,
+            definitions=extracted_definitions,
+            output_dir=round_dir / "harmonization",
+            request_json=request_json,
+            max_prompt_chars=int(config.max_prompt_chars),
+        )
+        summaries = feature_summaries(extracted, extracted_definitions)
         _write_json(round_dir / "aggregate_extraction_summary.json", summaries)
         reviewed, changed, review_report = _request_aggregate_ontology_supervisor(
             definitions=extracted_definitions,
@@ -8262,7 +8659,9 @@ def run_fold_analysis(
             request_identity=primary_identity,
         )
         final_fit_all = extracted
+        final_fit_raw = raw_extracted
         final_fit_definitions = extracted_definitions
+        final_fit_failure_summary = failure_summary
         current = [
             _normalized_feature_modeling_definition(feature) for feature in reviewed
         ]
@@ -8290,13 +8689,18 @@ def run_fold_analysis(
             review_converged = True
             break
 
-    if final_fit_all is None or final_fit_definitions is None:
+    if (
+        final_fit_all is None
+        or final_fit_raw is None
+        or final_fit_definitions is None
+        or final_fit_failure_summary is None
+    ):
         raise RuntimeError("Stage 2 ontology supervision did not perform extraction")
 
     # A revision in the last allowed supervisor round has not yet been applied
-    # to patient text. Re-extract all candidates before any statistical test.
+    # to patient text. Re-extract only changed candidates before statistical tests.
     if _value_fingerprint(final_fit_definitions) != _value_fingerprint(current):
-        final_fit_all, current, feedback_rounds = _extract_training_with_ontology_feedback(
+        final_fit_raw, current, feedback_rounds = _extract_training_with_ontology_feedback(
             dataset=dataset,
             row_ids=fit_ids,
             text_column=text_column,
@@ -8311,11 +8715,14 @@ def run_fold_analysis(
             max_refinement_rounds=max_ontology_refinement_rounds,
             request_identity=extraction_identity,
             tokenizer=extraction_tokenizer,
+            prior_extracted=final_fit_raw,
+            prior_definitions=final_fit_definitions,
+            prior_failure_summary=final_fit_failure_summary,
             **serial_extraction,
         )
         ontology_refinement_rounds += feedback_rounds
         final_fit_all, current, _ = _harmonize_training_extraction(
-            extracted=final_fit_all,
+            extracted=final_fit_raw,
             definitions=current,
             output_dir=output_dir / "extraction" / "all_candidates_fit_harmonization",
             request_json=request_json,

@@ -8913,6 +8913,20 @@ def test_aggregate_supervisor_can_revise_then_reextract_a_definition(
         / "supervisor"
         / "complete.json"
     ).is_file()
+    round_two_extraction = json.loads(
+        (
+            tmp_path
+            / "outer_001"
+            / "ontology_supervision"
+            / "round_002"
+            / "extraction"
+            / "complete.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert round_two_extraction["reextraction_scope"] == "changed_features_only"
+    assert round_two_extraction["reextracted_feature_names"] == [
+        "performance_status"
+    ]
 
 
 def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
@@ -9098,6 +9112,225 @@ def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
         ).read_text(encoding="utf-8")
     )
     assert supervisor_input["feature"]["categories_or_unit"] == ["stage_iii", "stage_iv"]
+
+
+def test_failure_refinement_reextracts_only_changed_features_and_resumes(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                f"Pretreatment stage {'III' if index % 2 == 0 else 'IV'}; marker present."
+                for index in range(4)
+            ]
+        }
+    )
+    definitions = [
+        {
+            "feature_id": "outer_001_feature_001",
+            "name": "disease_stage",
+            "description": "Pretreatment overall disease stage.",
+            "value_type": "ordinal",
+            "categories_or_unit": ["stage_i", "stage_ii"],
+            "measurement_definition": "Extract the documented pretreatment stage.",
+            "missing_value_rule": "Use null when the stage is undocumented.",
+        },
+        {
+            "feature_id": "outer_001_feature_002",
+            "name": "stable_marker",
+            "description": "Pretreatment marker status.",
+            "value_type": "binary",
+            "categories_or_unit": ["absent", "present"],
+            "measurement_definition": "Extract the documented pretreatment marker.",
+            "missing_value_rule": "Use null when the marker is undocumented.",
+        },
+    ]
+    extraction_feature_sets = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        body = json.loads(messages[1]["content"])
+        if body["job"] == "extract_stage2_patient_variables":
+            assert request_kind == "extraction"
+            feature_names = [feature["name"] for feature in body["features"]]
+            extraction_feature_sets.append(feature_names)
+            categories_by_name = {
+                feature["name"]: feature["categories_or_unit"]
+                for feature in body["features"]
+            }
+            rows = []
+            for patient in body["patients"]:
+                values = {}
+                if "disease_stage" in feature_names:
+                    raw = "stage_iii" if "stage III" in patient["text"] else "stage_iv"
+                    values["disease_stage"] = (
+                        raw
+                        if raw in categories_by_name["disease_stage"]
+                        else raw.replace("stage_", "TNM stage ").upper()
+                    )
+                if "stable_marker" in feature_names:
+                    values["stable_marker"] = "present"
+                rows.append({"row_id": patient["row_id"], "values": values})
+            return validate({"rows": rows})
+        if body["job"] == "map_extracted_values_to_declared_category_ontology":
+            return validate(
+                {
+                    "corrections": [
+                        {"mapping_id": item["mapping_id"], "value": None}
+                        for item in body["items"]
+                    ]
+                }
+            )
+        assert body["job"] == (
+            "refine_stage2_feature_ontology_from_repeated_extraction_failures"
+        )
+        assert body["feature"]["name"] == "disease_stage"
+        return validate(
+            {
+                "action": "revise",
+                "reason": "Add the observed pretreatment stage groups.",
+                "description": "Pretreatment overall disease stage group.",
+                "value_type": "ordinal",
+                "categories_or_unit": ["stage_iii", "stage_iv"],
+                "measurement_definition": (
+                    "Extract the documented pretreatment overall stage group."
+                ),
+                "missing_value_rule": "Use null when the stage group is undocumented.",
+            }
+        )
+
+    output_dir = tmp_path / "initial"
+    feedback_dir = tmp_path / "refinement"
+    extracted, refined, rounds = stage2_analysis._extract_training_with_ontology_feedback(
+        dataset=dataset,
+        row_ids=list(range(4)),
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=output_dir,
+        feedback_dir=feedback_dir,
+        request_json=request_json,
+        workers=2,
+        max_prompt_chars=20_000,
+        feature_batch_size=10,
+        minimum_failure_patients=3,
+        max_refinement_rounds=2,
+        request_identity={"model": "small-test-model"},
+        tokenizer=_CharacterChatTokenizer(),
+    )
+
+    assert rounds == 1
+    assert [feature["name"] for feature in refined] == [
+        "disease_stage",
+        "stable_marker",
+    ]
+    assert extracted["disease_stage"].isin(["stage_iii", "stage_iv"]).all()
+    assert extracted["stable_marker"].eq("present").all()
+    assert extraction_feature_sets[:4] == [
+        ["disease_stage", "stable_marker"]
+    ] * 4
+    assert extraction_feature_sets[4:] == [["disease_stage"]] * 4
+
+    delta_root = feedback_dir / "round_001" / "extraction"
+    completion = json.loads((delta_root / "complete.json").read_text(encoding="utf-8"))
+    assert completion["reextraction_scope"] == "changed_features_only"
+    assert completion["reextracted_feature_names"] == ["disease_stage"]
+    assert completion["reused_features"] == 1
+    assert (
+        delta_root / "changed_features" / "batches" / "batch_00001" / "complete.json"
+    ).is_file()
+    merged = pd.read_csv(delta_root / "extracted.csv")
+    assert list(merged.columns) == ["_oci_row_id", "disease_stage", "stable_marker"]
+    final_summary = json.loads(
+        (feedback_dir / "final_failure_summary.json").read_text(encoding="utf-8")
+    )
+    assert final_summary["feature_failure_patterns"] == []
+
+    def unexpected_request(_messages, _validate, *, request_kind="interpretation"):
+        raise AssertionError(f"completed delta checkpoint should resume ({request_kind})")
+
+    resumed, resumed_definitions, resumed_rounds = (
+        stage2_analysis._extract_training_with_ontology_feedback(
+            dataset=dataset,
+            row_ids=list(range(4)),
+            text_column="clinical_text",
+            definitions=definitions,
+            output_dir=output_dir,
+            feedback_dir=feedback_dir,
+            request_json=unexpected_request,
+            workers=2,
+            max_prompt_chars=20_000,
+            feature_batch_size=10,
+            minimum_failure_patients=3,
+            max_refinement_rounds=2,
+            request_identity={"model": "small-test-model"},
+            tokenizer=_CharacterChatTokenizer(),
+        )
+    )
+    pd.testing.assert_frame_equal(resumed, extracted)
+    assert resumed_definitions == refined
+    assert resumed_rounds == 1
+
+
+def test_incremental_failure_summary_replaces_only_changed_feature_patterns():
+    prior = {
+        "issue_files": 8,
+        "feature_failure_patterns": [
+            {
+                "feature_name": "changed_feature",
+                "failure_kind": "out_of_ontology_category",
+                "reason": "old changed failure",
+                "patient_count": 4,
+                "patient_row_ids": [0, 1, 2, 3],
+            },
+            {
+                "feature_name": "reused_feature",
+                "failure_kind": "invalid_scalar_or_value_type",
+                "reason": "retained reused failure",
+                "patient_count": 3,
+                "patient_row_ids": [1, 2, 3],
+            },
+            {
+                "feature_name": "dropped_feature",
+                "failure_kind": "out_of_ontology_category",
+                "reason": "must be dropped",
+                "patient_count": 5,
+                "patient_row_ids": [0, 1, 2, 3, 4],
+            },
+        ],
+        "structural_failure_patient_row_ids": [1, 4],
+    }
+    delta = {
+        "issue_files": 2,
+        "feature_failure_patterns": [
+            {
+                "feature_name": "changed_feature",
+                "failure_kind": "out_of_ontology_category",
+                "reason": "new changed failure",
+                "patient_count": 1,
+                "patient_row_ids": [5],
+            }
+        ],
+        "structural_failure_patient_row_ids": [4, 5],
+    }
+
+    merged = stage2_analysis._merge_incremental_failure_summaries(
+        prior_summary=prior,
+        delta_summary=delta,
+        current_feature_names=["changed_feature", "reused_feature"],
+        changed_feature_names=["changed_feature"],
+    )
+
+    assert merged["issue_files"] == 10
+    assert [row["reason"] for row in merged["feature_failure_patterns"]] == [
+        "retained reused failure",
+        "new changed failure",
+    ]
+    assert merged["structural_failure_patient_row_ids"] == [1, 4, 5]
+    assert merged["incremental_refinement"]["reextracted_feature_names"] == [
+        "changed_feature"
+    ]
+    assert merged["incremental_refinement"]["reused_feature_names"] == [
+        "reused_feature"
+    ]
 
 
 def test_failure_driven_ontology_refinement_never_rewrites_explicit_feature(

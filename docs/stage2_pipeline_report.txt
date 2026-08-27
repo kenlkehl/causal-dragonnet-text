@@ -803,12 +803,14 @@ a variable can be overridden when the variable has protected stable support.
 Ordinary roles without stable positive evidence can be removed. Effect
 modifiers follow the conservative negative-evidence rule described above.
 
-Any change to a definition, representation, role, or retained set triggers
-another training extraction and evaluation as needed. A fold is marked
-converged only when definitions are unchanged and stability selection is
-complete. If the ten-round limit is reached first, the fold is flagged as
-non-converged and proceeds with its latest retained definitions rather than
-hiding the condition.
+A change to a prompt-facing extraction definition triggers training
+re-extraction only for the changed or newly added features. Stage 2 merges those
+columns into the cached raw training matrix and drops removed features;
+unchanged columns are reused. Role-only and downstream representation changes
+are recomputed without another extractor call. A fold is marked converged only
+when definitions are unchanged and stability selection is complete. If the
+ten-round limit is reached first, the fold is flagged as non-converged and
+proceeds with its latest retained definitions rather than hiding the condition.
 
 
 STEP 16: FREEZE THE FEATURE SET
@@ -816,8 +818,10 @@ STEP 16: FREEZE THE FEATURE SET
 
 When review ends, Stage 2 writes final_definitions.json. If the last evaluation
 used exactly those definitions, its training extraction can be reused. If the
-final review changed the set or representation, Stage 2 re-extracts the outer
-training patients so that the final table exactly matches the final rules.
+final review changed any prompt-facing extraction definitions, Stage 2
+re-extracts only those changed or newly added features for the outer-training
+patients and merges them with unchanged cached columns so that the final table
+exactly matches the final rules.
 
 Before continuing, it checks extraction health. The final definitions,
 harmonization plans, causal roles, and missing-value behavior are now fixed for

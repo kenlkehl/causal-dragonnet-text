@@ -1019,6 +1019,12 @@ feature. Any revision triggers small-model re-extraction. This bounded
 supervision runs for at most `max_review_rounds` (two by default), and explicit
 investigator ontologies are locked.
 
+Re-extraction is incremental: only candidates whose prompt-facing extraction
+definition changed are sent back through the small model. Their columns are
+merged into the cached raw training matrix, while unchanged candidate columns
+are reused. Prompts still contain exactly one patient; feature batching within
+that patient is unchanged.
+
 Feature selection is deliberately simple and auditable. Within each inner-fold
 training partition, Stage 2 fits one candidate-at-a-time regressions for
 treatment and outcome and records raw omnibus p-values plus separate rankings.
@@ -1063,6 +1069,12 @@ type, categories or unit, measurement rule, and missingness rule. Malformed JSON
 or response-envelope failures are reported separately and never treated as
 ontology evidence. Explicit investigator-supplied ontologies remain immutable
 and are only audited when they repeatedly fail.
+
+Each refinement pass re-extracts only the features whose extraction definitions
+changed, then merges those refreshed columns with the unchanged cached columns.
+Failure summaries are merged on the same boundary: refreshed features replace
+their old patterns, while unchanged-feature and structural failures remain
+available to later supervision.
 
 Only after supervision and inner-fold selection end are the retained definitions
 applied to outer-held-out records. The final heterogeneous-effect model is an
