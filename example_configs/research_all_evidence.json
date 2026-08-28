@@ -25,7 +25,6 @@
     "model": "",
     "api_key": "EMPTY",
     "workers": 32,
-    "selection_workers": 32,
     "extraction_llm": {
       "endpoint": "http://127.0.0.1:8020/v1",
       "model": "",
@@ -51,10 +50,21 @@
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
-    "confounder_p_value_threshold": 0.05,
-    "confounder_min_inner_fold_fraction": 0.75,
-    "effect_modifier_p_value_threshold": 0.05,
-    "effect_modifier_min_inner_fold_fraction": 0.75,
+    "input_temporal_scope": "pre_index_treatment",
+    "agentic_evidence_pair_chunk_size": 512,
+    "agentic_selection": {
+      "minimum_pairwise_complete_rows": 10,
+      "categorical_rare_level_min_count": 5,
+      "missingness_weight": 0.15,
+      "cluster_similarity_threshold": 0.6,
+      "cluster_consensus_fraction": 0.6,
+      "cluster_max_size": 12,
+      "max_latents_per_cluster": 2,
+      "latent_min_coverage": 0.05,
+      "cluster_tool_call_limit": 8,
+      "adjudicator_tool_call_limit": 10,
+      "row_query_page_size": 200
+    },
     "estimation_trees": 200,
     "propensity_clip": 0.02,
     "explicit_features": []

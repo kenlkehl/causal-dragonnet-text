@@ -3,7 +3,7 @@
 This module intentionally treats a directory as the checkpoint.  It reads the
 ordinary JSONL handoff, defines and extracts patient-level variables, reviews
 small-model extraction aggregates with a separate primary model, selects roles
-with fold-local statistical screens, and produces causal-forest estimates.  It
+from fold-local evidence with bounded agents, and produces causal-forest estimates.  It
 has no bundle format, artifact authentication, immutable
 request, content hashes, or checkpoint adoption.
 """
@@ -21,7 +21,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
+from joblib.externals.loky import ProcessPoolExecutor
 
 from .plain_handoff_stage2_evidence import (
     EVIDENCE_COMPILER_VERSION,
@@ -42,6 +43,13 @@ from .plain_handoff_stage2_analysis import (
     infrastructure_failure_audit_paths,
     prompt_token_count,
     run_fold_analysis,
+)
+from .stage2_agentic_selection import (
+    DEFAULT_PAIRWISE_CHUNK_SIZE,
+    SCHEMA_VERSION as STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+    TEMPORAL_SCOPE,
+    Stage2AgenticSelectionConfig,
+    agentic_selection_config_from_mapping,
 )
 from .vllm_server_pool import (
     ManagedVLLMConfig,
@@ -101,11 +109,6 @@ DEFAULT_CONSOLIDATION_MAX_ROUNDS = (
 )
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
-DEFAULT_CONFOUNDER_P_VALUE_THRESHOLD = 0.05
-DEFAULT_CONFOUNDER_MIN_INNER_FOLD_FRACTION = 0.75
-DEFAULT_EFFECT_MODIFIER_P_VALUE_THRESHOLD = 0.05
-DEFAULT_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION = 0.75
-DEFAULT_SELECTION_WORKERS = 4
 DEFAULT_EXTRACTION_VLLM_BASE_PORT = 8110
 DEFAULT_EXTRACTION_VLLM_INTERNAL_PORT_BASE = 40_000
 MODEL_IDENTITY_SCHEMA_VERSION = "stage2_endpoint_model_identity_v1"
@@ -806,22 +809,21 @@ class PlainHandoffStage2Config:
     evidence_max_exemplars_per_card: int = 4
     evidence_max_exemplar_chars: int = 2_400
     workers: int = 4
-    # Process workers used only by the fold-local statistical screens.
-    selection_workers: int = DEFAULT_SELECTION_WORKERS
     extraction_llm: Stage2ExtractionLLMConfig | None = None
     # Limits aggregate ontology-supervisor reviews. These reviews cannot add,
     # drop, rename, or assign roles to candidate features.
     max_review_rounds: int = 2
     ontology_refinement_min_failure_patients: int = DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS
     max_ontology_refinement_rounds: int = DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS
-    confounder_p_value_threshold: float = DEFAULT_CONFOUNDER_P_VALUE_THRESHOLD
-    confounder_min_inner_fold_fraction: float = (
-        DEFAULT_CONFOUNDER_MIN_INNER_FOLD_FRACTION
+    # This is a hard upstream invariant. Historical treatments remain valid;
+    # Stage 2 never guesses timepoints from feature semantics.
+    input_temporal_scope: str = TEMPORAL_SCOPE
+    agentic_selection: Stage2AgenticSelectionConfig = field(
+        default_factory=Stage2AgenticSelectionConfig
     )
-    effect_modifier_p_value_threshold: float = DEFAULT_EFFECT_MODIFIER_P_VALUE_THRESHOLD
-    effect_modifier_min_inner_fold_fraction: float = (
-        DEFAULT_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION
-    )
+    # Operational tuning only: deterministic pair chunks are checkpointed and
+    # produce identical evidence regardless of this size.
+    agentic_evidence_pair_chunk_size: int = DEFAULT_PAIRWISE_CHUNK_SIZE
     estimation_trees: int = 200
     propensity_clip: float = 0.02
     min_nonmissing_fraction: float = 0.05
@@ -1027,12 +1029,6 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.evidence_max_exemplar_chars must be at least 256")
         if self.workers < 1:
             raise ValueError("stage2.workers must be positive")
-        if (
-            isinstance(self.selection_workers, bool)
-            or not isinstance(self.selection_workers, int)
-            or self.selection_workers < 1
-        ):
-            raise ValueError("stage2.selection_workers must be a positive integer")
         if self.extraction_llm is not None:
             if not isinstance(self.extraction_llm, Stage2ExtractionLLMConfig):
                 raise ValueError(
@@ -1045,34 +1041,24 @@ class PlainHandoffStage2Config:
             raise ValueError("stage2.ontology_refinement_min_failure_patients must be at least 2")
         if self.max_ontology_refinement_rounds < 0:
             raise ValueError("stage2.max_ontology_refinement_rounds must be nonnegative")
-        for field_name, value in (
-            ("confounder_p_value_threshold", self.confounder_p_value_threshold),
-            ("effect_modifier_p_value_threshold", self.effect_modifier_p_value_threshold),
+        if self.input_temporal_scope != TEMPORAL_SCOPE:
+            raise ValueError(
+                f"stage2.input_temporal_scope must be {TEMPORAL_SCOPE!r}; Stage 2 "
+                "does not perform semantic temporal filtering"
+            )
+        if not isinstance(self.agentic_selection, Stage2AgenticSelectionConfig):
+            raise ValueError(
+                "stage2.agentic_selection must be a Stage2AgenticSelectionConfig object"
+            )
+        self.agentic_selection.validate()
+        if (
+            isinstance(self.agentic_evidence_pair_chunk_size, bool)
+            or not isinstance(self.agentic_evidence_pair_chunk_size, int)
+            or self.agentic_evidence_pair_chunk_size < 1
         ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or not 0.0 < float(value) < 1.0
-            ):
-                raise ValueError(f"stage2.{field_name} must be strictly between 0 and 1")
-        for field_name, value in (
-            (
-                "confounder_min_inner_fold_fraction",
-                self.confounder_min_inner_fold_fraction,
-            ),
-            (
-                "effect_modifier_min_inner_fold_fraction",
-                self.effect_modifier_min_inner_fold_fraction,
-            ),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or not 0.0 < float(value) <= 1.0
-            ):
-                raise ValueError(f"stage2.{field_name} must be in (0, 1]")
+            raise ValueError(
+                "stage2.agentic_evidence_pair_chunk_size must be a positive integer"
+            )
         if self.estimation_trees < 10:
             raise ValueError("stage2.estimation_trees must be at least 10")
         if not 0.0 < self.propensity_clip < 0.5:
@@ -1118,6 +1104,7 @@ class PlainHandoffStage2Config:
         values["explicit_features"] = [
             feature.as_definition() for feature in self.explicit_features
         ]
+        values["agentic_selection"] = self.agentic_selection.public_dict()
         return values
 
 
@@ -1126,6 +1113,23 @@ def plain_stage2_config_from_mapping(
     *,
     default_workers: int,
 ) -> PlainHandoffStage2Config | None:
+    removed_screen_keys = sorted(
+        set(raw).intersection(
+            {
+                "selection_workers",
+                "confounder_p_value_threshold",
+                "confounder_min_inner_fold_fraction",
+                "effect_modifier_p_value_threshold",
+                "effect_modifier_min_inner_fold_fraction",
+            }
+        )
+    )
+    if removed_screen_keys:
+        raise ValueError(
+            "the Stage 2 p-value vote screen was removed; delete these settings and "
+            "configure stage2.agentic_selection instead: "
+            + ", ".join(f"stage2.{key}" for key in removed_screen_keys)
+        )
     if raw.get("command"):
         raise ValueError(
             "stage2.command is not used by the plain workflow; configure stage2.endpoint"
@@ -1257,6 +1261,14 @@ def plain_stage2_config_from_mapping(
         1,
         int(raw.get("workers", min(4, max(1, default_workers)))),
     )
+    raw_pair_chunk_size = raw.get(
+        "agentic_evidence_pair_chunk_size",
+        DEFAULT_PAIRWISE_CHUNK_SIZE,
+    )
+    if isinstance(raw_pair_chunk_size, bool):
+        raise ValueError(
+            "stage2.agentic_evidence_pair_chunk_size must be a positive integer"
+        )
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
         model=model,
@@ -1352,10 +1364,6 @@ def plain_stage2_config_from_mapping(
         evidence_max_exemplars_per_card=int(raw.get("evidence_max_exemplars_per_card", 4)),
         evidence_max_exemplar_chars=int(raw.get("evidence_max_exemplar_chars", 2_400)),
         workers=configured_workers,
-        selection_workers=max(
-            1,
-            int(raw.get("selection_workers", configured_workers)),
-        ),
         extraction_llm=extraction_llm,
         max_review_rounds=int(raw.get("max_review_rounds", 2)),
         ontology_refinement_min_failure_patients=int(
@@ -1370,30 +1378,13 @@ def plain_stage2_config_from_mapping(
                 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS,
             )
         ),
-        confounder_p_value_threshold=float(
-            raw.get(
-                "confounder_p_value_threshold",
-                DEFAULT_CONFOUNDER_P_VALUE_THRESHOLD,
-            )
+        input_temporal_scope=str(
+            raw.get("input_temporal_scope", TEMPORAL_SCOPE)
+        ).strip(),
+        agentic_selection=agentic_selection_config_from_mapping(
+            raw.get("agentic_selection")
         ),
-        confounder_min_inner_fold_fraction=float(
-            raw.get(
-                "confounder_min_inner_fold_fraction",
-                DEFAULT_CONFOUNDER_MIN_INNER_FOLD_FRACTION,
-            )
-        ),
-        effect_modifier_p_value_threshold=float(
-            raw.get(
-                "effect_modifier_p_value_threshold",
-                DEFAULT_EFFECT_MODIFIER_P_VALUE_THRESHOLD,
-            )
-        ),
-        effect_modifier_min_inner_fold_fraction=float(
-            raw.get(
-                "effect_modifier_min_inner_fold_fraction",
-                DEFAULT_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION,
-            )
-        ),
+        agentic_evidence_pair_chunk_size=int(raw_pair_chunk_size),
         estimation_trees=int(raw.get("estimation_trees", 200)),
         propensity_clip=float(raw.get("propensity_clip", 0.02)),
         min_nonmissing_fraction=float(raw.get("min_nonmissing_fraction", 0.05)),
@@ -7414,6 +7405,8 @@ class PlainHandoffStage2:
         outcome_type: str = "binary",
         inner_folds: int = 5,
         seed: int = 42,
+        agentic_evidence_workers: int = 1,
+        agentic_evidence_executor: ProcessPoolExecutor | None = None,
     ) -> Mapping[str, Any]:
         discovery_packets = list(packets)
         complete_path = output_dir / "complete.json"
@@ -7476,6 +7469,72 @@ class PlainHandoffStage2:
                     "evidence plan, feature-definition policy, or explicit-feature "
                     "configuration. Preserve it for audit and use a fresh Stage 2 output "
                     "directory before rerunning."
+                )
+            legacy_selection_path = output_dir / "selection" / "statistical_selection.json"
+            if legacy_selection_path.is_file():
+                raise RuntimeError(
+                    f"Stage 2 outer fold {outer_fold} was completed with the retired "
+                    "p-value selector. Preserve its results and rerun the workflow with "
+                    "--stage2-only --stage2-reselect to reuse interpretation and "
+                    "outer-training extraction."
+                )
+            try:
+                completed_selection = json.loads(
+                    (output_dir / "selection" / "complete.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                completed_selection_input = json.loads(
+                    (output_dir / "selection" / "input.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Stage 2 outer fold {outer_fold} has no compatible completed "
+                    "agentic-selection checkpoint; use --stage2-reselect"
+                ) from exc
+            if (
+                completed_selection.get("schema_version")
+                != STAGE2_ROLE_SELECTION_SCHEMA_VERSION
+            ):
+                raise RuntimeError(
+                    f"Stage 2 outer fold {outer_fold} has an incompatible role-selection "
+                    "schema; use --stage2-reselect"
+                )
+            stored_selection_value = {
+                str(key): value
+                for key, value in completed_selection_input.items()
+                if key != "input_fingerprint"
+            }
+            stored_selection_fingerprint = _value_fingerprint(stored_selection_value)
+            selection_policy_mismatches = []
+            if (
+                completed_selection.get("input_fingerprint")
+                != stored_selection_fingerprint
+                or completed_selection_input.get("input_fingerprint")
+                != stored_selection_fingerprint
+            ):
+                selection_policy_mismatches.append("checkpoint_fingerprint")
+            expected_selection_policy = {
+                "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+                "temporal_scope": self.config.input_temporal_scope,
+                "stage1_packets_fingerprint": _value_fingerprint(discovery_packets),
+                "outcome_type": outcome_type,
+                "agentic_selection_policy": (
+                    self.config.agentic_selection.public_dict()
+                ),
+            }
+            selection_policy_mismatches.extend(
+                key
+                for key, expected in expected_selection_policy.items()
+                if completed_selection_input.get(key) != expected
+            )
+            if selection_policy_mismatches:
+                raise RuntimeError(
+                    f"Stage 2 outer fold {outer_fold} was completed under a different "
+                    "role-selection policy or input; rerun with --stage2-reselect "
+                    f"({sorted(set(selection_policy_mismatches))})"
                 )
             LOGGER.info("skip completed Stage 2 outer fold=%s", outer_fold)
             final = json.loads(final_features_path.read_text(encoding="utf-8"))
@@ -7793,6 +7852,9 @@ class PlainHandoffStage2:
             request_json=request_analysis_json,
             config=self.config,
             extraction_tokenizer=self.extraction_tokenizer,
+            stage1_packets=discovery_packets,
+            agentic_evidence_workers=agentic_evidence_workers,
+            agentic_evidence_executor=agentic_evidence_executor,
         )
         completed = {
             "outer_fold": outer_fold,
@@ -7900,39 +7962,64 @@ class PlainHandoffStage2:
         fold_results_by_id: dict[int, Mapping[str, Any]] = {}
         if outer_fold_ids:
             fold_workers = min(len(outer_fold_ids), self.config.workers)
+            evidence_executor: ProcessPoolExecutor | None = None
+            if self.config.workers > 1:
+                evidence_executor = ProcessPoolExecutor(
+                    max_workers=self.config.workers,
+                    timeout=300,
+                    env={
+                        "OMP_NUM_THREADS": "1",
+                        "OPENBLAS_NUM_THREADS": "1",
+                        "MKL_NUM_THREADS": "1",
+                        "NUMEXPR_NUM_THREADS": "1",
+                    },
+                )
             LOGGER.info(
                 "Stage 2 outer-fold execution folds=%s fold_workers=%s "
-                "global_request_workers=%s",
+                "global_request_workers=%s evidence_backend=%s "
+                "global_evidence_workers=%s",
                 len(outer_fold_ids),
                 fold_workers,
                 self.config.workers,
+                "loky" if evidence_executor is not None else "sequential",
+                self.config.workers if evidence_executor is not None else 1,
             )
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=fold_workers,
-                thread_name_prefix="stage2-outer-fold",
-            ) as executor:
-                futures = {
-                    executor.submit(
-                        self._run_outer_fold,
-                        outer_fold=outer_fold,
-                        packets=packets_by_outer[outer_fold],
-                        output_dir=output_dir / f"outer_{outer_fold:03d}",
-                        dataset=dataset,
-                        split=splits.get(outer_fold),
-                        unit_id_column=unit_id_column,
-                        text_column=text_column,
-                        treatment_column=treatment_column,
-                        outcome_column=outcome_column,
-                        outcome_type=outcome_type,
-                        inner_folds=inner_folds,
-                        seed=seed,
-                    ): outer_fold
-                    for outer_fold in outer_fold_ids
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    outer_fold = futures[future]
-                    fold_results_by_id[outer_fold] = future.result()
-                    LOGGER.info("Stage 2 completed outer_fold=%s", outer_fold)
+            try:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=fold_workers,
+                    thread_name_prefix="stage2-outer-fold",
+                ) as outer_executor:
+                    futures = {
+                        outer_executor.submit(
+                            self._run_outer_fold,
+                            outer_fold=outer_fold,
+                            packets=packets_by_outer[outer_fold],
+                            output_dir=output_dir / f"outer_{outer_fold:03d}",
+                            dataset=dataset,
+                            split=splits.get(outer_fold),
+                            unit_id_column=unit_id_column,
+                            text_column=text_column,
+                            treatment_column=treatment_column,
+                            outcome_column=outcome_column,
+                            outcome_type=outcome_type,
+                            inner_folds=inner_folds,
+                            seed=seed,
+                            agentic_evidence_workers=self.config.workers,
+                            agentic_evidence_executor=evidence_executor,
+                        ): outer_fold
+                        for outer_fold in outer_fold_ids
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        outer_fold = futures[future]
+                        fold_results_by_id[outer_fold] = future.result()
+                        LOGGER.info("Stage 2 completed outer_fold=%s", outer_fold)
+            except BaseException:
+                if evidence_executor is not None:
+                    evidence_executor.shutdown(wait=True, kill_workers=True)
+                raise
+            else:
+                if evidence_executor is not None:
+                    evidence_executor.shutdown(wait=True)
         fold_results = [fold_results_by_id[outer_fold] for outer_fold in outer_fold_ids]
         _write_jsonl(output_dir / "features_by_outer_fold.jsonl", fold_results)
         name_counts: Counter[str] = Counter()

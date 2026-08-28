@@ -25,9 +25,16 @@ from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
+from joblib.externals.loky import ProcessPoolExecutor
 
 from ..models.causal_forest_head import CausalForestHead
-from .stage2_statistical_selection import select_stage2_features
+from .stage2_agentic_selection import (
+    DEFAULT_PAIRWISE_CHUNK_SIZE,
+    SCHEMA_VERSION as AGENTIC_SELECTION_SCHEMA_VERSION,
+    TEMPORAL_SCOPE,
+    materialize_selected_latents,
+    select_stage2_features_agentically,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -51,7 +58,15 @@ REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_ontology_supervisor_convergence_v1"
 ESTIMATION_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_outer_estimation_v5_outcome_typed_causal_forest"
 )
-STATISTICAL_SELECTION_SCHEMA_VERSION = "stage2_inner_fold_univariate_selection_v2_loky_omnibus"
+STAGE2_ROLE_SELECTION_SCHEMA_VERSION = AGENTIC_SELECTION_SCHEMA_VERSION
+PRESELECTION_SNAPSHOT_SCHEMA_VERSION = "stage2_frozen_preselection_snapshot_v1"
+HELDOUT_MEASUREMENT_CACHE_SCHEMA_VERSION = (
+    "stage2_frozen_heldout_measurement_cache_v1"
+)
+HELDOUT_MEASUREMENT_REUSE_SCHEMA_VERSION = (
+    "stage2_heldout_measurement_reuse_v1"
+)
+STAGE2_RESELECTION_MIGRATION_SCHEMA_VERSION = "stage2_reselection_migration_v1"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
 PENDING_CATEGORY_ONTOLOGY_SCHEMA_VERSION = "stage2_pending_category_ontology_v1"
 ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = (
@@ -364,6 +379,247 @@ def _frame_fingerprint(frame: pd.DataFrame) -> str:
     return digest.hexdigest()
 
 
+def frozen_preselection_review_policy(config: Any) -> dict[str, Any]:
+    """Return the ontology-review policy that produced a reusable fit matrix."""
+
+    minimum_failure_patients, maximum_refinement_rounds = (
+        _ontology_refinement_limits(config)
+    )
+    return {
+        "review_schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+        "review_convergence_schema_version": REVIEW_CONVERGENCE_SCHEMA_VERSION,
+        "ontology_refinement_schema_version": (
+            ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION
+        ),
+        "harmonization_schema_version": HARMONIZATION_CHECKPOINT_SCHEMA_VERSION,
+        "max_review_rounds": int(getattr(config, "max_review_rounds", 1)),
+        "ontology_refinement_min_failure_patients": int(
+            minimum_failure_patients
+        ),
+        "max_ontology_refinement_rounds": int(maximum_refinement_rounds),
+    }
+
+
+def _load_frozen_preselection_snapshot(
+    *,
+    output_dir: Path,
+    dataset: pd.DataFrame,
+    definitions: Sequence[Mapping[str, Any]],
+    fit_ids: Sequence[int],
+    heldout_ids: Sequence[int],
+    inner_splits: Sequence[Mapping[str, Any]],
+    unit_id_column: str,
+    text_column: str,
+    treatment_column: str,
+    outcome_column: str,
+    outcome_type: str,
+    stage1_packets: Sequence[Mapping[str, Any]],
+    config: Any,
+) -> tuple[
+    pd.DataFrame,
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any] | None,
+] | None:
+    """Load a migration-validated post-ontology matrix without re-extraction."""
+
+    snapshot_dir = Path(output_dir) / "preselection"
+    input_path = snapshot_dir / "input.json"
+    complete_path = snapshot_dir / "complete.json"
+    if not input_path.is_file() and not complete_path.is_file():
+        return None
+    if not input_path.is_file() or not complete_path.is_file():
+        raise RuntimeError(
+            f"incomplete frozen preselection snapshot under {snapshot_dir}; restore "
+            "the archived run or rerun --stage2-reselect"
+        )
+    try:
+        snapshot = json.loads(input_path.read_text(encoding="utf-8"))
+        completion = json.loads(complete_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"invalid frozen preselection snapshot under {snapshot_dir}"
+        ) from exc
+    if not isinstance(snapshot, Mapping) or not isinstance(completion, Mapping):
+        raise RuntimeError(f"invalid frozen preselection snapshot under {snapshot_dir}")
+    if (
+        snapshot.get("schema_version") != PRESELECTION_SNAPSHOT_SCHEMA_VERSION
+        or completion.get("schema_version") != PRESELECTION_SNAPSHOT_SCHEMA_VERSION
+        or completion.get("status") != "complete"
+    ):
+        raise RuntimeError(
+            f"incompatible frozen preselection snapshot under {snapshot_dir}"
+        )
+    snapshot_value = {
+        str(key): copy.deepcopy(value)
+        for key, value in snapshot.items()
+        if key != "input_fingerprint"
+    }
+    input_fingerprint = _value_fingerprint(snapshot_value)
+    if (
+        snapshot.get("input_fingerprint") != input_fingerprint
+        or completion.get("input_fingerprint") != input_fingerprint
+    ):
+        raise RuntimeError(
+            f"frozen preselection snapshot fingerprint mismatch under {snapshot_dir}"
+        )
+
+    expected_checks = {
+        "source_feature_definitions_fingerprint": _value_fingerprint(
+            [dict(feature) for feature in definitions]
+        ),
+        "fit_row_ids_fingerprint": _value_fingerprint([int(value) for value in fit_ids]),
+        "inner_splits_fingerprint": _value_fingerprint(list(inner_splits)),
+        "treatment_outcome_fingerprint": _frame_fingerprint(
+            dataset.iloc[list(fit_ids)][[treatment_column, outcome_column]].reset_index(
+                drop=True
+            )
+        ),
+        "fit_source_text_fingerprint": _frame_fingerprint(
+            dataset.iloc[list(fit_ids)][[unit_id_column, text_column]].reset_index(
+                drop=True
+            )
+        ),
+        "stage1_packets_fingerprint": _value_fingerprint(list(stage1_packets)),
+        "review_policy_fingerprint": _value_fingerprint(
+            frozen_preselection_review_policy(config)
+        ),
+    }
+    mismatches = sorted(
+        key for key, expected in expected_checks.items() if snapshot.get(key) != expected
+    )
+    if str(snapshot.get("outcome_type") or "") != str(outcome_type):
+        mismatches.append("outcome_type")
+    if mismatches:
+        raise RuntimeError(
+            "frozen preselection snapshot does not match the current run inputs: "
+            + ", ".join(mismatches)
+        )
+
+    matrix_relative = str(snapshot.get("matrix_path") or "").strip()
+    if not matrix_relative:
+        raise RuntimeError("frozen preselection snapshot has no matrix_path")
+    matrix_path = (Path(output_dir) / matrix_relative).resolve()
+    resolved_output = Path(output_dir).resolve()
+    if matrix_path != resolved_output and resolved_output not in matrix_path.parents:
+        raise RuntimeError("frozen preselection matrix_path escapes its outer-fold directory")
+    if not matrix_path.is_file():
+        raise RuntimeError(f"frozen preselection matrix is missing: {matrix_path}")
+    matrix = pd.read_csv(matrix_path)
+    if _frame_fingerprint(matrix) != snapshot.get("matrix_snapshot_fingerprint"):
+        raise RuntimeError(f"frozen preselection matrix changed after migration: {matrix_path}")
+
+    raw_snapshot_definitions = snapshot.get("definitions")
+    if not isinstance(raw_snapshot_definitions, list) or not all(
+        isinstance(feature, Mapping) for feature in raw_snapshot_definitions
+    ):
+        raise RuntimeError("frozen preselection snapshot definitions are invalid")
+    snapshot_definitions = [dict(feature) for feature in raw_snapshot_definitions]
+    names = [str(feature.get("name") or "") for feature in snapshot_definitions]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        raise RuntimeError("frozen preselection snapshot contains invalid feature names")
+    expected_columns = ["_oci_row_id", *names]
+    if list(matrix.columns) != expected_columns:
+        raise RuntimeError(
+            "frozen preselection matrix columns do not match its definitions"
+        )
+    numeric_ids = pd.to_numeric(matrix["_oci_row_id"], errors="coerce")
+    if numeric_ids.isna().any() or not np.allclose(
+        numeric_ids.to_numpy(dtype=float),
+        np.rint(numeric_ids.to_numpy(dtype=float)),
+    ):
+        raise RuntimeError("frozen preselection matrix contains invalid row identifiers")
+    matrix_ids = numeric_ids.astype(int).tolist()
+    if matrix_ids != [int(value) for value in fit_ids] or len(set(matrix_ids)) != len(
+        matrix_ids
+    ):
+        raise RuntimeError(
+            "frozen preselection matrix rows do not match the current outer-training rows"
+        )
+    matrix["_oci_row_id"] = numeric_ids.astype(int)
+    metadata = snapshot.get("review_metadata")
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError("frozen preselection snapshot review_metadata is invalid")
+    raw_heldout_cache = snapshot.get("heldout_measurement_cache")
+    heldout_cache: dict[str, Any] | None = None
+    if raw_heldout_cache is not None:
+        if not isinstance(raw_heldout_cache, Mapping):
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache is invalid"
+            )
+        heldout_cache = copy.deepcopy(dict(raw_heldout_cache))
+        if (
+            heldout_cache.get("schema_version")
+            != HELDOUT_MEASUREMENT_CACHE_SCHEMA_VERSION
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache has an "
+                "incompatible schema"
+            )
+        raw_cache_row_ids = heldout_cache.get("heldout_row_ids")
+        if not isinstance(raw_cache_row_ids, list):
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache has no row IDs"
+            )
+        try:
+            cache_row_ids = [int(value) for value in raw_cache_row_ids]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache row IDs are invalid"
+            ) from exc
+        expected_heldout_ids = [int(value) for value in heldout_ids]
+        if (
+            cache_row_ids != expected_heldout_ids
+            or len(cache_row_ids) != len(set(cache_row_ids))
+            or heldout_cache.get("heldout_row_ids_fingerprint")
+            != _value_fingerprint(cache_row_ids)
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache rows do not match "
+                "the current outer-heldout rows"
+            )
+        current_heldout_source_fingerprint = _frame_fingerprint(
+            dataset.iloc[cache_row_ids][[unit_id_column, text_column]].reset_index(
+                drop=True
+            )
+        )
+        if (
+            heldout_cache.get("heldout_source_text_fingerprint")
+            != current_heldout_source_fingerprint
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out source text changed after migration"
+            )
+        extraction_llm = getattr(config, "extraction_llm", None)
+        current_extraction_model = str(getattr(extraction_llm, "model", "") or "")
+        if str(heldout_cache.get("extraction_model") or "") != current_extraction_model:
+            raise RuntimeError(
+                "frozen preselection held-out cache extraction model does not match "
+                "the current extraction model"
+            )
+        cached_definitions = heldout_cache.get("measurement_definitions")
+        if not isinstance(cached_definitions, list) or not all(
+            isinstance(value, Mapping) for value in cached_definitions
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out cache definitions are invalid"
+            )
+        cache_names = [str(value.get("name") or "") for value in cached_definitions]
+        cache_ids = [
+            str(value.get("feature_id") or "") for value in cached_definitions
+        ]
+        if (
+            any(not value for value in cache_names)
+            or any(not value for value in cache_ids)
+            or len(cache_names) != len(set(cache_names))
+            or len(cache_ids) != len(set(cache_ids))
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out cache feature identities are invalid"
+            )
+    return matrix, snapshot_definitions, dict(metadata), heldout_cache
+
+
 def _clean_scalar(value: Any) -> Any:
     if value is None or isinstance(value, (str, bool, int, float)):
         if isinstance(value, float) and not math.isfinite(value):
@@ -529,6 +785,20 @@ def _prompt_feature_definitions(
         row["conflict_resolution"] = _resolved_conflict_resolution(definition)
         output.append(row)
     return output
+
+
+def frozen_measurement_definition_identity(
+    definition: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Identify exactly the feature measurement prompt represented by a cache column."""
+
+    prompt_definition = _prompt_feature_definitions([definition])[0]
+    return {
+        "feature_id": str(definition.get("feature_id") or ""),
+        "name": str(definition.get("name") or ""),
+        "prompt_definition": prompt_definition,
+        "prompt_definition_fingerprint": _value_fingerprint(prompt_definition),
+    }
 
 
 def _likely_positive_category(categories: Sequence[str]) -> str | None:
@@ -8819,6 +9089,262 @@ def _run_fold_analysis_legacy(
     }
 
 
+def _validated_heldout_measurement_frame(
+    frame: pd.DataFrame,
+    *,
+    heldout_ids: Sequence[int],
+    feature_names: Sequence[str],
+    source: str,
+) -> pd.DataFrame:
+    expected_columns = ["_oci_row_id", *map(str, feature_names)]
+    if list(frame.columns) != expected_columns:
+        raise ValueError(
+            f"{source} columns do not match its measurement definitions: "
+            f"expected={expected_columns!r}, actual={list(frame.columns)!r}"
+        )
+    numeric_ids = pd.to_numeric(frame["_oci_row_id"], errors="coerce")
+    if numeric_ids.isna().any() or not np.allclose(
+        numeric_ids.to_numpy(dtype=float),
+        np.rint(numeric_ids.to_numpy(dtype=float)),
+    ):
+        raise ValueError(f"{source} contains invalid row identifiers")
+    actual_ids = numeric_ids.astype(int).tolist()
+    expected_ids = [int(value) for value in heldout_ids]
+    if actual_ids != expected_ids or len(actual_ids) != len(set(actual_ids)):
+        raise ValueError(f"{source} rows do not match the outer-heldout partition")
+    validated = frame.copy()
+    validated["_oci_row_id"] = numeric_ids.astype(int)
+    return validated
+
+
+def _load_reusable_archived_heldout_measurements(
+    *,
+    output_dir: Path,
+    heldout_ids: Sequence[int],
+    measurement_definitions: Sequence[Mapping[str, Any]],
+    cache: Mapping[str, Any],
+) -> tuple[pd.DataFrame, set[str], dict[str, Any]]:
+    """Load only definition-identical raw measurements from the reselection archive."""
+
+    empty = pd.DataFrame({"_oci_row_id": [int(value) for value in heldout_ids]})
+    audit: dict[str, Any] = {
+        "schema_version": HELDOUT_MEASUREMENT_REUSE_SCHEMA_VERSION,
+        "status": "cache_rejected",
+        "cache_schema_version": cache.get("schema_version"),
+        "required_features": len(measurement_definitions),
+        "cache_available_features": 0,
+        "reused_features": [],
+        "definition_incompatible_features": [],
+    }
+    try:
+        stage2_dir = Path(output_dir).parent.resolve()
+        state_path = stage2_dir / "reselection_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, Mapping):
+            raise ValueError("reselection state is not an object")
+        if (
+            state.get("schema_version")
+            != STAGE2_RESELECTION_MIGRATION_SCHEMA_VERSION
+            or state.get("status") not in {"prepared", "complete"}
+        ):
+            raise ValueError("reselection state is not a prepared compatible migration")
+        archive_relative = Path(str(state.get("archive_path") or ""))
+        if (
+            not archive_relative.parts
+            or archive_relative.is_absolute()
+            or ".." in archive_relative.parts
+        ):
+            raise ValueError("reselection archive path is invalid")
+        archive_dir = (stage2_dir / archive_relative).resolve()
+        if stage2_dir not in archive_dir.parents:
+            raise ValueError("reselection archive escapes the Stage 2 directory")
+        manifest = json.loads((archive_dir / "manifest.json").read_text(encoding="utf-8"))
+        if (
+            not isinstance(manifest, Mapping)
+            or manifest.get("reselection_id") != state.get("reselection_id")
+            or manifest.get("policy_fingerprint") != state.get("policy_fingerprint")
+        ):
+            raise ValueError("reselection archive manifest does not match its state")
+        source_relative = Path(str(cache.get("source_artifact_path") or ""))
+        if (
+            not source_relative.parts
+            or source_relative.is_absolute()
+            or ".." in source_relative.parts
+        ):
+            raise ValueError("cached held-out artifact path is invalid")
+        archive_artifacts = (archive_dir / "artifacts").resolve()
+        source_path = (archive_artifacts / source_relative).resolve()
+        if archive_artifacts not in source_path.parents:
+            raise ValueError("cached held-out artifact escapes its archive")
+        cached_frame = pd.read_csv(source_path)
+        if _frame_fingerprint(cached_frame) != cache.get("raw_frame_fingerprint"):
+            raise ValueError("cached held-out artifact fingerprint changed")
+        raw_cached_definitions = cache.get("measurement_definitions")
+        if not isinstance(raw_cached_definitions, list) or not all(
+            isinstance(value, Mapping) for value in raw_cached_definitions
+        ):
+            raise ValueError("cached held-out measurement definitions are invalid")
+        cached_definitions = [dict(value) for value in raw_cached_definitions]
+        cached_names = [str(value.get("name") or "") for value in cached_definitions]
+        cached_frame = _validated_heldout_measurement_frame(
+            cached_frame,
+            heldout_ids=heldout_ids,
+            feature_names=cached_names,
+            source="archived held-out measurement cache",
+        )
+        audit["cache_available_features"] = len(cached_definitions)
+        audit["source_artifact_path"] = str(source_relative)
+        audit["source_frame_fingerprint"] = cache.get("raw_frame_fingerprint")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        audit["rejection_reason"] = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning(
+            "Stage 2 held-out measurement cache rejected; extracting all required "
+            "components instead: %s",
+            audit["rejection_reason"],
+        )
+        return empty, set(), audit
+
+    cached_by_id = {
+        str(value.get("feature_id") or ""): value for value in cached_definitions
+    }
+    reusable_names: list[str] = []
+    incompatible_names: list[str] = []
+    for definition in measurement_definitions:
+        current_identity = frozen_measurement_definition_identity(definition)
+        cached_identity = cached_by_id.get(current_identity["feature_id"])
+        name = str(definition["name"])
+        if cached_identity == current_identity and name in cached_frame.columns:
+            reusable_names.append(name)
+        elif cached_identity is not None:
+            incompatible_names.append(name)
+    audit["status"] = "cache_accepted"
+    audit["reused_features"] = reusable_names
+    audit["definition_incompatible_features"] = incompatible_names
+    return (
+        cached_frame[["_oci_row_id", *reusable_names]].copy(),
+        set(reusable_names),
+        audit,
+    )
+
+
+def _extract_outer_heldout_measurements(
+    *,
+    dataset: pd.DataFrame,
+    heldout_ids: Sequence[int],
+    text_column: str,
+    measurement_definitions: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    request_json: RequestJSON,
+    workers: int,
+    max_prompt_chars: int,
+    feature_batch_size: int,
+    request_identity: Mapping[str, Any],
+    tokenizer: Any | None,
+    frozen_cache: Mapping[str, Any] | None,
+    serial_extraction: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Reuse archived raw components and extract only cache misses."""
+
+    heldout_dir = Path(output_dir) / "extraction" / "heldout"
+    if frozen_cache is None:
+        return extract_rows(
+            dataset=dataset,
+            row_ids=heldout_ids,
+            text_column=text_column,
+            definitions=measurement_definitions,
+            output_dir=heldout_dir,
+            request_json=request_json,
+            workers=workers,
+            max_prompt_chars=max_prompt_chars,
+            feature_batch_size=feature_batch_size,
+            request_identity=request_identity,
+            tokenizer=tokenizer,
+            **dict(serial_extraction),
+        )
+
+    cached_frame, reused_names, audit = (
+        _load_reusable_archived_heldout_measurements(
+            output_dir=output_dir,
+            heldout_ids=heldout_ids,
+            measurement_definitions=measurement_definitions,
+            cache=frozen_cache,
+        )
+    )
+    missing_definitions = [
+        definition
+        for definition in measurement_definitions
+        if str(definition["name"]) not in reused_names
+    ]
+    missing_names = [str(definition["name"]) for definition in missing_definitions]
+    if missing_definitions:
+        newly_extracted = extract_rows(
+            dataset=dataset,
+            row_ids=heldout_ids,
+            text_column=text_column,
+            definitions=missing_definitions,
+            output_dir=heldout_dir / "new_measurements",
+            request_json=request_json,
+            workers=workers,
+            max_prompt_chars=max_prompt_chars,
+            feature_batch_size=feature_batch_size,
+            request_identity=request_identity,
+            tokenizer=tokenizer,
+            **dict(serial_extraction),
+        )
+        newly_extracted = _validated_heldout_measurement_frame(
+            newly_extracted,
+            heldout_ids=heldout_ids,
+            feature_names=missing_names,
+            source="new held-out measurements",
+        )
+    else:
+        newly_extracted = pd.DataFrame(
+            {"_oci_row_id": [int(value) for value in heldout_ids]}
+        )
+
+    combined = cached_frame.merge(
+        newly_extracted,
+        on="_oci_row_id",
+        how="inner",
+        sort=False,
+        validate="one_to_one",
+    )
+    required_names = [str(definition["name"]) for definition in measurement_definitions]
+    combined = _validated_heldout_measurement_frame(
+        combined[["_oci_row_id", *required_names]],
+        heldout_ids=heldout_ids,
+        feature_names=required_names,
+        source="combined held-out measurements",
+    )
+    _write_frame(heldout_dir / "extracted.csv", combined)
+    audit.update(
+        {
+            "completed_at": _now(),
+            "rows": len(combined),
+            "required_features": len(required_names),
+            "reused_feature_count": len(reused_names),
+            "newly_extracted_feature_count": len(missing_names),
+            "newly_extracted_features": missing_names,
+            "combined_frame_fingerprint": _frame_fingerprint(combined),
+        }
+    )
+    _write_json(heldout_dir / "measurement_reuse.json", audit)
+    _write_json(
+        heldout_dir / "complete.json",
+        {
+            "status": "complete",
+            "schema_version": HELDOUT_MEASUREMENT_REUSE_SCHEMA_VERSION,
+            "completed_at": _now(),
+            "rows": len(combined),
+            "features": len(required_names),
+            "reused_features": len(reused_names),
+            "newly_extracted_features": len(missing_names),
+            "combined_frame_fingerprint": _frame_fingerprint(combined),
+        },
+    )
+    return combined
+
+
 def run_fold_analysis(
     *,
     dataset: pd.DataFrame,
@@ -8836,6 +9362,9 @@ def run_fold_analysis(
     request_json: RequestJSON,
     config: Any,
     extraction_tokenizer: Any | None = None,
+    stage1_packets: Sequence[Mapping[str, Any]] = (),
+    agentic_evidence_workers: int = 1,
+    agentic_evidence_executor: ProcessPoolExecutor | None = None,
 ) -> dict[str, Any]:
     """Run extraction supervision, fold-local selection, and causal-forest estimation."""
 
@@ -8864,29 +9393,82 @@ def run_fold_analysis(
         getattr(extraction_llm, "workers", getattr(config, "workers", 1))
     )
 
-    current: list[dict[str, Any]] = []
-    for raw_feature in definitions:
-        feature = dict(raw_feature)
-        value_type = str(feature.get("value_type") or "ambiguous").strip().lower()
-        if value_type in {"binary", "categorical", "ordinal"}:
-            feature["categories_or_unit"] = _validated_closed_category_values(
-                value_type=value_type,
-                values=feature.get("categories_or_unit") or [],
-                source=f"feature {feature.get('name')!r}",
-            )
-        current.append(_normalized_feature_modeling_definition(feature))
-
-    review_rounds = 0
-    ontology_refinement_rounds = 0
-    review_converged = False
-    review_history: list[dict[str, Any]] = []
-    final_fit_all: pd.DataFrame | None = None
-    final_fit_raw: pd.DataFrame | None = None
-    final_fit_definitions: list[dict[str, Any]] | None = None
-    final_fit_failure_summary: dict[str, Any] | None = None
     maximum_review_rounds = int(getattr(config, "max_review_rounds", 1))
+    frozen_snapshot = _load_frozen_preselection_snapshot(
+        output_dir=output_dir,
+        dataset=dataset,
+        definitions=definitions,
+        fit_ids=fit_ids,
+        heldout_ids=heldout_ids,
+        inner_splits=inner_splits,
+        unit_id_column=unit_id_column,
+        text_column=text_column,
+        treatment_column=treatment_column,
+        outcome_column=outcome_column,
+        outcome_type=outcome_type,
+        stage1_packets=stage1_packets,
+        config=config,
+    )
+    frozen_review_convergence: dict[str, Any] | None = None
+    frozen_heldout_measurement_cache: dict[str, Any] | None = None
+    if frozen_snapshot is None:
+        current: list[dict[str, Any]] = []
+        for raw_feature in definitions:
+            feature = dict(raw_feature)
+            value_type = str(feature.get("value_type") or "ambiguous").strip().lower()
+            if value_type in {"binary", "categorical", "ordinal"}:
+                feature["categories_or_unit"] = _validated_closed_category_values(
+                    value_type=value_type,
+                    values=feature.get("categories_or_unit") or [],
+                    source=f"feature {feature.get('name')!r}",
+                )
+            current.append(_normalized_feature_modeling_definition(feature))
+        review_rounds = 0
+        ontology_refinement_rounds = 0
+        review_converged = False
+        review_history: list[dict[str, Any]] = []
+        final_fit_all: pd.DataFrame | None = None
+        final_fit_raw: pd.DataFrame | None = None
+        final_fit_definitions: list[dict[str, Any]] | None = None
+        final_fit_failure_summary: dict[str, Any] | None = None
+    else:
+        (
+            frozen_matrix,
+            frozen_definitions,
+            frozen_metadata,
+            frozen_heldout_measurement_cache,
+        ) = frozen_snapshot
+        current = [
+            _normalized_feature_modeling_definition(feature)
+            for feature in frozen_definitions
+        ]
+        review_rounds = int(frozen_metadata.get("review_rounds") or 0)
+        ontology_refinement_rounds = int(
+            frozen_metadata.get("ontology_refinement_rounds") or 0
+        )
+        review_converged = bool(frozen_metadata.get("review_converged"))
+        stored_convergence = frozen_metadata.get("review_convergence")
+        frozen_review_convergence = (
+            copy.deepcopy(dict(stored_convergence))
+            if isinstance(stored_convergence, Mapping)
+            else None
+        )
+        review_history = list(
+            (frozen_review_convergence or {}).get("history") or []
+        )
+        final_fit_all = frozen_matrix
+        final_fit_raw = frozen_matrix.copy()
+        final_fit_definitions = copy.deepcopy(current)
+        final_fit_failure_summary = {}
+        LOGGER.info(
+            "reuse frozen Stage 2 preselection snapshot: %s",
+            Path(output_dir) / "preselection",
+        )
 
-    for round_index in range(1, maximum_review_rounds + 1):
+    review_round_indices = (
+        range(1, maximum_review_rounds + 1) if frozen_snapshot is None else ()
+    )
+    for round_index in review_round_indices:
         review_rounds = round_index
         round_dir = output_dir / "ontology_supervision" / f"round_{round_index:03d}"
         _write_json(round_dir / "definitions_before_extraction.json", {"features": current})
@@ -8983,7 +9565,9 @@ def run_fold_analysis(
 
     # A revision in the last allowed supervisor round has not yet been applied
     # to patient text. Re-extract only changed candidates before statistical tests.
-    if _value_fingerprint(final_fit_definitions) != _value_fingerprint(current):
+    if frozen_snapshot is not None:
+        pass
+    elif _value_fingerprint(final_fit_definitions) != _value_fingerprint(current):
         final_fit_raw, current, feedback_rounds = _extract_training_with_ontology_feedback(
             dataset=dataset,
             row_ids=fit_ids,
@@ -9019,36 +9603,50 @@ def run_fold_analysis(
         )
 
     selection_dir = output_dir / "selection"
+    legacy_selection_path = selection_dir / "statistical_selection.json"
+    if legacy_selection_path.exists():
+        raise RuntimeError(
+            "this outer fold contains a retired Stage 2 p-value-screen checkpoint. "
+            "Preserve it for audit and use a fresh Stage 2 output directory for the "
+            "agentic selection schema."
+        )
+    if str(getattr(config, "input_temporal_scope", "")) != TEMPORAL_SCOPE:
+        raise ValueError(
+            f"Stage 2 requires input_temporal_scope={TEMPORAL_SCOPE!r}; it does not "
+            "perform semantic temporal filtering"
+        )
+    agentic_policy = getattr(config, "agentic_selection", None)
+    if agentic_policy is None:
+        raise ValueError("Stage 2 config is missing agentic_selection policy")
     selection_input = {
-        "schema_version": STATISTICAL_SELECTION_SCHEMA_VERSION,
+        "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+        "temporal_scope": TEMPORAL_SCOPE,
         "extracted_fit_fingerprint": _frame_fingerprint(final_fit_all),
         "treatment_outcome_fingerprint": _frame_fingerprint(
             dataset.iloc[fit_ids][[treatment_column, outcome_column]].reset_index(drop=True)
         ),
+        "stage1_packets_fingerprint": _value_fingerprint(list(stage1_packets)),
         "definitions": current,
         "inner_splits": inner_splits,
         "outcome_type": outcome_type,
-        "confounder_p_value_threshold": float(config.confounder_p_value_threshold),
-        "confounder_min_inner_fold_fraction": float(
-            config.confounder_min_inner_fold_fraction
-        ),
-        "effect_modifier_p_value_threshold": float(
-            config.effect_modifier_p_value_threshold
-        ),
-        "effect_modifier_min_inner_fold_fraction": float(
-            config.effect_modifier_min_inner_fold_fraction
-        ),
+        "agentic_selection_policy": agentic_policy.public_dict(),
     }
     selection_fingerprint = _value_fingerprint(selection_input)
-    selection_report_path = selection_dir / "statistical_selection.json"
+    selection_report_path = selection_dir / "agentic_selection.json"
     selected_path = selection_dir / "selected_definitions.json"
+    dependencies_path = selection_dir / "measurement_definitions.json"
+    latent_states_path = selection_dir / "selected_latent_states.json"
     selection_complete_path = selection_dir / "complete.json"
     selection_input_path = selection_dir / "input.json"
     selection_report: dict[str, Any] | None = None
     selected: list[dict[str, Any]] | None = None
+    measurement_definitions: list[dict[str, Any]] | None = None
+    latent_states: list[dict[str, Any]] | None = None
     if (
         selection_report_path.is_file()
         and selected_path.is_file()
+        and dependencies_path.is_file()
+        and latent_states_path.is_file()
         and selection_complete_path.is_file()
         and selection_input_path.is_file()
     ):
@@ -9057,25 +9655,60 @@ def run_fold_analysis(
             prior_input = json.loads(selection_input_path.read_text(encoding="utf-8"))
             cached_report = json.loads(selection_report_path.read_text(encoding="utf-8"))
             cached_selected = json.loads(selected_path.read_text(encoding="utf-8"))
+            cached_dependencies = json.loads(dependencies_path.read_text(encoding="utf-8"))
+            cached_latent_states = json.loads(latent_states_path.read_text(encoding="utf-8"))
             if (
                 completion.get("input_fingerprint") == selection_fingerprint
                 and prior_input.get("input_fingerprint") == selection_fingerprint
                 and cached_report.get("schema_version")
-                == STATISTICAL_SELECTION_SCHEMA_VERSION
+                == STAGE2_ROLE_SELECTION_SCHEMA_VERSION
                 and isinstance(cached_selected.get("features"), list)
+                and isinstance(cached_dependencies.get("features"), list)
+                and isinstance(cached_latent_states.get("latents"), list)
             ):
                 selection_report = dict(cached_report)
                 selected = [dict(feature) for feature in cached_selected["features"]]
-                LOGGER.info("skip completed Stage 2 statistical selection: %s", selection_dir)
+                measurement_definitions = [
+                    dict(feature) for feature in cached_dependencies["features"]
+                ]
+                latent_states = [dict(item) for item in cached_latent_states["latents"]]
+                LOGGER.info("skip completed Stage 2 agentic selection: %s", selection_dir)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             selection_report = None
             selected = None
-    if selection_report is None or selected is None:
+            measurement_definitions = None
+            latent_states = None
+    elif selection_complete_path.is_file():
+        try:
+            incompatible = json.loads(
+                selection_complete_path.read_text(encoding="utf-8")
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            incompatible = {}
+        if incompatible.get("schema_version") not in {
+            None,
+            STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+        }:
+            raise RuntimeError(
+                "this outer fold contains an incompatible Stage 2 selection schema. "
+                "Preserve it for audit and use a fresh Stage 2 output directory."
+            )
+    if (
+        selection_report is None
+        or selected is None
+        or measurement_definitions is None
+        or latent_states is None
+    ):
         _write_json(
             selection_input_path,
             {**selection_input, "input_fingerprint": selection_fingerprint},
         )
-        selected, selection_report = select_stage2_features(
+        (
+            selected,
+            selection_report,
+            measurement_definitions,
+            latent_states,
+        ) = select_stage2_features_agentically(
             dataset=dataset,
             extracted_fit=final_fit_all,
             definitions=current,
@@ -9083,33 +9716,44 @@ def run_fold_analysis(
             treatment_column=treatment_column,
             outcome_column=outcome_column,
             outcome_type=outcome_type,
-            confounder_p_value_threshold=float(config.confounder_p_value_threshold),
-            confounder_min_inner_fold_fraction=float(
-                config.confounder_min_inner_fold_fraction
+            unit_id_column=unit_id_column,
+            stage1_packets=stage1_packets,
+            output_dir=selection_dir,
+            request_json=request_json,
+            policy=agentic_policy,
+            evidence_workers=agentic_evidence_workers,
+            evidence_executor=agentic_evidence_executor,
+            pairwise_chunk_size=int(
+                getattr(
+                    config,
+                    "agentic_evidence_pair_chunk_size",
+                    DEFAULT_PAIRWISE_CHUNK_SIZE,
+                )
             ),
-            effect_modifier_p_value_threshold=float(
-                config.effect_modifier_p_value_threshold
-            ),
-            effect_modifier_min_inner_fold_fraction=float(
-                config.effect_modifier_min_inner_fold_fraction
-            ),
-            workers=int(getattr(config, "selection_workers", 1)),
         )
-        _write_json(selection_report_path, selection_report)
         _write_json(selected_path, {"features": selected})
+        _write_json(dependencies_path, {"features": measurement_definitions})
+        _write_json(latent_states_path, {"latents": latent_states})
         _write_json(
             selection_complete_path,
             {
                 "status": "complete",
-                "schema_version": STATISTICAL_SELECTION_SCHEMA_VERSION,
+                "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
                 "completed_at": _now(),
                 "input_fingerprint": selection_fingerprint,
                 "retained_features": len(selected),
+                "measurement_dependencies": len(measurement_definitions),
+                "selected_latents": len(latent_states),
             },
         )
 
     selected_names = [str(feature["name"]) for feature in selected]
-    fit_selected = final_fit_all[["_oci_row_id", *selected_names]].copy()
+    fit_materialized = materialize_selected_latents(
+        frame=final_fit_all,
+        latent_states=latent_states,
+        original_definitions=current,
+    )
+    fit_selected = fit_materialized[["_oci_row_id", *selected_names]].copy()
     _write_frame(output_dir / "extraction" / "fit" / "extracted.csv", fit_selected)
     _write_frame(output_dir / "extraction" / "fit" / "harmonized.csv", fit_selected)
     if selected:
@@ -9132,32 +9776,43 @@ def run_fold_analysis(
             },
         )
 
-    heldout_raw = extract_rows(
+    heldout_raw = _extract_outer_heldout_measurements(
         dataset=dataset,
-        row_ids=heldout_ids,
+        heldout_ids=heldout_ids,
         text_column=text_column,
-        definitions=selected,
-        output_dir=output_dir / "extraction" / "heldout",
+        measurement_definitions=measurement_definitions,
+        output_dir=output_dir,
         request_json=request_json,
         workers=extraction_workers,
         max_prompt_chars=int(config.extraction_max_prompt_chars),
         feature_batch_size=extraction_feature_batch_size,
         request_identity=extraction_identity,
         tokenizer=extraction_tokenizer,
-        **serial_extraction,
+        frozen_cache=frozen_heldout_measurement_cache,
+        serial_extraction=serial_extraction,
     )
-    heldout_extraction, heldout_harmonization = _apply_harmonization_plans(
+    heldout_measurements, heldout_harmonization = _apply_harmonization_plans(
         heldout_raw,
-        selected,
+        measurement_definitions,
         scope="outer_heldout",
     )
     _write_frame(
-        output_dir / "extraction" / "heldout" / "harmonized.csv",
-        heldout_extraction,
+        output_dir / "extraction" / "heldout" / "measurement_harmonized.csv",
+        heldout_measurements,
     )
     _write_json(
         output_dir / "extraction" / "heldout" / "harmonization.json",
         heldout_harmonization,
+    )
+    heldout_materialized = materialize_selected_latents(
+        frame=heldout_measurements,
+        latent_states=latent_states,
+        original_definitions=current,
+    )
+    heldout_extraction = heldout_materialized[["_oci_row_id", *selected_names]].copy()
+    _write_frame(
+        output_dir / "extraction" / "heldout" / "harmonized.csv",
+        heldout_extraction,
     )
     if selected:
         _assert_extraction_health(
@@ -9185,10 +9840,10 @@ def run_fold_analysis(
             "name": str(feature["name"]),
             **copy.deepcopy(feature["harmonization_fallback"]),
         }
-        for feature in selected
+        for feature in measurement_definitions
         if isinstance(feature.get("harmonization_fallback"), Mapping)
     ]
-    review_convergence = {
+    review_convergence = frozen_review_convergence or {
         "schema_version": REVIEW_CONVERGENCE_SCHEMA_VERSION,
         "status": "converged" if review_converged else "maximum_rounds_reached",
         "converged": review_converged,
@@ -9197,20 +9852,27 @@ def run_fold_analysis(
         "continued_with_latest_ontology": not review_converged,
         "history": review_history,
     }
+    if frozen_review_convergence is not None:
+        review_convergence = {
+            **review_convergence,
+            "reused_frozen_preselection_snapshot": True,
+        }
     _write_json(output_dir / "ontology_supervision" / "convergence.json", review_convergence)
     _write_json(
         output_dir / "final_definitions.json",
         {
-            "schema_version": STATISTICAL_SELECTION_SCHEMA_VERSION,
+            "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
             "features": selected,
+            "measurement_dependencies": measurement_definitions,
+            "selected_latent_states_artifact": str(latent_states_path),
             "all_candidate_features": len(current),
             "review_rounds": review_rounds,
             "evaluation_rounds": review_rounds,
             "review_converged": review_converged,
             "review_convergence": review_convergence,
             "ontology_refinement_rounds": ontology_refinement_rounds,
-            "selection_artifact": str(selection_dir / "statistical_selection.json"),
-            "screening_model_family": "univariate_logistic_or_linear_nested_tests",
+            "selection_artifact": str(selection_dir / "agentic_selection.json"),
+            "screening_model_family": "agentic_fold_local_mixed_evidence",
             "final_model_family": "causal_forest_dml",
             "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
         },
@@ -9242,17 +9904,23 @@ def run_fold_analysis(
         "review_converged": review_converged,
         "review_convergence": review_convergence,
         "ontology_refinement_rounds": ontology_refinement_rounds,
-        "screening_model_family": "univariate_logistic_or_linear_nested_tests",
+        "screening_model_family": "agentic_fold_local_mixed_evidence",
         "selection": selection_report,
+        "measurement_dependencies": measurement_definitions,
         "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
         "estimation": diagnostics,
     }
 
 
 __all__ = [
+    "HELDOUT_MEASUREMENT_CACHE_SCHEMA_VERSION",
+    "HELDOUT_MEASUREMENT_REUSE_SCHEMA_VERSION",
+    "PRESELECTION_SNAPSHOT_SCHEMA_VERSION",
     "Stage2InfrastructureError",
     "Stage2RequestExhaustedError",
     "Stage2ResponseValidationError",
+    "frozen_measurement_definition_identity",
+    "frozen_preselection_review_policy",
     "infrastructure_failure_audit_paths",
     "run_fold_analysis",
 ]

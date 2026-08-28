@@ -224,7 +224,7 @@ flowchart LR
     D --> E["Exhaustively list and merge concepts"]
     E --> F["Primary model defines ontologies"]
     F --> G["Small model extracts patient-level values"]
-    G --> H["Inner-fold p-value screens assign roles"]
+    G --> H["Fold-local evidence and agents assign roles"]
     H --> J["Cross-fitted causal forest"]
     J --> I["ATE, CATE or ITE estimates with diagnostics"]
 ```
@@ -665,10 +665,13 @@ overall CPU budget used by TF-IDF and divided among the concurrently active
 text-model lanes. If fewer workers than CUDA devices are requested, each active
 device still requires one controller worker. Stage 2 uses its own
 `stage2.workers` setting for primary requests,
-`stage2.extraction_llm.workers` for patient extraction, and
-`stage2.selection_workers` for loky statistical-screen processes. Independent outer folds run concurrently, while a
-shared request semaphore keeps their combined endpoint concurrency at
-`stage2.workers`. Review rounds within each fold remain ordered.
+`stage2.extraction_llm.workers` for patient extraction. Deterministic Stage 2
+evidence is computed inside each fold. Pairwise evidence uses deterministic,
+checkpointed chunks submitted by all outer folds to one shared loky process
+pool capped by `stage2.workers`. Bounded variable-selection agents use
+the shared primary-request budget. Independent outer folds run concurrently,
+while a shared request semaphore keeps their combined endpoint concurrency at
+`stage2.workers`. Review and role-agent rounds within each fold remain ordered.
 Every Stage 1 context and every expensive Stage 2 batch writes its own
 `complete.json`, so the same scheduling remains resumable after interruption.
 
@@ -718,7 +721,6 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
-    "selection_workers": 32,
     "extraction_llm": {
       "endpoint": "http://127.0.0.1:8020/v1",
       "model": "Qwen/Qwen3-4B-Instruct-2507",
@@ -750,10 +752,16 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
-    "confounder_p_value_threshold": 0.05,
-    "confounder_min_inner_fold_fraction": 0.75,
-    "effect_modifier_p_value_threshold": 0.05,
-    "effect_modifier_min_inner_fold_fraction": 0.75,
+    "input_temporal_scope": "pre_index_treatment",
+    "agentic_selection": {
+      "missingness_weight": 0.15,
+      "cluster_similarity_threshold": 0.60,
+      "cluster_consensus_fraction": 0.60,
+      "cluster_max_size": 12,
+      "max_latents_per_cluster": 2,
+      "cluster_tool_call_limit": 8,
+      "adjudicator_tool_call_limit": 10
+    },
     "estimation_trees": 200,
     "explicit_features": []
   },
@@ -1075,31 +1083,34 @@ merged into the cached raw training matrix, while unchanged candidate columns
 are reused. Prompts still contain exactly one patient; feature batching within
 that patient is unchanged.
 
-Feature selection is deliberately simple and auditable. Within each inner-fold
-training partition, Stage 2 fits one candidate-at-a-time regressions for
-treatment and outcome and records raw omnibus p-values plus separate rankings.
-A discovered feature becomes an outer-fold confounder only when both p-values
-are strictly below `confounder_p_value_threshold` (0.05 by default) in at least
-`confounder_min_inner_fold_fraction` of inner folds (0.75 by default, rounded up
-to a whole-fold vote count). Non-evaluable tests do not vote. Binary treatment
-and binary outcomes use logistic likelihood-ratio tests; continuous outcomes
-use the analogous partial-F test. The regression work is split into
-deterministic inner-fold/feature chunks and executed by joblib's `loky` backend.
+Stage 2 now builds a fold-local evidence layer before assigning roles. Each
+inner-training partition retains the former one-candidate treatment and outcome
+models, and adds all-pairs mixed-type association evidence: Spearman correlation,
+contingency tables with chi-square and bias-corrected Cramer's V, correlation
+ratio with Kruskal-Wallis, and missingness co-occurrence. Raw p-values and
+Benjamini-Hochberg q-values are evidence, not selection gates. Role-blind
+hierarchical clustering is performed in every inner fold and combined into
+outer-training consensus clusters.
 
-Modifier screening then fits one outcome model per candidate and inner-training
-partition. Each reduced model contains all selected confounders and observed
-binary treatment; the full model adds the candidate main effect and its
-treatment interaction. A categorical candidate contributes all estimable
-nonreference-level treatment interactions to one omnibus likelihood-ratio (or
-partial-F) test. A discovered candidate becomes an effect modifier when
-the raw interaction p-value is strictly below
-`effect_modifier_p_value_threshold` (0.05 by default) in at least
-`effect_modifier_min_inner_fold_fraction` of inner folds (0.75 by default).
-Candidates may receive both roles. Investigator-configured confounders and
-modifiers bypass every evidence and p-value gate and are always retained with
-their configured roles.
+A bounded cluster agent may consolidate structured measurements into at most two
+derived variables using either a fold-fitted mixed-data component or a small
+declarative rule language. Construction cannot access treatment or outcome and
+is evaluated on each inner heldout partition. The global confounder adjudicator
+then weighs empirical treatment and outcome evidence, including consistency
+across folds. After that set is fixed, Stage 2 reruns role consideration for
+effect modifiers using interaction tests and inner-heldout R-loss under the
+selected nuisance model. All original candidates remain modifier-eligible.
+Clinical plausibility is not a role criterion, and p-values never become a hard
+gate. Investigator-configured features preserve exactly their supplied roles.
 
-Statistical selection writes its own input fingerprint and completion marker,
+Selected latents are refit on the complete outer-training partition. Outer
+heldout text extraction requests their original measurement dependencies, then
+computes the latent deterministically; the heldout rows are never exposed to a
+selection agent. All supplied data must satisfy the persisted
+`pre_index_treatment` invariant. Historical treatments are valid measurements,
+and the agent is forbidden from inventing semantic timepoint filters.
+
+Agentic selection writes its own input fingerprint and completion marker,
 so an interrupted run resumes it independently. Endpoint URLs are transport
 details and may change between resumes. The root `model_identity.json` records
 the model IDs advertised at startup. A primary-model change raises an error
@@ -1145,7 +1156,7 @@ flowchart LR
     C --> D["Small model extracts every candidate<br/>on outer-training records"]
     D --> E["Primary model reviews<br/>aggregate ontology"]
     E -->|"ontology revised"| D
-    E -->|"frozen"| F["Inner-fold p-value screens<br/>for roles"]
+    E -->|"frozen"| F["Fold-local evidence, latents,<br/>and role agents"]
     F --> G["Small model extracts retained<br/>outer-held-out variables"]
     G --> H["Causal forest and<br/>held-out AIPW scores"]
     H --> I["Aggregate all outer folds"]
@@ -1217,9 +1228,18 @@ nsclc_all_evidence/
           supervisor/...
           complete.json
         convergence.json
+      preselection/                 # present after guarded reselection
+        input.json
+        complete.json
       selection/
-        statistical_selection.json
+        agentic_selection.json
+        stage2_evidence/inner_001/...
+        confounder_pass/...
+        effect_modifier_pass/...
+        latent_registry.json
         selected_definitions.json
+        measurement_definitions.json
+        selected_latent_states.json
       final_definitions.json
       extraction/
         fit/extracted.csv
@@ -1236,6 +1256,8 @@ nsclc_all_evidence/
     posthoc_oracle_ite_metrics.json
     causal_estimate.json
     summary.json
+    reselection_state.json          # present after guarded reselection
+    reselection_archives/...
     complete.json
 ```
 
@@ -1243,8 +1265,8 @@ nsclc_all_evidence/
 written to `logs/workflow.log`, and model-specific intermediate results are kept
 under `components/<name>/`. Stage 2's intermediate scientific results are under
 the current `stage2/outer_NNN/` directory: this is the direct place to inspect
-the candidates, aggregate ontology reviews, fold-local p-values and rankings,
-selected roles, extractions, and causal-forest estimates. If a process is
+the candidates, aggregate ontology reviews, fold-local mixed evidence and agent
+decisions, selected roles, extractions, and causal-forest estimates. If a process is
 interrupted, rerunning the same command skips each completed interpretation,
 consolidation, extraction, ontology-supervision, and estimation leaf, then
 re-enters the first incomplete directory. Across ontology rounds, aggregate
@@ -1253,6 +1275,29 @@ summary, failure pattern, and request identity have the same fingerprint.
 Checkpoints produced by the former request-exhaustion-as-null behavior are
 retained under `superseded_infrastructure_*` names and only those affected
 leaves are requested again.
+
+To replace role selection on a completed run without repeating interpretation,
+ontology supervision, or all-candidate outer-training extraction, use the saved
+configuration with guarded reselection:
+
+```bash
+uv run python scripts/run_all_evidence.py \
+  --config /path/to/completed_run/run_config.json \
+  --stage2-only \
+  --stage2-reselect
+```
+
+All outer folds are verified before anything is moved. The prior selector,
+held-out extraction, estimates, and aggregate results are retained under
+`stage2/reselection_archives/`; validated post-ontology definitions and training
+matrices are frozen under each fold's `preselection/` directory together with a
+fingerprinted manifest of archived raw held-out measurements. A cache mismatch
+aborts instead of repeating initial work, and an interrupted migration resumes
+from `stage2/reselection_state.json`. Use the same primary and extraction model
+IDs as the completed run; endpoint URLs and worker counts may change. Matching
+held-out component columns are reused, only missing or definition-incompatible
+components are re-extracted, and latent values are computed deterministically
+from those components before estimation is rerun.
 
 When the input dataset contains `true_ite_prob`, Stage 2 evaluates its frozen
 cross-fitted `estimated_cate` values against that oracle only after all modeling

@@ -45,7 +45,8 @@ Stage 2 does not stop at variable definitions. For each outer fold it exhaustive
 lists clinical features from every semantic evidence card, performs merge-only
 consolidation, uses a separate small model to extract all candidates on training
 records, and lets the primary model review only aggregate extraction ontologies.
-Fold-local regressions then assign confounder and effect-modifier roles before a
+Fold-local regressions, mixed-type associations, consensus clustering, and
+bounded role agents then assign confounder and effect-modifier roles before a
 causal forest is fit and evaluated on outer-held-out records. The common controls
 are:
 
@@ -55,7 +56,6 @@ are:
     "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
-    "selection_workers": 32,
     "extraction_llm": {
       "endpoint": "http://127.0.0.1:8020/v1",
       "model": "small-extractor",
@@ -78,10 +78,14 @@ are:
     "extraction_context_window_tokens": 131072,
     "extraction_context_margin_tokens": 1024,
     "max_review_rounds": 2,
-    "confounder_p_value_threshold": 0.05,
-    "confounder_min_inner_fold_fraction": 0.75,
-    "effect_modifier_p_value_threshold": 0.05,
-    "effect_modifier_min_inner_fold_fraction": 0.75,
+    "input_temporal_scope": "pre_index_treatment",
+    "agentic_selection": {
+      "missingness_weight": 0.15,
+      "cluster_similarity_threshold": 0.60,
+      "cluster_consensus_fraction": 0.60,
+      "cluster_max_size": 12,
+      "max_latents_per_cluster": 2
+    },
     "estimation_trees": 200,
     "explicit_features": []
   }
@@ -118,23 +122,25 @@ definitions. Each entry must include its complete extraction ontology and
 causal roles; see the complete workflow guide for the schema. Configured
 features join Stage 2 alias consolidation in every outer fold, so an
 automatically discovered alias does not create a second variable. They remain
-fixed and required regardless of evidence or p-values. Configure either role or
+fixed and required regardless of evidence strength. Configure either role or
 both; their ontologies and roles cannot be changed by the models.
 
 Independent outer folds run concurrently. Primary request concurrency is bounded
 by `stage2.workers`, and patient extraction by
 `stage2.extraction_llm.workers`. Each extraction request contains exactly one
-patient's text; this isolation is invariant. Statistical screens use
-`stage2.selection_workers` loky processes.
+patient's text; this isolation is invariant. Evidence construction and the
+ordered confounder/modifier agent passes run inside each outer fold. Pairwise
+evidence is pre-encoded once per inner fold and evaluated in deterministic loky
+chunks; all outer folds share one work-stealing pool capped by
+`stage2.workers`, and completed chunks are reusable after interruption.
 
-Discovered confounders must predict both treatment and outcome with raw p-values
-strictly below the configured threshold in at least the configured fraction of
-inner folds. Modifier models adjust for all selected confounders and treatment,
-then test one candidate's treatment interaction; the same threshold/fraction
-vote rule applies. Categorical candidates enter with all estimable
-nonreference-level interaction terms and receive one omnibus likelihood-ratio
-test. The default for both p-values is `0.05`, and the default for both fold
-fractions is `0.75` (rounded up to a whole-fold count).
+P-values and BH q-values remain visible evidence but are never hard gates.
+Confounder decisions require empirical treatment and outcome support plus an
+explicit inner-fold consistency assessment. Modifier decisions use interaction
+tests and inner-heldout R-loss under the selected nuisance confounders. Cluster
+agents can test at most two label-blind structured latents per cluster using a
+mixed component or declarative rule. Outer-heldout rows remain inaccessible to
+selection and only receive deterministic transforms fit on outer training.
 
 For pipeline-managed orchestrator and extractor roles, replace both endpoints
 in the example above with nested vLLM configurations. Their GPU lists define the
@@ -187,9 +193,26 @@ Stage 2 compiles the raw handoff into fold-local, provenance-preserving semantic
 cards under `stage2/evidence_compilation/`, and candidate discovery reads all of
 them. There is no ColBERT interaction filter, evidence-community graph,
 candidate reranking, or feature-count cap. Consolidation may only merge aliases;
-every unmerged candidate proceeds to extraction and the inner-fold screens.
+every unmerged candidate proceeds to extraction and fold-local agentic evidence.
 Each completed request is saved beneath the relevant outer-fold directory, so
 the same command resumes after interruption without repeating it.
+
+To apply the agentic selector to a completed legacy run without repeating
+interpretation or all-candidate training extraction:
+
+```bash
+uv run python scripts/run_all_evidence.py \
+  --config /path/to/completed_run/run_config.json \
+  --stage2-only --stage2-reselect
+```
+
+The command verifies all reusable inputs before archiving the previous selector
+and downstream results under `stage2/reselection_archives/`. It redoes agentic
+evidence and decisions, then reuses archived held-out component measurements
+whose row, text, model, frame, and definition fingerprints still match. Only
+newly required or incompatible components are extracted; structured latents are
+computed deterministically from their components. Estimation is then rerun.
+Keep the original primary and extraction model IDs; endpoints may change.
 
 The Stage 2 input is always:
 

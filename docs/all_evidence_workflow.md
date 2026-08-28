@@ -169,7 +169,6 @@ An external endpoint configuration is:
     "endpoint": "http://127.0.0.1:8010/v1",
     "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
-    "selection_workers": 32,
     "extraction_llm": {
       "endpoint": "http://127.0.0.1:8020/v1",
       "model": "small-extractor",
@@ -201,10 +200,16 @@ An external endpoint configuration is:
     "max_review_rounds": 2,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
-    "confounder_p_value_threshold": 0.05,
-    "confounder_min_inner_fold_fraction": 0.75,
-    "effect_modifier_p_value_threshold": 0.05,
-    "effect_modifier_min_inner_fold_fraction": 0.75,
+    "input_temporal_scope": "pre_index_treatment",
+    "agentic_selection": {
+      "missingness_weight": 0.15,
+      "cluster_similarity_threshold": 0.60,
+      "cluster_consensus_fraction": 0.60,
+      "cluster_max_size": 12,
+      "max_latents_per_cluster": 2,
+      "cluster_tool_call_limit": 8,
+      "adjudicator_tool_call_limit": 10
+    },
     "estimation_trees": 200,
     "explicit_features": [
       {
@@ -459,7 +464,7 @@ repairs, Python writes `fallback.json`, passes every member of that batch
 through unchanged, and records the fallback in the round and root completion
 summaries. This lossless fallback also preserves every configured feature.
 There is no fuzzy blocker, neighbor selection, or pairwise LLM request. Python
-leaves every discovered causal role empty until the fold-local p-value screens;
+leaves every discovered causal role empty until fold-local agentic selection;
 investigator-configured features alone carry supplied roles at this point.
 
 Every group remaining after consolidation is operationalized for extraction.
@@ -510,12 +515,11 @@ operational controls include `request_timeout` (900 seconds by default),
 `evidence_max_exemplars_per_card`, `evidence_max_exemplar_chars`,
 `max_review_rounds`,
 `ontology_refinement_min_failure_patients`,
-`max_ontology_refinement_rounds`, `confounder_p_value_threshold`,
-`confounder_min_inner_fold_fraction`, `effect_modifier_p_value_threshold`,
-`effect_modifier_min_inner_fold_fraction`, `estimation_trees`,
+`max_ontology_refinement_rounds`, `input_temporal_scope`,
+`agentic_selection`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
 `temperature`, `repetition_penalty`, `interpretation_reasoning_effort`, and
-`extraction_reasoning_effort`, and `selection_workers`. The nested `extraction_llm` object controls its
+and `extraction_reasoning_effort`. The nested `extraction_llm` object controls its
 endpoint or managed `vllm` pool, model, API key, and workers. A configured primary endpoint or managed
 vLLM pool makes the default mode `full`. The modes can always be made explicit:
 
@@ -564,8 +568,9 @@ sequences. Independent outer folds execute concurrently. `stage2.workers`
 controls combined primary-model concurrency, including consolidation and
 supervisor fan-outs; `stage2.extraction_llm.workers` independently controls
 small-model patient extraction without combining patients.
-`stage2.selection_workers` controls joblib loky processes for statistical
-screening; those checkpoints are reusable independently of endpoint URLs.
+Stage 2 evidence construction and bounded selection-agent calls occur inside
+each independent outer fold; those checkpoints are reusable independently of
+endpoint URLs.
 
 ```bash
 # Run/resume Stage 1 and stop after the handoff.
@@ -584,9 +589,11 @@ The same choice can be stored as `run.mode: "full"`, `"stage1"`, or
 values can also be supplied as `--stage2-endpoint` and `--stage2-model`.
 The small model has `--stage2-extraction-endpoint`,
 `--stage2-extraction-model`, `--stage2-extraction-api-key`, and
-`--stage2-extraction-workers`. Statistical processes and the two output ceilings
-use `--stage2-selection-workers`, `--stage2-max-tokens`, and
-`--stage2-extraction-max-tokens`.
+`--stage2-extraction-workers`. Agentic clustering exposes
+`--stage2-cluster-similarity-threshold`,
+`--stage2-cluster-consensus-fraction`, `--stage2-cluster-max-size`, and
+`--stage2-max-latents-per-cluster`; the two output ceilings use
+`--stage2-max-tokens` and `--stage2-extraction-max-tokens`.
 Managed mode additionally has `--stage2-vllm-servers`,
 `--stage2-vllm-gpus`, `--stage2-vllm-rapid-switch-seconds`,
 `--stage2-vllm-base-port`,
@@ -619,15 +626,13 @@ uv run python scripts/run_all_evidence.py \
   --stage2-model Qwen/Qwen3.8-27B \
   --stage2-extraction-endpoint http://127.0.0.1:8020/v1 \
   --stage2-extraction-model small-extractor \
-  --stage2-selection-workers 16 \
+  --stage2-cluster-similarity-threshold 0.60 \
+  --stage2-cluster-consensus-fraction 0.60 \
   --stage2-max-tokens 100000 \
   --stage2-extraction-max-tokens 75000 \
   --stage2-extraction-chunk-size-tokens 50000 \
   --stage2-review-rounds 2 \
-  --stage2-confounder-p-value-threshold 0.05 \
-  --stage2-confounder-min-inner-fold-fraction 0.75 \
-  --stage2-effect-modifier-p-value-threshold 0.05 \
-  --stage2-effect-modifier-min-inner-fold-fraction 0.75 \
+  --stage2-max-latents-per-cluster 2 \
   --stage2-estimation-trees 200
 ```
 
@@ -656,7 +661,7 @@ the available CPUs and GPUs as follows.
 | `text_models` | An outer/full or exact-inner context, with independent BoW folds inside it | One fixed process lane per configured CUDA device; `run.workers` is divided among active lanes and bounds their combined BoW fold threads |
 | `neural_queries` | An outer/full or exact-inner context | One fixed process lane per configured CUDA device; CPU-only runs use at most `run.workers` lanes |
 | `handoff` | None | The completed JSONL files are combined serially |
-| `stage2` | Independent outer folds, with interpretation, ontology-supervision, patient extraction, and inner-fold statistical chunks inside each fold | Outer folds execute concurrently; primary calls are bounded by `stage2.workers`, small-model extraction calls by `stage2.extraction_llm.workers`, statistical process work by `stage2.selection_workers` with loky, and ontology-supervision rounds within a fold remain ordered |
+| `stage2` | Independent outer folds; deterministic pair chunks within each inner fold | Outer folds execute concurrently; primary calls are bounded by `stage2.workers`, small-model extraction calls by `stage2.extraction_llm.workers`, and pair chunks from every fold share one loky pool capped by `stage2.workers`; role passes remain ordered |
 
 A fixed CUDA lane processes its assigned contexts serially on one GPU. This
 provides device affinity and prevents a process queue from placing two
@@ -772,9 +777,18 @@ my_stage1_run/
             complete.json
           complete.json
         convergence.json
+      preselection/                 # present after guarded reselection
+        input.json
+        complete.json
       selection/
-        statistical_selection.json
+        agentic_selection.json
+        stage2_evidence/...
+        confounder_pass/...
+        effect_modifier_pass/...
+        latent_registry.json
         selected_definitions.json
+        measurement_definitions.json
+        selected_latent_states.json
       final_definitions.json
       extraction/
         all_candidates_fit/...
@@ -795,6 +809,8 @@ my_stage1_run/
     posthoc_oracle_ite_metrics.json
     causal_estimate.json
     summary.json
+    reselection_state.json          # present after guarded reselection
+    reselection_archives/...
     complete.json
 ```
 
@@ -839,6 +855,45 @@ It writes an outer-fold completion marker only after held-out estimation, and
 writes the final top-level marker only after the cross-fitted estimates have
 been assembled.
 
+### Reselect a completed Stage 2 run
+
+Use `--stage2-reselect` to replace selection and its downstream estimates while
+reusing the completed interpretation, consolidation, ontology supervision, and
+all-candidate outer-training extraction:
+
+```bash
+uv run python scripts/run_all_evidence.py \
+  --config /path/to/completed_run/run_config.json \
+  --stage2-only \
+  --stage2-reselect
+```
+
+This is a guarded migration, not a broad `--rerun stage2`. Before moving any
+result it verifies every fold's feature-definition fingerprint, completed
+selector input, post-ontology definitions, training-matrix columns and row IDs,
+source text, treatment and outcome values, inner splits, review policy, and
+primary/extraction model IDs. Saved configurations from the retired p-value
+screen are accepted only in this mode; its five obsolete screen settings are
+removed while the new `agentic_selection` defaults or overrides are applied.
+
+The prior selection, selected-feature extraction, estimation, and root results
+are moved without deletion to `stage2/reselection_archives/`. Each fold receives
+a fingerprinted `preselection/` snapshot that directly loads the verified
+post-ontology definitions, harmonized training matrix, and a manifest for its
+archived raw held-out measurements. Consequently a cache miss cannot silently
+trigger interpretation or outer-training extraction. Interrupted preparation
+resumes through `stage2/reselection_state.json`.
+
+The primary and extraction model IDs must be the same as in the completed run;
+transport endpoints and worker counts may change. The new selector evidence and
+agent calls run from scratch. For each selected original feature or latent
+component, raw held-out values are reused when the archived column has matching
+row, source-text, model, frame, and measurement-definition fingerprints. Only
+missing or definition-incompatible components are sent to the extraction LLM.
+Latents themselves are always materialized deterministically from their measured
+components using parameters fitted on outer-training rows. Causal estimation
+then runs again. `--stage2-reselect` cannot be combined with `--rerun`.
+
 Raw-packet interpretation checkpoints do not match semantic-card inputs and are
 therefore rerun automatically. If a prior run already produced
 `feature_definitions.json`, the runner fails closed instead of silently mixing
@@ -858,32 +913,44 @@ raw training matrix, and repeats for at most
 `max_review_rounds`; `ontology_supervision/convergence.json` records whether the
 latest aggregate ontology was stable.
 
-Statistical role selection is written to
-`selection/statistical_selection.json`. For each inner-fold training partition,
-every discovered candidate is separately tested as a treatment predictor and
-an outcome predictor. Binary targets use nested logistic-regression likelihood-
-ratio tests; a continuous outcome uses a partial-F test. The artifact stores raw
-p-values and separate treatment/outcome rankings. A candidate is an outer-fold
-confounder only when both p-values are strictly below
-`confounder_p_value_threshold` in at least
-`ceil(confounder_min_inner_fold_fraction * number_of_inner_folds)` folds.
-Non-evaluable tests do not vote.
+Agentic role selection is written to `selection/agentic_selection.json`, with
+detailed inputs under `selection/stage2_evidence/`. Every inner-training
+partition retains the one-variable treatment and outcome regressions and adds
+all pairwise mixed-type relationships: Spearman correlations, contingency
+tables with chi-square and bias-corrected Cramer's V, correlation ratios with
+Kruskal-Wallis tests, and missingness relationships. P-values and BH q-values
+are evidence rather than gates. Mixed columns are encoded once into safe
+memory-mapped arrays, pair indices are split into deterministic chunks (512 by
+default), and fold-local loky workers atomically checkpoint each completed
+chunk. Resumption validates both the scientific input and exact chunk contents;
+BH correction is applied only after ordered assembly. The process allocation
+is dynamically work-stealed across concurrent outer folds and never exceeds
+`stage2.workers`, so a larger fold can use capacity released by a smaller one. Role-blind
+clusters are fit independently and combined into outer-training consensus
+clusters. Set `stage2.agentic_evidence_pair_chunk_size` to tune scheduling
+granularity without changing the scientific cache key.
 
-Modifier screening then adjusts for all outer-fold selected confounders and
-observed binary treatment. One candidate main effect is added at a time, and the
-full model adds that candidate's treatment interaction. For a categorical
-candidate, the model includes every estimable nonreference-level interaction
-simultaneously and uses one omnibus likelihood-ratio test (or partial-F test for
-a continuous outcome); the omitted level is only the full-rank reference. The candidate receives
-an effect-modifier role when the raw interaction p-value is strictly below
-`effect_modifier_p_value_threshold` in at least the analogous configured
-fraction of inner folds. Missingness indicators remain main effects and are not
-interacted with treatment. A candidate may receive both roles. Explicit
-investigator variables skip these votes and retain their configured roles even
-without evidence or statistical support.
+For each cluster, a bounded agent may propose up to two label-blind structured
+latents. The only constructions are a fold-fitted mixed-data component and a
+declarative categorical/numeric rule language; no executable code is accepted.
+Mappings are fit on inner-training values, tested on inner-heldout values, and
+refit on all outer-training rows only after selection. A global agent then
+adjudicates confounders from empirical treatment and outcome evidence and fold
+consistency. Modifier consideration runs afterward for every original feature,
+using the selected confounders as nuisance variables and evaluating interaction
+tests plus inner-heldout R-loss. A confounder decision never removes an original
+feature from modifier eligibility.
 
-Both screens run as deterministic inner-fold/feature chunks on joblib's `loky`
-backend and are checkpointed under `selection/`. Changing only endpoint URLs
+Clinical plausibility is excluded from role evidence, and the prompt requires
+evidence both for and against every decision. A selected latent and one of its
+sources are exclusive for the same role unless the adjudicator records an
+empirical exception. Explicit investigator features retain exactly their
+configured roles. The outer heldout partition is inaccessible to selection
+tools; its original measurement dependencies are extracted first and selected
+latents are then computed deterministically.
+
+The evidence, agent transcripts, typed-tool audit, latent registry, and both
+role adjudications are checkpointed under `selection/`. Changing only endpoint URLs
 does not invalidate completed scientific checkpoints. `model_identity.json`
 records the model IDs actually advertised at startup. Changing the primary
 model raises an error before interpretation checkpoints are reused. The
@@ -1001,7 +1068,7 @@ affected component.
   independently.
 - `handoff` gathers the completed evidence into the stable Stage 2 input path.
 - `stage2` exhaustively interprets semantic cards, supervises small-model
-  extraction ontologies, applies fold-local p-value screens, and writes held-out
+  extraction ontologies, applies fold-local mixed evidence and role agents, and writes held-out
   causal-forest effects and AIPW scores before aggregating the outer folds.
 
 The Stage 1 scientific model implementations are reused. The plain Stage 2 path

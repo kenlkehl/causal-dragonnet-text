@@ -26,7 +26,6 @@ stage2_model="${STAGE2_MODEL:-}"
 stage2_extraction_endpoint="${STAGE2_EXTRACTION_ENDPOINT:-}"
 stage2_extraction_model="${STAGE2_EXTRACTION_MODEL:-}"
 stage2_extraction_workers="${STAGE2_EXTRACTION_WORKERS:-}"
-stage2_selection_workers="${STAGE2_SELECTION_WORKERS:-}"
 stage2_max_tokens="${STAGE2_MAX_TOKENS:-}"
 stage2_extraction_max_tokens="${STAGE2_EXTRACTION_MAX_TOKENS:-}"
 stage2_extraction_chunk_size_tokens="${STAGE2_EXTRACTION_CHUNK_SIZE_TOKENS:-}"
@@ -54,10 +53,12 @@ stage2_consolidation_max_rounds="${STAGE2_CONSOLIDATION_MAX_ROUNDS:-}"
 stage2_extraction_feature_batch_size="${STAGE2_EXTRACTION_FEATURE_BATCH_SIZE:-}"
 stage2_ontology_refinement_min_failure_patients="${STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS:-}"
 stage2_max_ontology_refinement_rounds="${STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS:-}"
-stage2_confounder_p_value_threshold="${STAGE2_CONFOUNDER_P_VALUE_THRESHOLD:-}"
-stage2_confounder_min_inner_fold_fraction="${STAGE2_CONFOUNDER_MIN_INNER_FOLD_FRACTION:-}"
-stage2_effect_modifier_p_value_threshold="${STAGE2_EFFECT_MODIFIER_P_VALUE_THRESHOLD:-}"
-stage2_effect_modifier_min_inner_fold_fraction="${STAGE2_EFFECT_MODIFIER_MIN_INNER_FOLD_FRACTION:-}"
+stage2_cluster_similarity_threshold="${STAGE2_CLUSTER_SIMILARITY_THRESHOLD:-}"
+stage2_cluster_consensus_fraction="${STAGE2_CLUSTER_CONSENSUS_FRACTION:-}"
+stage2_cluster_max_size="${STAGE2_CLUSTER_MAX_SIZE:-}"
+stage2_max_latents_per_cluster="${STAGE2_MAX_LATENTS_PER_CLUSTER:-}"
+stage2_cluster_tool_call_limit="${STAGE2_CLUSTER_TOOL_CALL_LIMIT:-}"
+stage2_adjudicator_tool_call_limit="${STAGE2_ADJUDICATOR_TOOL_CALL_LIMIT:-}"
 stage1_architectures="${STAGE1_ARCHITECTURES:-}"
 min_free_gpu_gib="${MIN_FREE_GPU_GB:-20}"
 python_bin="${OCI_PYTHON:-}"
@@ -282,9 +283,6 @@ elif [[ -n "${stage2_extraction_endpoint}" ]]; then
         stage2_policy_args+=(--stage2-extraction-model "${stage2_extraction_model}")
     fi
 fi
-if [[ -n "${stage2_selection_workers}" ]]; then
-    stage2_policy_args+=(--stage2-selection-workers "${stage2_selection_workers}")
-fi
 if [[ -n "${stage2_max_tokens}" ]]; then
     stage2_policy_args+=(--stage2-max-tokens "${stage2_max_tokens}")
 fi
@@ -343,19 +341,23 @@ if [[ -n "${stage2_max_ontology_refinement_rounds}" ]]; then
         --set "stage2.max_ontology_refinement_rounds=${stage2_max_ontology_refinement_rounds}"
     )
 fi
-if [[ -n "${stage2_confounder_p_value_threshold}" ]]; then
-    stage2_policy_args+=(
-        --stage2-confounder-p-value-threshold "${stage2_confounder_p_value_threshold}"
-    )
+if [[ -n "${stage2_cluster_similarity_threshold}" ]]; then
+    stage2_policy_args+=(--stage2-cluster-similarity-threshold "${stage2_cluster_similarity_threshold}")
 fi
-if [[ -n "${stage2_confounder_min_inner_fold_fraction}" ]]; then
-    stage2_policy_args+=(--stage2-confounder-min-inner-fold-fraction "${stage2_confounder_min_inner_fold_fraction}")
+if [[ -n "${stage2_cluster_consensus_fraction}" ]]; then
+    stage2_policy_args+=(--stage2-cluster-consensus-fraction "${stage2_cluster_consensus_fraction}")
 fi
-if [[ -n "${stage2_effect_modifier_p_value_threshold}" ]]; then
-    stage2_policy_args+=(--stage2-effect-modifier-p-value-threshold "${stage2_effect_modifier_p_value_threshold}")
+if [[ -n "${stage2_cluster_max_size}" ]]; then
+    stage2_policy_args+=(--stage2-cluster-max-size "${stage2_cluster_max_size}")
 fi
-if [[ -n "${stage2_effect_modifier_min_inner_fold_fraction}" ]]; then
-    stage2_policy_args+=(--stage2-effect-modifier-min-inner-fold-fraction "${stage2_effect_modifier_min_inner_fold_fraction}")
+if [[ -n "${stage2_max_latents_per_cluster}" ]]; then
+    stage2_policy_args+=(--stage2-max-latents-per-cluster "${stage2_max_latents_per_cluster}")
+fi
+if [[ -n "${stage2_cluster_tool_call_limit}" ]]; then
+    stage2_policy_args+=(--stage2-cluster-tool-call-limit "${stage2_cluster_tool_call_limit}")
+fi
+if [[ -n "${stage2_adjudicator_tool_call_limit}" ]]; then
+    stage2_policy_args+=(--stage2-adjudicator-tool-call-limit "${stage2_adjudicator_tool_call_limit}")
 fi
 
 if (( stage2_managed_orchestrator )); then
