@@ -89,8 +89,8 @@ are:
     },
     "statistical_selection": {
       "l1_ratio": 0.8,
-      "nuisance_selection_frequency": 0.6,
-      "modifier_selection_frequency": 0.6,
+      "nuisance_selection_rule": "any_inner_fold_union",
+      "modifier_selection_rule": "any_inner_fold_union",
       "one_standard_error_rule": true,
       "modifier_one_standard_error_rule": false,
       "nuisance_forest_trees": 200
@@ -151,11 +151,14 @@ variables must remain separate. Accepted aliases immediately replace their
 sources in later retrievals. Lossless nominal-category unions are allowed, and
 continuous coalescing skips malformed nonnumeric values in favor of the next
 valid alias; the original extraction dependencies remain recorded. Separate treatment and outcome
-group elastic nets run inside each outer fold and accumulate original-feature
-stability votes. Ordered measurements use one standardized score; nominal
-factor contrasts and missingness are selected as one group. Inner-fold nuisance
-forests generate out-of-fold residuals, and a group-elastic-net R-learner
-selects stable treatment-interaction groups that improve held-out R-loss.
+group elastic nets run inside each outer fold. A candidate selected in any inner
+fold for either task enters one shared confounder union used by both nuisance
+models. Ordered measurements use one standardized score; nominal factor
+contrasts and missingness are selected as one group. Inner-fold nuisance forests
+generate out-of-fold residuals, and any treatment-interaction group selected by
+the group-elastic-net R-learner in any inner fold enters the causal-forest
+modifier union. Binary nuisance reports include AUROC and log loss; held-out
+R-loss remains diagnostic rather than gating modifier retention.
 Consolidation receives neither treatment nor outcome and is not a role-selection
 screen. Outer-heldout rows remain inaccessible until selection is frozen;
 selected latent states are then applied to their held-out measurement dependencies.

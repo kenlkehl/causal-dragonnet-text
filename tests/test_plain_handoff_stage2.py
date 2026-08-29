@@ -558,8 +558,14 @@ def test_stage2_config_migrates_retired_p_value_screen_settings(removed_key, cap
 
     assert config is not None
     assert "migrating legacy Stage 2 screen settings" in caplog.text
-    assert config.statistical_selection.nuisance_selection_frequency == 0.6
-    assert config.statistical_selection.modifier_selection_frequency == 0.6
+    assert (
+        config.statistical_selection.nuisance_selection_rule
+        == "any_inner_fold_union"
+    )
+    assert (
+        config.statistical_selection.modifier_selection_rule
+        == "any_inner_fold_union"
+    )
 
 
 @pytest.mark.parametrize(

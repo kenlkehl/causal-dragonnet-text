@@ -755,8 +755,8 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "input_temporal_scope": "pre_index_treatment",
     "statistical_selection": {
       "l1_ratio": 0.8,
-      "nuisance_selection_frequency": 0.6,
-      "modifier_selection_frequency": 0.6,
+      "nuisance_selection_rule": "any_inner_fold_union",
+      "modifier_selection_rule": "any_inner_fold_union",
       "internal_cv_folds": 3,
       "regularization_grid_size": 16,
       "optimization_tolerance": 1e-6,
@@ -1110,18 +1110,20 @@ Stage 2 then assigns modeling roles deterministically. In every inner fold, a lo
 and a separate group elastic net predicts the marginal outcome. Continuous and
 ordered measurements are standardized single-score groups, while every nominal
 factor's standardized contrasts and missingness indicator form one all-in/all-out
-group. Feature-group selection frequencies are accumulated separately;
-intersection is not a gate. Stable treatment predictors feed the propensity
-nuisance model, stable outcome predictors feed the outcome nuisance model, and
-their union forms the adjustment set for final effect estimation.
+group. Any feature group selected in at least one inner fold for either task
+enters the outer fold's confounder union; intersection and vote-frequency
+thresholds are not gates. Both the propensity and outcome nuisance models use
+that same union. Reports include inner-heldout and pooled out-of-fold AUROC as
+well as log loss for binary nuisance tasks.
 
 Inner-fold random forests then produce one out-of-fold propensity and marginal
 outcome prediction for every outer-training patient. Stage 2 residualizes
 treatment and outcome and fits a group-elastic-net R-learner whose penalized
 blocks are all residualized-treatment-by-candidate interaction columns for one
-measurement. Modifier support must be stable across folds and the selected set
-must improve held-out R-loss. Per-row squared loss is never used as a regression
-target. The nuisance screens use the
+measurement. Any modifier group selected in at least one inner fold enters the
+outer fold's causal-forest modifier union. Held-out R-loss improvement remains
+a reported diagnostic, not a selection gate. Per-row squared loss is never used
+as a regression target. The nuisance screens use the
 one-standard-error rule for sparsity; modifier interactions default to the
 minimum-CV-loss penalty because applying one-SE twice can erase genuine weak
 heterogeneity.

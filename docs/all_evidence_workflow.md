@@ -211,8 +211,8 @@ An external endpoint configuration is:
     },
     "statistical_selection": {
       "l1_ratio": 0.8,
-      "nuisance_selection_frequency": 0.6,
-      "modifier_selection_frequency": 0.6,
+      "nuisance_selection_rule": "any_inner_fold_union",
+      "modifier_selection_rule": "any_inner_fold_union",
       "internal_cv_folds": 3,
       "regularization_grid_size": 16,
       "one_standard_error_rule": true,
@@ -951,17 +951,19 @@ logistic group elastic net for treatment and a separate group elastic net for
 the marginal outcome. Ordered measurements use one standardized numerical
 score. A nominal factor's standardized contrasts and missingness indicator are
 penalized as one group, so its selection does not depend on one surviving dummy
-coefficient. Feature groups earn treatment and outcome stability votes
-separately; their intersection is never required. Stable treatment predictors
-feed the propensity nuisance forest, stable outcome predictors feed the
-marginal-outcome nuisance forest, and their union is retained as the causal
-forest's adjustment set.
+coefficient. Feature groups earn treatment and outcome votes separately. A
+single vote in either task places the feature in the outer-fold confounder
+union; their intersection and higher vote thresholds are never required. Both
+the propensity and marginal-outcome nuisance forests use that common union.
+For binary targets, the report records inner-heldout and pooled out-of-fold
+AUROC alongside log loss.
 
 Those forests generate one inner-heldout propensity and outcome prediction for
 every outer-training row. Treatment and outcome are residualized, and a second
 group elastic net directly minimizes R-loss using grouped
-residualized-treatment-by-feature columns. Modifier groups receive stability
-votes across inner folds, and the stable set must improve held-out R-loss. The
+residualized-treatment-by-feature columns. A modifier group selected in any
+inner fold enters the final causal-forest union. Held-out R-loss support remains
+a diagnostic and is not a selection gate. The
 nuisance screens use the
 one-standard-error rule; the modifier screen defaults to the minimum-CV-loss
 penalty. No per-row squared-loss target is used. Pairwise associations and the

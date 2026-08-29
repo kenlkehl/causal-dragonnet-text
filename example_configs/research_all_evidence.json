@@ -66,8 +66,8 @@
     },
     "statistical_selection": {
       "l1_ratio": 0.8,
-      "nuisance_selection_frequency": 0.6,
-      "modifier_selection_frequency": 0.6,
+      "nuisance_selection_rule": "any_inner_fold_union",
+      "modifier_selection_rule": "any_inner_fold_union",
       "internal_cv_folds": 3,
       "regularization_grid_size": 16,
       "optimization_tolerance": 1e-6,

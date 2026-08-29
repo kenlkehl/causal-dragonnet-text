@@ -4,15 +4,14 @@ The selector has one deliberately narrow job: turn the frozen, extracted
 outer-training candidate matrix into three empirical feature sets without
 consulting the outer-heldout partition:
 
-* stable predictors of treatment for the propensity nuisance model;
-* stable predictors of the marginal outcome for the outcome nuisance model;
-* stable treatment-interaction terms selected by an R-learner.
+* predictors selected in any inner fold for treatment or marginal outcome;
+* treatment-interaction terms selected in any inner fold by an R-learner.
 
-Treatment and outcome supports are retained separately.  Their union is the
-adjustment set used by the final causal forest, but the separate supports are
-persisted on each definition so the final propensity and outcome forests can
-use their own inputs.  R-learner targets are built from inner-fold out-of-fold
-nuisance predictions.  No pairwise clustering or latent construction occurs.
+The union of treatment and outcome selections is the outer-fold confounder set
+and is used by both nuisance models.  R-learner targets are built from
+inner-fold out-of-fold nuisance predictions using that common set.  The union
+of all nonzero inner-fold modifier groups is passed to the final causal forest.
+No pairwise clustering or latent construction occurs here.
 """
 
 from __future__ import annotations
@@ -25,10 +24,10 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import log_loss, mean_squared_error
+from sklearn.metrics import log_loss, mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold
 
-SCHEMA_VERSION = "stage2_group_elastic_net_rlearner_selection_v2"
+SCHEMA_VERSION = "stage2_group_elastic_net_rlearner_selection_v3_any_fold_union"
 TEMPORAL_SCOPE = "pre_index_treatment"
 
 
@@ -37,6 +36,10 @@ class Stage2ElasticNetSelectionConfig:
     """Scientific and numerical policy for deterministic grouped selection."""
 
     l1_ratio: float = 0.8
+    nuisance_selection_rule: str = "any_inner_fold_union"
+    modifier_selection_rule: str = "any_inner_fold_union"
+    # Retained only so older configuration files remain loadable. Selection no
+    # longer uses frequency thresholds; public_dict deliberately omits them.
     nuisance_selection_frequency: float = 0.6
     modifier_selection_frequency: float = 0.6
     internal_cv_folds: int = 3
@@ -55,6 +58,12 @@ class Stage2ElasticNetSelectionConfig:
     modifier_min_positive_fold_fraction: float = 0.4
 
     def validate(self) -> None:
+        for name in ("nuisance_selection_rule", "modifier_selection_rule"):
+            if getattr(self, name) != "any_inner_fold_union":
+                raise ValueError(
+                    f"stage2.statistical_selection.{name} must be "
+                    "'any_inner_fold_union'"
+                )
         for name in (
             "l1_ratio",
             "nuisance_selection_frequency",
@@ -135,7 +144,10 @@ class Stage2ElasticNetSelectionConfig:
                 )
 
     def public_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        result.pop("nuisance_selection_frequency", None)
+        result.pop("modifier_selection_frequency", None)
+        return result
 
 
 def statistical_selection_config_from_mapping(
@@ -863,18 +875,8 @@ def _selected_feature_ids(
     return selected, dict(sorted(magnitudes.items()))
 
 
-def _required_votes(frequency: float, folds: int) -> int:
-    return int(math.ceil(float(frequency) * int(folds)))
-
-
-def _stable_ids(
-    votes: Mapping[str, int],
-    *,
-    frequency: float,
-    folds: int,
-) -> tuple[set[str], int]:
-    required = _required_votes(frequency, folds)
-    return {key for key, value in votes.items() if int(value) >= required}, required
+def _selected_in_any_inner_fold(votes: Mapping[str, int]) -> set[str]:
+    return {key for key, value in votes.items() if int(value) >= 1}
 
 
 class _ConstantProbabilityModel:
@@ -948,6 +950,15 @@ def _loss(observed: np.ndarray, predicted: np.ndarray, *, binary: bool) -> float
     return float(mean_squared_error(observed, predicted))
 
 
+def _safe_auroc(observed: np.ndarray, predicted: np.ndarray) -> float | None:
+    observed = np.asarray(observed)
+    predicted = np.asarray(predicted, dtype=float)
+    mask = np.isfinite(observed) & np.isfinite(predicted)
+    if int(np.sum(mask)) < 2 or len(np.unique(observed[mask])) < 2:
+        return None
+    return float(roc_auc_score(observed[mask].astype(int), predicted[mask]))
+
+
 def select_stage2_features_elastic_net(
     *,
     dataset: pd.DataFrame,
@@ -988,6 +999,10 @@ def select_stage2_features_elastic_net(
     outcome_votes = {feature_id: 0 for feature_id in by_id}
     screen_folds: list[dict[str, Any]] = []
     binary_outcome = str(outcome_type) == "binary"
+    screen_t_observed: list[np.ndarray] = []
+    screen_t_predicted: list[np.ndarray] = []
+    screen_y_observed: list[np.ndarray] = []
+    screen_y_predicted: list[np.ndarray] = []
 
     for position, split in enumerate(folds, start=1):
         train_ids = [int(value) for value in split.get("fit_row_ids") or []]
@@ -1047,6 +1062,10 @@ def select_stage2_features_elastic_net(
             treatment_votes[feature_id] += 1
         for feature_id in outcome_selected:
             outcome_votes[feature_id] += 1
+        screen_t_observed.append(t_valid)
+        screen_t_predicted.append(treatment_fit.valid_prediction)
+        screen_y_observed.append(y_valid)
+        screen_y_predicted.append(outcome_fit.valid_prediction)
         screen_folds.append(
             {
                 "inner_fold": int(split.get("inner_fold", position)),
@@ -1068,6 +1087,10 @@ def select_stage2_features_elastic_net(
                             labels=[0, 1],
                         )
                     ),
+                    "heldout_auroc": _safe_auroc(
+                        t_valid,
+                        treatment_fit.valid_prediction,
+                    ),
                 },
                 "outcome": {
                     "status": outcome_fit.status,
@@ -1082,35 +1105,30 @@ def select_stage2_features_elastic_net(
                         outcome_fit.valid_prediction,
                         binary=binary_outcome,
                     ),
+                    "heldout_auroc": (
+                        _safe_auroc(y_valid, outcome_fit.valid_prediction)
+                        if binary_outcome
+                        else None
+                    ),
                 },
             }
         )
 
-    stable_treatment, nuisance_required = _stable_ids(
-        treatment_votes,
-        frequency=float(policy.nuisance_selection_frequency),
-        folds=len(folds),
-    )
-    stable_outcome, _ = _stable_ids(
-        outcome_votes,
-        frequency=float(policy.nuisance_selection_frequency),
-        folds=len(folds),
-    )
+    any_treatment = _selected_in_any_inner_fold(treatment_votes)
+    any_outcome = _selected_in_any_inner_fold(outcome_votes)
     locked_confounders = {
         _feature_key(feature)
         for feature in original
         if feature.get("configured_explicit_feature") is True
         and "confounder" in set(map(str, feature.get("roles") or []))
     }
-    stable_treatment.update(locked_confounders)
-    stable_outcome.update(locked_confounders)
+    confounder_union = any_treatment | any_outcome | locked_confounders
 
-    treatment_definitions = [
-        by_id[feature_id] for feature_id in by_id if feature_id in stable_treatment
+    nuisance_definitions = [
+        by_id[feature_id] for feature_id in by_id if feature_id in confounder_union
     ]
-    outcome_definitions = [
-        by_id[feature_id] for feature_id in by_id if feature_id in stable_outcome
-    ]
+    treatment_definitions = nuisance_definitions
+    outcome_definitions = nuisance_definitions
     all_fit_ids = sorted(
         {
             int(value)
@@ -1176,7 +1194,11 @@ def select_stage2_features_elastic_net(
                 "heldout_treatment_log_loss": float(
                     log_loss(t_valid, e_valid, labels=[0, 1])
                 ),
+                "heldout_treatment_auroc": _safe_auroc(t_valid, e_valid),
                 "heldout_outcome_loss": _loss(y_valid, m_valid, binary=binary_outcome),
+                "heldout_outcome_auroc": (
+                    _safe_auroc(y_valid, m_valid) if binary_outcome else None
+                ),
             }
         )
     if np.isnan(oof_e).any() or np.isnan(oof_m).any():
@@ -1262,11 +1284,7 @@ def select_stage2_features_elastic_net(
             }
         )
 
-    stable_modifiers, modifier_required = _stable_ids(
-        modifier_votes,
-        frequency=float(policy.modifier_selection_frequency),
-        folds=len(folds),
-    )
+    modifier_union = _selected_in_any_inner_fold(modifier_votes)
     locked_modifiers = {
         _feature_key(feature)
         for feature in original
@@ -1281,23 +1299,19 @@ def select_stage2_features_elastic_net(
         >= float(policy.modifier_min_mean_r_loss_improvement)
         and positive_fraction >= float(policy.modifier_min_positive_fold_fraction)
     )
-    if not modifier_set_supported:
-        stable_modifiers.clear()
-    stable_modifiers.update(locked_modifiers)
+    modifier_union.update(locked_modifiers)
 
     selected: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
     for feature in original:
         feature_id = _feature_key(feature)
-        nuisance_roles: list[str] = []
-        if feature_id in stable_treatment:
-            nuisance_roles.append("treatment")
-        if feature_id in stable_outcome:
-            nuisance_roles.append("outcome")
+        nuisance_roles = (
+            ["treatment", "outcome"] if feature_id in confounder_union else []
+        )
         roles: list[str] = []
         if nuisance_roles:
             roles.append("confounder")
-        if feature_id in stable_modifiers:
+        if feature_id in modifier_union:
             roles.append("effect_modifier")
         configured = feature.get("configured_explicit_feature") is True
         if configured:
@@ -1327,7 +1341,7 @@ def select_stage2_features_elastic_net(
                 "selection_source": (
                     "investigator_locked"
                     if configured
-                    else "group_elastic_net_inner_fold_stability"
+                    else "group_elastic_net_any_inner_fold_union"
                 ),
             }
         )
@@ -1338,7 +1352,7 @@ def select_stage2_features_elastic_net(
             updated["selection_source"] = (
                 "investigator_locked"
                 if configured
-                else "group_elastic_net_inner_fold_stability"
+                else "group_elastic_net_any_inner_fold_union"
             )
             selected.append(updated)
 
@@ -1347,7 +1361,7 @@ def select_stage2_features_elastic_net(
         "temporal_scope": TEMPORAL_SCOPE,
         "status": "complete",
         "selection_method": (
-            "separate_group_elastic_net_nuisance_supports_and_group_r_learner"
+            "any_inner_fold_union_group_elastic_net_nuisance_and_group_r_learner"
         ),
         "penalized_model_family": "group_lasso_plus_ridge",
         "encoding": {
@@ -1362,22 +1376,41 @@ def select_stage2_features_elastic_net(
         "inner_folds": len(folds),
         "nuisance_screen": {
             "folds": screen_folds,
-            "required_votes": nuisance_required,
+            "selection_rule": "selected_in_any_inner_fold_for_either_task",
+            "required_votes": 1,
             "treatment_votes": dict(sorted(treatment_votes.items())),
             "outcome_votes": dict(sorted(outcome_votes.items())),
-            "stable_treatment_feature_ids": sorted(stable_treatment),
-            "stable_outcome_feature_ids": sorted(stable_outcome),
+            "stable_treatment_feature_ids": sorted(any_treatment),
+            "stable_outcome_feature_ids": sorted(any_outcome),
+            "union_confounder_feature_ids": sorted(confounder_union),
             "intersection_is_not_a_selection_gate": True,
+            "union_is_used_by_both_nuisance_models": True,
+            "overall_treatment_auroc": _safe_auroc(
+                np.concatenate(screen_t_observed),
+                np.concatenate(screen_t_predicted),
+            ),
+            "overall_outcome_auroc": (
+                _safe_auroc(
+                    np.concatenate(screen_y_observed),
+                    np.concatenate(screen_y_predicted),
+                )
+                if binary_outcome
+                else None
+            ),
         },
         "cross_fitted_nuisance_models": {
             "model_family": "random_forest",
-            "treatment_feature_ids": sorted(stable_treatment),
-            "outcome_feature_ids": sorted(stable_outcome),
+            "treatment_feature_ids": sorted(confounder_union),
+            "outcome_feature_ids": sorted(confounder_union),
             "folds": nuisance_folds,
             "overall_treatment_log_loss": float(
                 log_loss(t_all, oof_e, labels=[0, 1])
             ),
             "overall_outcome_loss": _loss(y_all, oof_m, binary=binary_outcome),
+            "overall_treatment_auroc": _safe_auroc(t_all, oof_e),
+            "overall_outcome_auroc": (
+                _safe_auroc(y_all, oof_m) if binary_outcome else None
+            ),
             "propensity_min": float(np.min(oof_e)),
             "propensity_max": float(np.max(oof_e)),
             "predictions_are_inner_fold_out_of_fold": True,
@@ -1388,12 +1421,14 @@ def select_stage2_features_elastic_net(
                 "per-row squared loss is not used as a regression target"
             ),
             "folds": modifier_folds,
-            "required_votes": modifier_required,
+            "selection_rule": "selected_in_any_inner_fold",
+            "required_votes": 1,
             "votes": dict(sorted(modifier_votes.items())),
             "mean_heldout_r_loss_improvement": mean_r_improvement,
             "positive_fold_fraction": positive_fraction,
             "set_passed_heldout_r_loss_gate": modifier_set_supported,
-            "stable_effect_modifier_feature_ids": sorted(stable_modifiers),
+            "heldout_r_loss_gate_is_not_a_selection_gate": True,
+            "stable_effect_modifier_feature_ids": sorted(modifier_union),
         },
         "decisions": decisions,
         "retained_feature_ids": [_feature_key(feature) for feature in selected],
