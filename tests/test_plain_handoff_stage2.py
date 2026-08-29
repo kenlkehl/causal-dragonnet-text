@@ -166,6 +166,9 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config.agentic_selection.cluster_similarity_threshold == 0.60
     assert config.agentic_selection.cluster_consensus_fraction == 0.60
     assert config.agentic_selection.max_latents_per_cluster == 2
+    assert config.selection_consolidation.enabled is False
+    assert config.selection_consolidation.neighbor_count == 10
+    assert config.selection_consolidation.minimum_pairwise_association == 0.85
     assert config.workers == 4
 
 
@@ -299,6 +302,15 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
                 "cluster_tool_call_limit": 6,
                 "adjudicator_tool_call_limit": 7,
             },
+            "selection_consolidation": {
+                "enabled": True,
+                "neighbor_count": 8,
+                "embedding_model": "test-embedding-model",
+                "embedding_device": "cpu",
+                "max_latents_per_cluster": 3,
+                "minimum_pairwise_association": 0.9,
+                "latent_min_coverage": 0.1,
+            },
         },
         default_workers=1,
     )
@@ -335,6 +347,12 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.agentic_selection.cluster_consensus_fraction == 0.8
     assert config.agentic_selection.cluster_max_size == 10
     assert config.agentic_selection.cluster_tool_call_limit == 6
+    assert config.selection_consolidation.enabled is True
+    assert config.selection_consolidation.neighbor_count == 8
+    assert config.selection_consolidation.embedding_model == "test-embedding-model"
+    assert config.selection_consolidation.max_latents_per_cluster == 3
+    assert config.selection_consolidation.minimum_pairwise_association == 0.9
+    assert config.selection_consolidation.latent_min_coverage == 0.1
     assert config.public_dict()["max_tokens"] == 148_000
     assert config.public_dict()["request_timeout"] == 1_200.0
     assert config.public_dict()["request_attempt_timeout"] == 120.0
@@ -532,12 +550,16 @@ def test_stage2_config_rejects_invalid_agentic_selection_policy(field_name, valu
         "effect_modifier_min_inner_fold_fraction",
     ],
 )
-def test_stage2_config_rejects_retired_p_value_screen_settings(removed_key):
-    with pytest.raises(ValueError, match="p-value vote screen was removed"):
-        plain_stage2_config_from_mapping(
-            {"endpoint": "http://stage2.test/v1", removed_key: 1},
-            default_workers=1,
-        )
+def test_stage2_config_migrates_retired_p_value_screen_settings(removed_key, caplog):
+    config = plain_stage2_config_from_mapping(
+        {"endpoint": "http://stage2.test/v1", removed_key: 1},
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert "migrating legacy Stage 2 screen settings" in caplog.text
+    assert config.statistical_selection.nuisance_selection_frequency == 0.6
+    assert config.statistical_selection.modifier_selection_frequency == 0.6
 
 
 @pytest.mark.parametrize(
@@ -729,12 +751,12 @@ def test_stage2_config_rejects_invalid_max_tokens(max_tokens):
 
 @pytest.mark.parametrize(
     "extraction_max_tokens",
-    [0, -1, 59_999, True, 1.5, "60000"],
+    [0, -1, 4_095, True, 1.5, "4096"],
 )
 def test_stage2_config_rejects_invalid_extraction_max_tokens(extraction_max_tokens):
     with pytest.raises(
         ValueError,
-        match="extraction_max_tokens must be an integer of at least 60000",
+        match="extraction_max_tokens must be an integer of at least 4096",
     ):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
@@ -1235,6 +1257,64 @@ def test_json_repair_stops_after_ten_repairs():
         )
 
     assert len(calls) == 11
+
+
+def test_json_repair_audits_invalid_responses_and_uses_repeated_error_fallback():
+    conversations = []
+    events = []
+
+    def completion(messages, _config):
+        conversations.append([dict(message) for message in messages])
+        return '{"ok":false,"condition":{"operator":"present"}}'
+
+    def validate(value):
+        if value.get("ok") is not True:
+            raise ValueError("rule condition references unavailable feature ''")
+        return dict(value)
+
+    fallback = {
+        "ok": True,
+        "action": "leave_unchanged",
+        "rationale": "Conservative fallback.",
+    }
+    result = stage2_workflow._request_json(
+        messages=[
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": "Return a schema-valid decision."},
+        ],
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+        completion=completion,
+        validate=validate,
+        repair_context={
+            "allowed_feature_ids": ["feature_a", "feature_b"],
+            "valid_expression_examples": {
+                "coalesce": {
+                    "op": "coalesce",
+                    "feature_ids": ["feature_a", "feature_b"],
+                }
+            },
+            "conservative_response": fallback,
+        },
+        validation_event_observer=lambda event: events.append(dict(event)),
+        conservative_validation_fallback=fallback,
+        fallback_after_same_error=3,
+    )
+
+    assert result == fallback
+    assert len(conversations) == 3
+    assert "feature_a" in conversations[1][-1]["content"]
+    assert "Valid categorical-rule expression examples" in conversations[1][-1]["content"]
+    assert "has now occurred 2 times" in conversations[2][-1]["content"]
+    assert "leave_unchanged" in conversations[2][-1]["content"]
+    invalid_events = [event for event in events if event["event"] == "invalid_response"]
+    assert len(invalid_events) == 3
+    assert invalid_events[0]["raw_response"].startswith('{"ok":false')
+    assert invalid_events[-1]["same_error_occurrence"] == 3
+    assert events[-1]["event"] == "conservative_fallback"
+    assert events[-1]["trigger"] == "repeated_identical_validation_error"
 
 
 def test_json_repair_enables_thinking_after_five_repairs():
@@ -8787,8 +8867,6 @@ def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
     third_completed = threading.Event()
     second_completed = threading.Event()
     completion_order = []
-    evidence_budgets = {}
-    evidence_executors = set()
 
     monkeypatch.setattr(
         runner,
@@ -8798,9 +8876,8 @@ def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
 
     def run_outer_fold(**kwargs):
         outer_fold = int(kwargs["outer_fold"])
-        evidence_budgets[outer_fold] = int(kwargs["agentic_evidence_workers"])
-        evidence_executors.add(id(kwargs["agentic_evidence_executor"]))
-        assert kwargs["agentic_evidence_executor"] is not None
+        assert "agentic_evidence_workers" not in kwargs
+        assert "agentic_evidence_executor" not in kwargs
         barrier.wait(timeout=2.0)
         if outer_fold == 2:
             assert third_completed.wait(timeout=2.0)
@@ -8847,8 +8924,6 @@ def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
         .splitlines()
     ]
     assert completion_order == [3, 2, 1]
-    assert evidence_budgets == {1: 3, 2: 3, 3: 3}
-    assert len(evidence_executors) == 1
     assert [row["outer_fold"] for row in persisted] == [1, 2, 3]
     assert result["outer_folds"] == 3
     assert result["nonconverged_outer_folds"] == [2]
@@ -8964,20 +9039,18 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
     assert (output / "causal_estimate.json").is_file()
     assert (output / "posthoc_oracle_ite_metrics.json").is_file()
     assert (output / "posthoc_predictions_with_oracle_ite.csv").is_file()
-    selection_path = output / "outer_001" / "selection" / "agentic_selection.json"
+    selection_path = output / "outer_001" / "selection" / "elastic_net_selection.json"
     assert selection_path.is_file()
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
-    assert selection["schema_version"] == "stage2_agentic_role_selection_v1"
-    assert selection["p_values_are_evidence_only"] is True
-    assert selection["confounder_pass"]["cluster_reports"][0]["role"] == "confounder"
-    assert (
-        output
-        / "outer_001"
-        / "selection"
-        / "stage2_evidence"
-        / "inner_001"
-        / "confounder_univariable.jsonl"
-    ).is_file()
+    assert selection["schema_version"] == (
+        stage2_analysis.STAGE2_ROLE_SELECTION_SCHEMA_VERSION
+    )
+    assert selection["latent_construction"] == "disabled"
+    assert selection["pairwise_association_screen"] == "disabled"
+    assert selection["cross_fitted_nuisance_models"][
+        "predictions_are_inner_fold_out_of_fold"
+    ] is True
+    assert not (output / "outer_001" / "selection" / "stage2_evidence").exists()
     assert (
         output
         / "outer_001"
@@ -9002,8 +9075,8 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
         "criterion": "gini",
     }
     assert "extract_stage2_patient_variables" not in primary_calls
-    assert "analyze_stage2_variable_cluster" in primary_calls
-    assert "adjudicate_stage2_variable_role" in primary_calls
+    assert "analyze_stage2_variable_cluster" not in primary_calls
+    assert "adjudicate_stage2_variable_role" not in primary_calls
     assert extraction_calls
     assert set(extraction_calls) == {"extract_stage2_patient_variables"}
     calls_after_first = (len(primary_calls), len(extraction_calls))
@@ -9248,6 +9321,30 @@ def test_aggregate_supervisor_can_revise_then_reextract_a_definition(
         return original_extract_rows(**kwargs)
 
     monkeypatch.setattr(stage2_analysis, "extract_rows", tracked_extract_rows)
+
+    def retain_revised_definition(**kwargs):
+        selected = [
+            {
+                **kwargs["definitions"][0],
+                "roles": ["confounder"],
+                "nuisance_model_roles": ["treatment", "outcome"],
+            }
+        ]
+        return (
+            selected,
+            {
+                "schema_version": stage2_analysis.STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+                "status": "complete",
+            },
+            selected,
+            [],
+        )
+
+    monkeypatch.setattr(
+        stage2_analysis,
+        "select_stage2_features_elastic_net",
+        retain_revised_definition,
+    )
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
@@ -9494,7 +9591,7 @@ def test_fold_reselection_uses_frozen_preselection_without_training_extraction(
     )
     monkeypatch.setattr(
         stage2_analysis,
-        "select_stage2_features_agentically",
+        "select_stage2_features_elastic_net",
         lambda **_kwargs: (
             [],
             {
@@ -9735,7 +9832,7 @@ def test_fold_reselection_reuses_archived_heldout_components_and_extracts_only_m
     selected = [{**definition, "roles": ["confounder"]} for definition in definitions]
     monkeypatch.setattr(
         stage2_analysis,
-        "select_stage2_features_agentically",
+        "select_stage2_features_elastic_net",
         lambda **_kwargs: (
             selected,
             {

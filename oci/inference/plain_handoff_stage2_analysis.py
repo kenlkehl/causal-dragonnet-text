@@ -25,15 +25,19 @@ from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
-from joblib.externals.loky import ProcessPoolExecutor
 
 from ..models.causal_forest_head import CausalForestHead
-from .stage2_agentic_selection import (
-    DEFAULT_PAIRWISE_CHUNK_SIZE,
-    SCHEMA_VERSION as AGENTIC_SELECTION_SCHEMA_VERSION,
+from .stage2_elastic_net_selection import (
+    SCHEMA_VERSION as ELASTIC_NET_COMPONENT_SCHEMA_VERSION,
     TEMPORAL_SCOPE,
+    select_stage2_features_elastic_net,
+)
+from .stage2_sequential_consolidation import (
+    SELECTION_SCHEMA_VERSION,
+    consolidate_stage2_candidates,
+    latent_states_for_selected,
     materialize_selected_latents,
-    select_stage2_features_agentically,
+    measurement_definitions_for_selected,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -56,9 +60,9 @@ PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
 REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_aggregate_ontology_supervisor_v1"
 REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_ontology_supervisor_convergence_v1"
 ESTIMATION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_outer_estimation_v5_outcome_typed_causal_forest"
+    "stage2_outer_estimation_v6_separate_nuisance_supports"
 )
-STAGE2_ROLE_SELECTION_SCHEMA_VERSION = AGENTIC_SELECTION_SCHEMA_VERSION
+STAGE2_ROLE_SELECTION_SCHEMA_VERSION = SELECTION_SCHEMA_VERSION
 PRESELECTION_SNAPSHOT_SCHEMA_VERSION = "stage2_frozen_preselection_snapshot_v1"
 HELDOUT_MEASUREMENT_CACHE_SCHEMA_VERSION = (
     "stage2_frozen_heldout_measurement_cache_v1"
@@ -5495,6 +5499,40 @@ def _definitions_for_roles(
     ]
 
 
+def _definitions_for_nuisance_role(
+    definitions: Sequence[Mapping[str, Any]],
+    role: str,
+) -> list[Mapping[str, Any]]:
+    """Use persisted treatment/outcome supports with legacy-safe fallbacks."""
+
+    if role not in {"treatment", "outcome"}:
+        raise ValueError("nuisance role must be treatment or outcome")
+    definitions = list(definitions)
+    has_separate_supports = any(
+        "nuisance_model_roles" in feature for feature in definitions
+    )
+    if not has_separate_supports:
+        return (
+            _definitions_for_roles(definitions, {"confounder"})
+            if role == "treatment"
+            else definitions
+        )
+    selected = [
+        feature
+        for feature in definitions
+        if role in set(map(str, feature.get("nuisance_model_roles") or []))
+    ]
+    if role == "outcome":
+        selected_ids = {str(feature.get("feature_id") or feature["name"]) for feature in selected}
+        selected.extend(
+            feature
+            for feature in definitions
+            if "effect_modifier" in set(map(str, feature.get("roles") or []))
+            and str(feature.get("feature_id") or feature["name"]) not in selected_ids
+        )
+    return selected
+
+
 class _ConstantClassifier:
     classes_ = np.asarray([0, 1], dtype=int)
 
@@ -8359,7 +8397,8 @@ def _cross_fitted_nuisance(
     mu0 = np.full(len(fit_ids), np.nan)
     mu1 = np.full(len(fit_ids), np.nan)
     extracted_by_id = extracted.set_index("_oci_row_id", drop=False)
-    propensity_defs = _definitions_for_roles(definitions, {"confounder"})
+    propensity_defs = _definitions_for_nuisance_role(definitions, "treatment")
+    outcome_defs = _definitions_for_nuisance_role(definitions, "outcome")
     for fold_index, fold in enumerate(inner_splits, start=1):
         train_ids = [int(value) for value in fold["fit_row_ids"] if int(value) in position]
         valid_ids = [int(value) for value in fold["heldout_row_ids"] if int(value) in position]
@@ -8371,7 +8410,7 @@ def _cross_fitted_nuisance(
         t_train = train_data[treatment_column].to_numpy(dtype=float)
         y_train = train_data[outcome_column].to_numpy(dtype=float)
         t_encoder = _FeatureEncoder(propensity_defs).fit(train_features)
-        y_encoder = _FeatureEncoder(definitions).fit(train_features)
+        y_encoder = _FeatureEncoder(outcome_defs).fit(train_features)
         x_t_train = t_encoder.transform(train_features)
         x_t_valid = t_encoder.transform(valid_features)
         x_y_train = y_encoder.transform(train_features)
@@ -8469,16 +8508,18 @@ def estimate_outer_fold(
     t_heldout = heldout_data[treatment_column].to_numpy(dtype=float)
     y_heldout = heldout_data[outcome_column].to_numpy(dtype=float)
 
-    propensity_defs = _definitions_for_roles(definitions, {"confounder"})
+    adjustment_defs = _definitions_for_roles(definitions, {"confounder"})
+    propensity_defs = _definitions_for_nuisance_role(definitions, "treatment")
+    outcome_defs = _definitions_for_nuisance_role(definitions, "outcome")
     effect_defs = _definitions_for_roles(definitions, {"effect_modifier"})
     effect_ids = {str(feature["feature_id"]) for feature in effect_defs}
     pure_confounder_defs = [
         feature
-        for feature in propensity_defs
+        for feature in adjustment_defs
         if str(feature["feature_id"]) not in effect_ids
     ]
     t_encoder = _FeatureEncoder(propensity_defs).fit(extracted_fit)
-    y_encoder = _FeatureEncoder(definitions).fit(extracted_fit)
+    y_encoder = _FeatureEncoder(outcome_defs).fit(extracted_fit)
     effect_encoder = _FeatureEncoder(effect_defs).fit(extracted_fit)
     control_encoder = _FeatureEncoder(pure_confounder_defs).fit(extracted_fit)
     x_t_fit = t_encoder.transform(extracted_fit)
@@ -8601,13 +8642,15 @@ def estimate_outer_fold(
         "rows": len(heldout_ids),
         "fit_rows": len(fit_ids),
         "features": len(definitions),
-        "confounders": len(propensity_defs),
+        "confounders": len(adjustment_defs),
+        "treatment_nuisance_features": len(propensity_defs),
+        "outcome_nuisance_features": len(outcome_defs),
         "effect_modifiers": len(effect_defs),
         "pure_confounders_in_w": len(pure_confounder_defs),
         "dual_role_features_in_x_only": len(
             [
                 feature
-                for feature in propensity_defs
+                for feature in adjustment_defs
                 if str(feature["feature_id"]) in effect_ids
             ]
         ),
@@ -9360,11 +9403,10 @@ def run_fold_analysis(
     seed: int,
     output_dir: Path,
     request_json: RequestJSON,
+    selection_consolidation_request_json: RequestJSON | None = None,
     config: Any,
     extraction_tokenizer: Any | None = None,
     stage1_packets: Sequence[Mapping[str, Any]] = (),
-    agentic_evidence_workers: int = 1,
-    agentic_evidence_executor: ProcessPoolExecutor | None = None,
 ) -> dict[str, Any]:
     """Run extraction supervision, fold-local selection, and causal-forest estimation."""
 
@@ -9607,17 +9649,20 @@ def run_fold_analysis(
     if legacy_selection_path.exists():
         raise RuntimeError(
             "this outer fold contains a retired Stage 2 p-value-screen checkpoint. "
-            "Preserve it for audit and use a fresh Stage 2 output directory for the "
-            "agentic selection schema."
+            "Preserve it for audit and use guarded reselection for the group-elastic-net "
+            "selection schema."
         )
     if str(getattr(config, "input_temporal_scope", "")) != TEMPORAL_SCOPE:
         raise ValueError(
             f"Stage 2 requires input_temporal_scope={TEMPORAL_SCOPE!r}; it does not "
             "perform semantic temporal filtering"
         )
-    agentic_policy = getattr(config, "agentic_selection", None)
-    if agentic_policy is None:
-        raise ValueError("Stage 2 config is missing agentic_selection policy")
+    statistical_policy = getattr(config, "statistical_selection", None)
+    if statistical_policy is None:
+        raise ValueError("Stage 2 config is missing statistical_selection policy")
+    consolidation_policy = getattr(config, "selection_consolidation", None)
+    if consolidation_policy is None:
+        raise ValueError("Stage 2 config is missing selection_consolidation policy")
     selection_input = {
         "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
         "temporal_scope": TEMPORAL_SCOPE,
@@ -9629,10 +9674,12 @@ def run_fold_analysis(
         "definitions": current,
         "inner_splits": inner_splits,
         "outcome_type": outcome_type,
-        "agentic_selection_policy": agentic_policy.public_dict(),
+        "selection_consolidation_policy": consolidation_policy.scientific_dict(),
+        "selection_consolidation_llm_model": str(getattr(config, "model", "")),
+        "statistical_selection_policy": statistical_policy.public_dict(),
     }
     selection_fingerprint = _value_fingerprint(selection_input)
-    selection_report_path = selection_dir / "agentic_selection.json"
+    selection_report_path = selection_dir / "elastic_net_selection.json"
     selected_path = selection_dir / "selected_definitions.json"
     dependencies_path = selection_dir / "measurement_definitions.json"
     latent_states_path = selection_dir / "selected_latent_states.json"
@@ -9642,6 +9689,7 @@ def run_fold_analysis(
     selected: list[dict[str, Any]] | None = None
     measurement_definitions: list[dict[str, Any]] | None = None
     latent_states: list[dict[str, Any]] | None = None
+    modeling_fit_frame: pd.DataFrame | None = None
     if (
         selection_report_path.is_file()
         and selected_path.is_file()
@@ -9672,7 +9720,15 @@ def run_fold_analysis(
                     dict(feature) for feature in cached_dependencies["features"]
                 ]
                 latent_states = [dict(item) for item in cached_latent_states["latents"]]
-                LOGGER.info("skip completed Stage 2 agentic selection: %s", selection_dir)
+                modeling_fit_frame = materialize_selected_latents(
+                    frame=final_fit_all,
+                    latent_states=latent_states,
+                    measurement_definitions=measurement_definitions,
+                )
+                LOGGER.info(
+                    "skip completed Stage 2 group-elastic-net selection: %s",
+                    selection_dir,
+                )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             selection_report = None
             selected = None
@@ -9704,33 +9760,76 @@ def run_fold_analysis(
             {**selection_input, "input_fingerprint": selection_fingerprint},
         )
         (
-            selected,
-            selection_report,
-            measurement_definitions,
-            latent_states,
-        ) = select_stage2_features_agentically(
-            dataset=dataset,
+            consolidated_fit,
+            consolidated_definitions,
+            consolidation_report,
+            all_latent_entries,
+        ) = consolidate_stage2_candidates(
             extracted_fit=final_fit_all,
             definitions=current,
+            request_json=selection_consolidation_request_json or request_json,
+            policy=consolidation_policy,
+            output_dir=selection_dir / "candidate_consolidation",
+            request_model=str(getattr(config, "model", "")),
+            request_runtime_identity=(
+                {
+                    "endpoint": str(consolidation_policy.runtime_llm_endpoint),
+                    "model": str(consolidation_policy.runtime_llm_model),
+                }
+                if str(consolidation_policy.runtime_llm_endpoint).strip()
+                else None
+            ),
+        )
+        (
+            selected,
+            elastic_net_report,
+            _elastic_net_dependencies,
+            _elastic_net_latent_states,
+        ) = select_stage2_features_elastic_net(
+            dataset=dataset,
+            extracted_fit=consolidated_fit,
+            definitions=consolidated_definitions,
             inner_splits=inner_splits,
             treatment_column=treatment_column,
             outcome_column=outcome_column,
             outcome_type=outcome_type,
-            unit_id_column=unit_id_column,
-            stage1_packets=stage1_packets,
-            output_dir=selection_dir,
-            request_json=request_json,
-            policy=agentic_policy,
-            evidence_workers=agentic_evidence_workers,
-            evidence_executor=agentic_evidence_executor,
-            pairwise_chunk_size=int(
-                getattr(
-                    config,
-                    "agentic_evidence_pair_chunk_size",
-                    DEFAULT_PAIRWISE_CHUNK_SIZE,
-                )
-            ),
+            seed=seed,
+            policy=statistical_policy,
         )
+        measurement_definitions = measurement_definitions_for_selected(
+            selected,
+            current,
+        )
+        latent_states = latent_states_for_selected(selected, all_latent_entries)
+        selection_report = {
+            **elastic_net_report,
+            "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+            "elastic_net_component_schema_version": ELASTIC_NET_COMPONENT_SCHEMA_VERSION,
+            "latent_construction": (
+                "sequential_semantic_association_consolidation"
+                if consolidation_policy.enabled
+                else "disabled"
+            ),
+            "pairwise_association_screen": (
+                "unsupervised_preselection_consolidation_only"
+                if consolidation_policy.enabled
+                else "disabled"
+            ),
+            "preselection_consolidation": consolidation_report,
+            "candidate_counts": {
+                "before_consolidation": len(current),
+                "after_consolidation": len(consolidated_definitions),
+                "selected": len(selected),
+            },
+            "measurement_dependency_feature_ids": [
+                str(feature["feature_id"]) for feature in measurement_definitions
+            ],
+            "selected_latent_ids": [
+                str(item["latent_id"]) for item in latent_states
+            ],
+        }
+        modeling_fit_frame = consolidated_fit
+        _write_json(selection_report_path, selection_report)
         _write_json(selected_path, {"features": selected})
         _write_json(dependencies_path, {"features": measurement_definitions})
         _write_json(latent_states_path, {"latents": latent_states})
@@ -9747,13 +9846,10 @@ def run_fold_analysis(
             },
         )
 
+    if modeling_fit_frame is None:
+        raise RuntimeError("Stage 2 selection did not produce a modeling fit frame")
     selected_names = [str(feature["name"]) for feature in selected]
-    fit_materialized = materialize_selected_latents(
-        frame=final_fit_all,
-        latent_states=latent_states,
-        original_definitions=current,
-    )
-    fit_selected = fit_materialized[["_oci_row_id", *selected_names]].copy()
+    fit_selected = modeling_fit_frame[["_oci_row_id", *selected_names]].copy()
     _write_frame(output_dir / "extraction" / "fit" / "extracted.csv", fit_selected)
     _write_frame(output_dir / "extraction" / "fit" / "harmonized.csv", fit_selected)
     if selected:
@@ -9804,12 +9900,12 @@ def run_fold_analysis(
         output_dir / "extraction" / "heldout" / "harmonization.json",
         heldout_harmonization,
     )
-    heldout_materialized = materialize_selected_latents(
+    heldout_with_latents = materialize_selected_latents(
         frame=heldout_measurements,
         latent_states=latent_states,
-        original_definitions=current,
+        measurement_definitions=measurement_definitions,
     )
-    heldout_extraction = heldout_materialized[["_oci_row_id", *selected_names]].copy()
+    heldout_extraction = heldout_with_latents[["_oci_row_id", *selected_names]].copy()
     _write_frame(
         output_dir / "extraction" / "heldout" / "harmonized.csv",
         heldout_extraction,
@@ -9866,13 +9962,21 @@ def run_fold_analysis(
             "measurement_dependencies": measurement_definitions,
             "selected_latent_states_artifact": str(latent_states_path),
             "all_candidate_features": len(current),
+            "active_candidates_after_consolidation": int(
+                selection_report.get("candidate_counts", {}).get(
+                    "after_consolidation", len(current)
+                )
+            ),
+            "selection_consolidation_artifact": str(
+                selection_dir / "candidate_consolidation" / "report.json"
+            ),
             "review_rounds": review_rounds,
             "evaluation_rounds": review_rounds,
             "review_converged": review_converged,
             "review_convergence": review_convergence,
             "ontology_refinement_rounds": ontology_refinement_rounds,
-            "selection_artifact": str(selection_dir / "agentic_selection.json"),
-            "screening_model_family": "agentic_fold_local_mixed_evidence",
+            "selection_artifact": str(selection_dir / "elastic_net_selection.json"),
+            "screening_model_family": "group_elastic_net_nuisance_and_r_learner",
             "final_model_family": "causal_forest_dml",
             "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
         },
@@ -9904,7 +10008,7 @@ def run_fold_analysis(
         "review_converged": review_converged,
         "review_convergence": review_convergence,
         "ontology_refinement_rounds": ontology_refinement_rounds,
-        "screening_model_family": "agentic_fold_local_mixed_evidence",
+        "screening_model_family": "group_elastic_net_nuisance_and_r_learner",
         "selection": selection_report,
         "measurement_dependencies": measurement_definitions,
         "harmonization_validation_fallbacks": harmonization_validation_fallbacks,

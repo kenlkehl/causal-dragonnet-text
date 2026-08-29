@@ -587,6 +587,61 @@ def test_run_wrapper_keeps_managed_servers_alive_for_stage2_and_cleans_up(
     )
 
 
+def test_runtime_disabled_extractor_preserves_identity_without_launching_pool(
+    tmp_path,
+    monkeypatch,
+):
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://primary.test/v1",
+            "model": "large-reviewer",
+            "runtime_disable_extraction": True,
+            "extraction_llm": {
+                "model": "small-extractor",
+                "vllm": {"gpus": [1], "gpus_per_server": 1},
+            },
+        },
+        default_workers=4,
+    )
+    assert config is not None
+    assert config.runtime_disable_extraction is True
+    assert "runtime_disable_extraction" not in config.public_dict()
+
+    def unexpected_launch(**_kwargs):
+        raise AssertionError("the runtime-disabled extractor must not be launched")
+
+    def fake_run(self, **kwargs):
+        assert kwargs["dataset"] is not None
+        assert self.model_identity["extraction"]["selected_model"] == "small-extractor"
+        assert self.extraction_request_config is not None
+        assert self.extraction_completion is not None
+        with pytest.raises(RuntimeError, match="frozen measurement caches"):
+            self.extraction_completion([], self.extraction_request_config)
+        return {"phase": "post_extraction_reselection"}
+
+    monkeypatch.setattr(
+        stage2_workflow,
+        "launch_managed_vllm_servers",
+        unexpected_launch,
+    )
+    monkeypatch.setattr(PlainHandoffStage2, "run", fake_run)
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda request_config: [request_config.model],
+    )
+
+    result = run_plain_handoff_stage2(
+        handoff_path=tmp_path / "handoff.jsonl",
+        output_dir=tmp_path / "stage2",
+        clinical_question="test",
+        config=config,
+        dataset=object(),
+    )
+
+    assert result == {"phase": "post_extraction_reselection"}
+
+
 def test_feature_definition_only_run_never_starts_managed_extractor(
     tmp_path,
     monkeypatch,

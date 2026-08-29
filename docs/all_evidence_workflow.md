@@ -201,14 +201,24 @@ An external endpoint configuration is:
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
     "input_temporal_scope": "pre_index_treatment",
-    "agentic_selection": {
-      "missingness_weight": 0.15,
-      "cluster_similarity_threshold": 0.60,
-      "cluster_consensus_fraction": 0.60,
-      "cluster_max_size": 12,
+    "selection_consolidation": {
+      "enabled": true,
+      "neighbor_count": 10,
+      "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+      "embedding_device": "cpu",
       "max_latents_per_cluster": 2,
-      "cluster_tool_call_limit": 8,
-      "adjudicator_tool_call_limit": 10
+      "minimum_pairwise_association": 0.85
+    },
+    "statistical_selection": {
+      "l1_ratio": 0.8,
+      "nuisance_selection_frequency": 0.6,
+      "modifier_selection_frequency": 0.6,
+      "internal_cv_folds": 3,
+      "regularization_grid_size": 16,
+      "one_standard_error_rule": true,
+      "modifier_one_standard_error_rule": false,
+      "nuisance_forest_trees": 200,
+      "modifier_min_positive_fold_fraction": 0.4
     },
     "estimation_trees": 200,
     "explicit_features": [
@@ -463,8 +473,9 @@ one-feature no-op. If a batch is still structurally invalid after bounded
 repairs, Python writes `fallback.json`, passes every member of that batch
 through unchanged, and records the fallback in the round and root completion
 summaries. This lossless fallback also preserves every configured feature.
-There is no fuzzy blocker, neighbor selection, or pairwise LLM request. Python
-leaves every discovered causal role empty until fold-local agentic selection;
+There is no fuzzy blocker, neighbor selection, or pairwise LLM request during
+discovery-time alias consolidation. Python
+leaves every discovered causal role empty until fold-local group-elastic-net selection;
 investigator-configured features alone carry supplied roles at this point.
 
 Every group remaining after consolidation is operationalized for extraction.
@@ -516,7 +527,7 @@ operational controls include `request_timeout` (900 seconds by default),
 `max_review_rounds`,
 `ontology_refinement_min_failure_patients`,
 `max_ontology_refinement_rounds`, `input_temporal_scope`,
-`agentic_selection`, `estimation_trees`,
+`statistical_selection`, `estimation_trees`,
 `propensity_clip`, `min_nonmissing_fraction`, `max_dominant_fraction`,
 `temperature`, `repetition_penalty`, `interpretation_reasoning_effort`, and
 and `extraction_reasoning_effort`. The nested `extraction_llm` object controls its
@@ -538,7 +549,8 @@ extraction sends `extraction_max_tokens` as a 75,000-token ceiling. Neither is a
 generation target or minimum. A response that reaches its ceiling enters Stage
 2's bounded repair or fallback path. The extraction-only ceiling is transport
 policy and does not invalidate completed feature-definition checkpoints when it
-changes, so an interrupted extraction can resume under a safer ceiling.
+changes, so an interrupted extraction can resume under a safer ceiling (down to
+4,096 tokens).
 Extraction always isolates one patient and never sends more than the configured
 feature batch. Long records are read in ordered, lossless contiguous chunks of
 at most `extraction_chunk_size_tokens` (50,000 by default), preferring nearby
@@ -568,9 +580,9 @@ sequences. Independent outer folds execute concurrently. `stage2.workers`
 controls combined primary-model concurrency, including consolidation and
 supervisor fan-outs; `stage2.extraction_llm.workers` independently controls
 small-model patient extraction without combining patients.
-Stage 2 evidence construction and bounded selection-agent calls occur inside
-each independent outer fold; those checkpoints are reusable independently of
-endpoint URLs.
+Stage 2 sequential candidate consolidation and group-elastic-net selection occur
+inside each independent outer fold;
+those checkpoints are reusable independently of endpoint URLs.
 
 ```bash
 # Run/resume Stage 1 and stop after the handoff.
@@ -589,11 +601,11 @@ The same choice can be stored as `run.mode: "full"`, `"stage1"`, or
 values can also be supplied as `--stage2-endpoint` and `--stage2-model`.
 The small model has `--stage2-extraction-endpoint`,
 `--stage2-extraction-model`, `--stage2-extraction-api-key`, and
-`--stage2-extraction-workers`. Agentic clustering exposes
-`--stage2-cluster-similarity-threshold`,
-`--stage2-cluster-consensus-fraction`, `--stage2-cluster-max-size`, and
-`--stage2-max-latents-per-cluster`; the two output ceilings use
-`--stage2-max-tokens` and `--stage2-extraction-max-tokens`.
+`--stage2-extraction-workers`. Configure grouped selection under
+`stage2.statistical_selection` (or with a `--set` override). Configure the
+preceding equivalence-only alias pass under `stage2.selection_consolidation`.
+The two output
+ceilings use `--stage2-max-tokens` and `--stage2-extraction-max-tokens`.
 Managed mode additionally has `--stage2-vllm-servers`,
 `--stage2-vllm-gpus`, `--stage2-vllm-rapid-switch-seconds`,
 `--stage2-vllm-base-port`,
@@ -626,14 +638,12 @@ uv run python scripts/run_all_evidence.py \
   --stage2-model Qwen/Qwen3.8-27B \
   --stage2-extraction-endpoint http://127.0.0.1:8020/v1 \
   --stage2-extraction-model small-extractor \
-  --stage2-cluster-similarity-threshold 0.60 \
-  --stage2-cluster-consensus-fraction 0.60 \
   --stage2-max-tokens 100000 \
   --stage2-extraction-max-tokens 75000 \
   --stage2-extraction-chunk-size-tokens 50000 \
   --stage2-review-rounds 2 \
-  --stage2-max-latents-per-cluster 2 \
-  --stage2-estimation-trees 200
+  --stage2-estimation-trees 200 \
+  --set stage2.statistical_selection.l1_ratio=0.8
 ```
 
 Any less-common nested value can be set without adding another CLI flag:
@@ -781,14 +791,16 @@ my_stage1_run/
         input.json
         complete.json
       selection/
-        agentic_selection.json
-        stage2_evidence/...
-        confounder_pass/...
-        effect_modifier_pass/...
-        latent_registry.json
+        candidate_consolidation/
+          input.json
+          steps/...
+          registry.json
+          report.json
+          complete.json
+        elastic_net_selection.json
         selected_definitions.json
         measurement_definitions.json
-        selected_latent_states.json
+        selected_latent_states.json       # selected latents and recursive ancestors
       final_definitions.json
       extraction/
         all_candidates_fit/...
@@ -873,8 +885,8 @@ result it verifies every fold's feature-definition fingerprint, completed
 selector input, post-ontology definitions, training-matrix columns and row IDs,
 source text, treatment and outcome values, inner splits, review policy, and
 primary/extraction model IDs. Saved configurations from the retired p-value
-screen are accepted only in this mode; its five obsolete screen settings are
-removed while the new `agentic_selection` defaults or overrides are applied.
+screen are accepted only in this mode; its obsolete p-value settings are
+ignored while the new `statistical_selection` defaults or overrides are applied.
 
 The prior selection, selected-feature extraction, estimation, and root results
 are moved without deletion to `stage2/reselection_archives/`. Each fold receives
@@ -885,14 +897,12 @@ trigger interpretation or outer-training extraction. Interrupted preparation
 resumes through `stage2/reselection_state.json`.
 
 The primary and extraction model IDs must be the same as in the completed run;
-transport endpoints and worker counts may change. The new selector evidence and
-agent calls run from scratch. For each selected original feature or latent
-component, raw held-out values are reused when the archived column has matching
-row, source-text, model, frame, and measurement-definition fingerprints. Only
-missing or definition-incompatible components are sent to the extraction LLM.
-Latents themselves are always materialized deterministically from their measured
-components using parameters fitted on outer-training rows. Causal estimation
-then runs again. `--stage2-reselect` cannot be combined with `--rerun`.
+transport endpoints and worker counts may change. Group-elastic-net selection
+runs from scratch. For each selected original feature, raw held-out values are
+reused when the archived column has matching row, source-text, model, frame, and
+measurement-definition fingerprints. Only missing or definition-incompatible
+measurements are sent to the extraction LLM. Causal estimation then runs again.
+`--stage2-reselect` cannot be combined with `--rerun`.
 
 Raw-packet interpretation checkpoints do not match semantic-card inputs and are
 therefore rerun automatically. If a prior run already produced
@@ -913,50 +923,61 @@ raw training matrix, and repeats for at most
 `max_review_rounds`; `ontology_supervision/convergence.json` records whether the
 latest aggregate ontology was stable.
 
-Agentic role selection is written to `selection/agentic_selection.json`, with
-detailed inputs under `selection/stage2_evidence/`. Every inner-training
-partition retains the one-variable treatment and outcome regressions and adds
-all pairwise mixed-type relationships: Spearman correlations, contingency
-tables with chi-square and bias-corrected Cramer's V, correlation ratios with
-Kruskal-Wallis tests, and missingness relationships. P-values and BH q-values
-are evidence rather than gates. Mixed columns are encoded once into safe
-memory-mapped arrays, pair indices are split into deterministic chunks (512 by
-default), and fold-local loky workers atomically checkpoint each completed
-chunk. Resumption validates both the scientific input and exact chunk contents;
-BH correction is applied only after ordered assembly. The process allocation
-is dynamically work-stealed across concurrent outer folds and never exceeds
-`stage2.workers`, so a larger fold can use capacity released by a smaller one. Role-blind
-clusters are fit independently and combined into outer-training consensus
-clusters. Set `stage2.agentic_evidence_pair_chunk_size` to tune scheduling
-granularity without changing the scientific cache key.
+Before statistical role selection, `selection/candidate_consolidation/` records a
+sequential, outer-training-only pass. The loop visits the original candidate
+order once. At each still-active pivot, the configured embedding model retrieves
+the nearest active neighbors (ten by default), Python calculates Spearman,
+bias-corrected Cramer's V, or correlation-ratio evidence as appropriate, and the
+primary model chooses no replacement or one or more disjoint structured latents.
+Every source pair in a replacement must have an evaluable association of at
+least `minimum_pairwise_association` (0.85 by default), but this is necessary,
+not sufficient. The sources must be aliases for the same attribute, entity,
+time scope, granularity, and scale. Broader/narrower concepts, component/total
+relationships, and merely correlated measurements must remain separate. An
+accepted canonical measurement must consume the pivot and preserve source value
+type, units or category cardinality, and missingness using only coalescing or a
+bijective synonymous-category recode. It immediately replaces its aliases in
+the active pool, so later pivots retrieve the canonical measurement instead.
+Treatment, outcome, causal roles, and outer-heldout rows are absent from every
+consolidation request.
 
-For each cluster, a bounded agent may propose up to two label-blind structured
-latents. The only constructions are a fold-fitted mixed-data component and a
-declarative categorical/numeric rule language; no executable code is accepted.
-Mappings are fit on inner-training values, tested on inner-heldout values, and
-refit on all outer-training rows only after selection. A global agent then
-adjudicates confounders from empirical treatment and outcome evidence and fold
-consistency. Modifier consideration runs afterward for every original feature,
-using the selected confounders as nuisance variables and evaluating interaction
-tests plus inner-heldout R-loss. A confounder decision never removes an original
-feature from modifier eligibility.
+Statistical role selection is then written to
+`selection/elastic_net_selection.json`. Every inner-training partition fits a
+logistic group elastic net for treatment and a separate group elastic net for
+the marginal outcome. Ordered measurements use one standardized numerical
+score. A nominal factor's standardized contrasts and missingness indicator are
+penalized as one group, so its selection does not depend on one surviving dummy
+coefficient. Feature groups earn treatment and outcome stability votes
+separately; their intersection is never required. Stable treatment predictors
+feed the propensity nuisance forest, stable outcome predictors feed the
+marginal-outcome nuisance forest, and their union is retained as the causal
+forest's adjustment set.
 
-Clinical plausibility is excluded from role evidence, and the prompt requires
-evidence both for and against every decision. A selected latent and one of its
-sources are exclusive for the same role unless the adjudicator records an
-empirical exception. Explicit investigator features retain exactly their
-configured roles. The outer heldout partition is inaccessible to selection
-tools; its original measurement dependencies are extracted first and selected
-latents are then computed deterministically.
+Those forests generate one inner-heldout propensity and outcome prediction for
+every outer-training row. Treatment and outcome are residualized, and a second
+group elastic net directly minimizes R-loss using grouped
+residualized-treatment-by-feature columns. Modifier groups receive stability
+votes across inner folds, and the stable set must improve held-out R-loss. The
+nuisance screens use the
+one-standard-error rule; the modifier screen defaults to the minimum-CV-loss
+penalty. No per-row squared-loss target is used. Pairwise associations and the
+LLM are confined to the preceding unsupervised consolidation; they do not assign
+roles or gate elastic-net support.
 
-The evidence, agent transcripts, typed-tool audit, latent registry, and both
-role adjudications are checkpointed under `selection/`. Changing only endpoint URLs
-does not invalidate completed scientific checkpoints. `model_identity.json`
-records the model IDs actually advertised at startup. Changing the primary
-model raises an error before interpretation checkpoints are reused. The
-extraction model may change after extraction-and-later outer-fold artifacts are
-removed; completed interpretation, consolidation, and feature-definition
-checkpoints do not depend on the extractor identity and are retained.
+Explicit investigator features retain exactly their configured roles. The
+outer-heldout partition is inaccessible during selection and receives only the
+selected original measurement dependencies afterward. Fitted latent states are
+then applied in creation order, including recursive latent ancestors.
+
+The stability votes, cross-fitted nuisance diagnostics, grouped coefficients,
+R-loss diagnostics, and final decisions are checkpointed under `selection/`.
+Changing only endpoint URLs does not invalidate completed scientific
+checkpoints. `model_identity.json` records the model IDs actually advertised at
+startup. Changing the primary model raises an error before interpretation
+checkpoints are reused. The extraction model may change after
+extraction-and-later outer-fold artifacts are removed; completed interpretation,
+consolidation, and feature-definition checkpoints do not depend on the extractor
+identity and are retained.
 
 Continuous definitions accept either a numeric scalar or a documented
 categorical/threshold scalar when no exact number is reported. The extraction

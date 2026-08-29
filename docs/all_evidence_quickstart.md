@@ -79,12 +79,21 @@ are:
     "extraction_context_margin_tokens": 1024,
     "max_review_rounds": 2,
     "input_temporal_scope": "pre_index_treatment",
-    "agentic_selection": {
-      "missingness_weight": 0.15,
-      "cluster_similarity_threshold": 0.60,
-      "cluster_consensus_fraction": 0.60,
-      "cluster_max_size": 12,
-      "max_latents_per_cluster": 2
+    "selection_consolidation": {
+      "enabled": true,
+      "neighbor_count": 10,
+      "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+      "embedding_device": "cpu",
+      "max_latents_per_cluster": 2,
+      "minimum_pairwise_association": 0.85
+    },
+    "statistical_selection": {
+      "l1_ratio": 0.8,
+      "nuisance_selection_frequency": 0.6,
+      "modifier_selection_frequency": 0.6,
+      "one_standard_error_rule": true,
+      "modifier_one_standard_error_rule": false,
+      "nuisance_forest_trees": 200
     },
     "estimation_trees": 200,
     "explicit_features": []
@@ -100,7 +109,9 @@ models may use different endpoints or the same multi-model endpoint.
 `max_tokens` is the primary model's 100,000-token output ceiling;
 `extraction_max_tokens` is the patient extractor's 75,000-token ceiling. Neither
 asks nor forces a model to generate that many tokens, and normal EOS stopping
-applies. Long patient records are processed serially in lossless source chunks
+applies. The extraction ceiling may be lowered to 4,096 tokens to bound a
+runaway response without invalidating completed scientific checkpoints. Long
+patient records are processed serially in lossless source chunks
 of at most 50,000 tokens, carrying the validated structured extraction into the
 next chunk. The planner shrinks chunks as needed to preserve the model context,
 and checkpoints every chunk for restart.
@@ -128,19 +139,25 @@ both; their ontologies and roles cannot be changed by the models.
 Independent outer folds run concurrently. Primary request concurrency is bounded
 by `stage2.workers`, and patient extraction by
 `stage2.extraction_llm.workers`. Each extraction request contains exactly one
-patient's text; this isolation is invariant. Evidence construction and the
-ordered confounder/modifier agent passes run inside each outer fold. Pairwise
-evidence is pre-encoded once per inner fold and evaluated in deterministic loky
-chunks; all outer folds share one work-stealing pool capped by
-`stage2.workers`, and completed chunks are reusable after interruption.
-
-P-values and BH q-values remain visible evidence but are never hard gates.
-Confounder decisions require empirical treatment and outcome support plus an
-explicit inner-fold consistency assessment. Modifier decisions use interaction
-tests and inner-heldout R-loss under the selected nuisance confounders. Cluster
-agents can test at most two label-blind structured latents per cluster using a
-mixed component or declarative rule. Outer-heldout rows remain inaccessible to
-selection and only receive deterministic transforms fit on outer training.
+patient's text; this isolation is invariant. Before supervised selection, the
+optional `stage2.selection_consolidation` pass walks the extracted candidates,
+retrieves the ten nearest currently active features by default, calculates
+mixed-type association evidence on outer-training rows, and asks the primary
+model whether to leave them separate or replace disjoint subsets with canonical
+versions of the same measurement. Replacement requires every source pair to
+meet `minimum_pairwise_association` (0.85 by default), but high association is
+only a necessary condition: broader/narrower concepts and merely related
+variables must remain separate. Accepted aliases immediately replace their
+sources in later retrievals; the original extraction dependencies remain
+recorded. Separate treatment and outcome
+group elastic nets run inside each outer fold and accumulate original-feature
+stability votes. Ordered measurements use one standardized score; nominal
+factor contrasts and missingness are selected as one group. Inner-fold nuisance
+forests generate out-of-fold residuals, and a group-elastic-net R-learner
+selects stable treatment-interaction groups that improve held-out R-loss.
+Consolidation receives neither treatment nor outcome and is not a role-selection
+screen. Outer-heldout rows remain inaccessible until selection is frozen;
+selected latent states are then applied to their held-out measurement dependencies.
 
 For pipeline-managed orchestrator and extractor roles, replace both endpoints
 in the example above with nested vLLM configurations. Their GPU lists define the
@@ -192,12 +209,15 @@ all managed-server settings.
 Stage 2 compiles the raw handoff into fold-local, provenance-preserving semantic
 cards under `stage2/evidence_compilation/`, and candidate discovery reads all of
 them. There is no ColBERT interaction filter, evidence-community graph,
-candidate reranking, or feature-count cap. Consolidation may only merge aliases;
-every unmerged candidate proceeds to extraction and fold-local agentic evidence.
+candidate reranking, or feature-count cap. Discovery-time consolidation may only
+merge aliases, so every unmerged candidate proceeds to extraction. The distinct
+post-extraction selection-consolidation pass may replace empirically populated
+aliases with a canonical, information-preserving measurement before fold-local
+group-elastic-net selection.
 Each completed request is saved beneath the relevant outer-fold directory, so
 the same command resumes after interruption without repeating it.
 
-To apply the agentic selector to a completed legacy run without repeating
+To apply the group-elastic-net selector to a completed legacy run without repeating
 interpretation or all-candidate training extraction:
 
 ```bash
@@ -207,11 +227,10 @@ uv run python scripts/run_all_evidence.py \
 ```
 
 The command verifies all reusable inputs before archiving the previous selector
-and downstream results under `stage2/reselection_archives/`. It redoes agentic
-evidence and decisions, then reuses archived held-out component measurements
+and downstream results under `stage2/reselection_archives/`. It redoes nuisance
+and R-learner stability selection, then reuses archived held-out measurements
 whose row, text, model, frame, and definition fingerprints still match. Only
-newly required or incompatible components are extracted; structured latents are
-computed deterministically from their components. Estimation is then rerun.
+newly required or incompatible components are extracted. Estimation is then rerun.
 Keep the original primary and extraction model IDs; endpoints may change.
 
 The Stage 2 input is always:

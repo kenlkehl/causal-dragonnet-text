@@ -224,7 +224,7 @@ flowchart LR
     D --> E["Exhaustively list and merge concepts"]
     E --> F["Primary model defines ontologies"]
     F --> G["Small model extracts patient-level values"]
-    G --> H["Fold-local evidence and agents assign roles"]
+    G --> H["Group-elastic-net nuisance and R-learner screens assign roles"]
     H --> J["Cross-fitted causal forest"]
     J --> I["ATE, CATE or ITE estimates with diagnostics"]
 ```
@@ -753,14 +753,17 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
     "input_temporal_scope": "pre_index_treatment",
-    "agentic_selection": {
-      "missingness_weight": 0.15,
-      "cluster_similarity_threshold": 0.60,
-      "cluster_consensus_fraction": 0.60,
-      "cluster_max_size": 12,
-      "max_latents_per_cluster": 2,
-      "cluster_tool_call_limit": 8,
-      "adjudicator_tool_call_limit": 10
+    "statistical_selection": {
+      "l1_ratio": 0.8,
+      "nuisance_selection_frequency": 0.6,
+      "modifier_selection_frequency": 0.6,
+      "internal_cv_folds": 3,
+      "regularization_grid_size": 16,
+      "optimization_tolerance": 1e-6,
+      "one_standard_error_rule": true,
+      "modifier_one_standard_error_rule": false,
+      "nuisance_forest_trees": 200,
+      "modifier_min_positive_fold_fraction": 0.4
     },
     "estimation_trees": 200,
     "explicit_features": []
@@ -877,7 +880,8 @@ value-extraction requests use the configured small model with
 `reasoning_effort: "none"`. Both models may share an endpoint. Primary-model
 requests receive the configured `max_tokens` output ceiling (100,000 by
 default), while patient extraction receives `extraction_max_tokens` (75,000 by
-default). These ceilings permit long output but do not force generation to
+default; it may be lowered to a 4,096-token safety cap when an extractor fails
+to emit EOS). These ceilings permit long output but do not force generation to
 their limits. Extraction dynamically lowers that ceiling for a repair attempt
 when retaining it would exceed the remaining context. Stage 2
 detects Qwen 3 (including 3.8), Gemma 4, and LFM 2.5 IDs and sends their
@@ -1083,41 +1087,56 @@ merged into the cached raw training matrix, while unchanged candidate columns
 are reused. Prompts still contain exactly one patient; feature batching within
 that patient is unchanged.
 
-Stage 2 now builds a fold-local evidence layer before assigning roles. Each
-inner-training partition retains the former one-candidate treatment and outcome
-models, and adds all-pairs mixed-type association evidence: Spearman correlation,
-contingency tables with chi-square and bias-corrected Cramer's V, correlation
-ratio with Kruskal-Wallis, and missingness co-occurrence. Raw p-values and
-Benjamini-Hochberg q-values are evidence, not selection gates. Role-blind
-hierarchical clustering is performed in every inner fold and combined into
-outer-training consensus clusters.
+Stage 2 first performs an optional sequential consolidation after the extracted
+candidate ontology is frozen and before any supervised role selection. For each
+still-active candidate, a local embedding model retrieves the ten nearest
+currently active candidates by default. Mixed-type pairwise association evidence
+is calculated from outer-training rows only, and the primary model either leaves
+the cluster unchanged or defines a canonical representation of truly equivalent
+measurement aliases. Every source pair must have association of at least 0.85 by
+default, but association is only a necessary condition. Broader/narrower
+concepts, components and totals, and merely related variables cannot be merged.
+An accepted alias must preserve value type, category granularity, units, and
+missingness; it is populated immediately from a validated coalesce or bijective
+category-recode rule, replaces its sources in the active pool, and can be
+retrieved by later candidates. Original columns and recursive lineage remain
+available for audit and held-out reconstruction. Configured explicit features
+are protected from replacement.
 
-A bounded cluster agent may consolidate structured measurements into at most two
-derived variables using either a fold-fitted mixed-data component or a small
-declarative rule language. Construction cannot access treatment or outcome and
-is evaluated on each inner heldout partition. The global confounder adjudicator
-then weighs empirical treatment and outcome evidence, including consistency
-across folds. After that set is fixed, Stage 2 reruns role consideration for
-effect modifiers using interaction tests and inner-heldout R-loss under the
-selected nuisance model. All original candidates remain modifier-eligible.
-Clinical plausibility is not a role criterion, and p-values never become a hard
-gate. Investigator-configured features preserve exactly their supplied roles.
+Stage 2 then assigns modeling roles deterministically. In every inner fold, a logistic group elastic net predicts treatment
+and a separate group elastic net predicts the marginal outcome. Continuous and
+ordered measurements are standardized single-score groups, while every nominal
+factor's standardized contrasts and missingness indicator form one all-in/all-out
+group. Feature-group selection frequencies are accumulated separately;
+intersection is not a gate. Stable treatment predictors feed the propensity
+nuisance model, stable outcome predictors feed the outcome nuisance model, and
+their union forms the adjustment set for final effect estimation.
 
-Selected latents are refit on the complete outer-training partition. Outer
-heldout text extraction requests their original measurement dependencies, then
-computes the latent deterministically; the heldout rows are never exposed to a
-selection agent. All supplied data must satisfy the persisted
-`pre_index_treatment` invariant. Historical treatments are valid measurements,
-and the agent is forbidden from inventing semantic timepoint filters.
+Inner-fold random forests then produce one out-of-fold propensity and marginal
+outcome prediction for every outer-training patient. Stage 2 residualizes
+treatment and outcome and fits a group-elastic-net R-learner whose penalized
+blocks are all residualized-treatment-by-candidate interaction columns for one
+measurement. Modifier support must be stable across folds and the selected set
+must improve held-out R-loss. Per-row squared loss is never used as a regression
+target. The nuisance screens use the
+one-standard-error rule for sparsity; modifier interactions default to the
+minimum-CV-loss penalty because applying one-SE twice can erase genuine weak
+heterogeneity.
 
-Agentic selection writes its own input fingerprint and completion marker,
-so an interrupted run resumes it independently. Endpoint URLs are transport
+The consolidation agent never receives treatment, outcome, or outer-heldout
+rows; pairwise associations are used only for this unsupervised replacement
+decision and never as a causal-role screen. Investigator-configured roles remain
+locked. All supplied measurements must satisfy the persisted
+`pre_index_treatment` invariant, and outer-heldout rows remain unavailable until
+the selected definitions and model roles are frozen.
+
+Group-elastic-net selection writes its own input fingerprint and completion
+marker, so an interrupted run resumes independently. Endpoint URLs are transport
 details and may change between resumes. The root `model_identity.json` records
-the model IDs advertised at startup. A primary-model change raises an error
-before interpretation checkpoints are reused. The extractor model may change
-after extraction-and-later outer-fold artifacts are removed; completed
+the model IDs used for upstream interpretation and extraction. Completed
 interpretation, consolidation, and operationalized feature definitions remain
-reusable because their fingerprints do not depend on the extractor identity.
+reusable because statistical-selection settings do not participate in their
+fingerprints.
 
 Each patient extraction also records feature-attributable validation failures.
 After the training patients finish, Stage 2 aggregates repeated failures across
@@ -1156,10 +1175,11 @@ flowchart LR
     C --> D["Small model extracts every candidate<br/>on outer-training records"]
     D --> E["Primary model reviews<br/>aggregate ontology"]
     E -->|"ontology revised"| D
-    E -->|"frozen"| F["Fold-local evidence, latents,<br/>and role agents"]
-    F --> G["Small model extracts retained<br/>outer-held-out variables"]
-    G --> H["Causal forest and<br/>held-out AIPW scores"]
-    H --> I["Aggregate all outer folds"]
+    E -->|"frozen"| F["Sequential equivalence-only<br/>alias consolidation"]
+    F --> G["Group-elastic-net nuisance screens<br/>and R-learner selection"]
+    G --> H["Small model extracts retained<br/>outer-held-out dependencies"]
+    H --> I["Causal forest and<br/>held-out AIPW scores"]
+    I --> J["Aggregate all outer folds"]
 ```
 
 ### Output and interruption recovery
@@ -1232,14 +1252,16 @@ nsclc_all_evidence/
         input.json
         complete.json
       selection/
-        agentic_selection.json
-        stage2_evidence/inner_001/...
-        confounder_pass/...
-        effect_modifier_pass/...
-        latent_registry.json
+        candidate_consolidation/
+          input.json
+          steps/...
+          registry.json
+          report.json
+          complete.json
+        elastic_net_selection.json
         selected_definitions.json
         measurement_definitions.json
-        selected_latent_states.json
+        selected_latent_states.json       # selected latents and recursive ancestors
       final_definitions.json
       extraction/
         fit/extracted.csv
@@ -1265,8 +1287,8 @@ nsclc_all_evidence/
 written to `logs/workflow.log`, and model-specific intermediate results are kept
 under `components/<name>/`. Stage 2's intermediate scientific results are under
 the current `stage2/outer_NNN/` directory: this is the direct place to inspect
-the candidates, aggregate ontology reviews, fold-local mixed evidence and agent
-decisions, selected roles, extractions, and causal-forest estimates. If a process is
+the candidates, aggregate ontology reviews, elastic-net stability diagnostics,
+selected roles, extractions, and causal-forest estimates. If a process is
 interrupted, rerunning the same command skips each completed interpretation,
 consolidation, extraction, ontology-supervision, and estimation leaf, then
 re-enters the first incomplete directory. Across ontology rounds, aggregate
@@ -1295,9 +1317,8 @@ fingerprinted manifest of archived raw held-out measurements. A cache mismatch
 aborts instead of repeating initial work, and an interrupted migration resumes
 from `stage2/reselection_state.json`. Use the same primary and extraction model
 IDs as the completed run; endpoint URLs and worker counts may change. Matching
-held-out component columns are reused, only missing or definition-incompatible
-components are re-extracted, and latent values are computed deterministically
-from those components before estimation is rerun.
+held-out component columns are reused, and only missing or
+definition-incompatible components are re-extracted before estimation is rerun.
 
 When the input dataset contains `true_ite_prob`, Stage 2 evaluates its frozen
 cross-fitted `estimated_cate` values against that oracle only after all modeling

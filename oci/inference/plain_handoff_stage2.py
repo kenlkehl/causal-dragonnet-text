@@ -3,7 +3,8 @@
 This module intentionally treats a directory as the checkpoint.  It reads the
 ordinary JSONL handoff, defines and extracts patient-level variables, reviews
 small-model extraction aggregates with a separate primary model, selects roles
-from fold-local evidence with bounded agents, and produces causal-forest estimates.  It
+with fold-local group elastic nets and an R-learner, and produces causal-forest
+estimates. It
 has no bundle format, artifact authentication, immutable
 request, content hashes, or checkpoint adoption.
 """
@@ -29,7 +30,6 @@ from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
-from joblib.externals.loky import ProcessPoolExecutor
 
 from .plain_handoff_stage2_evidence import (
     EVIDENCE_COMPILER_VERSION,
@@ -46,10 +46,18 @@ from .plain_handoff_stage2_analysis import (
 )
 from .stage2_agentic_selection import (
     DEFAULT_PAIRWISE_CHUNK_SIZE,
-    SCHEMA_VERSION as STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
-    TEMPORAL_SCOPE,
     Stage2AgenticSelectionConfig,
     agentic_selection_config_from_mapping,
+)
+from .stage2_elastic_net_selection import (
+    TEMPORAL_SCOPE,
+    Stage2ElasticNetSelectionConfig,
+    statistical_selection_config_from_mapping,
+)
+from .stage2_sequential_consolidation import (
+    SELECTION_SCHEMA_VERSION as STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+    Stage2SequentialConsolidationConfig,
+    sequential_consolidation_config_from_mapping,
 )
 from .vllm_server_pool import (
     ManagedVLLMConfig,
@@ -79,10 +87,12 @@ THINKING_RESPONSE_REPAIR_EFFORT = "high"
 # normally at EOS as soon as the validated JSON object is complete.
 MINIMUM_MAX_TOKENS = 100_000
 DEFAULT_MAX_TOKENS = MINIMUM_MAX_TOKENS
-# The small Gemma 4 E2B/E4B extractors have a 131,072-token context window.
-# Keep enough room for the one-patient prompt while retaining a generous
-# completion ceiling for validated JSON extraction.
-MINIMUM_EXTRACTION_MAX_TOKENS = 60_000
+# Extraction responses are bounded JSON records, so the output ceiling may be
+# lowered independently when a model fails to emit EOS.  Keep the default
+# generous, but permit a 4K safety cap without invalidating completed
+# scientific checkpoints (this transport-only option is excluded from their
+# fingerprints below).
+MINIMUM_EXTRACTION_MAX_TOKENS = 4_096
 DEFAULT_EXTRACTION_MAX_TOKENS = 75_000
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_INTERPRETATION_REASONING_EFFORT = "high"
@@ -824,6 +834,16 @@ class PlainHandoffStage2Config:
     # Operational tuning only: deterministic pair chunks are checkpointed and
     # produce identical evidence regardless of this size.
     agentic_evidence_pair_chunk_size: int = DEFAULT_PAIRWISE_CHUNK_SIZE
+    # Optional outer-training-only semantic/association consolidation runs
+    # immediately before supervised role selection.  The older global agentic
+    # policy remains parseable only for historical checkpoint inspection.
+    selection_consolidation: Stage2SequentialConsolidationConfig = field(
+        default_factory=Stage2SequentialConsolidationConfig
+    )
+    # Deterministic post-extraction supervised selection.
+    statistical_selection: Stage2ElasticNetSelectionConfig = field(
+        default_factory=Stage2ElasticNetSelectionConfig
+    )
     estimation_trees: int = 200
     propensity_clip: float = 0.02
     min_nonmissing_fraction: float = 0.05
@@ -849,6 +869,10 @@ class PlainHandoffStage2Config:
     # Detected from the live endpoint's model record (including its backing
     # root when available) so served aliases still receive the right controls.
     runtime_model_family: str = ""
+    # Operational guard for post-extraction reselection. Preserve the configured
+    # extractor identity in checkpoints, but neither launch nor call it. Any
+    # unexpected extraction request fails closed instead of occupying a GPU.
+    runtime_disable_extraction: bool = False
 
     def validate(
         self,
@@ -946,6 +970,8 @@ class PlainHandoffStage2Config:
             )
         if self.runtime_model_family not in {"", "qwen3", "gemma4", "lfm2.5", "other"}:
             raise ValueError("stage2.runtime_model_family is not recognized")
+        if not isinstance(self.runtime_disable_extraction, bool):
+            raise ValueError("stage2.runtime_disable_extraction must be true or false")
         if self.max_prompt_chars < 4_000:
             raise ValueError("stage2.max_prompt_chars must be at least 4000")
         if self.consolidation_max_prompt_chars < 4_000:
@@ -1059,6 +1085,22 @@ class PlainHandoffStage2Config:
             raise ValueError(
                 "stage2.agentic_evidence_pair_chunk_size must be a positive integer"
             )
+        if not isinstance(
+            self.selection_consolidation, Stage2SequentialConsolidationConfig
+        ):
+            raise ValueError(
+                "stage2.selection_consolidation must be a "
+                "Stage2SequentialConsolidationConfig object"
+            )
+        self.selection_consolidation.validate()
+        if not isinstance(
+            self.statistical_selection, Stage2ElasticNetSelectionConfig
+        ):
+            raise ValueError(
+                "stage2.statistical_selection must be a "
+                "Stage2ElasticNetSelectionConfig object"
+            )
+        self.statistical_selection.validate()
         if self.estimation_trees < 10:
             raise ValueError("stage2.estimation_trees must be at least 10")
         if not 0.0 < self.propensity_clip < 0.5:
@@ -1101,10 +1143,15 @@ class PlainHandoffStage2Config:
         values.pop("runtime_request_kind", None)
         values.pop("runtime_reasoning_effort", None)
         values.pop("runtime_model_family", None)
+        values.pop("runtime_disable_extraction", None)
         values["explicit_features"] = [
             feature.as_definition() for feature in self.explicit_features
         ]
         values["agentic_selection"] = self.agentic_selection.public_dict()
+        values["selection_consolidation"] = (
+            self.selection_consolidation.public_dict()
+        )
+        values["statistical_selection"] = self.statistical_selection.public_dict()
         return values
 
 
@@ -1113,7 +1160,7 @@ def plain_stage2_config_from_mapping(
     *,
     default_workers: int,
 ) -> PlainHandoffStage2Config | None:
-    removed_screen_keys = sorted(
+    legacy_screen_keys = sorted(
         set(raw).intersection(
             {
                 "selection_workers",
@@ -1124,11 +1171,11 @@ def plain_stage2_config_from_mapping(
             }
         )
     )
-    if removed_screen_keys:
-        raise ValueError(
-            "the Stage 2 p-value vote screen was removed; delete these settings and "
-            "configure stage2.agentic_selection instead: "
-            + ", ".join(f"stage2.{key}" for key in removed_screen_keys)
+    if legacy_screen_keys:
+        LOGGER.warning(
+            "migrating legacy Stage 2 screen settings to the group-elastic-net selector "
+            "where possible; raw p-value thresholds and selection_workers are ignored: %s",
+            ", ".join(f"stage2.{key}" for key in legacy_screen_keys),
         )
     if raw.get("command"):
         raise ValueError(
@@ -1269,6 +1316,13 @@ def plain_stage2_config_from_mapping(
         raise ValueError(
             "stage2.agentic_evidence_pair_chunk_size must be a positive integer"
         )
+    raw_statistical_selection = raw.get("statistical_selection")
+    if raw_statistical_selection is None:
+        statistical_selection_value: dict[str, Any] = {}
+    elif isinstance(raw_statistical_selection, Mapping):
+        statistical_selection_value = dict(raw_statistical_selection)
+    else:
+        raise ValueError("stage2.statistical_selection must be a configuration object")
     config = PlainHandoffStage2Config(
         endpoint=endpoint.rstrip("/"),
         model=model,
@@ -1385,6 +1439,12 @@ def plain_stage2_config_from_mapping(
             raw.get("agentic_selection")
         ),
         agentic_evidence_pair_chunk_size=int(raw_pair_chunk_size),
+        selection_consolidation=sequential_consolidation_config_from_mapping(
+            raw.get("selection_consolidation")
+        ),
+        statistical_selection=statistical_selection_config_from_mapping(
+            statistical_selection_value
+        ),
         estimation_trees=int(raw.get("estimation_trees", 200)),
         propensity_clip=float(raw.get("propensity_clip", 0.02)),
         min_nonmissing_fraction=float(raw.get("min_nonmissing_fraction", 0.05)),
@@ -1398,6 +1458,10 @@ def plain_stage2_config_from_mapping(
                 "vllm_rapid_switch_seconds",
                 DEFAULT_VLLM_RAPID_SWITCH_SECONDS,
             )
+        ),
+        runtime_disable_extraction=raw.get(
+            "runtime_disable_extraction",
+            False,
         ),
     )
     config.validate(
@@ -2641,6 +2705,21 @@ class _ConcurrencyLimitedCompletion:
             return self.completion(messages, config)
 
 
+class _DisabledExtractionCompletion:
+    """Fail closed when a post-extraction run unexpectedly requests extraction."""
+
+    def __call__(
+        self,
+        _messages: Sequence[Mapping[str, str]],
+        _config: PlainHandoffStage2Config,
+    ) -> str:
+        raise RuntimeError(
+            "Stage 2 attempted a new patient extraction while "
+            "stage2.runtime_disable_extraction=true; the post-extraction "
+            "reselection run must use its frozen measurement caches"
+        )
+
+
 class _InterruptibleCompletion:
     """Cooperatively stop same-role calls after another role is requested."""
 
@@ -2817,7 +2896,12 @@ def _compact_json_messages(
     return compacted
 
 
-def _repair_message(exc: Exception) -> dict[str, str]:
+def _repair_message(
+    exc: Exception,
+    *,
+    repair_context: Mapping[str, Any] | None = None,
+    repeated_error_count: int = 1,
+) -> dict[str, str]:
     if isinstance(exc, _Stage2OutputLengthError):
         content = (
             "The previous JSON exceeded the available response length. Return one materially "
@@ -2830,18 +2914,65 @@ def _repair_message(exc: Exception) -> dict[str, str]:
             "The previous JSON failed validation. Correct this exact error: "
             f"{type(exc).__name__}: {exc}. Return one corrected JSON object only."
         )
+    context = dict(repair_context or {})
+    allowed_feature_ids = context.get("allowed_feature_ids")
+    if isinstance(allowed_feature_ids, list) and allowed_feature_ids:
+        content += (
+            " The only feature_ids allowed in this response are: "
+            + json.dumps(
+                list(map(str, allowed_feature_ids)),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "."
+        )
+    expression_examples = context.get("valid_expression_examples")
+    if isinstance(expression_examples, Mapping) and expression_examples:
+        content += (
+            " Valid categorical-rule expression examples are: "
+            + json.dumps(
+                dict(expression_examples),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "."
+        )
+    conservative_response = context.get("conservative_response")
+    if repeated_error_count >= 2 and isinstance(conservative_response, Mapping):
+        content += (
+            f" This exact validation error has now occurred {repeated_error_count} times. "
+            "Abandon the latent proposal and return exactly this conservative response: "
+            + json.dumps(
+                dict(conservative_response),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "."
+        )
     return {
         "role": "user",
         "content": content,
     }
 
 
-def _bounded_repair_directive(exc: Exception, *, max_chars: int) -> str:
+def _bounded_repair_directive(
+    exc: Exception,
+    *,
+    max_chars: int,
+    repair_context: Mapping[str, Any] | None = None,
+    repeated_error_count: int = 1,
+) -> str:
     """Keep the validation failure visible even in a packed repair prompt."""
 
     if max_chars < 16:
         raise ValueError("Stage 2 repair prompt has no room for its validation error") from exc
-    message = f"Fix this validation error: {type(exc).__name__}: {exc}. JSON only."
+    message = _repair_message(
+        exc,
+        repair_context=repair_context,
+        repeated_error_count=repeated_error_count,
+    )["content"]
     if len(message) <= max_chars:
         return message
     detail = f"{type(exc).__name__}: {exc}"
@@ -2860,6 +2991,10 @@ def _request_json(
     prompt_token_counter: Callable[[Sequence[Mapping[str, str]]], int] | None = None,
     context_window_tokens: int | None = None,
     context_margin_tokens: int = 0,
+    repair_context: Mapping[str, Any] | None = None,
+    validation_event_observer: Callable[[Mapping[str, Any]], None] | None = None,
+    conservative_validation_fallback: Mapping[str, Any] | None = None,
+    fallback_after_same_error: int = 3,
 ) -> dict[str, Any]:
     request_policy = _stage2_request_policy(config, request_kind)
     request_config = replace(
@@ -2873,6 +3008,10 @@ def _request_json(
     max_repairs = int(config.max_response_repairs)
     max_attempts = 1 + max_repairs
     logical_deadline = time.monotonic() + float(config.request_timeout)
+    validation_error_counts: Counter[str] = Counter()
+    validation_failure_count = 0
+    if fallback_after_same_error < 1:
+        raise ValueError("fallback_after_same_error must be a positive integer")
 
     def token_window_fits(candidate: Sequence[Mapping[str, str]]) -> bool:
         if prompt_token_counter is None or context_window_tokens is None:
@@ -2888,6 +3027,7 @@ def _request_json(
                 "Stage 2 logical request deadline expired across response repairs"
             )
         response: str | None = None
+        parsed_response: dict[str, Any] | None = None
         prompt_chars = sum(len(str(message.get("content") or "")) for message in conversation)
         if prompt_chars > int(config.max_prompt_chars):
             raise ValueError(
@@ -2945,13 +3085,60 @@ def _request_json(
                 completion,
                 deadline=logical_deadline,
             )
-            return validate(_parse_json_object(response))
+            parsed_response = _parse_json_object(response)
+            return validate(parsed_response)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             # Only a returned (or length-truncated) model response is eligible
             # for semantic repair/fallback. Local prompt-budget, configuration,
             # and transport exceptions must abort instead of becoming evidence.
             if response is None and not isinstance(exc, _Stage2OutputLengthError):
                 raise
+            validation_failure_count += 1
+            error_signature = f"{type(exc).__name__}: {exc}"
+            validation_error_counts[error_signature] += 1
+            repeated_error_count = validation_error_counts[error_signature]
+            if validation_event_observer is not None:
+                validation_event_observer(
+                    {
+                        "event": "invalid_response",
+                        "response_attempt": attempt + 1,
+                        "validation_failure_count": validation_failure_count,
+                        "same_error_occurrence": repeated_error_count,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "raw_response": response,
+                        "parsed_response": parsed_response,
+                    }
+                )
+            fallback_trigger: str | None = None
+            if conservative_validation_fallback is not None:
+                if repeated_error_count >= int(fallback_after_same_error):
+                    fallback_trigger = "repeated_identical_validation_error"
+                elif attempt == max_attempts - 1:
+                    fallback_trigger = "validation_repairs_exhausted"
+            if fallback_trigger is not None:
+                fallback_value = validate(dict(conservative_validation_fallback))
+                LOGGER.warning(
+                    "Stage 2 uses conservative validation fallback after %s failed "
+                    "response(s), trigger=%s last_error=%s",
+                    validation_failure_count,
+                    fallback_trigger,
+                    error_signature,
+                )
+                if validation_event_observer is not None:
+                    validation_event_observer(
+                        {
+                            "event": "conservative_fallback",
+                            "response_attempt": attempt + 1,
+                            "validation_failure_count": validation_failure_count,
+                            "same_error_occurrence": repeated_error_count,
+                            "trigger": fallback_trigger,
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                            "fallback_response": fallback_value,
+                        }
+                    )
+                return fallback_value
             if attempt == max_attempts - 1:
                 raise Stage2ResponseValidationError(
                     f"Stage 2 response remained invalid after {max_attempts - 1} repairs: {exc}"
@@ -2964,11 +3151,15 @@ def _request_json(
                 type(exc).__name__,
                 exc,
             )
-            repair_message = _repair_message(exc)
-            repair_context = [dict(message) for message in base_conversation]
+            repair_message = _repair_message(
+                exc,
+                repair_context=repair_context,
+                repeated_error_count=repeated_error_count,
+            )
+            response_context = [dict(message) for message in base_conversation]
             if response is not None:
-                repair_context.append({"role": "assistant", "content": str(response)})
-            for candidate_context in (repair_context, base_conversation):
+                response_context.append({"role": "assistant", "content": str(response)})
+            for candidate_context in (response_context, base_conversation):
                 repaired = [*candidate_context, repair_message]
                 repaired_chars = sum(len(str(message.get("content") or "")) for message in repaired)
                 if (
@@ -2985,7 +3176,7 @@ def _request_json(
             # A fully packed initial prompt may leave no room for another turn.
             # Minify JSON bodies without changing their content, then retry with
             # the same explicit validation error.
-            compact_context = _compact_json_messages(repair_context)
+            compact_context = _compact_json_messages(response_context)
             compact_repaired = [*compact_context, repair_message]
             if (
                 sum(len(str(message.get("content") or "")) for message in compact_repaired)
@@ -3030,6 +3221,8 @@ def _request_json(
             conversation[system_index]["content"] = _bounded_repair_directive(
                 exc,
                 max_chars=available,
+                repair_context=repair_context,
+                repeated_error_count=repeated_error_count,
             )
     raise RuntimeError(f"unreachable Stage 2 response state: {first_error}")
 
@@ -6081,6 +6274,40 @@ class PlainHandoffStage2:
             routed_completion,
             max_concurrency=config.workers,
         )
+        self.selection_consolidation_request_config: PlainHandoffStage2Config | None = None
+        self.selection_consolidation_completion: CompletionFunction | None = None
+        consolidation_runtime = config.selection_consolidation
+        if str(consolidation_runtime.runtime_llm_endpoint).strip():
+            consolidation_request_config = replace(
+                config,
+                endpoint=str(consolidation_runtime.runtime_llm_endpoint).rstrip("/"),
+                model=str(consolidation_runtime.runtime_llm_model).strip(),
+                api_key=str(consolidation_runtime.runtime_llm_api_key),
+                max_prompt_chars=max(
+                    int(config.max_prompt_chars),
+                    int(consolidation_runtime.max_prompt_chars),
+                ),
+                extraction_llm=None,
+                vllm=None,
+                runtime_endpoints=(),
+                runtime_model_family="",
+            )
+            consolidation_identity = _endpoint_model_identity(
+                consolidation_request_config,
+                endpoints=(consolidation_request_config.endpoint,),
+                role="selection_consolidation_runtime",
+                verify_live_endpoint=True,
+            )
+            self.selection_consolidation_request_config = replace(
+                consolidation_request_config,
+                runtime_model_family=str(consolidation_identity["model_family"]),
+            )
+            self.selection_consolidation_completion = _ConcurrencyLimitedCompletion(
+                _RoundRobinOpenAICompletion((consolidation_request_config.endpoint,)),
+                max_concurrency=config.workers,
+            )
+        else:
+            consolidation_identity = None
         self.extraction_request_config: PlainHandoffStage2Config | None = None
         self.extraction_completion: CompletionFunction | None = None
         self.extraction_tokenizer: Any | None = None
@@ -6141,6 +6368,7 @@ class PlainHandoffStage2:
             "schema_version": MODEL_IDENTITY_SCHEMA_VERSION,
             "primary": primary_identity,
             "extraction": extraction_identity,
+            "selection_consolidation_runtime": consolidation_identity,
             "endpoint_urls_are_transport_only": True,
         }
 
@@ -7405,8 +7633,6 @@ class PlainHandoffStage2:
         outcome_type: str = "binary",
         inner_folds: int = 5,
         seed: int = 42,
-        agentic_evidence_workers: int = 1,
-        agentic_evidence_executor: ProcessPoolExecutor | None = None,
     ) -> Mapping[str, Any]:
         discovery_packets = list(packets)
         complete_path = output_dir / "complete.json"
@@ -7492,7 +7718,7 @@ class PlainHandoffStage2:
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise RuntimeError(
                     f"Stage 2 outer fold {outer_fold} has no compatible completed "
-                    "agentic-selection checkpoint; use --stage2-reselect"
+                    "group-elastic-net-selection checkpoint; use --stage2-reselect"
                 ) from exc
             if (
                 completed_selection.get("schema_version")
@@ -7521,8 +7747,12 @@ class PlainHandoffStage2:
                 "temporal_scope": self.config.input_temporal_scope,
                 "stage1_packets_fingerprint": _value_fingerprint(discovery_packets),
                 "outcome_type": outcome_type,
-                "agentic_selection_policy": (
-                    self.config.agentic_selection.public_dict()
+                "selection_consolidation_policy": (
+                    self.config.selection_consolidation.scientific_dict()
+                ),
+                "selection_consolidation_llm_model": self.config.model,
+                "statistical_selection_policy": (
+                    self.config.statistical_selection.public_dict()
                 ),
             }
             selection_policy_mismatches.extend(
@@ -7793,6 +8023,12 @@ class PlainHandoffStage2:
             validate: Callable[[Mapping[str, Any]], dict[str, Any]],
             *,
             request_kind: str = "interpretation",
+            repair_context: Mapping[str, Any] | None = None,
+            validation_event_observer: (
+                Callable[[Mapping[str, Any]], None] | None
+            ) = None,
+            conservative_validation_fallback: Mapping[str, Any] | None = None,
+            fallback_after_same_error: int = 3,
         ) -> dict[str, Any]:
             if request_kind == "extraction":
                 if (
@@ -7834,6 +8070,54 @@ class PlainHandoffStage2:
                     if request_kind == "extraction"
                     else 0
                 ),
+                repair_context=repair_context,
+                validation_event_observer=validation_event_observer,
+                conservative_validation_fallback=conservative_validation_fallback,
+                fallback_after_same_error=fallback_after_same_error,
+            )
+
+        def request_selection_consolidation_json(
+            messages: Sequence[Mapping[str, str]],
+            validate: Callable[[Mapping[str, Any]], dict[str, Any]],
+            *,
+            request_kind: str = "interpretation",
+            repair_context: Mapping[str, Any] | None = None,
+            validation_event_observer: (
+                Callable[[Mapping[str, Any]], None] | None
+            ) = None,
+            conservative_validation_fallback: Mapping[str, Any] | None = None,
+            fallback_after_same_error: int = 3,
+        ) -> dict[str, Any]:
+            if (
+                self.selection_consolidation_request_config is None
+                or self.selection_consolidation_completion is None
+            ):
+                return request_analysis_json(
+                    messages,
+                    validate,
+                    request_kind=request_kind,
+                    repair_context=repair_context,
+                    validation_event_observer=validation_event_observer,
+                    conservative_validation_fallback=(
+                        conservative_validation_fallback
+                    ),
+                    fallback_after_same_error=fallback_after_same_error,
+                )
+            if request_kind != "interpretation":
+                raise ValueError(
+                    "the selection-consolidation runtime route accepts only "
+                    "interpretation requests"
+                )
+            return _request_json(
+                messages=messages,
+                config=self.selection_consolidation_request_config,
+                completion=self.selection_consolidation_completion,
+                validate=validate,
+                request_kind="interpretation",
+                repair_context=repair_context,
+                validation_event_observer=validation_event_observer,
+                conservative_validation_fallback=conservative_validation_fallback,
+                fallback_after_same_error=fallback_after_same_error,
             )
 
         analysis = run_fold_analysis(
@@ -7850,11 +8134,12 @@ class PlainHandoffStage2:
             seed=seed + 100_000 * outer_fold,
             output_dir=output_dir,
             request_json=request_analysis_json,
+            selection_consolidation_request_json=(
+                request_selection_consolidation_json
+            ),
             config=self.config,
             extraction_tokenizer=self.extraction_tokenizer,
             stage1_packets=discovery_packets,
-            agentic_evidence_workers=agentic_evidence_workers,
-            agentic_evidence_executor=agentic_evidence_executor,
         )
         completed = {
             "outer_fold": outer_fold,
@@ -7962,64 +8247,40 @@ class PlainHandoffStage2:
         fold_results_by_id: dict[int, Mapping[str, Any]] = {}
         if outer_fold_ids:
             fold_workers = min(len(outer_fold_ids), self.config.workers)
-            evidence_executor: ProcessPoolExecutor | None = None
-            if self.config.workers > 1:
-                evidence_executor = ProcessPoolExecutor(
-                    max_workers=self.config.workers,
-                    timeout=300,
-                    env={
-                        "OMP_NUM_THREADS": "1",
-                        "OPENBLAS_NUM_THREADS": "1",
-                        "MKL_NUM_THREADS": "1",
-                        "NUMEXPR_NUM_THREADS": "1",
-                    },
-                )
             LOGGER.info(
                 "Stage 2 outer-fold execution folds=%s fold_workers=%s "
-                "global_request_workers=%s evidence_backend=%s "
-                "global_evidence_workers=%s",
+                "global_request_workers=%s "
+                "statistical_selection=group_elastic_net_r_learner",
                 len(outer_fold_ids),
                 fold_workers,
                 self.config.workers,
-                "loky" if evidence_executor is not None else "sequential",
-                self.config.workers if evidence_executor is not None else 1,
             )
-            try:
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=fold_workers,
-                    thread_name_prefix="stage2-outer-fold",
-                ) as outer_executor:
-                    futures = {
-                        outer_executor.submit(
-                            self._run_outer_fold,
-                            outer_fold=outer_fold,
-                            packets=packets_by_outer[outer_fold],
-                            output_dir=output_dir / f"outer_{outer_fold:03d}",
-                            dataset=dataset,
-                            split=splits.get(outer_fold),
-                            unit_id_column=unit_id_column,
-                            text_column=text_column,
-                            treatment_column=treatment_column,
-                            outcome_column=outcome_column,
-                            outcome_type=outcome_type,
-                            inner_folds=inner_folds,
-                            seed=seed,
-                            agentic_evidence_workers=self.config.workers,
-                            agentic_evidence_executor=evidence_executor,
-                        ): outer_fold
-                        for outer_fold in outer_fold_ids
-                    }
-                    for future in concurrent.futures.as_completed(futures):
-                        outer_fold = futures[future]
-                        fold_results_by_id[outer_fold] = future.result()
-                        LOGGER.info("Stage 2 completed outer_fold=%s", outer_fold)
-            except BaseException:
-                if evidence_executor is not None:
-                    evidence_executor.shutdown(wait=True, kill_workers=True)
-                raise
-            else:
-                if evidence_executor is not None:
-                    evidence_executor.shutdown(wait=True)
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=fold_workers,
+                thread_name_prefix="stage2-outer-fold",
+            ) as outer_executor:
+                futures = {
+                    outer_executor.submit(
+                        self._run_outer_fold,
+                        outer_fold=outer_fold,
+                        packets=packets_by_outer[outer_fold],
+                        output_dir=output_dir / f"outer_{outer_fold:03d}",
+                        dataset=dataset,
+                        split=splits.get(outer_fold),
+                        unit_id_column=unit_id_column,
+                        text_column=text_column,
+                        treatment_column=treatment_column,
+                        outcome_column=outcome_column,
+                        outcome_type=outcome_type,
+                        inner_folds=inner_folds,
+                        seed=seed,
+                    ): outer_fold
+                    for outer_fold in outer_fold_ids
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    outer_fold = futures[future]
+                    fold_results_by_id[outer_fold] = future.result()
+                    LOGGER.info("Stage 2 completed outer_fold=%s", outer_fold)
         fold_results = [fold_results_by_id[outer_fold] for outer_fold in outer_fold_ids]
         _write_jsonl(output_dir / "features_by_outer_fold.jsonl", fold_results)
         name_counts: Counter[str] = Counter()
@@ -8281,6 +8542,18 @@ def run_plain_handoff_stage2(
 
     extraction = config.extraction_llm
     extraction_vllm = extraction.vllm if extraction is not None else None
+    if config.runtime_disable_extraction:
+        if extraction_completion is not None:
+            raise ValueError(
+                "stage2.runtime_disable_extraction cannot be combined with a custom "
+                "extraction completion"
+            )
+        extraction_completion = _DisabledExtractionCompletion()
+        extraction_vllm = None
+        LOGGER.info(
+            "Stage 2 extraction is runtime-disabled; preserving extractor model "
+            "identity without launching its managed vLLM pool"
+        )
     if config.vllm is None and extraction_vllm is None:
         return run_with_config(
             config,

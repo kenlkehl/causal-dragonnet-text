@@ -42,9 +42,12 @@ from .plain_handoff_stage2_analysis import (
     frozen_preselection_review_policy,
     infrastructure_failure_audit_paths,
 )
-from .stage2_agentic_selection import (
-    SCHEMA_VERSION as STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+from .stage2_elastic_net_selection import (
+    SCHEMA_VERSION as RETIRED_GROUP_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION,
     TEMPORAL_SCOPE as STAGE2_INPUT_TEMPORAL_SCOPE,
+)
+from .stage2_sequential_consolidation import (
+    SELECTION_SCHEMA_VERSION as STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
 )
 from .stage1_architectures import (
     BOW_NUISANCE,
@@ -87,6 +90,10 @@ WORKFLOW_COMPONENT_ORDER = (*STAGE1_COMPONENT_ORDER, "stage2")
 STAGE2_RESELECTION_SCHEMA_VERSION = "stage2_reselection_migration_v1"
 LEGACY_STAGE2_SELECTION_SCHEMA_VERSION = (
     "stage2_inner_fold_univariate_selection_v2_loky_omnibus"
+)
+RETIRED_AGENTIC_STAGE2_SELECTION_SCHEMA_VERSION = "stage2_agentic_role_selection_v1"
+RETIRED_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION = (
+    "stage2_elastic_net_rlearner_selection_v1"
 )
 RETIRED_STAGE2_SCREEN_CONFIG_KEYS = frozenset(
     {
@@ -1898,7 +1905,12 @@ def _stage2_reselection_policy_fingerprint(config: ResearchStage1Config) -> str:
             "schema_version": STAGE2_RESELECTION_SCHEMA_VERSION,
             "role_selection_schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
             "input_temporal_scope": config.stage2.input_temporal_scope,
-            "agentic_selection": config.stage2.agentic_selection.public_dict(),
+            "selection_consolidation": (
+                config.stage2.selection_consolidation.scientific_dict()
+            ),
+            "statistical_selection": (
+                config.stage2.statistical_selection.public_dict()
+            ),
             "review_policy": frozen_preselection_review_policy(config.stage2),
             "primary_model": config.stage2.model,
             "extraction_model": extraction_model,
@@ -2384,17 +2396,26 @@ def prepare_stage2_reselection(
         source_schema = str(selection_input.get("schema_version") or "")
         if source_schema not in {
             LEGACY_STAGE2_SELECTION_SCHEMA_VERSION,
+            RETIRED_AGENTIC_STAGE2_SELECTION_SCHEMA_VERSION,
+            RETIRED_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION,
+            RETIRED_GROUP_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION,
             STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
         }:
             raise RuntimeError(
                 f"outer fold {outer_fold} has unsupported selection schema "
                 f"{source_schema!r}"
             )
-        report_name = (
-            "statistical_selection.json"
-            if source_schema == LEGACY_STAGE2_SELECTION_SCHEMA_VERSION
-            else "agentic_selection.json"
-        )
+        report_name = {
+            LEGACY_STAGE2_SELECTION_SCHEMA_VERSION: "statistical_selection.json",
+            RETIRED_AGENTIC_STAGE2_SELECTION_SCHEMA_VERSION: "agentic_selection.json",
+            RETIRED_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION: (
+                "elastic_net_selection.json"
+            ),
+            RETIRED_GROUP_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION: (
+                "elastic_net_selection.json"
+            ),
+            STAGE2_ROLE_SELECTION_SCHEMA_VERSION: "elastic_net_selection.json",
+        }[source_schema]
         if not (outer_dir / "selection" / report_name).is_file():
             raise RuntimeError(
                 f"outer fold {outer_fold} is missing its completed selection report"
@@ -2785,7 +2806,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help=(
             "completion-token ceiling sent to patient-extraction requests; must be "
-            "at least 60000 and defaults to 75000"
+            "at least 4096 and defaults to 75000"
         ),
     )
     parser.add_argument(
@@ -3057,7 +3078,7 @@ def _raw_config_from_args(args: argparse.Namespace) -> tuple[dict[str, Any], Pat
         for key in RETIRED_STAGE2_SCREEN_CONFIG_KEYS:
             stage2.pop(key, None)
         stage2.setdefault("input_temporal_scope", STAGE2_INPUT_TEMPORAL_SCOPE)
-        stage2.setdefault("agentic_selection", {})
+        stage2.setdefault("statistical_selection", {})
     for key in ("endpoint", "model", "api_key"):
         value = getattr(args, f"stage2_{key}")
         if value is not None:
