@@ -9368,6 +9368,16 @@ def _extract_outer_heldout_measurements(
             "reused_feature_count": len(reused_names),
             "newly_extracted_feature_count": len(missing_names),
             "newly_extracted_features": missing_names,
+            "reused_measurement_model": str(
+                frozen_cache.get("extraction_model") or ""
+            ),
+            "new_measurement_request_identity": dict(request_identity),
+            "mixed_extractor_models": bool(
+                missing_names
+                and reused_names
+                and str(frozen_cache.get("extraction_model") or "")
+                != str(request_identity.get("model") or "")
+            ),
             "combined_frame_fingerprint": _frame_fingerprint(combined),
         }
     )
@@ -9425,8 +9435,14 @@ def run_fold_analysis(
         seed=seed,
     )
     extraction_llm = getattr(config, "extraction_llm", None)
+    configured_extraction_model = str(getattr(extraction_llm, "model", ""))
+    runtime_extraction_model = str(
+        getattr(extraction_llm, "runtime_model", "") or ""
+    ).strip()
     extraction_identity = {
-        "model": str(getattr(extraction_llm, "model", "")),
+        "model": runtime_extraction_model or configured_extraction_model,
+        "configured_checkpoint_model": configured_extraction_model,
+        "runtime_continuation_model": runtime_extraction_model or None,
     }
     primary_identity = {
         "model": str(getattr(config, "model", "")),
@@ -9976,7 +9992,9 @@ def run_fold_analysis(
             "review_convergence": review_convergence,
             "ontology_refinement_rounds": ontology_refinement_rounds,
             "selection_artifact": str(selection_dir / "elastic_net_selection.json"),
-            "screening_model_family": "group_elastic_net_nuisance_and_r_learner",
+            "screening_model_family": (
+                "group_elastic_net_nuisance_and_univariable_interaction"
+            ),
             "final_model_family": "causal_forest_dml",
             "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
         },
@@ -10008,7 +10026,9 @@ def run_fold_analysis(
         "review_converged": review_converged,
         "review_convergence": review_convergence,
         "ontology_refinement_rounds": ontology_refinement_rounds,
-        "screening_model_family": "group_elastic_net_nuisance_and_r_learner",
+        "screening_model_family": (
+            "group_elastic_net_nuisance_and_univariable_interaction"
+        ),
         "selection": selection_report,
         "measurement_dependencies": measurement_definitions,
         "harmonization_validation_fallbacks": harmonization_validation_fallbacks,

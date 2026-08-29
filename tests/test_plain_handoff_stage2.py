@@ -520,6 +520,53 @@ def test_stage2_config_warns_and_ignores_retired_colbert_settings(caplog):
     assert "ignoring retired Stage 2" in caplog.text
 
 
+def test_extraction_runtime_continuation_route_is_parsed_and_audited_separately():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://primary.test/v1",
+            "model": "primary-model",
+            "extraction_llm": {
+                "endpoint": "http://original-extractor.test/v1",
+                "model": "original-extractor",
+                "workers": 3,
+                "runtime_endpoint": "http://replacement-extractor.test/v1/",
+                "runtime_model": "replacement-extractor",
+                "runtime_api_key": "secret",
+            },
+        },
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert config.extraction_llm is not None
+    assert config.extraction_llm.model == "original-extractor"
+    assert config.extraction_llm.runtime_endpoint == (
+        "http://replacement-extractor.test/v1"
+    )
+    assert config.extraction_llm.runtime_model == "replacement-extractor"
+    public = config.extraction_llm.public_dict()
+    assert public["model"] == "original-extractor"
+    assert public["runtime_model"] == "replacement-extractor"
+    assert public["runtime_api_key"] == "<redacted>"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"runtime_endpoint": "http://replacement.test/v1"},
+        {"runtime_model": "replacement-model"},
+        {"runtime_endpoint": "not-a-url", "runtime_model": "replacement-model"},
+    ],
+)
+def test_extraction_runtime_continuation_route_requires_endpoint_model_pair(kwargs):
+    with pytest.raises(ValueError, match="runtime_"):
+        Stage2ExtractionLLMConfig(
+            endpoint="http://original.test/v1",
+            model="original-model",
+            **kwargs,
+        ).validate()
+
+
 @pytest.mark.parametrize(
     "field_name,value",
     [

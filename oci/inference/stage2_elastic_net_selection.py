@@ -1,33 +1,44 @@
-"""Fold-local group-elastic-net nuisance and R-learner selection for Stage 2.
+"""Fold-local nuisance selection and interaction screening for Stage 2.
 
 The selector has one deliberately narrow job: turn the frozen, extracted
 outer-training candidate matrix into three empirical feature sets without
 consulting the outer-heldout partition:
 
 * predictors selected in any inner fold for treatment or marginal outcome;
-* treatment-interaction terms selected in any inner fold by an R-learner.
+* candidate modifiers with a top-ranked treatment interaction in any inner fold.
 
 The union of treatment and outcome selections is the outer-fold confounder set
-and is used by both nuisance models.  R-learner targets are built from
-inner-fold out-of-fold nuisance predictions using that common set.  The union
-of all nonzero inner-fold modifier groups is passed to the final causal forest.
-No pairwise clustering or latent construction occurs here.
+and is used by both nuisance models.  Those models produce cross-fitted
+treatment and outcome predictions.  Within each inner fold, every candidate is
+then screened in its own outcome model containing those predictions, observed
+treatment, the candidate main effect, and the treatment-by-candidate
+interaction.  The candidates with the N smallest interaction p-values are
+retained, with categorical interactions tested jointly.  The union of those
+inner-fold top-N sets is passed to the final causal forest.  No pairwise
+clustering or latent construction occurs here.
 """
 
 from __future__ import annotations
 
 import copy
+import logging
 import math
+import warnings
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import log_loss, mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold
 
-SCHEMA_VERSION = "stage2_group_elastic_net_rlearner_selection_v3_any_fold_union"
+LOGGER = logging.getLogger(__name__)
+
+SCHEMA_VERSION = (
+    "stage2_group_elastic_net_univariable_modifier_selection_v4_top_n_union"
+)
 TEMPORAL_SCOPE = "pre_index_treatment"
 
 
@@ -54,6 +65,10 @@ class Stage2ElasticNetSelectionConfig:
     modifier_one_standard_error_rule: bool = False
     nuisance_forest_trees: int = 200
     nuisance_forest_min_samples_leaf: int = 10
+    modifier_top_n_per_inner_fold: int = 5
+    # Retained only so configurations written for the R-learner selector remain
+    # loadable.  These settings no longer affect modifier discovery and are
+    # omitted from public_dict so they do not misdescribe the scientific policy.
     modifier_min_mean_r_loss_improvement: float = 0.0
     modifier_min_positive_fold_fraction: float = 0.4
 
@@ -85,6 +100,7 @@ class Stage2ElasticNetSelectionConfig:
             "max_iter",
             "nuisance_forest_trees",
             "nuisance_forest_min_samples_leaf",
+            "modifier_top_n_per_inner_fold",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -145,8 +161,14 @@ class Stage2ElasticNetSelectionConfig:
 
     def public_dict(self) -> dict[str, Any]:
         result = asdict(self)
-        result.pop("nuisance_selection_frequency", None)
-        result.pop("modifier_selection_frequency", None)
+        for retired in (
+            "nuisance_selection_frequency",
+            "modifier_selection_frequency",
+            "modifier_one_standard_error_rule",
+            "modifier_min_mean_r_loss_improvement",
+            "modifier_min_positive_fold_fraction",
+        ):
+            result.pop(retired, None)
         return result
 
 
@@ -959,6 +981,219 @@ def _safe_auroc(observed: np.ndarray, predicted: np.ndarray) -> float | None:
     return float(roc_auc_score(observed[mask].astype(int), predicted[mask]))
 
 
+def _rank_safe_columns(
+    base: np.ndarray,
+    additions: np.ndarray,
+) -> tuple[np.ndarray, list[int]]:
+    """Append columns only when they add rank, preserving source order."""
+
+    current = np.asarray(base, dtype=float)
+    additions = np.asarray(additions, dtype=float)
+    if additions.ndim != 2:
+        raise ValueError("Stage 2 modifier additions must be a two-dimensional matrix")
+    rank = int(np.linalg.matrix_rank(current))
+    kept: list[int] = []
+    for index in range(additions.shape[1]):
+        candidate = np.column_stack([current, additions[:, index]])
+        next_rank = int(np.linalg.matrix_rank(candidate))
+        if next_rank > rank:
+            current = candidate
+            rank = next_rank
+            kept.append(index)
+    return current, kept
+
+
+def _binary_nested_interaction_p_value(
+    target: np.ndarray,
+    reduced: np.ndarray,
+    interactions: np.ndarray,
+) -> tuple[float | None, dict[str, Any]]:
+    """Likelihood-ratio p-value for one or more logistic interaction terms."""
+
+    target = np.asarray(target, dtype=float)
+    if len(np.unique(target)) != 2:
+        return None, {"status": "not_evaluable", "reason": "outcome_has_one_class"}
+    full, kept = _rank_safe_columns(reduced, interactions)
+    degrees = int(full.shape[1] - reduced.shape[1])
+    if degrees < 1:
+        return None, {
+            "status": "not_evaluable",
+            "reason": "no_independent_interaction_columns",
+        }
+    try:
+        import statsmodels.api as sm
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            reduced_fit = sm.GLM(
+                target,
+                reduced,
+                family=sm.families.Binomial(),
+            ).fit(disp=0)
+            full_fit = sm.GLM(
+                target,
+                full,
+                family=sm.families.Binomial(),
+            ).fit(disp=0)
+        if not bool(getattr(reduced_fit, "converged", True)) or not bool(
+            getattr(full_fit, "converged", True)
+        ):
+            raise ValueError("logistic regression did not converge")
+        reduced_llf = float(reduced_fit.llf)
+        full_llf = float(full_fit.llf)
+        if not math.isfinite(reduced_llf) or not math.isfinite(full_llf):
+            raise ValueError("nonfinite logistic log likelihood")
+        statistic = max(0.0, 2.0 * (full_llf - reduced_llf))
+        p_value = float(stats.chi2.sf(statistic, degrees))
+        if not math.isfinite(p_value):
+            raise ValueError("nonfinite likelihood-ratio p-value")
+    except Exception as exc:
+        return None, {
+            "status": "not_evaluable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    return p_value, {
+        "status": "ok",
+        "test": "likelihood_ratio_chi_square",
+        "statistic": statistic,
+        "degrees_of_freedom": degrees,
+        "tested_column_indices": kept,
+    }
+
+
+def _continuous_nested_interaction_p_value(
+    target: np.ndarray,
+    reduced: np.ndarray,
+    interactions: np.ndarray,
+) -> tuple[float | None, dict[str, Any]]:
+    """Partial-F p-value preserving support for continuous-outcome workflows."""
+
+    target = np.asarray(target, dtype=float)
+    full, kept = _rank_safe_columns(reduced, interactions)
+    degrees = int(full.shape[1] - reduced.shape[1])
+    residual_degrees = int(len(target) - full.shape[1])
+    if degrees < 1 or residual_degrees < 1:
+        return None, {
+            "status": "not_evaluable",
+            "reason": "insufficient_independent_columns_or_residual_degrees_of_freedom",
+        }
+    try:
+        reduced_coefficients = np.linalg.lstsq(reduced, target, rcond=None)[0]
+        full_coefficients = np.linalg.lstsq(full, target, rcond=None)[0]
+        reduced_residual = target - reduced @ reduced_coefficients
+        full_residual = target - full @ full_coefficients
+        reduced_ss = float(reduced_residual @ reduced_residual)
+        full_ss = float(full_residual @ full_residual)
+        if full_ss <= 1e-15:
+            statistic = math.inf if reduced_ss > full_ss + 1e-15 else 0.0
+        else:
+            numerator = max(0.0, (reduced_ss - full_ss) / degrees)
+            statistic = numerator / (full_ss / residual_degrees)
+        p_value = float(stats.f.sf(statistic, degrees, residual_degrees))
+        if not math.isfinite(p_value):
+            raise ValueError("nonfinite partial-F p-value")
+    except Exception as exc:
+        return None, {
+            "status": "not_evaluable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    return p_value, {
+        "status": "ok",
+        "test": "partial_f",
+        "statistic": statistic,
+        "degrees_of_freedom": [degrees, residual_degrees],
+        "tested_column_indices": kept,
+    }
+
+
+def _modifier_interaction_test(
+    *,
+    frame: pd.DataFrame,
+    treatment: np.ndarray,
+    outcome: np.ndarray,
+    reduced_base: np.ndarray,
+    feature: Mapping[str, Any],
+    binary_outcome: bool,
+    categorical_min_count: int,
+) -> dict[str, Any]:
+    """Fit the candidate-specific outcome model and test its interaction group."""
+
+    design = _encode_design(
+        frame,
+        frame,
+        [feature],
+        categorical_min_count=int(categorical_min_count),
+    )
+    reduced, kept_main = _rank_safe_columns(reduced_base, design.train)
+    interaction_indices = [
+        index
+        for index, name in enumerate(design.column_names)
+        if not str(name).endswith(":missing")
+    ]
+    interaction_columns = (
+        treatment.reshape(-1, 1) * design.train[:, interaction_indices]
+        if interaction_indices
+        else np.empty((len(frame), 0), dtype=float)
+    )
+    if binary_outcome:
+        p_value, test = _binary_nested_interaction_p_value(
+            outcome,
+            reduced,
+            interaction_columns,
+        )
+    else:
+        p_value, test = _continuous_nested_interaction_p_value(
+            outcome,
+            reduced,
+            interaction_columns,
+        )
+    interaction_names = [
+        str(design.column_names[index]) for index in interaction_indices
+    ]
+    tested_indices = [int(value) for value in test.get("tested_column_indices") or []]
+    strategy = _feature_strategy(feature)
+    return {
+        "feature_id": _feature_key(feature),
+        "name": str(feature["name"]),
+        "candidate_strategy": strategy,
+        "encoded_main_columns": [
+            str(design.column_names[index]) for index in kept_main
+        ],
+        "candidate_interaction_columns": interaction_names,
+        "tested_interaction_columns": [
+            interaction_names[index]
+            for index in tested_indices
+            if 0 <= index < len(interaction_names)
+        ],
+        "categorical_interactions_are_grouped": strategy == "categorical",
+        "missingness_interactions": False,
+        "interaction_p_value": p_value,
+        "interaction_test": test,
+    }
+
+
+def _rank_modifier_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    evaluable = [row for row in rows if row.get("interaction_p_value") is not None]
+    return [
+        {
+            "rank": rank,
+            "feature_id": str(row["feature_id"]),
+            "name": str(row["name"]),
+            "p_value": float(row["interaction_p_value"]),
+        }
+        for rank, row in enumerate(
+            sorted(
+                evaluable,
+                key=lambda row: (
+                    float(row["interaction_p_value"]),
+                    str(row["feature_id"]),
+                ),
+            ),
+            start=1,
+        )
+    ]
+
+
 def select_stage2_features_elastic_net(
     *,
     dataset: pd.DataFrame,
@@ -1208,80 +1443,90 @@ def select_stage2_features_elastic_net(
         )
     t_all = dataset.iloc[all_fit_ids][treatment_column].to_numpy(dtype=float)
     y_all = dataset.iloc[all_fit_ids][outcome_column].to_numpy(dtype=float)
-    residual_t = t_all - oof_e
-    residual_y = y_all - oof_m
 
     modifier_votes = {feature_id: 0 for feature_id in by_id}
+    modifier_p_values = {feature_id: [] for feature_id in by_id}
     modifier_folds: list[dict[str, Any]] = []
     for position, split in enumerate(folds, start=1):
         train_ids = [int(value) for value in split.get("fit_row_ids") or []]
         valid_ids = [int(value) for value in split.get("heldout_row_ids") or []]
         train = extracted_by_id.loc[train_ids].reset_index(drop=True)
-        valid = extracted_by_id.loc[valid_ids].reset_index(drop=True)
-        design = _encode_design(
-            train,
-            valid,
-            original,
-            categorical_min_count=int(policy.categorical_min_count),
+        train_positions = np.asarray(
+            [id_position[row_id] for row_id in train_ids],
+            dtype=int,
         )
-        train_positions = np.asarray([id_position[row_id] for row_id in train_ids], dtype=int)
-        valid_positions = np.asarray([id_position[row_id] for row_id in valid_ids], dtype=int)
-        rt_train, rt_valid = residual_t[train_positions], residual_t[valid_positions]
-        ry_train, ry_valid = residual_y[train_positions], residual_y[valid_positions]
-        weights = rt_train**2
-        centers = (
-            np.average(design.train, axis=0, weights=weights)
-            if design.train.shape[1] and float(np.sum(weights)) > 1e-12
-            else np.zeros(design.train.shape[1], dtype=float)
+        treatment = dataset.iloc[train_ids][treatment_column].to_numpy(dtype=float)
+        outcome = dataset.iloc[train_ids][outcome_column].to_numpy(dtype=float)
+        base_names = ["treatment_prediction", "outcome_prediction", "treatment"]
+        base_inputs = np.column_stack(
+            [oof_e[train_positions], oof_m[train_positions], treatment]
         )
-        centered_train = design.train - centers
-        centered_valid = design.valid - centers
-        denominator = float(np.sum(weights))
-        tau0 = (
-            float(np.sum(rt_train * ry_train) / denominator)
-            if denominator > 1e-12
-            else 0.0
+        reduced_base, kept_base = _rank_safe_columns(
+            np.ones((len(train), 1), dtype=float),
+            base_inputs,
         )
-        modifier_target = ry_train - rt_train * tau0
-        modifier_fit = _squared_error_elastic_net(
-            rt_train.reshape(-1, 1) * centered_train,
-            modifier_target,
-            rt_valid.reshape(-1, 1) * centered_valid,
-            design.column_feature_ids,
-            config=policy,
-            seed=seed + 30_000 + position,
-            fit_intercept=False,
-            one_standard_error_rule=policy.modifier_one_standard_error_rule,
-        )
-        selected_ids, magnitudes = _selected_feature_ids(
-            modifier_fit.coefficients,
-            design.column_feature_ids,
-            tolerance=float(policy.coefficient_tolerance),
-        )
+        tests = [
+            _modifier_interaction_test(
+                frame=train,
+                treatment=treatment,
+                outcome=outcome,
+                reduced_base=reduced_base,
+                feature=feature,
+                binary_outcome=binary_outcome,
+                categorical_min_count=int(policy.categorical_min_count),
+            )
+            for feature in original
+        ]
+        ranking = _rank_modifier_rows(tests)
+        selected_ids = [
+            str(row["feature_id"])
+            for row in ranking[: int(policy.modifier_top_n_per_inner_fold)]
+        ]
+        selected_set = set(selected_ids)
+        rank_by_id = {
+            str(row["feature_id"]): int(row["rank"])
+            for row in ranking
+        }
+        for row in tests:
+            feature_id = str(row["feature_id"])
+            row["rank"] = rank_by_id.get(feature_id)
+            row["selected_top_n"] = feature_id in selected_set
+            p_value = row.get("interaction_p_value")
+            if p_value is not None:
+                modifier_p_values[feature_id].append(float(p_value))
         for feature_id in selected_ids:
             modifier_votes[feature_id] += 1
-        null_prediction = rt_valid * tau0
-        full_prediction = null_prediction + modifier_fit.valid_prediction
-        null_loss = float(mean_squared_error(ry_valid, null_prediction))
-        full_loss = float(mean_squared_error(ry_valid, full_prediction))
         modifier_folds.append(
             {
                 "inner_fold": int(split.get("inner_fold", position)),
                 "fit_rows": len(train_ids),
-                "heldout_rows": len(valid_ids),
-                "encoded_modifier_columns": int(design.train.shape[1]),
-                "constant_effect": tau0,
-                "status": modifier_fit.status,
-                "regularization_alpha": modifier_fit.regularization,
-                "internal_cv_folds": modifier_fit.cv_folds,
+                "excluded_inner_heldout_rows": len(valid_ids),
+                "model_family": (
+                    "binomial_logistic_regression"
+                    if binary_outcome
+                    else "gaussian_linear_regression"
+                ),
+                "base_input_columns": [
+                    base_names[index] for index in kept_base
+                ],
+                "nuisance_predictions_are_cross_fitted": True,
+                "candidate_models": len(tests),
+                "evaluable_candidates": len(ranking),
+                "requested_top_n": int(policy.modifier_top_n_per_inner_fold),
                 "selected_feature_ids": selected_ids,
-                "feature_group_l2_norms": magnitudes,
-                "solver_iterations": modifier_fit.iterations,
-                "solver_converged": modifier_fit.converged,
-                "null_r_loss": null_loss,
-                "selected_r_loss": full_loss,
-                "heldout_r_loss_improvement": null_loss - full_loss,
+                "selected_count": len(selected_ids),
+                "interaction_p_value_ranking": ranking,
+                "tests": tests,
             }
+        )
+        LOGGER.info(
+            "Stage 2 modifier screen inner_fold=%s candidates=%s "
+            "evaluable=%s selected=%s top_n=%s",
+            int(split.get("inner_fold", position)),
+            len(tests),
+            len(ranking),
+            len(selected_ids),
+            int(policy.modifier_top_n_per_inner_fold),
         )
 
     modifier_union = _selected_in_any_inner_fold(modifier_votes)
@@ -1291,14 +1536,6 @@ def select_stage2_features_elastic_net(
         if feature.get("configured_explicit_feature") is True
         and "effect_modifier" in set(map(str, feature.get("roles") or []))
     }
-    r_improvements = [float(row["heldout_r_loss_improvement"]) for row in modifier_folds]
-    mean_r_improvement = float(np.mean(r_improvements))
-    positive_fraction = float(np.mean(np.asarray(r_improvements) > 0.0))
-    modifier_set_supported = bool(
-        mean_r_improvement
-        >= float(policy.modifier_min_mean_r_loss_improvement)
-        and positive_fraction >= float(policy.modifier_min_positive_fold_fraction)
-    )
     modifier_union.update(locked_modifiers)
 
     selected: list[dict[str, Any]] = []
@@ -1335,13 +1572,21 @@ def select_stage2_features_elastic_net(
                 "modifier_selection_frequency": float(
                     modifier_votes[feature_id] / len(folds)
                 ),
+                "modifier_min_interaction_p_value": (
+                    float(min(modifier_p_values[feature_id]))
+                    if modifier_p_values[feature_id]
+                    else None
+                ),
                 "nuisance_model_roles": nuisance_roles,
                 "roles": roles,
                 "retained": retained,
                 "selection_source": (
                     "investigator_locked"
                     if configured
-                    else "group_elastic_net_any_inner_fold_union"
+                    else (
+                        "group_elastic_net_nuisance_and_univariable_"
+                        "interaction_any_inner_fold_union"
+                    )
                 ),
             }
         )
@@ -1352,7 +1597,10 @@ def select_stage2_features_elastic_net(
             updated["selection_source"] = (
                 "investigator_locked"
                 if configured
-                else "group_elastic_net_any_inner_fold_union"
+                else (
+                    "group_elastic_net_nuisance_and_univariable_"
+                    "interaction_any_inner_fold_union"
+                )
             )
             selected.append(updated)
 
@@ -1361,8 +1609,12 @@ def select_stage2_features_elastic_net(
         "temporal_scope": TEMPORAL_SCOPE,
         "status": "complete",
         "selection_method": (
-            "any_inner_fold_union_group_elastic_net_nuisance_and_group_r_learner"
+            "any_inner_fold_union_group_elastic_net_nuisance_and_top_n_"
+            "univariable_treatment_interactions"
         ),
+        "penalized_nuisance_screen_model_family": "group_lasso_plus_ridge",
+        # Backward-compatible report key; penalization applies to nuisance
+        # screening only, not to the candidate-wise modifier regressions.
         "penalized_model_family": "group_lasso_plus_ridge",
         "encoding": {
             "ordinal": "single_training_standardized_ordered_score",
@@ -1417,17 +1669,43 @@ def select_stage2_features_elastic_net(
         },
         "effect_modifier_screen": {
             "objective": (
-                "squared_R_loss_on_residualized_outcome_and_treatment; "
-                "per-row squared loss is not used as a regression target"
+                "candidate-wise outcome regression adjusted for cross-fitted "
+                "treatment and outcome predictions, observed treatment, and the "
+                "candidate main effect"
+            ),
+            "model_family": (
+                "binomial_logistic_regression"
+                if binary_outcome
+                else "gaussian_linear_regression"
+            ),
+            "binary_outcome_formula": (
+                "outcome ~ treatment_prediction + outcome_prediction + treatment + "
+                "candidate + treatment:candidate"
+            ),
+            "categorical_interaction_test": (
+                "one_joint_likelihood_ratio_test_over_all_estimable_"
+                "treatment_by_nonreference_level_terms"
+                if binary_outcome
+                else (
+                    "one_joint_partial_f_test_over_all_estimable_treatment_by_"
+                    "nonreference_level_terms"
+                )
+            ),
+            "candidate_scope": "one_candidate_group_per_model",
+            "screening_rows": (
+                "inner_fold_fit_rows_with_cross_fitted_nuisance_predictions"
             ),
             "folds": modifier_folds,
-            "selection_rule": "selected_in_any_inner_fold",
+            "selection_rule": (
+                "union_of_top_n_interaction_p_values_from_each_inner_fold"
+            ),
+            "top_n_per_inner_fold": int(policy.modifier_top_n_per_inner_fold),
             "required_votes": 1,
             "votes": dict(sorted(modifier_votes.items())),
-            "mean_heldout_r_loss_improvement": mean_r_improvement,
-            "positive_fold_fraction": positive_fraction,
-            "set_passed_heldout_r_loss_gate": modifier_set_supported,
-            "heldout_r_loss_gate_is_not_a_selection_gate": True,
+            "p_values_are_raw": True,
+            "p_value_threshold_is_not_a_selection_gate": True,
+            "non_evaluable_candidates_are_not_ranked": True,
+            "missingness_interactions": False,
             "stable_effect_modifier_feature_ids": sorted(modifier_union),
         },
         "decisions": decisions,

@@ -42,10 +42,7 @@ from .plain_handoff_stage2_analysis import (
     frozen_preselection_review_policy,
     infrastructure_failure_audit_paths,
 )
-from .stage2_elastic_net_selection import (
-    SCHEMA_VERSION as RETIRED_GROUP_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION,
-    TEMPORAL_SCOPE as STAGE2_INPUT_TEMPORAL_SCOPE,
-)
+from .stage2_elastic_net_selection import TEMPORAL_SCOPE as STAGE2_INPUT_TEMPORAL_SCOPE
 from .stage2_sequential_consolidation import (
     SELECTION_SCHEMA_VERSION as STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
 )
@@ -94,6 +91,12 @@ LEGACY_STAGE2_SELECTION_SCHEMA_VERSION = (
 RETIRED_AGENTIC_STAGE2_SELECTION_SCHEMA_VERSION = "stage2_agentic_role_selection_v1"
 RETIRED_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION = (
     "stage2_elastic_net_rlearner_selection_v1"
+)
+RETIRED_GROUP_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION = (
+    "stage2_group_elastic_net_rlearner_selection_v3_any_fold_union"
+)
+RETIRED_ANY_INNER_FOLD_STAGE2_SELECTION_SCHEMA_VERSION = (
+    "stage2_group_elastic_net_rlearner_selection_v6_any_inner_fold_union"
 )
 RETIRED_STAGE2_SCREEN_CONFIG_KEYS = frozenset(
     {
@@ -2399,6 +2402,7 @@ def prepare_stage2_reselection(
             RETIRED_AGENTIC_STAGE2_SELECTION_SCHEMA_VERSION,
             RETIRED_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION,
             RETIRED_GROUP_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION,
+            RETIRED_ANY_INNER_FOLD_STAGE2_SELECTION_SCHEMA_VERSION,
             STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
         }:
             raise RuntimeError(
@@ -2412,6 +2416,9 @@ def prepare_stage2_reselection(
                 "elastic_net_selection.json"
             ),
             RETIRED_GROUP_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION: (
+                "elastic_net_selection.json"
+            ),
+            RETIRED_ANY_INNER_FOLD_STAGE2_SELECTION_SCHEMA_VERSION: (
                 "elastic_net_selection.json"
             ),
             STAGE2_ROLE_SELECTION_SCHEMA_VERSION: "elastic_net_selection.json",

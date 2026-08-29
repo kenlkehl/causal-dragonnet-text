@@ -92,8 +92,8 @@ are:
       "nuisance_selection_rule": "any_inner_fold_union",
       "modifier_selection_rule": "any_inner_fold_union",
       "one_standard_error_rule": true,
-      "modifier_one_standard_error_rule": false,
-      "nuisance_forest_trees": 200
+      "nuisance_forest_trees": 200,
+      "modifier_top_n_per_inner_fold": 5
     },
     "estimation_trees": 200,
     "explicit_features": []
@@ -155,10 +155,12 @@ group elastic nets run inside each outer fold. A candidate selected in any inner
 fold for either task enters one shared confounder union used by both nuisance
 models. Ordered measurements use one standardized score; nominal factor
 contrasts and missingness are selected as one group. Inner-fold nuisance forests
-generate out-of-fold residuals, and any treatment-interaction group selected by
-the group-elastic-net R-learner in any inner fold enters the causal-forest
-modifier union. Binary nuisance reports include AUROC and log loss; held-out
-R-loss remains diagnostic rather than gating modifier retention.
+generate out-of-fold treatment and outcome predictions. One outcome regression
+per candidate then includes those two predictions, observed treatment, the
+candidate, and its treatment interaction. For binary outcomes this is logistic
+regression, and categorical interaction contrasts receive one grouped test. The
+five smallest interaction p-values per inner fold enter the causal-forest
+modifier union by default. Binary nuisance reports include AUROC and log loss.
 Consolidation receives neither treatment nor outcome and is not a role-selection
 screen. Outer-heldout rows remain inaccessible until selection is frozen;
 selected latent states are then applied to their held-out measurement dependencies.
@@ -232,7 +234,7 @@ uv run python scripts/run_all_evidence.py \
 
 The command verifies all reusable inputs before archiving the previous selector
 and downstream results under `stage2/reselection_archives/`. It redoes nuisance
-and R-learner stability selection, then reuses archived held-out measurements
+and top-N interaction selection, then reuses archived held-out measurements
 whose row, text, model, frame, and definition fingerprints still match. Only
 newly required or incompatible components are extracted. Estimation is then rerun.
 Keep the original primary and extraction model IDs; endpoints may change.

@@ -716,6 +716,13 @@ class Stage2ExtractionLLMConfig:
     vllm: ManagedVLLMConfig | None = None
     # Populated only while an extractor pool owned by this pipeline is alive.
     runtime_endpoints: tuple[str, ...] = ()
+    # Optional continuation route for extracting cache misses with an explicitly
+    # authorized replacement model.  The configured model above remains the
+    # scientific identity of frozen extraction checkpoints; newly generated
+    # request artifacts record this runtime model instead.
+    runtime_endpoint: str = ""
+    runtime_model: str = ""
+    runtime_api_key: str = "EMPTY"
 
     def validate(self, *, require_model: bool = True) -> None:
         if self.endpoint and self.vllm is not None and not self.runtime_endpoints:
@@ -747,6 +754,20 @@ class Stage2ExtractionLLMConfig:
                     "stage2.extraction_llm.runtime_endpoints must contain HTTP(S) "
                     "OpenAI-compatible base URLs"
                 )
+        continuation_endpoint = str(self.runtime_endpoint).strip()
+        continuation_model = str(self.runtime_model).strip()
+        if bool(continuation_endpoint) != bool(continuation_model):
+            raise ValueError(
+                "stage2.extraction_llm.runtime_endpoint and runtime_model must be "
+                "configured together"
+            )
+        if continuation_endpoint:
+            parsed = urlparse(continuation_endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError(
+                    "stage2.extraction_llm.runtime_endpoint must be one HTTP(S) "
+                    "OpenAI-compatible base URL"
+                )
         if require_model and not self.model.strip():
             raise ValueError("stage2.extraction_llm.model must be nonempty")
         if isinstance(self.workers, bool) or not isinstance(self.workers, int) or self.workers < 1:
@@ -759,6 +780,9 @@ class Stage2ExtractionLLMConfig:
             "api_key": "<redacted>",
             "workers": self.workers,
             "vllm": self.vllm.public_dict() if self.vllm is not None else None,
+            "runtime_endpoint": self.runtime_endpoint,
+            "runtime_model": self.runtime_model,
+            "runtime_api_key": "<redacted>",
         }
 
 
@@ -1301,6 +1325,17 @@ def plain_stage2_config_from_mapping(
                 ),
             ),
             vllm=extraction_vllm,
+            runtime_endpoint=str(
+                raw_extraction_llm.get("runtime_endpoint") or ""
+            ).strip().rstrip("/"),
+            runtime_model=str(
+                raw_extraction_llm.get("runtime_model") or ""
+            ).strip(),
+            runtime_api_key=str(
+                raw_extraction_llm.get("runtime_api_key")
+                or os.environ.get("OCI_STAGE2_EXTRACTION_RUNTIME_API_KEY")
+                or "EMPTY"
+            ),
         )
         extraction_llm.validate(require_model=False)
 
@@ -6313,12 +6348,27 @@ class PlainHandoffStage2:
         self.extraction_tokenizer: Any | None = None
         if config.extraction_llm is not None:
             extraction = config.extraction_llm
-            extraction_endpoints = extraction.runtime_endpoints or (extraction.endpoint,)
+            continuation_route = bool(str(extraction.runtime_endpoint).strip())
+            extraction_endpoints = (
+                (str(extraction.runtime_endpoint).rstrip("/"),)
+                if continuation_route
+                else extraction.runtime_endpoints or (extraction.endpoint,)
+            )
+            request_model = (
+                str(extraction.runtime_model).strip()
+                if continuation_route
+                else extraction.model
+            )
+            request_api_key = (
+                extraction.runtime_api_key
+                if continuation_route
+                else extraction.api_key
+            )
             extraction_request_config = replace(
                 config,
                 endpoint=extraction_endpoints[0],
-                model=extraction.model,
-                api_key=extraction.api_key,
+                model=request_model,
+                api_key=request_api_key,
                 workers=extraction.workers,
                 extraction_llm=None,
                 vllm=None,
@@ -6329,15 +6379,33 @@ class PlainHandoffStage2:
             uses_default_extraction_transport = _uses_default_openai_transport(
                 routed_extraction
             )
-            extraction_identity = _endpoint_model_identity(
+            live_extraction_identity = _endpoint_model_identity(
                 extraction_request_config,
                 endpoints=extraction_endpoints,
-                role="extraction",
+                role=(
+                    "extraction_runtime_continuation"
+                    if continuation_route
+                    else "extraction"
+                ),
                 verify_live_endpoint=_uses_default_openai_transport(routed_extraction),
             )
+            if continuation_route:
+                extraction_identity = {
+                    "role": "extraction",
+                    "selected_model": extraction.model,
+                    "model_family": _stage2_model_family(extraction.model),
+                    "actual_model_identity": None,
+                    "live_endpoint_verified": False,
+                    "endpoint_observations": [],
+                    "runtime_continuation_is_separately_audited": True,
+                }
+                extraction_runtime_identity = live_extraction_identity
+            else:
+                extraction_identity = live_extraction_identity
+                extraction_runtime_identity = None
             self.extraction_request_config = replace(
                 extraction_request_config,
-                runtime_model_family=str(extraction_identity["model_family"]),
+                runtime_model_family=str(live_extraction_identity["model_family"]),
             )
             if routed_extraction is None:
                 routed_extraction = _RoundRobinOpenAICompletion(extraction_endpoints)
@@ -6350,24 +6418,26 @@ class PlainHandoffStage2:
             elif uses_default_extraction_transport:
                 extraction_vllm = extraction.vllm
                 self.extraction_tokenizer = _LazyStage2ExtractionTokenizer(
-                    model=extraction.model,
+                    model=request_model,
                     cache_dir=(
-                        str(extraction_vllm.download_dir)
-                        if extraction_vllm is not None
+                        str(extraction.vllm.download_dir)
+                        if extraction.vllm is not None
                         else ""
                     ),
                     chat_template_kwargs=(
-                        extraction_vllm.default_chat_template_kwargs
-                        if extraction_vllm is not None
+                        extraction.vllm.default_chat_template_kwargs
+                        if extraction.vllm is not None
                         else None
                     ),
                 )
         else:
             extraction_identity = None
+            extraction_runtime_identity = None
         self.model_identity = {
             "schema_version": MODEL_IDENTITY_SCHEMA_VERSION,
             "primary": primary_identity,
             "extraction": extraction_identity,
+            "extraction_runtime_continuation": extraction_runtime_identity,
             "selection_consolidation_runtime": consolidation_identity,
             "endpoint_urls_are_transport_only": True,
         }
@@ -8250,7 +8320,7 @@ class PlainHandoffStage2:
             LOGGER.info(
                 "Stage 2 outer-fold execution folds=%s fold_workers=%s "
                 "global_request_workers=%s "
-                "statistical_selection=group_elastic_net_r_learner",
+                "statistical_selection=group_elastic_net_univariable_interaction",
                 len(outer_fold_ids),
                 fold_workers,
                 self.config.workers,
@@ -8542,6 +8612,11 @@ def run_plain_handoff_stage2(
 
     extraction = config.extraction_llm
     extraction_vllm = extraction.vllm if extraction is not None else None
+    if extraction is not None and str(extraction.runtime_endpoint).strip():
+        # An explicit continuation route replaces only the live transport. The
+        # configured pool remains in the persisted checkpoint identity and must
+        # not be launched.
+        extraction_vllm = None
     if config.runtime_disable_extraction:
         if extraction_completion is not None:
             raise ValueError(

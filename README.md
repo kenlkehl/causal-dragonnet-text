@@ -224,7 +224,7 @@ flowchart LR
     D --> E["Exhaustively list and merge concepts"]
     E --> F["Primary model defines ontologies"]
     F --> G["Small model extracts patient-level values"]
-    G --> H["Group-elastic-net nuisance and R-learner screens assign roles"]
+    G --> H["Group-elastic-net nuisance and candidate-wise interaction screens assign roles"]
     H --> J["Cross-fitted causal forest"]
     J --> I["ATE, CATE or ITE estimates with diagnostics"]
 ```
@@ -761,9 +761,8 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
       "regularization_grid_size": 16,
       "optimization_tolerance": 1e-6,
       "one_standard_error_rule": true,
-      "modifier_one_standard_error_rule": false,
       "nuisance_forest_trees": 200,
-      "modifier_min_positive_fold_fraction": 0.4
+      "modifier_top_n_per_inner_fold": 5
     },
     "estimation_trees": 200,
     "explicit_features": []
@@ -1117,16 +1116,15 @@ that same union. Reports include inner-heldout and pooled out-of-fold AUROC as
 well as log loss for binary nuisance tasks.
 
 Inner-fold random forests then produce one out-of-fold propensity and marginal
-outcome prediction for every outer-training patient. Stage 2 residualizes
-treatment and outcome and fits a group-elastic-net R-learner whose penalized
-blocks are all residualized-treatment-by-candidate interaction columns for one
-measurement. Any modifier group selected in at least one inner fold enters the
-outer fold's causal-forest modifier union. Held-out R-loss improvement remains
-a reported diagnostic, not a selection gate. Per-row squared loss is never used
-as a regression target. The nuisance screens use the
-one-standard-error rule for sparsity; modifier interactions default to the
-minimum-CV-loss penalty because applying one-SE twice can erase genuine weak
-heterogeneity.
+outcome prediction for every outer-training patient. Within each inner fold,
+Stage 2 fits one outcome regression per candidate with the propensity
+prediction, outcome prediction, observed treatment, candidate main effect, and
+observed-treatment-by-candidate interaction as inputs. Binary outcomes use
+logistic regression. A nominal candidate's interaction contrasts are tested as
+one grouped likelihood-ratio term rather than as independent dummies. The five
+candidates with the smallest raw interaction p-values enter that inner fold's
+set by default; their union becomes the outer fold's causal-forest modifier set.
+The nuisance screens continue to use the one-standard-error rule for sparsity.
 
 The consolidation agent never receives treatment, outcome, or outer-heldout
 rows; pairwise associations are used only for this unsupervised replacement
@@ -1181,7 +1179,7 @@ flowchart LR
     D --> E["Primary model reviews<br/>aggregate ontology"]
     E -->|"ontology revised"| D
     E -->|"frozen"| F["Sequential equivalence-only<br/>alias consolidation"]
-    F --> G["Group-elastic-net nuisance screens<br/>and R-learner selection"]
+    F --> G["Group-elastic-net nuisance screens<br/>and top-N interaction selection"]
     G --> H["Small model extracts retained<br/>outer-held-out dependencies"]
     H --> I["Causal forest and<br/>held-out AIPW scores"]
     I --> J["Aggregate all outer folds"]

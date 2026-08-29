@@ -216,9 +216,8 @@ An external endpoint configuration is:
       "internal_cv_folds": 3,
       "regularization_grid_size": 16,
       "one_standard_error_rule": true,
-      "modifier_one_standard_error_rule": false,
       "nuisance_forest_trees": 200,
-      "modifier_min_positive_fold_fraction": 0.4
+      "modifier_top_n_per_inner_fold": 5
     },
     "estimation_trees": 200,
     "explicit_features": [
@@ -959,24 +958,26 @@ For binary targets, the report records inner-heldout and pooled out-of-fold
 AUROC alongside log loss.
 
 Those forests generate one inner-heldout propensity and outcome prediction for
-every outer-training row. Treatment and outcome are residualized, and a second
-group elastic net directly minimizes R-loss using grouped
-residualized-treatment-by-feature columns. A modifier group selected in any
-inner fold enters the final causal-forest union. Held-out R-loss support remains
-a diagnostic and is not a selection gate. The
-nuisance screens use the
-one-standard-error rule; the modifier screen defaults to the minimum-CV-loss
-penalty. No per-row squared-loss target is used. Pairwise associations and the
-LLM are confined to the preceding unsupervised consolidation; they do not assign
-roles or gate elastic-net support.
+every outer-training row. Within each inner fold, a separate outcome regression
+is fit for every candidate using the two cross-fitted nuisance predictions,
+observed treatment, the candidate main effect, and the observed-treatment-by-
+candidate interaction. Binary outcomes use logistic regression. All estimable
+interaction contrasts for a categorical candidate receive one joint likelihood-
+ratio test; continuous outcomes retain the analogous grouped partial-F test.
+The five candidates with the smallest raw interaction p-values per inner fold
+are selected by default, and their union enters the final causal forest. The
+nuisance screens continue to use the one-standard-error rule. Pairwise
+associations and the LLM are confined to the preceding unsupervised
+consolidation; they do not assign roles or gate statistical support.
 
 Explicit investigator features retain exactly their configured roles. The
 outer-heldout partition is inaccessible during selection and receives only the
 selected original measurement dependencies afterward. Fitted latent states are
 then applied in creation order, including recursive latent ancestors.
 
-The stability votes, cross-fitted nuisance diagnostics, grouped coefficients,
-R-loss diagnostics, and final decisions are checkpointed under `selection/`.
+The nuisance votes, cross-fitted nuisance diagnostics, candidate interaction
+p-values, grouped categorical tests, and final decisions are checkpointed under
+`selection/`.
 Changing only endpoint URLs does not invalidate completed scientific
 checkpoints. `model_identity.json` records the model IDs actually advertised at
 startup. Changing the primary model raises an error before interpretation

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.model_selection import KFold
 
 import oci.inference.stage2_elastic_net_selection as selection_module
@@ -38,7 +39,7 @@ def _categorical(feature_id: str, name: str, levels: list[str]) -> dict[str, obj
     }
 
 
-def test_any_fold_nuisance_union_and_r_learner_modifier_selection():
+def test_any_fold_nuisance_union_and_univariable_modifier_selection():
     rng = np.random.default_rng(141)
     rows = 700
     confounder = rng.normal(size=rows)
@@ -94,6 +95,7 @@ def test_any_fold_nuisance_union_and_r_learner_modifier_selection():
         regularization_grid_size=8,
         nuisance_forest_trees=60,
         nuisance_forest_min_samples_leaf=6,
+        modifier_top_n_per_inner_fold=1,
         max_iter=3_000,
     )
 
@@ -141,13 +143,17 @@ def test_any_fold_nuisance_union_and_r_learner_modifier_selection():
         assert fold["treatment"]["heldout_auroc"] is not None
         assert fold["outcome"]["heldout_auroc"] is None
     assert "effect_modifier" in selected_by_id["mod"]["roles"]
-    assert report["effect_modifier_screen"]["set_passed_heldout_r_loss_gate"] is True
-    assert report["effect_modifier_screen"]["required_votes"] == 1
-    assert (
-        report["effect_modifier_screen"]["heldout_r_loss_gate_is_not_a_selection_gate"]
-        is True
+    assert report["effect_modifier_screen"]["model_family"] == (
+        "gaussian_linear_regression"
     )
-    assert report["effect_modifier_screen"]["mean_heldout_r_loss_improvement"] > 0
+    assert report["effect_modifier_screen"]["top_n_per_inner_fold"] == 1
+    assert report["effect_modifier_screen"]["required_votes"] == 1
+    assert report["effect_modifier_screen"]["p_value_threshold_is_not_a_selection_gate"]
+    assert all(
+        fold["selected_count"] == 1
+        and fold["nuisance_predictions_are_cross_fitted"] is True
+        for fold in report["effect_modifier_screen"]["folds"]
+    )
     assert report["cross_fitted_nuisance_models"][
         "predictions_are_inner_fold_out_of_fold"
     ] is True
@@ -297,6 +303,82 @@ def test_nominal_factor_is_selected_as_one_group_in_both_nuisance_tasks():
         assert "factor" in fold["outcome"]["feature_group_l2_norms"]
 
 
+def test_categorical_modifier_uses_one_grouped_interaction_p_value():
+    rng = np.random.default_rng(733)
+    rows = 900
+    levels = np.asarray(["A", "B", "C"])
+    category_index = rng.integers(0, len(levels), size=rows)
+    category = levels[category_index]
+    treatment = rng.binomial(1, 0.5, size=rows)
+    interaction_effect = np.asarray([-2.8, 0.0, 2.8])[category_index]
+    outcome_probability = 1.0 / (
+        1.0 + np.exp(-(-0.3 + 0.15 * category_index + treatment * interaction_effect))
+    )
+    outcome = rng.binomial(1, outcome_probability)
+    extracted = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(rows),
+            "factor": category,
+            "noise": rng.normal(size=rows),
+        }
+    )
+    dataset = pd.DataFrame({"treatment": treatment, "outcome": outcome})
+    definitions = [
+        _categorical("factor", "factor", levels.tolist()),
+        _continuous("noise", "noise"),
+    ]
+    splitter = KFold(n_splits=3, shuffle=True, random_state=44)
+    inner_splits = [
+        {
+            "inner_fold": index,
+            "fit_row_ids": fit.tolist(),
+            "heldout_row_ids": heldout.tolist(),
+        }
+        for index, (fit, heldout) in enumerate(splitter.split(extracted), start=1)
+    ]
+
+    selected, report, _dependencies, _latents = select_stage2_features_elastic_net(
+        dataset=dataset,
+        extracted_fit=extracted,
+        definitions=definitions,
+        inner_splits=inner_splits,
+        treatment_column="treatment",
+        outcome_column="outcome",
+        outcome_type="binary",
+        seed=8,
+        policy=Stage2ElasticNetSelectionConfig(
+            regularization_grid_size=5,
+            nuisance_forest_trees=20,
+            nuisance_forest_min_samples_leaf=5,
+            modifier_top_n_per_inner_fold=1,
+            max_iter=2_000,
+        ),
+    )
+
+    selected_factor = next(row for row in selected if row["feature_id"] == "factor")
+    assert "effect_modifier" in selected_factor["roles"]
+    assert report["effect_modifier_screen"]["model_family"] == (
+        "binomial_logistic_regression"
+    )
+    for fold in report["effect_modifier_screen"]["folds"]:
+        assert fold["selected_feature_ids"] == ["factor"]
+        factor_test = next(
+            row for row in fold["tests"] if row["feature_id"] == "factor"
+        )
+        assert factor_test["categorical_interactions_are_grouped"] is True
+        assert len(factor_test["tested_interaction_columns"]) == 2
+        assert factor_test["interaction_test"]["test"] == (
+            "likelihood_ratio_chi_square"
+        )
+        assert factor_test["interaction_test"]["degrees_of_freedom"] == 2
+
+
+def test_modifier_top_n_defaults_to_five_and_must_be_positive():
+    assert Stage2ElasticNetSelectionConfig().modifier_top_n_per_inner_fold == 5
+    with pytest.raises(ValueError, match="modifier_top_n_per_inner_fold"):
+        Stage2ElasticNetSelectionConfig(modifier_top_n_per_inner_fold=0).validate()
+
+
 def test_binary_nuisance_screens_report_inner_and_pooled_aurocs():
     rng = np.random.default_rng(808)
     rows = 300
@@ -347,16 +429,19 @@ def test_binary_nuisance_screens_report_inner_and_pooled_aurocs():
         assert fold["outcome"]["heldout_auroc"] is not None
 
 
-def test_one_modifier_vote_is_retained_even_when_r_loss_gate_fails(monkeypatch):
+def test_outer_modifier_set_is_union_of_each_inner_folds_top_n(monkeypatch):
     rng = np.random.default_rng(99)
     rows = 90
     treatment = np.tile([0, 1], rows // 2)
     dataset = pd.DataFrame(
         {"treatment": treatment, "outcome": rng.normal(size=rows)}
     )
-    extracted = pd.DataFrame(
-        {"_oci_row_id": np.arange(rows), "candidate": rng.normal(size=rows)}
-    )
+    extracted = pd.DataFrame({
+        "_oci_row_id": np.arange(rows),
+        "candidate_a": rng.normal(size=rows),
+        "candidate_b": rng.normal(size=rows),
+        "candidate_c": rng.normal(size=rows),
+    })
     splitter = KFold(n_splits=3, shuffle=True, random_state=7)
     inner_splits = [
         {
@@ -380,8 +465,6 @@ def test_one_modifier_vote_is_retained_even_when_r_loss_gate_fails(monkeypatch):
             converged=True,
         )
 
-    modifier_calls = 0
-
     def controlled_squared(
         train_x,
         train_y,
@@ -391,17 +474,9 @@ def test_one_modifier_vote_is_retained_even_when_r_loss_gate_fails(monkeypatch):
         fit_intercept=True,
         **_kwargs,
     ):
-        nonlocal modifier_calls
         coefficients = np.zeros(train_x.shape[1])
         train_prediction = np.full(len(train_y), float(np.mean(train_y)))
         valid_prediction = np.full(len(valid_x), float(np.mean(train_y)))
-        if not fit_intercept:
-            modifier_calls += 1
-            train_prediction = np.zeros(len(train_y))
-            valid_prediction = np.zeros(len(valid_x))
-            if modifier_calls == 1:
-                coefficients[0] = 1.0
-                valid_prediction.fill(10.0)
         return selection_module._PenalizedFit(
             coefficients=coefficients,
             train_prediction=train_prediction,
@@ -415,11 +490,48 @@ def test_one_modifier_vote_is_retained_even_when_r_loss_gate_fails(monkeypatch):
 
     monkeypatch.setattr(selection_module, "_logistic_elastic_net", constant_logistic)
     monkeypatch.setattr(selection_module, "_squared_error_elastic_net", controlled_squared)
+    p_values = iter(
+        [
+            0.01, 0.20, 0.30,
+            0.20, 0.01, 0.30,
+            0.30, 0.20, 0.01,
+        ]
+    )
+
+    def controlled_interaction_test(*, feature, **_kwargs):
+        p_value = next(p_values)
+        return {
+            "feature_id": feature["feature_id"],
+            "name": feature["name"],
+            "candidate_strategy": "continuous",
+            "encoded_main_columns": [feature["name"]],
+            "candidate_interaction_columns": [feature["name"]],
+            "tested_interaction_columns": [feature["name"]],
+            "categorical_interactions_are_grouped": False,
+            "missingness_interactions": False,
+            "interaction_p_value": p_value,
+            "interaction_test": {
+                "status": "ok",
+                "test": "partial_f",
+                "degrees_of_freedom": [1, 50],
+                "tested_column_indices": [0],
+            },
+        }
+
+    monkeypatch.setattr(
+        selection_module,
+        "_modifier_interaction_test",
+        controlled_interaction_test,
+    )
 
     selected, report, _dependencies, _latents = select_stage2_features_elastic_net(
         dataset=dataset,
         extracted_fit=extracted,
-        definitions=[_continuous("candidate", "candidate")],
+        definitions=[
+            _continuous("candidate_a", "candidate_a"),
+            _continuous("candidate_b", "candidate_b"),
+            _continuous("candidate_c", "candidate_c"),
+        ],
         inner_splits=inner_splits,
         treatment_column="treatment",
         outcome_column="outcome",
@@ -429,13 +541,28 @@ def test_one_modifier_vote_is_retained_even_when_r_loss_gate_fails(monkeypatch):
             regularization_grid_size=5,
             nuisance_forest_trees=20,
             nuisance_forest_min_samples_leaf=5,
+            modifier_top_n_per_inner_fold=1,
         ),
     )
 
-    assert modifier_calls == 3
-    assert selected[0]["roles"] == ["effect_modifier"]
+    selected_by_id = {row["feature_id"]: row for row in selected}
+    assert all(
+        "effect_modifier" in selected_by_id[feature_id]["roles"]
+        for feature_id in ("candidate_a", "candidate_b", "candidate_c")
+    )
     assert report["effect_modifier_screen"]["required_votes"] == 1
-    assert report["effect_modifier_screen"]["set_passed_heldout_r_loss_gate"] is False
-    assert report["effect_modifier_screen"][
-        "stable_effect_modifier_feature_ids"
-    ] == ["candidate"]
+    assert report["effect_modifier_screen"]["votes"] == {
+        "candidate_a": 1,
+        "candidate_b": 1,
+        "candidate_c": 1,
+    }
+    assert report["effect_modifier_screen"]["stable_effect_modifier_feature_ids"] == [
+        "candidate_a",
+        "candidate_b",
+        "candidate_c",
+    ]
+    assert [fold["selected_count"] for fold in report["effect_modifier_screen"]["folds"]] == [
+        1,
+        1,
+        1,
+    ]
