@@ -936,7 +936,11 @@ time scope, granularity, and scale. Broader/narrower concepts, component/total
 relationships, and merely correlated measurements must remain separate. An
 accepted canonical measurement must consume the pivot and preserve source value
 type, units or category cardinality, and missingness using only coalescing or a
-bijective synonymous-category recode. It immediately replaces its aliases in
+lossless synonymous-category recode. Nominal categories may use a canonical
+union when every source category is retained injectively; binary and ordinal
+scales retain full cardinality. Continuous coalescing treats values that violate
+a continuous ontology as missing and falls through to the next valid alias. It
+immediately replaces its aliases in
 the active pool, so later pivots retrieve the canonical measurement instead.
 Treatment, outcome, causal roles, and outer-heldout rows are absent from every
 consolidation request.

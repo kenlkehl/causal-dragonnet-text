@@ -40,9 +40,9 @@ from .stage2_agentic_selection import (
     fit_latent_state,
 )
 
-SCHEMA_VERSION = "stage2_sequential_equivalent_measurement_consolidation_v2"
+SCHEMA_VERSION = "stage2_sequential_equivalent_measurement_consolidation_v3"
 SELECTION_SCHEMA_VERSION = (
-    "stage2_group_elastic_net_rlearner_selection_v4_equivalence_consolidation"
+    "stage2_group_elastic_net_rlearner_selection_v5_lossless_alias_consolidation"
 )
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 DEFAULT_NEIGHBOR_COUNT = 10
@@ -512,7 +512,7 @@ def _validate_information_preserving_rule(
     operation = str(expression["op"])
     if operation not in {"coalesce", "case"}:
         raise ValueError(
-            "equivalence consolidation permits only coalesce or a bijective category "
+            "equivalence consolidation permits only coalesce or a lossless category "
             "recode; aggregation and composite rules are not allowed"
         )
 
@@ -561,7 +561,7 @@ def _validate_information_preserving_rule(
             if not categories_match:
                 raise ValueError(
                     "coalesce requires identical category vocabularies and granularity; "
-                    f"source {source_id!r} differs from the output. Use a bijective case "
+                    f"source {source_id!r} differs from the output. Use a lossless case "
                     "recode only for synonymous labels"
                 )
         return
@@ -606,6 +606,7 @@ def _validate_information_preserving_rule(
                 )
             source_mapping[input_token] = output_token
 
+    reachable_output_tokens: set[str] = set()
     for source_id, categories in zip(source_ids, source_categories):
         declared_tokens = {_normalized_category_token(value) for value in categories}
         mapping = mappings[source_id]
@@ -613,14 +614,30 @@ def _validate_information_preserving_rule(
         missing = sorted(declared_tokens - set(mapping))
         if unknown or missing:
             raise ValueError(
-                "a bijective equivalence recode must map every and only declared category "
+                "a lossless equivalence recode must map every and only declared category "
                 f"for source {source_id!r}; unknown={unknown}, missing={missing}"
             )
-        if len(mapping) != len(output_tokens) or set(mapping.values()) != output_token_set:
+        mapped_outputs = list(mapping.values())
+        if len(mapped_outputs) != len(set(mapped_outputs)):
             raise ValueError(
-                "a bijective equivalence recode must preserve category cardinality and "
-                f"map source {source_id!r} one-to-one onto all output categories"
+                "a lossless equivalence recode must map each source category one-to-one; "
+                f"source {source_id!r} collapses distinct categories"
             )
+        reachable_output_tokens.update(mapped_outputs)
+        if source_type in {"binary", "ordinal"} and (
+            len(mapping) != len(output_tokens)
+            or set(mapped_outputs) != output_token_set
+        ):
+            raise ValueError(
+                "binary and ordinal equivalence recodes must preserve scale cardinality "
+                f"and map source {source_id!r} onto every output category"
+            )
+    if reachable_output_tokens != output_token_set:
+        unused = sorted(output_token_set - reachable_output_tokens)
+        raise ValueError(
+            "a lossless categorical union may contain only categories reachable from at "
+            f"least one source; unused_output_categories={unused}"
+        )
 
 
 def _validate_pairwise_association_threshold(
@@ -778,7 +795,7 @@ def _validate_latent_proposal(
     operation = str(expression["op"])
     if operation not in {"coalesce", "case"}:
         raise ValueError(
-            "equivalence consolidation permits only coalesce or a bijective category "
+            "equivalence consolidation permits only coalesce or a lossless category "
             "recode; aggregation and composite rules are not allowed"
         )
     core["expression"] = expression
@@ -892,7 +909,7 @@ def _rule_expression_examples(cluster_ids: Sequence[str]) -> dict[str, Any]:
             "op": "coalesce",
             "feature_ids": [first, second],
         },
-        "bijective_synonymous_category_recode": {
+        "lossless_synonymous_category_union_recode": {
             "op": "case",
             "cases": [
                 {
@@ -910,6 +927,14 @@ def _rule_expression_examples(cluster_ids: Sequence[str]) -> dict[str, Any]:
                         "value": "Source label B",
                     },
                     "then": "Canonical label B",
+                },
+                {
+                    "when": {
+                        "feature_id": first,
+                        "operator": "eq",
+                        "value": "Source-only label C",
+                    },
+                    "then": "Canonical label C",
                 },
                 {
                     "when": {
@@ -1157,12 +1182,18 @@ def _decision_messages(
             "information_preservation": (
                 "Use kind='categorical_rule'. All sources and the output must have the same "
                 "value_type and information granularity. Continuous sources must use the same "
-                "unit and may only be coalesced. Categorical, binary, or ordinal aliases may be "
-                "coalesced only when their category vocabularies are identical. Synonymous "
-                "category vocabularies may use a case rule only if each source category maps "
-                "one-to-one onto every output category. A case rule may use only eq/in and must "
-                "use else=null. Never turn missingness into 'No', 'Absent', zero, or a reference "
-                "category."
+                "unit and may only be coalesced; nonnumeric values that violate a continuous "
+                "source ontology are treated as missing and the next valid alias is used. "
+                "Categorical, binary, or ordinal aliases may be coalesced only when their "
+                "category vocabularies are identical. Synonymous categorical vocabularies may "
+                "use a case rule with a canonical union: map every declared category from each "
+                "source exactly once, never collapse two categories from the same source, and "
+                "include no output category that is unreachable from all sources. Binary and "
+                "ordinal scales must still map one-to-one onto the complete output scale. A "
+                "case rule may use only eq/in and must use else=null. Never turn missingness "
+                "into 'No', 'Absent', zero, or a reference category. Do not reject otherwise "
+                "equivalent nominal aliases merely because one declared vocabulary is a "
+                "lossless subset of another or uses synonymous spelling variants."
             ),
             "required_latent_fields": [
                 "kind",
@@ -1491,6 +1522,8 @@ def consolidate_stage2_candidates(
                 ),
                 "require_evaluable_association_for_every_source_pair": True,
                 "require_same_value_type_and_granularity": True,
+                "allow_lossless_categorical_union_recode": True,
+                "continuous_coalesce_skips_nonnumeric_source_values": True,
                 "allow_general_specific_rollups": False,
                 "allow_aggregation_or_composite_rules": False,
                 "preserve_all_source_missingness_as_null": True,

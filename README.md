@@ -1097,8 +1097,11 @@ measurement aliases. Every source pair must have association of at least 0.85 by
 default, but association is only a necessary condition. Broader/narrower
 concepts, components and totals, and merely related variables cannot be merged.
 An accepted alias must preserve value type, category granularity, units, and
-missingness; it is populated immediately from a validated coalesce or bijective
-category-recode rule, replaces its sources in the active pool, and can be
+missingness; it is populated immediately from a validated coalesce or lossless
+category-recode rule. A nominal categorical recode may use the union of
+source vocabularies, and continuous coalescing skips malformed nonnumeric source
+values in favor of the next valid alias. The canonical measurement replaces its
+sources in the active pool and can be
 retrieved by later candidates. Original columns and recursive lineage remain
 available for audit and held-out reconstruction. Configured explicit features
 are protected from replacement.

@@ -148,8 +148,9 @@ versions of the same measurement. Replacement requires every source pair to
 meet `minimum_pairwise_association` (0.85 by default), but high association is
 only a necessary condition: broader/narrower concepts and merely related
 variables must remain separate. Accepted aliases immediately replace their
-sources in later retrievals; the original extraction dependencies remain
-recorded. Separate treatment and outcome
+sources in later retrievals. Lossless nominal-category unions are allowed, and
+continuous coalescing skips malformed nonnumeric values in favor of the next
+valid alias; the original extraction dependencies remain recorded. Separate treatment and outcome
 group elastic nets run inside each outer fold and accumulate original-feature
 stability votes. Ordered measurements use one standardized score; nominal
 factor contrasts and missingness are selected as one group. Inner-fold nuisance

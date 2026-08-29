@@ -2042,6 +2042,14 @@ def _apply_rule(
         if operation == "count_present":
             return values.notna().sum(axis=1).astype(float)
         if operation == "coalesce":
+            if str(spec.get("output_type") or "") == "continuous":
+                # A continuous ontology can still contain an occasional malformed
+                # extractor value (for example, a complete blood-pressure pair in a
+                # systolic-only column). Treat values that cannot be parsed as missing
+                # and continue to the next equivalent source instead of allowing one
+                # bad alias value to invalidate the canonical measurement.
+                numeric = values.apply(pd.to_numeric, errors="coerce")
+                return numeric.bfill(axis=1).iloc[:, 0]
             return values.bfill(axis=1).iloc[:, 0]
         numeric = values.apply(pd.to_numeric, errors="coerce")
         if operation == "sum":

@@ -148,6 +148,12 @@ def test_created_latent_replaces_components_in_later_retrieval(tmp_path):
             "same_measurement_aliases_only"
         )
         assert body["equivalence_policy"]["minimum_pairwise_association"] == 0.85
+        assert body["equivalence_policy"][
+            "allow_lossless_categorical_union_recode"
+        ] is True
+        assert body["equivalence_policy"][
+            "continuous_coalesce_skips_nonnumeric_source_values"
+        ] is True
         assert body["response_json_schema"]["$defs"]["condition"]["properties"][
             "operator"
         ]["enum"] == ["eq", "in"]
@@ -333,6 +339,267 @@ def test_categorical_latent_flattens_lineage_and_populates_heldout(tmp_path):
         "squamous",
     ]
     assert pd.isna(populated[latent["name"]].iloc[2])
+
+
+def test_continuous_alias_coalesce_skips_malformed_source_value(tmp_path):
+    definitions = [
+        _continuous("a", "first_measure"),
+        _continuous("b", "second_measure"),
+    ]
+    frame = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(20),
+            "first_measure": ["100/60 unitless", *map(float, range(101, 120))],
+            "second_measure": np.arange(100, 120, dtype=float),
+        }
+    )
+
+    def request_json(_messages, validate, **_kwargs):
+        return validate(_continuous_alias_response(["a", "b"]))
+
+    consolidated, active, report, entries = consolidate_stage2_candidates(
+        extracted_fit=frame,
+        definitions=definitions,
+        request_json=request_json,
+        policy=Stage2SequentialConsolidationConfig(
+            enabled=True,
+            neighbor_count=1,
+            embedding_model="test-model",
+        ),
+        output_dir=tmp_path / "consolidation",
+        request_model="test-llm",
+        embedding_function=_embedding,
+    )
+
+    assert report["latents_created"] == 1
+    assert len(active) == 1
+    assert len(entries) == 1
+    populated = consolidated[entries[0]["name"]]
+    assert populated.iloc[0] == 100.0
+    np.testing.assert_allclose(populated.to_numpy(dtype=float), np.arange(100, 120))
+
+
+def test_categorical_alias_recode_allows_lossless_union_vocabulary(tmp_path):
+    definitions = [
+        {
+            **_categorical("h1", "cancer_histology"),
+            "categories_or_unit": [
+                "Adenocarcinoma",
+                "Squamous cell carcinoma",
+                "Large-cell carcinoma",
+                "Other",
+            ],
+        },
+        {
+            **_categorical("h2", "lung_cancer_histology"),
+            "categories_or_unit": [
+                "Adenocarcinoma",
+                "Squamous Cell Carcinoma",
+                "Large Cell Carcinoma",
+            ],
+        },
+    ]
+    first_cycle = [
+        "Adenocarcinoma",
+        "Squamous cell carcinoma",
+        "Large-cell carcinoma",
+        "Other",
+    ]
+    second_cycle = [
+        "Adenocarcinoma",
+        "Squamous Cell Carcinoma",
+        "Large Cell Carcinoma",
+        None,
+    ]
+    frame = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(24),
+            "cancer_histology": first_cycle * 6,
+            "lung_cancer_histology": second_cycle * 6,
+        }
+    )
+
+    def request_json(_messages, validate, **_kwargs):
+        return validate(
+            {
+                "action": "replace_with_latents",
+                "rationale": "The fields encode the same primary cancer histology.",
+                "latents": [
+                    {
+                        "kind": "categorical_rule",
+                        "source_feature_ids": ["h1", "h2"],
+                        "label": "Primary cancer histology",
+                        "description": "Canonical primary cancer histology.",
+                        "rationale": (
+                            "The narrower vocabulary is a lossless subset of the "
+                            "canonical union."
+                        ),
+                        "measurement_definition": (
+                            "Map synonymous histology spellings to canonical labels."
+                        ),
+                        "missing_value_rule": "Null when both sources are missing.",
+                        "output_type": "categorical",
+                        "categories_or_unit": [
+                            "Adenocarcinoma",
+                            "Squamous cell carcinoma",
+                            "Large cell carcinoma",
+                            "Other",
+                        ],
+                        "expression": {
+                            "op": "case",
+                            "cases": [
+                                {
+                                    "when": {
+                                        "feature_id": "h1",
+                                        "operator": "eq",
+                                        "value": source,
+                                    },
+                                    "then": target,
+                                }
+                                for source, target in [
+                                    ("Adenocarcinoma", "Adenocarcinoma"),
+                                    (
+                                        "Squamous cell carcinoma",
+                                        "Squamous cell carcinoma",
+                                    ),
+                                    ("Large-cell carcinoma", "Large cell carcinoma"),
+                                    ("Other", "Other"),
+                                ]
+                            ]
+                            + [
+                                {
+                                    "when": {
+                                        "feature_id": "h2",
+                                        "operator": "eq",
+                                        "value": source,
+                                    },
+                                    "then": target,
+                                }
+                                for source, target in [
+                                    ("Adenocarcinoma", "Adenocarcinoma"),
+                                    (
+                                        "Squamous Cell Carcinoma",
+                                        "Squamous cell carcinoma",
+                                    ),
+                                    ("Large Cell Carcinoma", "Large cell carcinoma"),
+                                ]
+                            ],
+                            "else": None,
+                        },
+                    }
+                ],
+            }
+        )
+
+    consolidated, active, report, entries = consolidate_stage2_candidates(
+        extracted_fit=frame,
+        definitions=definitions,
+        request_json=request_json,
+        policy=Stage2SequentialConsolidationConfig(
+            enabled=True,
+            neighbor_count=1,
+            embedding_model="test-model",
+        ),
+        output_dir=tmp_path / "consolidation",
+        request_model="test-llm",
+        embedding_function=_embedding,
+    )
+
+    assert report["latents_created"] == 1
+    assert len(active) == 1
+    assert len(entries) == 1
+    assert consolidated[entries[0]["name"]].tolist() == [
+        "Adenocarcinoma",
+        "Squamous cell carcinoma",
+        "Large cell carcinoma",
+        "Other",
+    ] * 6
+
+
+def test_categorical_union_recode_rejects_within_source_category_collapse(tmp_path):
+    definitions = [
+        {
+            **_categorical("h1", "first_histology"),
+            "categories_or_unit": ["Adenocarcinoma", "Squamous", "Other"],
+        },
+        {
+            **_categorical("h2", "second_histology"),
+            "categories_or_unit": ["Adenocarcinoma", "Squamous", "Other"],
+        },
+    ]
+    values = ["Adenocarcinoma", "Squamous", "Other"] * 7
+    frame = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(21),
+            "first_histology": values,
+            "second_histology": values,
+        }
+    )
+    checked = False
+
+    def request_json(_messages, validate, **_kwargs):
+        nonlocal checked
+        if not checked:
+            checked = True
+            cases = []
+            for feature_id in ("h1", "h2"):
+                for category in ("Adenocarcinoma", "Squamous", "Other"):
+                    cases.append(
+                        {
+                            "when": {
+                                "feature_id": feature_id,
+                                "operator": "eq",
+                                "value": category,
+                            },
+                            "then": (
+                                "Carcinoma"
+                                if category in {"Adenocarcinoma", "Squamous"}
+                                else "Other"
+                            ),
+                        }
+                    )
+            proposal = {
+                "action": "replace_with_latents",
+                "rationale": "Attempted lossy rollup.",
+                "latents": [
+                    {
+                        "kind": "categorical_rule",
+                        "source_feature_ids": ["h1", "h2"],
+                        "label": "Collapsed histology",
+                        "description": "A lossy histology rollup.",
+                        "rationale": "Collapse distinct histologies.",
+                        "measurement_definition": "Collapse source categories.",
+                        "missing_value_rule": "Null when both are missing.",
+                        "output_type": "categorical",
+                        "categories_or_unit": ["Carcinoma", "Other"],
+                        "expression": {"op": "case", "cases": cases, "else": None},
+                    }
+                ],
+            }
+            with pytest.raises(ValueError, match="collapses distinct categories"):
+                validate(proposal)
+        return validate(
+            {
+                "action": "leave_unchanged",
+                "rationale": "The proposed recode loses category information.",
+                "latents": [],
+            }
+        )
+
+    consolidate_stage2_candidates(
+        extracted_fit=frame,
+        definitions=definitions,
+        request_json=request_json,
+        policy=Stage2SequentialConsolidationConfig(
+            enabled=True,
+            neighbor_count=1,
+            embedding_model="test-model",
+        ),
+        output_dir=tmp_path / "consolidation",
+        request_model="test-llm",
+        embedding_function=_embedding,
+    )
+    assert checked is True
 
 
 def test_rejects_alias_proposal_below_pairwise_association_threshold(tmp_path):
