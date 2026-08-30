@@ -260,7 +260,7 @@ def test_stage2_analysis_defaults_pre_refinement_config_fields(caplog):
     assert "pre-ontology-refinement config" in caplog.text
 
 
-def test_large_statistical_selector_runs_in_spawned_process(monkeypatch):
+def test_large_statistical_selector_runs_in_loky_process(monkeypatch):
     expected = ([{"feature_id": "selected"}], {"status": "complete"}, [], [])
     calls = []
 
@@ -273,9 +273,8 @@ def test_large_statistical_selector_runs_in_spawned_process(monkeypatch):
             return expected
 
     class FakeExecutor:
-        def __init__(self, *, max_workers, mp_context):
+        def __init__(self, *, max_workers):
             assert max_workers == 1
-            assert mp_context == "spawn-context"
 
         def __enter__(self):
             return self
@@ -299,13 +298,8 @@ def test_large_statistical_selector_runs_in_spawned_process(monkeypatch):
         fake_selector,
     )
     monkeypatch.setattr(
-        stage2_analysis.multiprocessing,
-        "get_context",
-        lambda method: "spawn-context" if method == "spawn" else None,
-    )
-    monkeypatch.setattr(
-        stage2_analysis.concurrent.futures,
-        "ProcessPoolExecutor",
+        stage2_analysis,
+        "LokyProcessPoolExecutor",
         FakeExecutor,
     )
 
@@ -468,93 +462,6 @@ def _retired_test_stage2_config_maps_prior_selector_embedding_fields_to_registry
     assert config.candidate_registry_embedding_device == "cuda:4"
     assert "candidate_selection_embedding_model" not in config.public_dict()
     assert "candidate_selection_embedding_device" not in config.public_dict()
-
-
-def _retired_test_stage2_config_parses_lane_aware_evidence_community_settings():
-    config = plain_stage2_config_from_mapping(
-        {
-            "endpoint": "http://stage2.test/v1",
-            "evidence_community_enabled": True,
-            "evidence_community_model": "local/evidence-colbert",
-            "evidence_community_device": "cuda:2",
-            "evidence_community_max_packets": 60,
-            "evidence_community_min_per_causal_lane": 20,
-            "evidence_community_max_atom_words": 18,
-            "evidence_community_atom_overlap_words": 5,
-            "evidence_community_candidate_neighbors": 32,
-            "evidence_community_reciprocal_neighbors": 4,
-            "evidence_community_louvain_resolution": 1.75,
-            "evidence_community_max_exemplars": 2,
-            "evidence_community_max_consensus_phrases": 12,
-            "evidence_community_inner_fold_saturation": 4,
-            "evidence_community_architecture_saturation": 3,
-            "evidence_community_hierarchy_target_communities": [120, 60],
-            "candidate_discovery_source": "compiled_packets",
-            "candidate_selection_hierarchical_colbert": False,
-            "candidate_selection_hierarchy_top_communities": 5,
-        },
-        default_workers=1,
-    )
-
-    assert config is not None
-    assert config.evidence_community_model == "local/evidence-colbert"
-    assert config.evidence_community_device == "cuda:2"
-    assert config.evidence_community_max_packets == 60
-    assert config.evidence_community_min_per_causal_lane == 20
-    assert config.evidence_community_max_atom_words == 18
-    assert config.evidence_community_atom_overlap_words == 5
-    assert config.evidence_community_candidate_neighbors == 32
-    assert config.evidence_community_reciprocal_neighbors == 4
-    assert config.evidence_community_louvain_resolution == 1.75
-    assert config.evidence_community_max_exemplars == 2
-    assert config.evidence_community_max_consensus_phrases == 12
-    assert config.evidence_community_inner_fold_saturation == 4
-    assert config.evidence_community_architecture_saturation == 3
-    assert config.evidence_community_hierarchy_target_communities == (120, 60)
-    assert config.candidate_discovery_source == "compiled_packets"
-    assert config.candidate_selection_hierarchical_colbert is False
-    assert config.candidate_selection_hierarchy_top_communities == 5
-    assert config.public_dict()["evidence_community_min_per_causal_lane"] == 20
-
-
-def _retired_test_stage2_config_rejects_impossible_evidence_community_lane_reserve():
-    with pytest.raises(ValueError, match="min_per_causal_lane"):
-        PlainHandoffStage2Config(
-            endpoint="http://stage2.test/v1",
-            model="test-model",
-            evidence_community_max_packets=75,
-            evidence_community_min_per_causal_lane=38,
-        ).validate()
-
-
-def _retired_test_stage2_config_rejects_non_boolean_evidence_community_switch():
-    with pytest.raises(ValueError, match="evidence_community_enabled"):
-        plain_stage2_config_from_mapping(
-            {
-                "endpoint": "http://stage2.test/v1",
-                "evidence_community_enabled": "true",
-            },
-            default_workers=1,
-        )
-
-
-def _retired_test_stage2_config_rejects_non_decreasing_community_hierarchy_targets():
-    with pytest.raises(ValueError, match="strictly decreasing"):
-        PlainHandoffStage2Config(
-            endpoint="http://stage2.test/v1",
-            model="test-model",
-            evidence_community_hierarchy_target_communities=(75, 300),
-        ).validate()
-
-
-def _retired_test_stage2_config_requires_communities_for_legacy_community_discovery():
-    with pytest.raises(ValueError, match="community_packets requires"):
-        PlainHandoffStage2Config(
-            endpoint="http://stage2.test/v1",
-            model="test-model",
-            candidate_discovery_source="community_packets",
-            evidence_community_enabled=False,
-        ).validate()
 
 
 def test_stage2_config_warns_and_ignores_retired_colbert_settings(caplog):

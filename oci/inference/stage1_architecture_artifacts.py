@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .stage1_architectures import (
     STAGE1_ARCHITECTURE_REGISTRY,
+    TFIDF_TOPICS,
     canonicalize_stage1_architectures,
     resolve_support_services,
 )
@@ -72,22 +73,40 @@ def _score_artifacts(output_dir: Path, architecture: str) -> list[str]:
             (root / "components" / "text_models").glob("*/worker_artifacts/**/predictions.parquet")
         )
     elif producer == "tfidf":
-        paths = []
         primary = root / "components" / "tfidf" / "predictions.parquet"
-        if primary.is_file():
-            paths.append(primary)
-        paths.extend(
-            sorted(
-                (root / "components" / "tfidf" / "stage1_tfidf_topics").glob(
-                    "contexts/**/*.parquet"
-                )
-            )
-        )
+        # The context-local nuisance files mix candidate-selection inner
+        # heldouts with the full-outer heldout and the latter is copied into
+        # this canonical sidecar.  Registering both makes post-hoc metrics
+        # count the outer rows twice and can admit inner rows whose parquet
+        # schema does not identify its enclosing context.
+        # This is the topic producer's shared nuisance projection, not an
+        # orphan-ngram-specific row score.  The orphan lane is evaluated from
+        # its canonical evidence instead of receiving duplicate topic metrics.
+        paths = [primary] if architecture == TFIDF_TOPICS and primary.is_file() else []
     elif producer == "neural_queries":
         paths = sorted((root / "components" / "neural_queries").glob("*/scores.parquet"))
     else:  # pragma: no cover - registry validation prevents this
         paths = []
     return [os.path.relpath(path, start=root) for path in paths if path.is_file()]
+
+
+def _bind_occurrence_to_handoff_row(
+    occurrence: dict[str, Any],
+    *,
+    handoff_row: int,
+) -> None:
+    """Bind every compact provenance reference to its canonical JSONL row."""
+
+    reference = dict(occurrence.get("reference") or {})
+    reference["handoff_row"] = int(handoff_row)
+    occurrence["reference"] = reference
+    summaries = occurrence.get("reference_summaries")
+    if isinstance(summaries, Sequence) and not isinstance(summaries, (str, bytes)):
+        occurrence["reference_summaries"] = [
+            {**dict(summary), "handoff_row": int(handoff_row)}
+            for summary in summaries
+            if isinstance(summary, Mapping)
+        ]
 
 
 def materialize_stage1_architecture_artifacts(
@@ -151,27 +170,14 @@ def materialize_stage1_architecture_artifacts(
             )
 
     canonical_handoff: list[dict[str, Any]] = []
-    artifact_index: dict[str, Any] = {}
+    evidence_rows_by_architecture: dict[str, list[dict[str, Any]]] = {}
     architecture_root = Path(output_dir) / "stage1_architectures"
     for architecture in selected:
         evidence_rows = sorted(
             rows_by_architecture[architecture],
             key=_evidence_sort_key,
         )
-        evidence_path = architecture_root / architecture / "evidence.jsonl"
-        _write_jsonl(evidence_path, evidence_rows)
-        artifact_index[architecture] = {
-            "evidence": os.path.relpath(evidence_path, start=Path(output_dir)),
-            "evidence_sha256": _file_sha256(evidence_path),
-            "occurrences": sum(
-                int(row["occurrence"].get("raw_occurrence_count", 1))
-                for row in evidence_rows
-            ),
-            "compact_records": len(evidence_rows),
-            "producer_component": STAGE1_ARCHITECTURE_REGISTRY[architecture].component,
-            "support_services": list(STAGE1_ARCHITECTURE_REGISTRY[architecture].support_services),
-            "score_artifacts": _score_artifacts(Path(output_dir), architecture),
-        }
+        evidence_rows_by_architecture[architecture] = evidence_rows
         canonical_handoff.extend(
             {
                 "source": "stage1_architecture",
@@ -187,6 +193,45 @@ def materialize_stage1_architecture_artifacts(
             }
             for row in evidence_rows
         )
+
+    canonical_handoff.sort(
+        key=lambda row: (
+            int(row["outer_fold"]),
+            int(row.get("inner_fold") or 0),
+            str(row["evidence"]["architecture"]),
+            str(row["evidence"]["occurrence"].get("evidence_kind") or ""),
+            str(row["evidence"]["occurrence"].get("text") or ""),
+        )
+    )
+    if selection_mode == "explicit":
+        for handoff_row, row in enumerate(canonical_handoff, start=1):
+            _bind_occurrence_to_handoff_row(
+                row["evidence"]["occurrence"],
+                handoff_row=handoff_row,
+            )
+
+    # Canonical handoff rows and architecture sidecars share the occurrence
+    # objects above.  For an explicit handoff, write sidecars only after
+    # rebinding compact summaries so every persisted handoff_row resolves in
+    # the final combined handoff.  A legacy evaluation backfill keeps the
+    # source handoff in place, so its original row references remain valid.
+    artifact_index: dict[str, Any] = {}
+    for architecture in selected:
+        evidence_rows = evidence_rows_by_architecture[architecture]
+        evidence_path = architecture_root / architecture / "evidence.jsonl"
+        _write_jsonl(evidence_path, evidence_rows)
+        artifact_index[architecture] = {
+            "evidence": os.path.relpath(evidence_path, start=Path(output_dir)),
+            "evidence_sha256": _file_sha256(evidence_path),
+            "occurrences": sum(
+                int(row["occurrence"].get("raw_occurrence_count", 1))
+                for row in evidence_rows
+            ),
+            "compact_records": len(evidence_rows),
+            "producer_component": STAGE1_ARCHITECTURE_REGISTRY[architecture].component,
+            "support_services": list(STAGE1_ARCHITECTURE_REGISTRY[architecture].support_services),
+            "score_artifacts": _score_artifacts(Path(output_dir), architecture),
+        }
 
     manifest_path = architecture_root / "manifest.json"
     existing: dict[str, Any] = {}
@@ -206,15 +251,6 @@ def materialize_stage1_architecture_artifacts(
         "architectures": artifact_index,
     }
     _write_json(manifest_path, manifest)
-    canonical_handoff.sort(
-        key=lambda row: (
-            int(row["outer_fold"]),
-            int(row.get("inner_fold") or 0),
-            str(row["evidence"]["architecture"]),
-            str(row["evidence"]["occurrence"].get("evidence_kind") or ""),
-            str(row["evidence"]["occurrence"].get("text") or ""),
-        )
-    )
     return canonical_handoff, manifest
 
 

@@ -1102,7 +1102,10 @@ An accepted alias must preserve value type, category granularity, units, and
 missingness; it is populated immediately from a validated coalesce or lossless
 category-recode rule. A nominal categorical recode may use the union of
 source vocabularies, and continuous coalescing skips malformed nonnumeric source
-values in favor of the next valid alias. The canonical measurement replaces its
+values in favor of the next valid alias. On every row where multiple valid
+sources are nonmissing, their numeric values or canonical recoded categories
+must agree; a conflict rejects the replacement instead of silently letting the
+first source win. The canonical measurement replaces its
 sources in the active pool and can be
 retrieved by later candidates. Original columns and recursive lineage remain
 available for audit and held-out reconstruction. Configured explicit features
@@ -1174,7 +1177,10 @@ propensities, potential-outcome predictions, and AIPW scores. `CausalForestDML`
 cross-fits the same nuisance family internally. The causal forest supplies
 held-out conditional effects and confidence intervals; combining outer-held-out
 AIPW scores across folds supplies the reported cross-fitted average treatment
-effect and confidence interval.
+effect and confidence interval. The retired strict random-forest runtime-config
+module is not an alternate estimator path. Fold diagnostics audit every fitted
+elastic-net nuisance clone, including effective CV folds, selected
+regularization, and optimizer iteration-limit status.
 
 ```mermaid
 flowchart LR

@@ -3268,6 +3268,29 @@ def _configure_logging(output_dir: Path, level: str) -> None:
     )
 
 
+def _invalidate_component_for_rerun(
+    workflow: ResearchAllEvidenceWorkflow,
+    name: str,
+) -> None:
+    """Invalidate resumable markers, including TF-IDF context-level seals."""
+
+    component_dir = workflow._component_dir(name)
+    if not component_dir.is_dir():
+        return
+    markers = (
+        [component_dir / "complete.json"]
+        if name == "handoff"
+        else list(component_dir.rglob("complete.json"))
+    )
+    if name == "tfidf":
+        # Exact TF-IDF contexts are independently resumable by their metadata,
+        # not complete.json.  Removing only the component markers would rerun
+        # orchestration while silently reusing every fitted context.
+        markers.extend(component_dir.rglob("context_metadata.json"))
+    for marker in dict.fromkeys(markers):
+        marker.unlink(missing_ok=True)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -3299,15 +3322,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prepare_stage2_reselection(config=config)
     workflow = ResearchAllEvidenceWorkflow(config)
     for name in args.rerun:
-        component_dir = workflow._component_dir(name)
-        if component_dir.is_dir():
-            markers = (
-                [component_dir / "complete.json"]
-                if name == "handoff"
-                else list(component_dir.rglob("complete.json"))
-            )
-            for marker in markers:
-                marker.unlink()
+        _invalidate_component_for_rerun(workflow, name)
     try:
         result = workflow.run()
     except KeyboardInterrupt:

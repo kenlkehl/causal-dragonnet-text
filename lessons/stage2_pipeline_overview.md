@@ -1,235 +1,178 @@
 # Stage 2 pipeline overview
 
-Stage 2 is a fold-honest evidence-to-variable-to-causal-estimate pipeline. It
-converts Stage 1 model evidence into measurable clinical features, reviews and
-refines those features using only the outer-training data, freezes their
-definitions, and estimates effects on the untouched outer-heldout patients.
+Stage 2 is an outer-fold-honest evidence-to-measurement-to-estimate pipeline.
+The current implementation deliberately separates three kinds of information:
+
+- Stage 1 evidence proposes what could be measured.
+- Outer-training notes determine how those candidates behave as measurements.
+- Outer-heldout notes are touched only after definitions, roles, mappings, and
+  latent rules are frozen.
 
 ```text
-$OUT/handoff/evidence.jsonl
-  Stage 1 evidence from:
-  - text models and matched pairs
-  - TF-IDF topics and n-grams
-  - neural queries
-            |
-            | all_evidence_fusion allowlisting
-            | + exact fold-local deduplication
-            | + cached-embedding / lexical clustering
-            v
-$OUT/stage2/evidence_compilation/
-  packets.jsonl                 compact prompt cards
-  outer_NNN/cards.jsonl         readable card inventory
-  outer_NNN/members.jsonl       exact members -> Stage 1 paths
-  outer_NNN/lineage.jsonl       card -> exact member IDs
-  summary.json                  reduction audit
-            |
-            | prompt-size batching
-            v
-+---------------------- ONE OUTER FOLD --------------------------+
-|                                                               |
-|  input_packets.jsonl                                          |
-|       |                                                       |
-|       | group by evidence architecture, then prompt-size batch|
-|       v                                                       |
-|  Parallel LLM interpretation                                  |
-|  packets ---> candidate concepts + grounded packet citations  |
-|       |                                                       |
-|  interpreted_candidates.json (unfiltered)                     |
-|       |                                                       |
-|       | exact names + conservative dense semantic registry    |
-|       | ColBERT candidate<->cited-packet MeanMaxSim            |
-|       | top N per evidence axis + hard outer-fold cap          |
-|       v                                                       |
-|  selected_candidates.json                                     |
-|  candidate_registry_selection.json                            |
-|       |                                                       |
-|       +---- configured explicit features + supplied ontologies|
-|       | local pairwise alias judgments                         |
-|       | + causal-role routing                                  |
-|       | + one global name-only merge-directive pass            |
-|       v                                                       |
-|  feature_definitions.json                                     |
-|  operational variables:                                      |
-|  name, type, categories/unit, extraction rules, causal role   |
-|       |                                                       |
-|       +---- original OUTER-TRAINING patient notes             |
-|       v                                                       |
-|  LLM patient-level feature extraction                         |
-|       |                                                       |
-|       v                                                       |
-|  Training feature matrix + missingness/variation summaries    |
-|       |                                                       |
-|       +---- treatment/outcome + inner-fold splits             |
-|       v                                                       |
-|  Empirical performance review                                 |
-|       |                                                       |
-|       v                                                       |
-|  LLM keep / drop / revise decision --------+                  |
-|       ^                                    |                  |
-|       +----- re-extract if revised --------+                  |
-|                                                               |
-|  final_definitions.json   <- definitions are now frozen       |
-|       |                                                       |
-|       +---- OUTER-HELDOUT patient notes                       |
-|       v                                                       |
-|  Heldout feature extraction                                   |
-|       |                                                       |
-|       v                                                       |
-|  Fit nuisance/effect models on training rows only             |
-|  Predict propensity, mu0, mu1, and CATE on heldout rows       |
-|       |                                                       |
-|       v                                                       |
-|  estimation/predictions.csv + diagnostics.json                |
-+---------------------------------------------------------------+
-            | repeat independently for every outer fold
-            v
-cross_fitted_predictions.csv
-causal_estimate.json
-features_by_outer_fold.jsonl
-summary.json
+Stage 1 handoff
+    |
+    v
+semantic_cluster_cards_v2 (fold-local cards + exact lineage)
+    |
+    v
+exhaustive candidate discovery (all cards; no retrieval/candidate cap)
+    |
+    v
+merge-only name consolidation -> one-feature ontology requests
+    |
+    v
+extract every candidate on outer-training records
+    |
+    v
+aggregate ontology supervision and incremental re-extraction
+    |
+    v
+optional equivalence-only alias consolidation
+    |
+    v
+group-elastic-net nuisance selection + candidate held-out R-loss
+    |
+    v
+freeze definitions and extract selected held-out dependencies
+    |
+    v
+elastic-net nuisances + honest causal forest + held-out AIPW
+    |
+    v
+cross-fold estimate and stability summary
 ```
 
-## Inputs and outputs
+## What changed from the older Stage 2 design
 
-| Stage | Main inputs | Main outputs |
-|---|---|---|
-| Evidence compilation | Stage 1 handoff rows plus the existing memory-mapped Stage 1 chunk-embedding cache, when available | Fold-local semantic cards, exact-member and raw-path lineage manifests, a reduction audit, and bounded prompt packets |
-| Interpretation | One architecture-specific batch projected to prompt-local item numbers and readable text only | Candidate clinical concepts and citations to supplied item numbers; Python maps these back to packet provenance |
-| Candidate selection and assembly | Concepts from all interpretation batches plus readable packet evidence | Exact names and conservative dense aliases form a fold-level registry; natural-language candidate names receive ColBERT MeanMaxSim scores only against cited packets; the default top five per evidence axis, subject to the hard fold cap, continue to `selected_candidates.json`, with complete lineage and rankings in `candidate_registry_selection.json` |
-| Consolidation | Candidates from all Stage 1 architectures plus optional `stage2.explicit_features` | Deduplicated operational definitions in `feature_definitions.json`; configured groups use their supplied ontology |
-| Training extraction | Operational definitions plus outer-training patient text | A patient-by-feature matrix for the training patients |
-| Review | Training-only extraction summaries and inner-fold treatment/outcome performance | Keep, drop, or measurement-revision decisions; a revision may trigger another extraction round |
-| Freeze and heldout extraction | Final reviewed definitions plus outer-heldout text | `final_definitions.json` and heldout feature measurements |
-| Fold estimation | Training/heldout features, treatment, outcome, and split provenance | Heldout propensity, `mu0`, `mu1`, AIPW score, estimated CATE, and fold diagnostics |
-| Cross-fold aggregation | Exactly one heldout prediction for every patient | Cross-fitted ATE, standard error, 95% CI, mean estimated CATE, and feature stability counts |
+Current Stage 2 does **not** use an evidence-community graph, ColBERT routing,
+candidate-to-evidence retrieval, top-N evidence-axis union, hard candidate cap,
+or discovery-time role filter. Every compiled semantic card enters exhaustive
+feature listing, and every discovered feature reaches lossless merge-only
+consolidation. Documents that describe `selected_candidates.json`, a bounded
+candidate registry, or ColBERT candidate scoring are historical.
 
-Stage 2 keeps the outer folds separate throughout feature discovery and review.
-Treatment/outcome performance used to review definitions is calculated within
-the outer-training data. Feature definitions are frozen before heldout feature
-extraction and heldout outcome estimation.
+Discovery creates names and evidence lineage, not extraction types or causal
+roles. One independent operationalization request defines each consolidated
+candidate. Roles are assigned later from outer-training data.
 
-Potential causal roles are derived from the evidence supporting each feature:
+## Fold boundary
 
-- Treatment plus outcome evidence supports a potential confounder role.
-- Outcome evidence supports a prognostic role.
-- Residual-effect or matched-pair evidence supports a potential effect-modifier
-  role.
+For one outer fold, all of the following are training-only:
 
-## Evidence compilation before LLM interpretation
+- evidence compilation and candidate discovery;
+- alias merging and ontology definition;
+- extraction harmonization and aggregate ontology revisions;
+- equivalence-only latent construction;
+- nuisance-role and modifier selection;
+- categorical encoders, missingness rules, and fitted models.
 
-The default compiler is `semantic_cluster_cards_v2`. It reconnects the plain
-Stage 2 route to the audited scientific projections in `all_evidence_fusion`:
-large TF-IDF score arrays and operational diagnostics do not enter the prompt,
-while topic terms, orphan n-grams, sparse terms, retrieved clinical text, HTR
-attention evidence, and neural-query evidence do.
+The held-out fold receives only frozen measurement dependencies. Treatment and
+outcome are absent from discovery, ontology supervision, and alias consolidation.
+Oracle effect columns are reserved for post-run evaluation.
 
-Reduction happens independently inside each outer fold:
+## Evidence and candidate construction
 
-1. Normalize the concept-bearing content and remove exact duplicates while
-   unioning source families, evidence axes, polarity, full/inner-fold support,
-   and raw JSON paths.
-2. Stratify exact members by evidence kind, axes, polarity, and semantic-vector
-   availability. This prevents a treatment-only term from being clustered into
-   an unrelated residual-effect group merely because their wording overlaps.
-3. Reuse the Stage 1 chunk embeddings by memory map for compatible retrieved
-   chunks. Other evidence uses deterministic character n-gram projections; no
-   second embedding model is loaded beside vLLM.
-4. Cluster within each stratum and produce conservative cards containing
-   representative text, support/stability counts, source families, axes, and
-   score ranges. The complete raw evidence remains in Stage 1, and the manifests
-   preserve the route from every card back to every raw occurrence.
+`semantic_cluster_cards_v2` is the only supported compiler. It applies the
+scientific evidence projection, exact-deduplicates with provenance unioned,
+builds conservative fold-local cards, and verifies all frozen selected Stage 1
+architectures are represented. Its outputs live in
+`stage2/evidence_compilation/`.
 
-The default ceiling is `evidence_max_cards_per_fold=400`, with up to four
-representatives per card. This is deliberately an oversampled evidence atlas,
-not a variable limit; the community distiller may carry many concepts forward
-from its atoms. If a
-sensitivity analysis is warranted, raise the card ceiling rather than reverting
-to raw packetization. `raw_packets_v1` is retired because it merged distinct
-scientific architectures.
+The primary model lists every pretreatment patient-level feature supported by
+the cards. Exact names coalesce first. Repeated batches can merge aliases but
+cannot drop unmentioned features. Early rounds shift alphabetical boundaries;
+later rounds use deterministic shuffles. Explicit features are immutable.
 
-Before the LLM sees this atlas, Stage 2 builds a second fold-local reduction.
-Representatives are divided into overlapping 16-word atoms; exact member
-lineage restores their inner-fold and full-outer support. Pooled,
-centroid-residualized ColBERT vectors retrieve candidates only from other Stage
-1 architectures. Mutual candidates are reranked with symmetric
-document/document MeanMaxSim, reciprocal top-five edges are clustered, and
-communities are scored by fold coverage, architecture diversity, causal-axis
-corroboration, graph cohesion, and support size.
+Operationalization sees one canonical name and readable supporting excerpts.
+It defines type, unit/categories, extraction rule, and missingness. Prompt
+packing and all repair/fallback behavior are checkpointed per feature.
 
-The default 75-community budget is lane-aware. The best 30
-treatment/outcome communities and best 30 residual-effect/matched-pair
-communities are reserved independently; overlaps consume one slot, and global
-rank fills the remainder. This keeps confounder and modifier evidence from
-crowding each other out. Oracle values never participate. Every atom, edge,
-community, selected packet, and cache seal is retained under
-`stage2/evidence_communities`.
+## Extraction and supervision
 
-Before interpretation, Python strips each selected community to
-`{"item": N, "text": ["..."]}`. The integer is local to that request and is
-mapped back to the original packet immediately after validation. The LLM does
-see the community's consensus phrases plus at most three architecture-diverse
-evidence atoms. It does not see packet or card IDs, evidence kind, detail objects, truncation flags,
-axes, polarity, semantic grouping, architectures, scores, support counts,
-folds, or other compiler metadata. It returns feature names, descriptions,
-rationales, and `supporting_items`; it does not choose value types or any other
-part of the extraction ontology during discovery.
+The small model extracts every candidate from outer-training notes, one patient
+per request and bounded feature/document chunks per request. Mixed continuous
+and categorical representations get a training-only harmonization plan that is
+frozen for later rows.
 
-Compilation is cached under `stage2/evidence_compilation`. A restart hashes the
-Stage 1 handoff, loads the compact packet cache when its compiler signature
-matches, and avoids reparsing and reclustering the raw evidence. Interpretation
-checkpoints also carry an input fingerprint: completed batches are reused only
-when their exact selected-community inputs and clinical question match. The
-community graph has its own fingerprint over the compiled cards, member
-manifest, ColBERT configuration, graph configuration, and seed.
+The primary supervisor sees aggregate values and validation failures only. It
+can revise the same extraction ontology, but cannot add/drop/split/merge/rename
+features or assign roles. Only changed prompt-facing definitions are
+re-extracted. Explicit ontologies remain locked.
 
-## Candidate consolidation
+## Equivalence-only consolidation
 
-Optional investigator-specified features enter consolidation here rather than
-bypassing it. This lets iterative alias review merge a discovered synonym into
-one configured feature. The configured feature's name, causal
-roles, and complete extraction ontology remain authoritative, so its group
-skips model-authored ontology definition while retaining any Stage 1 provenance
-carried by the merged candidates. Training-fold diagnostics are still computed,
-but review must keep the feature without revising its supplied ontology.
+Before supervised selection, the optional sequential pass visits the original
+candidate order once. Each active pivot retrieves nearby active definitions.
+Pairwise Spearman, bias-corrected Cramer's V, or correlation-ratio evidence is
+computed on outer-training rows.
 
-Before that expensive review, Python builds one registry from all interpreted
-candidates in the outer fold. It coalesces exact normalized names and performs
-only high-threshold dense semantic merges that also share a non-generic lexical
-measurement anchor. It then turns each canonical identifier into a readable
-query and computes ColBERT MeanMaxSim only along its cited evidence-packet
-edges. The rank aggregates the best evidence scores with source-architecture
-and inner-fold coverage. A stratified top-N union preserves each evidence axis,
-and `max_candidates_per_fold` bounds the final discovered set. Packet
-provenance is retained even though only the best evidence packets are routed to
-ontology definition.
+A replacement must satisfy all of these conditions:
 
-The bounded registry candidates are then repeatedly presented in batches to
-the LLM. Early rounds use shifted alphabetical
-partitions; later rounds use reproducible seeded shuffles so lexically distant
-aliases can meet. Every response contains only merge directives of the form
-`inputs -> output`; it contains no opaque IDs, exclusion list, or enumeration
-of unchanged features. Python resolves names back to internal groups, rejects
-unknown or overlapping inputs, unions provenance for accepted merges, and
-passes every group absent from `inputs` through unchanged. Thus consolidation
-is lossless except for alias merging, and an invalid batch response falls back
-to retaining the complete batch.
+- every source pair is evaluable and meets the configured association threshold;
+- sources represent the same attribute, entity, temporal scope, and granularity;
+- source and output value types match;
+- continuous units match and the rule is coalesce;
+- categorical recodes map every declared source category injectively;
+- all-source missingness remains missing;
+- overlapping nonmissing sources agree numerically or after canonical recoding.
 
-Only after all iterative rounds does Python apply the deterministic causal-role
-filter. Groups without evidence supporting a confounder, prognostic, or
-effect-modifier role are excluded there, with decisions recorded in
-`consolidation/causal_role_filter.json`. Configured features use their supplied
-roles and remain protected.
+The last check matters: coalesce is first-source-wins mechanically, so accepting
+conflicting overlaps would discard information. The validator now rejects such
+proposals. Malformed values outside a declared continuous ontology are still
+treated as missing, matching materialization semantics.
 
-All groups remaining after this residual semantic deduplication are
-operationalized one at a time. The ontology model sees the canonical feature
-name and a deduplicated flat list of `representative_evidence.text` strings.
-It does not see packet boundaries, evidence kind, detail objects, truncation
-flags, fold metadata, internal IDs, causal axes, semantic grouping, architecture
-names, scores, support counts, candidate summaries, or an earlier proposed
-value type. It chooses the value type and supplies allowed values or a unit
-based on the readable text. Python keeps provenance and causal-role routing
-outside the prompt and validates ontology shape without encoding domain-specific
-clinical answers. There is no diversity-ranking prompt or feature-count pruning
-prompt. `max_candidates_per_fold` is enforced deterministically before these
-requests; `consolidation_oversample_factor` remains readable only so existing
-run files continue to parse.
+Accepted canonical measurements immediately replace their sources in the
+active retrieval pool. Original columns and recursive lineage remain in the
+registry. Whether enabled, disabled, or trivial, the pass writes the report
+referenced from final definitions.
+
+## Statistical selection
+
+Every inner fold fits two group elastic nets: logistic treatment nuisance and
+the outcome-appropriate marginal nuisance. Nominal contrasts plus missingness
+form one group. A feature with at least one treatment or outcome vote enters the
+confounder union; intersection and stability thresholds are diagnostic only.
+
+Cross-fitted nuisance predictions feed candidate-specific grouped calibration
+and a ridge-stabilized R-learner. All estimable treatment interactions for one
+candidate are scored together on inner-heldout rows. The top ten held-out
+R-loss gains per fold are selected by rank, without a positivity or p-value
+gate. Their union supplies final effect modifiers.
+
+At 64 or more candidates, selection is submitted to a loky worker so Python
+optimization loops do not contend with thread-level outer-fold orchestration.
+Loky serialization also makes this path safe from notebooks, `python -c`, and
+stdin without an `if __name__ == "__main__"` wrapper.
+
+## Estimation and audit
+
+Selected modifiers form causal-forest `X`; pure confounders form `W`; dual-role
+features occur once in `X`. A constant-effect design is used when no modifier
+survives. Outer-heldout rows receive propensity, potential-outcome predictions,
+AIPW scores, causal-forest effects, and available uncertainty intervals.
+
+The only supported nuisance family is elastic net. Logistic elastic net is used
+for treatment and binary outcomes; squared-error elastic net is used for
+continuous outcomes. The obsolete strict random-forest runtime-config module
+was retired with its disconnected tests and guidance. `fit_audit()` now records
+both configured settings and every fitted EconML nuisance clone, including its
+cross-fit position, effective CV folds, selected `C` or `alpha`, constant-model
+fallback, iteration count, and iteration-limit status.
+
+## Checkpoints worth inspecting
+
+| Path | Meaning |
+|---|---|
+| `evidence_compilation/` | Cards, exact members, lineage, and reduction audit |
+| `outer_NNN/feature_definitions.json` | Operational definitions before extraction |
+| `outer_NNN/ontology_supervision/` | Aggregate review, revisions, and convergence |
+| `outer_NNN/selection/candidate_consolidation/` | Alias decisions, repair events, report, and latent registry |
+| `outer_NNN/selection/elastic_net_selection.json` | Nuisance votes, cross-fitted diagnostics, R-loss scores, and selected roles |
+| `outer_NNN/final_definitions.json` | Frozen selected definitions and dependencies |
+| `outer_NNN/estimation/diagnostics.json` | Fitted model and nuisance-clone audit |
+| `cross_fitted_predictions.csv` | One held-out prediction per patient |
+| `causal_estimate.json` | Cross-fitted ATE and uncertainty |
+
+Reruns validate semantic fingerprints rather than trusting file presence. The
+guarded `--stage2-reselect` path archives selection and downstream artifacts,
+then reuses post-ontology definitions and all-candidate training extraction.

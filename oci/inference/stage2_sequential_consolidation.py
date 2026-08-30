@@ -40,7 +40,7 @@ from .stage2_agentic_selection import (
     fit_latent_state,
 )
 
-SCHEMA_VERSION = "stage2_sequential_equivalent_measurement_consolidation_v3"
+SCHEMA_VERSION = "stage2_sequential_equivalent_measurement_consolidation_v4_row_agreement"
 SELECTION_SCHEMA_VERSION = (
     "stage2_candidate_augmented_rlearner_selection_v8_elastic_net_nuisance_top_n_union"
 )
@@ -640,6 +640,117 @@ def _validate_information_preserving_rule(
         )
 
 
+def _validate_observed_alias_agreement(
+    proposal: Mapping[str, Any],
+    *,
+    frame: pd.DataFrame,
+    definitions_by_id: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Reject aliases that disagree where multiple sources are observed.
+
+    A coalesce expression necessarily chooses one source when two aliases are
+    populated.  That choice is information preserving only when the populated
+    values are equal.  Structural ontology checks alone cannot establish that
+    row-level property, so validate it on the outer-training measurements before
+    accepting a replacement.
+    """
+
+    source_ids = list(map(str, proposal["source_feature_ids"]))
+    expression = dict(proposal["expression"])
+    operation = str(expression["op"])
+
+    observed_by_source: dict[str, pd.Series] = {}
+    for source_id in source_ids:
+        name = str(definitions_by_id[source_id]["name"])
+        if name not in frame:
+            raise ValueError(
+                f"alias agreement audit is missing source column {name!r}"
+            )
+        observed_by_source[source_id] = frame[name]
+
+    comparable_by_source: dict[str, pd.Series] = {}
+    if operation == "coalesce":
+        continuous = str(proposal["output_type"]) == "continuous"
+        for source_id, values in observed_by_source.items():
+            if continuous:
+                # Match application semantics: malformed continuous values are
+                # excluded from the coalesce and therefore are not comparable.
+                comparable_by_source[source_id] = pd.to_numeric(
+                    values, errors="coerce"
+                )
+            else:
+                comparable_by_source[source_id] = values.map(
+                    lambda value: (
+                        None
+                        if pd.isna(value)
+                        else _normalized_category_token(value)
+                    )
+                )
+    elif operation == "case":
+        mappings: dict[str, dict[str, str]] = {
+            source_id: {} for source_id in source_ids
+        }
+        for case in expression.get("cases") or []:
+            condition = dict(case["when"])
+            source_id = str(condition["feature_id"])
+            input_values = (
+                list(condition.get("values") or [])
+                if str(condition["operator"]) == "in"
+                else [condition.get("value")]
+            )
+            output_token = _normalized_category_token(case.get("then"))
+            for input_value in input_values:
+                # _condition_mask applies eq/in with exact string spelling, so
+                # use the same lookup semantics in this preflight audit.
+                mappings[source_id][str(input_value)] = output_token
+        for source_id, values in observed_by_source.items():
+            mapping = mappings[source_id]
+            comparable = values.map(
+                lambda value: (
+                    None
+                    if pd.isna(value)
+                    else mapping.get(str(value))
+                )
+            )
+            unmapped = values.notna() & comparable.isna()
+            if bool(unmapped.any()):
+                examples = (
+                    values.loc[unmapped]
+                    .astype(str)
+                    .drop_duplicates()
+                    .head(5)
+                    .tolist()
+                )
+                raise ValueError(
+                    "lossless categorical alias recode encountered observed values "
+                    f"without a mapping for source {source_id!r}: {examples}"
+                )
+            comparable_by_source[source_id] = comparable
+    else:  # Guarded by _validate_information_preserving_rule.
+        raise ValueError(f"unsupported alias agreement operation {operation!r}")
+
+    row_identity = (
+        frame["_oci_row_id"]
+        if "_oci_row_id" in frame
+        else pd.Series(frame.index, index=frame.index)
+    )
+    for left_index, left_id in enumerate(source_ids):
+        left = comparable_by_source[left_id]
+        for right_id in source_ids[left_index + 1 :]:
+            right = comparable_by_source[right_id]
+            overlap = left.notna() & right.notna()
+            conflicts = overlap & ~left.eq(right)
+            if not bool(conflicts.any()):
+                continue
+            conflict_rows = row_identity.loc[conflicts].astype(str).head(10).tolist()
+            raise ValueError(
+                "lossless alias consolidation found conflicting overlapping values; "
+                f"pair=({left_id!r}, {right_id!r}), "
+                f"conflict_count={int(conflicts.sum())}, "
+                f"example_row_ids={conflict_rows}"
+            )
+
+
 def _validate_pairwise_association_threshold(
     proposal: Mapping[str, Any],
     *,
@@ -869,6 +980,11 @@ def _validate_and_fit_decision(
             frame=frame,
             definitions_by_id=definitions_by_id,
             policy=policy,
+        )
+        _validate_observed_alias_agreement(
+            proposal,
+            frame=frame,
+            definitions_by_id=definitions_by_id,
         )
         definition = _latent_definition(proposal, definitions_by_id)
         state = fit_latent_state(frame, proposal, definitions_by_id)
@@ -1184,6 +1300,9 @@ def _decision_messages(
                 "value_type and information granularity. Continuous sources must use the same "
                 "unit and may only be coalesced; nonnumeric values that violate a continuous "
                 "source ontology are treated as missing and the next valid alias is used. "
+                "Where two sources are nonmissing on the same training row, their numeric "
+                "values (or their canonical categorical values after recoding) must agree; "
+                "a first-source-wins rule is never allowed to hide a conflict. "
                 "Categorical, binary, or ordinal aliases may be coalesced only when their "
                 "category vocabularies are identical. Synonymous categorical vocabularies may "
                 "use a case rule with a canonical union: map every declared category from each "
@@ -1356,19 +1475,35 @@ def consolidate_stage2_candidates(
     original = [copy.deepcopy(dict(feature)) for feature in definitions]
     if not policy.enabled or len(original) < 2:
         status = "disabled" if not policy.enabled else "complete_fewer_than_two_candidates"
+        early_input = {
+            "schema_version": SCHEMA_VERSION,
+            "frame_fingerprint": _frame_fingerprint(extracted_fit),
+            "definitions": original,
+            "policy": policy.scientific_dict(),
+            "request_model": str(request_model),
+            "terminal_status": status,
+        }
+        early_fingerprint = _fingerprint(early_input)
+        report = {
+            "schema_version": SCHEMA_VERSION,
+            "input_fingerprint": early_fingerprint,
+            "status": status,
+            "policy": policy.scientific_dict(),
+            "original_candidates": len(original),
+            "active_candidates": len(original),
+            "latents_created": 0,
+            "components_consumed": 0,
+            "steps": [],
+        }
+        _write_json(
+            output_dir / "input.json",
+            {**early_input, "input_fingerprint": early_fingerprint},
+        )
+        _write_json(output_dir / "report.json", report)
         return (
             extracted_fit.copy(),
             original,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "status": status,
-                "policy": policy.scientific_dict(),
-                "original_candidates": len(original),
-                "active_candidates": len(original),
-                "latents_created": 0,
-                "components_consumed": 0,
-                "steps": [],
-            },
+            report,
             [],
         )
     feature_ids = [_feature_key(feature) for feature in original]
@@ -1407,6 +1542,7 @@ def consolidate_stage2_candidates(
                 and completion.get("input_fingerprint") == root_fingerprint
                 and completion.get("schema_version") == SCHEMA_VERSION
                 and report.get("schema_version") == SCHEMA_VERSION
+                and report.get("input_fingerprint") == root_fingerprint
                 and registry.get("schema_version") == SCHEMA_VERSION
             ):
                 frame, active, entries = _reconstruct_completed(
@@ -1524,6 +1660,7 @@ def consolidate_stage2_candidates(
                 "require_same_value_type_and_granularity": True,
                 "allow_lossless_categorical_union_recode": True,
                 "continuous_coalesce_skips_nonnumeric_source_values": True,
+                "require_overlapping_source_agreement": True,
                 "allow_general_specific_rollups": False,
                 "allow_aggregation_or_composite_rules": False,
                 "preserve_all_source_missingness_as_null": True,
@@ -1689,6 +1826,7 @@ def consolidate_stage2_candidates(
     active_definitions = [definitions_by_id[feature_id] for feature_id in active_ids]
     report = {
         "schema_version": SCHEMA_VERSION,
+        "input_fingerprint": root_fingerprint,
         "status": "complete",
         "policy": policy.scientific_dict(),
         "treatment_and_outcome_were_unavailable": True,

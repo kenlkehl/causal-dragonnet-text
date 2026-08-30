@@ -940,7 +940,10 @@ type, units or category cardinality, and missingness using only coalescing or a
 lossless synonymous-category recode. Nominal categories may use a canonical
 union when every source category is retained injectively; binary and ordinal
 scales retain full cardinality. Continuous coalescing treats values that violate
-a continuous ontology as missing and falls through to the next valid alias. It
+a continuous ontology as missing and falls through to the next valid alias.
+Whenever multiple valid sources are nonmissing on one training row, their
+numeric values or canonical recoded categories must agree; conflicting overlaps
+reject the replacement instead of being resolved by source order. It
 immediately replaces its aliases in
 the active pool, so later pivots retrieve the canonical measurement instead.
 Treatment, outcome, causal roles, and outer-heldout rows are absent from every
@@ -1035,7 +1038,11 @@ rows. Effect modifiers form its heterogeneity matrix and pure confounders form
 its controls; dual-role variables are represented once in the heterogeneity
 matrix. A constant heterogeneity design is used when no modifier survives, so
 the final model remains a causal forest. Fold diagnostics include its fit audit
-and held-out effect confidence intervals.
+and held-out effect confidence intervals. The supported nuisance path is
+elastic-net-only; the obsolete strict random-forest runtime-config contract is
+retired. The fit audit records every fitted cross-fit nuisance clone, including
+its effective CV folds, selected regularization, and optimizer iteration-limit
+status.
 
 If the dataset supplies `true_ite_prob`, Stage 2 hashes and freezes
 `cross_fitted_predictions.csv` before joining that oracle column. The final

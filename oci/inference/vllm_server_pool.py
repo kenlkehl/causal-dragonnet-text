@@ -102,6 +102,40 @@ def _vllm_internal_port_bases(
     return bases
 
 
+def validate_managed_vllm_pool_isolation(
+    primary: ManagedVLLMConfig,
+    extraction: ManagedVLLMConfig,
+) -> None:
+    """Reject internal rendezvous ranges shared by concurrently resident pools."""
+
+    primary.validate()
+    extraction.validate()
+    primary_bases = _vllm_internal_port_bases(
+        primary.server_count,
+        internal_port_base=primary.internal_port_base,
+    )
+    extraction_bases = _vllm_internal_port_bases(
+        extraction.server_count,
+        internal_port_base=extraction.internal_port_base,
+    )
+    overlaps = [
+        (primary_base, extraction_base)
+        for primary_base in primary_bases
+        for extraction_base in extraction_bases
+        if max(primary_base, extraction_base)
+        <= min(
+            primary_base + _VLLM_INTERNAL_PORT_STRIDE - 1,
+            extraction_base + _VLLM_INTERNAL_PORT_STRIDE - 1,
+        )
+    ]
+    if overlaps:
+        raise ValueError(
+            "primary and extraction managed vLLM pools have overlapping internal "
+            "rendezvous ranges; configure distinct internal_port_base values "
+            f"(overlapping replica bases={overlaps})"
+        )
+
+
 @dataclass(frozen=True)
 class ManagedVLLMConfig:
     """Configuration for pipeline-owned vLLM replica processes."""
@@ -778,4 +812,5 @@ __all__ = [
     "ManagedVLLMServerPool",
     "launch_managed_vllm_servers",
     "managed_vllm_config_from_mapping",
+    "validate_managed_vllm_pool_isolation",
 ]

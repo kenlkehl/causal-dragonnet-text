@@ -123,7 +123,7 @@ def test_created_latent_replaces_components_in_later_retrieval(tmp_path):
         {
             "_oci_row_id": np.arange(20),
             "first_burden": np.arange(20, dtype=float),
-            "second_burden": np.arange(20, dtype=float) + 0.1,
+            "second_burden": np.arange(20, dtype=float),
             "third_marker": np.linspace(1.0, 2.0, 20),
         }
     )
@@ -153,6 +153,9 @@ def test_created_latent_replaces_components_in_later_retrieval(tmp_path):
         ] is True
         assert body["equivalence_policy"][
             "continuous_coalesce_skips_nonnumeric_source_values"
+        ] is True
+        assert body["equivalence_policy"][
+            "require_overlapping_source_agreement"
         ] is True
         assert body["response_json_schema"]["$defs"]["condition"]["properties"][
             "operator"
@@ -379,6 +382,128 @@ def test_continuous_alias_coalesce_skips_malformed_source_value(tmp_path):
     np.testing.assert_allclose(populated.to_numpy(dtype=float), np.arange(100, 120))
 
 
+def test_continuous_alias_rejects_conflicting_overlapping_values(tmp_path):
+    definitions = [
+        _continuous("a", "first_measure"),
+        _continuous("b", "second_measure"),
+    ]
+    first = np.arange(20, dtype=float)
+    second = first.copy()
+    second[7] = 7.25
+    frame = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(100, 120),
+            "first_measure": first,
+            "second_measure": second,
+        }
+    )
+    checked = False
+
+    def request_json(_messages, validate, **_kwargs):
+        nonlocal checked
+        if not checked:
+            checked = True
+            with pytest.raises(
+                ValueError,
+                match="conflicting overlapping values.*conflict_count=1",
+            ):
+                validate(_continuous_alias_response(["a", "b"]))
+        return validate(
+            {
+                "action": "leave_unchanged",
+                "rationale": "The overlapping measurements disagree.",
+                "latents": [],
+            }
+        )
+
+    _consolidated, active, report, entries = consolidate_stage2_candidates(
+        extracted_fit=frame,
+        definitions=definitions,
+        request_json=request_json,
+        policy=Stage2SequentialConsolidationConfig(
+            enabled=True,
+            neighbor_count=1,
+            embedding_model="test-model",
+        ),
+        output_dir=tmp_path / "consolidation",
+        request_model="test-llm",
+        embedding_function=_embedding,
+    )
+
+    assert checked is True
+    assert len(active) == 2
+    assert report["latents_created"] == 0
+    assert entries == []
+
+
+def test_categorical_coalesce_rejects_conflicting_overlapping_values(tmp_path):
+    definitions = [
+        _categorical("h1", "histology_primary"),
+        _categorical("h2", "histology_secondary"),
+    ]
+    primary = ["adenocarcinoma", "squamous"] * 10
+    secondary = list(primary)
+    secondary[6] = "squamous"
+    frame = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(20),
+            "histology_primary": primary,
+            "histology_secondary": secondary,
+        }
+    )
+    checked = False
+
+    def request_json(_messages, validate, **_kwargs):
+        nonlocal checked
+        if not checked:
+            checked = True
+            proposal = {
+                "action": "replace_with_latents",
+                "rationale": "Attempted alias coalesce.",
+                "latents": [
+                    {
+                        "kind": "categorical_rule",
+                        "source_feature_ids": ["h1", "h2"],
+                        "label": "Canonical histology",
+                        "description": "Canonical pretreatment histology.",
+                        "rationale": "The fields appear to be aliases.",
+                        "measurement_definition": "Coalesce the source fields.",
+                        "missing_value_rule": "Null when both fields are absent.",
+                        "output_type": "categorical",
+                        "categories_or_unit": ["adenocarcinoma", "squamous"],
+                        "expression": {
+                            "op": "coalesce",
+                            "feature_ids": ["h1", "h2"],
+                        },
+                    }
+                ],
+            }
+            with pytest.raises(ValueError, match="conflicting overlapping values"):
+                validate(proposal)
+        return validate(
+            {
+                "action": "leave_unchanged",
+                "rationale": "The overlapping category values disagree.",
+                "latents": [],
+            }
+        )
+
+    consolidate_stage2_candidates(
+        extracted_fit=frame,
+        definitions=definitions,
+        request_json=request_json,
+        policy=Stage2SequentialConsolidationConfig(
+            enabled=True,
+            neighbor_count=1,
+            embedding_model="test-model",
+        ),
+        output_dir=tmp_path / "consolidation",
+        request_model="test-llm",
+        embedding_function=_embedding,
+    )
+    assert checked is True
+
+
 def test_categorical_alias_recode_allows_lossless_union_vocabulary(tmp_path):
     definitions = [
         {
@@ -514,6 +639,105 @@ def test_categorical_alias_recode_allows_lossless_union_vocabulary(tmp_path):
         "Large cell carcinoma",
         "Other",
     ] * 6
+
+
+def test_categorical_recode_rejects_conflicting_canonical_values(tmp_path):
+    definitions = [
+        _binary("a", "first_status"),
+        {
+            **_binary("b", "second_status"),
+            "categories_or_unit": ["Yes", "No"],
+        },
+    ]
+    first = ["Present", "Absent"] * 10
+    second = ["Yes", "No"] * 10
+    second[4] = "No"
+    frame = pd.DataFrame(
+        {
+            "_oci_row_id": np.arange(20),
+            "first_status": first,
+            "second_status": second,
+        }
+    )
+    checked = False
+
+    def request_json(_messages, validate, **_kwargs):
+        nonlocal checked
+        if not checked:
+            checked = True
+            proposal = {
+                "action": "replace_with_latents",
+                "rationale": "Attempted synonymous recode.",
+                "latents": [
+                    {
+                        "kind": "categorical_rule",
+                        "source_feature_ids": ["a", "b"],
+                        "label": "Canonical status",
+                        "description": "Canonical pretreatment status.",
+                        "rationale": "The source vocabularies are synonymous.",
+                        "measurement_definition": "Map both vocabularies.",
+                        "missing_value_rule": "Null when both sources are absent.",
+                        "output_type": "binary",
+                        "categories_or_unit": ["Present", "Absent"],
+                        "expression": {
+                            "op": "case",
+                            "cases": [
+                                {
+                                    "when": {
+                                        "feature_id": "a",
+                                        "operator": "eq",
+                                        "value": source,
+                                    },
+                                    "then": target,
+                                }
+                                for source, target in (
+                                    ("Present", "Present"),
+                                    ("Absent", "Absent"),
+                                )
+                            ]
+                            + [
+                                {
+                                    "when": {
+                                        "feature_id": "b",
+                                        "operator": "eq",
+                                        "value": source,
+                                    },
+                                    "then": target,
+                                }
+                                for source, target in (
+                                    ("Yes", "Present"),
+                                    ("No", "Absent"),
+                                )
+                            ],
+                            "else": None,
+                        },
+                    }
+                ],
+            }
+            with pytest.raises(ValueError, match="conflicting overlapping values"):
+                validate(proposal)
+        return validate(
+            {
+                "action": "leave_unchanged",
+                "rationale": "The canonicalized overlapping values disagree.",
+                "latents": [],
+            }
+        )
+
+    consolidate_stage2_candidates(
+        extracted_fit=frame,
+        definitions=definitions,
+        request_json=request_json,
+        policy=Stage2SequentialConsolidationConfig(
+            enabled=True,
+            neighbor_count=1,
+            embedding_model="test-model",
+        ),
+        output_dir=tmp_path / "consolidation",
+        request_model="test-llm",
+        embedding_function=_embedding,
+    )
+    assert checked is True
 
 
 def test_categorical_union_recode_rejects_within_source_category_collapse(tmp_path):
@@ -847,6 +1071,35 @@ def test_disabled_consolidation_is_identity(tmp_path):
     assert active == definitions
     assert report["status"] == "disabled"
     assert entries == []
+    persisted_report = json.loads(
+        (tmp_path / "consolidation" / "report.json").read_text(encoding="utf-8")
+    )
+    assert persisted_report == report
+
+
+def test_single_candidate_consolidation_writes_advertised_report(tmp_path):
+    definitions = [_continuous("a", "only_measure")]
+    frame = pd.DataFrame({"_oci_row_id": [0, 1], "only_measure": [1.0, 2.0]})
+
+    def unexpected_request(*_args, **_kwargs):
+        raise AssertionError("a single candidate must not call the LLM")
+
+    _consolidated, active, report, entries = consolidate_stage2_candidates(
+        extracted_fit=frame,
+        definitions=definitions,
+        request_json=unexpected_request,
+        policy=Stage2SequentialConsolidationConfig(enabled=True),
+        output_dir=tmp_path / "consolidation",
+        request_model="test-llm",
+        embedding_function=_embedding,
+    )
+
+    assert active == definitions
+    assert report["status"] == "complete_fewer_than_two_candidates"
+    assert entries == []
+    assert json.loads(
+        (tmp_path / "consolidation" / "report.json").read_text(encoding="utf-8")
+    ) == report
 
 
 def test_invalid_response_and_conservative_fallback_are_persisted(tmp_path):

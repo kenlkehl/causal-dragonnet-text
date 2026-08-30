@@ -1,1157 +1,208 @@
-STAGE 2, FROM START TO FINISH
-=============================
+STAGE 2 PIPELINE REPORT
+=======================
 
-Current implementation as of 22 August 2026
+Current implementation as of 30 August 2026
 
 
-WHAT STAGE 2 IS FOR
--------------------
+PURPOSE
+-------
 
-Stage 2 turns clues learned in Stage 1 into an actual causal analysis.
+Stage 2 turns fold-scoped Stage 1 evidence into measured pretreatment variables
+and held-out causal estimates. It is an outer-cross-fitting workflow: every
+decision that can adapt to the data is learned inside one outer-training
+partition, frozen, and only then applied to that fold's held-out patients.
 
-Stage 1 has already read the clinical text through several different modeling
-approaches. It hands Stage 2 many small pieces of evidence about patterns that
-may matter for treatment choice, outcome, or treatment-effect differences.
-Those pieces are not yet a usable patient table. They may say things such as
-"older patients," "high biomarker expression," or "brain metastases," but they
-do not yet define a clean variable or give every patient a value.
+The workflow requires the Stage 1 handoff, a stable patient identifier, clinical
+text, binary treatment, numeric outcome, and outer/inner split provenance. A
+definition-only run may stop before patient extraction and estimation.
 
-Stage 2 does the following, separately inside each outer fold:
+Oracle columns never participate in evidence compilation, discovery,
+operationalization, extraction, supervision, selection, or fitting. If an
+oracle individual effect is available, it is loaded only for post-run
+evaluation of already-frozen artifacts.
 
-1. Cleans and compresses the Stage 1 evidence without losing its audit trail.
-2. Organizes that evidence into a searchable hierarchy of communities.
-3. Reads all of the compiled evidence and proposes a broad list of candidate
-   patient variables.
-4. Uses hierarchical ColBERT retrieval to find the strongest evidence for each
-   already-named candidate and reduces the candidate list to a manageable size.
-5. Merges aliases, assigns causal roles, and writes a precise extraction rule
-   for each surviving variable.
-6. Reads the raw clinical record for one patient at a time and extracts those
-   frozen variables.
-7. Uses only the outer training patients to repair measurement rules, reconcile
-   mixed representations, and test whether variables are useful and stable.
-8. Freezes the final variables and all value mappings.
-9. Extracts the outer-held-out patients once under those frozen rules.
-10. Fits causal models and produces held-out treatment-effect predictions.
-11. Combines the held-out predictions from all outer folds into the final
-    average treatment-effect estimate.
 
-The central separation is this:
-
-    Stage 1 evidence packets -> discover and define variables
-    Raw patient documents    -> extract values for those defined variables
-
-Feature discovery does not scan raw patient notes. Raw notes enter only after
-the candidate variables and their initial measurement definitions have been
-created.
-
-
-A FEW TERMS USED THROUGHOUT THIS REPORT
----------------------------------------
-
-Outer fold
-    One full train/test split. Everything that can adapt -- feature discovery,
-    measurement repair, value mapping, and feature selection -- is learned on
-    the outer training portion. The outer-held-out patients are reserved for
-    the final prediction and effect estimate for that fold.
-
-Inner fold
-    A smaller train/validation split made within an outer training fold. Inner
-    folds are used to judge whether an extracted variable helps on patients
-    that were not used to fit the screening model.
-
-Stage 1 architecture
-    One of the distinct Stage 1 evidence-generating approaches. Keeping the
-    architectures separate long enough to measure agreement is useful because
-    a clue found by several different approaches is more convincing than a clue
-    repeated many times by one approach.
-
-Evidence packet
-    A JSON record containing scientific evidence from Stage 1, readable text,
-    its fold, its source architecture, and provenance. It is evidence about a
-    possible variable, not a patient and not an extracted patient value.
-
-Compiled evidence card
-    Stage 2's cleaned, deduplicated, and semantically clustered form of related
-    Stage 1 evidence. In the code, these cards are also passed around as
-    packets. Each compiled card belongs to one outer fold and one Stage 1
-    architecture.
-
-Evidence community
-    A group of related evidence atoms found by a similarity graph. Communities
-    make a compact searchable index. They do not decide which clinical features
-    exist.
-
-Serialized community packet
-    A community written as one ordinary JSON object, usually one line in a
-    JSONL file. "Serialized" merely means converted to a file representation.
-    It is not a model-generated patient summary. It contains readable excerpts,
-    a full ColBERT routing document, community statistics, and links back to the
-    compiled evidence that formed it.
-
-Candidate
-    A named possible patient variable, such as age at treatment or biomarker
-    expression. A candidate is provisional. It has not necessarily survived
-    ranking, causal-role filtering, extraction, or empirical review.
-
-Feature definition, or ontology
-    The instructions that turn a candidate into an extractable measurement:
-    its name, description, value type, unit or categories, measurement rule,
-    and missing-value rule. "Ontology" sounds grander than it is here; it means
-    the allowed form and precise meaning of one variable.
-
-Confounder
-    A pretreatment variable supported as relevant to both treatment choice and
-    outcome.
-
-Prognostic variable
-    A pretreatment variable supported as relevant to outcome, but not also
-    supported as a treatment-choice variable.
-
-Effect modifier
-    A pretreatment variable for which the treatment effect may differ across
-    values. One feature can have more than one causal role.
-
-ColBERT
-    A text-matching model that compares a short query with a document at the
-    token level. It is useful when one small phrase inside a longer evidence
-    record matters. Here it is a retrieval and ranking tool, not a clinical
-    reasoner and not the source of candidate names.
-
-Router
-    A compact community packet used as the first stop in search. Given an
-    already-discovered candidate name, a router points Stage 2 toward a smaller
-    set of original compiled evidence packets. Those original packets are then
-    scored directly.
-
-
-THE INPUTS STAGE 2 EXPECTS
---------------------------
-
-A full Stage 2 causal run receives four kinds of input:
-
-1. The Stage 1 handoff, containing fold-scoped scientific evidence and its
-   provenance.
-2. A patient dataset with a stable patient identifier, raw clinical text, a
-   binary treatment column, and a numeric outcome column.
-3. The outer and inner split provenance, when it is available. If inner splits
-   are absent, Stage 2 can make deterministic inner folds within the outer
-   training rows.
-4. Run configuration: model endpoints, prompt and extraction limits, feature
-   limits, random seed, clinical question, and any investigator-specified
-   features.
-
-Before analysis begins, Stage 2 checks the modeling columns. Treatment must be
-complete and coded 0/1. Outcome must be complete and numeric, and a binary
-outcome must also contain only 0/1. It writes a public, redacted copy of the
-configuration to config.json.
-
-The standard run expects all supported Stage 1 architectures to be present for
-every outer fold. Evidence compilation fails before its first language-model
-request if a required architecture is missing. This prevents a partially
-produced Stage 1 handoff from silently becoming a different analysis.
-
-Stage 2 can also stop after feature definitions if no patient dataset is
-supplied. In that mode it performs evidence compilation, discovery, selection,
-consolidation, causal-role assignment, and operationalization, but not patient
-extraction or causal estimation.
-
-
-THE FOLD BOUNDARY: THE MOST IMPORTANT DESIGN RULE
--------------------------------------------------
-
-Each outer fold is its own small analysis. Its feature set is allowed to differ
-from the feature sets in other outer folds because it is learned only from that
-fold's permitted training evidence and training patients.
-
-For a given outer fold, the following are training-only decisions:
-
-* which candidate variables are discovered;
-* which evidence supports each candidate;
-* which aliases are merged;
-* which causal roles are supported;
-* how each variable is measured;
-* how mixed numeric and categorical values are harmonized;
-* whether extraction failures justify revising a definition;
-* whether a variable survives empirical screening; and
-* how encoders and causal models are fitted.
-
-The outer-held-out clinical notes are not used to make any of those decisions.
-They are extracted only after the definitions and mappings are frozen. Their
-outcomes do not go into feature review. This is why the final row-level
-predictions can be treated as out-of-fold predictions rather than in-sample
-descriptions.
-
-The outer folds may run at the same time, so a directory can look mixed while a
-run is in progress: one fold may be discovering candidates while another is
-extracting patients. Concurrency does not mix their data. A global request
-limit still caps the total number of language-model calls in flight.
-
-
-STEP 1: COMPILE THE RAW STAGE 1 EVIDENCE
----------------------------------------
-
-The Stage 1 handoff can contain a large number of repeated or closely related
-pieces of evidence. Sending every raw occurrence to later steps would waste
-context and let frequent duplicates dominate. The evidence compiler therefore
-works inside each outer fold and performs three jobs.
-
-First, it extracts only allowlisted scientific content from the supported Stage
-1 outputs. Operational details such as file paths, run timing, model mechanics,
-or internal identifiers are not treated as clinical evidence.
-
-Second, it removes exact duplication. Exact copies are represented once, but
-the member and lineage files retain where every occurrence came from. Repeated
-text can therefore increase provenance support without consuming the prompt
-again and again.
-
-Third, it conservatively groups semantically similar evidence into compiled
-cards. The compiler stratifies this work so that one prolific architecture,
-evidence kind, causal axis, or polarity does not take the entire allowance.
-Each compiled card remains tied to exactly one Stage 1 architecture. The normal
-cap is 400 cards per outer fold, although a run configuration can change it.
-
-A card contains a small number of readable representative excerpts plus
-machine-readable support and provenance. The compiler records both the compact
-card and its membership, so a later reviewer can trace the card back through
-the exact Stage 1 occurrences.
-
-The main compilation artifacts are under evidence_compilation/. For each outer
-fold, cards.jsonl contains the compiled cards, members.jsonl contains their
-members, and lineage.jsonl records the chain back to Stage 1. Summary and
-completion files record counts and input fingerprints.
-
-This is a compression step, not feature discovery. No clinical variable has
-yet been named.
-
-
-STEP 2: BUILD AN INDEPENDENT EVIDENCE-COMMUNITY HIERARCHY
---------------------------------------------------------
-
-Stage 2 next builds a searchable map of the compiled evidence. This map is used
-later to find evidence for an already-named candidate. Under the current
-candidate-first design, it is not the input gate for candidate discovery.
-Discovery reads all compiled cards by default.
-
-The hierarchy is built without a feature query. There is no query for age,
-PD-L1, or any other clinical concept at this point.
-
-2.1 Split readable evidence into short atoms
-
-The readable representatives are split into overlapping spans of at most 16
-words, with a 4-word overlap by default. Short atoms reduce the chance that one
-small but important phrase is drowned out by the rest of a long excerpt.
-
-Each atom keeps its source packet, architecture, evidence axes, inner-fold
-support, and exact-member provenance. The text is shortened for matching, but
-the links needed to reconstruct support are retained.
-
-2.2 Find likely neighbors cheaply
-
-The atom encoder first produces pooled vectors. Those vectors are used only to
-make a manageable neighbor shortlist. In the first round, an atom looks for
-neighbors from other Stage 1 architectures. This favors agreement across
-independent evidence-generating approaches rather than clusters made entirely
-of one architecture repeating itself.
-
-2.3 Rerank with symmetric document-to-document ColBERT
-
-ColBERT then compares the shortlisted atom pairs at the token level. Because
-both sides are evidence documents rather than a query and a document, the code
-uses a symmetric MeanMaxSim comparison. An edge is kept only when the atoms are
-among each other's top neighbors. The default reciprocal neighborhood is five.
-
-This reciprocal rule makes the graph conservative: a one-way resemblance is
-not enough.
-
-2.4 Form first-level communities
-
-The reciprocal graph is clustered with Louvain community detection. The result
-is a set of small, related evidence groups. The number of first-level
-communities depends on the evidence; it is not a fixed constant.
-
-2.5 Coarsen the communities in later rounds
-
-Later hierarchy rounds render every underlying atom in a community into one
-complete community document, re-encode those documents, compare communities,
-and cluster again. These later rounds do not require cross-architecture pairs,
-because each lower-level community already carries its full source mixture.
-
-The default target counts are approximately 300 communities and then 75. They
-are targets for choosing a clustering resolution, not promises of an exact
-count. A round is skipped if its target is not smaller than its input. The
-artifacts record the actual count at every level.
-
-2.6 Choose the final router packets
-
-The final serialized set is capped at 75 community packets per outer fold by
-default. Selection reserves room for evidence useful to the confounder lane and
-the effect-modifier lane -- normally 30 for each -- then deduplicates overlaps
-and fills remaining slots by the overall community score. These lanes are
-derived from generic Stage 1 evidence axes, not from named clinical concepts.
-
-Community scores reward such things as support, architecture diversity,
-inner-fold coverage, causal-axis relevance, and graph cohesion. They do not
-contain hand-written bonuses for age, PD-L1, or another target variable.
-
-2.7 Serialize the result
-
-Each selected community becomes one JSON packet containing:
-
-* readable representative evidence;
-* consensus phrases;
-* counts and coverage summaries;
-* the community's causal lanes and evidence axes;
-* source packet identifiers; and
-* a ColBERT document containing the community's complete atom text for later
-  routing.
-
-These packets are written under evidence_communities/, along with the atoms,
-graph edges, first-level communities, hierarchy records, selection details,
-and summary. packets.jsonl is the compact set used as candidate routers.
-
-Again, the current default is important: these community packets help route
-named candidates later. They do not replace the compiled cards as the source
-read by the discovery prompts.
-
-
-STEP 3: HIGH-RECALL, CANDIDATE-FIRST FEATURE DISCOVERY
------------------------------------------------------
-
-Candidate discovery now starts from every compiled evidence card in the outer
-fold. This is why it is called candidate-first: Stage 2 asks what variables are
-present before using a feature name as a search query.
-
-3.1 Keep architectures visible to the scheduler
-
-Compiled cards are grouped by their Stage 1 architecture and divided into
-batches that fit the exact rendered prompt-character limit. Architecture is
-used by Python to schedule and audit the batches. The model itself is not told
-which architecture produced a batch.
-
-3.2 Show the model only readable evidence
-
-For each card, the discovery prompt contains a temporary item number and the
-readable consensus text and representative excerpts. It does not expose packet
-IDs, architecture names, support counts, evidence scores, fold labels,
-polarities, causal-axis metadata, or the clinical question. Those fields could
-encourage the model to follow analysis metadata rather than the clinical text.
-
-The prompt asks for every atomic patient-level clinical variable supported by
-each item. It explicitly asks the model to notice demographic clauses,
-biomarkers, laboratory measurements, disease sites, clinical history, and
-other secondary details instead of returning only the dominant topic. It also
-rejects names, administrative fields, documentation artifacts, modeling
-methods, cohort-level summaries, and vague composite inventories.
-
-The instruction is generic. It does not name PD-L1, age, or another desired
-answer. The configuration's explicit_features list is empty unless an
-investigator deliberately supplies a feature.
-
-At this stage the model supplies only:
-
-* a snake_case candidate name;
-* a short description; and
-* the temporary item numbers that support it.
-
-It does not choose a data type, unit, list of categories, or patient extraction
-rule yet.
-
-3.3 Map citations back to evidence
-
-Python validates every citation and maps each prompt-local item number back to
-the real compiled packet. A candidate with no valid cited packet is not
-accepted. The code then attaches the packet's architectures and evidence axes
-outside the prompt. This is how readable discovery remains connected to exact
-provenance.
-
-3.4 Audit evidence that produced no candidate
-
-After the first pass, every compiled card that was not cited by any candidate
-is sent through a separate recall-oriented audit. The audit again asks for all
-atomic patient variables, including secondary details that may not match the
-card's apparent topic. Candidates from the initial pass and audit are merged.
-
-This second pass matters because an evidence card can contain several facts.
-The most salient fact may be found on the first pass while a short demographic
-or biomarker clause is overlooked.
-
-The resulting raw list is saved in interpreted_candidates.json. This file is
-the first place to inspect when asking whether a concept was ever discovered.
-
-
-STEP 4: BUILD A CONSERVATIVE CANDIDATE REGISTRY
------------------------------------------------
-
-The same measurement can appear under several spellings. Before ranking,
-Stage 2 creates a registry of canonical candidate names.
-
-It first collapses exact normalized names. It can then use dense embeddings to
-merge extremely similar names, with a default similarity threshold of 0.94.
-Dense similarity alone is not sufficient: the names must also share an
-informative lexical anchor. Generic words that occur everywhere are not
-accepted as anchors.
-
-This is deliberately conservative. "Age," "age at diagnosis," and "patient
-age" may be recognized as one family when the names support that reading, but
-two clinically different measurements should not be merged merely because
-their embeddings are nearby.
-
-Every registry entry retains all original candidate IDs, descriptions,
-citations, source architectures, and evidence axes. Registry construction
-reduces aliases; it does not discard provenance.
-
-
-STEP 5: USE HIERARCHICAL COLBERT TO SUPPORT AND RANK NAMED CANDIDATES
--------------------------------------------------------------------
-
-Only now does a feature name become a ColBERT query. For example, a discovered
-identifier such as patient_age is rendered as the short query "Patient Age."
-The query contains the candidate name and nothing more elaborate. This point is
-why hierarchical retrieval cannot cause an undiscovered concept to appear: the
-concept must already have been named from compiled evidence before a query
-exists.
-
-5.1 Search the community routers
-
-The candidate name is scored against the final community packets. By default,
-the three best communities are selected. This configuration value --
-candidate_selection_hierarchy_top_communities -- controls breadth. Raising it
-means that each candidate descends through more communities and therefore
-examines more original compiled packets; it also costs more matching time and
-admits more weakly related material.
-
-5.2 Descend to original compiled evidence
-
-Each selected community lists the compiled packets from which it came. Stage 2
-forms a leaf-level search set from those source packets. It always adds the
-packets that the discovery model directly cited, even if no selected community
-would have routed to them. Direct discovery evidence therefore cannot be lost
-because the hierarchy placed it oddly.
-
-5.3 Rerank the leaves
-
-ColBERT scores the candidate name directly against every compiled packet in the
-routed leaf set. The default top three leaf packets become the candidate's main
-ontology evidence. A small relevant phrase can score well even when it sits in
-a longer card, which is the main reason for using late interaction here.
-
-The router is only an efficient first pass. The final evidence score comes from
-the original compiled cards, not from assuming that every item in a broad
-community is equally relevant.
-
-5.4 Add independent coverage information
-
-Stage 2 calculates architecture coverage and inner-fold coverage from packets
-that discovery directly cited. It does not inflate coverage by counting every
-descendant of a broad router community.
-
-The default aggregate support score is:
-
-    75%  normalized mean relevance of the top evidence packets
-    12.5% fraction of Stage 1 architectures directly supporting the candidate
-    12.5% fraction of inner folds directly supporting the candidate
-
-5.5 Preserve several causal evidence lanes, then apply the hard cap
-
-Candidates are ranked within the evidence axes carried from Stage 1: treatment,
-outcome, residual effect, matched pair, semantic, and unclear. The normal
-configuration keeps up to the top 50 per axis, takes an axis-balanced union, and
-then applies a hard limit of 50 discovered candidates per outer fold.
-
-This is the main narrowing point before alias consolidation. A real concept can
-be discovered but still fall below the fold cap. The selection file records
-both retained and dropped registry candidates, their scores, their routed
-communities, their top evidence, and all original candidate IDs affected.
-
-The main artifacts are:
-
-* candidate_registry_selection.json -- registry merges, scores, routes,
-  rankings, retained candidates, and dropped candidates;
-* selected_candidates.json -- the candidates that passed the cap;
-* input_packets.jsonl -- the full compiled evidence used for discovery; and
-* colbert_support_packets.jsonl -- the bounded hierarchy routers used after
-  candidate naming.
-
-
-HOW TO TRACE A MISSED FEATURE
------------------------------
-
-The design makes a miss traceable as a sequence rather than a guess. Starting
-from the beginning, ask:
-
-1. Was the relevant Stage 1 occurrence present in the handoff?
-2. Did evidence compilation put it into a card, and does members.jsonl or
-   lineage.jsonl preserve the occurrence?
-3. Is the readable phrase present in input_packets.jsonl for that outer fold?
-4. Did interpreted_candidates.json contain a candidate for it, either on the
-   first pass or the rejected-card audit?
-5. If it was discovered, was it merged into a registry entry under another
-   name?
-6. Did candidate_registry_selection.json retain it, or did the 50-candidate
-   ranking cap remove it?
-7. Did alias consolidation merge it correctly, and did the merged evidence
-   preserve all of its cited packets?
-8. Did the deterministic causal-role filter find a supported role?
-9. Did operationalization define the intended measurement, or fall back to an
-   ambiguous definition after validation failure?
-10. During extraction, was the concept absent, represented unexpectedly, or
-    rejected by a closed-category rule?
-11. During empirical review, was it dropped for poor measurement or lack of
-    stable training-fold signal?
-
-That path distinguishes four very different statements: "Stage 1 never saw
-it," "discovery failed to name it," "ranking removed it," and "it was measured
-but did not survive review."
-
-
-STEP 6: CONSOLIDATE TRUE ALIASES WITHOUT USING THE MODEL AS A FILTER
--------------------------------------------------------------------
-
-The selected candidates now go through a broader alias-consolidation process.
-This is separate from the conservative registry merge because aliases may be
-worded differently enough to require clinical interpretation.
-
-The consolidation model sees bounded batches, normally 20 candidate groups at
-a time. The first rounds use shifted alphabetical order. Later rounds use
-deterministic seeded shuffles, for up to 55 rounds by default. Varying the
-neighborhood lets aliases meet even if they were far apart in one ordering.
-
-The model's authority in this step is narrow: it may merge candidates that mean
-the same scalar measurement. It may not exclude a candidate, invent a new
-feature, split one candidate into several, or discard cited evidence. Python
-checks that every input candidate has exactly one disposition and that a merge
-preserves all packet support.
-
-A deterministic lexical measurement-anchor check blocks semantically
-incompatible merges. If a model response is invalid, the batch falls back to
-passing the groups through rather than silently losing them.
-
-Investigator-specified explicit features, if any, are added after the discovered
-candidate cap. They cannot be renamed, merged into a different measurement,
-revised, or dropped by the ordinary pipeline.
-
-
-STEP 7: ASSIGN CAUSAL ROLES FROM STAGE 1 SUPPORT
------------------------------------------------
-
-After aliases have been consolidated, Python assigns roles from the evidence
-axes attached to all supporting packets:
-
-* Treatment plus outcome support gives the feature the confounder role.
-* Outcome support without treatment support gives it the prognostic role.
-* Residual-effect or matched-pair support gives it the effect-modifier role.
-
-A feature may be both a confounder and an effect modifier, for example. A group
-with none of the supported roles is excluded and recorded in
-consolidation/causal_role_filter.json.
-
-This step is deterministic. A language model does not look at the clinical
-question and freely declare roles. The roles must be backed by the fold-local
-Stage 1 evidence axes.
-
-
-STEP 8: TURN EACH SURVIVING NAME INTO AN EXTRACTION DEFINITION
--------------------------------------------------------------
-
-Each retained group is operationalized one feature at a time. The model sees
-the canonical feature name and readable text from the selected evidence
-packets. It does not see packet IDs, architecture labels, fold numbers, support
-scores, causal axes, roles, or the clinical question.
-
-It must return one flat definition containing:
-
-* a plain description of the one patient-level measurement;
-* value type: binary, categorical, continuous, ordinal, or ambiguous;
-* allowed categories or the unit;
-* the measurement definition;
-* the missing-value rule;
-* a short scientific support summary; and
-* caveats.
-
-The rule prefers continuous measurement when a realistic number exists, but it
-does not force false precision. A continuous definition may explicitly allow a
-documented category or threshold string when an exact number is missing. This
-is important for biomarkers that may be reported as an exact percentage in one
-record and as "less than 1%," "1-49%," or "50% or greater" in another.
-
-Binary and closed categorical definitions are validated strictly. A binary
-feature must have exactly two distinct scalar ontology values. Categorical and
-ordinal features must have at least two distinct values, with no duplicate
-spellings disguised by punctuation or capitalization.
-
-Malformed responses are repaired within bounded retry limits. If a valid,
-grounded definition still cannot be produced, Stage 2 uses a conservative
-ambiguous definition rather than crashing the entire fold or pretending to
-know the answer.
-
-At this point feature_definitions.json and definitions_complete.json mark the
-end of definition discovery. If the run has no patient dataset, Stage 2 stops
-here.
-
-
-STEP 9: EXTRACT THE DEFINITIONS FROM RAW PATIENT DOCUMENTS
----------------------------------------------------------
-
-This is the first stage that reads the raw patient clinical text.
-
-Extraction is intentionally narrow. Every request contains exactly one
-patient's record. Definitions are divided into stable slices, normally no more
-than 10 features per request. No prompt ever contains several patients, so the
-model cannot compare patients or copy a value from one row into another.
-
-For each feature, the extractor receives the frozen name, type, allowed values,
-measurement definition, and missing-value rule. It must return one scalar or
-null. It is told to use only the supplied clinical record and to return null
-when the record does not support a value.
-
-For binary, categorical, and ordinal features, the returned scalar must match
-one declared ontology value exactly. Validation and bounded repair occur at the
-feature level, so one invalid field can be set to null without throwing away
-valid fields from the same patient.
-
-If a patient note is too large for one prompt, Stage 2 splits it into contiguous,
-lossless pages and prefers nearby note, paragraph, line, sentence, or word
-boundaries. Page extraction returns every supported observation with an exact
-evidence quote, verified page-relative and document-relative character offsets,
-and a locally normalized date backed by an exact source quote when one is
-explicit. It does not collapse conflicting longitudinal values within a page.
-
-Reconciliation is then local and deterministic rather than another LLM call.
-The frozen feature ontology specifies latest, earliest, maximum, minimum, mode,
-any-positive, or conservative null-on-conflict behavior. Verified dates take
-precedence for temporal rules, source order is the explicit fallback, and the
-complete observation set and selected observation ID are written to an audit
-file. A missing observation on one page cannot overwrite evidence from another,
-and no page is silently dropped.
-
-Work is checkpointed at the patient, feature-slice, page, repair, and
-reconciliation levels. An interrupted run can reuse successful calls.
-
-
-STEP 10: LEARN FROM REPEATED EXTRACTION FAILURES, USING TRAINING PATIENTS ONLY
------------------------------------------------------------------------------
-
-Every extraction writes an issue ledger. It distinguishes a whole-response
-format failure from a feature-specific ontology failure such as an unexpected
-category.
-
-If the same feature fails for several outer-training patients -- three by
-default -- Stage 2 may ask for a one-feature ontology refinement. The refinement
-request sees:
-
-* the current definition;
-* counts of failure kinds; and
-* the failed output forms.
-
-It does not see the patients' clinical text, treatment, outcome, or any
-outer-held-out information. It can clarify the description, type, categories,
-unit, measurement rule, and missing-value rule. It cannot change the feature's
-identity, name, causal roles, or supporting evidence. The default limit is two
-refinement rounds.
-
-This feedback loop addresses systematic representation mistakes -- for
-example, an ontology that allowed "positive" while the records consistently
-say "detected" -- without allowing patient outcomes to steer the wording.
-Investigator-specified explicit features are immutable; their failures are
-audited but do not rewrite their ontology.
-
-
-STEP 11: HARMONIZE CONTINUOUS VALUES THAT ARRIVE IN MIXED FORMS
---------------------------------------------------------------
-
-Clinical records often mix exact numbers and categories. Stage 2 deliberately
-allows this at extraction time instead of forcing the model to invent a number.
-
-For a continuous feature, a valid raw extraction can therefore be either:
-
-* a numeric scalar; or
-* a concise, documented categorical or threshold string permitted by the
-  measurement rule.
-
-After outer-training extraction, Stage 2 summarizes numeric values and fallback
-strings separately. It then learns a harmonization plan using only those
-training observations.
-
-There are three main outcomes.
-
-1. Continuous representation
-
-   If every fallback string has an exact, defensible numeric meaning, it can be
-   mapped without inventing a midpoint and the feature remains continuous.
-
-2. Categorical representation
-
-   If the strings describe ranges or categories rather than exact values,
-   Stage 2 can convert the training numbers into matching bins and map the
-   strings into the same exhaustive category set. For a biomarker percentage,
-   a learned plan might use categories such as less than 1%, 1-49%, and at
-   least 50%. That is an example of a plan learned from observed training
-   representations, not a category list hard-coded into discovery.
-
-3. Safe hybrid fallback
-
-   If a common validated mapping cannot be learned, Stage 2 keeps a numeric
-   channel plus indicators for numeric presence or missingness and one-hot
-   channels for observed string categories, including an other category. It
-   does not coerce a range such as "1-49%" to a made-up midpoint.
-
-The chosen plan is attached to the feature definition and frozen. The same
-mapping is later applied deterministically to outer-held-out extractions.
-Ambiguous, conflicting, or previously unseen held-out strings become null or
-the plan's declared safe fallback; held-out values do not teach the plan new
-categories.
-
-Later training review rounds may extend an exact training token map when new
-training extractions reveal an equivalent spelling, but they cannot use
-held-out records to change the representation.
-
-
-STEP 12: SUMMARIZE MEASUREMENT QUALITY ON THE OUTER TRAINING FOLD
----------------------------------------------------------------
-
-Stage 2 calculates a compact summary for every extracted feature, including:
-
-* number and fraction nonmissing;
-* number of unique values;
-* most common value and its fraction;
-* common values;
-* numeric range and distribution information when appropriate; and
-* counts of numeric values versus categorical fallback strings.
-
-These summaries reveal variables that are nearly all missing, invariant, or
-dominated by one value. The normal guides are at least 5% nonmissing and no more
-than 98% in one dominant value, although the final decision also uses causal
-role and predictive evidence.
-
-
-STEP 13: SCREEN FEATURES WITH INNER-HELD-OUT RANDOM FORESTS
-----------------------------------------------------------
-
-Measurement plausibility is not enough. Stage 2 tests whether each claimed role
-has empirical support on inner-held-out patients within the outer training
-fold.
-
-The default screening family is random forest with 200 trees. For each inner
-fold, models are fitted on the inner training rows and scored on the inner
-validation rows. Stage 2 compares a no-feature baseline with models using the
-extracted features.
-
-Roles determine where a feature is used:
-
-* Confounders enter the treatment-propensity model.
-* All retained features can enter the outcome models.
-* Effect modifiers enter the treatment-effect model.
-
-Stage 2 records treatment prediction, observed-outcome prediction, and
-treatment-effect R-loss. It orients improvement numbers so that positive always
-means better, even when the underlying metric is an error or loss.
-
-It evaluates the complete feature set, every feature by itself, and the full
-set with one feature removed. The singleton screen asks whether a feature can
-support its claimed role on its own. The leave-one-out screen asks what it adds
-in the presence of the other retained features.
-
-Role support is defined plainly:
-
-* A confounder needs positive treatment and outcome signal.
-* A prognostic variable needs positive outcome signal.
-* An effect modifier needs positive treatment-effect R-loss signal.
-
-Aggregate improvement alone is not enough; support must also occur in a
-sufficient fraction of the inner folds.
-
-
-STEP 14: REPEAT THE SCREEN TO MEASURE STABILITY
-----------------------------------------------
-
-One random-forest screen can be noisy. Stage 2 accumulates votes for the same
-feature representation across evaluation rounds. By default, an ordinary role
-needs at least three evaluations and positive support in at least two-thirds of
-them before it is stably retained.
-
-Effect modifiers use a deliberately asymmetric rule. Heterogeneous effects are
-hard to detect, so absence of a positive signal is not enough to remove a
-modifier. It is pruned only when repeated screens show a consistently and
-materially worse treatment-effect R-loss beyond the configured negative
-margin.
-
-If a measurement rule, value type, harmonization plan, or modeling strategy
-changes, its stability history is tied to the old representation and does not
-count as proof for the new one.
-
-
-STEP 15: BOUNDED LANGUAGE-MODEL REVIEW, FOLLOWED BY DETERMINISTIC PRUNING
-------------------------------------------------------------------------
-
-The reviewer receives only outer-training information: the clinical question,
-the current definitions, extraction summaries, inner-validation performance,
-singleton signals, leave-one-out results, and stability state.
-
-It can keep or drop a feature. In an early review it may also clarify how the
-same measurement is extracted. It cannot add a new feature, change supporting
-evidence, or assign a new causal role. The final allowed review cannot revise a
-definition, because a revised definition would otherwise leave the loop
-without being evaluated.
-
-There are at most two language-model review rounds by default. Deterministic
-evaluation-only rounds may continue after those reviews until the feature set
-and stability decisions stop changing, up to ten evaluation rounds in total.
-
-After each review, Python applies the empirical gates. A model request to drop
-a variable can be overridden when the variable has protected stable support.
-Ordinary roles without stable positive evidence can be removed. Effect
-modifiers follow the conservative negative-evidence rule described above.
-
-A change to a prompt-facing extraction definition triggers training
-re-extraction only for the changed or newly added features. Stage 2 merges those
-columns into the cached raw training matrix and drops removed features;
-unchanged columns are reused. Role-only and downstream representation changes
-are recomputed without another extractor call. A fold is marked converged only
-when definitions are unchanged and stability selection is complete. If the
-ten-round limit is reached first, the fold is flagged as non-converged and
-proceeds with its latest retained definitions rather than hiding the condition.
-
-
-STEP 16: FREEZE THE FEATURE SET
+CURRENT FLOW FOR ONE OUTER FOLD
 -------------------------------
 
-When review ends, Stage 2 writes final_definitions.json. If the last evaluation
-used exactly those definitions, its training extraction can be reused. If the
-final review changed any prompt-facing extraction definitions, Stage 2
-re-extracts only those changed or newly added features for the outer-training
-patients and merges them with unchanged cached columns so that the final table
-exactly matches the final rules.
+1. Compile Stage 1 evidence
+
+   The only supported compiler is semantic_cluster_cards_v2. It applies the
+   scientific allowlist, removes exact duplicates while retaining provenance,
+   and creates a fold-local semantic-card atlas. It verifies that every frozen
+   Stage 1 architecture selected for the run is present. Cards, exact members,
+   lineage, and the reduction summary are written under
+   stage2/evidence_compilation/.
+
+2. Discover candidates exhaustively
+
+   Every compiled card is sent to primary-model feature discovery. The model
+   lists all pretreatment patient-level features supported or implied by the
+   supplied evidence. One card may support more than one candidate.
+
+   There is no evidence-community graph, ColBERT candidate router, candidate
+   retrieval filter, hard candidate cap, or discovery-time causal-role filter.
+   Documentation or artifacts describing selected_candidates.json or a
+   candidate-registry ranking refer to an older pipeline and are not current.
+
+3. Merge aliases and operationalize every candidate
+
+   Exact normalized names are coalesced first. The remaining names enter
+   repeated merge-only batches: shifted alphabetical batches in early rounds
+   and deterministic shuffled batches later. A directive may merge aliases but
+   cannot exclude a candidate; every unmentioned candidate passes through.
+
+   Explicit investigator definitions are protected. They cannot be renamed,
+   merged with a distinct configured feature, revised, or stripped of their
+   configured roles.
+
+   The primary model then receives one canonical candidate and its readable
+   supporting evidence. It supplies the value type, unit or categories,
+   measurement rule, and missing-value rule. Invalid responses receive bounded
+   repair; persistent failure is recorded and uses a conservative ambiguous
+   ontology instead of silently dropping the feature.
+
+4. Extract all candidates on outer-training patients
+
+   The extraction model receives exactly one patient per prompt, with bounded
+   feature batches and document chunks. Every candidate is extracted before
+   statistical selection. Each batch has ordinary input/result/completion
+   checkpoints.
+
+   Continuous definitions may preserve a documented categorical or threshold
+   value when no exact number exists. Mixed numeric/categorical training values
+   receive a training-only harmonization plan. That plan is frozen and applied
+   deterministically to later rows; ambiguous mappings become null and are
+   audited.
+
+5. Supervise the extraction ontology
+
+   The primary model reviews aggregate training values and validation failures,
+   not patient text, treatment, outcomes, roles, metrics, or p-values. It may
+   keep or revise the same feature's extraction schema, but may not add, drop,
+   split, merge, rename, or role-label features. A revision triggers incremental
+   re-extraction only for changed definitions. Supervision is bounded and
+   explicit ontologies stay locked.
+
+6. Optionally consolidate equivalent extracted measurements
+
+   selection/candidate_consolidation/ is an unsupervised, outer-training-only
+   alias pass. In original-candidate order, an embedding retrieves nearby active
+   definitions and Python computes mixed-type pairwise association evidence.
+   The model may leave them separate or propose a canonical measurement.
+
+   A replacement is accepted only when every source pair is evaluable and
+   clears the configured association threshold (0.85 by default), the sources
+   describe the same attribute at the same scope and granularity, and the rule
+   is demonstrably information preserving. Sources and output must retain value
+   type, unit/category granularity, and missingness. Continuous aliases may only
+   coalesce. Categorical aliases may coalesce identical vocabularies or use an
+   injective synonymous-category recode.
 
-Before continuing, it checks extraction health. The final definitions,
-harmonization plans, causal roles, and missing-value behavior are now fixed for
-the fold. The later encoders are fitted from this frozen outer-training table;
-they do not learn categories or scaling rules from held-out patients.
+   Crucially, whenever two aliases are nonmissing on the same training row,
+   their numeric values or their canonical recoded categories must agree.
+   Conflicting overlaps reject the proposal; source order may not silently win.
+   Malformed values that violate a continuous ontology retain the documented
+   behavior of being treated as missing before coalescing.
 
+   Accepted latents enter later retrievals immediately. Original columns and
+   recursive measurement lineage remain available for audit and held-out
+   reconstruction. Disabled or trivial consolidation still writes the report
+   referenced by final definitions.
+
+7. Assign roles with group elastic nets and held-out R-loss
+
+   Every inner-training partition fits a logistic group elastic net for
+   treatment and a separate group elastic net for marginal outcome. A nominal
+   factor's contrasts and missingness indicator form one all-in/all-out group;
+   continuous and ordered measurements use standardized score groups.
+
+   A feature selected in at least one inner fold for either nuisance task enters
+   the outer-fold confounder union. There is no intersection or vote-frequency
+   gate. Both nuisance tasks use that common union.
+
+   Candidate-specific cross-fitted nuisance calibrations feed a
+   ridge-stabilized R-learner. Each candidate is scored by the held-out R-loss
+   gain from adding all estimable treatment interactions for that candidate.
+   The ten largest gains per inner fold are retained by default, even if a gain
+   is nonpositive; the deduplicated union (at most 50 for five folds) supplies
+   final effect modifiers.
 
-STEP 17: EXTRACT THE OUTER-HELD-OUT PATIENTS ONCE
-------------------------------------------------
+   Large candidate sets run their CPU-bound selector in a loky process. This
+   process isolation is safe for CLI, notebook, python -c, and stdin callers and
+   does not require the caller to wrap execution in an __main__ guard.
 
-Only after the freeze does Stage 2 read the outer-held-out clinical documents.
-It uses the same one-patient, bounded-feature extraction procedure. It then
-applies the frozen training-fold harmonization plan without learning from the
-held-out distribution.
-
-The held-out outcomes are not sent to the extractor, ontology refiner,
-harmonizer, or reviewer. A strange held-out spelling is not a reason to reopen
-the feature definition. This strict behavior can create nulls, but it preserves
-the meaning of held-out evaluation.
-
-The training and held-out extracted tables are joined by the internal row ID
-and written as extracted_features.csv for the fold.
-
-
-STEP 18: FIT THE FOLD'S CAUSAL MODELS
-------------------------------------
-
-The final estimator uses random forests and role-aware feature matrices.
-Categorical variables are one-hot encoded. Continuous and hybrid variables use
-their frozen modeling strategy and missingness handling.
-
-Inside the outer training fold, Stage 2 first makes cross-fitted nuisance
-predictions using the inner folds:
-
-* propensity: probability of receiving treatment;
-* mu0: predicted outcome under no treatment; and
-* mu1: predicted outcome under treatment.
-
-Cross-fitting means each outer-training row receives nuisance predictions from
-models that did not train on that row. Those predictions are used to construct
-doubly robust pseudo-outcomes for the treatment-effect model.
-
-Stage 2 then fits final propensity and outcome forests on all outer-training
-rows and predicts the outer-held-out rows. The propensity model uses
-confounders. The outcome models use all retained features. Propensity values are
-protected from division by extreme probabilities with the configured clip,
-0.02 by default.
-
-An effect forest is fitted on the cross-fitted training pseudo-outcomes using
-the effect-modifier features. It predicts a conditional treatment effect, or
-CATE, for each held-out patient. If there are no effect modifiers, the model
-still produces a constant-style effect prediction rather than inventing
-heterogeneity.
-
-For every outer-held-out row, Stage 2 writes:
-
-* treatment and outcome;
-* predicted propensity;
-* predicted outcome under no treatment, mu0;
-* predicted outcome under treatment, mu1;
-* an estimated conditional treatment effect; and
-* an augmented inverse-probability-weighted, or AIPW, score.
-
-The AIPW score combines outcome modeling and propensity weighting. It is called
-doubly robust because the estimate can remain consistent when one of those two
-nuisance components is correctly specified, under the usual causal assumptions.
-That statistical property does not repair unmeasured confounding, bad temporal
-ordering, or positivity violations.
-
-
-STEP 19: COMBINE OUTER FOLDS INTO THE FINAL ESTIMATE
----------------------------------------------------
-
-Each patient must appear in exactly one outer-held-out prediction file. Stage 2
-checks that the union covers every dataset row once and only once, sorts the
-rows, and writes cross_fitted_predictions.csv.
-
-The final average treatment effect is the mean of all finite held-out AIPW
-scores. Its standard error is the empirical standard deviation of those scores
-divided by the square root of the number of patients. The reported 95%
-confidence interval uses plus or minus 1.96 standard errors.
-
-causal_estimate.json records the average treatment effect, standard error,
-confidence interval, mean estimated CATE, row count, and prediction path.
-
-In synthetic datasets, a true individual treatment effect may be present for
-evaluation. Stage 2 joins that oracle column only after all predictions are
-frozen and writes separate post-hoc metrics. Oracle values never enter feature
-discovery, extraction, selection, model fitting, or the causal estimate.
-
+8. Freeze definitions and extract held-out dependencies
 
-WHAT THE LANGUAGE MODEL DECIDES, AND WHAT ORDINARY CODE DECIDES
---------------------------------------------------------------
-
-The language model is used where reading clinical language is necessary:
-
-* naming candidate variables from readable Stage 1 evidence;
-* auditing evidence that produced no candidate;
-* recognizing aliases in bounded batches;
-* writing one feature's extraction definition;
-* extracting frozen features from one patient's text;
-* reconciling pages of one long note;
-* repairing repeated ontology failures; and
-* reviewing training-fold measurement quality and model diagnostics.
-
-Ordinary deterministic code controls:
+   final_definitions.json records selected roles, original measurement
+   dependencies, latent states, and consolidation-report provenance. Only the
+   dependencies required by selected definitions are extracted on held-out
+   notes. Frozen harmonization and latent states are applied without seeing
+   held-out outcomes.
 
-* fold boundaries;
-* evidence allowlists and provenance;
-* exact deduplication and compilation limits;
-* graph construction and community selection;
-* prompt batching and patient isolation;
-* response schemas and citation validation;
-* candidate registry rules and semantic-merge safeguards;
-* ColBERT routing and score calculation;
-* the 50-candidate cap;
-* causal-role derivation;
-* closed-category validation;
-* harmonization-plan application;
-* stability votes and pruning gates;
-* all joins, encoders, random forests, causal scores, and final aggregation; and
-* checkpoint fingerprints and completion rules.
+9. Estimate effects
 
-The model therefore reads and labels text, but it does not have unchecked
-authority over the analysis.
+   An honest EconML CausalForestDML uses effect modifiers in X and pure
+   confounders in W; a dual-role variable appears once in X. If no modifier is
+   selected, a constant-effect design preserves the causal-forest estimator.
 
+   The supported nuisance family is cross-validated elastic net: logistic for
+   treatment and binary outcome, squared-error for continuous outcome. The
+   former strict random-forest runtime-config contract has been retired and is
+   not an alternate estimator path. Diagnostics audit configured parameters and
+   every fitted EconML nuisance clone, including the selected regularization,
+   effective CV folds, and whether its optimizer reached the iteration limit.
 
-NO HIDDEN PD-L1 OR AGE HINTS IN THE STANDARD PATH
--------------------------------------------------
+   Each held-out row receives propensity, mu0, mu1, AIPW score, conditional
+   effect, and available causal-forest uncertainty bounds.
 
-The standard candidate discovery prompts contain generic instructions to find
-all atomic patient-level clinical variables. They do not mention PD-L1 or age.
-The pre-discovery community builder is also query-free: it compares evidence
-documents with other evidence documents.
+10. Aggregate outer folds
 
-After discovery, the natural-language name of each discovered candidate becomes
-a ColBERT query. If the model has already named a candidate PD-L1 expression,
-then "PD-L1 Expression" will of course appear as its retrieval query. That is
-not leakage into discovery; it is the discovered candidate being used to find
-its own strongest evidence.
+   Exactly one held-out prediction per patient is combined into
+   cross_fitted_predictions.csv. The cross-fitted AIPW scores produce the
+   reported average treatment effect, standard error, and confidence interval.
+   Feature and role stability are summarized across folds.
 
-Similarly, causal lanes use generic evidence labels such as treatment, outcome,
-residual effect, and matched pair. They contain no secret clinical-concept list.
 
-An investigator can deliberately provide explicit features in configuration.
-Those are visible, protected inputs and should be reported as prespecified, not
-as discoveries. With explicit_features empty, the standard production path has
-no non-prompt age or PD-L1 seed.
+IMPORTANT OUTPUTS
+-----------------
 
+stage2/evidence_compilation/
+    Compiled cards, exact members, lineage, and reduction audit.
 
-CHECKPOINTING, RESUMING, AND SAFE RERUNS
----------------------------------------
+stage2/outer_NNN/feature_definitions.json
+    Operationalized definitions before training extraction.
 
-Stage 2 is file-oriented and heavily checkpointed. A successful unit of work is
-marked complete only after its validated output has been written. Language-model
-requests, pages, patient-feature slices, review rounds, fold estimates, and
-top-level products can all be reused.
+stage2/outer_NNN/ontology_supervision/
+    Aggregate review rounds, incremental re-extraction, and convergence.
 
-Every important checkpoint has an input fingerprint. If the evidence,
-definition policy, explicit features, or other material configuration differs
-from a completed fold, Stage 2 fails closed and asks for a fresh output
-directory instead of mixing two analyses.
+stage2/outer_NNN/selection/candidate_consolidation/
+    Sequential alias inputs, per-pivot decisions, repair/fallback events,
+    report.json, registry.json, and completion marker.
 
-If the Stage 2 output directory is removed and the same command is run again,
-the pipeline can rebuild it from the Stage 1 handoff and source data. If the
-directory is retained, the same command resumes compatible work and skips
-completed units. Deleting output is not required for an ordinary interrupted
-run and gives up useful checkpoints and audit history.
+stage2/outer_NNN/selection/elastic_net_selection.json
+    Inner-fold nuisance votes, cross-fitted diagnostics, candidate R-loss
+    comparisons, selected confounder union, and modifier union.
 
-Transport failures use bounded retries. Invalid JSON or schema violations use
-bounded repairs. When a safe local fallback exists, it is conservative: keep
-groups separate, mark a definition ambiguous, or set one value to null. Stage 2
-does not silently invent clinical values to make a fold finish.
+stage2/outer_NNN/final_definitions.json
+    Frozen selected roles and measurement/latent dependencies.
 
+stage2/outer_NNN/estimation/{predictions.csv,diagnostics.json,complete.json}
+    Held-out fold predictions and audited fitted estimator details.
 
-WHERE TO LOOK WHILE A RUN IS ACTIVE
------------------------------------
-
-At the Stage 2 output root:
-
-config.json
-    Public run settings.
-
-evidence_compilation/
-    Compiled cards, exact members, lineage, summaries, and completion markers.
-
-evidence_communities/
-    Atoms, reciprocal edges, communities, hierarchy levels, selected serialized
-    packets, and actual community counts.
-
-summary.json
-    Written at top-level completion. It summarizes folds, evidence, features,
-    convergence, and final estimate paths.
-
-For one fold, such as outer_003/:
-
-input_packets.jsonl
-    All compiled cards read by candidate discovery.
-
-colbert_support_packets.jsonl
-    Community routers used for post-discovery hierarchical retrieval.
-
-interpreted_candidates.json
-    Raw grounded candidates from discovery and the recall audit.
-
-candidate_registry_selection.json
-    Registry merges, ColBERT routes, evidence scores, axis rankings, cap
-    decisions, and dropped candidates.
-
-selected_candidates.json
-    Candidates that passed ranking and the hard fold cap.
-
-consolidation/
-    Alias reconciliation, causal-role filtering, and per-feature
-    operationalization records.
-
-feature_definitions.json
-    Definitions before patient-level empirical review.
-
-definitions_complete.json
-    Checkpoint showing that discovery and definition work is complete.
-
-review/round_NNN/
-    Training extraction, ontology feedback, harmonization, summaries,
-    performance, review decision, stability guard, signal pruning, and round
-    completion.
-
-review/convergence.json
-    Whether repeated evaluation stabilized before the configured limit.
-
-final_definitions.json
-    The exact definitions and representations used for final extraction and
-    estimation.
-
-extraction/fit/
-    Final outer-training extraction and harmonization.
-
-extraction/heldout/
-    One-time frozen outer-held-out extraction and harmonization.
-
-estimation/predictions.csv
-    Held-out predictions and AIPW scores for this fold.
-
-estimation/diagnostics.json
-    Fold-level model counts, effect estimate, standard error, propensity range,
-    and clipping diagnostics.
-
-complete.json
-    The fold's final phase and completion fingerprint.
-
-Because folds run concurrently, the best way to tell what is happening is to
-inspect each outer fold separately rather than infer a single global phase from
-the newest file in the root directory.
-
-
-CURRENT DEFAULTS THAT MOST AFFECT BEHAVIOR
-------------------------------------------
-
-These are implementation defaults, not universal scientific recommendations.
-A run file can override them.
-
-Compiled cards per outer fold                         400
-Community atom length                                16 words
-Atom overlap                                          4 words
-Initial reciprocal neighbors                          5
-Hierarchy target community counts                   300, then 75
-Serialized router packets per outer fold, maximum    75
-Reserved routers per causal lane                     30
-Routers searched per named candidate                  3
-Leaf evidence packets retained per candidate          3
-Registry embedding merge threshold                    0.94
-Candidates retained per evidence axis, before union  50
-Discovered candidates per outer fold, hard maximum   50
-Alias-consolidation batch size                       20
-Alias-consolidation rounds, maximum                  55
-Features per patient extraction request              10
-Patients per extraction request                       1
-Repeated failed patients before ontology refinement   3
-Ontology-refinement rounds, maximum                   2
-Language-model review rounds, maximum                 2
-All evaluation rounds, maximum                       10
-Screening random-forest trees                       200
-Stability evaluations required                        3
-Stability support frequency                           2/3
-Estimation random-forest trees                       200
-Propensity clipping                                   0.02
-Minimum nonmissing guide                              0.05
-Maximum dominant-value guide                          0.98
-
-
-WHAT THIS PIPELINE CAN AND CANNOT CLAIM
----------------------------------------
-
-Stage 2 is designed to make feature discovery broad, provenance-preserving,
-fold-local, and auditable. Candidate-first discovery prevents a small set of
-preselected community topics from deciding what is allowed to exist.
-Hierarchical ColBERT makes evidence retrieval practical after names have been
-found. The extraction and review loops then force those names to survive contact
-with actual patient records and held-out predictive checks.
-
-Those safeguards do not prove that every relevant confounder was documented or
-discovered. A feature can still be absent from the source text, missed by Stage
-1, compressed poorly, overlooked by both discovery passes, ranked below the
-candidate cap, assigned no supported causal role, measured unreliably, or
-pruned by training-fold evidence. The artifact chain is intended to show which
-of those happened.
-
-Nor does predictive usefulness by itself establish causal validity. Correct
-temporal ordering, consistency, exchangeability, positivity, appropriate
-outcome definition, and absence of important unmeasured confounding remain
-scientific assumptions. Stage 2 helps operationalize and audit a causal
-analysis; it does not make those assumptions disappear.
-
-
-ONE-PARAGRAPH VERSION
----------------------
-
-For each outer fold, Stage 2 cleans the Stage 1 evidence into traceable cards
-and independently builds a query-free ColBERT community hierarchy. A language
-model reads every compiled card, names all grounded patient variables it can
-find, and audits initially unused cards. Python conservatively merges duplicate
-names. Each discovered name then queries the hierarchy, descends to original
-cards, and receives a support score; an axis-balanced ranking keeps at most 50
-candidates. A bounded alias process merges true synonyms, deterministic Stage
-1 axes assign causal roles, and each retained variable receives a precise
-measurement rule. Only then does Stage 2 read raw notes, one patient at a time.
-Using outer-training patients only, it repairs systematic ontology problems,
-harmonizes mixed values, evaluates variables on inner-held-out rows, and repeats
-until selection stabilizes or the round limit is reached. It freezes the final
-definitions, extracts the outer-held-out notes once, fits role-aware random
-forests, and writes held-out AIPW and CATE predictions. Finally it checks that
-every patient was held out exactly once and averages the AIPW scores to obtain
-the reported treatment effect.
+stage2/{cross_fitted_predictions.csv,causal_estimate.json,summary.json}
+    Cross-fold results.
+
+
+RESUME AND RESELECTION
+----------------------
+
+Scientific leaves use semantic input fingerprints and write completion markers.
+Rerunning the same command resumes at the first incomplete or invalidated leaf.
+Endpoint URLs and worker counts are transport details; model identities and
+scientific settings remain part of the relevant checkpoint decisions.
+
+Use --stage2-reselect for the guarded workflow that preserves post-ontology
+definitions and all-candidate training extraction, archives selection and later
+artifacts, and recomputes selection, held-out extraction, and estimation. It is
+not a general request to reuse scientifically incompatible checkpoints.

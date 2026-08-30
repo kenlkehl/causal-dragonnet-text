@@ -133,8 +133,7 @@ class CausalForestHead:
             nuisance_cv_folds: Internal folds used to select regularization.
             nuisance_regularization_grid_size: Number of regularization values.
             n_jobs: Operational CPU parallelism for the causal forest and
-                nuisance estimators. This setting does not change the portable
-                scientific identity.
+                nuisance estimators. It is recorded in the fit audit.
             outcome_type: ``"binary"`` selects logistic elastic net and
                 EconML's discrete-outcome probability contract;
                 ``"continuous"`` selects squared-error elastic net. ``None``
@@ -554,7 +553,44 @@ class CausalForestHead:
             "tuning_params": "auto" if self.tune_model else None,
             "effective_parameters": dict(self.effective_forest_parameters_),
             "effective_nuisance_parameters": dict(self.effective_nuisance_parameters_),
+            "fitted_nuisance_models": self._fitted_nuisance_model_audit(),
         }
+
+    def _fitted_nuisance_model_audit(self) -> Dict[str, Any]:
+        """Audit every EconML-fitted nuisance clone and its cross-fit position."""
+
+        if self.model is None:
+            raise RuntimeError("causal forest model has not been fit")
+
+        def visit(value: Any, path: tuple[int, ...] = ()):
+            if isinstance(value, (list, tuple)):
+                for index, child in enumerate(value):
+                    yield from visit(child, (*path, index))
+                return
+            audit_method = getattr(value, "fit_audit", None)
+            if not callable(audit_method):
+                raise RuntimeError(
+                    "fitted nuisance estimator does not expose fit_audit; "
+                    f"type={type(value).__module__}.{type(value).__name__}"
+                )
+            yield path, dict(audit_method())
+
+        result: Dict[str, Any] = {}
+        for role, attribute in (
+            ("treatment", "models_t"),
+            ("outcome", "models_y"),
+        ):
+            if not hasattr(self.model, attribute):
+                raise RuntimeError(
+                    f"fitted causal forest does not expose {attribute} for audit"
+                )
+            entries = []
+            for path, audit in visit(getattr(self.model, attribute)):
+                entries.append({"crossfit_path": list(path), **audit})
+            if not entries:
+                raise RuntimeError(f"fitted causal forest has no {role} nuisance models")
+            result[role] = entries
+        return result
 
     def predict(
         self, X: Optional[np.ndarray], return_ci: bool = True, alpha: float = 0.05

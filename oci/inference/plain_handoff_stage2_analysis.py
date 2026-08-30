@@ -14,7 +14,6 @@ import hashlib
 import json
 import logging
 import math
-import multiprocessing
 import os
 import re
 import threading
@@ -26,6 +25,7 @@ from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
+from joblib.externals.loky import ProcessPoolExecutor as LokyProcessPoolExecutor
 
 from ..models.causal_forest_head import CausalForestHead
 from ..models.elastic_net_nuisance import (
@@ -9399,11 +9399,11 @@ def _run_stage2_statistical_selection(
         candidate_count,
         STATISTICAL_SELECTION_PROCESS_ISOLATION_MIN_CANDIDATES,
     )
-    context = multiprocessing.get_context("spawn")
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=1,
-        mp_context=context,
-    ) as executor:
+    # Loky serializes the submitted callable and does not re-import an
+    # interactive ``__main__`` module.  The large-candidate path therefore
+    # remains process isolated when called from notebooks, ``python -c``, or
+    # stdin, where the stdlib spawn executor cannot safely bootstrap.
+    with LokyProcessPoolExecutor(max_workers=1) as executor:
         return executor.submit(
             select_stage2_features_elastic_net,
             **arguments,

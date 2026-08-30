@@ -459,6 +459,31 @@ def test_stage2_handoff_reader_uses_the_obvious_output_path(tmp_path):
     ]
 
 
+def test_rerun_tfidf_invalidates_exact_context_metadata_but_keeps_products(tmp_path: Path):
+    component_dir = tmp_path / "components" / "tfidf"
+    context_dir = (
+        component_dir
+        / "stage1_tfidf_topics"
+        / "contexts"
+        / "outer_001_inner_001"
+    )
+    context_dir.mkdir(parents=True)
+    component_complete = component_dir / "complete.json"
+    worker_complete = context_dir / "complete.json"
+    context_metadata = context_dir / "context_metadata.json"
+    fitted_product = context_dir / "fitted_context.json"
+    for path in (component_complete, worker_complete, context_metadata, fitted_product):
+        path.write_text("{}\n", encoding="utf-8")
+    workflow = SimpleNamespace(_component_dir=lambda _name: component_dir)
+
+    all_evidence_workflow._invalidate_component_for_rerun(workflow, "tfidf")
+
+    assert not component_complete.exists()
+    assert not worker_complete.exists()
+    assert not context_metadata.exists()
+    assert fitted_product.exists()
+
+
 def test_legacy_handoff_references_sources_without_copy_or_architecture_expansion(
     tmp_path: Path,
 ):

@@ -59,7 +59,7 @@ def test_compiler_is_fold_local_and_preserves_exact_deduplication_lineage(
     compiled = compile_stage2_handoff_evidence(
         [
             _htr_row(outer_fold=1, inner_fold=1, row_id=3),
-            _htr_row(outer_fold=1, inner_fold=2, row_id=3),
+            _htr_row(outer_fold=1, inner_fold=2, row_id=4),
             _htr_row(outer_fold=2, inner_fold=1, row_id=3),
         ],
         handoff_path=tmp_path / "handoff" / "evidence.jsonl",
@@ -79,6 +79,7 @@ def test_compiler_is_fold_local_and_preserves_exact_deduplication_lineage(
     member = compiled.members_by_outer_fold[1][0]
     assert member["raw_occurrence_count"] == 2
     assert {row["inner_fold"] for row in member["raw_references"]} == {1, 2}
+    assert {row["row_id"] for row in member["raw_references"]} == {3, 4}
     card = compiled.cards_by_outer_fold[1][0]
     assert card["support"]["inner_folds"] == [1, 2]
     assert card["support"]["raw_occurrence_count"] == 2

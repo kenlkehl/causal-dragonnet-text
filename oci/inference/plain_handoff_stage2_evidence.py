@@ -107,6 +107,90 @@ class CompiledStage2Evidence:
     summary: Mapping[str, Any]
 
 
+def _discover_chunk_embedding_cache_directory(handoff_path: Path) -> Path | None:
+    output_root = Path(handoff_path).parent.parent
+    candidates = sorted(
+        path.parent
+        for path in (output_root / "components" / "embedding_cache" / "cache").glob(
+            "*/metadata.json"
+        )
+        if (path.parent / "chunk_embeddings.npy").is_file()
+        and (path.parent / "offsets.npy").is_file()
+    )
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "Stage 2 evidence compilation found multiple Stage 1 embedding caches: "
+            f"{[str(path) for path in candidates]}"
+        )
+    return candidates[0]
+
+
+def stage1_embedding_cache_dependency_identity(
+    handoff_path: Path,
+) -> Mapping[str, Any] | None:
+    """Return a lightweight identity for the optional Stage 1 embedding cache.
+
+    Cache arrays can be many gigabytes, so restart compatibility deliberately
+    uses only the producer's small semantic metadata plus path/stat identities.
+    It never reads or hashes array contents.
+    """
+
+    directory = _discover_chunk_embedding_cache_directory(Path(handoff_path))
+    if directory is None:
+        return None
+    metadata_path = directory / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    semantic_metadata_keys = (
+        "sentence_model_name",
+        "hidden_size",
+        "num_samples",
+        "total_chunks",
+        "chunk_size_words",
+        "chunk_overlap_words",
+        "max_chunks",
+        "chunk_selection",
+        "normalize_embeddings",
+        "max_seq_length",
+        "effective_max_seq_length",
+        "chunking_mode",
+        "storage_format",
+        "dataset_path",
+        "cache_hash",
+        "chunking_policy_version",
+        "semantic_truncation_allowed",
+        "dtype",
+    )
+
+    def product_identity(path: Path) -> dict[str, Any]:
+        stat = path.stat()
+        return {
+            "path": str(path.resolve()),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "ctime_ns": int(stat.st_ctime_ns),
+            "device": int(stat.st_dev),
+            "inode": int(stat.st_ino),
+        }
+
+    return {
+        "schema_version": "stage1_embedding_cache_dependency_v1",
+        "directory": str(directory.resolve()),
+        "semantic_metadata": {
+            key: metadata.get(key) for key in semantic_metadata_keys
+        },
+        "products": {
+            filename: product_identity(directory / filename)
+            for filename in (
+                "metadata.json",
+                "chunk_embeddings.npy",
+                "offsets.npy",
+            )
+        },
+    }
+
+
 class _ChunkEmbeddingCache:
     """Read-only row/chunk lookup over the existing Stage 1 embedding cache."""
 
@@ -123,23 +207,10 @@ class _ChunkEmbeddingCache:
 
     @classmethod
     def discover(cls, handoff_path: Path) -> _ChunkEmbeddingCache | None:
-        output_root = Path(handoff_path).parent.parent
-        candidates = sorted(
-            path.parent
-            for path in (output_root / "components" / "embedding_cache" / "cache").glob(
-                "*/metadata.json"
-            )
-            if (path.parent / "chunk_embeddings.npy").is_file()
-            and (path.parent / "offsets.npy").is_file()
-        )
-        if not candidates:
+        directory = _discover_chunk_embedding_cache_directory(Path(handoff_path))
+        if directory is None:
             return None
-        if len(candidates) != 1:
-            raise RuntimeError(
-                "Stage 2 evidence compilation found multiple Stage 1 embedding caches: "
-                f"{[str(path) for path in candidates]}"
-            )
-        return cls(candidates[0])
+        return cls(directory)
 
     def flat_index(self, row_id: Any, chunk_index: Any) -> int | None:
         try:
@@ -274,6 +345,25 @@ def _base_reference(
         "scope": str(row.get("scope") or "unspecified"),
         "json_path": str(json_path),
     }
+
+
+def _rebind_compact_handoff_references(
+    occurrence: dict[str, Any],
+    *,
+    handoff_row: int,
+) -> None:
+    """Point representative and summarized provenance at the row being read."""
+
+    reference = dict(occurrence.get("reference") or {})
+    reference["handoff_row"] = int(handoff_row)
+    occurrence["reference"] = reference
+    summaries = occurrence.get("reference_summaries")
+    if isinstance(summaries, Sequence) and not isinstance(summaries, (str, bytes)):
+        occurrence["reference_summaries"] = [
+            {**dict(summary), "handoff_row": int(handoff_row)}
+            for summary in summaries
+            if isinstance(summary, Mapping)
+        ]
 
 
 def _occurrence(
@@ -1062,9 +1152,10 @@ def _extract_occurrences(rows: Iterable[Mapping[str, Any]]) -> dict[int, list[di
                 raise ValueError(
                     f"handoff row {handoff_row} architecture envelope is inconsistent"
                 )
-            reference = dict(occurrence.get("reference") or {})
-            reference["handoff_row"] = int(handoff_row)
-            occurrence["reference"] = reference
+            _rebind_compact_handoff_references(
+                occurrence,
+                handoff_row=handoff_row,
+            )
             occurrences.append(occurrence)
         elif isinstance(payload, Mapping) and source == "text_models":
             occurrences.extend(_extract_sparse_occurrences(row, payload, handoff_row=handoff_row))
@@ -1798,4 +1889,5 @@ __all__ = [
     "SUPPORTED_STAGE2_ARCHITECTURES",
     "compile_stage2_handoff_evidence",
     "extract_stage1_architecture_occurrences",
+    "stage1_embedding_cache_dependency_identity",
 ]

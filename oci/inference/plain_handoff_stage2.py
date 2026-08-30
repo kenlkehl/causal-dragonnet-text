@@ -35,9 +35,9 @@ from .plain_handoff_stage2_evidence import (
     EVIDENCE_COMPILER_VERSION,
     SUPPORTED_STAGE2_ARCHITECTURES,
     compile_stage2_handoff_evidence,
+    stage1_embedding_cache_dependency_identity,
 )
 from .plain_handoff_stage2_analysis import (
-    ESTIMATION_CHECKPOINT_SCHEMA_VERSION,
     Stage2RequestExhaustedError,
     Stage2ResponseValidationError,
     infrastructure_failure_audit_paths,
@@ -55,7 +55,6 @@ from .stage2_elastic_net_selection import (
     statistical_selection_config_from_mapping,
 )
 from .stage2_sequential_consolidation import (
-    SELECTION_SCHEMA_VERSION as STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
     Stage2SequentialConsolidationConfig,
     sequential_consolidation_config_from_mapping,
 )
@@ -63,6 +62,7 @@ from .vllm_server_pool import (
     ManagedVLLMConfig,
     launch_managed_vllm_servers,
     managed_vllm_config_from_mapping,
+    validate_managed_vllm_pool_isolation,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -890,6 +890,11 @@ class PlainHandoffStage2Config:
     # A bounded repair may temporarily strengthen the request-level reasoning
     # policy. This override is transport state, not scientific configuration.
     runtime_reasoning_effort: str | None = None
+    # Absolute monotonic deadline and remaining HTTP-call allowance for one
+    # transport-retry turn. These are populated only by the request runner so
+    # compatibility negotiation cannot create unbounded hidden attempts.
+    runtime_request_deadline: float | None = None
+    runtime_transport_attempt_budget: int | None = None
     # Detected from the live endpoint's model record (including its backing
     # root when available) so served aliases still receive the right controls.
     runtime_model_family: str = ""
@@ -991,6 +996,20 @@ class PlainHandoffStage2Config:
             raise ValueError(
                 "stage2.runtime_reasoning_effort must be null or one of "
                 f"{sorted(SUPPORTED_REASONING_EFFORTS)}"
+            )
+        if self.runtime_request_deadline is not None and (
+            isinstance(self.runtime_request_deadline, bool)
+            or not isinstance(self.runtime_request_deadline, (int, float))
+            or not math.isfinite(float(self.runtime_request_deadline))
+        ):
+            raise ValueError("stage2.runtime_request_deadline must be null or finite")
+        if self.runtime_transport_attempt_budget is not None and (
+            isinstance(self.runtime_transport_attempt_budget, bool)
+            or not isinstance(self.runtime_transport_attempt_budget, int)
+            or self.runtime_transport_attempt_budget < 1
+        ):
+            raise ValueError(
+                "stage2.runtime_transport_attempt_budget must be null or a positive integer"
             )
         if self.runtime_model_family not in {"", "qwen3", "gemma4", "lfm2.5", "other"}:
             raise ValueError("stage2.runtime_model_family is not recognized")
@@ -1166,6 +1185,8 @@ class PlainHandoffStage2Config:
         values.pop("runtime_endpoints", None)
         values.pop("runtime_request_kind", None)
         values.pop("runtime_reasoning_effort", None)
+        values.pop("runtime_request_deadline", None)
+        values.pop("runtime_transport_attempt_budget", None)
         values.pop("runtime_model_family", None)
         values.pop("runtime_disable_extraction", None)
         values["explicit_features"] = [
@@ -2232,6 +2253,15 @@ class _Stage2OutputLengthError(ValueError):
     """The server exhausted the available completion length."""
 
 
+class _Stage2TransportFailure(RuntimeError):
+    """Carry the number of real HTTP calls consumed by one completion call."""
+
+    def __init__(self, cause: Exception, *, attempts_used: int) -> None:
+        self.cause = cause
+        self.attempts_used = max(1, int(attempts_used))
+        super().__init__(str(cause))
+
+
 class _ManagedStage2ModelSwitch(RuntimeError):
     """Signal that a checkpointed managed run needs the other model loaded."""
 
@@ -2615,14 +2645,6 @@ def _openai_completion(
 ) -> str:
     from openai import OpenAI
 
-    client = OpenAI(
-        base_url=config.endpoint,
-        api_key=config.api_key,
-        timeout=config.request_timeout,
-        # Stage 2 owns completion retries so they are logged, bounded, and do
-        # not multiply invisibly with SDK-level retries.
-        max_retries=0,
-    )
     request_policy = _stage2_request_policy(config)
     model_family = config.runtime_model_family or _stage2_model_family(config.model)
     wire_reasoning_effort = _wire_reasoning_effort(
@@ -2667,30 +2689,71 @@ def _openai_completion(
         request_policy=request_policy,
         model_family=model_family,
     )
-    try:
-        response = None
-        for variant_index, kwargs in enumerate(variants, start=1):
-            try:
-                response = client.chat.completions.create(**kwargs)
-                break
-            except Exception as exc:
-                if (
-                    variant_index == len(variants)
-                    or not _openai_optional_parameter_error(exc)
-                ):
-                    raise
-                LOGGER.warning(
-                    "Stage 2 endpoint rejected optional request controls; trying "
-                    "compatibility variant %s/%s (%s: %s)",
-                    variant_index + 1,
-                    len(variants),
-                    type(exc).__name__,
+    logical_deadline = (
+        float(config.runtime_request_deadline)
+        if config.runtime_request_deadline is not None
+        else time.monotonic() + float(config.request_timeout)
+    )
+    attempt_budget = int(
+        config.runtime_transport_attempt_budget
+        if config.runtime_transport_attempt_budget is not None
+        else config.transport_max_attempts
+    )
+    response = None
+    attempts_used = 0
+    for variant_index, kwargs in enumerate(variants, start=1):
+        remaining = logical_deadline - time.monotonic()
+        if remaining <= 0:
+            raise Stage2RequestExhaustedError(
+                "Stage 2 logical request deadline expired during compatibility negotiation"
+            )
+        if attempts_used >= attempt_budget:
+            raise Stage2RequestExhaustedError(
+                "Stage 2 transport attempt budget expired during compatibility negotiation"
+            )
+        client = OpenAI(
+            base_url=config.endpoint,
+            api_key=config.api_key,
+            timeout=min(float(config.request_timeout), remaining),
+            # Stage 2 owns completion retries so they are logged, bounded, and do
+            # not multiply invisibly with SDK-level retries.
+            max_retries=0,
+        )
+        attempts_used += 1
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if (
+                variant_index == len(variants)
+                or not _openai_optional_parameter_error(exc)
+            ):
+                raise _Stage2TransportFailure(
                     exc,
-                )
-        if response is None:  # pragma: no cover - loop either returns or raises
-            raise RuntimeError("Stage 2 request compatibility negotiation failed")
-    finally:
-        client.close()
+                    attempts_used=attempts_used,
+                ) from exc
+            if attempts_used >= attempt_budget:
+                raise Stage2RequestExhaustedError(
+                    "Stage 2 transport exhausted its HTTP attempt budget while "
+                    "negotiating optional request controls"
+                ) from exc
+            LOGGER.warning(
+                "Stage 2 endpoint rejected optional request controls; trying "
+                "compatibility variant %s/%s (%s: %s)",
+                variant_index + 1,
+                len(variants),
+                type(exc).__name__,
+                exc,
+            )
+            continue
+        finally:
+            client.close()
+        if time.monotonic() > logical_deadline:
+            raise Stage2RequestExhaustedError(
+                "Stage 2 logical request deadline expired during a transport attempt"
+            )
+        break
+    if response is None:  # pragma: no cover - loop either returns or raises
+        raise RuntimeError("Stage 2 request compatibility negotiation failed")
     choice = response.choices[0]
     finish_reason = str(getattr(choice, "finish_reason", "") or "")
     if finish_reason in {"length", "max_tokens"}:
@@ -2699,7 +2762,10 @@ def _openai_completion(
         )
     content = _response_message_text(choice.message)
     if not content:
-        raise _RetryableStage2ResponseError("Stage 2 model returned an empty response")
+        raise _Stage2TransportFailure(
+            _RetryableStage2ResponseError("Stage 2 model returned an empty response"),
+            attempts_used=attempts_used,
+        )
     return content
 
 
@@ -2799,6 +2865,8 @@ def _uses_default_openai_transport(
 def _is_retryable_transport_error(exc: Exception) -> bool:
     """Return whether a failed OpenAI-compatible request is safe to retry."""
 
+    if isinstance(exc, _Stage2TransportFailure):
+        exc = exc.cause
     if isinstance(exc, _RetryableStage2ResponseError):
         return True
     try:
@@ -2826,7 +2894,8 @@ def _completion_with_transport_retries(
         else time.monotonic() + float(config.request_timeout)
     )
     max_attempts = max(1, int(config.transport_max_attempts))
-    for attempt in range(1, max_attempts + 1):
+    remaining_attempts = max_attempts
+    while remaining_attempts > 0:
         remaining = logical_deadline - time.monotonic()
         if remaining <= 0:
             raise Stage2RequestExhaustedError(
@@ -2835,33 +2904,43 @@ def _completion_with_transport_retries(
         attempt_config = replace(
             config,
             request_timeout=min(float(config.request_attempt_timeout), remaining),
+            runtime_request_deadline=logical_deadline,
+            runtime_transport_attempt_budget=remaining_attempts,
         )
         try:
             return completion(messages, attempt_config)
         except Exception as exc:
-            if not _is_retryable_transport_error(exc):
-                raise
-            if attempt == max_attempts:
+            cause = exc.cause if isinstance(exc, _Stage2TransportFailure) else exc
+            attempts_used = (
+                exc.attempts_used if isinstance(exc, _Stage2TransportFailure) else 1
+            )
+            remaining_attempts -= min(remaining_attempts, attempts_used)
+            if not _is_retryable_transport_error(cause):
+                raise cause
+            if remaining_attempts <= 0:
                 raise Stage2RequestExhaustedError(
                     f"Stage 2 transport exhausted {max_attempts} attempt(s)"
-                ) from exc
+                ) from cause
             remaining = logical_deadline - time.monotonic()
             if remaining <= 0:
                 raise Stage2RequestExhaustedError(
                     "Stage 2 logical request deadline expired after a transport failure"
-                ) from exc
-            delay = float(config.transport_retry_backoff) * (2 ** (attempt - 1))
+                ) from cause
+            consumed_attempts = max_attempts - remaining_attempts
+            delay = float(config.transport_retry_backoff) * (
+                2 ** max(0, consumed_attempts - 1)
+            )
             if delay >= remaining:
                 raise Stage2RequestExhaustedError(
                     "Stage 2 logical request deadline would expire during retry backoff"
-                ) from exc
+                ) from cause
             LOGGER.warning(
                 "Stage 2 transport failed; retrying request attempt %s/%s " "after %.1fs (%s: %s)",
-                attempt + 1,
+                consumed_attempts + 1,
                 max_attempts,
                 delay,
-                type(exc).__name__,
-                exc,
+                type(cause).__name__,
+                cause,
             )
             if delay > 0:
                 time.sleep(delay)
@@ -6569,6 +6648,9 @@ class PlainHandoffStage2:
         summary_path = compilation_dir / "summary.json"
         complete_path = compilation_dir / "compile_complete.json"
         max_packet_chars = max(2_000, self.config.max_prompt_chars // 4)
+        embedding_cache_dependency = stage1_embedding_cache_dependency_identity(
+            handoff_path
+        )
         signature = {
             "compiler": self.config.evidence_compiler,
             "compiler_version": EVIDENCE_COMPILER_VERSION,
@@ -6583,6 +6665,7 @@ class PlainHandoffStage2:
             "max_exemplar_chars": self.config.evidence_max_exemplar_chars,
             "max_packet_chars": max_packet_chars,
             "seed": int(seed),
+            "stage1_embedding_cache_dependency": embedding_cache_dependency,
         }
         signature_fingerprint = _value_fingerprint(signature)
         handoff_size = handoff_path.stat().st_size
@@ -6675,311 +6758,6 @@ class PlainHandoffStage2:
             compilation_dir,
         )
         return packets, summary
-
-    def _evidence_community_config(self) -> Stage2EvidenceCommunityConfig:
-        return Stage2EvidenceCommunityConfig(
-            model_name=self.config.evidence_community_model,
-            device=self.config.evidence_community_device,
-            max_communities=self.config.evidence_community_max_packets,
-            min_per_causal_lane=self.config.evidence_community_min_per_causal_lane,
-            max_atom_words=self.config.evidence_community_max_atom_words,
-            atom_overlap_words=self.config.evidence_community_atom_overlap_words,
-            candidate_neighbors=self.config.evidence_community_candidate_neighbors,
-            reciprocal_neighbors=self.config.evidence_community_reciprocal_neighbors,
-            louvain_resolution=self.config.evidence_community_louvain_resolution,
-            max_exemplars=self.config.evidence_community_max_exemplars,
-            max_consensus_phrases=(
-                self.config.evidence_community_max_consensus_phrases
-            ),
-            inner_fold_saturation=(
-                self.config.evidence_community_inner_fold_saturation
-            ),
-            architecture_saturation=(
-                self.config.evidence_community_architecture_saturation
-            ),
-            hierarchy_target_communities=(
-                self.config.evidence_community_hierarchy_target_communities
-            ),
-        )
-
-    def _load_or_distill_evidence_communities(
-        self,
-        *,
-        packets: Sequence[Mapping[str, Any]],
-        output_dir: Path,
-        seed: int,
-    ) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
-        """Load or build sealed evidence communities for candidate routing."""
-
-        if not self.config.evidence_community_enabled:
-            summary = {
-                "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
-                "enabled": False,
-                "source_packets": len(packets),
-                "selected_packets": len(packets),
-                "reason": "disabled_by_stage2_configuration",
-            }
-            return [dict(packet) for packet in packets], summary
-
-        community_config = self._evidence_community_config()
-        community_config.validate()
-        community_dir = output_dir / "evidence_communities"
-        packets_by_outer: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
-        for packet in packets:
-            packets_by_outer[int(packet["outer_fold"])].append(packet)
-
-        selected_packets: list[dict[str, Any]] = []
-        fold_summaries: dict[str, Mapping[str, Any]] = {}
-        fold_fingerprints: dict[str, str] = {}
-        for outer_fold in sorted(packets_by_outer):
-            fold_packets = packets_by_outer[outer_fold]
-            member_manifest_path = (
-                output_dir
-                / "evidence_compilation"
-                / f"outer_{outer_fold:03d}"
-                / "members.jsonl"
-            )
-            if not member_manifest_path.is_file():
-                raise FileNotFoundError(
-                    "Stage 2 evidence-community construction requires the exact member "
-                    f"manifest for outer fold {outer_fold}: {member_manifest_path}"
-                )
-            member_sha256 = _file_sha256(member_manifest_path)
-            fold_input = {
-                "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
-                "outer_fold": outer_fold,
-                "config": community_config.public_dict(),
-                "seed": int(seed),
-                "compiled_packets": list(fold_packets),
-                "member_manifest_sha256": member_sha256,
-            }
-            input_fingerprint = _value_fingerprint(fold_input)
-            fold_fingerprints[str(outer_fold)] = input_fingerprint
-            fold_dir = community_dir / f"outer_{outer_fold:03d}"
-            selected_path = fold_dir / "packets.jsonl"
-            atoms_path = fold_dir / "atoms.jsonl"
-            communities_path = fold_dir / "communities.jsonl"
-            edges_path = fold_dir / "edges.jsonl"
-            hierarchy_communities_path = fold_dir / "hierarchy_communities.jsonl"
-            hierarchy_edges_path = fold_dir / "hierarchy_edges.jsonl"
-            summary_path = fold_dir / "summary.json"
-            complete_path = fold_dir / "complete.json"
-            required_paths = (
-                selected_path,
-                atoms_path,
-                communities_path,
-                edges_path,
-                hierarchy_communities_path,
-                hierarchy_edges_path,
-                summary_path,
-            )
-            if complete_path.is_file() and all(path.is_file() for path in required_paths):
-                complete = json.loads(complete_path.read_text(encoding="utf-8"))
-                if complete.get("input_fingerprint") == input_fingerprint:
-                    expected_hashes = complete.get("artifact_sha256")
-                    artifact_paths = {
-                        "packets": selected_path,
-                        "atoms": atoms_path,
-                        "communities": communities_path,
-                        "edges": edges_path,
-                        "hierarchy_communities": hierarchy_communities_path,
-                        "hierarchy_edges": hierarchy_edges_path,
-                        "summary": summary_path,
-                    }
-                    artifacts_match = isinstance(expected_hashes, Mapping) and all(
-                        str(expected_hashes.get(name) or "") == _file_sha256(path)
-                        for name, path in artifact_paths.items()
-                    )
-                    cached_packets = _read_jsonl(selected_path) if artifacts_match else []
-                    cached_summary = (
-                        json.loads(summary_path.read_text(encoding="utf-8"))
-                        if artifacts_match
-                        else {}
-                    )
-                    cached_packet_ids = [
-                        str(packet.get("packet_id") or "") for packet in cached_packets
-                    ]
-                    if (
-                        len(cached_packets) == int(complete.get("selected_packets") or -1)
-                        and len(cached_packets) > 0
-                        and len(cached_packet_ids) == len(set(cached_packet_ids))
-                        and cached_summary.get("input_fingerprint") == input_fingerprint
-                        and all(
-                            packet_id
-                            and int(packet.get("outer_fold", -1)) == outer_fold
-                            and packet.get("architecture")
-                            == EVIDENCE_COMMUNITY_ARCHITECTURE
-                            and isinstance(packet.get("content"), Mapping)
-                            and packet["content"].get("schema_version")
-                            == EVIDENCE_COMMUNITY_SCHEMA_VERSION
-                            for packet_id, packet in zip(
-                                cached_packet_ids,
-                                cached_packets,
-                            )
-                        )
-                    ):
-                        selected_packets.extend(cached_packets)
-                        fold_summaries[str(outer_fold)] = cached_summary
-                        LOGGER.info(
-                            "loaded cached Stage 2 evidence communities outer_fold=%s "
-                            "selected=%s path=%s",
-                            outer_fold,
-                            len(cached_packets),
-                            fold_dir,
-                        )
-                        continue
-                LOGGER.info(
-                    "rebuild stale Stage 2 evidence communities outer_fold=%s path=%s",
-                    outer_fold,
-                    fold_dir,
-                )
-
-            started = time.monotonic()
-            distilled = distill_stage2_evidence_communities(
-                fold_packets,
-                member_manifest_path=member_manifest_path,
-                config=community_config,
-                seed=seed,
-            )
-            elapsed = time.monotonic() - started
-            fold_summary = {
-                **dict(distilled.summary),
-                "input_fingerprint": input_fingerprint,
-                "member_manifest_path": str(member_manifest_path),
-                "member_manifest_sha256": member_sha256,
-                "distillation_seconds": elapsed,
-                "artifacts": {
-                    "packets": str(selected_path),
-                    "atoms": str(atoms_path),
-                    "communities": str(communities_path),
-                    "edges": str(edges_path),
-                    "hierarchy_communities": str(hierarchy_communities_path),
-                    "hierarchy_edges": str(hierarchy_edges_path),
-                },
-            }
-            _write_jsonl(selected_path, distilled.packets)
-            _write_jsonl(atoms_path, distilled.atoms)
-            _write_jsonl(communities_path, distilled.communities)
-            _write_jsonl(edges_path, distilled.edges)
-            _write_jsonl(
-                hierarchy_communities_path,
-                distilled.hierarchy_communities,
-            )
-            _write_jsonl(hierarchy_edges_path, distilled.hierarchy_edges)
-            _write_json(summary_path, fold_summary)
-            artifact_sha256 = {
-                "packets": _file_sha256(selected_path),
-                "atoms": _file_sha256(atoms_path),
-                "communities": _file_sha256(communities_path),
-                "edges": _file_sha256(edges_path),
-                "hierarchy_communities": _file_sha256(hierarchy_communities_path),
-                "hierarchy_edges": _file_sha256(hierarchy_edges_path),
-                "summary": _file_sha256(summary_path),
-            }
-            _write_json(
-                complete_path,
-                {
-                    "status": "complete",
-                    "completed_at": _now(),
-                    "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
-                    "input_fingerprint": input_fingerprint,
-                    "member_manifest_sha256": member_sha256,
-                    "selected_packets": len(distilled.packets),
-                    "atoms": len(distilled.atoms),
-                    "communities": len(distilled.communities),
-                    "reciprocal_edges": len(distilled.edges),
-                    "hierarchy_communities": len(distilled.hierarchy_communities),
-                    "hierarchy_edges": len(distilled.hierarchy_edges),
-                    "artifact_sha256": artifact_sha256,
-                },
-            )
-            selected_packets.extend(dict(packet) for packet in distilled.packets)
-            fold_summaries[str(outer_fold)] = fold_summary
-            LOGGER.info(
-                "built Stage 2 evidence communities outer_fold=%s source_packets=%s "
-                "atoms=%s communities=%s selected=%s seconds=%.2f",
-                outer_fold,
-                len(fold_packets),
-                len(distilled.atoms),
-                len(distilled.communities),
-                len(distilled.packets),
-                elapsed,
-            )
-
-        aggregate_keys = (
-            "source_representatives",
-            "exact_member_hashes_matched",
-            "member_manifest_records_scanned",
-            "atoms",
-            "pooled_mutual_pairs_reranked",
-            "reciprocal_edges",
-            "communities",
-            "hierarchy_communities",
-            "final_communities",
-            "selected_communities",
-            "selected_atoms",
-            "selected_confounder_lane_communities",
-            "selected_modifier_lane_communities",
-            "selected_lane_overlap",
-            "selected_global_fill_communities",
-            "selected_full_inner_fold_coverage",
-            "source_readable_chars",
-            "source_packet_chars",
-            "selected_readable_chars",
-            "selected_colbert_chars",
-            "selected_packet_chars",
-        )
-        totals = {
-            key: sum(int(summary.get(key) or 0) for summary in fold_summaries.values())
-            for key in aggregate_keys
-        }
-        source_chars = totals["source_readable_chars"]
-        source_packet_chars = totals["source_packet_chars"]
-        selected_readable_chars = totals["selected_readable_chars"]
-        selected_chars = totals["selected_packet_chars"]
-        summary = {
-            "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
-            "enabled": True,
-            "config": community_config.public_dict(),
-            "seed": int(seed),
-            "source_packets": len(packets),
-            "selected_packets": len(selected_packets),
-            "outer_folds": fold_summaries,
-            "totals": totals,
-            "prompt_character_reduction_fraction": (
-                1.0 - selected_readable_chars / source_chars if source_chars else 0.0
-            ),
-            "serialized_packet_reduction_fraction": (
-                1.0 - selected_chars / source_packet_chars
-                if source_packet_chars
-                else 0.0
-            ),
-        }
-        root_fingerprint = _value_fingerprint(
-            {
-                "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
-                "fold_input_fingerprints": fold_fingerprints,
-            }
-        )
-        _write_jsonl(community_dir / "packets.jsonl", selected_packets)
-        _write_json(community_dir / "summary.json", summary)
-        root_artifact_sha256 = {
-            "packets": _file_sha256(community_dir / "packets.jsonl"),
-            "summary": _file_sha256(community_dir / "summary.json"),
-        }
-        _write_json(
-            community_dir / "complete.json",
-            {
-                "status": "complete",
-                "completed_at": _now(),
-                "schema_version": EVIDENCE_COMMUNITY_SCHEMA_VERSION,
-                "input_fingerprint": root_fingerprint,
-                "fold_input_fingerprints": fold_fingerprints,
-                "selected_packets": len(selected_packets),
-                "artifact_sha256": root_artifact_sha256,
-            },
-        )
-        return selected_packets, summary
 
     def _interpret_batch(
         self,
@@ -7707,7 +7485,6 @@ class PlainHandoffStage2:
         discovery_packets = list(packets)
         complete_path = output_dir / "complete.json"
         features_path = output_dir / "feature_definitions.json"
-        final_features_path = output_dir / "final_definitions.json"
         definitions_complete_path = output_dir / "definitions_complete.json"
         interpreted_candidates_path = output_dir / "interpreted_candidates.json"
         definition_inputs = _feature_definition_input_value(
@@ -7723,18 +7500,6 @@ class PlainHandoffStage2:
             if definitions_complete_path.is_file()
             else {}
         )
-        completion = (
-            json.loads(complete_path.read_text(encoding="utf-8")) if complete_path.is_file() else {}
-        )
-        estimation_complete_path = output_dir / "estimation" / "complete.json"
-        try:
-            estimation_completion = (
-                json.loads(estimation_complete_path.read_text(encoding="utf-8"))
-                if estimation_complete_path.is_file()
-                else {}
-            )
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            estimation_completion = {}
         infrastructure_audits = (
             infrastructure_failure_audit_paths(output_dir)
             if complete_path.is_file()
@@ -7751,133 +7516,14 @@ class PlainHandoffStage2:
                 complete_path,
                 complete_path.with_name("superseded_infrastructure_complete.json"),
             )
-            completion = {}
-        if (
-            completion.get("phase") == "causal_estimation"
-            and final_features_path.is_file()
-            and estimation_completion.get("schema_version")
-            == ESTIMATION_CHECKPOINT_SCHEMA_VERSION
-            and estimation_completion.get("outcome_type") == outcome_type
-        ):
-            if definitions_state.get("evidence_input_fingerprint") != evidence_input_fingerprint:
-                raise RuntimeError(
-                    f"Stage 2 outer fold {outer_fold} was completed from a different "
-                    "evidence plan, feature-definition policy, or explicit-feature "
-                    "configuration. Preserve it for audit and use a fresh Stage 2 output "
-                    "directory before rerunning."
-                )
-            legacy_selection_path = output_dir / "selection" / "statistical_selection.json"
-            if legacy_selection_path.is_file():
-                raise RuntimeError(
-                    f"Stage 2 outer fold {outer_fold} was completed with the retired "
-                    "p-value selector. Preserve its results and rerun the workflow with "
-                    "--stage2-only --stage2-reselect to reuse interpretation and "
-                    "outer-training extraction."
-                )
-            try:
-                completed_selection = json.loads(
-                    (output_dir / "selection" / "complete.json").read_text(
-                        encoding="utf-8"
-                    )
-                )
-                completed_selection_input = json.loads(
-                    (output_dir / "selection" / "input.json").read_text(
-                        encoding="utf-8"
-                    )
-                )
-            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"Stage 2 outer fold {outer_fold} has no compatible completed "
-                    "group-elastic-net-selection checkpoint; use --stage2-reselect"
-                ) from exc
-            if (
-                completed_selection.get("schema_version")
-                != STAGE2_ROLE_SELECTION_SCHEMA_VERSION
-            ):
-                raise RuntimeError(
-                    f"Stage 2 outer fold {outer_fold} has an incompatible role-selection "
-                    "schema; use --stage2-reselect"
-                )
-            stored_selection_value = {
-                str(key): value
-                for key, value in completed_selection_input.items()
-                if key != "input_fingerprint"
-            }
-            stored_selection_fingerprint = _value_fingerprint(stored_selection_value)
-            selection_policy_mismatches = []
-            if (
-                completed_selection.get("input_fingerprint")
-                != stored_selection_fingerprint
-                or completed_selection_input.get("input_fingerprint")
-                != stored_selection_fingerprint
-            ):
-                selection_policy_mismatches.append("checkpoint_fingerprint")
-            expected_selection_policy = {
-                "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
-                "temporal_scope": self.config.input_temporal_scope,
-                "stage1_packets_fingerprint": _value_fingerprint(discovery_packets),
-                "outcome_type": outcome_type,
-                "selection_consolidation_policy": (
-                    self.config.selection_consolidation.scientific_dict()
-                ),
-                "selection_consolidation_llm_model": self.config.model,
-                "statistical_selection_policy": (
-                    self.config.statistical_selection.public_dict()
-                ),
-            }
-            selection_policy_mismatches.extend(
-                key
-                for key, expected in expected_selection_policy.items()
-                if completed_selection_input.get(key) != expected
+        elif complete_path.is_file() and dataset is not None:
+            # Do not trust the coarse outer marker as a science checkpoint.
+            # The analysis layer reconstructs the current selection and
+            # estimation fingerprints before reusing those artifacts.
+            LOGGER.info(
+                "revalidate completed Stage 2 outer-fold semantic checkpoints fold=%s",
+                outer_fold,
             )
-            if selection_policy_mismatches:
-                raise RuntimeError(
-                    f"Stage 2 outer fold {outer_fold} was completed under a different "
-                    "role-selection policy or input; rerun with --stage2-reselect "
-                    f"({sorted(set(selection_policy_mismatches))})"
-                )
-            LOGGER.info("skip completed Stage 2 outer fold=%s", outer_fold)
-            final = json.loads(final_features_path.read_text(encoding="utf-8"))
-            review_convergence = final.get("review_convergence")
-            convergence_path = output_dir / "review" / "convergence.json"
-            if not isinstance(review_convergence, Mapping) and convergence_path.is_file():
-                review_convergence = json.loads(convergence_path.read_text(encoding="utf-8"))
-            review_converged = final.get("review_converged")
-            if not isinstance(review_converged, bool) and isinstance(
-                review_convergence, Mapping
-            ):
-                stored_converged = review_convergence.get("converged")
-                review_converged = (
-                    stored_converged if isinstance(stored_converged, bool) else None
-                )
-            return {
-                "outer_fold": outer_fold,
-                "features": list(final.get("features") or []),
-                "candidate_dispositions": (
-                    json.loads(features_path.read_text(encoding="utf-8")).get(
-                        "candidate_dispositions", {}
-                    )
-                    if features_path.is_file()
-                    else {}
-                ),
-                "review_rounds": int(final.get("review_rounds") or 0),
-                "evaluation_rounds": int(
-                    final.get("evaluation_rounds") or final.get("review_rounds") or 0
-                ),
-                "review_converged": review_converged,
-                "review_convergence": (
-                    dict(review_convergence)
-                    if isinstance(review_convergence, Mapping)
-                    else None
-                ),
-                "harmonization_validation_fallbacks": list(
-                    final.get("harmonization_validation_fallbacks") or []
-                ),
-                "ontology_refinement_rounds": int(final.get("ontology_refinement_rounds") or 0),
-                "estimation": json.loads(
-                    (output_dir / "estimation" / "diagnostics.json").read_text(encoding="utf-8")
-                ),
-            }
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_jsonl(output_dir / "input_packets.jsonl", discovery_packets)
 
@@ -8642,6 +8288,11 @@ def run_plain_handoff_stage2(
     def run_configured_managed_pools() -> Mapping[str, Any]:
         """Run with each managed model on its exact configured allocation."""
 
+        if config.vllm is not None and extraction_vllm is not None:
+            validate_managed_vllm_pool_isolation(
+                config.vllm,
+                extraction_vllm,
+            )
         with ExitStack() as stack:
             runtime_config = config
             if config.vllm is not None:

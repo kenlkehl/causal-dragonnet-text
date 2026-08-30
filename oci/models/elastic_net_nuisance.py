@@ -128,6 +128,8 @@ class ElasticNetLogisticClassifier(ClassifierMixin, BaseEstimator):
         self.classes_ = np.asarray([0, 1], dtype=int)
         self.constant_probability_ = None
         self.model_ = None
+        self.fit_mode_ = "constant"
+        self.effective_cv_folds_ = 0
         if len(values) < 2 or design.shape[1] == 0:
             self.constant_probability_ = float(np.clip(np.mean(target), 1e-6, 1 - 1e-6))
             return self
@@ -143,6 +145,8 @@ class ElasticNetLogisticClassifier(ClassifierMixin, BaseEstimator):
             "n_jobs": jobs,
         }
         if folds >= 2:
+            self.fit_mode_ = "cross_validated"
+            self.effective_cv_folds_ = int(folds)
             splitter = StratifiedKFold(
                 n_splits=folds,
                 shuffle=True,
@@ -157,6 +161,7 @@ class ElasticNetLogisticClassifier(ClassifierMixin, BaseEstimator):
                 **common,
             )
         else:
+            self.fit_mode_ = "fixed_grid_midpoint"
             self.model_ = LogisticRegression(
                 C=float(grid[len(grid) // 2]),
                 l1_ratio=ratio,
@@ -165,6 +170,56 @@ class ElasticNetLogisticClassifier(ClassifierMixin, BaseEstimator):
         self.model_.fit(design, target.astype(int))
         self.classes_ = np.asarray(self.model_.classes_, dtype=int)
         return self
+
+    def fit_audit(self) -> dict[str, Any]:
+        """Return JSON-safe details from the fitted nuisance clone."""
+
+        check_is_fitted(
+            self,
+            ("classes_", "model_", "fit_mode_", "effective_cv_folds_"),
+        )
+        selected_regularization = None
+        iteration_values = np.asarray([], dtype=int)
+        if self.model_ is not None:
+            selected_c = (
+                np.asarray(self.model_.C_, dtype=float).reshape(-1)[0]
+                if hasattr(self.model_, "C_")
+                else float(self.model_.C)
+            )
+            selected_regularization = {
+                "parameter": "C",
+                "value": float(selected_c),
+            }
+            iteration_values = np.asarray(
+                getattr(self.model_, "n_iter_", []), dtype=int
+            ).reshape(-1)
+        maximum_iterations = (
+            int(iteration_values.max()) if iteration_values.size else 0
+        )
+        return {
+            "estimator": (
+                "oci.models.elastic_net_nuisance."
+                "ElasticNetLogisticClassifier"
+            ),
+            "fit_mode": str(self.fit_mode_),
+            "n_features": int(self.n_features_in_),
+            "requested_cv_folds": int(self.cv_folds),
+            "effective_cv_folds": int(self.effective_cv_folds_),
+            "selected_regularization": selected_regularization,
+            "constant_prediction": (
+                float(self.constant_probability_)
+                if self.constant_probability_ is not None
+                else None
+            ),
+            "optimization": {
+                "configured_max_iter": int(self.max_iter),
+                "maximum_iterations_observed": maximum_iterations,
+                "iteration_limit_reached": bool(
+                    iteration_values.size
+                    and maximum_iterations >= int(self.max_iter)
+                ),
+            },
+        }
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         check_is_fitted(self, ("classes_", "model_"))
@@ -251,11 +306,15 @@ class ElasticNetRegressor(RegressorMixin, BaseEstimator):
         self.n_features_in_ = int(design.shape[1])
         self.constant_mean_ = None
         self.model_ = None
+        self.fit_mode_ = "constant"
+        self.effective_cv_folds_ = 0
         if design.shape[1] == 0 or len(target) < 3 or float(np.var(target)) <= 1e-15:
             self.constant_mean_ = float(np.mean(target))
             return self
 
         folds = min(requested_folds, len(target))
+        self.fit_mode_ = "cross_validated"
+        self.effective_cv_folds_ = int(folds)
         splitter = KFold(n_splits=folds, shuffle=True, random_state=seed)
         self.model_ = ElasticNetCV(
             l1_ratio=ratio,
@@ -270,6 +329,43 @@ class ElasticNetRegressor(RegressorMixin, BaseEstimator):
         )
         self.model_.fit(design, target)
         return self
+
+    def fit_audit(self) -> dict[str, Any]:
+        """Return JSON-safe details from the fitted nuisance clone."""
+
+        check_is_fitted(
+            self,
+            ("model_", "fit_mode_", "effective_cv_folds_"),
+        )
+        selected_regularization = None
+        iterations = 0
+        duality_gap = None
+        if self.model_ is not None:
+            selected_regularization = {
+                "parameter": "alpha",
+                "value": float(self.model_.alpha_),
+            }
+            iterations = int(np.asarray(self.model_.n_iter_).reshape(-1).max())
+            duality_gap = float(np.asarray(self.model_.dual_gap_).reshape(-1).max())
+        return {
+            "estimator": "oci.models.elastic_net_nuisance.ElasticNetRegressor",
+            "fit_mode": str(self.fit_mode_),
+            "n_features": int(self.n_features_in_),
+            "requested_cv_folds": int(self.cv_folds),
+            "effective_cv_folds": int(self.effective_cv_folds_),
+            "selected_regularization": selected_regularization,
+            "constant_prediction": (
+                float(self.constant_mean_)
+                if self.constant_mean_ is not None
+                else None
+            ),
+            "optimization": {
+                "configured_max_iter": int(self.max_iter),
+                "maximum_iterations_observed": iterations,
+                "iteration_limit_reached": bool(iterations >= int(self.max_iter)),
+                "duality_gap": duality_gap,
+            },
+        }
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         check_is_fitted(self, "model_")
