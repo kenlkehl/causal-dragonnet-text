@@ -217,9 +217,16 @@ An external endpoint configuration is:
       "regularization_grid_size": 16,
       "one_standard_error_rule": true,
       "nuisance_prediction_one_standard_error_rule": false,
+      "modifier_one_standard_error_rule": false,
+      "univariable_confounder_p_value_threshold": 0.05,
+      "univariable_confounder_q_value_threshold": 0.10,
       "modifier_top_n_per_inner_fold": 10,
       "modifier_ridge_alpha": 10.0,
       "modifier_continuous_winsor_quantile": 0.005
+    },
+    "role_adjudication": {
+      "enabled": true,
+      "max_candidates_per_request": 20
     },
     "estimation_trees": 200,
     "explicit_features": [
@@ -476,7 +483,7 @@ through unchanged, and records the fallback in the round and root completion
 summaries. This lossless fallback also preserves every configured feature.
 There is no fuzzy blocker, neighbor selection, or pairwise LLM request during
 discovery-time alias consolidation. Python
-leaves every discovered causal role empty until fold-local group-elastic-net selection;
+leaves every discovered causal role empty until fold-local all-evidence adjudication;
 investigator-configured features alone carry supplied roles at this point.
 
 Every group remaining after consolidation is operationalized for extraction.
@@ -581,7 +588,7 @@ sequences. Independent outer folds execute concurrently. `stage2.workers`
 controls combined primary-model concurrency, including consolidation and
 supervisor fan-outs; `stage2.extraction_llm.workers` independently controls
 small-model patient extraction without combining patients.
-Stage 2 sequential candidate consolidation and group-elastic-net selection occur
+Stage 2 sequential candidate consolidation and all-evidence role selection occur
 inside each independent outer fold;
 those checkpoints are reusable independently of endpoint URLs.
 
@@ -798,6 +805,13 @@ my_stage1_run/
           registry.json
           report.json
           complete.json
+        statistical_evidence.json
+        role_adjudication/
+          evidence.json
+          prompt.json
+          batches/batch_NNN/{prompt.json,response.json,complete.json}
+          response.json
+          complete.json
         elastic_net_selection.json
         selected_definitions.json
         measurement_definitions.json
@@ -924,7 +938,7 @@ raw training matrix, and repeats for at most
 `max_review_rounds`; `ontology_supervision/convergence.json` records whether the
 latest aggregate ontology was stable.
 
-Before statistical role selection, `selection/candidate_consolidation/` records a
+Before supervised evidence construction, `selection/candidate_consolidation/` records a
 sequential, outer-training-only pass. The loop visits the original candidate
 order once. At each still-active pivot, the configured embedding model retrieves
 the nearest active neighbors (ten by default), Python calculates Spearman,
@@ -949,16 +963,21 @@ the active pool, so later pivots retrieve the canonical measurement instead.
 Treatment, outcome, causal roles, and outer-heldout rows are absent from every
 consolidation request.
 
-Statistical role selection is then written to
-`selection/elastic_net_selection.json`. Every inner-training partition fits a
+All-evidence role selection is written to the historically named
+`selection/elastic_net_selection.json`; its standalone numerical component is
+also written to `selection/statistical_evidence.json`. Every inner-training partition fits a
 logistic group elastic net for treatment and a separate group elastic net for
 the marginal outcome. Ordered measurements use one standardized numerical
 score. A nominal factor's standardized contrasts and missingness indicator are
 penalized as one group, so its selection does not depend on one surviving dummy
 coefficient. Feature groups earn treatment and outcome votes separately. A
-single vote in either task places the feature in the outer-fold confounder
-union; their intersection and higher vote thresholds are never required. Both
-the propensity and marginal-outcome grouped elastic nets use that common union.
+single vote in either task places the feature in a provisional confounder
+union. In parallel, candidate-wise omnibus models test association with
+treatment, marginal outcome, and outcome adjusted for treatment. Raw p-values,
+within-fold Benjamini-Hochberg q-values, and cross-fold support counts are
+evidence only, never hard gates. Both the propensity and marginal-outcome
+grouped elastic nets used to construct modifier evidence use the provisional
+common union.
 For binary targets, the report records inner-heldout and pooled out-of-fold
 AUROC alongside log loss.
 
@@ -969,11 +988,22 @@ ridge-stabilized R-learner compares constant and candidate-varying treatment-
 effect models on untouched inner-heldout rows. All estimable interaction
 contrasts for a categorical candidate enter together and receive one held-out
 R-loss score. The ten largest gains per inner fold are selected by default,
-without a positive-gain gate, and their deduplicated union enters the final
-causal forest. The nuisance screens continue to use the one-standard-error rule.
-Pairwise
-associations and the LLM are confined to the preceding unsupervised
-consolidation; they do not assign roles or gate statistical support.
+without a positive-gain gate. A second modifier view jointly fits all candidate
+treatment-interaction groups in one grouped-elastic-net R-loss model per fold.
+Its coefficient supports and held-out whole-model R-loss gains are additional
+evidence rather than a gate. The nuisance screens continue to use the
+one-standard-error rule.
+
+The primary LLM then receives bounded slices of one allowlisted aggregate
+role-evidence artifact and assigns the final roles. A slice contains at most
+`role_adjudication.max_candidates_per_request` candidates (20 by default) and
+retains their global votes, ranks, and fold evidence. The adjudicator must
+reconcile multivariable and univariable confounder evidence, candidate-wise and
+joint modifier evidence, method disagreement, and fold consistency. Its
+interface has no dataset argument and excludes row values, identifiers,
+outer-heldout information, oracle fields, dataset paths or names, and
+data-generation metadata. Investigator-locked roles remain exact. Failure does
+not fall back silently to the provisional unions.
 
 Explicit investigator features retain exactly their configured roles. The
 outer-heldout partition is inaccessible during selection and receives only the

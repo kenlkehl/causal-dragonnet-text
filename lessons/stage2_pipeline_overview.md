@@ -30,7 +30,10 @@ aggregate ontology supervision and incremental re-extraction
 optional equivalence-only alias consolidation
     |
     v
-group-elastic-net nuisance selection + candidate held-out R-loss
+confounder elastic-net + univariable evidence; modifier candidate-R + joint elastic-net evidence
+    |
+    v
+allowlisted aggregate evidence -> validated LLM role adjudication
     |
     v
 freeze definitions and extract selected held-out dependencies
@@ -126,18 +129,28 @@ active retrieval pool. Original columns and recursive lineage remain in the
 registry. Whether enabled, disabled, or trivial, the pass writes the report
 referenced from final definitions.
 
-## Statistical selection
+## Statistical evidence and role adjudication
 
 Every inner fold fits two group elastic nets: logistic treatment nuisance and
 the outcome-appropriate marginal nuisance. Nominal contrasts plus missingness
-form one group. A feature with at least one treatment or outcome vote enters the
-confounder union; intersection and stability thresholds are diagnostic only.
+form one group. Candidate-wise omnibus screens also test treatment, outcome,
+and treatment-adjusted outcome association, with within-fold FDR correction.
+Both views are retained as evidence; neither decides the final role alone.
 
 Cross-fitted nuisance predictions feed candidate-specific grouped calibration
 and a ridge-stabilized R-learner. All estimable treatment interactions for one
 candidate are scored together on inner-heldout rows. The top ten held-out
 R-loss gains per fold are selected by rank, without a positivity or p-value
-gate. Their union supplies final effect modifiers.
+gate. In parallel, one grouped-elastic-net R-loss model per fold selects among
+all candidate interaction groups jointly and records held-out whole-model gain.
+
+An allowlisted aggregate artifact packages all four views for the primary LLM.
+The artifact is submitted in bounded candidate batches while each candidate's
+global votes and ranks remain intact. The adjudicator covers every candidate,
+explicitly reconciles method disagreement and fold consistency, and may assign
+both roles or neither. Prompt construction has no dataset interface and excludes
+row-level values, identifiers, outer-heldout data, oracle fields, paths or names,
+and generation metadata. Explicit investigator roles remain locked.
 
 At 64 or more candidates, selection is submitted to a loky worker so Python
 optimization loops do not contend with thread-level outer-fold orchestration.
@@ -167,7 +180,9 @@ fallback, iteration count, and iteration-limit status.
 | `outer_NNN/feature_definitions.json` | Operational definitions before extraction |
 | `outer_NNN/ontology_supervision/` | Aggregate review, revisions, and convergence |
 | `outer_NNN/selection/candidate_consolidation/` | Alias decisions, repair events, report, and latent registry |
-| `outer_NNN/selection/elastic_net_selection.json` | Nuisance votes, cross-fitted diagnostics, R-loss scores, and selected roles |
+| `outer_NNN/selection/statistical_evidence.json` | Univariable and multivariable confounder evidence plus candidate-wise and joint modifier evidence |
+| `outer_NNN/selection/role_adjudication/` | Allowlisted evidence, bounded batch prompts/responses, and validated combined response |
+| `outer_NNN/selection/elastic_net_selection.json` | Final all-evidence role report (historical filename retained) |
 | `outer_NNN/final_definitions.json` | Frozen selected definitions and dependencies |
 | `outer_NNN/estimation/diagnostics.json` | Fitted model and nuisance-clone audit |
 | `cross_fitted_predictions.csv` | One held-out prediction per patient |

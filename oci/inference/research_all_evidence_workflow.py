@@ -101,6 +101,9 @@ RETIRED_ANY_INNER_FOLD_STAGE2_SELECTION_SCHEMA_VERSION = (
 RETIRED_UNIVARIABLE_STAGE2_SELECTION_SCHEMA_VERSION = (
     "stage2_group_elastic_net_univariable_modifier_selection_v7_top_n_union"
 )
+RETIRED_CANDIDATE_AUGMENTED_STAGE2_SELECTION_SCHEMA_VERSION = (
+    "stage2_candidate_augmented_rlearner_selection_v8_elastic_net_nuisance_top_n_union"
+)
 RETIRED_STAGE2_SCREEN_CONFIG_KEYS = frozenset(
     {
         "selection_workers",
@@ -2407,6 +2410,7 @@ def prepare_stage2_reselection(
             RETIRED_GROUP_ELASTIC_NET_STAGE2_SELECTION_SCHEMA_VERSION,
             RETIRED_ANY_INNER_FOLD_STAGE2_SELECTION_SCHEMA_VERSION,
             RETIRED_UNIVARIABLE_STAGE2_SELECTION_SCHEMA_VERSION,
+            RETIRED_CANDIDATE_AUGMENTED_STAGE2_SELECTION_SCHEMA_VERSION,
             STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
         }:
             raise RuntimeError(
@@ -2426,6 +2430,9 @@ def prepare_stage2_reselection(
                 "elastic_net_selection.json"
             ),
             RETIRED_UNIVARIABLE_STAGE2_SELECTION_SCHEMA_VERSION: (
+                "elastic_net_selection.json"
+            ),
+            RETIRED_CANDIDATE_AUGMENTED_STAGE2_SELECTION_SCHEMA_VERSION: (
                 "elastic_net_selection.json"
             ),
             STAGE2_ROLE_SELECTION_SCHEMA_VERSION: "elastic_net_selection.json",

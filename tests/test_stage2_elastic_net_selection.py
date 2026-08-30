@@ -137,6 +137,20 @@ def test_any_fold_nuisance_union_and_candidate_augmented_rlearner_selection():
     )
     assert report["nuisance_screen"]["overall_treatment_auroc"] is not None
     assert report["nuisance_screen"]["overall_outcome_auroc"] is None
+    assert report["confounder_univariable_screen"]["hard_selection_gate"] is False
+    assert report["confounder_univariable_screen"][
+        "multiplicity_adjustment"
+    ] == "benjamini_hochberg_within_inner_fold_endpoint"
+    assert report["confounder_univariable_screen"][
+        "nominal_joint_support_votes"
+    ]["conf"] >= 1
+    for fold in report["confounder_univariable_screen"]["folds"]:
+        confounder_test = next(
+            row for row in fold["tests"] if row["feature_id"] == "conf"
+        )
+        assert confounder_test["treatment_p_value"] is not None
+        assert confounder_test["outcome_adjusted_for_treatment_p_value"] is not None
+        assert "treatment_q_value" in confounder_test
     for fold in report["nuisance_screen"]["folds"]:
         assert fold["treatment"]["heldout_auroc"] is not None
         assert fold["outcome"]["heldout_auroc"] is None
@@ -170,6 +184,13 @@ def test_any_fold_nuisance_union_and_candidate_augmented_rlearner_selection():
     assert report["cross_fitted_nuisance_models"][
         "one_standard_error_rule"
     ] is False
+    joint_modifier = report["multivariable_modifier_elastic_net_screen"]
+    assert joint_modifier["hard_selection_gate"] is False
+    assert joint_modifier["candidate_scope"] == (
+        "all_candidate_groups_in_one_model_per_inner_fold"
+    )
+    assert len(joint_modifier["folds"]) == len(inner_splits)
+    assert all(fold["status"] for fold in joint_modifier["folds"])
     assert [row["feature_id"] for row in dependencies] == [
         row["feature_id"] for row in selected
     ]

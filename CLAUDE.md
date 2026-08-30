@@ -72,6 +72,9 @@ may enter the Stage 2 handoff.
 
 - Never use oracle columns during discovery, fitting, selection, or handoff
   construction.
+- Final Stage 2 role prompts may contain only the allowlisted aggregate evidence
+  bundle. Never add dataset paths/names, synthetic-generation metadata, known
+  data-generating roles, row values, identifiers, or outer-heldout information.
 - Hash frozen Stage 1 artifacts before loading oracle data for evaluation.
 - Keep outer-test rows unavailable to inner-fold discovery and review.
 - Preserve exact row, split, component, architecture, and configuration

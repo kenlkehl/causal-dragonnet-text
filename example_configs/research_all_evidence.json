@@ -73,9 +73,19 @@
       "optimization_tolerance": 1e-6,
       "one_standard_error_rule": true,
       "nuisance_prediction_one_standard_error_rule": false,
+      "modifier_one_standard_error_rule": false,
+      "univariable_confounder_p_value_threshold": 0.05,
+      "univariable_confounder_q_value_threshold": 0.1,
       "modifier_top_n_per_inner_fold": 10,
       "modifier_ridge_alpha": 10.0,
       "modifier_continuous_winsor_quantile": 0.005
+    },
+    "role_adjudication": {
+      "enabled": true,
+      "max_description_chars": 1200,
+      "max_measurement_definition_chars": 1600,
+      "max_categories_per_feature": 40,
+      "max_candidates_per_request": 20
     },
     "estimation_trees": 200,
     "propensity_clip": 0.02,

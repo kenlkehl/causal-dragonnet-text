@@ -54,6 +54,10 @@ from .stage2_elastic_net_selection import (
     Stage2ElasticNetSelectionConfig,
     statistical_selection_config_from_mapping,
 )
+from .stage2_role_adjudication import (
+    Stage2RoleAdjudicationConfig,
+    role_adjudication_config_from_mapping,
+)
 from .stage2_sequential_consolidation import (
     Stage2SequentialConsolidationConfig,
     sequential_consolidation_config_from_mapping,
@@ -868,6 +872,12 @@ class PlainHandoffStage2Config:
     statistical_selection: Stage2ElasticNetSelectionConfig = field(
         default_factory=Stage2ElasticNetSelectionConfig
     )
+    # Final role assignment reconciles all fold-honest statistical views. The
+    # prompt builder has no dataset interface and accepts only an allowlisted,
+    # aggregate evidence bundle.
+    role_adjudication: Stage2RoleAdjudicationConfig = field(
+        default_factory=Stage2RoleAdjudicationConfig
+    )
     estimation_trees: int = 200
     propensity_clip: float = 0.02
     min_nonmissing_fraction: float = 0.05
@@ -1144,6 +1154,12 @@ class PlainHandoffStage2Config:
                 "Stage2ElasticNetSelectionConfig object"
             )
         self.statistical_selection.validate()
+        if not isinstance(self.role_adjudication, Stage2RoleAdjudicationConfig):
+            raise ValueError(
+                "stage2.role_adjudication must be a "
+                "Stage2RoleAdjudicationConfig object"
+            )
+        self.role_adjudication.validate()
         if self.estimation_trees < 10:
             raise ValueError("stage2.estimation_trees must be at least 10")
         if not 0.0 < self.propensity_clip < 0.5:
@@ -1197,6 +1213,7 @@ class PlainHandoffStage2Config:
             self.selection_consolidation.public_dict()
         )
         values["statistical_selection"] = self.statistical_selection.public_dict()
+        values["role_adjudication"] = self.role_adjudication.public_dict()
         return values
 
 
@@ -1500,6 +1517,9 @@ def plain_stage2_config_from_mapping(
         ),
         statistical_selection=statistical_selection_config_from_mapping(
             statistical_selection_value
+        ),
+        role_adjudication=role_adjudication_config_from_mapping(
+            raw.get("role_adjudication")
         ),
         estimation_trees=int(raw.get("estimation_trees", 200)),
         propensity_clip=float(raw.get("propensity_clip", 0.02)),
@@ -7966,7 +7986,7 @@ class PlainHandoffStage2:
             LOGGER.info(
                 "Stage 2 outer-fold execution folds=%s fold_workers=%s "
                 "global_request_workers=%s "
-                "statistical_selection=group_elastic_net_candidate_augmented_rlearner",
+                "role_selection=all_evidence_llm_adjudication",
                 len(outer_fold_ids),
                 fold_workers,
                 self.config.workers,

@@ -42,7 +42,7 @@ from .stage2_agentic_selection import (
 
 SCHEMA_VERSION = "stage2_sequential_equivalent_measurement_consolidation_v4_row_agreement"
 SELECTION_SCHEMA_VERSION = (
-    "stage2_candidate_augmented_rlearner_selection_v8_elastic_net_nuisance_top_n_union"
+    "stage2_all_evidence_llm_role_selection_v1"
 )
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 DEFAULT_NEIGHBOR_COUNT = 10

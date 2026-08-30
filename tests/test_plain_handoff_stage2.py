@@ -21,6 +21,7 @@ from oci.inference.plain_handoff_stage2 import (
     run_plain_handoff_stage2,
 )
 from oci.inference.plain_handoff_stage2_analysis import extract_rows, run_fold_analysis
+from oci.inference.stage2_role_adjudication import Stage2RoleAdjudicationConfig
 
 
 class _CharacterChatTokenizer:
@@ -87,6 +88,8 @@ def _prompt_job(body):
         return "analyze_stage2_variable_cluster"
     if body.get("task") == "outer_fold_role_adjudication":
         return "adjudicate_stage2_variable_role"
+    if body.get("task") == "adjudicate_stage2_roles_from_all_evidence":
+        return "adjudicate_stage2_roles_from_all_evidence"
     if set(body) == {"candidate_feature_name", "supporting_evidence"}:
         return "operationalize_stage2_candidate_group"
     raise AssertionError(f"unrecognized prompt body keys: {sorted(body)}")
@@ -362,6 +365,13 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
                 "minimum_pairwise_association": 0.9,
                 "latent_min_coverage": 0.1,
             },
+            "role_adjudication": {
+                "enabled": True,
+                "max_description_chars": 900,
+                "max_measurement_definition_chars": 1_100,
+                "max_categories_per_feature": 25,
+                "max_candidates_per_request": 17,
+            },
         },
         default_workers=1,
     )
@@ -404,6 +414,11 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.selection_consolidation.max_latents_per_cluster == 3
     assert config.selection_consolidation.minimum_pairwise_association == 0.9
     assert config.selection_consolidation.latent_min_coverage == 0.1
+    assert config.role_adjudication.enabled is True
+    assert config.role_adjudication.max_description_chars == 900
+    assert config.role_adjudication.max_measurement_definition_chars == 1_100
+    assert config.role_adjudication.max_categories_per_feature == 25
+    assert config.role_adjudication.max_candidates_per_request == 17
     assert config.public_dict()["max_tokens"] == 148_000
     assert config.public_dict()["request_timeout"] == 1_200.0
     assert config.public_dict()["request_attempt_timeout"] == 120.0
@@ -426,6 +441,13 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.public_dict()["vllm_rapid_switch_seconds"] == 1_200.0
     assert config.public_dict()["ontology_refinement_min_failure_patients"] == 4
     assert config.public_dict()["max_ontology_refinement_rounds"] == 3
+    assert config.public_dict()["role_adjudication"] == {
+        "enabled": True,
+        "max_description_chars": 900,
+        "max_measurement_definition_chars": 1_100,
+        "max_categories_per_feature": 25,
+        "max_candidates_per_request": 17,
+    }
     assert config.public_dict()["extraction_llm"]["api_key"] == "<redacted>"
     assert config.public_dict()["api_key"] == "<redacted>"
 
@@ -4895,6 +4917,32 @@ def test_consolidation_expands_ordinal_integer_range_categories():
 
 
 def _agentic_fixture_response(body):
+    if body.get("task") == "adjudicate_stage2_roles_from_all_evidence":
+        decisions = []
+        for item in body["role_evidence"]["candidates"]:
+            definition = item["definition"]
+            roles = (
+                list(definition["configured_roles"])
+                if definition["investigator_locked"]
+                else ["confounder", "effect_modifier"]
+            )
+            decisions.append(
+                {
+                    "feature_id": item["feature_id"],
+                    "roles": roles,
+                    "evidence_for": ["Fold-honest fixture evidence."],
+                    "evidence_against": [],
+                    "inner_fold_consistency": "Consistent in fixture folds.",
+                    "cross_method_reconciliation": (
+                        "Fixture methods support the assigned roles."
+                    ),
+                    "rationale": "Exercise all-evidence role adjudication.",
+                }
+            )
+        return {
+            "summary": "Apply fixture all-evidence decisions.",
+            "decisions": decisions,
+        }
     if body.get("task") == "analyze_cluster":
         recommendations = []
         for feature in body["definitions"]:
@@ -4961,6 +5009,7 @@ def _fake_completion(calls):
         if body.get("task") in {
             "analyze_cluster",
             "outer_fold_role_adjudication",
+            "adjudicate_stage2_roles_from_all_evidence",
         }:
             return json.dumps(_agentic_fixture_response(body))
         if job == "extract_stage2_patient_variables":
@@ -9065,6 +9114,38 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
     assert selection["cross_fitted_nuisance_models"][
         "predictions_are_inner_fold_out_of_fold"
     ] is True
+    assert selection["confounder_univariable_screen"]["hard_selection_gate"] is False
+    assert selection["multivariable_modifier_elastic_net_screen"][
+        "hard_selection_gate"
+    ] is False
+    assert selection["final_role_assignment"] == "llm_all_evidence_adjudication"
+    assert selection["role_adjudication"]["prompt_data_contract"][
+        "oracle_columns_are_excluded"
+    ] is True
+    assert (
+        output
+        / "outer_001"
+        / "selection"
+        / "statistical_evidence.json"
+    ).is_file()
+    role_prompt_path = (
+        output
+        / "outer_001"
+        / "selection"
+        / "role_adjudication"
+        / "prompt.json"
+    )
+    assert role_prompt_path.is_file()
+    role_batch_prompt_path = (
+        role_prompt_path.parent
+        / "batches"
+        / "batch_001"
+        / "prompt.json"
+    )
+    assert role_batch_prompt_path.is_file()
+    role_prompt = role_batch_prompt_path.read_text(encoding="utf-8").casefold()
+    assert "oracle_ite" not in role_prompt
+    assert "generation_config" not in role_prompt
     assert not (output / "outer_001" / "selection" / "stage2_evidence").exists()
     assert (
         output
@@ -9096,6 +9177,7 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
     assert "extract_stage2_patient_variables" not in primary_calls
     assert "analyze_stage2_variable_cluster" not in primary_calls
     assert "adjudicate_stage2_variable_role" not in primary_calls
+    assert "adjudicate_stage2_roles_from_all_evidence" in primary_calls
     assert extraction_calls
     assert set(extraction_calls) == {"extract_stage2_patient_variables"}
     calls_after_first = (len(primary_calls), len(extraction_calls))
@@ -9367,7 +9449,11 @@ def test_aggregate_supervisor_can_revise_then_reextract_a_definition(
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
-        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+        if body.get("task") in {
+            "analyze_cluster",
+            "outer_fold_role_adjudication",
+            "adjudicate_stage2_roles_from_all_evidence",
+        }:
             return validate(_agentic_fixture_response(body))
         jobs.append(body["job"])
         if body["job"] == "extract_stage2_patient_variables":
@@ -9511,6 +9597,7 @@ def test_fold_reselection_uses_frozen_preselection_without_training_extraction(
             model="extractor-model",
             workers=1,
         ),
+        role_adjudication=Stage2RoleAdjudicationConfig(enabled=False),
         max_review_rounds=2,
         estimation_trees=10,
     )
@@ -9714,6 +9801,7 @@ def test_fold_reselection_reuses_archived_heldout_components_and_extracts_only_m
             model="extractor-model",
             workers=1,
         ),
+        role_adjudication=Stage2RoleAdjudicationConfig(enabled=False),
         max_review_rounds=2,
         estimation_trees=10,
     )
@@ -10048,7 +10136,11 @@ def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
-        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+        if body.get("task") in {
+            "analyze_cluster",
+            "outer_fold_role_adjudication",
+            "adjudicate_stage2_roles_from_all_evidence",
+        }:
             return validate(_agentic_fixture_response(body))
         jobs.append(body["job"])
         if body["job"] == "extract_stage2_patient_variables":
@@ -10209,7 +10301,11 @@ def test_failure_refinement_reextracts_only_changed_features_and_resumes(
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
-        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+        if body.get("task") in {
+            "analyze_cluster",
+            "outer_fold_role_adjudication",
+            "adjudicate_stage2_roles_from_all_evidence",
+        }:
             return validate(_agentic_fixture_response(body))
         if body["job"] == "extract_stage2_patient_variables":
             assert request_kind == "extraction"
@@ -10490,7 +10586,11 @@ def _retired_test_final_training_extraction_is_rerun_after_review_drops_a_featur
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
-        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+        if body.get("task") in {
+            "analyze_cluster",
+            "outer_fold_role_adjudication",
+            "adjudicate_stage2_roles_from_all_evidence",
+        }:
             return validate(_agentic_fixture_response(body))
         if body["job"] == "extract_stage2_patient_variables":
             names = [feature["name"] for feature in body["features"]]
@@ -10599,7 +10699,11 @@ def test_final_training_extraction_fails_fast_when_effectively_all_null(
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
-        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+        if body.get("task") in {
+            "analyze_cluster",
+            "outer_fold_role_adjudication",
+            "adjudicate_stage2_roles_from_all_evidence",
+        }:
             return validate(_agentic_fixture_response(body))
         if body["job"] == "extract_stage2_patient_variables":
             return validate(

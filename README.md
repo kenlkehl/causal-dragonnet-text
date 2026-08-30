@@ -273,10 +273,11 @@ A complete Stage 2 analysis ordinarily performs the following sequence:
 5. The primary model reviews only aggregate small-model outputs and validation
    failures. It may revise the same ontology but cannot add, drop, rename, or
    role-label a feature.
-6. Inner-fold group elastic nets select discovered confounders from treatment
-   or outcome prediction. Candidate-augmented R-learners rank modifiers by
-   held-out R-loss gain.
-   Investigator-configured roles bypass these gates.
+6. Inner-fold multivariable elastic nets and simple univariable tests provide
+   complementary confounder evidence. Candidate-augmented R-learners and a
+   restored joint interaction elastic net provide complementary modifier
+   evidence. An allowlisted aggregate bundle goes to the primary LLM for final
+   role adjudication; investigator-configured roles remain locked.
 7. It freezes the retained definitions, applies them to the outer-held-out
    records, and fits the fold-honest nuisance models and causal forest.
 8. It combines held-out AIPW scores across outer folds to estimate the average
@@ -763,9 +764,16 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
       "optimization_tolerance": 1e-6,
       "one_standard_error_rule": true,
       "nuisance_prediction_one_standard_error_rule": false,
+      "modifier_one_standard_error_rule": false,
+      "univariable_confounder_p_value_threshold": 0.05,
+      "univariable_confounder_q_value_threshold": 0.10,
       "modifier_top_n_per_inner_fold": 10,
       "modifier_ridge_alpha": 10.0,
       "modifier_continuous_winsor_quantile": 0.005
+    },
+    "role_adjudication": {
+      "enabled": true,
+      "max_candidates_per_request": 20
     },
     "estimation_trees": 200,
     "explicit_features": []
@@ -1111,15 +1119,16 @@ retrieved by later candidates. Original columns and recursive lineage remain
 available for audit and held-out reconstruction. Configured explicit features
 are protected from replacement.
 
-Stage 2 then assigns modeling roles deterministically. In every inner fold, a logistic group elastic net predicts treatment
+Stage 2 then builds fold-honest role evidence. In every inner fold, a logistic group elastic net predicts treatment
 and a separate group elastic net predicts the marginal outcome. Continuous and
 ordered measurements are standardized single-score groups, while every nominal
 factor's standardized contrasts and missingness indicator form one all-in/all-out
 group. Any feature group selected in at least one inner fold for either task
-enters the outer fold's confounder union; intersection and vote-frequency
-thresholds are not gates. Both the propensity and outcome nuisance models use
-that same union. Reports include inner-heldout and pooled out-of-fold AUROC as
-well as log loss for binary nuisance tasks.
+enters a provisional confounder union. Candidate-wise omnibus screens also test
+treatment, outcome, and treatment-adjusted outcome associations, retaining raw
+p-values, within-fold FDR values, and fold support. Both nuisance models used to
+build modifier evidence use the provisional union. Reports include
+inner-heldout and pooled out-of-fold AUROC as well as log loss for binary tasks.
 
 Inner-fold grouped elastic nets produce cross-fitted propensity and marginal-
 outcome predictions. For every candidate, candidate-specific grouped elastic-
@@ -1127,11 +1136,21 @@ net calibration layers augment both nuisances using only inner-fold training
 data. A ridge-stabilized R-learner compares a constant-effect model with a model
 that jointly adds all estimable candidate interaction contrasts, and scores the
 gain on untouched inner-heldout rows. The ten largest held-out R-loss gains enter
-each inner fold's set by default, without a sign or p-value gate; their
-deduplicated union (at most 50 candidates for five inner folds) becomes the outer
-fold's causal-forest modifier set. The nuisance screens continue to use the
-one-standard-error rule for sparse confounder discovery, while nuisance
+each inner fold's evidence set by default, without a sign or p-value gate. A
+second R-loss model places all candidate interaction groups in one joint grouped
+elastic net and records coefficient support plus held-out whole-model gain. The
+nuisance screens continue to use the one-standard-error rule, while nuisance
 prediction defaults to the minimum-CV-loss elastic net.
+
+Final primary-model adjudication receives only allowlisted definitions and these
+aggregate statistics. Large candidate sets are sliced into bounded requests of
+`stage2.role_adjudication.max_candidates_per_request` candidates (20 by
+default); each slice retains the global fold votes, ranks, and method evidence
+for its candidates. The adjudicator reconciles all methods and fold consistency,
+assigning both roles or neither when warranted. The prompt interface excludes
+dataset rows, identifiers, outer-heldout information, oracle fields, paths or
+names, and generation metadata; failure does not silently fall back to
+provisional statistical unions.
 
 The consolidation agent never receives treatment, outcome, or outer-heldout
 rows; pairwise associations are used only for this unsupervised replacement
@@ -1140,7 +1159,7 @@ locked. All supplied measurements must satisfy the persisted
 `pre_index_treatment` invariant, and outer-heldout rows remain unavailable until
 the selected definitions and model roles are frozen.
 
-Group-elastic-net selection writes its own input fingerprint and completion
+All-evidence selection writes its own input fingerprint and completion
 marker, so an interrupted run resumes independently. Endpoint URLs are transport
 details and may change between resumes. The root `model_identity.json` records
 the model IDs used for upstream interpretation and extraction. Completed
@@ -1271,6 +1290,13 @@ nsclc_all_evidence/
           steps/...
           registry.json
           report.json
+          complete.json
+        statistical_evidence.json
+        role_adjudication/
+          evidence.json
+          prompt.json
+          batches/batch_NNN/{prompt.json,response.json,complete.json}
+          response.json
           complete.json
         elastic_net_selection.json
         selected_definitions.json

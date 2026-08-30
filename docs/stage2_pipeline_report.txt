@@ -110,23 +110,28 @@ CURRENT FLOW FOR ONE OUTER FOLD
    reconstruction. Disabled or trivial consolidation still writes the report
    referenced by final definitions.
 
-7. Assign roles with group elastic nets and held-out R-loss
+7. Build complementary statistical evidence and adjudicate final roles
 
    Every inner-training partition fits a logistic group elastic net for
    treatment and a separate group elastic net for marginal outcome. A nominal
    factor's contrasts and missingness indicator form one all-in/all-out group;
    continuous and ordered measurements use standardized score groups.
 
-   A feature selected in at least one inner fold for either nuisance task enters
-   the outer-fold confounder union. There is no intersection or vote-frequency
-   gate. Both nuisance tasks use that common union.
+   Candidate-wise omnibus screens add treatment, outcome, and
+   treatment-adjusted-outcome evidence with within-fold FDR. The elastic-net
+   nuisance union and univariable screens are evidence, not final role gates.
 
    Candidate-specific cross-fitted nuisance calibrations feed a
    ridge-stabilized R-learner. Each candidate is scored by the held-out R-loss
    gain from adding all estimable treatment interactions for that candidate.
-   The ten largest gains per inner fold are retained by default, even if a gain
-   is nonpositive; the deduplicated union (at most 50 for five folds) supplies
-   final effect modifiers.
+   The ten largest gains per inner fold are retained as evidence by default,
+   even if a gain is nonpositive. A joint grouped-elastic-net R-loss screen adds
+   multivariable interaction evidence.
+
+   The primary LLM reconciles all four aggregate views in bounded candidate
+   batches while retaining global votes and ranks. Its prompt boundary excludes
+   row-level values, identifiers, outer-heldout information, oracle fields,
+   dataset identity, and generation metadata. Locked roles remain exact.
 
    Large candidate sets run their CPU-bound selector in a loky process. This
    process isolation is safe for CLI, notebook, python -c, and stdin callers and
@@ -181,8 +186,15 @@ stage2/outer_NNN/selection/candidate_consolidation/
     report.json, registry.json, and completion marker.
 
 stage2/outer_NNN/selection/elastic_net_selection.json
-    Inner-fold nuisance votes, cross-fitted diagnostics, candidate R-loss
-    comparisons, selected confounder union, and modifier union.
+    Final all-evidence roles plus the numerical and LLM component audit.
+
+stage2/outer_NNN/selection/statistical_evidence.json
+    Inner-fold univariable and elastic-net confounder evidence plus
+    candidate-wise and joint elastic-net modifier evidence.
+
+stage2/outer_NNN/selection/role_adjudication/
+    Allowlisted aggregate evidence, bounded batch prompts/responses, and the
+    validated combined LLM response.
 
 stage2/outer_NNN/final_definitions.json
     Frozen selected roles and measurement/latent dependencies.

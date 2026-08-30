@@ -37,6 +37,10 @@ from .stage2_elastic_net_selection import (
     TEMPORAL_SCOPE,
     select_stage2_features_elastic_net,
 )
+from .stage2_role_adjudication import (
+    SCHEMA_VERSION as ROLE_ADJUDICATION_COMPONENT_SCHEMA_VERSION,
+    adjudicate_stage2_roles,
+)
 from .stage2_sequential_consolidation import (
     SELECTION_SCHEMA_VERSION,
     consolidate_stage2_candidates,
@@ -9705,6 +9709,8 @@ def run_fold_analysis(
         "selection_consolidation_policy": consolidation_policy.scientific_dict(),
         "selection_consolidation_llm_model": str(getattr(config, "model", "")),
         "statistical_selection_policy": statistical_policy.public_dict(),
+        "role_adjudication_policy": config.role_adjudication.public_dict(),
+        "role_adjudication_llm_model": str(getattr(config, "model", "")),
     }
     selection_fingerprint = _value_fingerprint(selection_input)
     selection_report_path = selection_dir / "elastic_net_selection.json"
@@ -9754,7 +9760,7 @@ def run_fold_analysis(
                     measurement_definitions=measurement_definitions,
                 )
                 LOGGER.info(
-                    "skip completed Stage 2 group-elastic-net selection: %s",
+                    "skip completed Stage 2 all-evidence role selection: %s",
                     selection_dir,
                 )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -9809,7 +9815,7 @@ def run_fold_analysis(
             ),
         )
         (
-            selected,
+            statistically_selected,
             elastic_net_report,
             _elastic_net_dependencies,
             _elastic_net_latent_states,
@@ -9826,6 +9832,33 @@ def run_fold_analysis(
                 "policy": statistical_policy,
             }
         )
+        _write_json(
+            selection_dir / "statistical_evidence.json",
+            elastic_net_report,
+        )
+        if consolidated_definitions and config.role_adjudication.enabled:
+            selected, role_adjudication_report, _role_evidence = (
+                adjudicate_stage2_roles(
+                    definitions=consolidated_definitions,
+                    statistical_report=elastic_net_report,
+                    request_json=request_json,
+                    output_dir=selection_dir / "role_adjudication",
+                    policy=config.role_adjudication,
+                )
+            )
+        else:
+            selected = statistically_selected
+            role_adjudication_report = {
+                "schema_version": ROLE_ADJUDICATION_COMPONENT_SCHEMA_VERSION,
+                "status": (
+                    "complete_no_candidates"
+                    if not consolidated_definitions
+                    else "disabled_by_configuration"
+                ),
+                "retained_feature_ids": [
+                    str(feature["feature_id"]) for feature in selected
+                ],
+            }
         measurement_definitions = measurement_definitions_for_selected(
             selected,
             current,
@@ -9835,6 +9868,25 @@ def run_fold_analysis(
             **elastic_net_report,
             "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
             "elastic_net_component_schema_version": ELASTIC_NET_COMPONENT_SCHEMA_VERSION,
+            "statistical_component_schema_version": ELASTIC_NET_COMPONENT_SCHEMA_VERSION,
+            "statistical_provisional_decisions": elastic_net_report.get(
+                "decisions", []
+            ),
+            "role_adjudication_component_schema_version": (
+                ROLE_ADJUDICATION_COMPONENT_SCHEMA_VERSION
+            ),
+            "role_adjudication": role_adjudication_report,
+            "final_role_assignment": (
+                "llm_all_evidence_adjudication"
+                if consolidated_definitions and config.role_adjudication.enabled
+                else "statistical_provisional_roles"
+            ),
+            "decisions": role_adjudication_report.get(
+                "decisions", elastic_net_report.get("decisions", [])
+            ),
+            "retained_feature_ids": [
+                str(feature["feature_id"]) for feature in selected
+            ],
             "latent_construction": (
                 "sequential_semantic_association_consolidation"
                 if consolidation_policy.enabled
@@ -10007,7 +10059,7 @@ def run_fold_analysis(
             "ontology_refinement_rounds": ontology_refinement_rounds,
             "selection_artifact": str(selection_dir / "elastic_net_selection.json"),
             "screening_model_family": (
-                "group_elastic_net_nuisance_and_candidate_augmented_rlearner"
+                "all_evidence_univariable_and_elastic_net_with_llm_role_adjudication"
             ),
             "final_model_family": "causal_forest_dml",
             "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
@@ -10041,7 +10093,7 @@ def run_fold_analysis(
         "review_convergence": review_convergence,
         "ontology_refinement_rounds": ontology_refinement_rounds,
         "screening_model_family": (
-            "group_elastic_net_nuisance_and_candidate_augmented_rlearner"
+            "all_evidence_univariable_and_elastic_net_with_llm_role_adjudication"
         ),
         "selection": selection_report,
         "measurement_dependencies": measurement_definitions,

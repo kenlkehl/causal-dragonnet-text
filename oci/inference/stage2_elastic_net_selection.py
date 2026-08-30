@@ -1,21 +1,15 @@
-"""Fold-local elastic-net nuisance selection and candidate-wise R-learning.
+"""Fold-honest statistical evidence for Stage 2 causal-role adjudication.
 
-The selector has one deliberately narrow job: turn the frozen, extracted
-outer-training candidate matrix into three empirical feature sets without
-consulting the outer-heldout partition:
+For confounders, this module records both multivariable grouped elastic-net
+support in treatment/outcome nuisance models and candidate-wise treatment and
+outcome association tests.  For effect modifiers, it records both
+candidate-augmented held-out R-loss comparisons and a joint multivariable
+grouped elastic-net interaction model.  All four views use only the current
+outer-training partition and inner-fold honest evaluation.
 
-* predictors selected in any inner fold for treatment or marginal outcome;
-* candidate modifiers with a top-ranked held-out R-loss gain in any inner fold.
-
-The union of treatment and outcome selections is the outer-fold confounder set
-and is used by both base nuisance models.  Every nuisance fit in this selector
-uses the grouped elastic-net family.  Within each inner fold, every candidate
-gets its own cross-fitted elastic-net calibration layer that augments both base
-nuisances with that candidate.  A ridge-stabilized R-learner then compares a
-constant treatment effect with candidate-varying treatment effects on untouched
-inner-heldout rows.  The N largest held-out R-loss gains are retained, with
-categorical interactions added and scored as one group.  The union of those
-inner-fold top-N sets is passed to the final causal forest.  No pairwise
+The numerical unions remain provisional for compatibility and model setup.
+They are packaged as fallible evidence for the downstream LLM role adjudicator,
+which makes the final confounder/effect-modifier assignments.  No pairwise
 clustering or latent construction occurs here.
 """
 
@@ -33,11 +27,16 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics import log_loss, mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold
 
+from .stage2_statistical_selection import (
+    _binary_nested_p_value,
+    _continuous_nested_p_value,
+    _encode_feature as _encode_univariable_feature,
+    _rank_safe_columns as _univariable_rank_safe_columns,
+)
+
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = (
-    "stage2_group_elastic_net_candidate_augmented_rlearner_v9_top_n_union"
-)
+SCHEMA_VERSION = "stage2_all_evidence_statistical_components_v1"
 TEMPORAL_SCOPE = "pre_index_treatment"
 
 
@@ -63,6 +62,11 @@ class Stage2ElasticNetSelectionConfig:
     one_standard_error_rule: bool = True
     nuisance_prediction_one_standard_error_rule: bool = False
     modifier_one_standard_error_rule: bool = False
+    # Univariable tests are descriptive inputs to the final role adjudicator.
+    # These thresholds create fold-level evidence flags; neither is a hard
+    # selection gate.
+    univariable_confounder_p_value_threshold: float = 0.05
+    univariable_confounder_q_value_threshold: float = 0.10
     # Retained only so older configuration files remain loadable. Nuisance
     # prediction is now performed by the same grouped elastic-net family used
     # for screening; these forest settings no longer affect computation.
@@ -127,6 +131,8 @@ class Stage2ElasticNetSelectionConfig:
             "modifier_continuous_winsor_quantile",
             "modifier_min_fold_r_loss_improvement",
             "modifier_min_mean_r_loss_improvement",
+            "univariable_confounder_p_value_threshold",
+            "univariable_confounder_q_value_threshold",
         ):
             value = getattr(self, name)
             if (
@@ -170,6 +176,14 @@ class Stage2ElasticNetSelectionConfig:
                 "must be in [0, 0.25)"
             )
         for name in (
+            "univariable_confounder_p_value_threshold",
+            "univariable_confounder_q_value_threshold",
+        ):
+            if not 0.0 < float(getattr(self, name)) <= 1.0:
+                raise ValueError(
+                    f"stage2.statistical_selection.{name} must be in (0, 1]"
+                )
+        for name in (
             "one_standard_error_rule",
             "nuisance_prediction_one_standard_error_rule",
             "modifier_one_standard_error_rule",
@@ -184,7 +198,6 @@ class Stage2ElasticNetSelectionConfig:
         for retired in (
             "nuisance_selection_frequency",
             "modifier_selection_frequency",
-            "modifier_one_standard_error_rule",
             "nuisance_forest_trees",
             "nuisance_forest_min_samples_leaf",
             "modifier_min_fold_r_loss_improvement",
@@ -1499,6 +1512,256 @@ def _rank_modifier_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any
     ]
 
 
+def _benjamini_hochberg(values: Sequence[float | None]) -> list[float | None]:
+    """Return multiplicity-adjusted q-values while preserving missing entries."""
+
+    valid = [
+        (index, float(value))
+        for index, value in enumerate(values)
+        if value is not None and math.isfinite(float(value))
+    ]
+    result: list[float | None] = [None] * len(values)
+    if not valid:
+        return result
+    ordered = sorted(valid, key=lambda item: (item[1], item[0]))
+    adjusted = [0.0] * len(ordered)
+    running = 1.0
+    total = len(ordered)
+    for reverse_position in range(total - 1, -1, -1):
+        _index, p_value = ordered[reverse_position]
+        rank = reverse_position + 1
+        running = min(running, float(p_value) * total / rank)
+        adjusted[reverse_position] = min(1.0, running)
+    for (index, _p_value), q_value in zip(ordered, adjusted):
+        result[index] = float(q_value)
+    return result
+
+
+def _rank_p_values(
+    rows: Sequence[Mapping[str, Any]],
+    key: str,
+) -> list[dict[str, Any]]:
+    evaluable = [row for row in rows if row.get(key) is not None]
+    return [
+        {
+            "rank": rank,
+            "feature_id": str(row["feature_id"]),
+            "name": str(row["name"]),
+            key: float(row[key]),
+        }
+        for rank, row in enumerate(
+            sorted(
+                evaluable,
+                key=lambda row: (float(row[key]), str(row["feature_id"])),
+            ),
+            start=1,
+        )
+    ]
+
+
+def _confounder_univariable_rows(
+    *,
+    frame: pd.DataFrame,
+    treatment: np.ndarray,
+    outcome: np.ndarray,
+    definitions: Sequence[Mapping[str, Any]],
+    binary_outcome: bool,
+    p_value_threshold: float,
+    q_value_threshold: float,
+) -> list[dict[str, Any]]:
+    """Compute simple candidate-wise treatment and outcome associations."""
+
+    intercept = np.ones((len(frame), 1), dtype=float)
+    outcome_adjustment, _ = _univariable_rank_safe_columns(
+        intercept,
+        np.asarray(treatment, dtype=float).reshape(-1, 1),
+    )
+    rows: list[dict[str, Any]] = []
+    for feature in definitions:
+        design = _encode_univariable_feature(frame, feature)
+        treatment_p, treatment_test = _binary_nested_p_value(
+            treatment,
+            intercept,
+            design.main,
+        )
+        outcome_test_function = (
+            _binary_nested_p_value if binary_outcome else _continuous_nested_p_value
+        )
+        outcome_p, outcome_test = outcome_test_function(
+            outcome,
+            intercept,
+            design.main,
+        )
+        adjusted_outcome_p, adjusted_outcome_test = outcome_test_function(
+            outcome,
+            outcome_adjustment,
+            design.main,
+        )
+        rows.append(
+            {
+                "feature_id": _feature_key(feature),
+                "name": str(feature["name"]),
+                "treatment_p_value": treatment_p,
+                "outcome_p_value": outcome_p,
+                "outcome_adjusted_for_treatment_p_value": adjusted_outcome_p,
+                "treatment_test": treatment_test,
+                "outcome_test": outcome_test,
+                "outcome_adjusted_for_treatment_test": adjusted_outcome_test,
+            }
+        )
+    for p_key in (
+        "treatment_p_value",
+        "outcome_p_value",
+        "outcome_adjusted_for_treatment_p_value",
+    ):
+        q_key = p_key.replace("p_value", "q_value")
+        for row, q_value in zip(
+            rows,
+            _benjamini_hochberg([row.get(p_key) for row in rows]),
+        ):
+            row[q_key] = q_value
+    for row in rows:
+        row["nominal_joint_support"] = bool(
+            row["treatment_p_value"] is not None
+            and row["outcome_adjusted_for_treatment_p_value"] is not None
+            and float(row["treatment_p_value"]) < float(p_value_threshold)
+            and float(row["outcome_adjusted_for_treatment_p_value"])
+            < float(p_value_threshold)
+        )
+        row["multiplicity_adjusted_joint_support"] = bool(
+            row["treatment_q_value"] is not None
+            and row["outcome_adjusted_for_treatment_q_value"] is not None
+            and float(row["treatment_q_value"]) < float(q_value_threshold)
+            and float(row["outcome_adjusted_for_treatment_q_value"])
+            < float(q_value_threshold)
+        )
+    return rows
+
+
+def _joint_modifier_elastic_net_fold(
+    *,
+    context: Mapping[str, Any],
+    definitions: Sequence[Mapping[str, Any]],
+    config: Stage2ElasticNetSelectionConfig,
+    seed: int,
+) -> dict[str, Any]:
+    """Fit one multivariable group-elastic-net R-loss interaction screen."""
+
+    train = context["train"]
+    valid = context["valid"]
+    treatment_train = np.asarray(context["treatment_train"], dtype=float)
+    treatment_valid = np.asarray(context["treatment_valid"], dtype=float)
+    outcome_train = np.asarray(context["outcome_train"], dtype=float)
+    outcome_valid = np.asarray(context["outcome_valid"], dtype=float)
+    design = _winsorize_modifier_design(
+        _encode_design(
+            train,
+            valid,
+            definitions,
+            categorical_min_count=int(config.categorical_min_count),
+        ),
+        quantile=float(config.modifier_continuous_winsor_quantile),
+    )
+    interaction_indices: list[int] = []
+    excluded_low_support: list[str] = []
+    for index, name in enumerate(design.column_names):
+        rendered_name = str(name)
+        if rendered_name.endswith(":missing"):
+            continue
+        if ":level=" in rendered_name or ":fallback=" in rendered_name:
+            values = design.train[:, index]
+            present = values == float(np.max(values))
+            treated = int(np.sum(present & (treatment_train == 1)))
+            untreated = int(np.sum(present & (treatment_train == 0)))
+            if min(treated, untreated) < int(config.categorical_min_count):
+                excluded_low_support.append(rendered_name)
+                continue
+        interaction_indices.append(index)
+
+    interaction_feature_ids = tuple(
+        str(design.column_feature_ids[index]) for index in interaction_indices
+    )
+    interaction_names = tuple(
+        str(design.column_names[index]) for index in interaction_indices
+    )
+    candidate_train = design.train[:, interaction_indices]
+    candidate_valid = design.valid[:, interaction_indices]
+    residual_treatment_train = treatment_train - np.asarray(
+        context["base_e_train"], dtype=float
+    )
+    residual_treatment_valid = treatment_valid - np.asarray(
+        context["base_e_valid"], dtype=float
+    )
+    residual_outcome_train = outcome_train - np.asarray(
+        context["base_m_train"], dtype=float
+    )
+    residual_outcome_valid = outcome_valid - np.asarray(
+        context["base_m_valid"], dtype=float
+    )
+    weights = np.square(residual_treatment_train)
+    denominator = float(np.sum(weights))
+    centers = (
+        np.average(candidate_train, axis=0, weights=weights)
+        if candidate_train.shape[1] and denominator > 1e-12
+        else np.zeros(candidate_train.shape[1], dtype=float)
+    )
+    centered_train = candidate_train - centers
+    centered_valid = candidate_valid - centers
+    constant_effect = (
+        float(
+            np.sum(residual_treatment_train * residual_outcome_train)
+            / denominator
+        )
+        if denominator > 1e-12
+        else 0.0
+    )
+    modifier_target = (
+        residual_outcome_train - residual_treatment_train * constant_effect
+    )
+    modifier_fit = _squared_error_elastic_net(
+        residual_treatment_train.reshape(-1, 1) * centered_train,
+        modifier_target,
+        residual_treatment_valid.reshape(-1, 1) * centered_valid,
+        interaction_feature_ids,
+        config=config,
+        seed=seed,
+        fit_intercept=False,
+        one_standard_error_rule=bool(config.modifier_one_standard_error_rule),
+    )
+    selected_ids, magnitudes = _selected_feature_ids(
+        modifier_fit.coefficients,
+        interaction_feature_ids,
+        tolerance=float(config.coefficient_tolerance),
+    )
+    reduced_prediction = residual_treatment_valid * constant_effect
+    full_prediction = reduced_prediction + modifier_fit.valid_prediction
+    reduced_loss = float(
+        mean_squared_error(residual_outcome_valid, reduced_prediction)
+    )
+    full_loss = float(mean_squared_error(residual_outcome_valid, full_prediction))
+    return {
+        "fit_rows": len(train),
+        "heldout_rows": len(valid),
+        "encoded_candidate_columns": int(design.train.shape[1]),
+        "tested_interaction_columns": list(interaction_names),
+        "excluded_missingness_interactions": True,
+        "excluded_interaction_columns_low_treatment_arm_support": (
+            excluded_low_support
+        ),
+        "constant_effect": constant_effect,
+        "status": modifier_fit.status,
+        "regularization_alpha": modifier_fit.regularization,
+        "internal_cv_folds": modifier_fit.cv_folds,
+        "selected_feature_ids": selected_ids,
+        "feature_group_l2_norms": magnitudes,
+        "solver_iterations": modifier_fit.iterations,
+        "solver_converged": modifier_fit.converged,
+        "heldout_reduced_r_loss": reduced_loss,
+        "heldout_full_r_loss": full_loss,
+        "heldout_r_loss_improvement": reduced_loss - full_loss,
+    }
+
+
 def select_stage2_features_elastic_net(
     *,
     dataset: pd.DataFrame,
@@ -1543,6 +1806,9 @@ def select_stage2_features_elastic_net(
     screen_t_predicted: list[np.ndarray] = []
     screen_y_observed: list[np.ndarray] = []
     screen_y_predicted: list[np.ndarray] = []
+    univariable_nominal_votes = {feature_id: 0 for feature_id in by_id}
+    univariable_adjusted_votes = {feature_id: 0 for feature_id in by_id}
+    univariable_folds: list[dict[str, Any]] = []
 
     for position, split in enumerate(folds, start=1):
         train_ids = [int(value) for value in split.get("fit_row_ids") or []]
@@ -1561,6 +1827,47 @@ def select_stage2_features_elastic_net(
         t_valid = dataset.iloc[valid_ids][treatment_column].to_numpy(dtype=float)
         y_train = dataset.iloc[train_ids][outcome_column].to_numpy(dtype=float)
         y_valid = dataset.iloc[valid_ids][outcome_column].to_numpy(dtype=float)
+        univariable_rows = _confounder_univariable_rows(
+            frame=train,
+            treatment=t_train,
+            outcome=y_train,
+            definitions=original,
+            binary_outcome=binary_outcome,
+            p_value_threshold=float(
+                policy.univariable_confounder_p_value_threshold
+            ),
+            q_value_threshold=float(
+                policy.univariable_confounder_q_value_threshold
+            ),
+        )
+        for row in univariable_rows:
+            feature_id = str(row["feature_id"])
+            univariable_nominal_votes[feature_id] += int(
+                bool(row["nominal_joint_support"])
+            )
+            univariable_adjusted_votes[feature_id] += int(
+                bool(row["multiplicity_adjusted_joint_support"])
+            )
+        univariable_folds.append(
+            {
+                "inner_fold": int(split.get("inner_fold", position)),
+                "fit_rows": len(train_ids),
+                "evaluation_scope": "inner_fold_fit_rows_only",
+                "tests": univariable_rows,
+                "treatment_p_value_ranking": _rank_p_values(
+                    univariable_rows, "treatment_p_value"
+                ),
+                "outcome_p_value_ranking": _rank_p_values(
+                    univariable_rows, "outcome_p_value"
+                ),
+                "outcome_adjusted_for_treatment_p_value_ranking": (
+                    _rank_p_values(
+                        univariable_rows,
+                        "outcome_adjusted_for_treatment_p_value",
+                    )
+                ),
+            }
+        )
         treatment_fit = _logistic_elastic_net(
             design.train,
             t_train,
@@ -1826,10 +2133,24 @@ def select_stage2_features_elastic_net(
     modifier_votes = {feature_id: 0 for feature_id in by_id}
     modifier_r_loss_improvements = {feature_id: [] for feature_id in by_id}
     modifier_folds: list[dict[str, Any]] = []
+    modifier_elastic_net_votes = {feature_id: 0 for feature_id in by_id}
+    modifier_elastic_net_folds: list[dict[str, Any]] = []
     for position, context in enumerate(modifier_contexts, start=1):
         split = context["split"]
         train = context["train"]
         valid = context["valid"]
+        elastic_net_fold = _joint_modifier_elastic_net_fold(
+            context=context,
+            definitions=original,
+            config=policy,
+            seed=seed + 50_000 * position,
+        )
+        elastic_net_fold["inner_fold"] = int(
+            split.get("inner_fold", position)
+        )
+        for feature_id in elastic_net_fold["selected_feature_ids"]:
+            modifier_elastic_net_votes[str(feature_id)] += 1
+        modifier_elastic_net_folds.append(elastic_net_fold)
         tests = [
             _candidate_r_learner_test(
                 train=train,
@@ -1935,6 +2256,15 @@ def select_stage2_features_elastic_net(
                 "treatment_votes": int(treatment_votes[feature_id]),
                 "outcome_votes": int(outcome_votes[feature_id]),
                 "modifier_votes": int(modifier_votes[feature_id]),
+                "univariable_nominal_confounder_votes": int(
+                    univariable_nominal_votes[feature_id]
+                ),
+                "univariable_adjusted_confounder_votes": int(
+                    univariable_adjusted_votes[feature_id]
+                ),
+                "multivariable_modifier_elastic_net_votes": int(
+                    modifier_elastic_net_votes[feature_id]
+                ),
                 "treatment_selection_frequency": float(
                     treatment_votes[feature_id] / len(folds)
                 ),
@@ -2026,6 +2356,30 @@ def select_stage2_features_elastic_net(
                 else None
             ),
         },
+        "confounder_univariable_screen": {
+            "objective": (
+                "candidate-wise association with treatment and outcome, including "
+                "outcome association adjusted only for treatment"
+            ),
+            "role": "selection_evidence_only",
+            "hard_selection_gate": False,
+            "fit_scope": "inner_fold_fit_rows_only",
+            "categorical_tests_are_omnibus": True,
+            "p_value_threshold": float(
+                policy.univariable_confounder_p_value_threshold
+            ),
+            "q_value_threshold": float(
+                policy.univariable_confounder_q_value_threshold
+            ),
+            "multiplicity_adjustment": "benjamini_hochberg_within_inner_fold_endpoint",
+            "nominal_joint_support_votes": dict(
+                sorted(univariable_nominal_votes.items())
+            ),
+            "multiplicity_adjusted_joint_support_votes": dict(
+                sorted(univariable_adjusted_votes.items())
+            ),
+            "folds": univariable_folds,
+        },
         "cross_fitted_nuisance_models": {
             "model_family": "group_elastic_net",
             "penalty": "group_lasso_plus_ridge",
@@ -2102,6 +2456,47 @@ def select_stage2_features_elastic_net(
             "non_evaluable_candidates_are_not_ranked": True,
             "missingness_interactions": False,
             "stable_effect_modifier_feature_ids": sorted(modifier_union),
+        },
+        "multivariable_modifier_elastic_net_screen": {
+            "objective": (
+                "joint grouped elastic-net treatment-interaction selection under "
+                "squared R-loss"
+            ),
+            "role": "selection_evidence_only",
+            "hard_selection_gate": False,
+            "model_family": "group_elastic_net_r_learner",
+            "candidate_scope": "all_candidate_groups_in_one_model_per_inner_fold",
+            "nuisance_model_family": "group_elastic_net",
+            "training_nuisance_predictions_are_nested_cross_fitted": True,
+            "evaluation_rows_are_untouched_inner_heldout": True,
+            "one_standard_error_rule": bool(
+                policy.modifier_one_standard_error_rule
+            ),
+            "missingness_interactions": False,
+            "votes": dict(sorted(modifier_elastic_net_votes.items())),
+            "selected_in_any_inner_fold_feature_ids": sorted(
+                _selected_in_any_inner_fold(modifier_elastic_net_votes)
+            ),
+            "mean_heldout_r_loss_improvement": float(
+                np.mean(
+                    [
+                        float(row["heldout_r_loss_improvement"])
+                        for row in modifier_elastic_net_folds
+                    ]
+                )
+            ),
+            "positive_heldout_r_loss_improvement_fraction": float(
+                np.mean(
+                    np.asarray(
+                        [
+                            float(row["heldout_r_loss_improvement"])
+                            for row in modifier_elastic_net_folds
+                        ]
+                    )
+                    > 0.0
+                )
+            ),
+            "folds": modifier_elastic_net_folds,
         },
         "decisions": decisions,
         "retained_feature_ids": [_feature_key(feature) for feature in selected],

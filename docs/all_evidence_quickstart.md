@@ -93,9 +93,16 @@ are:
       "modifier_selection_rule": "any_inner_fold_union",
       "one_standard_error_rule": true,
       "nuisance_prediction_one_standard_error_rule": false,
+      "modifier_one_standard_error_rule": false,
+      "univariable_confounder_p_value_threshold": 0.05,
+      "univariable_confounder_q_value_threshold": 0.10,
       "modifier_top_n_per_inner_fold": 10,
       "modifier_ridge_alpha": 10.0,
       "modifier_continuous_winsor_quantile": 0.005
+    },
+    "role_adjudication": {
+      "enabled": true,
+      "max_candidates_per_request": 20
     },
     "estimation_trees": 200,
     "explicit_features": []
@@ -152,18 +159,16 @@ only a necessary condition: broader/narrower concepts and merely related
 variables must remain separate. Accepted aliases immediately replace their
 sources in later retrievals. Lossless nominal-category unions are allowed, and
 continuous coalescing skips malformed nonnumeric values in favor of the next
-valid alias; the original extraction dependencies remain recorded. Separate treatment and outcome
-group elastic nets run inside each outer fold. A candidate selected in any inner
-fold for either task enters one shared confounder union used by both nuisance
-models. Ordered measurements use one standardized score; nominal factor
-contrasts and missingness are selected as one group. Inner-fold grouped elastic
-nets generate cross-fitted treatment and outcome predictions. Candidate-specific
-grouped elastic nets then augment both nuisances before a ridge-stabilized
-R-learner scores each candidate on untouched inner-heldout rows. Categorical
-interaction contrasts enter together and receive one held-out R-loss score. The
-ten largest gains per inner fold enter the deduplicated causal-forest modifier
-union by default, with no sign threshold. Binary nuisance reports include AUROC
-and log loss.
+valid alias; the original extraction dependencies remain recorded. Separate
+treatment and outcome group elastic nets run inside each outer fold alongside
+simple candidate-wise treatment and outcome screens. Inner-fold elastic nets
+generate cross-fitted nuisance predictions. Candidate-specific grouped
+calibrations feed held-out R-loss comparisons, while a second joint grouped
+elastic net selects among all candidate interactions. The primary LLM receives
+only an allowlisted aggregate bundle of those four evidence views and assigns
+final roles. The bundle excludes row values, identifiers, outer-heldout
+information, oracle fields, dataset identity, and generation metadata. Binary
+nuisance reports include AUROC and log loss.
 Consolidation receives neither treatment nor outcome and is not a role-selection
 screen. Outer-heldout rows remain inaccessible until selection is frozen;
 selected latent states are then applied to their held-out measurement dependencies.
@@ -222,11 +227,13 @@ candidate reranking, or feature-count cap. Discovery-time consolidation may only
 merge aliases, so every unmerged candidate proceeds to extraction. The distinct
 post-extraction selection-consolidation pass may replace empirically populated
 aliases with a canonical, information-preserving measurement before fold-local
-group-elastic-net selection.
-Each completed request is saved beneath the relevant outer-fold directory, so
-the same command resumes after interruption without repeating it.
+univariable/elastic-net evidence construction and final LLM role adjudication.
+Role adjudication uses bounded candidate batches (20 per request by default),
+while preserving each candidate's global fold votes and ranks. Each completed
+request is saved beneath the relevant outer-fold directory, so the same command
+resumes after interruption without repeating it.
 
-To apply the group-elastic-net selector to a completed legacy run without repeating
+To apply the all-evidence role selector to a completed legacy run without repeating
 interpretation or all-candidate training extraction:
 
 ```bash
