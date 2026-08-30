@@ -46,10 +46,10 @@ STAGE2_EXTRACTION_WORKERS=128 \
 
 Both wrappers default `MIN_FREE_GPU_GB` to `0`; default
 `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and
-`NUMEXPR_NUM_THREADS` to `1`; and default `STAGE2_ENDPOINT` and
-`STAGE2_EXTRACTION_ENDPOINT` to empty. Those settings can still be overridden
-in the environment and therefore do not need to be repeated above. The explicit
-vLLM GPU settings enable managed Stage 2 despite the blank endpoint defaults.
+`NUMEXPR_NUM_THREADS` to `1`; and use `http://127.0.0.1:8010/v1` and
+`http://127.0.0.1:8020/v1` as the external Stage 2 orchestration and extraction
+endpoints. Explicit managed-vLLM settings bypass the corresponding localhost
+default, so the commands above do not need endpoint overrides.
 
 ## Installation
 
@@ -81,12 +81,13 @@ libraries required by the chosen vLLM/Torch build.
 
 ## Try the complete Stage 1 → 2 workflow
 
-Stage 2 can use an already-running OpenAI-compatible server or launch its own
-pool of local vLLM servers. The example launchers default both endpoint
-variables to empty, so a bare invocation runs Stage 1 only. Configure external
-or managed primary and extraction endpoints, as in the quickstart above, to run
-the complete workflow. To run the bundled one-confounder, one-effect-modifier
-NSCLC experiment with the defaults:
+Stage 2 can use already-running OpenAI-compatible servers or launch its own
+pool of local vLLM servers. With no Stage 2 environment overrides, the example
+launchers use orchestration at `http://127.0.0.1:8010/v1` and extraction at
+`http://127.0.0.1:8020/v1`, so a bare invocation runs the complete workflow.
+Ensure those servers are available, or configure managed vLLM as in the
+quickstart above. To run the bundled one-confounder, one-effect-modifier NSCLC
+experiment with the defaults:
 
 ```bash
 ./run_one_conf_one_mod.sh
@@ -94,7 +95,7 @@ NSCLC experiment with the defaults:
 
 That command synchronizes the environment, discovers visible GPUs and
 their free VRAM, selects every visible GPU, sizes Stage 1 CPU workers, and runs
-or resumes Stage 1. Results default to
+or resumes both stages. Results default to
 `artifacts/research_all_evidence/one_conf_one_mod_nsclc_full/`.
 
 The most useful overrides are environment variables:
@@ -126,8 +127,8 @@ runs independent outer folds concurrently and defaults to 32 globally bounded
 endpoint workers.
 
 Advanced overrides are `MIN_FREE_GPU_GB`, `STAGE1_WORKERS`, `STAGE2_WORKERS`,
-`DISABLE_HTR`, `STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (leave it empty and
-omit managed vLLM settings for a Stage-1-only run). Managed mode accepts
+`DISABLE_HTR`, `STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (set it explicitly
+to empty and omit managed vLLM settings for a Stage-1-only run). Managed mode accepts
 `STAGE2_VLLM_SERVERS`, optional `STAGE2_VLLM_GPUS` (the detected logical devices
 are the default),
 `STAGE2_VLLM_DOWNLOAD_DIR`, and a JSON token list in
@@ -141,7 +142,8 @@ example uses the identical hardware and endpoint behavior:
 ```
 
 After a run has a completed `handoff/evidence.jsonl` checkpoint, either launcher
-automatically resumes in Stage 2-only mode when `STAGE2_ENDPOINT` is nonempty.
+automatically resumes in Stage 2-only mode under the default or an explicitly
+configured nonempty `STAGE2_ENDPOINT`.
 That path does not inspect or reserve local GPUs: it passes `--devices cpu` for
 workflow bookkeeping and uses 32 endpoint workers by default (or
 `STAGE2_WORKERS` when set). Local GPU eligibility and `MIN_FREE_GPU_GB` apply

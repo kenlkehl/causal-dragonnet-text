@@ -23,7 +23,6 @@ physical_gpus="${PHYSICAL_GPUS:-}"
 stage1_workers="${STAGE1_WORKERS:-auto}"
 stage2_workers="${STAGE2_WORKERS:-32}"
 stage2_model="${STAGE2_MODEL:-}"
-stage2_extraction_endpoint="${STAGE2_EXTRACTION_ENDPOINT:-}"
 stage2_extraction_model="${STAGE2_EXTRACTION_MODEL:-}"
 stage2_extraction_workers="${STAGE2_EXTRACTION_WORKERS:-}"
 stage2_max_tokens="${STAGE2_MAX_TOKENS:-}"
@@ -100,6 +99,11 @@ if (( stage2_managed_orchestrator )); then
     stage2_endpoint="${STAGE2_ENDPOINT:-}"
 else
     stage2_endpoint="${STAGE2_ENDPOINT-http://127.0.0.1:8010/v1}"
+fi
+if (( stage2_managed_extractor )); then
+    stage2_extraction_endpoint="${STAGE2_EXTRACTION_ENDPOINT:-}"
+else
+    stage2_extraction_endpoint="${STAGE2_EXTRACTION_ENDPOINT-http://127.0.0.1:8020/v1}"
 fi
 if (( stage2_managed_orchestrator )) && [[ -n "${stage2_endpoint}" ]]; then
     echo "Set either STAGE2_ENDPOINT or managed orchestrator vLLM settings, not both." >&2

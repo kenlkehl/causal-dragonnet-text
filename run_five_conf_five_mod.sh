@@ -17,6 +17,7 @@
 #     ./run_five_conf_five_mod.sh
 #   STAGE1_ARCHITECTURES=bow_nuisance,tfidf_topics ./run_five_conf_five_mod.sh
 #   STAGE2_CONSOLIDATION_MAX_ROUNDS=12 ./run_five_conf_five_mod.sh
+#   STAGE2_ENDPOINT= ./run_five_conf_five_mod.sh  # Stage 1 only
 #   ./run_five_conf_five_mod.sh /persistent/results/my_run
 
 set -euo pipefail
@@ -30,8 +31,6 @@ export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
-export STAGE2_ENDPOINT="${STAGE2_ENDPOINT:-}"
-export STAGE2_EXTRACTION_ENDPOINT="${STAGE2_EXTRACTION_ENDPOINT:-}"
 
 # Stage 2 ontology preset for this example. Callers may override any setting
 # through the corresponding environment variable.
