@@ -4,12 +4,10 @@ import inspect
 import numpy as np
 import pytest
 from econml.dml import CausalForestDML
-from econml.grf import CausalForest as EconMLCausalForest
 from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import StratifiedKFold
 
-import oci.models.causal_forest_head as head_module
 from oci.models.causal_forest_head import CausalForestHead
 from oci.models.elastic_net_nuisance import (
     ElasticNetLogisticClassifier,
@@ -23,7 +21,6 @@ from oci.models.strict_causal_forest_runtime import (
     TREATMENT_FOREST_IMPLEMENTATION,
     StrictCausalForestRuntimeConfig,
     assert_supported_constructor_signatures,
-    audit_strict_fitted_estimator,
 )
 
 
@@ -116,16 +113,6 @@ def _runtime_mapping(*, n_jobs=1):
 
 def _runtime(*, n_jobs=1):
     return StrictCausalForestRuntimeConfig.from_mapping(_runtime_mapping(n_jobs=n_jobs))
-
-
-def _binary_runtime(*, n_jobs=1):
-    mapping = _runtime_mapping(n_jobs=n_jobs)
-    mapping["causal_forest"]["discrete_outcome"] = True
-    outcome_model = copy.deepcopy(mapping["causal_forest"]["treatment_model"])
-    outcome_model["criterion"] = "log_loss"
-    outcome_model["max_features"] = 1.0
-    mapping["causal_forest"]["outcome_model"] = outcome_model
-    return StrictCausalForestRuntimeConfig.from_mapping(mapping)
 
 
 def _data():
@@ -239,166 +226,23 @@ def test_installed_constructor_signatures_are_exhaustively_classified():
         )
 
 
-def test_strict_model_constructor_receives_every_explicit_kwarg(monkeypatch):
-    real_cf_signature = inspect.signature(CausalForestDML)
-    real_t_signature = inspect.signature(RandomForestClassifier)
-    real_y_signature = inspect.signature(RandomForestRegressor)
-    real_cv_signature = inspect.signature(StratifiedKFold)
-
-    class FakeTreatmentForest:
-        __signature__ = real_t_signature
-
-        def __init__(self, **kwargs):
-            self.parameters = dict(kwargs)
-
-        def get_params(self, deep=False):
-            assert deep is False
-            return dict(self.parameters)
-
-    class FakeOutcomeForest:
-        __signature__ = real_y_signature
-
-        def __init__(self, **kwargs):
-            self.parameters = dict(kwargs)
-
-        def get_params(self, deep=False):
-            assert deep is False
-            return dict(self.parameters)
-
-    class FakeCrossfit:
-        __signature__ = real_cv_signature
-
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-    class FakeCausalForest:
-        __signature__ = real_cf_signature
-
-        def __init__(self, **kwargs):
-            self.kwargs = dict(kwargs)
-            self.model_t = kwargs["model_t"]
-            self.model_y = kwargs["model_y"]
-            self.cv = kwargs["cv"]
-            for key, value in kwargs.items():
-                if key not in {"model_t", "model_y", "cv"}:
-                    setattr(self, key, value)
-
-    monkeypatch.setattr(head_module, "CausalForestDML", FakeCausalForest)
-    monkeypatch.setattr(head_module, "RandomForestClassifier", FakeTreatmentForest)
-    monkeypatch.setattr(head_module, "RandomForestRegressor", FakeOutcomeForest)
-    monkeypatch.setattr(head_module, "StratifiedKFold", FakeCrossfit)
-
-    config = _runtime()
-    model = CausalForestHead(runtime_config=config)._create_model()
-    assert tuple(model.kwargs) == tuple(inspect.signature(CausalForestDML).parameters)
-    assert tuple(model.model_t.parameters) == tuple(
-        inspect.signature(RandomForestClassifier).parameters
-    )
-    assert tuple(model.model_y.parameters) == tuple(
-        inspect.signature(RandomForestRegressor).parameters
-    )
-    assert set(vars(model.cv)) == set(inspect.signature(StratifiedKFold).parameters)
-
-
-def test_real_strict_fit_audits_attributes_clones_grfs_and_split_hashes():
-    effect, control, treatment, outcome = _data()
-    config = _runtime()
-    head = CausalForestHead(runtime_config=config).fit(
-        X=effect,
-        W=control,
-        T=treatment,
-        Y=outcome,
-    )
-    audit = head.fit_audit()
-
-    assert audit["configuration_mode"] == ("portable_strict_runtime_config_v1")
-    assert audit["scientific_identity_sha256"] == (config.scientific_identity_sha256())
-    assert audit["operational_attestation"] == (config.operational_attestation())
-    assert audit["fit_call_contract"] == {
-        "sample_weight": None,
-        "groups": None,
-        "cache_values": False,
-        "inference": "auto",
-        "fit_call_count": 1,
+def test_causal_forest_head_exposes_only_elastic_net_nuisance_configuration():
+    parameters = inspect.signature(CausalForestHead).parameters
+    retired = {
+        "runtime_config",
+        "nuisance_model_family",
+        "nuisance_n_estimators",
+        "nuisance_max_depth",
+        "nuisance_min_samples_leaf",
+        "nuisance_treatment_max_features",
+        "nuisance_outcome_max_features",
     }
-    assert audit["prediction_contrast"] == {"T0": 0, "T1": 1}
-    split_audit = audit["crossfit_split_audit"]
-    assert len(split_audit["splits"]) == 2
-    assert split_audit == config.split_audit(treatment)
-    fitted = audit["fitted_estimator_audit"]
-    assert len(fitted["fitted_treatment_models"]) == 1
-    assert len(fitted["fitted_treatment_models"][0]) == 2
-    assert len(fitted["fitted_outcome_models"][0]) == 2
-    assert len(fitted["fitted_grf_parameters"]) == 1
-    assert fitted["fitted_grf_parameters"][0]["warm_start"] is False
 
-    top_level_trees = head.model.n_estimators
-    del head.model.n_estimators
-    with pytest.raises(RuntimeError, match="does not expose"):
-        audit_strict_fitted_estimator(
-            model=head.model,
-            config=config,
-            causal_forest_class=CausalForestDML,
-            treatment_forest_class=RandomForestClassifier,
-            outcome_forest_class=RandomForestRegressor,
-            stratified_crossfit_class=StratifiedKFold,
-            grf_class=EconMLCausalForest,
-        )
-    head.model.n_estimators = top_level_trees
-
-    head.model.models_t[0][0].min_samples_leaf += 1
-    with pytest.raises(RuntimeError, match="effective parameters differ"):
-        audit_strict_fitted_estimator(
-            model=head.model,
-            config=config,
-            causal_forest_class=CausalForestDML,
-            treatment_forest_class=RandomForestClassifier,
-            outcome_forest_class=RandomForestRegressor,
-            stratified_crossfit_class=StratifiedKFold,
-            grf_class=EconMLCausalForest,
-        )
-    head.model.models_t[0][0].min_samples_leaf -= 1
-
-    head.model.model_cate.estimators_[0].min_samples_leaf += 1
-    with pytest.raises(RuntimeError, match="effective parameters differ"):
-        audit_strict_fitted_estimator(
-            model=head.model,
-            config=config,
-            causal_forest_class=CausalForestDML,
-            treatment_forest_class=RandomForestClassifier,
-            outcome_forest_class=RandomForestRegressor,
-            stratified_crossfit_class=StratifiedKFold,
-            grf_class=EconMLCausalForest,
-        )
-
-
-def test_real_strict_binary_outcome_uses_classifier_and_joint_stratification():
-    effect, control, treatment, outcome = _data()
-    config = _binary_runtime()
-
-    head = CausalForestHead(runtime_config=config).fit(
-        X=effect,
-        W=control,
-        T=treatment,
-        Y=outcome,
-    )
-    audit = head.fit_audit()
-
-    assert type(head.model.model_y) is RandomForestClassifier
-    assert head.model.discrete_outcome is True
-    assert audit["outcome_model_contract"] == {
-        "outcome_type": "binary",
-        "discrete_outcome": True,
-        "model_class": "sklearn.ensemble.RandomForestClassifier",
-        "prediction_interface": "predict_proba",
-        "criterion": "log_loss",
-    }
-    assert audit["crossfit_split_audit"] == config.split_audit(treatment, outcome)
-    fitted = audit["fitted_estimator_audit"]
-    assert all(
-        model["criterion"] == "log_loss"
-        for model in fitted["fitted_outcome_models"][0]
-    )
+    assert retired.isdisjoint(parameters)
+    with pytest.raises(TypeError, match="runtime_config"):
+        CausalForestHead(runtime_config=_runtime())
+    with pytest.raises(TypeError, match="nuisance_model_family"):
+        CausalForestHead(nuisance_model_family="random_forest")
 
 
 def test_prediction_calls_explicit_binary_treatment_contrast():
@@ -519,94 +363,6 @@ def test_binary_convenience_head_rejects_nonbinary_outcomes():
 
     with pytest.raises(ValueError, match="must contain exactly both 0 and 1"):
         head.fit(effect, treatment, np.array([0.0, 0.2, 0.8, 1.0]))
-
-
-def test_explicit_crossfit_preserves_implicit_cv2_predictions_and_n_jobs():
-    effect, control, treatment, outcome = _data()
-    strict_one = CausalForestHead(runtime_config=_runtime(n_jobs=1)).fit(
-        X=effect,
-        W=control,
-        T=treatment,
-        Y=outcome,
-    )
-    strict_two = CausalForestHead(runtime_config=_runtime(n_jobs=2)).fit(
-        X=effect,
-        W=control,
-        T=treatment,
-        Y=outcome,
-    )
-    strict_repeat = CausalForestHead(runtime_config=_runtime(n_jobs=1)).fit(
-        X=effect,
-        W=control,
-        T=treatment,
-        Y=outcome,
-    )
-    legacy = CausalForestHead(
-        n_estimators=8,
-        max_depth=None,
-        min_samples_leaf=2,
-        max_features="sqrt",
-        honest=True,
-        inference=True,
-        random_state=42,
-        tune_model=False,
-        subforest_size=4,
-        nuisance_model_family="random_forest",
-        nuisance_n_estimators=5,
-        nuisance_max_depth=None,
-        nuisance_min_samples_leaf=2,
-        nuisance_treatment_max_features="sqrt",
-        nuisance_outcome_max_features=1.0,
-        n_jobs=1,
-        outcome_type="continuous",
-    ).fit(
-        X=effect,
-        W=control,
-        T=treatment,
-        Y=outcome,
-    )
-    legacy_parallel = CausalForestHead(
-        n_estimators=8,
-        max_depth=None,
-        min_samples_leaf=2,
-        max_features="sqrt",
-        honest=True,
-        inference=True,
-        random_state=42,
-        tune_model=False,
-        subforest_size=4,
-        nuisance_model_family="random_forest",
-        nuisance_n_estimators=5,
-        nuisance_max_depth=None,
-        nuisance_min_samples_leaf=2,
-        nuisance_treatment_max_features="sqrt",
-        nuisance_outcome_max_features=1.0,
-        n_jobs=2,
-        outcome_type="continuous",
-    ).fit(
-        X=effect,
-        W=control,
-        T=treatment,
-        Y=outcome,
-    )
-    heldout = effect[:12]
-    strict_one_tau = strict_one.predict(heldout, return_ci=False)["tau_pred"]
-    strict_two_tau = strict_two.predict(heldout, return_ci=False)["tau_pred"]
-    strict_repeat_tau = strict_repeat.predict(heldout, return_ci=False)["tau_pred"]
-    legacy_tau = legacy.predict(heldout, return_ci=False)["tau_pred"]
-    legacy_parallel_tau = legacy_parallel.predict(heldout, return_ci=False)["tau_pred"]
-    np.testing.assert_array_equal(strict_one_tau, strict_two_tau)
-    np.testing.assert_array_equal(strict_one_tau, strict_repeat_tau)
-    np.testing.assert_array_equal(strict_one_tau, legacy_tau)
-    assert not np.array_equal(legacy_tau, legacy_parallel_tau)
-    np.testing.assert_allclose(
-        legacy_tau,
-        legacy_parallel_tau,
-        rtol=0.0,
-        atol=2e-15,
-    )
-    assert strict_two.fit_audit()["operational_attestation"]["requested_host_cpu_budget"] == 2
-    assert strict_two.fit_audit()["operational_attestation"]["effective_estimator_n_jobs"] == 1
 
 
 def test_scientific_mutations_change_identity_but_operations_do_not():

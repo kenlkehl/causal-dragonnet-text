@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import math
+import multiprocessing
 import os
 import re
 import threading
@@ -45,6 +46,13 @@ from .stage2_sequential_consolidation import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# Large selectors spend most of their time in Python-level proximal-gradient
+# loops. Outer folds are otherwise orchestrated by threads, which makes those
+# loops contend on the GIL. Isolating one large selector per outer fold keeps
+# the scientific computation unchanged while allowing the independent folds
+# to use separate cores. Small selectors stay in-process to avoid spawn cost.
+STATISTICAL_SELECTION_PROCESS_ISOLATION_MIN_CANDIDATES = 64
 
 EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_single_patient_extraction_v6_conflict_resolution_independent_small_model"
@@ -9377,6 +9385,31 @@ def _extract_outer_heldout_measurements(
     return combined
 
 
+def _run_stage2_statistical_selection(
+    selector_arguments: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], list[Any]]:
+    """Run a large fold selector outside the thread-orchestration GIL."""
+
+    arguments = dict(selector_arguments)
+    candidate_count = len(arguments.get("definitions") or [])
+    if candidate_count < STATISTICAL_SELECTION_PROCESS_ISOLATION_MIN_CANDIDATES:
+        return select_stage2_features_elastic_net(**arguments)
+    LOGGER.info(
+        "Stage 2 statistical selection process isolation candidates=%s threshold=%s",
+        candidate_count,
+        STATISTICAL_SELECTION_PROCESS_ISOLATION_MIN_CANDIDATES,
+    )
+    context = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=context,
+    ) as executor:
+        return executor.submit(
+            select_stage2_features_elastic_net,
+            **arguments,
+        ).result()
+
+
 def run_fold_analysis(
     *,
     dataset: pd.DataFrame,
@@ -9780,16 +9813,18 @@ def run_fold_analysis(
             elastic_net_report,
             _elastic_net_dependencies,
             _elastic_net_latent_states,
-        ) = select_stage2_features_elastic_net(
-            dataset=dataset,
-            extracted_fit=consolidated_fit,
-            definitions=consolidated_definitions,
-            inner_splits=inner_splits,
-            treatment_column=treatment_column,
-            outcome_column=outcome_column,
-            outcome_type=outcome_type,
-            seed=seed,
-            policy=statistical_policy,
+        ) = _run_stage2_statistical_selection(
+            {
+                "dataset": dataset,
+                "extracted_fit": consolidated_fit,
+                "definitions": consolidated_definitions,
+                "inner_splits": inner_splits,
+                "treatment_column": treatment_column,
+                "outcome_column": outcome_column,
+                "outcome_type": outcome_type,
+                "seed": seed,
+                "policy": statistical_policy,
+            }
         )
         measurement_definitions = measurement_definitions_for_selected(
             selected,

@@ -260,6 +260,63 @@ def test_stage2_analysis_defaults_pre_refinement_config_fields(caplog):
     assert "pre-ontology-refinement config" in caplog.text
 
 
+def test_large_statistical_selector_runs_in_spawned_process(monkeypatch):
+    expected = ([{"feature_id": "selected"}], {"status": "complete"}, [], [])
+    calls = []
+
+    def fake_selector(**arguments):
+        calls.append(arguments)
+        return expected
+
+    class FakeFuture:
+        def result(self):
+            return expected
+
+    class FakeExecutor:
+        def __init__(self, *, max_workers, mp_context):
+            assert max_workers == 1
+            assert mp_context == "spawn-context"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def submit(self, function, **arguments):
+            assert function is fake_selector
+            calls.append(arguments)
+            return FakeFuture()
+
+    monkeypatch.setattr(
+        stage2_analysis,
+        "STATISTICAL_SELECTION_PROCESS_ISOLATION_MIN_CANDIDATES",
+        2,
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "select_stage2_features_elastic_net",
+        fake_selector,
+    )
+    monkeypatch.setattr(
+        stage2_analysis.multiprocessing,
+        "get_context",
+        lambda method: "spawn-context" if method == "spawn" else None,
+    )
+    monkeypatch.setattr(
+        stage2_analysis.concurrent.futures,
+        "ProcessPoolExecutor",
+        FakeExecutor,
+    )
+
+    result = stage2_analysis._run_stage2_statistical_selection(
+        {"definitions": [{"feature_id": "one"}, {"feature_id": "two"}]}
+    )
+
+    assert result == expected
+    assert len(calls) == 1
+
+
 def test_stage2_config_parses_independent_large_context_prompt_budgets():
     config = plain_stage2_config_from_mapping(
         {
