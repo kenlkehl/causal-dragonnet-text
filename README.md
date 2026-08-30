@@ -8,6 +8,49 @@ matched-patient models in Stage 1, then uses Stage 2 to interpret that evidence,
 define measurable patient variables, extract them without crossing patient or
 fold boundaries, and estimate causal effects with diagnostics.
 
+## Quickstart: 8× RTX Pro 6000
+
+After cloning OCI and installing its system CUDA and FFmpeg prerequisites, this
+is the managed-vLLM configuration for an eight-GPU RTX Pro 6000 machine. The
+one-confounder, one-effect-modifier run configures GPUs 0–1 as the primary-model
+pool and GPUs 2–7 as the extraction pool:
+
+```bash
+STAGE2_WORKERS=96 \
+PHYSICAL_GPUS=0,1,2,3,4,5,6,7 \
+STAGE2_MODEL=nvidia/Gemma-4-31B-IT-NVFP4 \
+STAGE2_VLLM_GPUS=0,1 \
+STAGE2_VLLM_GPUS_PER_SERVER=1 \
+STAGE2_EXTRACTION_MODEL=google/gemma-4-E4B-it \
+STAGE2_EXTRACTION_VLLM_GPUS=2,3,4,5,6,7 \
+STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER=1 \
+STAGE2_EXTRACTION_WORKERS=128 \
+./run_one_conf_one_mod.sh artifacts/research_all_evidence/one_conf_one_mod_nsclc_full/
+```
+
+Use the same machine configuration for the five-confounder,
+five-effect-modifier run:
+
+```bash
+STAGE2_WORKERS=96 \
+PHYSICAL_GPUS=0,1,2,3,4,5,6,7 \
+STAGE2_MODEL=nvidia/Gemma-4-31B-IT-NVFP4 \
+STAGE2_VLLM_GPUS=0,1 \
+STAGE2_VLLM_GPUS_PER_SERVER=1 \
+STAGE2_EXTRACTION_MODEL=google/gemma-4-E4B-it \
+STAGE2_EXTRACTION_VLLM_GPUS=2,3,4,5,6,7 \
+STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER=1 \
+STAGE2_EXTRACTION_WORKERS=128 \
+./run_five_conf_five_mod.sh artifacts/research_all_evidence/five_conf_five_mod_nsclc_full/
+```
+
+Both wrappers default `MIN_FREE_GPU_GB` to `0`; default
+`OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and
+`NUMEXPR_NUM_THREADS` to `1`; and default `STAGE2_ENDPOINT` and
+`STAGE2_EXTRACTION_ENDPOINT` to empty. Those settings can still be overridden
+in the environment and therefore do not need to be repeated above. The explicit
+vLLM GPU settings enable managed Stage 2 despite the blank endpoint defaults.
+
 ## Installation
 
 OCI supports Python 3.12 and 3.13 and uses
@@ -39,19 +82,19 @@ libraries required by the chosen vLLM/Torch build.
 ## Try the complete Stage 1 → 2 workflow
 
 Stage 2 can use an already-running OpenAI-compatible server or launch its own
-pool of local vLLM servers. The example launcher retains the external-server
-default and expects it at `http://127.0.0.1:8010/v1`; it automatically uses the
-only model advertised by that server's `/models` endpoint. Then run the bundled
-one-confounder, one-effect-modifier NSCLC experiment:
+pool of local vLLM servers. The example launchers default both endpoint
+variables to empty, so a bare invocation runs Stage 1 only. Configure external
+or managed primary and extraction endpoints, as in the quickstart above, to run
+the complete workflow. To run the bundled one-confounder, one-effect-modifier
+NSCLC experiment with the defaults:
 
 ```bash
 ./run_one_conf_one_mod.sh
 ```
 
-That single command synchronizes the environment, discovers visible GPUs and
-their free VRAM, selects every GPU with at least 20 GiB free, sizes Stage 1 CPU
-workers and Stage 2 request concurrency, and runs or resumes the complete
-multi-model workflow. Results default to
+That command synchronizes the environment, discovers visible GPUs and
+their free VRAM, selects every visible GPU, sizes Stage 1 CPU workers, and runs
+or resumes Stage 1. Results default to
 `artifacts/research_all_evidence/one_conf_one_mod_nsclc_full/`.
 
 The most useful overrides are environment variables:
@@ -63,24 +106,30 @@ GPU_COUNT=2 ./run_one_conf_one_mod.sh
 # Use exact host GPU IDs; CUDA remaps these to logical devices for the run.
 PHYSICAL_GPUS=1,3 ./run_one_conf_one_mod.sh
 
-# Use a server on another port and bypass model autodiscovery if needed.
+# Use already-running primary and extraction servers.
 STAGE2_ENDPOINT=http://127.0.0.1:8010/v1 \
+STAGE2_EXTRACTION_ENDPOINT=http://127.0.0.1:8020/v1 \
 STAGE2_MODEL=nvidia/Gemma-4-26B-A4B-NVFP4 \
 ./run_one_conf_one_mod.sh
 
-# Or let the launcher run one vLLM replica on each of eight selected GPUs.
+# Or manage the primary vLLM pool while using an external extractor.
 STAGE2_VLLM_SERVERS=8 \
 STAGE2_MODEL=google/gemma-4-31B-it \
+STAGE2_EXTRACTION_ENDPOINT=http://127.0.0.1:8020/v1 \
 GPU_COUNT=8 \
 ./run_one_conf_one_mod.sh
 ```
 
-`GPU_COUNT` and `PHYSICAL_GPUS` are mutually exclusive. Stage 2 runs independent
-outer folds concurrently and defaults to 32 globally bounded endpoint workers.
+`GPU_COUNT` and `PHYSICAL_GPUS` are mutually exclusive. The wrappers select all
+visible GPUs by default because their `MIN_FREE_GPU_GB` default is `0`. Stage 2
+runs independent outer folds concurrently and defaults to 32 globally bounded
+endpoint workers.
+
 Advanced overrides are `MIN_FREE_GPU_GB`, `STAGE1_WORKERS`, `STAGE2_WORKERS`,
-`DISABLE_HTR`, `STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (set it to an empty
-string for a Stage-1-only run). Managed mode accepts `STAGE2_VLLM_SERVERS`,
-optional `STAGE2_VLLM_GPUS` (the detected logical devices are the default),
+`DISABLE_HTR`, `STAGE1_ARCHITECTURES`, and `STAGE2_ENDPOINT` (leave it empty and
+omit managed vLLM settings for a Stage-1-only run). Managed mode accepts
+`STAGE2_VLLM_SERVERS`, optional `STAGE2_VLLM_GPUS` (the detected logical devices
+are the default),
 `STAGE2_VLLM_DOWNLOAD_DIR`, and a JSON token list in
 `STAGE2_VLLM_EXTRA_ARGS_JSON`. Set
 `OCI_PYTHON` to an existing environment's interpreter to skip `uv sync`. An
@@ -107,6 +156,7 @@ at most two refinement rounds. Override these with
 `STAGE2_CONSOLIDATION_MAX_ROUNDS`,
 `STAGE2_OPERATIONALIZATION_MAX_PROMPT_CHARS`,
 `STAGE2_EXTRACTION_FEATURE_BATCH_SIZE`,
+`STAGE2_MAX_TOKENS`, `STAGE2_EXTRACTION_MAX_TOKENS`,
 `STAGE2_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS`, and
 `STAGE2_MAX_ONTOLOGY_REFINEMENT_ROUNDS`.
 
@@ -149,15 +199,16 @@ not treatment-effect estimates.
 
 **Stage 2 is evidence interpretation and causal operationalization.** It reviews
 the Stage 1 evidence within and across architectures, consolidates supported
-clinical concepts, assigns causal roles from the types of evidence that support
-each concept, defines how each variable will be measured in a complete patient
-record, extracts those values, and fits the study's final causal estimator.
+clinical concepts, defines how each variable will be measured in a complete
+patient record, extracts those values, statistically assigns causal roles, and
+fits the study's final causal forest.
 Stage 2 may be human-led, language-model-assisted, or a combination of the two.
-The simplified runner supplies the language-model-assisted path. It sends
-fold-scoped evidence to one configured OpenAI-compatible endpoint, saves the
-resulting feature definitions as ordinary JSON, extracts the variables, reviews
-their training-fold empirical performance, and completes cross-fitted causal
-estimation. Investigators remain responsible for judging the identification
+The simplified runner supplies the language-model-assisted path. A primary
+OpenAI-compatible endpoint exhaustively interprets fold-scoped semantic cards,
+performs merge-only consolidation, and supervises ontologies. A different small
+endpoint performs the many one-patient extraction calls. Inner-fold regression
+screens assign discovered confounder and modifier roles before cross-fitted
+causal-forest estimation. Investigators remain responsible for judging the identification
 assumptions, clinical validity, overlap, and sensitivity of the resulting
 estimate; the automated review is not a substitute for scientific review.
 
@@ -170,11 +221,12 @@ flowchart LR
     C1 --> D["Stage 1 handoff"]
     C2 --> D
     C3 --> D
-    D --> E["Interpret and reconcile concepts"]
-    E --> F["Define and extract patient-level variables"]
-    F --> G["Route adjustment variables to W and effect modifiers to X"]
-    G --> H["Cross-fitted causal estimation and review"]
-    H --> I["ATE, CATE or ITE estimates with diagnostics"]
+    D --> E["Exhaustively list and merge concepts"]
+    E --> F["Primary model defines ontologies"]
+    F --> G["Small model extracts patient-level values"]
+    G --> H["Group-elastic-net nuisance and candidate-wise interaction screens assign roles"]
+    H --> J["Cross-fitted causal forest"]
+    J --> I["ATE, CATE or ITE estimates with diagnostics"]
 ```
 
 ### Why the stages are separated
@@ -209,22 +261,24 @@ A complete Stage 2 analysis ordinarily performs the following sequence:
    evidence family cannot erase a smaller one. Each compiled card is projected
    to a prompt-local integer and its readable text strings only. The model cites
    those simple integers, which Python maps back to full provenance; discovery
-   does not choose value types or extraction ontologies.
+   lists every supported clinical feature and does not choose causal roles,
+   value types, or extraction ontologies.
 2. It consolidates spelling variants and genuine aliases while preserving
-   clinically distinct measurements.
-3. It compares the resulting architecture-level dossiers and reviews the exact
-   supporting evidence for proposed cross-architecture merges.
-4. It routes grounded concepts to adjustment, prognostic, or treatment-effect
-   heterogeneity roles according to their treatment, outcome, residual-effect,
-   and matched-pair evidence.
-5. It extracts the proposed variables on outer-training records and measures
-   missingness, variation, nuisance-model performance, residual-effect loss,
-   and leave-one-variable-out contributions by inner validation.
-6. It permits a bounded clarification of the extraction definition and repeats
-   training-fold evaluation when a definition changes. The final review round
-   may retain or drop a variable but cannot introduce an unevaluated definition.
+   clinically distinct measurements. Consolidation is merge-only; there is no
+   retrieval filter or candidate cap.
+3. The primary model operationalizes every consolidated candidate as one
+   extractable patient-level scalar ontology.
+4. A separate small model extracts every candidate on the outer-training rows,
+   one patient per prompt.
+5. The primary model reviews only aggregate small-model outputs and validation
+   failures. It may revise the same ontology but cannot add, drop, rename, or
+   role-label a feature.
+6. Inner-fold group elastic nets select discovered confounders from treatment
+   or outcome prediction. Candidate-augmented R-learners rank modifiers by
+   held-out R-loss gain.
+   Investigator-configured roles bypass these gates.
 7. It freezes the retained definitions, applies them to the outer-held-out
-   records, and fits the fold-honest nuisance and effect-modification models.
+   records, and fits the fold-honest nuisance models and causal forest.
 8. It combines held-out AIPW scores across outer folds to estimate the average
    treatment effect and writes row-level conditional effect estimates and
    overlap diagnostics.
@@ -611,10 +665,14 @@ The `run.devices` setting determines GPU-lane concurrency. `run.workers` is the
 overall CPU budget used by TF-IDF and divided among the concurrently active
 text-model lanes. If fewer workers than CUDA devices are requested, each active
 device still requires one controller worker. Stage 2 uses its own
-`stage2.workers` setting for concurrent interpretation requests and
-patient-extraction batches. Independent outer folds run concurrently, while a
-shared request semaphore keeps their combined endpoint concurrency at
-`stage2.workers`. Review rounds within each fold remain ordered.
+`stage2.workers` setting for primary requests,
+`stage2.extraction_llm.workers` for patient extraction. Deterministic Stage 2
+evidence is computed inside each fold. Pairwise evidence uses deterministic,
+checkpointed chunks submitted by all outer folds to one shared loky process
+pool capped by `stage2.workers`. Bounded variable-selection agents use
+the shared primary-request budget. Independent outer folds run concurrently,
+while a shared request semaphore keeps their combined endpoint concurrency at
+`stage2.workers`. Review and role-agent rounds within each fold remain ordered.
 Every Stage 1 context and every expensive Stage 2 batch writes its own
 `complete.json`, so the same scheduling remains resumable after interruption.
 
@@ -640,15 +698,19 @@ NUMEXPR_NUM_THREADS=1 \
 uv run python scripts/run_all_evidence.py \
   --config run.json \
   --stage2-only \
-  --stage2-endpoint http://127.0.0.1:8010/v1
+  --stage2-endpoint http://127.0.0.1:8010/v1 \
+  --stage2-extraction-endpoint http://127.0.0.1:8020/v1
 ```
 
-Set these thread limits before starting Python on high-core-count machines.
-Stage 2 already controls request concurrency with `stage2.workers`; allowing
+Set these thread limits before starting Python directly on high-core-count
+machines. The two synthetic wrapper scripts set all four to `1` by default.
+Stage 2 already controls primary-model request concurrency with `stage2.workers`
+and extraction concurrency with `stage2.extraction_llm.workers`; allowing
 OpenBLAS, OpenMP, MKL, or NumExpr to create another native thread pool per
 concurrent task can exhaust OpenBLAS's thread metadata or memory regions and
-terminate the process. A configured `stage2.model` is reused; otherwise the
-runner discovers the sole model advertised by the endpoint.
+terminate the process. Every live endpoint is probed through `/models`. An
+omitted model is resolved only when exactly one ID is advertised; an explicit
+model must be among the advertised IDs.
 
 A configured endpoint or managed vLLM pool makes the unflagged default a full
 Stage 1 and Stage 2 run. The API key may be stored in `stage2.api_key` or
@@ -658,10 +720,19 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
 {
   "stage2": {
     "endpoint": "http://127.0.0.1:8010/v1",
-    "model": "Qwen/Qwen3-32B",
+    "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
-    "request_timeout": 7200,
-    "max_tokens": 50000,
+    "extraction_llm": {
+      "endpoint": "http://127.0.0.1:8020/v1",
+      "model": "Qwen/Qwen3-4B-Instruct-2507",
+      "api_key": "EMPTY",
+      "workers": 32
+    },
+    "request_timeout": 900,
+    "request_attempt_timeout": 300,
+    "transport_max_attempts": 3,
+    "max_tokens": 100000,
+    "extraction_max_tokens": 75000,
     "max_response_repairs": 10,
     "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
@@ -676,15 +747,26 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
     "consolidation_alphabetical_rounds": 5,
     "consolidation_max_rounds": 55,
     "extraction_feature_batch_size": 10,
+    "extraction_chunk_size_tokens": 50000,
+    "extraction_context_window_tokens": 131072,
+    "extraction_context_margin_tokens": 1024,
     "max_review_rounds": 2,
-    "max_evaluation_rounds": 10,
     "ontology_refinement_min_failure_patients": 3,
     "max_ontology_refinement_rounds": 2,
-    "screening_trees": 200,
-    "stability_selection_rounds": 3,
-    "stability_selection_frequency": 0.6666666667,
-    "effect_modifier_negative_margin_fraction": 0.01,
-    "effect_modifier_negative_fold_fraction": 0.6,
+    "input_temporal_scope": "pre_index_treatment",
+    "statistical_selection": {
+      "l1_ratio": 0.8,
+      "nuisance_selection_rule": "any_inner_fold_union",
+      "modifier_selection_rule": "any_inner_fold_union",
+      "internal_cv_folds": 3,
+      "regularization_grid_size": 16,
+      "optimization_tolerance": 1e-6,
+      "one_standard_error_rule": true,
+      "nuisance_prediction_one_standard_error_rule": false,
+      "modifier_top_n_per_inner_fold": 10,
+      "modifier_ridge_alpha": 10.0,
+      "modifier_continuous_winsor_quantile": 0.005
+    },
     "estimation_trees": 200,
     "explicit_features": []
   },
@@ -697,26 +779,40 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
 `stage2.model` is optional. When it is empty or omitted, Stage 2 queries the
 endpoint's OpenAI-compatible `/models` API and uses the advertised model if
 exactly one model ID is returned. Configure `stage2.model` explicitly when the
-endpoint advertises multiple IDs.
+endpoint advertises multiple IDs. Dataset-backed Stage 2 also requires
+`stage2.extraction_llm`. Its endpoint may differ from the primary endpoint or
+may be the same multi-model endpoint. Its `model` is resolved by the same
+one-model rule when omitted.
 
 ### Pipeline-managed vLLM server pools
 
-To let the pipeline start and stop vLLM itself, omit `stage2.endpoint`, provide
-`stage2.model`, and add `stage2.vllm`. This example launches eight independent
-model replicas, one on each of eight logical GPUs, then distributes all
-concurrent Stage 2 requests round-robin across them:
+The pipeline can independently own the orchestrator and extractor vLLM
+lifecycles. For the orchestrator, omit `stage2.endpoint`, provide
+`stage2.model`, and add `stage2.vllm`. For the extractor, omit
+`stage2.extraction_llm.endpoint`, provide its `model`, and add the nested
+`stage2.extraction_llm.vllm`. This example runs one tensor-parallel orchestrator
+on GPUs 0-1 and two one-GPU extractor replicas on GPUs 2-3:
 
 ```json
 {
   "stage2": {
-    "model": "google/gemma-4-31B-it",
+    "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
+    "vllm_rapid_switch_seconds": 900,
+    "extraction_llm": {
+      "model": "LiquidAI/LFM2.5-2.6B",
+      "workers": 64,
+      "vllm": {
+        "gpus": ["cuda:2", "cuda:3"],
+        "gpus_per_server": 1,
+        "base_port": 8110,
+        "download_dir": "/models/huggingface",
+        "extra_args": ["--gpu-memory-utilization", "0.80"]
+      }
+    },
     "vllm": {
-      "server_count": 8,
-      "gpus": [
-        "cuda:0", "cuda:1", "cuda:2", "cuda:3",
-        "cuda:4", "cuda:5", "cuda:6", "cuda:7"
-      ],
+      "gpus": ["cuda:0", "cuda:1"],
+      "gpus_per_server": 2,
       "base_port": 8010,
       "download_dir": "/models/huggingface",
       "extra_args": [
@@ -731,14 +827,37 @@ concurrent Stage 2 requests round-robin across them:
 }
 ```
 
-The GPU list contains indices in the pipeline's current logical CUDA namespace.
-If the parent was started with `CUDA_VISIBLE_DEVICES`, each child assignment is
-mapped through that setting. GPUs are split into equal, nonoverlapping groups:
-eight servers over eight GPUs gives tensor parallel size 1, while four servers
-over eight GPUs gives tensor parallel size 2. Uneven divisions, duplicate GPUs,
-and more servers than GPUs are rejected before any process starts.
+Each managed role has its own allowed GPU list and `gpus_per_server`
+tensor-parallel width. The configured replica count is derived as
+`len(gpus) / gpus_per_server`;
+`server_count` may also be supplied, but must agree. GPU indices use the
+pipeline's current logical CUDA namespace. If the parent has
+`CUDA_VISIBLE_DEVICES`, each child assignment is mapped through it. Uneven
+divisions, duplicate GPUs within a pool, inconsistent counts, and more servers
+than GPUs are rejected before any process starts.
 
-The managed settings `host`, `base_port` (or an exact `ports` list),
+When both models are managed, Stage 2 initially keeps only one model resident at
+a time. It loads the orchestrator across the ordered union of both GPU lists for
+interpretation and feature definition, checkpoints that work, unloads it, and
+loads the extractor across the same union. Later ontology-supervision barriers
+switch the complete union back to the orchestrator; revised ontologies and
+held-out extraction switch it back to the extractor as needed. Each role
+preserves its configured tensor-parallel width and adds replicas when that width
+evenly divides the union; otherwise it uses one tensor-parallel server across
+the complete union. Added replicas receive consecutive ports in that role's
+configured range.
+
+The runner measures each interval between switches. If consecutive switches are
+less than `stage2.vllm_rapid_switch_seconds` apart (900 seconds by default), it
+stops all-GPU alternation and keeps both models resident for the rest of the run.
+In that fallback, each role uses its exact configured `gpus`,
+`gpus_per_server`, replica count, and ports. Set the value to `0` to disable the
+fallback. Feature-definition-only runs never load the extractor. Resumes use
+`stage2/vllm_servers/model_phase.json` plus ordinary scientific checkpoints to
+reload the required role or retain a previously selected concurrent split.
+
+Both nested managed configurations accept `host`, `base_port` (or an exact
+`ports` list), `internal_port_base`, and `gpus_per_server`. The settings
 `startup_timeout`, `startup_poll_interval`, and `shutdown_timeout` control the
 server lifecycle. `download_dir`, `reasoning_parser`, `language_model_only`, and
 `default_chat_template_kwargs` map directly to their vLLM options. Any remaining
@@ -755,20 +874,37 @@ is explicitly overridden:
   `language_model_only: true`.
 
 Reasoning is selected in each Chat Completions payload instead of in the vLLM
-server command. Interpretation-class requests send
-`reasoning_effort: "high"` by default and omit `max_tokens`; this includes
+server command. Primary-model interpretation requests send
+`reasoning_effort: "high"` by default; this includes
 evidence interpretation and audit, consolidation, operationalization, feature
-review, and ontology refinement. Patient extraction and its category-repair
-requests send `reasoning_effort: "none"` and retain the configured
-`max_tokens` cap (50,000 by default). vLLM maps those request values to Gemma
-4's `enable_thinking` chat-template switch. The two efforts are recorded as
+ontology supervision, category mapping, and ontology refinement. One-patient
+value-extraction requests use the configured small model with
+`reasoning_effort: "none"`. Both models may share an endpoint. Primary-model
+requests receive the configured `max_tokens` output ceiling (100,000 by
+default), while patient extraction receives `extraction_max_tokens` (75,000 by
+default; it may be lowered to a 4,096-token safety cap when an extractor fails
+to emit EOS). These ceilings permit long output but do not force generation to
+their limits. Extraction dynamically lowers that ceiling for a repair attempt
+when retaining it would exceed the remaining context. Stage 2
+detects Qwen 3 (including 3.8), Gemma 4, and LFM 2.5 IDs and sends their
+template-level thinking switch, with portable prompt and request-field
+fallbacks for non-vLLM servers. It parses either separate reasoning fields or
+inline reasoning delimiters. The two efforts are recorded as
 `interpretation_reasoning_effort` and `extraction_reasoning_effort` in the
 Stage 2 configuration. Every Stage 2 completion request also sends the
 configured `repetition_penalty` (1.1 by default).
+For Qwen 3.8, the model-agnostic `high` policy is translated to the endpoint's
+`reasoning_effort: "xhigh"` wire value. Disabled extraction thinking omits the
+wire-level effort enum and uses the family-specific hard-off controls.
 
-A completed response that fails JSON parsing or schema validation receives up
-to `max_response_repairs` validator-guided retries (10 by default), each with
-the concrete validation error. Repair attempts through
+A logical request, including transport retries and validator-guided repair
+turns, is bounded by `request_timeout` (900 seconds by default). Each HTTP call
+is bounded by `request_attempt_timeout` (300 seconds by default), so a
+straggling endpoint can be abandoned and retried. A transport failure receives
+up to `transport_max_attempts` attempts (3 by default). A completed response
+that fails JSON parsing or schema validation receives up to
+`max_response_repairs` validator-guided retries (10 by default), each with the
+concrete validation error. Repair attempts through
 `thinking_after_response_repairs` (5 by default) retain the request's normal
 reasoning policy; later repairs force `reasoning_effort` to at least `high`,
 which enables thinking for the managed vLLM reasoning parsers.
@@ -779,20 +915,43 @@ The equivalent direct CLI invocation is:
 uv run python scripts/run_all_evidence.py \
   --config run.json \
   --stage2-only \
-  --stage2-model google/gemma-4-31B-it \
-  --stage2-vllm-servers 8 \
-  --stage2-vllm-gpus cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7 \
+  --stage2-model Qwen/Qwen3.8-27B \
+  --stage2-vllm-gpus cuda:0,cuda:1 \
+  --stage2-vllm-gpus-per-server 2 \
+  --stage2-vllm-rapid-switch-seconds 900 \
   --stage2-vllm-download-dir /models/huggingface \
   --stage2-vllm-extra-arg=--gpu-memory-utilization \
-  --stage2-vllm-extra-arg=0.90
+  --stage2-vllm-extra-arg=0.90 \
+  --stage2-extraction-model LiquidAI/LFM2.5-2.6B \
+  --stage2-extraction-workers 64 \
+  --stage2-extraction-vllm-gpus cuda:2,cuda:3 \
+  --stage2-extraction-vllm-gpus-per-server 1 \
+  --stage2-extraction-vllm-download-dir /models/huggingface \
+  --stage2-extraction-vllm-extra-arg=--gpu-memory-utilization \
+  --stage2-extraction-vllm-extra-arg=0.80
 ```
 
-The runner waits until every server advertises a model at `/v1/models` before
-starting inference. Logs and the redacted process/GPU/endpoint manifest are
-written under `stage2/vllm_servers/`. On normal completion, interruption, or a
-Stage 2 error, it terminates every managed vLLM process group. The existing
-single external endpoint mode is unchanged, and `stage2.endpoint` and
-`stage2.vllm` are mutually exclusive.
+The runner waits until every server in the active pool advertises its
+configured model at `/v1/models` before inference. Logs and redacted manifests
+are written under `stage2/vllm_servers/orchestrator_all_gpus/`,
+`stage2/vllm_servers/extractor_all_gpus/`,
+`stage2/vllm_servers/orchestrator/`, and
+`stage2/vllm_servers/extractor/`, as applicable. On normal completion,
+interruption, startup failure, or a Stage 2 error, it terminates every managed
+process group. Either role may instead use an external endpoint, so
+managed/external combinations are supported independently. All-GPU staging
+applies only when both roles are pipeline-managed. Within each role, its
+endpoint and vLLM pool are mutually exclusive.
+
+The synthetic-run shell wrappers expose the same split through
+`STAGE2_VLLM_GPUS` and `STAGE2_VLLM_GPUS_PER_SERVER` for the orchestrator, and
+`STAGE2_EXTRACTION_VLLM_GPUS` plus
+`STAGE2_EXTRACTION_VLLM_GPUS_PER_SERVER` for the extractor. Positive
+`STAGE2_VLLM_SERVERS` and `STAGE2_EXTRACTION_VLLM_SERVERS` values may be used
+instead of deriving replica counts, provided they agree with the selected GPU
+lists and GPUs-per-server settings. `STAGE2_VLLM_RAPID_SWITCH_SECONDS` controls
+the adaptive fallback cutoff. Their default public port ranges begin at 8010
+and 8110, respectively.
 
 To guarantee inclusion of an investigator-specified variable, populate
 `stage2.explicit_features` with complete definitions containing `name`,
@@ -801,16 +960,28 @@ To guarantee inclusion of an investigator-specified variable, populate
 same per-fold alias consolidation as discovered candidates. A discovered alias
 is merged into the configured feature and contributes provenance, but the
 configured name, roles, and ontology remain authoritative and no ontology-
-definition request is made for that group. Later empirical review diagnoses
-the feature but cannot drop it or revise its ontology. See
+definition request is made for that group. Aggregate ontology supervision and
+statistical screening cannot drop it, change its roles, or revise its ontology.
+See
 [`docs/all_evidence_workflow.md`](docs/all_evidence_workflow.md) for a complete
 example and validation rules.
 
 Stage 2 extraction is permanently isolated to one patient per model prompt. It
 queries at most `stage2.extraction_feature_batch_size` definitions per prompt
 (10 by default), checkpoints each feature slice, and merges the slices before
-review. The CLI equivalent is `--stage2-extraction-feature-batch-size`.
-Concurrency is controlled by `stage2.workers`; patient batching is not configurable.
+review. A record longer than the available prompt envelope is processed in
+source order with lossless contiguous chunks capped by
+`stage2.extraction_chunk_size_tokens` (50,000 by default). Each validated
+structured extraction becomes the prior state for the next chunk. The planner
+counts the extraction model's chat tokens and shrinks a chunk when definitions
+or carried state need more room under `extraction_context_window_tokens`
+(131,072) and `extraction_context_margin_tokens` (1,024). Chunk results are
+independently checkpointed, so a restart resumes at the first unfinished chunk.
+The extraction model's tokenizer must therefore be available locally under its
+configured model ID (the managed vLLM download directory or Hugging Face cache).
+The CLI equivalents begin with `--stage2-extraction-*`.
+Concurrency is controlled by `stage2.extraction_llm.workers`; patient batching
+is not configurable.
 
 Stage 2 preserves the outer-fold boundary throughout variable construction and
 estimation. Before the first LLM request, its default evidence compiler reuses
@@ -823,6 +994,13 @@ does not load another embedding model beside the serving process. The raw Stage
 reduction audit are written under `stage2/evidence_compilation/`. The compiled
 packet plan is cached and input-fingerprinted for fast, safe restarts.
 
+Stage 2 sends every compiled semantic evidence card to exhaustive feature
+discovery. The primary model must list every pretreatment patient-level clinical
+feature mentioned or implied by the supplied cards, and one evidence item may
+support many candidates. There is no ColBERT routing, evidence-community graph,
+candidate retrieval, candidate-count cap, or causal-role filter. All discovered
+candidates enter merge-only consolidation; oracle metadata never participates.
+
 `semantic_cluster_cards_v2` is the only supported Stage 2 evidence compiler.
 Before any interpretation request, it compares the architectures present in
 each outer fold with the run's frozen Stage 1 selection: either the explicit
@@ -834,8 +1012,8 @@ bundle attestation, checkpoint adoption, or deployment gates. The former
 `raw_packets_v1` option was retired because it merged distinct architectures
 into broad prompt buckets.
 
-Stage 2 then interprets the compiled evidence architectures and consolidates
-the result into operational patient-level definitions. After exact-name
+Stage 2 then consolidates the candidates discovered from compiled packets into
+operational patient-level definitions. After exact-name
 coalescing, consolidation alphabetically sorts candidates into batches of 20
 by default, applies each batch's merge directives, re-sorts the consolidated
 versions, and repeats for up to 55 rounds. The first five rounds shift
@@ -848,13 +1026,9 @@ candidate: every unmerged feature passes through unchanged. Explicit
 investigator-configured features are hard invariants in every round: they
 cannot be renamed, distinct configured features cannot be merged, and their
 supplied ontology and roles remain authoritative. Python deterministically carries supporting packets,
-architectures, evidence axes, causal roles, descriptions, and original-candidate
-dispositions through the rounds. Only after iterative consolidation does a
-separate deterministic filter remove groups without an evidence-supported
-causal role, recording its decisions in
-`consolidation/causal_role_filter.json`. There is no feature-count selection
-step, and causal roles are derived after iterative grouping so complementary
-evidence can combine. Finally, independent one-feature requests receive only the
+architectures, evidence axes, descriptions, and original-candidate dispositions
+through the rounds. Discovered features have no causal role at this point;
+roles are assigned only by the later statistical screens. Finally, independent one-feature requests receive only the
 canonical feature name and a deduplicated flat list of readable supporting-text
 strings. The model decides the value type, units or allowed categories,
 measurement rule, and missingness handling from that evidence; packet structure,
@@ -868,7 +1042,7 @@ records the available, included, omitted, and truncated evidence counts plus a
 fingerprint of all available evidence. A malformed ontology still receives the
 bounded repair attempts; if it remains invalid, Python records an explicit
 fallback artifact and uses a conservative `ambiguous` ontology for training-fold
-extraction and review instead of aborting the outer fold.
+extraction and aggregate supervision instead of aborting the outer fold.
 Every consolidation round/batch and one-group operationalization request is
 input-fingerprinted separately, so a retry skips successful leaves instead of
 repeating the whole fan-out. Batch size and maximum rounds are configurable as
@@ -880,12 +1054,13 @@ reused output omitted from its own merge inputs. Degenerate one-feature merges
 are ignored. If one batch remains structurally invalid after bounded repairs,
 that batch is recorded as a conservative passthrough and all its candidates are
 retained, so a malformed optional consolidation response cannot discard an
-explicit feature or abort the fold. Stage 2 then extracts the variables on the
-outer training rows and measures missingness, variation, treatment prediction,
-outcome prediction, and residual-effect performance by inner validation. A
+explicit feature or abort the fold.
+
+The small extraction endpoint then extracts every consolidated candidate on the
+outer-training records, one patient per prompt. A
 feature defined as continuous may preserve a documented category or threshold
 when the record has no exact number. When both numeric and categorical values
-appear, a separate LLM harmonization step sees only outer-training values and
+appear, a primary-model harmonization step sees only outer-training values and
 chooses one common continuous or categorical ontology. The validated plan is
 then frozen and applied deterministically to training and held-out rows;
 categorical ranges are not silently coerced to invented numeric midpoints.
@@ -898,28 +1073,80 @@ a valid prior plan is retained with unresolved new tokens mapped to null, while
 a feature without a prior plan retains its raw mixed values under
 `continuous_with_categorical_fallback` modeling. Final fold definitions and the
 run summary retain these fallback records for audit.
-Leave-one-feature-out measurements show whether each variable improves or
-degrades the complete extracted feature set.
 
-Feature retention uses repeated random-forest screens scored only on
-inner-held-out rows. Confounder and prognostic roles must earn stable positive
-support. Because modifiers are harder to detect, an effect modifier is retained
-unless repeated screens show R-loss deterioration beyond the configured
-negative margin with consistent negative folds. An LLM drop cannot bypass this
-stability gate. Propensity, outcome, and treatment-effect models all use forests
-when feature columns exist. Investigator-configured features remain immutable.
-The language model may revise an extraction definition for at most
-`max_review_rounds`. Every definition, modeling-representation, role, or feature
-set change—including an ordinary drop—forces another extraction/evaluation
-round. After the final allowed language-model review, evaluation-only rounds
-continue until stability selection is complete and the retained feature set is
-unchanged, so the final set is always rescored. An outer fold is limited to
-`max_evaluation_rounds` total cycles (10 by default); reaching that cap without
-convergence writes a non-convergence flag to `review/convergence.json` and
-continues with the latest retained definitions. The flag is also carried in
-`final_definitions.json`, the outer-fold completion record, and the run summary's
-`nonconverged_outer_folds`; if the definitions changed in the capped final
-round, the final training extraction is refreshed before held-out estimation.
+The primary model then reviews each candidate's aggregate extracted values and
+validation failures. It receives no patient text, treatment or outcome values,
+causal-role evidence, performance metric, or p-value. It may keep or revise the
+same candidate's description, value type, categories or unit, measurement rule,
+and missingness rule, but cannot add, drop, split, merge, rename, or role-label a
+feature. Any revision triggers small-model re-extraction. This bounded
+supervision runs for at most `max_review_rounds` (two by default), and explicit
+investigator ontologies are locked.
+
+Re-extraction is incremental: only candidates whose prompt-facing extraction
+definition changed are sent back through the small model. Their columns are
+merged into the cached raw training matrix, while unchanged candidate columns
+are reused. Prompts still contain exactly one patient; feature batching within
+that patient is unchanged.
+
+Stage 2 first performs an optional sequential consolidation after the extracted
+candidate ontology is frozen and before any supervised role selection. For each
+still-active candidate, a local embedding model retrieves the ten nearest
+currently active candidates by default. Mixed-type pairwise association evidence
+is calculated from outer-training rows only, and the primary model either leaves
+the cluster unchanged or defines a canonical representation of truly equivalent
+measurement aliases. Every source pair must have association of at least 0.85 by
+default, but association is only a necessary condition. Broader/narrower
+concepts, components and totals, and merely related variables cannot be merged.
+An accepted alias must preserve value type, category granularity, units, and
+missingness; it is populated immediately from a validated coalesce or lossless
+category-recode rule. A nominal categorical recode may use the union of
+source vocabularies, and continuous coalescing skips malformed nonnumeric source
+values in favor of the next valid alias. On every row where multiple valid
+sources are nonmissing, their numeric values or canonical recoded categories
+must agree; a conflict rejects the replacement instead of silently letting the
+first source win. The canonical measurement replaces its
+sources in the active pool and can be
+retrieved by later candidates. Original columns and recursive lineage remain
+available for audit and held-out reconstruction. Configured explicit features
+are protected from replacement.
+
+Stage 2 then assigns modeling roles deterministically. In every inner fold, a logistic group elastic net predicts treatment
+and a separate group elastic net predicts the marginal outcome. Continuous and
+ordered measurements are standardized single-score groups, while every nominal
+factor's standardized contrasts and missingness indicator form one all-in/all-out
+group. Any feature group selected in at least one inner fold for either task
+enters the outer fold's confounder union; intersection and vote-frequency
+thresholds are not gates. Both the propensity and outcome nuisance models use
+that same union. Reports include inner-heldout and pooled out-of-fold AUROC as
+well as log loss for binary nuisance tasks.
+
+Inner-fold grouped elastic nets produce cross-fitted propensity and marginal-
+outcome predictions. For every candidate, candidate-specific grouped elastic-
+net calibration layers augment both nuisances using only inner-fold training
+data. A ridge-stabilized R-learner compares a constant-effect model with a model
+that jointly adds all estimable candidate interaction contrasts, and scores the
+gain on untouched inner-heldout rows. The ten largest held-out R-loss gains enter
+each inner fold's set by default, without a sign or p-value gate; their
+deduplicated union (at most 50 candidates for five inner folds) becomes the outer
+fold's causal-forest modifier set. The nuisance screens continue to use the
+one-standard-error rule for sparse confounder discovery, while nuisance
+prediction defaults to the minimum-CV-loss elastic net.
+
+The consolidation agent never receives treatment, outcome, or outer-heldout
+rows; pairwise associations are used only for this unsupervised replacement
+decision and never as a causal-role screen. Investigator-configured roles remain
+locked. All supplied measurements must satisfy the persisted
+`pre_index_treatment` invariant, and outer-heldout rows remain unavailable until
+the selected definitions and model roles are frozen.
+
+Group-elastic-net selection writes its own input fingerprint and completion
+marker, so an interrupted run resumes independently. Endpoint URLs are transport
+details and may change between resumes. The root `model_identity.json` records
+the model IDs used for upstream interpretation and extraction. Completed
+interpretation, consolidation, and operationalized feature definitions remain
+reusable because statistical-selection settings do not participate in their
+fingerprints.
 
 Each patient extraction also records feature-attributable validation failures.
 After the training patients finish, Stage 2 aggregates repeated failures across
@@ -933,24 +1160,40 @@ or response-envelope failures are reported separately and never treated as
 ontology evidence. Explicit investigator-supplied ontologies remain immutable
 and are only audited when they repeatedly fail.
 
-Only after this review has ended is the final definition applied to the outer
-held-out records. Nuisance models for treatment and potential outcomes are fit
-without using those held-out outcomes. The fold result contains held-out
-propensities, potential-outcome predictions, AIPW scores, and conditional effect
-estimates. Combining the held-out rows across outer folds produces the final
-average treatment effect and its confidence interval.
+Each refinement pass re-extracts only the features whose extraction definitions
+changed, then merges those refreshed columns with the unchanged cached columns.
+Failure summaries are merged on the same boundary: refreshed features replace
+their old patterns, while unchanged-feature and structural failures remain
+available to later supervision.
+
+Only after supervision and inner-fold selection end are the retained definitions
+applied to outer-held-out records. The final heterogeneous-effect model is an
+honest `CausalForestDML`: effect modifiers form its heterogeneity matrix and
+pure confounders form its controls (a dual-role variable is represented once in
+the heterogeneity matrix). If no modifier survives, a constant effect design
+keeps the final model a causal forest. Cross-validated elastic-net nuisance
+models are fit without using outer-held-out outcomes and produce held-out
+propensities, potential-outcome predictions, and AIPW scores. `CausalForestDML`
+cross-fits the same nuisance family internally. The causal forest supplies
+held-out conditional effects and confidence intervals; combining outer-held-out
+AIPW scores across folds supplies the reported cross-fitted average treatment
+effect and confidence interval. The retired strict random-forest runtime-config
+module is not an alternate estimator path. Fold diagnostics audit every fitted
+elastic-net nuisance clone, including effective CV folds, selected
+regularization, and optimizer iteration-limit status.
 
 ```mermaid
 flowchart LR
-    A["Stage 1 evidence<br/>for one outer fold"] --> B["Operational variable definitions"]
-    B --> C["Extract outer-training records"]
-    C --> H["Aggregate repeated<br/>feature-level failures"]
-    H -->|"ontology revised"| C
-    H -->|"stable"| D["Inner-fold predictive and R-loss review"]
-    D -->|"revise, if another round remains"| B
-    D -->|"freeze"| E["Extract outer-held-out records"]
-    E --> F["Held-out nuisance predictions and AIPW score"]
-    F --> G["Aggregate all outer folds"]
+    A["Semantic evidence cards<br/>for one outer fold"] --> B["Exhaustive primary-model<br/>feature listing"]
+    B --> C["Merge-only consolidation<br/>and operationalization"]
+    C --> D["Small model extracts every candidate<br/>on outer-training records"]
+    D --> E["Primary model reviews<br/>aggregate ontology"]
+    E -->|"ontology revised"| D
+    E -->|"frozen"| F["Sequential equivalence-only<br/>alias consolidation"]
+    F --> G["Group-elastic-net nuisance screens<br/>and top-N interaction selection"]
+    G --> H["Small model extracts retained<br/>outer-held-out dependencies"]
+    H --> I["Causal forest and<br/>held-out AIPW scores"]
+    I --> J["Aggregate all outer folds"]
 ```
 
 ### Output and interruption recovery
@@ -986,14 +1229,11 @@ nsclc_all_evidence/
       outer_001_inner_001/...
       evidence.jsonl
       complete.json
-  stage1_architectures/
+  stage1_architectures/              # explicit --architectures runs only
     manifest.json
     bow_nuisance/evidence.jsonl
     ...
   handoff/
-    text_models.jsonl
-    tfidf.jsonl
-    neural_queries.jsonl
     evidence.jsonl
     index.json
     complete.json
@@ -1006,19 +1246,40 @@ nsclc_all_evidence/
       architectures/.../metrics.jsonl
   stage2/
     config.json
+    evidence_compilation/
+      packets.jsonl
+      outer_001/{cards,members,lineage}.jsonl
     outer_001/
+      input_packets.jsonl
       interpretations/...
+      consolidation/...
       feature_definitions.json
-      review/
+      ontology_supervision/
+        supervisor_cache/<fingerprint-prefix>/<fingerprint>/...
         round_001/
-          extraction/extracted.csv
-          extraction_summary.json
-          performance.json
-          review.json
+          extraction/...
+          aggregate_extraction_summary.json
+          supervisor/...
           complete.json
+        convergence.json
+      preselection/                 # present after guarded reselection
+        input.json
+        complete.json
+      selection/
+        candidate_consolidation/
+          input.json
+          steps/...
+          registry.json
+          report.json
+          complete.json
+        elastic_net_selection.json
+        selected_definitions.json
+        measurement_definitions.json
+        selected_latent_states.json       # selected latents and recursive ancestors
       final_definitions.json
       extraction/
-        heldout/extracted.csv
+        fit/extracted.csv
+        heldout/harmonized.csv
         extracted_features.csv
       estimation/
         predictions.csv
@@ -1031,6 +1292,8 @@ nsclc_all_evidence/
     posthoc_oracle_ite_metrics.json
     causal_estimate.json
     summary.json
+    reselection_state.json          # present after guarded reselection
+    reselection_archives/...
     complete.json
 ```
 
@@ -1038,10 +1301,38 @@ nsclc_all_evidence/
 written to `logs/workflow.log`, and model-specific intermediate results are kept
 under `components/<name>/`. Stage 2's intermediate scientific results are under
 the current `stage2/outer_NNN/` directory: this is the direct place to inspect
-the variables, extraction summaries, performance measurements, and fold-level
-estimates. If a process is interrupted, rerunning the same command skips each
-completed interpretation batch, extraction batch, review round, and fold
-estimate, then re-enters the first incomplete directory.
+the candidates, aggregate ontology reviews, elastic-net stability diagnostics,
+selected roles, extractions, and causal-forest estimates. If a process is
+interrupted, rerunning the same command skips each completed interpretation,
+consolidation, extraction, ontology-supervision, and estimation leaf, then
+re-enters the first incomplete directory. Across ontology rounds, aggregate
+supervisor decisions are reused only when the feature definition, extraction
+summary, failure pattern, and request identity have the same fingerprint.
+Checkpoints produced by the former request-exhaustion-as-null behavior are
+retained under `superseded_infrastructure_*` names and only those affected
+leaves are requested again.
+
+To replace role selection on a completed run without repeating interpretation,
+ontology supervision, or all-candidate outer-training extraction, use the saved
+configuration with guarded reselection:
+
+```bash
+uv run python scripts/run_all_evidence.py \
+  --config /path/to/completed_run/run_config.json \
+  --stage2-only \
+  --stage2-reselect
+```
+
+All outer folds are verified before anything is moved. The prior selector,
+held-out extraction, estimates, and aggregate results are retained under
+`stage2/reselection_archives/`; validated post-ontology definitions and training
+matrices are frozen under each fold's `preselection/` directory together with a
+fingerprinted manifest of archived raw held-out measurements. A cache mismatch
+aborts instead of repeating initial work, and an interrupted migration resumes
+from `stage2/reselection_state.json`. Use the same primary and extraction model
+IDs as the completed run; endpoint URLs and worker counts may change. Matching
+held-out component columns are reused, and only missing or
+definition-incompatible components are re-extracted before estimation is rerun.
 
 When the input dataset contains `true_ite_prob`, Stage 2 evaluates its frozen
 cross-fitted `estimated_cate` values against that oracle only after all modeling
@@ -1053,9 +1344,10 @@ oracle-free; the joined audit data is written separately to
 the metrics file records that the evaluation is unavailable.
 
 The stable boundary between the stages is `handoff/evidence.jsonl`.
-`handoff/index.json` identifies the contributing files, and the uncombined
-per-component JSONL files remain beside it. Python consumers can stream the
-combined handoff without loading it into memory:
+`handoff/index.json` references the contributing component files in place, so
+the handoff retains only that combined boundary instead of adding three more
+full-size per-component copies. Python consumers can stream the combined
+handoff without loading it into memory:
 
 ```python
 from oci.inference.research_all_evidence_workflow import iter_stage1_handoff
@@ -1064,11 +1356,12 @@ for evidence_context in iter_stage1_handoff("/results/nsclc_all_evidence"):
     process(evidence_context)
 ```
 
-The additive `stage1_architectures/` contract is the architecture-oriented
-view of the same frozen evidence. Its manifest records the selected lanes,
-private support services, producer artifacts, hashes, and row-score sidecars.
-Targeted runs use these canonical envelopes as the handoff itself; legacy runs
-retain their existing component handoff and receive the sidecars additively.
+For an explicit `--architectures` selection, `stage1_architectures/` is the
+architecture-oriented view of the same frozen evidence. Its manifest records
+the selected lanes, private support services, producer artifacts, hashes, and
+row-score sidecars, and its compact canonical envelopes become the handoff.
+Legacy enable-flag runs stream the component evidence directly and skip this
+redundant materialization.
 
 To inspect status without starting work, use `--status`. To intentionally rerun
 a component, use `--rerun COMPONENT`. This removes completion markers but leaves

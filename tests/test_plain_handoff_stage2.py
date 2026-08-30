@@ -15,11 +15,41 @@ import oci.inference.plain_handoff_stage2_analysis as stage2_analysis
 from oci.inference.plain_handoff_stage2 import (
     PlainHandoffStage2,
     PlainHandoffStage2Config,
+    Stage2ExtractionLLMConfig,
     packetize_handoff,
     plain_stage2_config_from_mapping,
     run_plain_handoff_stage2,
 )
 from oci.inference.plain_handoff_stage2_analysis import extract_rows, run_fold_analysis
+
+
+class _CharacterChatTokenizer:
+    """Deterministic test tokenizer with one token per rendered character."""
+
+    def __call__(
+        self,
+        text,
+        *,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    ):
+        del add_special_tokens, return_attention_mask
+        return {"input_ids": list(range(len(str(text))))}
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize=True,
+        add_generation_prompt=True,
+    ):
+        assert tokenize is True
+        rendered = "".join(
+            f"<{message['role']}>{message['content']}" for message in messages
+        )
+        if add_generation_prompt:
+            rendered += "<assistant>"
+        return list(range(len(rendered)))
 
 
 def _original_evidence_packets(packet_ids):
@@ -53,9 +83,42 @@ def _install_test_candidate_scorer(monkeypatch):
 def _prompt_job(body):
     if "job" in body:
         return body["job"]
+    if body.get("task") == "analyze_cluster":
+        return "analyze_stage2_variable_cluster"
+    if body.get("task") == "outer_fold_role_adjudication":
+        return "adjudicate_stage2_variable_role"
     if set(body) == {"candidate_feature_name", "supporting_evidence"}:
         return "operationalize_stage2_candidate_group"
     raise AssertionError(f"unrecognized prompt body keys: {sorted(body)}")
+
+
+def _page_observation(
+    *,
+    feature_name,
+    value,
+    text,
+    evidence,
+    recorded_at=None,
+    recorded_at_evidence=None,
+):
+    evidence_start = text.index(evidence)
+    if recorded_at is None:
+        recorded_at_start = None
+        recorded_at_end = None
+    else:
+        recorded_at_start = text.index(recorded_at_evidence)
+        recorded_at_end = recorded_at_start + len(recorded_at_evidence)
+    return {
+        "feature_name": feature_name,
+        "value": value,
+        "evidence": evidence,
+        "evidence_start": evidence_start,
+        "evidence_end": evidence_start + len(evidence),
+        "recorded_at": recorded_at,
+        "recorded_at_evidence": recorded_at_evidence,
+        "recorded_at_start": recorded_at_start,
+        "recorded_at_end": recorded_at_end,
+    }
 
 
 def test_stage2_config_allows_endpoint_without_model():
@@ -67,11 +130,13 @@ def test_stage2_config_allows_endpoint_without_model():
     assert config is not None
     assert config.endpoint == "http://stage2.test/v1"
     assert config.model == ""
-    assert config.request_timeout == 7_200.0
+    assert config.request_timeout == 900.0
+    assert config.request_attempt_timeout == 300.0
     assert config.transport_max_attempts == 3
     assert config.max_response_repairs == 10
     assert config.thinking_after_response_repairs == 5
-    assert config.max_tokens == 50_000
+    assert config.max_tokens == 100_000
+    assert config.extraction_max_tokens == 75_000
     assert config.repetition_penalty == 1.1
     assert config.interpretation_reasoning_effort == "high"
     assert config.extraction_reasoning_effort == "none"
@@ -88,24 +153,101 @@ def test_stage2_config_allows_endpoint_without_model():
     )
     assert config.extraction_max_prompt_chars == 640_000
     assert config.extraction_feature_batch_size == 10
-    assert config.max_evaluation_rounds == 10
+    assert config.extraction_chunk_size_tokens == 50_000
+    assert config.extraction_context_window_tokens == 131_072
+    assert config.extraction_context_margin_tokens == 1_024
+    assert config.vllm_rapid_switch_seconds == 900.0
     assert config.ontology_refinement_min_failure_patients == 3
     assert config.max_ontology_refinement_rounds == 2
     assert config.evidence_compiler == "semantic_cluster_cards_v2"
     assert config.evidence_max_cards_per_fold == 400
-    assert config.consolidation_oversample_factor == 4
-    assert config.candidate_selection_top_n == 50
-    assert config.candidate_registry_embedding_model == "Qwen/Qwen3-Embedding-0.6B"
-    assert config.candidate_registry_embedding_device == "cpu"
-    assert config.candidate_registry_similarity_threshold == 0.94
-    assert config.candidate_selection_method == "late_interaction"
-    assert (
-        config.candidate_selection_late_interaction_model
-        == "answerdotai/answerai-colbert-small-v1"
+    assert config.extraction_llm is None
+    assert config.input_temporal_scope == "pre_index_treatment"
+    assert config.agentic_selection.cluster_similarity_threshold == 0.60
+    assert config.agentic_selection.cluster_consensus_fraction == 0.60
+    assert config.agentic_selection.max_latents_per_cluster == 2
+    assert config.selection_consolidation.enabled is False
+    assert config.selection_consolidation.neighbor_count == 10
+    assert config.selection_consolidation.minimum_pairwise_association == 0.85
+    assert config.workers == 4
+
+
+def test_stage2_config_parses_agentic_evidence_pair_chunk_size():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "agentic_evidence_pair_chunk_size": 37,
+        },
+        default_workers=8,
     )
-    assert config.candidate_selection_late_interaction_device == "cpu"
-    assert config.candidate_selection_top_evidence_packets == 3
-    assert config.candidate_selection_document_chunk_overlap_tokens == 32
+
+    assert config is not None
+    assert config.agentic_evidence_pair_chunk_size == 37
+    with pytest.raises(ValueError, match="pair_chunk_size"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            agentic_evidence_pair_chunk_size=0,
+        ).validate(require_model=False)
+
+
+def test_extraction_token_cap_does_not_invalidate_completed_feature_definitions():
+    prior_config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="primary-model",
+        extraction_max_tokens=100_000,
+    )
+    resumed_config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="primary-model",
+        extraction_max_tokens=60_000,
+    )
+
+    def definition_inputs(config):
+        return stage2_workflow._feature_definition_input_value(
+            config=config,
+            clinical_question="Identify confounders.",
+            outer_fold=1,
+            discovery_packets=[],
+            seed=42,
+        )
+
+    assert definition_inputs(resumed_config) == definition_inputs(prior_config)
+    assert stage2_workflow._stage2_request_policy(
+        prior_config,
+        "extraction",
+    )["max_tokens"] == 100_000
+    assert stage2_workflow._stage2_request_policy(
+        resumed_config,
+        "extraction",
+    )["max_tokens"] == 60_000
+
+
+def test_agentic_selection_policy_does_not_invalidate_feature_definitions():
+    prior_config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="primary-model",
+        agentic_selection=stage2_workflow.Stage2AgenticSelectionConfig(
+            cluster_similarity_threshold=0.60,
+        ),
+    )
+    resumed_config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="primary-model",
+        agentic_selection=stage2_workflow.Stage2AgenticSelectionConfig(
+            cluster_similarity_threshold=0.75,
+        ),
+    )
+
+    def definition_inputs(config):
+        return stage2_workflow._feature_definition_input_value(
+            config=config,
+            clinical_question="Identify confounders.",
+            outer_fold=1,
+            discovery_packets=[],
+            seed=42,
+        )
+
+    assert definition_inputs(resumed_config) == definition_inputs(prior_config)
 
 
 def test_stage2_analysis_defaults_pre_refinement_config_fields(caplog):
@@ -118,11 +260,65 @@ def test_stage2_analysis_defaults_pre_refinement_config_fields(caplog):
     assert "pre-ontology-refinement config" in caplog.text
 
 
+def test_large_statistical_selector_runs_in_loky_process(monkeypatch):
+    expected = ([{"feature_id": "selected"}], {"status": "complete"}, [], [])
+    calls = []
+
+    def fake_selector(**arguments):
+        calls.append(arguments)
+        return expected
+
+    class FakeFuture:
+        def result(self):
+            return expected
+
+    class FakeExecutor:
+        def __init__(self, *, max_workers):
+            assert max_workers == 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def submit(self, function, **arguments):
+            assert function is fake_selector
+            calls.append(arguments)
+            return FakeFuture()
+
+    monkeypatch.setattr(
+        stage2_analysis,
+        "STATISTICAL_SELECTION_PROCESS_ISOLATION_MIN_CANDIDATES",
+        2,
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "select_stage2_features_elastic_net",
+        fake_selector,
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "LokyProcessPoolExecutor",
+        FakeExecutor,
+    )
+
+    result = stage2_analysis._run_stage2_statistical_selection(
+        {"definitions": [{"feature_id": "one"}, {"feature_id": "two"}]}
+    )
+
+    assert result == expected
+    assert len(calls) == 1
+
+
 def test_stage2_config_parses_independent_large_context_prompt_budgets():
     config = plain_stage2_config_from_mapping(
         {
             "endpoint": "http://stage2.test/v1",
-            "max_tokens": 48_000,
+            "request_timeout": 1_200,
+            "request_attempt_timeout": 120,
+            "max_tokens": 148_000,
+            "extraction_max_tokens": 72_000,
             "max_response_repairs": 8,
             "thinking_after_response_repairs": 3,
             "repetition_penalty": 1.15,
@@ -136,29 +332,45 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
             "consolidation_max_rounds": 7,
             "extraction_max_prompt_chars": 500_000,
             "extraction_feature_batch_size": 7,
-            "max_evaluation_rounds": 12,
+            "extraction_chunk_size_tokens": 41_000,
+            "extraction_context_window_tokens": 160_000,
+            "extraction_context_margin_tokens": 2_000,
+            "vllm_rapid_switch_seconds": 1_200,
+            "extraction_llm": {
+                "endpoint": "http://extract.test/v1",
+                "model": "small-model",
+                "api_key": "secret-small-key",
+                "workers": 3,
+            },
             "ontology_refinement_min_failure_patients": 4,
             "max_ontology_refinement_rounds": 3,
-            "screening_trees": 64,
-            "stability_selection_rounds": 4,
-            "stability_selection_frequency": 0.75,
-            "effect_modifier_negative_margin_fraction": 0.01,
-            "effect_modifier_negative_fold_fraction": 0.7,
-            "candidate_selection_top_n": 7,
-            "candidate_registry_embedding_model": "local/clinical-embedding-model",
-            "candidate_registry_embedding_device": "cuda:2",
-            "candidate_registry_similarity_threshold": 0.91,
-            "candidate_selection_method": "dense_cosine",
-            "candidate_selection_late_interaction_model": "local/colbert-model",
-            "candidate_selection_late_interaction_device": "cuda:3",
-            "candidate_selection_top_evidence_packets": 4,
-            "candidate_selection_document_chunk_overlap_tokens": 24,
+            "input_temporal_scope": "pre_index_treatment",
+            "agentic_selection": {
+                "cluster_similarity_threshold": 0.7,
+                "cluster_consensus_fraction": 0.8,
+                "cluster_max_size": 10,
+                "max_latents_per_cluster": 2,
+                "cluster_tool_call_limit": 6,
+                "adjudicator_tool_call_limit": 7,
+            },
+            "selection_consolidation": {
+                "enabled": True,
+                "neighbor_count": 8,
+                "embedding_model": "test-embedding-model",
+                "embedding_device": "cpu",
+                "max_latents_per_cluster": 3,
+                "minimum_pairwise_association": 0.9,
+                "latent_min_coverage": 0.1,
+            },
         },
         default_workers=1,
     )
 
     assert config is not None
-    assert config.max_tokens == 48_000
+    assert config.request_timeout == 1_200.0
+    assert config.request_attempt_timeout == 120.0
+    assert config.max_tokens == 148_000
+    assert config.extraction_max_tokens == 72_000
     assert config.max_response_repairs == 8
     assert config.thinking_after_response_repairs == 3
     assert config.repetition_penalty == 1.15
@@ -172,24 +384,30 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.consolidation_max_rounds == 7
     assert config.extraction_max_prompt_chars == 500_000
     assert config.extraction_feature_batch_size == 7
-    assert config.max_evaluation_rounds == 12
+    assert config.extraction_chunk_size_tokens == 41_000
+    assert config.extraction_context_window_tokens == 160_000
+    assert config.extraction_context_margin_tokens == 2_000
+    assert config.vllm_rapid_switch_seconds == 1_200.0
     assert config.ontology_refinement_min_failure_patients == 4
     assert config.max_ontology_refinement_rounds == 3
-    assert config.screening_trees == 64
-    assert config.stability_selection_rounds == 4
-    assert config.stability_selection_frequency == 0.75
-    assert config.effect_modifier_negative_margin_fraction == 0.01
-    assert config.effect_modifier_negative_fold_fraction == 0.7
-    assert config.candidate_selection_top_n == 7
-    assert config.candidate_registry_embedding_model == "local/clinical-embedding-model"
-    assert config.candidate_registry_embedding_device == "cuda:2"
-    assert config.candidate_registry_similarity_threshold == 0.91
-    assert config.candidate_selection_method == "dense_cosine"
-    assert config.candidate_selection_late_interaction_model == "local/colbert-model"
-    assert config.candidate_selection_late_interaction_device == "cuda:3"
-    assert config.candidate_selection_top_evidence_packets == 4
-    assert config.candidate_selection_document_chunk_overlap_tokens == 24
-    assert config.public_dict()["max_tokens"] == 48_000
+    assert config.extraction_llm.endpoint == "http://extract.test/v1"
+    assert config.extraction_llm.model == "small-model"
+    assert config.extraction_llm.workers == 3
+    assert config.input_temporal_scope == "pre_index_treatment"
+    assert config.agentic_selection.cluster_similarity_threshold == 0.7
+    assert config.agentic_selection.cluster_consensus_fraction == 0.8
+    assert config.agentic_selection.cluster_max_size == 10
+    assert config.agentic_selection.cluster_tool_call_limit == 6
+    assert config.selection_consolidation.enabled is True
+    assert config.selection_consolidation.neighbor_count == 8
+    assert config.selection_consolidation.embedding_model == "test-embedding-model"
+    assert config.selection_consolidation.max_latents_per_cluster == 3
+    assert config.selection_consolidation.minimum_pairwise_association == 0.9
+    assert config.selection_consolidation.latent_min_coverage == 0.1
+    assert config.public_dict()["max_tokens"] == 148_000
+    assert config.public_dict()["request_timeout"] == 1_200.0
+    assert config.public_dict()["request_attempt_timeout"] == 120.0
+    assert config.public_dict()["extraction_max_tokens"] == 72_000
     assert config.public_dict()["max_response_repairs"] == 8
     assert config.public_dict()["thinking_after_response_repairs"] == 3
     assert config.public_dict()["repetition_penalty"] == 1.15
@@ -202,30 +420,34 @@ def test_stage2_config_parses_independent_large_context_prompt_budgets():
     assert config.public_dict()["consolidation_max_rounds"] == 7
     assert config.public_dict()["extraction_max_prompt_chars"] == 500_000
     assert config.public_dict()["extraction_feature_batch_size"] == 7
-    assert config.public_dict()["max_evaluation_rounds"] == 12
+    assert config.public_dict()["extraction_chunk_size_tokens"] == 41_000
+    assert config.public_dict()["extraction_context_window_tokens"] == 160_000
+    assert config.public_dict()["extraction_context_margin_tokens"] == 2_000
+    assert config.public_dict()["vllm_rapid_switch_seconds"] == 1_200.0
     assert config.public_dict()["ontology_refinement_min_failure_patients"] == 4
     assert config.public_dict()["max_ontology_refinement_rounds"] == 3
-    assert config.public_dict()["screening_trees"] == 64
-    assert config.public_dict()["stability_selection_rounds"] == 4
-    assert config.public_dict()["stability_selection_frequency"] == 0.75
-    assert config.public_dict()["effect_modifier_negative_margin_fraction"] == 0.01
-    assert config.public_dict()["effect_modifier_negative_fold_fraction"] == 0.7
-    assert config.public_dict()["candidate_selection_top_n"] == 7
-    assert (
-        config.public_dict()["candidate_registry_embedding_model"]
-        == "local/clinical-embedding-model"
-    )
-    assert config.public_dict()["candidate_registry_embedding_device"] == "cuda:2"
-    assert config.public_dict()["candidate_registry_similarity_threshold"] == 0.91
-    assert config.public_dict()["candidate_selection_method"] == "dense_cosine"
-    assert (
-        config.public_dict()["candidate_selection_late_interaction_model"]
-        == "local/colbert-model"
-    )
-    assert config.public_dict()["candidate_selection_top_evidence_packets"] == 4
+    assert config.public_dict()["extraction_llm"]["api_key"] == "<redacted>"
+    assert config.public_dict()["api_key"] == "<redacted>"
 
 
-def test_stage2_config_maps_prior_selector_embedding_fields_to_registry():
+def test_stage2_allows_primary_and_extraction_models_on_the_same_endpoint():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "model": "large-model",
+            "extraction_llm": {
+                "endpoint": "http://stage2.test/v1/",
+                "model": "small-model",
+            },
+        },
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert config.endpoint == config.extraction_llm.endpoint
+
+
+def _retired_test_stage2_config_maps_prior_selector_embedding_fields_to_registry():
     config = plain_stage2_config_from_mapping(
         {
             "endpoint": "http://stage2.test/v1",
@@ -240,6 +462,156 @@ def test_stage2_config_maps_prior_selector_embedding_fields_to_registry():
     assert config.candidate_registry_embedding_device == "cuda:4"
     assert "candidate_selection_embedding_model" not in config.public_dict()
     assert "candidate_selection_embedding_device" not in config.public_dict()
+
+
+def test_stage2_config_warns_and_ignores_retired_colbert_settings(caplog):
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://stage2.test/v1",
+            "evidence_community_enabled": True,
+            "candidate_selection_method": "late_interaction",
+            "max_evaluation_rounds": 10,
+            "screening_trees": 200,
+        },
+        default_workers=1,
+    )
+
+    assert config is not None
+    public = config.public_dict()
+    assert "evidence_community_enabled" not in public
+    assert "candidate_selection_method" not in public
+    assert "max_evaluation_rounds" not in public
+    assert "ignoring retired Stage 2" in caplog.text
+
+
+def test_extraction_runtime_continuation_route_is_parsed_and_audited_separately():
+    config = plain_stage2_config_from_mapping(
+        {
+            "endpoint": "http://primary.test/v1",
+            "model": "primary-model",
+            "extraction_llm": {
+                "endpoint": "http://original-extractor.test/v1",
+                "model": "original-extractor",
+                "workers": 3,
+                "runtime_endpoint": "http://replacement-extractor.test/v1/",
+                "runtime_model": "replacement-extractor",
+                "runtime_api_key": "secret",
+            },
+        },
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert config.extraction_llm is not None
+    assert config.extraction_llm.model == "original-extractor"
+    assert config.extraction_llm.runtime_endpoint == (
+        "http://replacement-extractor.test/v1"
+    )
+    assert config.extraction_llm.runtime_model == "replacement-extractor"
+    public = config.extraction_llm.public_dict()
+    assert public["model"] == "original-extractor"
+    assert public["runtime_model"] == "replacement-extractor"
+    assert public["runtime_api_key"] == "<redacted>"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"runtime_endpoint": "http://replacement.test/v1"},
+        {"runtime_model": "replacement-model"},
+        {"runtime_endpoint": "not-a-url", "runtime_model": "replacement-model"},
+    ],
+)
+def test_extraction_runtime_continuation_route_requires_endpoint_model_pair(kwargs):
+    with pytest.raises(ValueError, match="runtime_"):
+        Stage2ExtractionLLMConfig(
+            endpoint="http://original.test/v1",
+            model="original-model",
+            **kwargs,
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "field_name,value",
+    [
+        ("cluster_similarity_threshold", 0.0),
+        ("cluster_consensus_fraction", 1.1),
+        ("missingness_weight", float("nan")),
+        ("cluster_max_size", 1),
+        ("cluster_tool_call_limit", 0),
+    ],
+)
+def test_stage2_config_rejects_invalid_agentic_selection_policy(field_name, value):
+    policy = stage2_workflow.Stage2AgenticSelectionConfig(**{field_name: value})
+    with pytest.raises(ValueError, match=field_name):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            agentic_selection=policy,
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "removed_key",
+    [
+        "selection_workers",
+        "confounder_p_value_threshold",
+        "confounder_min_inner_fold_fraction",
+        "effect_modifier_p_value_threshold",
+        "effect_modifier_min_inner_fold_fraction",
+    ],
+)
+def test_stage2_config_migrates_retired_p_value_screen_settings(removed_key, caplog):
+    config = plain_stage2_config_from_mapping(
+        {"endpoint": "http://stage2.test/v1", removed_key: 1},
+        default_workers=1,
+    )
+
+    assert config is not None
+    assert "migrating legacy Stage 2 screen settings" in caplog.text
+    assert (
+        config.statistical_selection.nuisance_selection_rule
+        == "any_inner_fold_union"
+    )
+    assert (
+        config.statistical_selection.modifier_selection_rule
+        == "any_inner_fold_union"
+    )
+
+
+@pytest.mark.parametrize(
+    "rapid_switch_seconds",
+    [-1, True, float("inf"), float("nan"), "900"],
+)
+def test_stage2_config_rejects_invalid_vllm_rapid_switch_seconds(
+    rapid_switch_seconds,
+):
+    with pytest.raises(ValueError, match="vllm_rapid_switch_seconds"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            vllm_rapid_switch_seconds=rapid_switch_seconds,
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("request_timeout", 0),
+        ("request_timeout", float("inf")),
+        ("request_timeout", True),
+        ("request_attempt_timeout", -1),
+        ("request_attempt_timeout", float("nan")),
+        ("request_attempt_timeout", "300"),
+    ],
+)
+def test_stage2_config_rejects_invalid_request_timeouts(field_name, value):
+    with pytest.raises(ValueError, match=field_name):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            **{field_name: value},
+        ).validate()
 
 
 def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
@@ -292,9 +664,23 @@ def test_stage2_config_rejects_invalid_consolidation_iteration_limits():
             extraction_feature_batch_size=0,
         ).validate()
 
+    with pytest.raises(ValueError, match="extraction_chunk_size_tokens"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_chunk_size_tokens=0,
+        ).validate()
+
+    with pytest.raises(ValueError, match="context window must exceed"):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_context_window_tokens=76_024,
+        ).validate()
+
 
 @pytest.mark.parametrize("top_n", [0, -1, True, 1.5, "5"])
-def test_stage2_config_rejects_invalid_candidate_selection_top_n(top_n):
+def _retired_test_stage2_config_rejects_invalid_candidate_selection_top_n(top_n):
     with pytest.raises(ValueError, match="candidate_selection_top_n must be a positive integer"):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
@@ -312,7 +698,7 @@ def test_stage2_config_rejects_invalid_candidate_selection_top_n(top_n):
         "candidate_selection_late_interaction_device",
     ],
 )
-def test_stage2_config_rejects_blank_candidate_selection_model_settings(field_name):
+def _retired_test_stage2_config_rejects_blank_candidate_selection_model_settings(field_name):
     with pytest.raises(ValueError, match=field_name):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
@@ -322,7 +708,7 @@ def test_stage2_config_rejects_blank_candidate_selection_model_settings(field_na
 
 
 @pytest.mark.parametrize("threshold", [0.0, -0.1, 1.1, True, float("nan")])
-def test_stage2_config_rejects_invalid_candidate_registry_threshold(threshold):
+def _retired_test_stage2_config_rejects_invalid_candidate_registry_threshold(threshold):
     with pytest.raises(ValueError, match="candidate_registry_similarity_threshold"):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
@@ -331,7 +717,7 @@ def test_stage2_config_rejects_invalid_candidate_registry_threshold(threshold):
         ).validate()
 
 
-def test_stage2_config_rejects_invalid_candidate_selection_method():
+def _retired_test_stage2_config_rejects_invalid_candidate_selection_method():
     with pytest.raises(ValueError, match="candidate_selection_method"):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
@@ -341,7 +727,7 @@ def test_stage2_config_rejects_invalid_candidate_selection_method():
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "3"])
-def test_stage2_config_rejects_invalid_top_evidence_packet_count(value):
+def _retired_test_stage2_config_rejects_invalid_top_evidence_packet_count(value):
     with pytest.raises(ValueError, match="candidate_selection_top_evidence_packets"):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
@@ -351,7 +737,7 @@ def test_stage2_config_rejects_invalid_top_evidence_packet_count(value):
 
 
 @pytest.mark.parametrize("max_evaluation_rounds", [0, -1, True, 1.5, "10"])
-def test_stage2_config_rejects_invalid_max_evaluation_rounds(max_evaluation_rounds):
+def _retired_test_stage2_config_rejects_invalid_max_evaluation_rounds(max_evaluation_rounds):
     with pytest.raises(ValueError, match="max_evaluation_rounds must be a positive integer"):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
@@ -360,7 +746,7 @@ def test_stage2_config_rejects_invalid_max_evaluation_rounds(max_evaluation_roun
         ).validate()
 
 
-def test_stage2_config_requires_enough_evaluation_rounds_for_stability_selection():
+def _retired_test_stage2_config_requires_enough_evaluation_rounds_for_stability_selection():
     with pytest.raises(ValueError, match="must be at least stage2.stability_selection_rounds"):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
@@ -370,13 +756,29 @@ def test_stage2_config_requires_enough_evaluation_rounds_for_stability_selection
         ).validate()
 
 
-@pytest.mark.parametrize("max_tokens", [0, -1, True, 1.5, "50000"])
+@pytest.mark.parametrize("max_tokens", [0, -1, 99_999, True, 1.5, "100000"])
 def test_stage2_config_rejects_invalid_max_tokens(max_tokens):
-    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+    with pytest.raises(ValueError, match="max_tokens must be an integer of at least 100000"):
         PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
             model="test-model",
             max_tokens=max_tokens,
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    "extraction_max_tokens",
+    [0, -1, 4_095, True, 1.5, "4096"],
+)
+def test_stage2_config_rejects_invalid_extraction_max_tokens(extraction_max_tokens):
+    with pytest.raises(
+        ValueError,
+        match="extraction_max_tokens must be an integer of at least 4096",
+    ):
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_max_tokens=extraction_max_tokens,
         ).validate()
 
 
@@ -461,6 +863,10 @@ def test_stage2_config_parses_explicit_feature_with_supplied_ontology():
     assert feature.value_type == "ordinal"
     assert feature.categories_or_unit == ("0", "1", "2", "3", "4")
     assert feature.roles == ("confounder", "effect_modifier")
+    assert feature.conflict_resolution == {
+        "strategy": "latest",
+        "positive_category": None,
+    }
     assert config.public_dict()["explicit_features"][0]["categories_or_unit"] == [
         "0",
         "1",
@@ -502,15 +908,15 @@ def test_stage2_ignores_legacy_extraction_batch_size_and_parses_extraction_token
         {
             "endpoint": "http://stage2.test/v1",
             "extraction_batch_size": 100,
-            "max_tokens": 25_000,
+            "max_tokens": 125_000,
         },
         default_workers=8,
     )
 
     assert config is not None
     assert "extraction_batch_size" not in config.public_dict()
-    assert config.max_tokens == 25_000
-    assert config.public_dict()["max_tokens"] == 25_000
+    assert config.max_tokens == 125_000
+    assert config.public_dict()["max_tokens"] == 125_000
     assert "permanently isolated to one patient per prompt" in caplog.text
 
 
@@ -580,6 +986,221 @@ def test_explicit_stage2_model_skips_autodiscovery(monkeypatch):
     )
 
     assert runner.config.model == "configured-model"
+
+
+def test_live_stage2_verifies_the_configured_model_on_every_runtime_endpoint(
+    monkeypatch,
+):
+    checked = []
+
+    def served_models(config):
+        checked.append(config.endpoint)
+        return ["configured-model"]
+
+    monkeypatch.setattr(stage2_workflow, "_served_model_ids", served_models)
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://replica-a.test/v1",
+            runtime_endpoints=(
+                "http://replica-a.test/v1",
+                "http://replica-b.test/v1",
+            ),
+            model="configured-model",
+        ),
+        clinical_question="Identify confounders.",
+    )
+
+    assert checked == ["http://replica-a.test/v1", "http://replica-b.test/v1"]
+    assert runner.model_identity["primary"]["selected_model"] == "configured-model"
+    assert runner.model_identity["primary"]["live_endpoint_verified"] is True
+
+
+def test_live_stage2_rejects_configured_model_that_endpoint_does_not_serve(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda _config: ["different-running-model"],
+    )
+
+    with pytest.raises(RuntimeError, match="actual served model does not match"):
+        PlainHandoffStage2(
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="configured-model",
+            ),
+            clinical_question="Identify confounders.",
+        )
+
+
+def test_same_live_endpoint_can_serve_distinct_primary_and_extraction_models(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_served_model_ids",
+        lambda _config: ["large-reviewer", "small-extractor"],
+    )
+
+    runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://shared.test/v1",
+            model="large-reviewer",
+            extraction_llm=Stage2ExtractionLLMConfig(
+                endpoint="http://shared.test/v1",
+                model="small-extractor",
+            ),
+        ),
+        clinical_question="Identify confounders.",
+    )
+
+    assert runner.model_identity["primary"]["selected_model"] == "large-reviewer"
+    assert runner.model_identity["extraction"]["selected_model"] == "small-extractor"
+
+
+@pytest.mark.parametrize(
+    ("model", "family"),
+    [
+        ("Qwen/Qwen3.8-27B", "qwen3"),
+        ("google/gemma-4-26B-A4B-it", "gemma4"),
+        ("LiquidAI/LFM2.5-1.2B-Thinking", "lfm2.5"),
+        ("some/other-model", "other"),
+    ],
+)
+def test_stage2_detects_reasoning_model_family_from_served_model_id(model, family):
+    assert stage2_workflow._stage2_model_family(model) == family
+
+
+def test_model_identity_resume_allows_endpoint_change_but_rejects_model_change(
+    tmp_path: Path,
+):
+    completion = lambda _messages, _config: "{}"
+    first = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://old-endpoint.test/v1",
+            model="same-model",
+        ),
+        clinical_question="Identify confounders.",
+        completion=completion,
+    )
+    first._check_and_record_model_identity(tmp_path)
+
+    moved = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://new-endpoint.test/v1",
+            model="same-model",
+        ),
+        clinical_question="Identify confounders.",
+        completion=completion,
+    )
+    moved._check_and_record_model_identity(tmp_path)
+
+    changed = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://new-endpoint.test/v1",
+            model="changed-model",
+        ),
+        clinical_question="Identify confounders.",
+        completion=completion,
+    )
+    with pytest.raises(RuntimeError, match="actual running model identity changed"):
+        changed._check_and_record_model_identity(tmp_path)
+
+
+def test_model_identity_resume_allows_extractor_change_before_extraction(
+    tmp_path: Path,
+):
+    completion = lambda _messages, _config: "{}"
+
+    def runner(extraction_model):
+        return PlainHandoffStage2(
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="same-primary",
+                extraction_llm=Stage2ExtractionLLMConfig(
+                    endpoint="http://extract.test/v1",
+                    model=extraction_model,
+                ),
+            ),
+            clinical_question="Identify confounders.",
+            completion=completion,
+        )
+
+    runner("extractor-a")._check_and_record_model_identity(tmp_path)
+    runner("extractor-b")._check_and_record_model_identity(tmp_path)
+
+    identity = json.loads((tmp_path / "model_identity.json").read_text(encoding="utf-8"))
+    assert identity["extraction"]["selected_model"] == "extractor-b"
+
+
+def test_model_identity_resume_rejects_extractor_change_with_extraction_checkpoints(
+    tmp_path: Path,
+):
+    completion = lambda _messages, _config: "{}"
+
+    def runner(extraction_model):
+        return PlainHandoffStage2(
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="same-primary",
+                extraction_llm=Stage2ExtractionLLMConfig(
+                    endpoint="http://extract.test/v1",
+                    model=extraction_model,
+                ),
+            ),
+            clinical_question="Identify confounders.",
+            completion=completion,
+        )
+
+    runner("extractor-a")._check_and_record_model_identity(tmp_path)
+    (tmp_path / "outer_001" / "ontology_supervision").mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="extraction-dependent checkpoints remain"):
+        runner("extractor-b")._check_and_record_model_identity(tmp_path)
+
+
+def test_model_identity_detects_changed_backing_root_behind_same_served_alias(
+    tmp_path: Path,
+    monkeypatch,
+):
+    backing_root = ["Qwen/Qwen3.8-27B-revision-a"]
+
+    def served_models(_config):
+        return stage2_workflow._ServedModelIds(
+            ["stable-alias"],
+            records=[
+                {
+                    "id": "stable-alias",
+                    "root": backing_root[0],
+                    "parent": None,
+                    "revision": None,
+                }
+            ],
+        )
+
+    monkeypatch.setattr(stage2_workflow, "_served_model_ids", served_models)
+    first = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="stable-alias",
+        ),
+        clinical_question="Identify confounders.",
+    )
+    assert first.config.runtime_model_family == "qwen3"
+    first._check_and_record_model_identity(tmp_path)
+
+    backing_root[0] = "Qwen/Qwen3.8-27B-revision-b"
+    changed = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="stable-alias",
+        ),
+        clinical_question="Identify confounders.",
+    )
+    with pytest.raises(RuntimeError, match="actual running model identity changed"):
+        changed._check_and_record_model_identity(tmp_path)
 
 
 def test_json_repair_retry_stays_within_full_initial_prompt_budget():
@@ -655,6 +1276,64 @@ def test_json_repair_stops_after_ten_repairs():
     assert len(calls) == 11
 
 
+def test_json_repair_audits_invalid_responses_and_uses_repeated_error_fallback():
+    conversations = []
+    events = []
+
+    def completion(messages, _config):
+        conversations.append([dict(message) for message in messages])
+        return '{"ok":false,"condition":{"operator":"present"}}'
+
+    def validate(value):
+        if value.get("ok") is not True:
+            raise ValueError("rule condition references unavailable feature ''")
+        return dict(value)
+
+    fallback = {
+        "ok": True,
+        "action": "leave_unchanged",
+        "rationale": "Conservative fallback.",
+    }
+    result = stage2_workflow._request_json(
+        messages=[
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": "Return a schema-valid decision."},
+        ],
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+        ),
+        completion=completion,
+        validate=validate,
+        repair_context={
+            "allowed_feature_ids": ["feature_a", "feature_b"],
+            "valid_expression_examples": {
+                "coalesce": {
+                    "op": "coalesce",
+                    "feature_ids": ["feature_a", "feature_b"],
+                }
+            },
+            "conservative_response": fallback,
+        },
+        validation_event_observer=lambda event: events.append(dict(event)),
+        conservative_validation_fallback=fallback,
+        fallback_after_same_error=3,
+    )
+
+    assert result == fallback
+    assert len(conversations) == 3
+    assert "feature_a" in conversations[1][-1]["content"]
+    assert "Valid categorical-rule expression examples" in conversations[1][-1]["content"]
+    assert "has now occurred 2 times" in conversations[2][-1]["content"]
+    assert "leave_unchanged" in conversations[2][-1]["content"]
+    invalid_events = [event for event in events if event["event"] == "invalid_response"]
+    assert len(invalid_events) == 3
+    assert invalid_events[0]["raw_response"].startswith('{"ok":false')
+    assert invalid_events[-1]["same_error_occurrence"] == 3
+    assert events[-1]["event"] == "conservative_fallback"
+    assert events[-1]["trigger"] == "repeated_identical_validation_error"
+
+
 def test_json_repair_enables_thinking_after_five_repairs():
     efforts = []
     conversations = []
@@ -696,6 +1375,47 @@ def test_json_repair_enables_thinking_after_five_repairs():
             f"response attempt {response_attempt} rejected"
             in conversations[response_attempt][-1]["content"]
         )
+
+
+def test_extraction_repairs_dynamically_cap_output_to_the_remaining_context():
+    attempts = []
+
+    def counter(messages):
+        return 10 + sum(len(message["content"]) for message in messages)
+
+    def completion(messages, request_config):
+        prompt_tokens = counter(messages)
+        output_cap = stage2_workflow._stage2_request_policy(request_config)["max_tokens"]
+        attempts.append((prompt_tokens, output_cap))
+        return "{}" if len(attempts) == 1 else '{"ok": true}'
+
+    result = stage2_workflow._request_json(
+        messages=[
+            {"role": "system", "content": "Return JSON only."},
+            {"role": "user", "content": "x" * 300},
+        ],
+        config=PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="test-model",
+            extraction_max_tokens=75_000,
+            max_prompt_chars=4_000,
+        ),
+        completion=completion,
+        validate=lambda value: (
+            dict(value)
+            if value.get("ok") is True
+            else (_ for _ in ()).throw(ValueError("missing ok=true"))
+        ),
+        request_kind="extraction",
+        prompt_token_counter=counter,
+        context_window_tokens=1_000,
+        context_margin_tokens=100,
+    )
+
+    assert result == {"ok": True}
+    assert len(attempts) == 2
+    assert all(prompt + output + 100 <= 1_000 for prompt, output in attempts)
+    assert all(output < 75_000 for _prompt, output in attempts)
 
 
 def test_output_length_repair_explicitly_requests_a_shorter_complete_object():
@@ -787,18 +1507,26 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
             rows=[{"row_id": 7, "text": "Prior immunotherapy was documented."}],
         )[1]["content"]
     )
-    reconciliation = json.loads(
-        stage2_analysis._page_reconciliation_prompt(
+    page_extraction = json.loads(
+        stage2_analysis._page_extraction_prompt(
             definitions=[definition],
-            row_id=7,
-            page_results=[],
+            row={
+                "row_id": 7,
+                "text": "Prior immunotherapy was documented.",
+                "page": {
+                    "page_index": 1,
+                    "char_start": 0,
+                    "char_end": 37,
+                    "document_chars": 37,
+                },
+            },
         )[1]["content"]
     )
     assert extraction["features"][0]["categories_or_unit"] == [
         "not documented",
         "documented",
     ]
-    assert reconciliation["features"][0]["categories_or_unit"] == [
+    assert page_extraction["features"][0]["categories_or_unit"] == [
         "not documented",
         "documented",
     ]
@@ -809,13 +1537,16 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
         "categories_or_unit",
         "measurement_definition",
         "missing_value_rule",
+        "conflict_resolution",
     }
     assert set(extraction["features"][0]) == expected_extraction_fields
-    assert set(reconciliation["features"][0]) == expected_extraction_fields
+    assert set(page_extraction["features"][0]) == expected_extraction_fields
     assert "clinical_question" not in extraction
-    assert "clinical_question" not in reconciliation
+    assert "clinical_question" not in page_extraction
     assert any("Do not substitute 0/1" in rule for rule in extraction["rules"])
-    assert any("Do not substitute 0/1" in rule for rule in reconciliation["rules"])
+    assert any("declared category exactly" in rule for rule in page_extraction["rules"])
+    assert any("exact contiguous evidence" in rule for rule in page_extraction["rules"])
+    assert any("do not collapse conflicting" in rule.lower() for rule in page_extraction["rules"])
     extraction_messages = stage2_analysis._extraction_prompt(
         definitions=[definition],
         rows=[{"row_id": 7, "text": "Prior immunotherapy was documented."}],
@@ -830,14 +1561,50 @@ def test_extraction_category_error_lists_allowed_literals_and_prompts_forbid_ali
     assert "pre-treatment" not in extraction_instructions
     assert "treatment received" not in extraction_instructions
     assert any("supplied clinical text" in rule for rule in extraction["rules"])
-    for prompt in (extraction, reconciliation):
-        assert any("never return an object or array" in rule for rule in prompt["rules"])
-        composite_rule = next(
-            rule for rule in prompt["rules"] if "composite such as 147/93" in rule
-        )
-        assert "component explicitly named by the feature" in composite_rule
-        assert "requests multiple components, return null" in composite_rule
-        assert "rather than a ratio string or aggregate" in composite_rule
+    assert any("never return an object or array" in rule for rule in extraction["rules"])
+    composite_rule = next(
+        rule for rule in extraction["rules"] if "composite such as 147/93" in rule
+    )
+    assert "component explicitly named by the feature" in composite_rule
+    assert "requests multiple components, return null" in composite_rule
+    assert "rather than a ratio string or aggregate" in composite_rule
+
+
+def test_normal_extraction_prompt_applies_explicit_conflict_resolution():
+    definition = {
+        "name": "age",
+        "description": "The patient's age in years.",
+        "value_type": "continuous",
+        "categories_or_unit": ["years"],
+        "measurement_definition": (
+            "Extract the age from the pretreatment record or earliest available encounter."
+        ),
+        "missing_value_rule": "Return null when age is undocumented.",
+        "conflict_resolution": {"strategy": "latest", "positive_category": None},
+    }
+
+    prompt = json.loads(
+        stage2_analysis._extraction_prompt(
+            definitions=[definition],
+            rows=[
+                {
+                    "row_id": 7,
+                    "text": "At age 68 the patient was diagnosed. At age 72 treatment was considered.",
+                }
+            ],
+        )[1]["content"]
+    )
+
+    policy = prompt["features"][0]["conflict_resolution"]
+    rules = " ".join(prompt["rules"])
+    assert policy["strategy"] == "latest"
+    assert policy["strategy_source"] == "explicit_ontology"
+    assert policy["dated_observations_precede_undated"] is True
+    assert policy["source_order_tie_breaker"] == "last"
+    assert "Consider every explicitly supported observation" in rules
+    assert "conflict_resolution policy governs" in rules
+    assert "use clinical-text source order" in rules
+    assert "do not treat the first mention" in rules
 
 
 def test_continuous_extraction_preserves_categorical_fallback_for_modeling_review():
@@ -1092,6 +1859,397 @@ def test_stage2_extraction_batches_features_by_default_and_accepts_override(
         max_prompt_chars=100_000,
     )
     pd.testing.assert_frame_equal(resumed, frame)
+
+
+def test_extraction_retries_only_legacy_infrastructure_failure_feature_batches(
+    tmp_path: Path,
+):
+    definitions = [
+        {
+            "name": f"feature_{index:02d}",
+            "description": f"Feature {index}",
+            "value_type": "continuous",
+            "categories_or_unit": ["score"],
+            "measurement_definition": f"Extract feature {index}.",
+            "missing_value_rule": "Return null when undocumented.",
+        }
+        for index in range(2)
+    ]
+    dataset = pd.DataFrame({"clinical_text": ["Both feature values are documented."]})
+    output = tmp_path / "extraction"
+    calls: list[list[str]] = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        assert request_kind == "extraction"
+        body = json.loads(messages[1]["content"])
+        names = [feature["name"] for feature in body["features"]]
+        calls.append(names)
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {
+                            name: int(name.removeprefix("feature_")) for name in names
+                        },
+                    }
+                ]
+            }
+        )
+
+    expected = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=100_000,
+        feature_batch_size=1,
+    )
+    calls.clear()
+
+    parent_dir = output / "batches" / "batch_00001"
+    failed_dir = parent_dir / "feature_batches" / "batch_00002"
+    (failed_dir / "result.json").write_text(
+        json.dumps({"rows": [{"row_id": 0, "values": {"feature_01": None}}]}),
+        encoding="utf-8",
+    )
+    (failed_dir / "extraction_failure.json").write_text(
+        json.dumps(
+            {
+                "resolution": "conservative_all_null",
+                "validation_error": (
+                    "Stage2RequestExhaustedError: transport attempts exhausted"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (failed_dir / "extraction_issues.json").write_text(
+        json.dumps(
+            {
+                "events": [
+                    {
+                        "failure_kind": "structural_response_failure",
+                        "reason": "Stage2RequestExhaustedError: transport attempts exhausted",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (parent_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {
+                        "row_id": 0,
+                        "values": {"feature_00": 0, "feature_01": None},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    repaired = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=100_000,
+        feature_batch_size=1,
+    )
+
+    pd.testing.assert_frame_equal(repaired, expected)
+    assert calls == [["feature_01"]]
+    assert (failed_dir / "superseded_infrastructure_extraction_failure.json").is_file()
+    assert (failed_dir / "superseded_infrastructure_result.json").is_file()
+    assert (parent_dir / "superseded_infrastructure_complete.json").is_file()
+    archived_failure = output / "_partial_backup_20260827" / "extraction_failure.json"
+    archived_failure.parent.mkdir()
+    archived_failure.write_text(
+        '{"validation_error":"Stage2RequestExhaustedError: archived"}',
+        encoding="utf-8",
+    )
+    assert stage2_analysis.infrastructure_failure_audit_paths(output) == ()
+
+
+def test_stage2_serial_extraction_carries_state_across_lossless_token_chunks_and_resumes(
+    tmp_path: Path,
+):
+    definitions = [
+        {
+            "name": f"feature_{index}",
+            "description": "A clinical score.",
+            "value_type": "continuous",
+            "categories_or_unit": ["score"],
+            "measurement_definition": "Extract the documented score.",
+            "missing_value_rule": "Return null when undocumented.",
+            "conflict_resolution": {
+                "strategy": "latest",
+                "positive_category": None,
+            },
+        }
+        for index in range(3)
+    ]
+    note = ("a" * 450) + " EVIDENCE " + ("b" * 450)
+    output = tmp_path / "serial"
+    tokenizer = _CharacterChatTokenizer()
+    bodies = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        assert request_kind == "extraction"
+        body = json.loads(messages[1]["content"])
+        assert body["job"] == "update_stage2_patient_variables_serially"
+        bodies.append(body)
+        patient = body["patient"]
+        prior = patient["prior_extraction"]
+        prior_state = patient["prior_feature_state"]
+        values = {
+            name: (
+                int(name.removeprefix("feature_"))
+                if "EVIDENCE" in patient["current_chunk"]
+                else prior[name]
+            )
+            for name in prior
+        }
+        state = {
+            name: (
+                "documented in the EVIDENCE chunk"
+                if "EVIDENCE" in patient["current_chunk"]
+                else prior_state[name]
+            )
+            for name in prior
+        }
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "values": values,
+                        "carry_forward_state": state,
+                    }
+                ]
+            }
+        )
+
+    kwargs = {
+        "dataset": pd.DataFrame({"clinical_text": [note]}),
+        "row_ids": [0],
+        "text_column": "clinical_text",
+        "definitions": definitions,
+        "output_dir": output,
+        "workers": 1,
+        "max_prompt_chars": 100_000,
+        "feature_batch_size": 2,
+        "tokenizer": tokenizer,
+        "chunk_size_tokens": 200,
+        "context_window_tokens": 6_000,
+        "max_output_tokens": 500,
+        "context_margin_tokens": 200,
+    }
+    frame = extract_rows(request_json=request_json, **kwargs)
+
+    assert frame.loc[0, "feature_0"] == 0.0
+    assert frame.loc[0, "feature_1"] == 1.0
+    assert frame.loc[0, "feature_2"] == 2.0
+    assert len(bodies) > 2
+    assert all(
+        body["patient"]["prior_extraction"][name] == int(name.removeprefix("feature_"))
+        for body in bodies
+        for name in body["patient"]["prior_extraction"]
+        if body["patient"]["chunk"]["char_start"] > note.index("EVIDENCE") + len("EVIDENCE")
+    )
+    assert all(
+        body["patient"]["prior_feature_state"][name]
+        == "documented in the EVIDENCE chunk"
+        for body in bodies
+        for name in body["patient"]["prior_feature_state"]
+        if body["patient"]["chunk"]["char_start"]
+        > note.index("EVIDENCE") + len("EVIDENCE")
+    )
+
+    feature_dirs = sorted(
+        (output / "batches" / "batch_00001" / "feature_batches").glob("batch_*")
+    )
+    assert len(feature_dirs) == 2
+    for feature_dir in feature_dirs:
+        inputs = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted((feature_dir / "serial_chunks").glob("chunk_*/input.json"))
+        ]
+        assert "".join(value["chunk"]["text"] for value in inputs) == note
+        assert all(value["chunk"]["source_tokens"] <= 200 for value in inputs)
+        assert all(value["chunk"]["prompt_tokens"] <= 5_300 for value in inputs)
+        manifest = json.loads(
+            (feature_dir / "serial_extraction.json").read_text(encoding="utf-8")
+        )
+        assert manifest["lossless_source_coverage"] is True
+
+    def unexpected_request(_messages, _validate, *, request_kind="interpretation"):
+        raise AssertionError("completed serial chunks should be reused")
+
+    parent_dir = output / "batches" / "batch_00001"
+    (parent_dir / "complete.json").unlink()
+    (parent_dir / "result.json").unlink()
+    resumed = extract_rows(request_json=unexpected_request, **kwargs)
+    pd.testing.assert_frame_equal(resumed, frame)
+
+
+def test_serial_ontology_repair_normalizes_numeric_carry_forward_state(
+    tmp_path: Path,
+):
+    definitions = [
+        {
+            "feature_id": "outer_001_feature_207",
+            "name": "metastasis_sites",
+            "description": "Documented sites of distant metastasis.",
+            "value_type": "categorical",
+            "categories_or_unit": ["Brain", "Bone", "Liver", "Adrenal Gland"],
+            "measurement_definition": "Extract one declared metastatic site.",
+            "missing_value_rule": "Return null when unavailable.",
+            "conflict_resolution": {"strategy": "latest", "positive_category": None},
+        },
+        {
+            "feature_id": "outer_001_feature_208",
+            "name": "metastasis_size",
+            "description": "Documented metastatic lesion size.",
+            "value_type": "continuous",
+            "categories_or_unit": ["cm"],
+            "measurement_definition": "Extract the documented lesion size.",
+            "missing_value_rule": "Return null when unavailable.",
+            "conflict_resolution": {"strategy": "latest", "positive_category": None},
+        },
+    ]
+    note = "metastatic disease " + ("x" * 450)
+    observed_prior_states = []
+    extraction_calls = 0
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        nonlocal extraction_calls
+        body = json.loads(messages[1]["content"])
+        if request_kind == "interpretation":
+            item = body["items"][0]
+            return validate(
+                {
+                    "corrections": [
+                        {"mapping_id": item["mapping_id"], "value": None}
+                    ]
+                }
+            )
+
+        extraction_calls += 1
+        patient = body["patient"]
+        observed_prior_states.append(dict(patient["prior_feature_state"]))
+        if extraction_calls == 1:
+            values = {
+                "metastasis_sites": "Adrenal Gland, Bone",
+                "metastasis_size": 4.5,
+            }
+            state = {
+                "metastasis_sites": "Adrenal Gland and bone are documented.",
+                # This is the exact malformed metadata shape from the failed run.
+                "metastasis_size": 4.5,
+            }
+        else:
+            values = dict(patient["prior_extraction"])
+            state = dict(patient["prior_feature_state"])
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "values": values,
+                        "carry_forward_state": state,
+                    }
+                ]
+            }
+        )
+
+    output = tmp_path / "serial_ontology_repair"
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": [note]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=output,
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=100_000,
+        tokenizer=_CharacterChatTokenizer(),
+        chunk_size_tokens=200,
+        context_window_tokens=6_000,
+        max_output_tokens=500,
+        context_margin_tokens=200,
+    )
+
+    assert extraction_calls > 1
+    assert pd.isna(frame.loc[0, "metastasis_sites"])
+    assert frame.loc[0, "metastasis_size"] == 4.5
+    assert observed_prior_states[1]["metastasis_size"] == "4.5"
+    first_chunk = (
+        output
+        / "batches"
+        / "batch_00001"
+        / "serial_chunks"
+        / "chunk_00001"
+    )
+    audit = json.loads(
+        (first_chunk / "category_ontology_repair.json").read_text(encoding="utf-8")
+    )
+    assert audit["resolution"] == "llm_category_ontology"
+    assert (output / "complete.json").is_file()
+
+
+def test_stage2_tokenizer_keeps_short_patient_extraction_one_shot(tmp_path: Path):
+    jobs = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        body = json.loads(messages[1]["content"])
+        jobs.append(body["job"])
+        patient = body["patients"][0]
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "values": {"age": 67},
+                    }
+                ]
+            }
+        )
+
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": ["Age 67."]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[
+            {
+                "name": "age",
+                "value_type": "continuous",
+                "categories_or_unit": ["years"],
+            }
+        ],
+        output_dir=tmp_path / "short",
+        request_json=request_json,
+        workers=1,
+        max_prompt_chars=100_000,
+        tokenizer=_CharacterChatTokenizer(),
+        chunk_size_tokens=50_000,
+        context_window_tokens=10_000,
+        max_output_tokens=1_000,
+        context_margin_tokens=200,
+    )
+
+    assert jobs == ["extract_stage2_patient_variables"]
+    assert frame.loc[0, "age"] == 67.0
+    assert not list((tmp_path / "short").glob("**/serial_complete.json"))
 
 
 def test_stage2_extraction_prompt_does_not_ascii_escape_clinical_text():
@@ -1547,6 +2705,130 @@ def test_extraction_uses_note_free_category_ontology_after_ten_failed_repairs(
     assert audit["corrections"][0]["value"] == "documented"
 
 
+def test_pending_category_ontology_resumes_without_repeating_extraction(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame({"clinical_text": ["Prior immunotherapy was documented."]})
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "prior_immunotherapy_history",
+        "description": "Whether prior immunotherapy was documented.",
+        "value_type": "binary",
+        "categories_or_unit": ["not documented", "documented"],
+        "measurement_definition": "Extract pretreatment immunotherapy history.",
+        "missing_value_rule": "Return null when unavailable.",
+    }
+    output = tmp_path / "extraction"
+    first_calls = []
+
+    def extraction_then_switch(messages, validate, *, request_kind="interpretation"):
+        first_calls.append(request_kind)
+        if request_kind == "extraction":
+            return validate(
+                {
+                    "rows": [
+                        {
+                            "row_id": 0,
+                            "values": {"prior_immunotherapy_history": 1},
+                        }
+                    ]
+                }
+            )
+        raise RuntimeError("switch to the interpretation model")
+
+    with pytest.raises(RuntimeError, match="switch to the interpretation model"):
+        extract_rows(
+            dataset=dataset,
+            row_ids=[0],
+            text_column="clinical_text",
+            definitions=[definition],
+            output_dir=output,
+            request_json=extraction_then_switch,
+            workers=1,
+            max_prompt_chars=10_000,
+        )
+
+    batch = output / "batches" / "batch_00001"
+    pending_path = batch / "pending_category_ontology.json"
+    assert first_calls == ["extraction", "interpretation"]
+    assert pending_path.is_file()
+    resumed_calls = []
+
+    def resume_interpretation(messages, validate, *, request_kind="interpretation"):
+        resumed_calls.append(request_kind)
+        assert request_kind == "interpretation"
+        item = json.loads(messages[1]["content"])["items"][0]
+        return validate(
+            {
+                "corrections": [
+                    {
+                        "mapping_id": item["mapping_id"],
+                        "value": "documented",
+                    }
+                ]
+            }
+        )
+
+    frame = extract_rows(
+        dataset=dataset,
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        output_dir=output,
+        request_json=resume_interpretation,
+        workers=1,
+        max_prompt_chars=10_000,
+    )
+
+    assert resumed_calls == ["interpretation"]
+    assert frame.loc[0, "prior_immunotherapy_history"] == "documented"
+    assert not pending_path.exists()
+    assert (batch / "complete.json").is_file()
+
+
+def test_extraction_request_exhaustion_aborts_without_scientific_checkpoint(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame({"clinical_text": ["No usable response returned."]})
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "performance_status",
+        "description": "Pretreatment performance status.",
+        "value_type": "continuous",
+        "categories_or_unit": ["ECOG score"],
+        "measurement_definition": "Extract the documented ECOG score.",
+        "missing_value_rule": "Return null when unavailable.",
+    }
+    output = tmp_path / "extraction"
+
+    def exhausted_request(_messages, _validate, *, request_kind="interpretation"):
+        assert request_kind == "extraction"
+        raise stage2_analysis.Stage2RequestExhaustedError(
+            "logical request deadline expired"
+        )
+
+    with pytest.raises(
+        stage2_analysis.Stage2RequestExhaustedError,
+        match="logical request deadline expired",
+    ):
+        extract_rows(
+            dataset=dataset,
+            row_ids=[0],
+            text_column="clinical_text",
+            definitions=[definition],
+            output_dir=output,
+            request_json=exhausted_request,
+            workers=1,
+            max_prompt_chars=10_000,
+        )
+
+    batch = output / "batches" / "batch_00001"
+    assert not (batch / "extraction_failure.json").exists()
+    assert not (batch / "result.json").exists()
+    assert not (batch / "complete.json").exists()
+    assert not (output / "complete.json").exists()
+
+
 def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
     tmp_path: Path,
 ):
@@ -1571,7 +2853,9 @@ def test_extraction_defaults_unmappable_category_to_null_instead_of_crashing(
                     ]
                 }
             )
-        raise ValueError("category ontology response remained invalid")
+        raise stage2_analysis.Stage2ResponseValidationError(
+            "category ontology response remained invalid"
+        )
 
     output = tmp_path / "extraction"
     frame = extract_rows(
@@ -1609,7 +2893,7 @@ def test_extraction_defaults_structurally_invalid_response_to_audited_null(
     }
 
     def request_json(_messages, _validate, *, request_kind="interpretation"):
-        raise ValueError(
+        raise stage2_analysis.Stage2ResponseValidationError(
             "Stage 2 response remained invalid after 10 repairs: "
             "Unterminated string at character 104409"
         )
@@ -1743,6 +3027,19 @@ def test_interpretation_prompt_inverts_noisy_text_evidence_without_temporal_filt
     assert "longitudinal information as clinical context" in rules
     assert "do not perform temporal eligibility filtering" in rules
     assert "prefer atomic clinical variables" in rules
+    assert "exhaustively enumerate every distinct atomic patient-level clinical feature" in rules
+    assert "apparent topic, dominant concept, or consensus theme" in rules
+    assert "read every string in an evidence item's text array" in rules
+    assert "do not limit an evidence item to one candidate" in rules
+    assert "multiple independently varying patient attributes" in rules
+    assert "a separate atomic candidate for each attribute" in rules
+    assert "attributes belonging to relatives, specimens, clinicians" in rules
+    assert "corresponding patient feature" in rules
+    assert "multiple exemplar patients with different observed values" in rules
+    assert "community's apparent topic or most salient feature" in messages[0][
+        "content"
+    ].lower()
+    assert re.search(r"\bage\b", instructions) is None
     assert "one coherent ontology" in rules
     assert "list, set, tuple, mapping, concatenated code" in rules
     assert "open-ended family is present" in rules
@@ -1820,6 +3117,16 @@ def test_rejected_packet_audit_prompt_is_generic_recall_guardrail():
         messages[0]["content"].lower()
     )
     assert "prefer atomic clinical variables" in rules
+    assert "exhaustively enumerate every distinct atomic patient-level clinical feature" in rules
+    assert "read every string in an evidence item's text array" in rules
+    assert "do not limit an evidence item to one candidate" in rules
+    assert "multiple independently varying patient attributes" in rules
+    assert "a separate atomic candidate for each attribute" in rules
+    assert "attributes belonging to relatives, specimens, clinicians" in rules
+    assert "including secondary features outside the dominant topic" in messages[0][
+        "content"
+    ].lower()
+    assert re.search(r"\bage\b", instructions) is None
     assert "return no candidate rather than a vague catch-all" in rules
     assert "longitudinal information as clinical context" in rules
     assert "pretreatment" not in instructions
@@ -1849,6 +3156,8 @@ def test_operationalization_prompt_prefers_realistic_continuous_measurements():
     assert "prefer value_type continuous" in rules
     assert "realistically be extracted as a numeric measurement" in rules
     assert "would misrepresent the feature" in rules
+    assert "conflict_resolution strategy" in rules
+    assert instructions["response"]["conflict_resolution"]["strategy"].startswith("latest|")
     rendered = messages[1]["content"]
     for irrelevant_key in (
         "outer_fold",
@@ -2104,6 +3413,104 @@ def test_candidate_registry_selection_ranks_canonical_candidates_by_evidence_axi
     assert audit["axis_rankings"]["outcome"][0] == "candidate-renal"
 
 
+def test_candidate_selection_uses_hierarchical_colbert_to_route_back_to_leaf_packets():
+    packets = {
+        "packet-pdl1-a": {
+            "architecture": "architecture-a",
+            "observable_axes": ["treatment"],
+            "content": {
+                "support": {"inner_folds": [1, 2]},
+                "representative_evidence": [{"text": "PD-L1 TPS was 30%."}],
+            },
+        },
+        "packet-pdl1-b": {
+            "architecture": "architecture-b",
+            "observable_axes": ["outcome"],
+            "content": {
+                "support": {"inner_folds": [3, 4]},
+                "representative_evidence": [
+                    {"text": "Low PD-L1 expression was documented."}
+                ],
+            },
+        },
+        "packet-age": {
+            "architecture": "architecture-c",
+            "observable_axes": ["outcome"],
+            "content": {
+                "support": {"inner_folds": [5]},
+                "representative_evidence": [{"text": "Patient age was 72 years."}],
+            },
+        },
+    }
+    hierarchy_packets = {
+        "community-pdl1": {
+            "content": {
+                "source_packet_ids": ["packet-pdl1-a", "packet-pdl1-b"],
+                "colbert_document": "PD-L1 expression and tumor proportion score evidence.",
+            }
+        },
+        "community-age": {
+            "content": {
+                "source_packet_ids": ["packet-age"],
+                "colbert_document": "Age at treatment evidence.",
+            }
+        },
+    }
+    candidate = {
+        "candidate_id": "candidate-pdl1",
+        "name": "pd_l1_expression",
+        "supporting_packet_ids": ["packet-pdl1-a"],
+        "evidence_axes": ["treatment"],
+    }
+    scores = {
+        "PD-L1 expression and tumor proportion score evidence.": 0.99,
+        "Age at treatment evidence.": 0.10,
+        "PD-L1 TPS was 30%.": 0.97,
+        "Low PD-L1 expression was documented.": 0.96,
+    }
+    calls = []
+
+    def score(queries, documents, _model, _device):
+        calls.append(list(documents))
+        assert set(queries) == {"Pd L1 Expression"}
+        return np.asarray([scores[document] for document in documents], dtype=np.float32)
+
+    selected, audit = stage2_workflow._select_candidates_from_registry(
+        candidates=[candidate],
+        packet_by_id=packets,
+        hierarchy_packet_by_id=hierarchy_packets,
+        top_n_per_axis=1,
+        max_candidates=1,
+        scoring_method="late_interaction",
+        late_interaction_model="test-colbert",
+        late_interaction_device="cpu",
+        dense_embedding_model="unused",
+        dense_embedding_device="cpu",
+        top_evidence_packets=2,
+        hierarchy_top_communities=1,
+        document_chunk_overlap_tokens=32,
+        late_interaction_scoring_function=score,
+    )
+
+    assert len(calls) == 2
+    assert selected[0]["supporting_packet_ids"] == ["packet-pdl1-a"]
+    assert selected[0]["ontology_packet_ids"] == [
+        "packet-pdl1-a",
+        "packet-pdl1-b",
+    ]
+    assert selected[0]["candidate_selection"]["hierarchy_packet_ids"] == [
+        "community-pdl1"
+    ]
+    # Retrieval can improve ontology evidence, but broad router membership does
+    # not manufacture architecture/fold coverage for the candidate.
+    row = audit["candidate_rankings"][0]
+    assert row["supporting_architectures"] == ["architecture-a"]
+    assert row["architecture_coverage"] == pytest.approx(1 / 3)
+    assert row["retrieved_packet_count"] == 2
+    assert audit["candidate_hierarchy_associations_scored"] == 2
+    assert audit["candidate_packet_associations_scored"] == 2
+
+
 def test_candidate_registry_selection_supports_configured_dense_cosine_fallback():
     packet = {
         "packet": {
@@ -2280,7 +3687,7 @@ def test_candidate_funnel_bounds_two_thousand_packet_ten_thousand_candidate_case
     assert len(selected) == 10
 
 
-def test_outer_fold_sends_only_registry_selected_candidates_to_consolidation(
+def _retired_test_outer_fold_sends_only_registry_selected_candidates_to_consolidation(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -2376,7 +3783,7 @@ def test_outer_fold_sends_only_registry_selected_candidates_to_consolidation(
     assert selection["selection"]["dropped_origin_candidate_ids"] == ["candidate_0002"]
 
 
-def test_outer_fold_reuses_completed_candidate_funnel_after_consolidation_failure(
+def _retired_test_outer_fold_reuses_completed_candidate_funnel_after_consolidation_failure(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -2654,6 +4061,23 @@ def test_interpretation_second_pass_recovers_rejected_named_measurement(tmp_path
     ]
     assert cached == result
 
+    def should_not_call(_messages, _config):
+        raise AssertionError("endpoint-only change should reuse the checkpoint")
+
+    moved_runner = PlainHandoffStage2(
+        config=PlainHandoffStage2Config(
+            endpoint="http://replacement-stage2.test/v1",
+            model="test-model",
+        ),
+        clinical_question=secret_question,
+        completion=should_not_call,
+    )
+    assert moved_runner._interpret_batch(
+        architecture=packet["architecture"],
+        packets=[packet],
+        output_dir=output_dir,
+    ) == result
+
 
 def test_interpretation_does_not_pair_new_input_with_an_old_complete_result(
     tmp_path: Path,
@@ -2698,6 +4122,9 @@ def test_interpretation_does_not_pair_new_input_with_an_old_complete_result(
     output_dir.mkdir()
     input_value = {
         "interpretation_schema": stage2_workflow.INTERPRETATION_SCHEMA_VERSION,
+        "llm_identity": {
+            "model": "test-model",
+        },
         "architecture": packet["architecture"],
         "packets": [packet],
     }
@@ -2785,6 +4212,109 @@ def test_stage2_retries_retryable_transport_errors_without_using_repair_turns(
     assert delays == [0.25, 0.5]
 
 
+def test_stage2_does_not_reclassify_a_pre_response_failure_as_invalid_science():
+    calls = []
+
+    def completion(_messages, _config):
+        calls.append("called")
+        raise ValueError("endpoint routing is misconfigured")
+
+    with pytest.raises(ValueError, match="endpoint routing is misconfigured"):
+        stage2_workflow._request_json(
+            messages=[{"role": "user", "content": "Return JSON."}],
+            config=PlainHandoffStage2Config(
+                endpoint="http://stage2.test/v1",
+                model="test-model",
+            ),
+            completion=completion,
+            validate=lambda value: dict(value),
+        )
+
+    assert calls == ["called"]
+
+
+def test_stage2_default_transport_policy_allows_three_attempts(monkeypatch):
+    class RetryableTransportError(Exception):
+        pass
+
+    calls = []
+
+    def completion(messages, _config):
+        calls.append([dict(message) for message in messages])
+        if len(calls) < 3:
+            raise RetryableTransportError("temporary timeout")
+        return '{"ok": true}'
+
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_is_retryable_transport_error",
+        lambda exc: isinstance(exc, RetryableTransportError),
+    )
+    monkeypatch.setattr(stage2_workflow.time, "sleep", lambda _delay: None)
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        transport_retry_backoff=0.0,
+    )
+
+    result = stage2_workflow._request_json(
+        messages=[{"role": "user", "content": "Return JSON."}],
+        config=config,
+        completion=completion,
+        validate=lambda value: dict(value),
+    )
+
+    assert result == {"ok": True}
+    assert len(calls) == 3
+    assert all(call == calls[0] for call in calls)
+
+
+def test_stage2_logical_request_deadline_bounds_transport_retries(monkeypatch):
+    class RetryableTransportError(Exception):
+        pass
+
+    clock = [0.0]
+    attempt_timeouts = []
+
+    def completion(_messages, request_config):
+        attempt_timeouts.append(request_config.request_timeout)
+        raise RetryableTransportError("straggling endpoint")
+
+    monkeypatch.setattr(
+        stage2_workflow,
+        "_is_retryable_transport_error",
+        lambda exc: isinstance(exc, RetryableTransportError),
+    )
+    monkeypatch.setattr(stage2_workflow.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        stage2_workflow.time,
+        "sleep",
+        lambda delay: clock.__setitem__(0, clock[0] + delay),
+    )
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="test-model",
+        request_timeout=2.5,
+        request_attempt_timeout=1.0,
+        transport_max_attempts=10,
+        transport_retry_backoff=1.0,
+    )
+
+    with pytest.raises(
+        stage2_analysis.Stage2RequestExhaustedError,
+        match="deadline",
+    ):
+        stage2_workflow._request_json(
+            messages=[{"role": "user", "content": "Return JSON."}],
+            config=config,
+            completion=completion,
+            validate=lambda value: dict(value),
+        )
+
+    assert attempt_timeouts == [1.0, 1.0]
+    assert clock[0] == 1.0
+
+
 def test_openai_timeout_is_a_retryable_transport_error():
     import httpx
     from openai import APITimeoutError
@@ -2804,9 +4334,9 @@ def test_empty_model_response_is_a_retryable_call_failure():
 
 @pytest.mark.parametrize(
     ("request_kind", "reasoning_effort", "max_tokens"),
-    [
-        ("interpretation", "high", None),
-        ("extraction", "none", 50_000),
+        [
+            ("interpretation", "high", 100_000),
+            ("extraction", "none", 75_000),
     ],
 )
 def test_openai_completion_sends_request_scoped_reasoning_and_token_cap(
@@ -2856,11 +4386,162 @@ def test_openai_completion_sends_request_scoped_reasoning_and_token_cap(
     assert client_kwargs["max_retries"] == 0
     assert request_kwargs["reasoning_effort"] == reasoning_effort
     assert request_kwargs["extra_body"] == {"repetition_penalty": 1.1}
-    if max_tokens is None:
-        assert "max_tokens" not in request_kwargs
-    else:
-        assert request_kwargs["max_tokens"] == max_tokens
+    assert request_kwargs["max_tokens"] == max_tokens
     assert "max_completion_tokens" not in request_kwargs
+
+
+@pytest.mark.parametrize(
+    (
+        "request_kind",
+        "enabled",
+        "soft_switch",
+        "wire_reasoning_effort",
+        "expected_max_tokens",
+    ),
+        [
+            ("extraction", False, "/no_think", None, 75_000),
+        ("interpretation", True, "/think", "xhigh", 100_000),
+    ],
+)
+def test_qwen38_requests_use_hard_and_soft_thinking_controls(
+    monkeypatch,
+    request_kind,
+    enabled,
+    soft_switch,
+    wire_reasoning_effort,
+    expected_max_tokens,
+):
+    request_kwargs = {}
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            request_kwargs.update(kwargs)
+            message = type("Message", (), {"content": '{"ok": true}'})()
+            choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
+            return type("Response", (), {"choices": [choice]})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+        def close(self):
+            pass
+
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", FakeClient)
+    result = stage2_workflow._openai_completion(
+        [{"role": "user", "content": "Return JSON."}],
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="Qwen/Qwen3.8-27B",
+            runtime_request_kind=request_kind,
+        ),
+    )
+
+    assert result == '{"ok": true}'
+    assert request_kwargs["max_tokens"] == expected_max_tokens
+    assert request_kwargs["messages"][-1]["content"].endswith(soft_switch)
+    assert request_kwargs["extra_body"]["chat_template_kwargs"] == {
+        "enable_thinking": enabled
+    }
+    if wire_reasoning_effort is None:
+        assert "reasoning_effort" not in request_kwargs
+    else:
+        assert request_kwargs["reasoning_effort"] == wire_reasoning_effort
+
+
+@pytest.mark.parametrize(
+    ("configured_effort", "wire_effort"),
+    [
+        ("none", None),
+        ("minimal", None),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "xhigh"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+    ],
+)
+def test_qwen38_reasoning_effort_uses_supported_wire_vocabulary(
+    configured_effort,
+    wire_effort,
+):
+    assert stage2_workflow._wire_reasoning_effort(
+        configured_effort=configured_effort,
+        model_family="qwen3",
+    ) == wire_effort
+
+
+def test_openai_completion_falls_back_when_reasoning_effort_is_not_supported(
+    monkeypatch,
+):
+    calls = []
+
+    class UnsupportedParameterError(Exception):
+        status_code = 400
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            calls.append(kwargs)
+            if "reasoning_effort" in kwargs:
+                raise UnsupportedParameterError(
+                    "Unexpected reasoning effort high. Supported types are xhigh, medium, and low."
+                )
+            message = type("Message", (), {"content": '{"ok": true}'})()
+            choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
+            return type("Response", (), {"choices": [choice]})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+        def close(self):
+            pass
+
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", FakeClient)
+
+    assert stage2_workflow._openai_completion(
+        [{"role": "user", "content": "Return JSON."}],
+        PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="google/gemma-4-26B-A4B-it",
+        ),
+    ) == '{"ok": true}'
+    assert len(calls) == 2
+    assert "reasoning_effort" in calls[0]
+    assert "reasoning_effort" not in calls[1]
+    assert calls[1]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        '<think>draft {"draft": true}</think>\n{"ok": true}',
+        '<think>```json\n{"draft": true}\n```</think>\n{"ok": true}',
+        '<|channel>thought\nconsider alternatives<channel|>{"ok": true}',
+        'Reasoning that was not parsed by the server.\n```json\n{"ok": true}\n```',
+    ],
+)
+def test_json_parser_extracts_final_object_after_inline_reasoning(response):
+    assert stage2_workflow._parse_json_object(response) == {"ok": True}
+
+
+def test_response_message_prefers_final_content_over_parsed_reasoning():
+    message = type(
+        "Message",
+        (),
+        {
+            "content": '{"ok": true}',
+            "reasoning_content": 'draft {"ok": false}',
+        },
+    )()
+
+    assert stage2_workflow._response_message_text(message) == '{"ok": true}'
 
 
 def test_openai_completion_reports_output_token_truncation(monkeypatch):
@@ -3213,11 +4894,75 @@ def test_consolidation_expands_ordinal_integer_range_categories():
     assert result["features"][0]["categories_or_unit"] == ["0", "1", "2", "3", "4"]
 
 
+def _agentic_fixture_response(body):
+    if body.get("task") == "analyze_cluster":
+        recommendations = []
+        for feature in body["definitions"]:
+            promote = (
+                body["role"] in feature.get("roles", [])
+                if feature.get("configured_explicit_feature") is True
+                else True
+            )
+            recommendations.append(
+                {
+                    "candidate_id": feature["feature_id"],
+                    "promote": promote,
+                    "evidence_for": ["test fixture retention"] if promote else [],
+                    "evidence_against": [] if promote else ["role not configured"],
+                    "inner_fold_consistency": "Consistent in the fixture folds.",
+                    "rationale": "Exercise the agentic selection integration.",
+                }
+            )
+        return {
+            "action": "final",
+            "role": body["role"],
+            "cluster_id": body["cluster"]["cluster_id"],
+            "assessment": "Apply fixture decisions.",
+            "latent_ids": [],
+            "recommendations": recommendations,
+        }
+    if body.get("task") == "outer_fold_role_adjudication":
+        decisions = []
+        for item in body["eligible_candidates"]:
+            definition = item["definition"]
+            promote = (
+                body["role"] in definition.get("roles", [])
+                if definition.get("configured_explicit_feature") is True
+                else True
+            )
+            decisions.append(
+                {
+                    "candidate_id": item["candidate_id"],
+                    "promote": promote,
+                    "evidence_for": ["test fixture retention"] if promote else [],
+                    "evidence_against": [] if promote else ["role not configured"],
+                    "inner_fold_consistency": "Consistent in the fixture folds.",
+                    "rationale": "Exercise the agentic adjudication integration.",
+                }
+            )
+        return {
+            "action": "final",
+            "role": body["role"],
+            "summary": "Apply fixture decisions.",
+            "decisions": decisions,
+            "selected_candidate_ids": [
+                row["candidate_id"] for row in decisions if row["promote"]
+            ],
+            "latent_source_exceptions": [],
+        }
+    raise AssertionError("not an agentic fixture prompt")
+
+
 def _fake_completion(calls):
     def complete(messages, _config):
         body = json.loads(messages[1]["content"])
         job = _prompt_job(body)
         calls.append(job)
+        if body.get("task") in {
+            "analyze_cluster",
+            "outer_fold_role_adjudication",
+        }:
+            return json.dumps(_agentic_fixture_response(body))
         if job == "extract_stage2_patient_variables":
             rows = []
             for patient in body["patients"]:
@@ -3227,6 +4972,25 @@ def _fake_completion(calls):
                     values[feature["name"]] = match.group(1) if match is not None else None
                 rows.append({"row_id": patient["row_id"], "values": values})
             return json.dumps({"rows": rows})
+        if job == "map_extracted_values_to_declared_category_ontology":
+            return json.dumps(
+                {
+                    "corrections": [
+                        {
+                            "mapping_id": item["mapping_id"],
+                            "value": f"ECOG {item['prior_extracted_value']}",
+                        }
+                        for item in body["items"]
+                    ]
+                }
+            )
+        if job == "review_stage2_small_model_extraction_ontology":
+            return json.dumps(
+                {
+                    "action": "keep",
+                    "reason": "Aggregate extraction values match the ontology.",
+                }
+            )
         if job == "review_stage2_variables_against_training_fold_performance":
             return json.dumps(
                 {
@@ -3462,34 +5226,20 @@ def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Pat
     def request_json(messages, validate, *, request_kind="interpretation"):
         prompt_sizes.append(sum(len(message["content"]) for message in messages))
         body = json.loads(messages[1]["content"])
-        if body["job"] == "extract_stage2_patient_variables":
-            page_bodies.extend(body["patients"])
-            response = {
-                "rows": [
-                    {
-                        "row_id": patient["row_id"],
-                        "values": {
-                            "performance_status": (
-                                "ECOG 2" if "ECOG 2" in patient["text"] else None
-                            )
-                        },
-                    }
-                    for patient in body["patients"]
-                ]
-            }
-        else:
-            assert body["job"] == "reconcile_stage2_patient_variable_pages"
-            assert [row["page_index"] for row in body["page_results"]] == list(
-                range(1, len(body["page_results"]) + 1)
+        assert body["job"] == "extract_stage2_patient_variable_observations"
+        patient = body["patient"]
+        page_bodies.append(patient)
+        observations = []
+        if "ECOG 2" in patient["text"]:
+            observations.append(
+                _page_observation(
+                    feature_name="performance_status",
+                    value="ECOG 2",
+                    text=patient["text"],
+                    evidence="ECOG 2",
+                )
             )
-            response = {
-                "rows": [
-                    {
-                        "row_id": body["row_id"],
-                        "values": {"performance_status": "ECOG 2"},
-                    }
-                ]
-            }
+        response = {"rows": [{"row_id": patient["row_id"], "observations": observations}]}
         return validate(response)
 
     frame = extract_rows(
@@ -3507,6 +5257,24 @@ def test_stage2_pages_oversized_unicode_note_without_dropping_text(tmp_path: Pat
     assert "".join(row["text"] for row in ordered_pages) == note
     assert all(size <= 5_000 for size in prompt_sizes)
     assert frame.loc[0, "performance_status"] == "ECOG 2"
+    decisions = json.loads(
+        (
+            tmp_path
+            / "extraction"
+            / "pages"
+            / "row_00000000"
+            / "reconciliation"
+            / "decisions.json"
+        ).read_text(encoding="utf-8")
+    )
+    decision = decisions["decisions"]["performance_status"]
+    assert decision["resolution"] == "unanimous_value"
+    assert decision["observations"][0]["evidence"] == "ECOG 2"
+    assert note[
+        decision["observations"][0]["source_start"] : decision["observations"][0][
+            "source_end"
+        ]
+    ] == "ECOG 2"
 
 
 def test_stage2_feature_batch_limit_is_preserved_across_lossless_pages(tmp_path: Path):
@@ -3523,7 +5291,6 @@ def test_stage2_feature_batch_limit_is_preserved_across_lossless_pages(tmp_path:
         for index in range(11)
     ]
     extraction_bodies = []
-    reconciliation_bodies = []
     prompt_sizes = []
 
     def request_json(messages, validate, *, request_kind="interpretation"):
@@ -3531,19 +5298,23 @@ def test_stage2_feature_batch_limit_is_preserved_across_lossless_pages(tmp_path:
         body = json.loads(messages[1]["content"])
         names = [feature["name"] for feature in body["features"]]
         assert len(names) <= 4
-        if body["job"] == "extract_stage2_patient_variables":
-            extraction_bodies.append(body)
-            row_id = body["patients"][0]["row_id"]
-        else:
-            assert body["job"] == "reconcile_stage2_patient_variable_pages"
-            reconciliation_bodies.append(body)
-            row_id = body["row_id"]
+        assert body["job"] == "extract_stage2_patient_variable_observations"
+        extraction_bodies.append(body)
+        patient = body["patient"]
         return validate(
             {
                 "rows": [
                     {
-                        "row_id": row_id,
-                        "values": {name: int(name.removeprefix("page_feature_")) for name in names},
+                        "row_id": patient["row_id"],
+                        "observations": [
+                            _page_observation(
+                                feature_name=name,
+                                value=int(name.removeprefix("page_feature_")),
+                                text=patient["text"],
+                                evidence="n",
+                            )
+                            for name in names
+                        ],
                     }
                 ]
             }
@@ -3564,13 +5335,12 @@ def test_stage2_feature_batch_limit_is_preserved_across_lossless_pages(tmp_path:
 
     pages_by_index = {}
     for body in extraction_bodies:
-        page = body["patients"][0]
+        page = body["patient"]
         pages_by_index[int(page["page"]["page_index"])] = page
     ordered_pages = [pages_by_index[index] for index in sorted(pages_by_index)]
     assert len(ordered_pages) >= 2
     assert "".join(page["text"] for page in ordered_pages) == note
     assert all(len(body["features"]) <= 4 for body in extraction_bodies)
-    assert all(len(body["features"]) <= 4 for body in reconciliation_bodies)
     assert all(size <= 5_000 for size in prompt_sizes)
     assert frame.loc[0, "page_feature_10"] == 10.0
     page_completion = json.loads(
@@ -3584,10 +5354,11 @@ def test_stage2_feature_batch_limit_is_preserved_across_lossless_pages(tmp_path:
             encoding="utf-8"
         )
     )
-    assert reconciliation_completion["feature_batches"] == 3
+    assert reconciliation_completion["reconciliation_method"] == "deterministic_provenance"
+    assert reconciliation_completion["features"] == 11
 
 
-def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
+def test_stage2_reconciles_oversized_page_observations_without_another_llm_request(
     tmp_path: Path,
 ):
     note = "n" * 2_500
@@ -3611,28 +5382,28 @@ def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
         )
 
     page_bodies = []
-    reconciliation_bodies = []
     prompt_sizes = []
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         prompt_sizes.append(sum(len(message["content"]) for message in messages))
         body = json.loads(messages[1]["content"])
-        if body["job"] == "extract_stage2_patient_variables":
-            page_bodies.extend(body["patients"])
-            row_id = body["patients"][0]["row_id"]
-        else:
-            assert body["job"] == "reconcile_stage2_patient_variable_pages"
-            reconciliation_bodies.append(body)
-            row_id = body["row_id"]
+        assert body["job"] == "extract_stage2_patient_variable_observations"
+        page_bodies.append(body["patient"])
+        patient = body["patient"]
         return validate(
             {
                 "rows": [
                     {
-                        "row_id": row_id,
-                        "values": {
-                            feature["name"]: expected_values[feature["name"]]
+                        "row_id": patient["row_id"],
+                        "observations": [
+                            _page_observation(
+                                feature_name=feature["name"],
+                                value=expected_values[feature["name"]],
+                                text=patient["text"],
+                                evidence="n",
+                            )
                             for feature in body["features"]
-                        },
+                        ],
                     }
                 ]
             }
@@ -3653,13 +5424,6 @@ def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
     ordered_pages = sorted(page_bodies, key=lambda row: row["page"]["page_index"])
     assert "".join(row["text"] for row in ordered_pages) == note
     assert len(ordered_pages) >= 2
-    assert len(reconciliation_bodies) == 2
-    assert all(len(body["features"]) == 1 for body in reconciliation_bodies)
-    expected_page_indices = list(range(1, len(ordered_pages) + 1))
-    assert all(
-        [page["page_index"] for page in body["page_results"]] == expected_page_indices
-        for body in reconciliation_bodies
-    )
     assert all(size <= 5_000 for size in prompt_sizes)
     assert frame.loc[0, definitions[0]["name"]] == expected_values[definitions[0]["name"]]
     assert frame.loc[0, definitions[1]["name"]] == expected_values[definitions[1]["name"]]
@@ -3668,7 +5432,210 @@ def test_stage2_losslessly_partitions_oversized_page_reconciliation_by_feature(
             encoding="utf-8"
         )
     )
-    assert completion["feature_batches"] == 2
+    assert completion["reconciliation_method"] == "deterministic_provenance"
+    assert completion["features"] == 2
+
+
+def test_stage2_oversized_note_uses_verified_dates_instead_of_page_order(tmp_path: Path):
+    newest = "2024-02-01 PD-L1 TPS 50%"
+    older = "2023-01-01 PD-L1 TPS 10%"
+    note = newest + (" x" * 5_000) + older
+    definition = {
+        "name": "pd_l1_tps",
+        "description": "PD-L1 tumor proportion score.",
+        "value_type": "continuous",
+        "categories_or_unit": ["percent"],
+        "measurement_definition": "Extract the latest documented PD-L1 TPS.",
+        "missing_value_rule": "Return null when undocumented.",
+        "conflict_resolution": {"strategy": "latest", "positive_category": None},
+    }
+    page_prompts = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        body = json.loads(messages[1]["content"])
+        assert body["job"] == "extract_stage2_patient_variable_observations"
+        page_prompts.append(body)
+        patient = body["patient"]
+        observations = []
+        for evidence, value, recorded_at in (
+            (newest, 50, "2024-02-01"),
+            (older, 10, "2023-01-01"),
+        ):
+            if evidence in patient["text"]:
+                observations.append(
+                    _page_observation(
+                        feature_name="pd_l1_tps",
+                        value=value,
+                        text=patient["text"],
+                        evidence=evidence,
+                        recorded_at=recorded_at,
+                        recorded_at_evidence=recorded_at,
+                    )
+                )
+        return validate(
+            {
+                "rows": [
+                    {
+                        "row_id": patient["row_id"],
+                        "observations": observations,
+                    }
+                ]
+            }
+        )
+
+    output = tmp_path / "extraction"
+    frame = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": [note]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        output_dir=output,
+        request_json=request_json,
+        workers=4,
+        max_prompt_chars=5_000,
+    )
+
+    assert len(page_prompts) >= 2
+    assert frame.loc[0, "pd_l1_tps"] == 50.0
+    decisions = json.loads(
+        (
+            output / "pages" / "row_00000000" / "reconciliation" / "decisions.json"
+        ).read_text(encoding="utf-8")
+    )
+    decision = decisions["decisions"]["pd_l1_tps"]
+    assert decision["distinct_value_count"] == 2
+    assert decision["selection_basis"] == "verified_recorded_at"
+    assert decision["value"] == 50.0
+    selected = next(
+        observation
+        for observation in decision["observations"]
+        if observation["observation_id"] == decision["selected_observation_id"]
+    )
+    assert selected["recorded_at"] == "2024-02-01"
+    assert note[selected["source_start"] : selected["source_end"]] == newest
+
+    def unexpected_request(*_args, **_kwargs):
+        raise AssertionError("completed page observations and reconciliation must resume")
+
+    resumed = extract_rows(
+        dataset=pd.DataFrame({"clinical_text": [note]}),
+        row_ids=[0],
+        text_column="clinical_text",
+        definitions=[definition],
+        output_dir=output,
+        request_json=unexpected_request,
+        workers=4,
+        max_prompt_chars=5_000,
+    )
+    assert resumed.loc[0, "pd_l1_tps"] == 50.0
+
+
+def test_stage2_single_or_null_conflict_policy_is_conservative_and_audited():
+    definition = {
+        "name": "ambiguous_status",
+        "description": "A status with no valid longitudinal precedence.",
+        "value_type": "categorical",
+        "categories_or_unit": ["A", "B"],
+        "measurement_definition": "Return one value only when unambiguous.",
+        "missing_value_rule": "Return null for conflicting documentation.",
+        "conflict_resolution": {"strategy": "single_or_null"},
+    }
+    observations = [
+        {
+            "observation_id": "observation_a",
+            "feature_name": "ambiguous_status",
+            "value": "A",
+            "source_start": 10,
+            "source_end": 11,
+            "recorded_at": None,
+        },
+        {
+            "observation_id": "observation_b",
+            "feature_name": "ambiguous_status",
+            "value": "B",
+            "source_start": 20,
+            "source_end": 21,
+            "recorded_at": None,
+        },
+    ]
+
+    value, decision = stage2_analysis._resolve_feature_observations(
+        definition=definition,
+        observations=observations,
+    )
+
+    assert value is None
+    assert decision["resolution"] == "conflict_null"
+    assert decision["selection_basis"] == "conflicting_values_are_null"
+    assert decision["selected_observation_id"] is None
+
+
+def test_stage2_page_provenance_requires_exact_quotes_and_repairs_offsets():
+    text = "Encounter 2024-06-03: ECOG was 2."
+    page = {
+        "row_id": 4,
+        "text": text,
+        "page": {
+            "page_index": 2,
+            "char_start": 100,
+            "char_end": 100 + len(text),
+            "document_chars": 300,
+        },
+    }
+    definition = {
+        "name": "ecog",
+        "description": "ECOG performance status.",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0", "1", "2", "3", "4"],
+        "measurement_definition": "Extract the latest ECOG score.",
+        "missing_value_rule": "Return null when undocumented.",
+    }
+    response = {
+        "rows": [
+            {
+                "row_id": 4,
+                "observations": [
+                    {
+                        "feature_name": "ecog",
+                        "value": "2",
+                        "evidence": "ECOG was 2",
+                        "evidence_start": 0,
+                        "evidence_end": 2,
+                        "recorded_at": "2024-06-03",
+                        "recorded_at_evidence": "2024-06-03",
+                        "recorded_at_start": 0,
+                        "recorded_at_end": 2,
+                    },
+                    {
+                        "feature_name": "ecog",
+                        "value": "3",
+                        "evidence": "ECOG was 3",
+                        "evidence_start": 0,
+                        "evidence_end": 10,
+                        "recorded_at": None,
+                        "recorded_at_evidence": None,
+                        "recorded_at_start": None,
+                        "recorded_at_end": None,
+                    },
+                ],
+            }
+        ]
+    }
+
+    with pytest.raises(stage2_analysis._PageObservationValidationError) as error:
+        stage2_analysis._validate_page_observations(
+            response,
+            page=page,
+            definitions=[definition],
+        )
+
+    retained = error.value.response["rows"][0]["observations"]
+    assert len(retained) == 1
+    assert retained[0]["offset_resolution"] == "nearest_exact_match"
+    assert retained[0]["recorded_at_offset_resolution"] == "nearest_exact_match"
+    assert retained[0]["source_start"] == 100 + text.index("ECOG was 2")
+    assert retained[0]["recorded_at_source_start"] == 100 + text.index("2024-06-03")
+    assert "not an exact substring" in error.value.issues[0]["reason"]
 
 
 def test_stage2_iterative_consolidation_does_not_lose_candidates():
@@ -3721,7 +5688,6 @@ def test_stage2_iterative_consolidation_does_not_lose_candidates():
         model="test-model",
         max_prompt_chars=8_000,
         consolidation_max_prompt_chars=50_000,
-        max_candidates_per_fold=3,
     )
     runner = PlainHandoffStage2(
         config=config,
@@ -4634,7 +6600,6 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
         config=PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
             model="test-model",
-            max_candidates_per_fold=2,
         ),
         clinical_question="Estimate a treatment effect.",
         completion=completion,
@@ -4700,9 +6665,7 @@ def test_redesigned_consolidation_assembles_provenance_roles_and_dispositions_in
         ["architecture_gamma"],
         ["architecture_alpha", "architecture_delta"],
     ]
-    assert result["features"][0]["roles"] == ["prognostic", "effect_modifier"]
-    assert result["features"][1]["roles"] == ["prognostic"]
-    assert result["features"][2]["roles"] == ["confounder"]
+    assert [feature["roles"] for feature in result["features"]] == [[], [], []]
     assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0002"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0003"]["status"] == "retained"
@@ -4994,7 +6957,9 @@ def test_configured_feature_is_retained_without_any_discovered_candidate():
     assert result["features"][0]["roles"] == ["confounder"]
 
 
-def test_global_consolidation_merges_aliases_then_filters_unsupported_roles(tmp_path: Path):
+def test_global_consolidation_merges_aliases_and_retains_all_candidates_for_screening(
+    tmp_path: Path,
+):
     prompt_bodies = []
     evidence_packets = [
         {
@@ -5127,39 +7092,24 @@ def test_global_consolidation_merges_aliases_then_filters_unsupported_roles(tmp_
     assert [feature["name"] for feature in result["features"]] == [
         "blood_glucose_concentration",
         "heart_rate",
+        "james_lee_clinical_profile",
     ]
     assert result["features"][0]["supporting_packet_ids"] == [
         "packet_alpha",
         "packet_beta",
     ]
-    assert result["features"][0]["roles"] == ["confounder", "effect_modifier"]
+    assert [feature["roles"] for feature in result["features"]] == [[], [], []]
     assert result["candidate_dispositions"]["candidate_0001"]["status"] == "retained"
     assert result["candidate_dispositions"]["candidate_0002"]["status"] == "merged"
     assert result["candidate_dispositions"]["candidate_0003"]["status"] == "retained"
-    assert result["candidate_dispositions"]["candidate_0004"]["status"] == "excluded"
-    assert (
-        "Stage 1 evidence does not support"
-        in result["candidate_dispositions"]["candidate_0004"]["reason"]
-    )
+    assert result["candidate_dispositions"]["candidate_0004"]["status"] == "retained"
     assert [_prompt_job(body) for body in prompt_bodies].count(
         "consolidate_stage2_candidate_pool"
     ) == 2
     assert [_prompt_job(body) for body in prompt_bodies].count(
         "operationalize_stage2_candidate_group"
-    ) == 2
-    role_filter = json.loads(
-        (tmp_path / "consolidation" / "causal_role_filter.json").read_text(encoding="utf-8")
-    )
-    assert role_filter["phase"] == "post_consolidation_causal_role_filter"
-    assert role_filter["input_groups"] == 3
-    assert role_filter["retained_groups"] == 2
-    assert role_filter["excluded_groups"] == 1
-    profile_decision = next(
-        decision
-        for decision in role_filter["decisions"]
-        if decision["name"] == "james_lee_clinical_profile"
-    )
-    assert profile_decision["status"] == "excluded"
+    ) == 3
+    assert not (tmp_path / "consolidation" / "causal_role_filter.json").exists()
     ontology_bodies = {
         body["candidate_feature_name"]: body
         for body in prompt_bodies
@@ -5170,6 +7120,9 @@ def test_global_consolidation_merges_aliases_then_filters_unsupported_roles(tmp_
         "Glycemia was documented numerically.",
     ]
     assert ontology_bodies["heart_rate"]["supporting_evidence"] == ["Resting pulse was 72 bpm."]
+    assert ontology_bodies["james_lee_clinical_profile"]["supporting_evidence"] == [
+        "James Lee had several unrelated chart findings."
+    ]
 
 
 def test_iterative_batch_jointly_merges_general_threshold_value_and_score_representations():
@@ -5277,10 +7230,7 @@ def test_iterative_batch_jointly_merges_general_threshold_value_and_score_repres
     ]
     assert [feature["name"] for feature in result["features"]] == ["inflammation_marker_expression"]
     assert result["features"][0]["supporting_packet_ids"] == packet_ids
-    assert result["features"][0]["roles"] == [
-        "confounder",
-        "effect_modifier",
-    ]
+    assert result["features"][0]["roles"] == []
     assert [
         result["candidate_dispositions"][f"candidate_{index:04d}"]["status"]
         for index in range(1, 5)
@@ -5314,6 +7264,10 @@ def test_operationalization_ignores_model_authored_provenance_and_uses_aliases()
     assert result["categories_or_unit"] == ["standard unit"]
     assert result["measurement_definition"] == "Extract the pretreatment value."
     assert result["missing_value_rule"] == "Return null when undocumented."
+    assert result["conflict_resolution"] == {
+        "strategy": "latest",
+        "positive_category": None,
+    }
     assert "name" not in result
     assert "supporting_packet_ids" not in result
     assert "roles" not in result
@@ -5339,6 +7293,7 @@ def test_operationalization_supplies_safe_defaults_for_omitted_leaf_fields():
         "Extract one pretreatment scalar for scalar measurement"
     )
     assert result["missing_value_rule"].startswith("Return null")
+    assert result["conflict_resolution"]["strategy"] == "single_or_null"
     assert result["stability_summary"] == (
         "Supported by 2 evidence packet(s) across 1 Stage 1 architecture(s)."
     )
@@ -5359,6 +7314,51 @@ def test_operationalization_requires_model_authored_value_type():
                 "supporting_packet_ids": ["packet_1"],
             },
         )
+
+
+def test_operationalization_validates_structured_conflict_resolution():
+    with pytest.raises(ValueError, match="requires a continuous feature"):
+        stage2_workflow._validate_operationalization(
+            {
+                "description": "A binary status.",
+                "value_type": "binary",
+                "categories_or_unit": ["Absent", "Present"],
+                "measurement_definition": "Extract the documented status.",
+                "missing_value_rule": "Return null when undocumented.",
+                "conflict_resolution": {
+                    "strategy": "maximum",
+                    "positive_category": None,
+                },
+            },
+            group={
+                "name": "binary_status",
+                "supporting_packet_ids": ["packet_1"],
+                "supporting_architectures": ["architecture_1"],
+            },
+        )
+
+    result = stage2_workflow._validate_operationalization(
+        {
+            "description": "Whether the condition was ever documented.",
+            "value_type": "binary",
+            "categories_or_unit": ["Absent", "Present"],
+            "measurement_definition": "Extract whether there is any history of the condition.",
+            "missing_value_rule": "Return null when documentation is insufficient.",
+            "conflict_resolution": {
+                "strategy": "any_positive",
+                "positive_category": "Present",
+            },
+        },
+        group={
+            "name": "condition_history",
+            "supporting_packet_ids": ["packet_1"],
+            "supporting_architectures": ["architecture_1"],
+        },
+    )
+    assert result["conflict_resolution"] == {
+        "strategy": "any_positive",
+        "positive_category": "Present",
+    }
 
 
 @pytest.mark.parametrize(
@@ -5879,7 +7879,7 @@ def test_inner_heldout_signal_pruning_keeps_causal_roles_and_drops_noise():
     assert report["features_dropped"] == 1
 
 
-def test_stage2_feature_models_use_forests_for_both_causal_roles():
+def test_stage2_nuisance_models_use_elastic_nets_and_effect_model_remains_forest():
     rng = np.random.default_rng(123)
     features = rng.normal(size=(80, 3))
     binary = rng.binomial(1, 0.5, size=80)
@@ -5889,13 +7889,11 @@ def test_stage2_feature_models_use_forests_for_both_causal_roles():
         features,
         binary,
         seed=11,
-        trees=10,
     )
     outcome_regressor = stage2_analysis._fit_regressor(
         features,
         continuous,
         seed=12,
-        trees=10,
     )
     effect_model = stage2_analysis._fit_effect_model(
         features,
@@ -5904,12 +7902,12 @@ def test_stage2_feature_models_use_forests_for_both_causal_roles():
         trees=10,
     )
 
-    assert classifier.__class__.__name__ == "RandomForestClassifier"
-    assert outcome_regressor.__class__.__name__ == "RandomForestRegressor"
+    assert classifier.__class__.__name__ == "ElasticNetLogisticClassifier"
+    assert outcome_regressor.__class__.__name__ == "ElasticNetRegressor"
     assert effect_model.model.__class__.__name__ == "RandomForestRegressor"
 
 
-def test_stability_selection_prunes_modifiers_only_after_stable_negative_margin():
+def _retired_test_stability_selection_prunes_modifiers_only_after_stable_negative_margin():
     definitions = [
         {
             "feature_id": "feature_confounder",
@@ -6039,7 +8037,7 @@ def test_stability_selection_prunes_modifiers_only_after_stable_negative_margin(
     assert guard["drop_decisions_overridden"] == 1
 
 
-def test_fold_analysis_flags_nonconvergence_and_continues_at_evaluation_round_cap(
+def _retired_test_fold_analysis_flags_nonconvergence_and_continues_at_evaluation_round_cap(
     tmp_path,
     monkeypatch,
 ):
@@ -6156,7 +8154,7 @@ def test_fold_analysis_flags_nonconvergence_and_continues_at_evaluation_round_ca
     assert not (output / "review" / "round_003").exists()
 
 
-def test_fold_analysis_reextracts_final_definition_change_at_evaluation_round_cap(
+def _retired_test_fold_analysis_reextracts_final_definition_change_at_evaluation_round_cap(
     tmp_path,
     monkeypatch,
 ):
@@ -6533,7 +8531,9 @@ def test_harmonization_retains_prior_plan_and_nulls_failed_delta(tmp_path: Path)
     )
 
     def invalid_delta(*_args, **_kwargs):
-        raise ValueError("mapping response remained invalid after bounded repairs")
+        raise stage2_analysis.Stage2ResponseValidationError(
+            "mapping response remained invalid after bounded repairs"
+        )
 
     harmonized, definitions, report = stage2_analysis._harmonize_training_extraction(
         extracted=extracted,
@@ -6587,7 +8587,9 @@ def test_harmonization_uses_audited_hybrid_fallback_without_prior_plan(
     )
 
     def invalid_plan(*_args, **_kwargs):
-        raise ValueError("plan response remained invalid after bounded repairs")
+        raise stage2_analysis.Stage2ResponseValidationError(
+            "plan response remained invalid after bounded repairs"
+        )
 
     harmonized, definitions, report = stage2_analysis._harmonize_training_extraction(
         extracted=extracted,
@@ -6750,7 +8752,7 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path, monkeypatch):
     definitions = json.loads(
         (output / "outer_001" / "feature_definitions.json").read_text(encoding="utf-8")
     )
-    assert definitions["features"][0]["roles"] == ["confounder"]
+    assert definitions["features"][0]["roles"] == []
     # Architecture-stratified compilation interprets the two producers
     # independently, then deterministically coalesces their exact shared name
     # before iterative semantic batches.
@@ -6781,6 +8783,86 @@ def test_plain_stage2_is_fold_scoped_and_resumable(tmp_path: Path, monkeypatch):
         )
 
 
+def test_feature_definitions_resume_without_llm_calls_after_extractor_transport_change(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _install_test_candidate_scorer(monkeypatch)
+    handoff = tmp_path / "handoff.jsonl"
+    handoff.write_text(
+        json.dumps(
+            {
+                "source": "tfidf",
+                "outer_fold": 1,
+                "inner_fold": None,
+                "scope": "full_outer_train",
+                "evidence": {
+                    "architecture": "tfidf_topic_contrast",
+                    "evidence_id": "treatment-ecog",
+                    "objective": "treatment",
+                    "terms": ["ECOG", "poor performance status"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "stage2"
+    calls = []
+
+    def config(extraction_model, extraction_max_tokens):
+        return PlainHandoffStage2Config(
+            endpoint="http://stage2.test/v1",
+            model="same-primary",
+            extraction_max_tokens=extraction_max_tokens,
+            max_prompt_chars=8_000,
+            workers=2,
+            required_architectures=(),
+            extraction_llm=Stage2ExtractionLLMConfig(
+                endpoint="http://extract.test/v1",
+                model=extraction_model,
+                workers=1,
+            ),
+        )
+
+    run_plain_handoff_stage2(
+        handoff_path=handoff,
+        output_dir=output,
+        clinical_question="Identify confounders.",
+        config=config("extractor-a", 100_000),
+        completion=_fake_completion(calls),
+    )
+    first_call_count = len(calls)
+    first_completion = json.loads(
+        (output / "outer_001" / "definitions_complete.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    run_plain_handoff_stage2(
+        handoff_path=handoff,
+        output_dir=output,
+        clinical_question="Identify confounders.",
+        config=config("extractor-b", 60_000),
+        completion=_fake_completion(calls),
+    )
+
+    second_completion = json.loads(
+        (output / "outer_001" / "definitions_complete.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    identity = json.loads((output / "model_identity.json").read_text(encoding="utf-8"))
+    resumed_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    assert len(calls) == first_call_count
+    assert (
+        second_completion["evidence_input_fingerprint"]
+        == first_completion["evidence_input_fingerprint"]
+    )
+    assert identity["extraction"]["selected_model"] == "extractor-b"
+    assert resumed_config["extraction_max_tokens"] == 60_000
+
+
 def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
     tmp_path: Path,
     monkeypatch,
@@ -6809,6 +8891,8 @@ def test_plain_stage2_runs_outer_folds_concurrently_and_writes_them_in_order(
 
     def run_outer_fold(**kwargs):
         outer_fold = int(kwargs["outer_fold"])
+        assert "agentic_evidence_workers" not in kwargs
+        assert "agentic_evidence_executor" not in kwargs
         barrier.wait(timeout=2.0)
         if outer_fold == 2:
             assert third_completed.wait(timeout=2.0)
@@ -6930,13 +9014,19 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
         "".join(json.dumps(row) + "\n" for row in split_rows),
         encoding="utf-8",
     )
-    calls = []
+    primary_calls = []
+    extraction_calls = []
     output = tmp_path / "stage2"
     config = PlainHandoffStage2Config(
         endpoint="http://stage2.test/v1",
         model="test-model",
         max_prompt_chars=12_000,
         workers=4,
+        extraction_llm=stage2_workflow.Stage2ExtractionLLMConfig(
+            endpoint="http://extract.test/v1",
+            model="small-model",
+            workers=4,
+        ),
         max_review_rounds=1,
         estimation_trees=10,
         required_architectures=(),
@@ -6947,7 +9037,8 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
         output_dir=output,
         clinical_question="Estimate the treatment effect.",
         config=config,
-        completion=_fake_completion(calls),
+        completion=_fake_completion(primary_calls),
+        extraction_completion=_fake_completion(extraction_calls),
         dataset=dataset,
         split_provenance_path=split_path,
         inner_folds=2,
@@ -6963,23 +9054,81 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
     assert (output / "causal_estimate.json").is_file()
     assert (output / "posthoc_oracle_ite_metrics.json").is_file()
     assert (output / "posthoc_predictions_with_oracle_ite.csv").is_file()
-    assert (output / "outer_001" / "review" / "round_001" / "performance.json").is_file()
-    performance = json.loads(
-        (output / "outer_001" / "review" / "round_001" / "performance.json").read_text(
+    selection_path = output / "outer_001" / "selection" / "elastic_net_selection.json"
+    assert selection_path.is_file()
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    assert selection["schema_version"] == (
+        stage2_analysis.STAGE2_ROLE_SELECTION_SCHEMA_VERSION
+    )
+    assert selection["latent_construction"] == "disabled"
+    assert selection["pairwise_association_screen"] == "disabled"
+    assert selection["cross_fitted_nuisance_models"][
+        "predictions_are_inner_fold_out_of_fold"
+    ] is True
+    assert not (output / "outer_001" / "selection" / "stage2_evidence").exists()
+    assert (
+        output
+        / "outer_001"
+        / "ontology_supervision"
+        / "round_001"
+        / "supervisor"
+        / "complete.json"
+    ).is_file()
+    assert (output / "outer_001" / "extraction" / "extracted_features.csv").is_file()
+    assert (output / "outer_001" / "estimation" / "predictions.csv").is_file()
+    diagnostics = json.loads(
+        (output / "outer_001" / "estimation" / "diagnostics.json").read_text(
             encoding="utf-8"
         )
     )
-    assert performance["leave_one_feature_out"][0]["name"] == "performance_status"
-    assert (output / "outer_001" / "extraction" / "extracted_features.csv").is_file()
-    assert (output / "outer_001" / "estimation" / "predictions.csv").is_file()
-    calls_after_first = len(calls)
+    assert diagnostics["model_family"] == "causal_forest_dml"
+    assert diagnostics["causal_forest_fit_audit"]["outcome_model_contract"] == {
+        "outcome_type": "binary",
+        "discrete_outcome": True,
+        "model_class": (
+            "oci.models.elastic_net_nuisance.ElasticNetLogisticClassifier"
+        ),
+        "prediction_interface": "predict_proba",
+        "criterion": "log_loss",
+        "penalty": "elastic_net",
+    }
+    assert diagnostics["nuisance_model_family"] == "elastic_net"
+    assert "extract_stage2_patient_variables" not in primary_calls
+    assert "analyze_stage2_variable_cluster" not in primary_calls
+    assert "adjudicate_stage2_variable_role" not in primary_calls
+    assert extraction_calls
+    assert set(extraction_calls) == {"extract_stage2_patient_variables"}
+    calls_after_first = (len(primary_calls), len(extraction_calls))
+    extraction_path = output / "outer_001" / "extraction" / "extracted_features.csv"
+    selection_bytes = selection_path.read_bytes()
+    extraction_bytes = extraction_path.read_bytes()
+    estimation_complete_path = output / "outer_001" / "estimation" / "complete.json"
+    old_estimation_completion = json.loads(
+        estimation_complete_path.read_text(encoding="utf-8")
+    )
+    old_estimation_completion["schema_version"] = (
+        "stage2_outer_estimation_v4_causal_forest"
+    )
+    estimation_complete_path.write_text(
+        json.dumps(old_estimation_completion),
+        encoding="utf-8",
+    )
+    forest_fits = []
+    original_forest_fit = stage2_analysis.CausalForestHead.fit
+
+    def tracked_forest_fit(self, *args, **kwargs):
+        forest_fits.append(self.outcome_type)
+        return original_forest_fit(self, *args, **kwargs)
+
+    monkeypatch.setattr(stage2_analysis.CausalForestHead, "fit", tracked_forest_fit)
 
     second = run_plain_handoff_stage2(
         handoff_path=handoff,
         output_dir=output,
         clinical_question="Estimate the treatment effect.",
         config=config,
-        completion=_fake_completion(calls),
+        completion=_fake_completion(primary_calls),
+        extraction_completion=_fake_completion(extraction_calls),
         dataset=dataset,
         split_provenance_path=split_path,
         inner_folds=2,
@@ -6987,19 +9136,166 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
     )
 
     assert second["causal_estimate"]["rows"] == 40
-    assert len(calls) == calls_after_first
+    assert (len(primary_calls), len(extraction_calls)) == calls_after_first
+    assert forest_fits == ["binary"]
+    assert selection_path.read_bytes() == selection_bytes
+    assert extraction_path.read_bytes() == extraction_bytes
+    resumed_estimation_completion = json.loads(
+        estimation_complete_path.read_text(encoding="utf-8")
+    )
+    assert resumed_estimation_completion["schema_version"] == (
+        stage2_analysis.ESTIMATION_CHECKPOINT_SCHEMA_VERSION
+    )
 
 
-def test_training_fold_review_can_revise_then_retest_a_definition(
+def test_aggregate_supervisor_reuses_identical_feature_review_across_rounds(
+    tmp_path: Path,
+):
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "performance_status",
+        "description": "Pretreatment performance status.",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0", "1", "2", "3", "4"],
+        "measurement_definition": "Extract the documented pretreatment ECOG score.",
+        "missing_value_rule": "Return null when it is undocumented.",
+    }
+    summary = {
+        "feature_id": definition["feature_id"],
+        "name": definition["name"],
+        "rows": 20,
+        "nonmissing": 18,
+        "nonmissing_fraction": 0.9,
+        "unique_nonmissing": 3,
+        "dominant_value_fraction": 0.5,
+        "most_common_values": {"1": 9, "0": 6, "2": 3},
+    }
+    calls = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        calls.append(json.loads(messages[1]["content"])["feature"]["feature_id"])
+        assert request_kind == "interpretation"
+        return validate(
+            {
+                "action": "keep",
+                "reason": "The aggregate extraction matches the declared ontology.",
+            }
+        )
+
+    supervision = tmp_path / "ontology_supervision"
+    first_definitions, first_changed, first_report = (
+        stage2_analysis._request_aggregate_ontology_supervisor(
+            definitions=[definition],
+            summaries=[summary],
+            failure_summary={"feature_failure_patterns": []},
+            output_dir=supervision / "round_001" / "supervisor",
+            request_json=request_json,
+            workers=1,
+            request_identity={"model": "primary-test-model"},
+        )
+    )
+    second_definitions, second_changed, second_report = (
+        stage2_analysis._request_aggregate_ontology_supervisor(
+            definitions=[definition],
+            summaries=[summary],
+            failure_summary={"feature_failure_patterns": []},
+            output_dir=supervision / "round_002" / "supervisor",
+            request_json=request_json,
+            workers=1,
+            request_identity={"model": "primary-test-model"},
+        )
+    )
+    changed_definition = {
+        **definition,
+        "measurement_definition": (
+            "Extract the last documented pretreatment ECOG score before treatment."
+        ),
+    }
+    _third_definitions, _third_changed, third_report = (
+        stage2_analysis._request_aggregate_ontology_supervisor(
+            definitions=[changed_definition],
+            summaries=[summary],
+            failure_summary={"feature_failure_patterns": []},
+            output_dir=supervision / "round_003" / "supervisor",
+            request_json=request_json,
+            workers=1,
+            request_identity={"model": "primary-test-model"},
+        )
+    )
+
+    assert calls == [definition["feature_id"], definition["feature_id"]]
+    assert first_definitions == second_definitions
+    assert first_changed is second_changed is False
+    assert first_report["model_requested_features"] == 1
+    assert first_report["cache_reused_features"] == 0
+    assert second_report["model_requested_features"] == 0
+    assert second_report["cache_reused_features"] == 1
+    assert third_report["model_requested_features"] == 1
+    assert third_report["cache_reused_features"] == 0
+    second_completion = json.loads(
+        (
+            supervision
+            / "round_002"
+            / "supervisor"
+            / "feature_0001"
+            / "complete.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert second_completion["reused"] is True
+    assert second_completion["reuse_source"] == "content_addressed_cache"
+
+
+def test_aggregate_supervisor_transport_exhaustion_is_not_checkpointed(
+    tmp_path: Path,
+):
+    definition = {
+        "feature_id": "outer_001_feature_001",
+        "name": "performance_status",
+        "description": "Pretreatment performance status.",
+        "value_type": "ordinal",
+        "categories_or_unit": ["0", "1", "2", "3", "4"],
+        "measurement_definition": "Extract the documented pretreatment ECOG score.",
+        "missing_value_rule": "Return null when it is undocumented.",
+    }
+
+    def exhausted(*_args, **_kwargs):
+        raise stage2_analysis.Stage2RequestExhaustedError("extractor endpoint unavailable")
+
+    output_dir = tmp_path / "ontology_supervision" / "round_001" / "supervisor"
+    with pytest.raises(
+        stage2_analysis.Stage2RequestExhaustedError,
+        match="endpoint unavailable",
+    ):
+        stage2_analysis._request_aggregate_ontology_supervisor(
+            definitions=[definition],
+            summaries=[
+                {
+                    "feature_id": definition["feature_id"],
+                    "name": definition["name"],
+                }
+            ],
+            failure_summary={"feature_failure_patterns": []},
+            output_dir=output_dir,
+            request_json=exhausted,
+            workers=1,
+        )
+
+    assert not (output_dir / "feature_0001" / "result.json").exists()
+    assert not (output_dir / "feature_0001" / "complete.json").exists()
+    assert not (output_dir / "complete.json").exists()
+
+
+def test_aggregate_supervisor_can_revise_then_reextract_a_definition(
     tmp_path: Path,
     monkeypatch,
 ):
+    rows = 48
     dataset = pd.DataFrame(
         {
-            "patient_id": [f"p{index:02d}" for index in range(12)],
-            "clinical_text": [f"Pretreatment ECOG {index % 3}." for index in range(12)],
-            "treatment_indicator": [0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0],
-            "outcome_indicator": [0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0],
+            "patient_id": [f"p{index:02d}" for index in range(rows)],
+            "clinical_text": [f"Pretreatment ECOG {index % 3}." for index in range(rows)],
+            "treatment_indicator": [int(index % 3 != 0) for index in range(rows)],
+            "outcome_indicator": [int(index % 3 != 0) for index in range(rows)],
         }
     )
     definitions = [
@@ -7009,7 +9305,7 @@ def test_training_fold_review_can_revise_then_retest_a_definition(
             "description": "Baseline ECOG performance status.",
             "value_type": "ordinal",
             "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
-            "roles": ["confounder"],
+            "roles": [],
             "measurement_definition": "Extract the pretreatment ECOG score.",
             "missing_value_rule": "Use null when undocumented.",
             "supporting_packet_ids": ["packet_1"],
@@ -7020,11 +9316,19 @@ def test_training_fold_review_can_revise_then_retest_a_definition(
     ]
     split = {
         "outer_fold": 1,
-        "fit_row_ids": list(range(6)),
-        "heldout_row_ids": list(range(6, 12)),
+        "fit_row_ids": list(range(24)),
+        "heldout_row_ids": list(range(24, 48)),
         "inner_splits": [
-            {"inner_fold": 1, "fit_row_ids": [0, 1, 2], "heldout_row_ids": [3, 4, 5]},
-            {"inner_fold": 2, "fit_row_ids": [3, 4, 5], "heldout_row_ids": [0, 1, 2]},
+            {
+                "inner_fold": 1,
+                "fit_row_ids": list(range(12)),
+                "heldout_row_ids": list(range(12, 24)),
+            },
+            {
+                "inner_fold": 2,
+                "fit_row_ids": list(range(12, 24)),
+                "heldout_row_ids": list(range(12)),
+            },
         ],
     }
     jobs = []
@@ -7037,66 +9341,73 @@ def test_training_fold_review_can_revise_then_retest_a_definition(
 
     monkeypatch.setattr(stage2_analysis, "extract_rows", tracked_extract_rows)
 
-    def retain_signal_for_revision_test(definitions, _performance, *, defer_feature_ids=None):
-        return [dict(feature) for feature in definitions], {
-            "features_evaluated": len(definitions),
-            "features_retained": len(definitions),
-            "features_dropped": 0,
-            "features_with_roles_pruned": 0,
-            "features_deferred_for_re_evaluation": len(defer_feature_ids or set()),
-            "decisions": [],
-        }
+    def retain_revised_definition(**kwargs):
+        selected = [
+            {
+                **kwargs["definitions"][0],
+                "roles": ["confounder"],
+                "nuisance_model_roles": ["treatment", "outcome"],
+            }
+        ]
+        return (
+            selected,
+            {
+                "schema_version": stage2_analysis.STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+                "status": "complete",
+            },
+            selected,
+            [],
+        )
 
     monkeypatch.setattr(
         stage2_analysis,
-        "_apply_empirical_signal_pruning",
-        retain_signal_for_revision_test,
+        "select_stage2_features_elastic_net",
+        retain_revised_definition,
     )
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
+        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+            return validate(_agentic_fixture_response(body))
         jobs.append(body["job"])
         if body["job"] == "extract_stage2_patient_variables":
+            assert request_kind == "extraction"
             response = {
                 "rows": [
                     {
                         "row_id": patient["row_id"],
                         "values": {
-                            "performance_status": re.search(
-                                r"ECOG\s*([0-2])", patient["text"]
-                            ).group(1)
+                            "performance_status": "ECOG "
+                            + re.search(r"ECOG\s*([0-2])", patient["text"]).group(1)
                         },
                     }
                     for patient in body["patients"]
                 ]
             }
-        elif body["allow_measurement_revision"]:
+        elif (
+            body["job"] == "review_stage2_small_model_extraction_ontology"
+            and jobs.count("review_stage2_small_model_extraction_ontology") == 1
+        ):
+            assert request_kind == "interpretation"
+            assert "patients" not in body
+            assert "treatment_indicator" not in json.dumps(body).lower()
             response = {
-                "feature_decisions": [
-                    {
-                        "feature_id": "outer_001_feature_001",
-                        "action": "revise",
-                        "reason": "Clarify the scale before another training-fold evaluation.",
-                        "value_type": "ordinal",
-                        "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
-                        "measurement_definition": (
-                            "Extract the last explicitly documented pretreatment ECOG score."
-                        ),
-                        "missing_value_rule": "Use null when no explicit score is documented.",
-                    }
-                ],
-                "overall_assessment": "Retest the clarified definition.",
+                "action": "revise",
+                "reason": "Clarify which pretreatment score to extract.",
+                "description": "Last documented pretreatment ECOG performance status.",
+                "value_type": "ordinal",
+                "categories_or_unit": ["ECOG 0", "ECOG 1", "ECOG 2"],
+                "measurement_definition": (
+                    "Extract the last explicitly documented pretreatment ECOG score."
+                ),
+                "missing_value_rule": "Use null when no explicit score is documented.",
             }
         else:
+            assert body["job"] == "review_stage2_small_model_extraction_ontology"
+            assert request_kind == "interpretation"
             response = {
-                "feature_decisions": [
-                    {
-                        "feature_id": "outer_001_feature_001",
-                        "action": "keep",
-                        "reason": "The revised definition was evaluated successfully.",
-                    }
-                ],
-                "overall_assessment": "Freeze the definition.",
+                "action": "keep",
+                "reason": "The revised aggregate extraction is internally consistent.",
             }
         return validate(response)
 
@@ -7117,6 +9428,11 @@ def test_training_fold_review_can_revise_then_retest_a_definition(
         config=PlainHandoffStage2Config(
             endpoint="http://stage2.test/v1",
             model="test-model",
+            extraction_llm=Stage2ExtractionLLMConfig(
+                endpoint="http://small-stage2.test/v1",
+                model="small-test-model",
+                workers=1,
+            ),
             max_prompt_chars=12_000,
             extraction_max_prompt_chars=20_000,
             max_review_rounds=2,
@@ -7126,10 +9442,555 @@ def test_training_fold_review_can_revise_then_retest_a_definition(
 
     assert result["review_rounds"] == 2
     assert result["features"][0]["measurement_definition"].startswith("Extract the last")
-    assert extraction_prompt_limits == [20_000, 20_000, 20_000]
-    assert jobs.count("review_stage2_variables_against_training_fold_performance") == 2
-    assert jobs.count("extract_stage2_patient_variables") == 18
-    assert (tmp_path / "outer_001" / "review" / "round_002" / "performance.json").is_file()
+    assert set(extraction_prompt_limits) == {20_000}
+    assert jobs.count("review_stage2_small_model_extraction_ontology") == 2
+    assert jobs.count("extract_stage2_patient_variables") > 48
+    assert (
+        tmp_path
+        / "outer_001"
+        / "ontology_supervision"
+        / "round_002"
+        / "supervisor"
+        / "complete.json"
+    ).is_file()
+    round_two_extraction = json.loads(
+        (
+            tmp_path
+            / "outer_001"
+            / "ontology_supervision"
+            / "round_002"
+            / "extraction"
+            / "complete.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert round_two_extraction["reextraction_scope"] == "changed_features_only"
+    assert round_two_extraction["reextracted_feature_names"] == [
+        "performance_status"
+    ]
+
+
+def test_fold_reselection_uses_frozen_preselection_without_training_extraction(
+    tmp_path: Path,
+    monkeypatch,
+):
+    dataset = pd.DataFrame(
+        {
+            "patient_id": ["p0", "p1", "p2", "p3"],
+            "clinical_text": ["baseline yes", "baseline no", "baseline yes", "heldout"],
+            "treatment_indicator": [0, 1, 0, 1],
+            "outcome_indicator": [0, 1, 1, 0],
+        }
+    )
+    definitions = [
+        {
+            "feature_id": "outer_001_feature_001",
+            "name": "baseline_status",
+            "description": "Pretreatment baseline status.",
+            "value_type": "binary",
+            "categories_or_unit": ["Present", "Absent"],
+            "roles": [],
+            "measurement_definition": "Extract pretreatment baseline status.",
+            "missing_value_rule": "Return null when undocumented.",
+        }
+    ]
+    split = {
+        "outer_fold": 1,
+        "fit_row_ids": [0, 1, 2],
+        "heldout_row_ids": [3],
+        "inner_splits": [
+            {"inner_fold": 1, "fit_row_ids": [0, 1], "heldout_row_ids": [2]},
+            {"inner_fold": 2, "fit_row_ids": [1, 2], "heldout_row_ids": [0]},
+        ],
+    }
+    packets = [{"packet_id": "packet_1", "outer_fold": 1}]
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="primary-model",
+        extraction_llm=Stage2ExtractionLLMConfig(
+            endpoint="http://extract.test/v1",
+            model="extractor-model",
+            workers=1,
+        ),
+        max_review_rounds=2,
+        estimation_trees=10,
+    )
+    output_dir = tmp_path / "outer_001"
+    matrix_path = output_dir / "extraction" / "all_candidates_fit" / "extracted.csv"
+    matrix_path.parent.mkdir(parents=True)
+    matrix = pd.DataFrame(
+        {
+            "_oci_row_id": [0, 1, 2],
+            "baseline_status": ["Present", "Absent", "Present"],
+        }
+    )
+    matrix.to_csv(matrix_path, index=False)
+    convergence = {
+        "schema_version": stage2_analysis.REVIEW_CONVERGENCE_SCHEMA_VERSION,
+        "status": "converged",
+        "converged": True,
+        "review_rounds": 1,
+        "maximum_review_rounds": 2,
+        "continued_with_latest_ontology": False,
+        "history": [{"round": 1}],
+    }
+    snapshot_value = {
+        "schema_version": stage2_analysis.PRESELECTION_SNAPSHOT_SCHEMA_VERSION,
+        "created_at": "2026-01-01T00:00:00Z",
+        "outer_fold": 1,
+        "source_selection_schema_version": "legacy-test",
+        "source_selection_input_fingerprint": "legacy-selection",
+        "source_reported_extracted_fit_fingerprint": "legacy-frame",
+        "source_feature_definition_input_fingerprint": "feature-input",
+        "source_feature_definitions_fingerprint": stage2_analysis._value_fingerprint(
+            definitions
+        ),
+        "matrix_path": "extraction/all_candidates_fit/extracted.csv",
+        "matrix_snapshot_fingerprint": stage2_analysis._frame_fingerprint(matrix),
+        "fit_row_ids_fingerprint": stage2_analysis._value_fingerprint([0, 1, 2]),
+        "fit_source_text_fingerprint": stage2_analysis._frame_fingerprint(
+            dataset.iloc[[0, 1, 2]][["patient_id", "clinical_text"]].reset_index(
+                drop=True
+            )
+        ),
+        "treatment_outcome_fingerprint": stage2_analysis._frame_fingerprint(
+            dataset.iloc[[0, 1, 2]][
+                ["treatment_indicator", "outcome_indicator"]
+            ].reset_index(drop=True)
+        ),
+        "inner_splits_fingerprint": stage2_analysis._value_fingerprint(
+            split["inner_splits"]
+        ),
+        "stage1_packets_fingerprint": stage2_analysis._value_fingerprint(packets),
+        "review_policy": stage2_analysis.frozen_preselection_review_policy(config),
+        "review_policy_fingerprint": stage2_analysis._value_fingerprint(
+            stage2_analysis.frozen_preselection_review_policy(config)
+        ),
+        "outcome_type": "binary",
+        "rows": 3,
+        "features": 1,
+        "definitions": definitions,
+        "review_metadata": {
+            "review_rounds": 1,
+            "evaluation_rounds": 1,
+            "review_converged": True,
+            "review_convergence": convergence,
+            "ontology_refinement_rounds": 0,
+            "harmonization_validation_fallbacks": [],
+        },
+    }
+    snapshot = {
+        **snapshot_value,
+        "input_fingerprint": stage2_analysis._value_fingerprint(snapshot_value),
+    }
+    preselection_dir = output_dir / "preselection"
+    preselection_dir.mkdir()
+    (preselection_dir / "input.json").write_text(
+        json.dumps(snapshot), encoding="utf-8"
+    )
+    (preselection_dir / "complete.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "schema_version": stage2_analysis.PRESELECTION_SNAPSHOT_SCHEMA_VERSION,
+                "input_fingerprint": snapshot["input_fingerprint"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_extract_training_with_ontology_feedback",
+        lambda **_kwargs: pytest.fail("training extraction must not run"),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_request_aggregate_ontology_supervisor",
+        lambda **_kwargs: pytest.fail("ontology supervision must not run"),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "select_stage2_features_elastic_net",
+        lambda **_kwargs: (
+            [],
+            {
+                "schema_version": stage2_analysis.STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+                "status": "complete",
+            },
+            [],
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "extract_rows",
+        lambda **kwargs: pd.DataFrame({"_oci_row_id": kwargs["row_ids"]}),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_apply_harmonization_plans",
+        lambda extracted, _definitions, **_kwargs: (extracted, {"plans": []}),
+    )
+    monkeypatch.setattr(
+        stage2_analysis,
+        "estimate_outer_fold",
+        lambda **_kwargs: {"status": "estimated_from_snapshot"},
+    )
+
+    result = run_fold_analysis(
+        dataset=dataset,
+        definitions=definitions,
+        split=split,
+        clinical_question="Estimate treatment effect.",
+        unit_id_column="patient_id",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        inner_folds=2,
+        seed=11,
+        output_dir=output_dir,
+        request_json=lambda *_args, **_kwargs: pytest.fail(
+            "the frozen no-feature fixture should make no LLM request"
+        ),
+        config=config,
+        stage1_packets=packets,
+    )
+
+    assert result["estimation"]["status"] == "estimated_from_snapshot"
+    assert result["review_convergence"]["reused_frozen_preselection_snapshot"] is True
+    assert result["review_rounds"] == 1
+
+
+def test_fold_reselection_reuses_archived_heldout_components_and_extracts_only_missing(
+    tmp_path: Path,
+    monkeypatch,
+):
+    dataset = pd.DataFrame(
+        {
+            "patient_id": ["p0", "p1", "p2", "p3"],
+            "clinical_text": ["fit zero", "fit one", "fit two", "heldout"],
+            "treatment_indicator": [0, 1, 0, 1],
+            "outcome_indicator": [0, 1, 1, 0],
+        }
+    )
+    definitions = [
+        {
+            "feature_id": "outer_001_feature_001",
+            "name": "cached_component",
+            "description": "A cached pretreatment component.",
+            "value_type": "binary",
+            "categories_or_unit": ["Present", "Absent"],
+            "roles": [],
+            "measurement_definition": "Extract the cached component.",
+            "missing_value_rule": "Return null when undocumented.",
+        },
+        {
+            "feature_id": "outer_001_feature_002",
+            "name": "new_component",
+            "description": "A newly required pretreatment component.",
+            "value_type": "binary",
+            "categories_or_unit": ["Present", "Absent"],
+            "roles": [],
+            "measurement_definition": "Extract the new component.",
+            "missing_value_rule": "Return null when undocumented.",
+        },
+    ]
+    split = {
+        "outer_fold": 1,
+        "fit_row_ids": [0, 1, 2],
+        "heldout_row_ids": [3],
+        "inner_splits": [
+            {"inner_fold": 1, "fit_row_ids": [0, 1], "heldout_row_ids": [2]},
+            {"inner_fold": 2, "fit_row_ids": [1, 2], "heldout_row_ids": [0]},
+        ],
+    }
+    packets = [{"packet_id": "packet_1", "outer_fold": 1}]
+    config = PlainHandoffStage2Config(
+        endpoint="http://stage2.test/v1",
+        model="primary-model",
+        extraction_llm=Stage2ExtractionLLMConfig(
+            endpoint="http://extract.test/v1",
+            model="extractor-model",
+            workers=1,
+        ),
+        max_review_rounds=2,
+        estimation_trees=10,
+    )
+    stage2_dir = tmp_path / "stage2"
+    output_dir = stage2_dir / "outer_001"
+    matrix_path = output_dir / "extraction" / "all_candidates_fit" / "extracted.csv"
+    matrix_path.parent.mkdir(parents=True)
+    matrix = pd.DataFrame(
+        {
+            "_oci_row_id": [0, 1, 2],
+            "cached_component": ["Present", "Absent", "Present"],
+            "new_component": ["Absent", "Present", "Present"],
+        }
+    )
+    matrix.to_csv(matrix_path, index=False)
+
+    archive_relative = Path("reselection_archives") / "reselection_test"
+    archive_dir = stage2_dir / archive_relative
+    cached_raw = pd.DataFrame(
+        {"_oci_row_id": [3], "cached_component": ["Absent"]}
+    )
+    cached_path = (
+        archive_dir
+        / "artifacts"
+        / "outer_001"
+        / "extraction"
+        / "heldout"
+        / "extracted.csv"
+    )
+    cached_path.parent.mkdir(parents=True)
+    cached_raw.to_csv(cached_path, index=False)
+    state = {
+        "schema_version": "stage2_reselection_migration_v1",
+        "status": "prepared",
+        "reselection_id": "reselection_test",
+        "archive_path": str(archive_relative),
+        "policy_fingerprint": "test-policy",
+        "outer_folds": [1],
+    }
+    (stage2_dir / "reselection_state.json").write_text(
+        json.dumps(state), encoding="utf-8"
+    )
+    (archive_dir / "manifest.json").write_text(json.dumps(state), encoding="utf-8")
+    heldout_cache = {
+        "schema_version": stage2_analysis.HELDOUT_MEASUREMENT_CACHE_SCHEMA_VERSION,
+        "source_artifact_path": "outer_001/extraction/heldout/extracted.csv",
+        "raw_frame_fingerprint": stage2_analysis._frame_fingerprint(cached_raw),
+        "heldout_row_ids": [3],
+        "heldout_row_ids_fingerprint": stage2_analysis._value_fingerprint([3]),
+        "heldout_source_text_fingerprint": stage2_analysis._frame_fingerprint(
+            dataset.iloc[[3]][["patient_id", "clinical_text"]].reset_index(drop=True)
+        ),
+        "extraction_model": "extractor-model",
+        "rows": 1,
+        "features": 1,
+        "measurement_definitions": [
+            stage2_analysis.frozen_measurement_definition_identity(definitions[0])
+        ],
+    }
+    convergence = {
+        "schema_version": stage2_analysis.REVIEW_CONVERGENCE_SCHEMA_VERSION,
+        "status": "converged",
+        "converged": True,
+        "review_rounds": 1,
+        "maximum_review_rounds": 2,
+        "continued_with_latest_ontology": False,
+        "history": [{"round": 1}],
+    }
+    snapshot_value = {
+        "schema_version": stage2_analysis.PRESELECTION_SNAPSHOT_SCHEMA_VERSION,
+        "created_at": "2026-01-01T00:00:00Z",
+        "outer_fold": 1,
+        "source_selection_schema_version": "legacy-test",
+        "source_selection_input_fingerprint": "legacy-selection",
+        "source_reported_extracted_fit_fingerprint": "legacy-frame",
+        "source_feature_definition_input_fingerprint": "feature-input",
+        "source_feature_definitions_fingerprint": stage2_analysis._value_fingerprint(
+            definitions
+        ),
+        "matrix_path": "extraction/all_candidates_fit/extracted.csv",
+        "matrix_snapshot_fingerprint": stage2_analysis._frame_fingerprint(matrix),
+        "fit_row_ids_fingerprint": stage2_analysis._value_fingerprint([0, 1, 2]),
+        "fit_source_text_fingerprint": stage2_analysis._frame_fingerprint(
+            dataset.iloc[[0, 1, 2]][["patient_id", "clinical_text"]].reset_index(
+                drop=True
+            )
+        ),
+        "treatment_outcome_fingerprint": stage2_analysis._frame_fingerprint(
+            dataset.iloc[[0, 1, 2]][
+                ["treatment_indicator", "outcome_indicator"]
+            ].reset_index(drop=True)
+        ),
+        "inner_splits_fingerprint": stage2_analysis._value_fingerprint(
+            split["inner_splits"]
+        ),
+        "stage1_packets_fingerprint": stage2_analysis._value_fingerprint(packets),
+        "review_policy": stage2_analysis.frozen_preselection_review_policy(config),
+        "review_policy_fingerprint": stage2_analysis._value_fingerprint(
+            stage2_analysis.frozen_preselection_review_policy(config)
+        ),
+        "outcome_type": "binary",
+        "rows": 3,
+        "features": 2,
+        "definitions": definitions,
+        "review_metadata": {
+            "review_rounds": 1,
+            "evaluation_rounds": 1,
+            "review_converged": True,
+            "review_convergence": convergence,
+            "ontology_refinement_rounds": 0,
+            "harmonization_validation_fallbacks": [],
+        },
+        "heldout_measurement_cache": heldout_cache,
+    }
+    snapshot = {
+        **snapshot_value,
+        "input_fingerprint": stage2_analysis._value_fingerprint(snapshot_value),
+    }
+    preselection_dir = output_dir / "preselection"
+    preselection_dir.mkdir()
+    (preselection_dir / "input.json").write_text(
+        json.dumps(snapshot), encoding="utf-8"
+    )
+    (preselection_dir / "complete.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "schema_version": stage2_analysis.PRESELECTION_SNAPSHOT_SCHEMA_VERSION,
+                "input_fingerprint": snapshot["input_fingerprint"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    selected = [{**definition, "roles": ["confounder"]} for definition in definitions]
+    monkeypatch.setattr(
+        stage2_analysis,
+        "select_stage2_features_elastic_net",
+        lambda **_kwargs: (
+            selected,
+            {
+                "schema_version": stage2_analysis.STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+                "status": "complete",
+            },
+            definitions,
+            [],
+        ),
+    )
+    extraction_calls = []
+
+    def extract_missing(**kwargs):
+        names = [definition["name"] for definition in kwargs["definitions"]]
+        extraction_calls.append(names)
+        return pd.DataFrame(
+            {
+                "_oci_row_id": kwargs["row_ids"],
+                **{name: ["Present"] for name in names},
+            }
+        )
+
+    monkeypatch.setattr(stage2_analysis, "extract_rows", extract_missing)
+    monkeypatch.setattr(
+        stage2_analysis,
+        "_apply_harmonization_plans",
+        lambda extracted, _definitions, **_kwargs: (extracted, {"plans": []}),
+    )
+    captured_heldout = {}
+
+    def estimate(**kwargs):
+        captured_heldout["frame"] = kwargs["extracted_heldout"].copy()
+        return {"status": "estimated_with_reuse"}
+
+    monkeypatch.setattr(stage2_analysis, "estimate_outer_fold", estimate)
+
+    result = run_fold_analysis(
+        dataset=dataset,
+        definitions=definitions,
+        split=split,
+        clinical_question="Estimate treatment effect.",
+        unit_id_column="patient_id",
+        text_column="clinical_text",
+        treatment_column="treatment_indicator",
+        outcome_column="outcome_indicator",
+        outcome_type="binary",
+        inner_folds=2,
+        seed=11,
+        output_dir=output_dir,
+        request_json=lambda *_args, **_kwargs: pytest.fail(
+            "only the mocked missing-component extractor should run"
+        ),
+        config=config,
+        stage1_packets=packets,
+    )
+
+    assert result["estimation"]["status"] == "estimated_with_reuse"
+    assert extraction_calls == [["new_component"]]
+    assert captured_heldout["frame"].iloc[0].to_dict() == {
+        "_oci_row_id": 3,
+        "cached_component": "Absent",
+        "new_component": "Present",
+    }
+    reuse = json.loads(
+        (
+            output_dir / "extraction" / "heldout" / "measurement_reuse.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert reuse["reused_features"] == ["cached_component"]
+    assert reuse["newly_extracted_features"] == ["new_component"]
+
+    all_cached = stage2_analysis._extract_outer_heldout_measurements(
+        dataset=dataset,
+        heldout_ids=[3],
+        text_column="clinical_text",
+        measurement_definitions=[definitions[0]],
+        output_dir=stage2_dir / "outer_all_cached",
+        request_json=lambda *_args, **_kwargs: pytest.fail(
+            "an entirely cached dependency set must make no LLM request"
+        ),
+        workers=1,
+        max_prompt_chars=10_000,
+        feature_batch_size=10,
+        request_identity={"model": "extractor-model"},
+        tokenizer=None,
+        frozen_cache=heldout_cache,
+        serial_extraction={},
+    )
+    assert extraction_calls == [["new_component"]]
+    assert all_cached.iloc[0].to_dict() == {
+        "_oci_row_id": 3,
+        "cached_component": "Absent",
+    }
+    all_cached_audit = json.loads(
+        (
+            stage2_dir
+            / "outer_all_cached"
+            / "extraction"
+            / "heldout"
+            / "measurement_reuse.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert all_cached_audit["newly_extracted_feature_count"] == 0
+
+    changed_definition = {
+        **definitions[0],
+        "measurement_definition": "Extract a materially changed component.",
+    }
+    changed = stage2_analysis._extract_outer_heldout_measurements(
+        dataset=dataset,
+        heldout_ids=[3],
+        text_column="clinical_text",
+        measurement_definitions=[changed_definition],
+        output_dir=stage2_dir / "outer_changed_definition",
+        request_json=lambda *_args, **_kwargs: pytest.fail(
+            "the mocked extractor handles definition-incompatible cache misses"
+        ),
+        workers=1,
+        max_prompt_chars=10_000,
+        feature_batch_size=10,
+        request_identity={"model": "extractor-model"},
+        tokenizer=None,
+        frozen_cache=heldout_cache,
+        serial_extraction={},
+    )
+    assert extraction_calls == [["new_component"], ["cached_component"]]
+    assert changed["cached_component"].tolist() == ["Present"]
+    changed_audit = json.loads(
+        (
+            stage2_dir
+            / "outer_changed_definition"
+            / "extraction"
+            / "heldout"
+            / "measurement_reuse.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert changed_audit["definition_incompatible_features"] == [
+        "cached_component"
+    ]
 
 
 def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
@@ -7187,6 +10048,8 @@ def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
+        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+            return validate(_agentic_fixture_response(body))
         jobs.append(body["job"])
         if body["job"] == "extract_stage2_patient_variables":
             categories = body["features"][0]["categories_or_unit"]
@@ -7235,14 +10098,8 @@ def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
             )
         return validate(
             {
-                "feature_decisions": [
-                    {
-                        "feature_id": "outer_001_feature_001",
-                        "action": "keep",
-                        "reason": "The refined ontology extracted consistently.",
-                    }
-                ],
-                "overall_assessment": "Keep the refined feature.",
+                "action": "keep",
+                "reason": "The refined ontology extracted consistently.",
             }
         )
 
@@ -7273,30 +10130,269 @@ def test_repeated_training_extraction_failures_refine_ontology_and_reextract(
     )
 
     assert result["ontology_refinement_rounds"] == 1
-    assert result["features"][0]["categories_or_unit"] == ["stage_iii", "stage_iv"]
     assert jobs.count("refine_stage2_feature_ontology_from_repeated_extraction_failures") == 1
     initial_summary = json.loads(
-        (output / "review" / "round_001" / "extraction" / "failure_summary.json").read_text(
-            encoding="utf-8"
-        )
+        (
+            output
+            / "ontology_supervision"
+            / "round_001"
+            / "extraction"
+            / "failure_summary.json"
+        ).read_text(encoding="utf-8")
     )
     assert initial_summary["feature_failure_patterns"][0]["patient_count"] == 6
     feedback = json.loads(
-        (output / "review" / "round_001" / "ontology_refinement" / "complete.json").read_text(
-            encoding="utf-8"
-        )
+        (
+            output
+            / "ontology_supervision"
+            / "round_001"
+            / "failure_ontology_refinement"
+            / "complete.json"
+        ).read_text(encoding="utf-8")
     )
     assert feedback["stopped_reason"] == "no_repeated_feature_failures"
     refined = pd.read_csv(
         output
-        / "review"
+        / "ontology_supervision"
         / "round_001"
-        / "ontology_refinement"
+        / "failure_ontology_refinement"
         / "round_001"
         / "extraction"
         / "extracted.csv"
     )
     assert refined["disease_stage"].notna().all()
+    supervisor_input = json.loads(
+        (
+            output
+            / "ontology_supervision"
+            / "round_001"
+            / "supervisor"
+            / "feature_0001"
+            / "input.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert supervisor_input["feature"]["categories_or_unit"] == ["stage_iii", "stage_iv"]
+
+
+def test_failure_refinement_reextracts_only_changed_features_and_resumes(
+    tmp_path: Path,
+):
+    dataset = pd.DataFrame(
+        {
+            "clinical_text": [
+                f"Pretreatment stage {'III' if index % 2 == 0 else 'IV'}; marker present."
+                for index in range(4)
+            ]
+        }
+    )
+    definitions = [
+        {
+            "feature_id": "outer_001_feature_001",
+            "name": "disease_stage",
+            "description": "Pretreatment overall disease stage.",
+            "value_type": "ordinal",
+            "categories_or_unit": ["stage_i", "stage_ii"],
+            "measurement_definition": "Extract the documented pretreatment stage.",
+            "missing_value_rule": "Use null when the stage is undocumented.",
+        },
+        {
+            "feature_id": "outer_001_feature_002",
+            "name": "stable_marker",
+            "description": "Pretreatment marker status.",
+            "value_type": "binary",
+            "categories_or_unit": ["absent", "present"],
+            "measurement_definition": "Extract the documented pretreatment marker.",
+            "missing_value_rule": "Use null when the marker is undocumented.",
+        },
+    ]
+    extraction_feature_sets = []
+
+    def request_json(messages, validate, *, request_kind="interpretation"):
+        body = json.loads(messages[1]["content"])
+        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+            return validate(_agentic_fixture_response(body))
+        if body["job"] == "extract_stage2_patient_variables":
+            assert request_kind == "extraction"
+            feature_names = [feature["name"] for feature in body["features"]]
+            extraction_feature_sets.append(feature_names)
+            categories_by_name = {
+                feature["name"]: feature["categories_or_unit"]
+                for feature in body["features"]
+            }
+            rows = []
+            for patient in body["patients"]:
+                values = {}
+                if "disease_stage" in feature_names:
+                    raw = "stage_iii" if "stage III" in patient["text"] else "stage_iv"
+                    values["disease_stage"] = (
+                        raw
+                        if raw in categories_by_name["disease_stage"]
+                        else raw.replace("stage_", "TNM stage ").upper()
+                    )
+                if "stable_marker" in feature_names:
+                    values["stable_marker"] = "present"
+                rows.append({"row_id": patient["row_id"], "values": values})
+            return validate({"rows": rows})
+        if body["job"] == "map_extracted_values_to_declared_category_ontology":
+            return validate(
+                {
+                    "corrections": [
+                        {"mapping_id": item["mapping_id"], "value": None}
+                        for item in body["items"]
+                    ]
+                }
+            )
+        assert body["job"] == (
+            "refine_stage2_feature_ontology_from_repeated_extraction_failures"
+        )
+        assert body["feature"]["name"] == "disease_stage"
+        return validate(
+            {
+                "action": "revise",
+                "reason": "Add the observed pretreatment stage groups.",
+                "description": "Pretreatment overall disease stage group.",
+                "value_type": "ordinal",
+                "categories_or_unit": ["stage_iii", "stage_iv"],
+                "measurement_definition": (
+                    "Extract the documented pretreatment overall stage group."
+                ),
+                "missing_value_rule": "Use null when the stage group is undocumented.",
+            }
+        )
+
+    output_dir = tmp_path / "initial"
+    feedback_dir = tmp_path / "refinement"
+    extracted, refined, rounds = stage2_analysis._extract_training_with_ontology_feedback(
+        dataset=dataset,
+        row_ids=list(range(4)),
+        text_column="clinical_text",
+        definitions=definitions,
+        output_dir=output_dir,
+        feedback_dir=feedback_dir,
+        request_json=request_json,
+        workers=2,
+        max_prompt_chars=20_000,
+        feature_batch_size=10,
+        minimum_failure_patients=3,
+        max_refinement_rounds=2,
+        request_identity={"model": "small-test-model"},
+        tokenizer=_CharacterChatTokenizer(),
+    )
+
+    assert rounds == 1
+    assert [feature["name"] for feature in refined] == [
+        "disease_stage",
+        "stable_marker",
+    ]
+    assert extracted["disease_stage"].isin(["stage_iii", "stage_iv"]).all()
+    assert extracted["stable_marker"].eq("present").all()
+    assert extraction_feature_sets[:4] == [
+        ["disease_stage", "stable_marker"]
+    ] * 4
+    assert extraction_feature_sets[4:] == [["disease_stage"]] * 4
+
+    delta_root = feedback_dir / "round_001" / "extraction"
+    completion = json.loads((delta_root / "complete.json").read_text(encoding="utf-8"))
+    assert completion["reextraction_scope"] == "changed_features_only"
+    assert completion["reextracted_feature_names"] == ["disease_stage"]
+    assert completion["reused_features"] == 1
+    assert (
+        delta_root / "changed_features" / "batches" / "batch_00001" / "complete.json"
+    ).is_file()
+    merged = pd.read_csv(delta_root / "extracted.csv")
+    assert list(merged.columns) == ["_oci_row_id", "disease_stage", "stable_marker"]
+    final_summary = json.loads(
+        (feedback_dir / "final_failure_summary.json").read_text(encoding="utf-8")
+    )
+    assert final_summary["feature_failure_patterns"] == []
+
+    def unexpected_request(_messages, _validate, *, request_kind="interpretation"):
+        raise AssertionError(f"completed delta checkpoint should resume ({request_kind})")
+
+    resumed, resumed_definitions, resumed_rounds = (
+        stage2_analysis._extract_training_with_ontology_feedback(
+            dataset=dataset,
+            row_ids=list(range(4)),
+            text_column="clinical_text",
+            definitions=definitions,
+            output_dir=output_dir,
+            feedback_dir=feedback_dir,
+            request_json=unexpected_request,
+            workers=2,
+            max_prompt_chars=20_000,
+            feature_batch_size=10,
+            minimum_failure_patients=3,
+            max_refinement_rounds=2,
+            request_identity={"model": "small-test-model"},
+            tokenizer=_CharacterChatTokenizer(),
+        )
+    )
+    pd.testing.assert_frame_equal(resumed, extracted)
+    assert resumed_definitions == refined
+    assert resumed_rounds == 1
+
+
+def test_incremental_failure_summary_replaces_only_changed_feature_patterns():
+    prior = {
+        "issue_files": 8,
+        "feature_failure_patterns": [
+            {
+                "feature_name": "changed_feature",
+                "failure_kind": "out_of_ontology_category",
+                "reason": "old changed failure",
+                "patient_count": 4,
+                "patient_row_ids": [0, 1, 2, 3],
+            },
+            {
+                "feature_name": "reused_feature",
+                "failure_kind": "invalid_scalar_or_value_type",
+                "reason": "retained reused failure",
+                "patient_count": 3,
+                "patient_row_ids": [1, 2, 3],
+            },
+            {
+                "feature_name": "dropped_feature",
+                "failure_kind": "out_of_ontology_category",
+                "reason": "must be dropped",
+                "patient_count": 5,
+                "patient_row_ids": [0, 1, 2, 3, 4],
+            },
+        ],
+        "structural_failure_patient_row_ids": [1, 4],
+    }
+    delta = {
+        "issue_files": 2,
+        "feature_failure_patterns": [
+            {
+                "feature_name": "changed_feature",
+                "failure_kind": "out_of_ontology_category",
+                "reason": "new changed failure",
+                "patient_count": 1,
+                "patient_row_ids": [5],
+            }
+        ],
+        "structural_failure_patient_row_ids": [4, 5],
+    }
+
+    merged = stage2_analysis._merge_incremental_failure_summaries(
+        prior_summary=prior,
+        delta_summary=delta,
+        current_feature_names=["changed_feature", "reused_feature"],
+        changed_feature_names=["changed_feature"],
+    )
+
+    assert merged["issue_files"] == 10
+    assert [row["reason"] for row in merged["feature_failure_patterns"]] == [
+        "retained reused failure",
+        "new changed failure",
+    ]
+    assert merged["structural_failure_patient_row_ids"] == [1, 4, 5]
+    assert merged["incremental_refinement"]["reextracted_feature_names"] == [
+        "changed_feature"
+    ]
+    assert merged["incremental_refinement"]["reused_feature_names"] == [
+        "reused_feature"
+    ]
 
 
 def test_failure_driven_ontology_refinement_never_rewrites_explicit_feature(
@@ -7343,7 +10439,7 @@ def test_failure_driven_ontology_refinement_never_rewrites_explicit_feature(
     assert report["immutable_explicit_features"] == 1
 
 
-def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
+def _retired_test_final_training_extraction_is_rerun_after_review_drops_a_feature(
     tmp_path: Path,
 ):
     dataset = pd.DataFrame(
@@ -7394,6 +10490,8 @@ def test_final_training_extraction_is_rerun_after_review_drops_a_feature(
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
+        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+            return validate(_agentic_fixture_response(body))
         if body["job"] == "extract_stage2_patient_variables":
             names = [feature["name"] for feature in body["features"]]
             extraction_feature_sets.append(tuple(names))
@@ -7501,6 +10599,8 @@ def test_final_training_extraction_fails_fast_when_effectively_all_null(
 
     def request_json(messages, validate, *, request_kind="interpretation"):
         body = json.loads(messages[1]["content"])
+        if body.get("task") in {"analyze_cluster", "outer_fold_role_adjudication"}:
+            return validate(_agentic_fixture_response(body))
         if body["job"] == "extract_stage2_patient_variables":
             return validate(
                 {

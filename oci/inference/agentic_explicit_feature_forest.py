@@ -3407,6 +3407,7 @@ class CausalForestExplicitEvaluator:
             honest=self.cf_config.honest,
             inference=self.cf_config.inference,
             random_state=42 + fold_id,
+            outcome_type=self.config.outcome_type,
         )
         forest.fit(X_train, train_T, train_Y, W=W_train)
         cf_preds = forest.predict(X_test, return_ci=True)

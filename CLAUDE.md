@@ -36,7 +36,7 @@ oci/
 │   └── agentic_explicit_feature_forest.py
 ├── models/
 │   ├── causal_forest_head.py
-│   ├── strict_causal_forest_runtime.py
+│   ├── elastic_net_nuisance.py
 │   ├── hierarchical_transformer_extractor.py
 │   ├── concept_embedding_cache.py
 │   ├── explicit_feature_featurizer.py
@@ -77,7 +77,8 @@ may enter the Stage 2 handoff.
 - Preserve exact row, split, component, architecture, and configuration
   provenance in sidecars.
 - Fail closed when text capacity would truncate semantic content.
-- Keep the strict causal-forest runtime schema closed and versioned.
+- Keep causal-forest nuisance models elastic-net-only, and retain fitted-clone
+  audit records for selected regularization and optimizer iteration limits.
 - Do not silently change the omitted-selector legacy path.
 
 ## Explicit-feature functionality

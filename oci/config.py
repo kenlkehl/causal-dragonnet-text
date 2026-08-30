@@ -3366,6 +3366,12 @@ class ExperimentConfig:
                 f"Unsupported or retired model_type={model_type!r}; retained types are "
                 + ", ".join(sorted(retained_model_types))
             )
+        if model_type == "multi_model_forest":
+            raise ValueError(
+                "model_type='multi_model_forest' is a Stage 1 all-evidence producer and "
+                "cannot run through ExperimentRunner; use "
+                "scripts/run_all_evidence.py (ResearchAllEvidenceWorkflow)"
+            )
         if model_type == "agentic_attention_variable_forest":
             avf_config = self.applied_inference.architecture.agentic_attention_variable_forest
             if not (

@@ -13,6 +13,7 @@ from oci.inference.plain_handoff_stage2_evidence import (
 )
 from oci.inference.plain_handoff_stage2 import plain_stage2_config_from_mapping
 from oci.inference.stage1_architecture_artifacts import (
+    _score_artifacts,
     iter_stage1_architecture_evidence,
     materialize_stage1_architecture_artifacts,
 )
@@ -81,6 +82,17 @@ def test_stage2_mapping_accepts_comma_separated_architecture_names():
 def test_targeted_artifacts_expose_only_the_selected_architecture(tmp_path: Path):
     source = tmp_path / "components" / "tfidf" / "evidence.jsonl"
     source.parent.mkdir(parents=True)
+    primary_scores = source.parent / "predictions.parquet"
+    context_scores = (
+        source.parent
+        / "stage1_tfidf_topics"
+        / "contexts"
+        / "outer_001_inner_001"
+        / "nuisance_predictions.parquet"
+    )
+    context_scores.parent.mkdir(parents=True)
+    primary_scores.touch()
+    context_scores.touch()
     raw_rows = [
         {
             "source": "tfidf",
@@ -118,6 +130,10 @@ def test_targeted_artifacts_expose_only_the_selected_architecture(tmp_path: Path
     )
 
     assert manifest["selected_architectures"] == ["tfidf_topics"]
+    assert manifest["architectures"]["tfidf_topics"]["score_artifacts"] == [
+        "components/tfidf/predictions.parquet"
+    ]
+    assert _score_artifacts(tmp_path, "tfidf_orphan_ngrams") == []
     assert {row["evidence"]["architecture"] for row in targeted} == {"tfidf_topics"}
     assert {row["architecture"] for row in iter_stage1_architecture_evidence(tmp_path)} == {
         "tfidf_topics"
@@ -131,6 +147,71 @@ def test_targeted_artifacts_expose_only_the_selected_architecture(tmp_path: Path
         included_architectures=("tfidf_topics",),
     )
     assert {packet["architecture"] for packet in compiled.packets} == {"tfidf_topics"}
+    assert {
+        reference["handoff_row"]
+        for member in compiled.members_by_outer_fold[1]
+        for reference in member["raw_references"]
+    } == {1}
+
+
+def test_neural_query_architecture_artifact_uses_compact_occurrence_records(
+    tmp_path: Path,
+):
+    source = tmp_path / "components" / "neural_queries" / "evidence.jsonl"
+    source.parent.mkdir(parents=True)
+    raw_rows = [
+        {
+            "source": "neural_queries",
+            "outer_fold": 1,
+            "inner_fold": inner_fold,
+            "scope": "candidate_consistency_inner_train",
+            "evidence": {
+                "evidence": [
+                    {
+                        "query_id": "effect_query",
+                        "bank": "effect",
+                        "top_contrastive_ngrams": [
+                            {
+                                "term": "pretreatment performance status",
+                                "tfidf_contrast": score,
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+        for inner_fold, score in ((1, 0.4), (2, 0.7))
+    ]
+    source.write_text(
+        "".join(json.dumps(row["evidence"]) + "\n" for row in raw_rows),
+        encoding="utf-8",
+    )
+
+    targeted, manifest = materialize_stage1_architecture_artifacts(
+        output_dir=tmp_path,
+        raw_handoff_rows=iter(raw_rows),
+        selected_architectures=("neural_query_moments",),
+        source_artifacts={"neural_queries": source},
+        selection_mode="explicit",
+    )
+
+    architecture = manifest["architectures"]["neural_query_moments"]
+    assert architecture["occurrences"] == 2
+    assert architecture["compact_records"] == 1
+    assert len(targeted) == 1
+    occurrence = targeted[0]["evidence"]["occurrence"]
+    assert occurrence["raw_occurrence_count"] == 2
+    assert {row["inner_fold"] for row in occurrence["reference_summaries"]} == {1, 2}
+    assert {row["handoff_row"] for row in occurrence["reference_summaries"]} == {1}
+    persisted = json.loads(
+        (tmp_path / "stage1_architectures" / "neural_query_moments" / "evidence.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert {
+        row["handoff_row"]
+        for row in persisted["occurrence"]["reference_summaries"]
+    } == {1}
 
 
 def test_stage2_included_architectures_filter_private_support(tmp_path: Path):

@@ -323,6 +323,95 @@ def _load_encoder(model_name: str, device: str) -> Any:
     return encoder
 
 
+def _encode_document_matrices(
+    encoder: Any,
+    documents: Sequence[str],
+    *,
+    document_chunk_overlap_tokens: int,
+    strip_common_framing_tokens: bool,
+) -> list[np.ndarray]:
+    """Encode logical documents once, preserving all lossless chunks."""
+
+    chunks: list[str] = []
+    chunk_spans: list[tuple[int, int]] = []
+    document_length = int(encoder.document_length)
+    overlap = min(
+        int(document_chunk_overlap_tokens),
+        max(0, document_length - 3),
+    )
+    encoding_prefix = str(getattr(encoder, "document_encoding_prefix", ""))
+    for document in documents:
+        document_chunks = split_text_to_token_chunks(
+            document,
+            encoder.tokenizer,
+            max_seq_length=document_length,
+            chunk_overlap_tokens=overlap,
+            encoding_prefix=encoding_prefix,
+        )
+        begin = len(chunks)
+        chunks.extend(document_chunks)
+        chunk_spans.append((begin, len(chunks)))
+
+    chunk_matrices = [
+        _as_token_matrix(matrix) for matrix in encoder.encode_documents(chunks)
+    ]
+    if strip_common_framing_tokens and isinstance(
+        encoder,
+        _StanfordColbertCompatibilityAdapter,
+    ):
+        # Compatibility documents are [CLS] [unused1] content [SEP]. Those
+        # shared markers dominate similarities between very short documents.
+        # Query/document candidate scoring does not have this symmetric-short-
+        # document failure mode, so stripping is opt-in for document/document
+        # evidence comparison only.
+        chunk_matrices = [
+            matrix[2:-1] if len(matrix) > 3 else matrix
+            for matrix in chunk_matrices
+        ]
+
+    return [
+        np.concatenate(chunk_matrices[begin:end], axis=0).astype(np.float32)
+        for begin, end in chunk_spans
+    ]
+
+
+def encode_late_interaction_documents(
+    documents: Sequence[str],
+    model_name: str,
+    device: str = "cpu",
+    *,
+    document_chunk_overlap_tokens: int = 16,
+    strip_common_framing_tokens: bool = False,
+) -> list[np.ndarray]:
+    """Return one normalized ColBERT token matrix per logical document.
+
+    This public document-only path supports symmetric evidence/evidence
+    comparison without pretending that either passage is a short query. Long
+    passages are split losslessly and concatenated back into one token matrix.
+    """
+
+    if not documents:
+        return []
+    clean_documents = [str(value).strip() for value in documents]
+    if any(not value for value in clean_documents):
+        raise ValueError("late-interaction documents must be nonempty")
+    if document_chunk_overlap_tokens < 0:
+        raise ValueError("document_chunk_overlap_tokens must be nonnegative")
+
+    with _ENCODER_LOCK:
+        encoder = _load_encoder(str(model_name).strip(), str(device).strip())
+        unique_documents = list(dict.fromkeys(clean_documents))
+        unique_matrices = _encode_document_matrices(
+            encoder,
+            unique_documents,
+            document_chunk_overlap_tokens=document_chunk_overlap_tokens,
+            strip_common_framing_tokens=strip_common_framing_tokens,
+        )
+        matrix_by_document = dict(zip(unique_documents, unique_matrices))
+        matrices = [matrix_by_document[document] for document in clean_documents]
+    return matrices
+
+
 def score_late_interaction_pairs(
     queries: Sequence[str],
     documents: Sequence[str],
@@ -357,30 +446,17 @@ def score_late_interaction_pairs(
         unique_documents = list(dict.fromkeys(clean_documents))
         query_matrices = dict(zip(unique_queries, encoder.encode_queries(unique_queries)))
 
-        chunks: list[str] = []
-        chunk_spans: dict[str, tuple[int, int]] = {}
-        document_length = int(encoder.document_length)
-        overlap = min(
-            int(document_chunk_overlap_tokens),
-            max(0, document_length - 3),
-        )
-        encoding_prefix = str(getattr(encoder, "document_encoding_prefix", ""))
-        for document in unique_documents:
-            document_chunks = split_text_to_token_chunks(
-                document,
-                encoder.tokenizer,
-                max_seq_length=document_length,
-                chunk_overlap_tokens=overlap,
-                encoding_prefix=encoding_prefix,
+        document_matrices = dict(
+            zip(
+                unique_documents,
+                _encode_document_matrices(
+                    encoder,
+                    unique_documents,
+                    document_chunk_overlap_tokens=document_chunk_overlap_tokens,
+                    strip_common_framing_tokens=False,
+                ),
             )
-            begin = len(chunks)
-            chunks.extend(document_chunks)
-            chunk_spans[document] = (begin, len(chunks))
-        chunk_matrices = encoder.encode_documents(chunks)
-        document_matrices = {
-            document: np.concatenate(chunk_matrices[begin:end], axis=0)
-            for document, (begin, end) in chunk_spans.items()
-        }
+        )
 
         scores = np.empty(len(clean_queries), dtype=np.float32)
         pairs_by_document: dict[str, list[int]] = defaultdict(list)

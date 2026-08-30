@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -29,6 +29,7 @@ dependencies = [
     # configuration and was removed in scikit-learn 1.8.
     "scikit-learn>=1.2.0,<1.8.0",
     "scipy>=1.10.0",
+    "statsmodels>=0.14.0",
     "tqdm>=4.65.0",
     "pyarrow",
     "joblib>=1.2.0",

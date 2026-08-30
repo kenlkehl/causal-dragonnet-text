@@ -107,6 +107,90 @@ class CompiledStage2Evidence:
     summary: Mapping[str, Any]
 
 
+def _discover_chunk_embedding_cache_directory(handoff_path: Path) -> Path | None:
+    output_root = Path(handoff_path).parent.parent
+    candidates = sorted(
+        path.parent
+        for path in (output_root / "components" / "embedding_cache" / "cache").glob(
+            "*/metadata.json"
+        )
+        if (path.parent / "chunk_embeddings.npy").is_file()
+        and (path.parent / "offsets.npy").is_file()
+    )
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "Stage 2 evidence compilation found multiple Stage 1 embedding caches: "
+            f"{[str(path) for path in candidates]}"
+        )
+    return candidates[0]
+
+
+def stage1_embedding_cache_dependency_identity(
+    handoff_path: Path,
+) -> Mapping[str, Any] | None:
+    """Return a lightweight identity for the optional Stage 1 embedding cache.
+
+    Cache arrays can be many gigabytes, so restart compatibility deliberately
+    uses only the producer's small semantic metadata plus path/stat identities.
+    It never reads or hashes array contents.
+    """
+
+    directory = _discover_chunk_embedding_cache_directory(Path(handoff_path))
+    if directory is None:
+        return None
+    metadata_path = directory / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    semantic_metadata_keys = (
+        "sentence_model_name",
+        "hidden_size",
+        "num_samples",
+        "total_chunks",
+        "chunk_size_words",
+        "chunk_overlap_words",
+        "max_chunks",
+        "chunk_selection",
+        "normalize_embeddings",
+        "max_seq_length",
+        "effective_max_seq_length",
+        "chunking_mode",
+        "storage_format",
+        "dataset_path",
+        "cache_hash",
+        "chunking_policy_version",
+        "semantic_truncation_allowed",
+        "dtype",
+    )
+
+    def product_identity(path: Path) -> dict[str, Any]:
+        stat = path.stat()
+        return {
+            "path": str(path.resolve()),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "ctime_ns": int(stat.st_ctime_ns),
+            "device": int(stat.st_dev),
+            "inode": int(stat.st_ino),
+        }
+
+    return {
+        "schema_version": "stage1_embedding_cache_dependency_v1",
+        "directory": str(directory.resolve()),
+        "semantic_metadata": {
+            key: metadata.get(key) for key in semantic_metadata_keys
+        },
+        "products": {
+            filename: product_identity(directory / filename)
+            for filename in (
+                "metadata.json",
+                "chunk_embeddings.npy",
+                "offsets.npy",
+            )
+        },
+    }
+
+
 class _ChunkEmbeddingCache:
     """Read-only row/chunk lookup over the existing Stage 1 embedding cache."""
 
@@ -123,23 +207,10 @@ class _ChunkEmbeddingCache:
 
     @classmethod
     def discover(cls, handoff_path: Path) -> _ChunkEmbeddingCache | None:
-        output_root = Path(handoff_path).parent.parent
-        candidates = sorted(
-            path.parent
-            for path in (output_root / "components" / "embedding_cache" / "cache").glob(
-                "*/metadata.json"
-            )
-            if (path.parent / "chunk_embeddings.npy").is_file()
-            and (path.parent / "offsets.npy").is_file()
-        )
-        if not candidates:
+        directory = _discover_chunk_embedding_cache_directory(Path(handoff_path))
+        if directory is None:
             return None
-        if len(candidates) != 1:
-            raise RuntimeError(
-                "Stage 2 evidence compilation found multiple Stage 1 embedding caches: "
-                f"{[str(path) for path in candidates]}"
-            )
-        return cls(candidates[0])
+        return cls(directory)
 
     def flat_index(self, row_id: Any, chunk_index: Any) -> int | None:
         try:
@@ -276,6 +347,25 @@ def _base_reference(
     }
 
 
+def _rebind_compact_handoff_references(
+    occurrence: dict[str, Any],
+    *,
+    handoff_row: int,
+) -> None:
+    """Point representative and summarized provenance at the row being read."""
+
+    reference = dict(occurrence.get("reference") or {})
+    reference["handoff_row"] = int(handoff_row)
+    occurrence["reference"] = reference
+    summaries = occurrence.get("reference_summaries")
+    if isinstance(summaries, Sequence) and not isinstance(summaries, (str, bytes)):
+        occurrence["reference_summaries"] = [
+            {**dict(summary), "handoff_row": int(handoff_row)}
+            for summary in summaries
+            if isinstance(summary, Mapping)
+        ]
+
+
 def _occurrence(
     *,
     text: Any,
@@ -318,6 +408,244 @@ def _occurrence(
         "patient_row_id": ref.get("row_id"),
         "cache_coordinate": cache_coordinate,
     }
+
+
+def _exact_occurrence_key(occurrence: Mapping[str, Any]) -> str:
+    """Return the scientific identity used for lossless exact aggregation."""
+
+    return _canonical_json(
+        {
+            "evidence_kind": occurrence["evidence_kind"],
+            "text": _clean_text(occurrence["text"]).casefold(),
+            "source_families": sorted(occurrence["source_families"]),
+            "architecture": str(occurrence["architecture"]),
+        }
+    )
+
+
+def _occurrence_count(occurrence: Mapping[str, Any]) -> int:
+    raw = occurrence.get("raw_occurrence_count", 1)
+    if isinstance(raw, bool):
+        raise ValueError("compact evidence occurrence count must be a positive integer")
+    try:
+        count = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("compact evidence occurrence count must be a positive integer") from exc
+    if count < 1:
+        raise ValueError("compact evidence occurrence count must be a positive integer")
+    return count
+
+
+def _occurrence_polarities(occurrence: Mapping[str, Any]) -> set[str]:
+    values = occurrence.get("polarities")
+    if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+        rendered = {str(value) for value in values if str(value)}
+        if rendered:
+            return rendered
+    return {str(occurrence.get("polarity") or "unsigned")}
+
+
+def _occurrence_reference_summaries(
+    occurrence: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return compact provenance rows whose counts sum to the raw multiplicity."""
+
+    raw_summaries = occurrence.get("reference_summaries")
+    if isinstance(raw_summaries, Sequence) and not isinstance(
+        raw_summaries, (str, bytes)
+    ):
+        summaries = [dict(value) for value in raw_summaries if isinstance(value, Mapping)]
+    else:
+        reference = dict(occurrence.get("reference") or {})
+        details = occurrence.get("details")
+        if isinstance(details, Mapping):
+            for key in ("query_id", "bank"):
+                value = details.get(key)
+                if value not in (None, ""):
+                    reference[key] = value
+        scores = _finite_scores(occurrence.get("scores") or {})
+        if scores:
+            # Keep the score-to-context association, not just the marginal
+            # score distribution encoded on the compact representative.
+            reference["scores"] = scores
+        reference["occurrence_count"] = _occurrence_count(occurrence)
+        summaries = [reference]
+    total = 0
+    for summary in summaries:
+        raw_count = summary.get("occurrence_count", 1)
+        if isinstance(raw_count, bool):
+            raise ValueError("compact evidence reference count must be positive")
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("compact evidence reference count must be positive") from exc
+        if count < 1:
+            raise ValueError("compact evidence reference count must be positive")
+        summary["occurrence_count"] = count
+        total += count
+    if total != _occurrence_count(occurrence):
+        raise ValueError(
+            "compact evidence reference counts do not equal raw_occurrence_count"
+        )
+    return summaries
+
+
+def _merge_reference_summaries(
+    occurrences: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    counts: dict[str, int] = defaultdict(int)
+    values: dict[str, dict[str, Any]] = {}
+    for occurrence in occurrences:
+        for raw_summary in _occurrence_reference_summaries(occurrence):
+            summary = dict(raw_summary)
+            count = int(summary.pop("occurrence_count", 1))
+            key = _canonical_json(summary)
+            values[key] = summary
+            counts[key] += count
+    return [
+        {**values[key], "occurrence_count": counts[key]}
+        for key in sorted(values)
+    ]
+
+
+def _occurrence_score_value_counts(
+    occurrence: Mapping[str, Any],
+) -> dict[str, dict[float, int]]:
+    """Return exact run-length encoded score values for one compact occurrence."""
+
+    encoded = occurrence.get("score_value_counts")
+    output: dict[str, dict[float, int]] = defaultdict(lambda: defaultdict(int))
+    if isinstance(encoded, Mapping):
+        for raw_name, rows in encoded.items():
+            if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+                raise ValueError("compact evidence score counts must be arrays")
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    raise ValueError("compact evidence score count rows must be objects")
+                value = float(row["value"])
+                count = int(row["count"])
+                if not math.isfinite(value) or count < 1:
+                    raise ValueError("compact evidence score values must be finite and counted")
+                output[str(raw_name)][value] += count
+        return {name: dict(counts) for name, counts in output.items()}
+
+    count = _occurrence_count(occurrence)
+    for name, value in _finite_scores(occurrence.get("scores") or {}).items():
+        output[name][float(value)] += count
+    return {name: dict(counts) for name, counts in output.items()}
+
+
+@dataclass(slots=True)
+class _ExactOccurrenceGroup:
+    representative: Mapping[str, Any]
+    axes: set[str]
+    polarities: set[str]
+    raw_occurrence_count: int
+    reference_values: dict[str, dict[str, Any]]
+    reference_counts: dict[str, int]
+    score_counts: dict[str, dict[float, int]]
+
+    @classmethod
+    def from_occurrence(
+        cls,
+        occurrence: Mapping[str, Any],
+    ) -> "_ExactOccurrenceGroup":
+        group = cls(
+            representative=occurrence,
+            axes=set(),
+            polarities=set(),
+            raw_occurrence_count=0,
+            reference_values={},
+            reference_counts=defaultdict(int),
+            score_counts=defaultdict(lambda: defaultdict(int)),
+        )
+        group.add(occurrence)
+        return group
+
+    def add(self, occurrence: Mapping[str, Any]) -> None:
+        representative_rank = (
+            len(self.representative.get("scores") or {}),
+            len(self.representative.get("details") or {}),
+        )
+        occurrence_rank = (
+            len(occurrence.get("scores") or {}),
+            len(occurrence.get("details") or {}),
+        )
+        if occurrence_rank > representative_rank:
+            self.representative = occurrence
+        self.axes.update(map(str, occurrence.get("axes") or []))
+        self.polarities.update(_occurrence_polarities(occurrence))
+        self.raw_occurrence_count += _occurrence_count(occurrence)
+        for raw_summary in _occurrence_reference_summaries(occurrence):
+            summary = dict(raw_summary)
+            count = int(summary.pop("occurrence_count", 1))
+            reference_key = _canonical_json(summary)
+            self.reference_values[reference_key] = summary
+            self.reference_counts[reference_key] += count
+        for score_name, value_counts in _occurrence_score_value_counts(
+            occurrence
+        ).items():
+            for score_value, count in value_counts.items():
+                self.score_counts[score_name][score_value] += count
+
+    def render(self) -> dict[str, Any]:
+        occurrence = copy.deepcopy(dict(self.representative))
+        polarities = sorted(self.polarities)
+        occurrence["axes"] = sorted(self.axes)
+        occurrence["polarity"] = polarities[0]
+        occurrence["polarities"] = polarities
+        occurrence["raw_occurrence_count"] = int(self.raw_occurrence_count)
+        occurrence["reference_summaries"] = [
+            {
+                **self.reference_values[reference_key],
+                "occurrence_count": int(self.reference_counts[reference_key]),
+            }
+            for reference_key in sorted(self.reference_values)
+        ]
+        occurrence["score_value_counts"] = {
+            score_name: [
+                {
+                    "value": score_value,
+                    "count": int(value_counts[score_value]),
+                }
+                for score_value in sorted(value_counts)
+            ]
+            for score_name, value_counts in sorted(self.score_counts.items())
+        }
+        return occurrence
+
+
+class _ExactOccurrenceCompactor:
+    """Compact repeated occurrences online without retaining duplicate objects."""
+
+    def __init__(self) -> None:
+        self._groups: dict[
+            str,
+            Mapping[str, Any] | _ExactOccurrenceGroup,
+        ] = {}
+
+    def add(self, occurrence: Mapping[str, Any]) -> None:
+        key = _exact_occurrence_key(occurrence)
+        current = self._groups.get(key)
+        if current is None:
+            self._groups[key] = occurrence
+            return
+        if isinstance(current, _ExactOccurrenceGroup):
+            current.add(occurrence)
+            return
+        group = _ExactOccurrenceGroup.from_occurrence(current)
+        group.add(occurrence)
+        self._groups[key] = group
+
+    def finish(self) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for key in sorted(self._groups):
+            value = self._groups.pop(key)
+            if isinstance(value, _ExactOccurrenceGroup):
+                output.append(value.render())
+            else:
+                output.append(dict(value))
+        return output
 
 
 def _extract_sparse_occurrences(
@@ -713,6 +1041,7 @@ def _extract_neural_query_occurrences(
     if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
         return []
     output: list[dict[str, Any]] = []
+    ngram_compactor = _ExactOccurrenceCompactor()
     for query_index, query in enumerate(values):
         if not isinstance(query, Mapping):
             continue
@@ -764,7 +1093,8 @@ def _extract_neural_query_occurrences(
                 scores={**_finite_scores(compact), **_finite_scores(query)},
             )
             if occurrence is not None:
-                output.append(occurrence)
+                ngram_compactor.add(occurrence)
+    output.extend(ngram_compactor.finish())
     return output
 
 
@@ -797,6 +1127,7 @@ def _extract_generic_occurrence(
 
 def _extract_occurrences(rows: Iterable[Mapping[str, Any]]) -> dict[int, list[dict[str, Any]]]:
     by_outer: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    neural_by_outer: dict[int, _ExactOccurrenceCompactor] = {}
     for handoff_row, row in enumerate(rows, start=1):
         try:
             outer_fold = int(row["outer_fold"])
@@ -821,9 +1152,10 @@ def _extract_occurrences(rows: Iterable[Mapping[str, Any]]) -> dict[int, list[di
                 raise ValueError(
                     f"handoff row {handoff_row} architecture envelope is inconsistent"
                 )
-            reference = dict(occurrence.get("reference") or {})
-            reference["handoff_row"] = int(handoff_row)
-            occurrence["reference"] = reference
+            _rebind_compact_handoff_references(
+                occurrence,
+                handoff_row=handoff_row,
+            )
             occurrences.append(occurrence)
         elif isinstance(payload, Mapping) and source == "text_models":
             occurrences.extend(_extract_sparse_occurrences(row, payload, handoff_row=handoff_row))
@@ -843,7 +1175,17 @@ def _extract_occurrences(rows: Iterable[Mapping[str, Any]]) -> dict[int, list[di
                 payload,
                 handoff_row=handoff_row,
             )
-        by_outer[outer_fold].extend(occurrences)
+        for occurrence in occurrences:
+            if str(occurrence["architecture"]) == NEURAL_QUERY_MOMENTS:
+                compactor = neural_by_outer.get(outer_fold)
+                if compactor is None:
+                    compactor = _ExactOccurrenceCompactor()
+                    neural_by_outer[outer_fold] = compactor
+                compactor.add(occurrence)
+            else:
+                by_outer[outer_fold].append(occurrence)
+    for outer_fold, compactor in neural_by_outer.items():
+        by_outer[outer_fold].extend(compactor.finish())
     if not by_outer or not any(by_outer.values()):
         raise ValueError("the Stage 1 handoff contains no compilable scientific evidence")
     return by_outer
@@ -882,23 +1224,18 @@ def _aggregate_exact_occurrences(
 ) -> list[dict[str, Any]]:
     grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for occurrence in occurrences:
-        key = _canonical_json(
-            {
-                "evidence_kind": occurrence["evidence_kind"],
-                "text": _clean_text(occurrence["text"]).casefold(),
-                "source_families": sorted(occurrence["source_families"]),
-                "architecture": str(occurrence["architecture"]),
-            }
-        )
-        grouped[key].append(occurrence)
+        grouped[_exact_occurrence_key(occurrence)].append(occurrence)
     members: list[dict[str, Any]] = []
     for key, values in sorted(grouped.items()):
         member_id = f"member_{_sha256_text(key)[:20]}"
         axes = sorted({axis for value in values for axis in value["axes"]})
-        polarities = sorted({str(value["polarity"]) for value in values})
+        polarities = sorted(
+            {polarity for value in values for polarity in _occurrence_polarities(value)}
+        )
         families = sorted({family for value in values for family in value["source_families"]})
         architectures = sorted({str(value["architecture"]) for value in values})
-        references = [dict(value["reference"]) for value in values]
+        references = _merge_reference_summaries(values)
+        raw_occurrence_count = sum(_occurrence_count(value) for value in values)
         cache_index = None
         if embedding_cache is not None:
             for value in values:
@@ -920,6 +1257,7 @@ def _aggregate_exact_occurrences(
                 "source_architectures": architectures,
                 "occurrences": [dict(value) for value in values],
                 "raw_references": references,
+                "raw_occurrence_count": raw_occurrence_count,
                 "cache_index": cache_index,
             }
         )
@@ -1048,7 +1386,7 @@ def _member_support(member: Mapping[str, Any]) -> tuple[int, int, int, str]:
     return (
         len(contexts),
         len(member["source_families"]),
-        len(references),
+        int(member["raw_occurrence_count"]),
         str(member["member_id"]),
     )
 
@@ -1095,20 +1433,38 @@ def _select_exemplars(
 
 
 def _score_summary(members: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    values: dict[str, list[float]] = defaultdict(list)
+    values: dict[str, dict[float, int]] = defaultdict(lambda: defaultdict(int))
     for member in members:
         for occurrence in member["occurrences"]:
-            for key, value in occurrence.get("scores", {}).items():
-                values[str(key)].append(float(value))
-    return {
-        key: {
-            "minimum": min(numbers),
-            "median": float(np.median(numbers)),
-            "maximum": max(numbers),
+            for key, value_counts in _occurrence_score_value_counts(occurrence).items():
+                for value, count in value_counts.items():
+                    values[str(key)][float(value)] += int(count)
+
+    def weighted_value_at(value_counts: Mapping[float, int], position: int) -> float:
+        seen = 0
+        for value, count in sorted(value_counts.items()):
+            seen += int(count)
+            if position < seen:
+                return float(value)
+        raise RuntimeError("weighted score position exceeds its encoded count")
+
+    summary: dict[str, Any] = {}
+    for key, value_counts in sorted(values.items()):
+        if not value_counts:
+            continue
+        total = sum(value_counts.values())
+        upper = weighted_value_at(value_counts, total // 2)
+        median = upper
+        if total % 2 == 0:
+            lower = weighted_value_at(value_counts, total // 2 - 1)
+            median = (lower + upper) / 2.0
+        ordered_values = sorted(value_counts)
+        summary[key] = {
+            "minimum": ordered_values[0],
+            "median": median,
+            "maximum": ordered_values[-1],
         }
-        for key, numbers in sorted(values.items())
-        if numbers
-    }
+    return summary
 
 
 def _truncate_exemplar(text: str, *, max_chars: int) -> dict[str, Any]:
@@ -1144,6 +1500,7 @@ def _build_card(
         limit=max(1, int(max_exemplars)),
     )
     references = [reference for member in members for reference in member["raw_references"]]
+    raw_occurrence_count = sum(int(member["raw_occurrence_count"]) for member in members)
     inner_folds = sorted(
         {
             int(reference["inner_fold"])
@@ -1196,7 +1553,7 @@ def _build_card(
         "source_architectures": architectures,
         "support": {
             "exact_member_count": len(members),
-            "raw_occurrence_count": len(references),
+            "raw_occurrence_count": raw_occurrence_count,
             "patient_count": len(patient_ids),
             "inner_folds": inner_folds,
             "full_outer_train_support": any(
@@ -1210,7 +1567,7 @@ def _build_card(
     lineage = {
         "card_id": card_id,
         "member_ids": member_ids,
-        "raw_occurrence_count": len(references),
+        "raw_occurrence_count": raw_occurrence_count,
     }
     return card, lineage
 
@@ -1332,6 +1689,7 @@ def compile_stage2_handoff_evidence(
     fold_summaries: dict[str, Any] = {}
     for outer_fold in sorted(occurrences_by_outer):
         occurrences = occurrences_by_outer[outer_fold]
+        raw_occurrence_count = sum(_occurrence_count(value) for value in occurrences)
         present_architectures = {
             str(occurrence["architecture"]) for occurrence in occurrences
         }
@@ -1451,7 +1809,7 @@ def compile_stage2_handoff_evidence(
                 "source_families": list(member["source_families"]),
                 "source_architectures": list(member["source_architectures"]),
                 "raw_references": list(member["raw_references"]),
-                "raw_occurrence_count": len(member["raw_references"]),
+                "raw_occurrence_count": int(member["raw_occurrence_count"]),
             }
             for member in members
         )
@@ -1459,19 +1817,42 @@ def compile_stage2_handoff_evidence(
         members_by_outer[outer_fold] = public_members
         lineage_by_outer[outer_fold] = tuple(lineage)
         fold_summaries[str(outer_fold)] = {
-            "raw_occurrences": len(occurrences),
+            "raw_occurrences": raw_occurrence_count,
+            "compact_occurrence_records": len(occurrences),
             "exact_members": len(members),
             "cards": len(fitted_cards),
-            "exact_duplicate_occurrences_removed": len(occurrences) - len(members),
+            "exact_duplicate_occurrences_removed": raw_occurrence_count - len(members),
             "prompt_packet_chars": sum(len(_canonical_json(packet)) for packet in fold_packets),
             "groups": group_audit,
             "source_family_occurrences": dict(
                 sorted(
-                    Counter(
-                        family
-                        for occurrence in occurrences
-                        for family in occurrence["source_families"]
-                    ).items()
+                    {
+                        family: sum(
+                            _occurrence_count(occurrence)
+                            for occurrence in occurrences
+                            if family in occurrence["source_families"]
+                        )
+                        for family in {
+                            family
+                            for occurrence in occurrences
+                            for family in occurrence["source_families"]
+                        }
+                    }.items()
+                )
+            ),
+            "architecture_occurrences": dict(
+                sorted(
+                    {
+                        architecture: sum(
+                            _occurrence_count(occurrence)
+                            for occurrence in occurrences
+                            if str(occurrence["architecture"]) == architecture
+                        )
+                        for architecture in {
+                            str(occurrence["architecture"])
+                            for occurrence in occurrences
+                        }
+                    }.items()
                 )
             ),
             "architecture_packets": dict(
@@ -1508,4 +1889,5 @@ __all__ = [
     "SUPPORTED_STAGE2_ARCHITECTURES",
     "compile_stage2_handoff_evidence",
     "extract_stage1_architecture_occurrences",
+    "stage1_embedding_cache_dependency_identity",
 ]

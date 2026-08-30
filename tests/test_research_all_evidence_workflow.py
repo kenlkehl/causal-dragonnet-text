@@ -459,6 +459,78 @@ def test_stage2_handoff_reader_uses_the_obvious_output_path(tmp_path):
     ]
 
 
+def test_rerun_tfidf_invalidates_exact_context_metadata_but_keeps_products(tmp_path: Path):
+    component_dir = tmp_path / "components" / "tfidf"
+    context_dir = (
+        component_dir
+        / "stage1_tfidf_topics"
+        / "contexts"
+        / "outer_001_inner_001"
+    )
+    context_dir.mkdir(parents=True)
+    component_complete = component_dir / "complete.json"
+    worker_complete = context_dir / "complete.json"
+    context_metadata = context_dir / "context_metadata.json"
+    fitted_product = context_dir / "fitted_context.json"
+    for path in (component_complete, worker_complete, context_metadata, fitted_product):
+        path.write_text("{}\n", encoding="utf-8")
+    workflow = SimpleNamespace(_component_dir=lambda _name: component_dir)
+
+    all_evidence_workflow._invalidate_component_for_rerun(workflow, "tfidf")
+
+    assert not component_complete.exists()
+    assert not worker_complete.exists()
+    assert not context_metadata.exists()
+    assert fitted_product.exists()
+
+
+def test_legacy_handoff_references_sources_without_copy_or_architecture_expansion(
+    tmp_path: Path,
+):
+    _raw, config = _inputs(tmp_path, components=())
+    context = ResearchAllEvidenceWorkflow(config)._resolved_context()
+    assert context.config.stage1_architectures is None
+    source = context.component_dir("text_models") / "evidence.jsonl"
+    source.parent.mkdir(parents=True)
+    source_row = {
+        "outer_fold": 1,
+        "inner_fold": None,
+        "scope": "full_outer_train",
+        "importance": {"views": []},
+    }
+    source.write_text(json.dumps(source_row) + "\n", encoding="utf-8")
+    handoff_dir = context.component_dir("handoff")
+    handoff_dir.mkdir(parents=True)
+    obsolete_copies = [
+        handoff_dir / f"{source_name}.jsonl"
+        for source_name in ("text_models", "tfidf", "neural_queries")
+    ]
+    for obsolete_copy in obsolete_copies:
+        obsolete_copy.write_text("obsolete duplicate\n", encoding="utf-8")
+
+    result = all_evidence_workflow._handoff_component(context, handoff_dir)
+
+    assert result["rows"] == 1
+    assert all(not obsolete_copy.exists() for obsolete_copy in obsolete_copies)
+    assert not (context.output_dir / "stage1_architectures").exists()
+    index = json.loads((handoff_dir / "index.json").read_text(encoding="utf-8"))
+    assert index["source_storage"] == "referenced_without_copy"
+    assert index["architecture_materialization"] == "skipped_for_legacy_raw_handoff"
+    assert index["sources"] == {
+        "text_models": "../components/text_models/evidence.jsonl"
+    }
+    rows = list(iter_stage1_handoff(context.output_dir))
+    assert rows == [
+        {
+            "source": "text_models",
+            "outer_fold": 1,
+            "inner_fold": None,
+            "scope": "full_outer_train",
+            "evidence": source_row,
+        }
+    ]
+
+
 def test_other_evidence_families_reuse_visible_tfidf_splits(tmp_path):
     _raw, config = _inputs(tmp_path, components=("tfidf", "text_models"))
     split_path = config.output_dir / "components" / "tfidf" / "split_provenance.jsonl"
@@ -727,6 +799,314 @@ def test_phase_flags_are_mutually_exclusive():
         parser.parse_args(["--stage1-only", "--stage2-only"])
 
 
+def _completed_stage2_reselection_fixture(tmp_path: Path):
+    raw, _config = _inputs(tmp_path, components=())
+    raw["run"]["mode"] = "stage2"
+    raw["stage2"] = {
+        "endpoint": "http://stage2.test/v1",
+        "model": "primary-model",
+        "extraction_llm": {
+            "endpoint": "http://extract.test/v1",
+            "model": "extractor-model",
+            "workers": 1,
+        },
+        "max_review_rounds": 2,
+    }
+    config = compile_config(raw, config_dir=tmp_path)
+    stage2_dir = config.output_dir / "stage2"
+    stage2_dir.mkdir(parents=True)
+    (stage2_dir / "model_identity.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage2_endpoint_model_identity_v1",
+                "primary": {"selected_model": "primary-model"},
+                "extraction": {"selected_model": "extractor-model"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (stage2_dir / "complete.json").write_text(
+        json.dumps({"status": "complete", "phase": "causal_estimation"}),
+        encoding="utf-8",
+    )
+    for name in (
+        "config.json",
+        "summary.json",
+        "features_by_outer_fold.jsonl",
+        "cross_fitted_predictions.csv",
+        "causal_estimate.json",
+        "posthoc_oracle_ite_metrics.json",
+    ):
+        (stage2_dir / name).write_text("{}\n", encoding="utf-8")
+
+    dataset = pd.read_parquet(config.dataset).reset_index(drop=True)
+    for outer_fold in range(1, config.outer_folds + 1):
+        outer_dir = stage2_dir / f"outer_{outer_fold:03d}"
+        outer_dir.mkdir(parents=True)
+        packets = [
+            {
+                "packet_id": f"outer-{outer_fold}",
+                "outer_fold": outer_fold,
+                "architecture": "tfidf_topic_contrast",
+            }
+        ]
+        (outer_dir / "input_packets.jsonl").write_text(
+            "".join(json.dumps(packet) + "\n" for packet in packets),
+            encoding="utf-8",
+        )
+        source_features = [
+            {
+                "feature_id": f"outer_{outer_fold:03d}_feature_001",
+                "name": "baseline_status",
+                "value_type": "binary",
+                "categories_or_unit": ["Present", "Absent"],
+                "definition": "Pretreatment baseline status.",
+                "extraction_guidance": "Extract only pretreatment status.",
+                "roles": [],
+            }
+        ]
+        (outer_dir / "feature_definitions.json").write_text(
+            json.dumps({"outer_fold": outer_fold, "features": source_features}),
+            encoding="utf-8",
+        )
+        definition_fingerprint = all_evidence_workflow._stage2_value_fingerprint(
+            all_evidence_workflow._feature_definition_input_value(
+                config=config.stage2,
+                clinical_question=config.clinical_question,
+                outer_fold=outer_fold,
+                discovery_packets=packets,
+                seed=config.seed,
+            )
+        )
+        (outer_dir / "definitions_complete.json").write_text(
+            json.dumps(
+                {
+                    "status": "complete",
+                    "evidence_input_fingerprint": definition_fingerprint,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        fit_ids = [0, 1, 2, 3]
+        matrix = pd.DataFrame(
+            {
+                "_oci_row_id": fit_ids,
+                "baseline_status": ["Present", "Absent", "Present", "Absent"],
+            }
+        )
+        matrix_path = outer_dir / "extraction" / "all_candidates_fit" / "extracted.csv"
+        matrix_path.parent.mkdir(parents=True)
+        matrix.to_csv(matrix_path, index=False)
+        inner_splits = [
+            {"fit_row_ids": [0, 1], "heldout_row_ids": [2, 3]},
+            {"fit_row_ids": [2, 3], "heldout_row_ids": [0, 1]},
+        ]
+        treatment_outcome = dataset.iloc[fit_ids][
+            [config.treatment_column, config.outcome_column]
+        ].reset_index(drop=True)
+        selection_value = {
+            "schema_version": (
+                all_evidence_workflow.LEGACY_STAGE2_SELECTION_SCHEMA_VERSION
+            ),
+            "extracted_fit_fingerprint": "legacy-in-memory-frame-fingerprint",
+            "treatment_outcome_fingerprint": (
+                all_evidence_workflow._frame_fingerprint(treatment_outcome)
+            ),
+            "definitions": source_features,
+            "inner_splits": inner_splits,
+            "outcome_type": config.outcome_type,
+            "confounder_p_value_threshold": 0.05,
+        }
+        selection_fingerprint = all_evidence_workflow._stage2_value_fingerprint(
+            selection_value
+        )
+        selection_dir = outer_dir / "selection"
+        selection_dir.mkdir()
+        (selection_dir / "input.json").write_text(
+            json.dumps(
+                {**selection_value, "input_fingerprint": selection_fingerprint}
+            ),
+            encoding="utf-8",
+        )
+        (selection_dir / "complete.json").write_text(
+            json.dumps(
+                {
+                    "status": "complete",
+                    "schema_version": selection_value["schema_version"],
+                    "input_fingerprint": selection_fingerprint,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (selection_dir / "statistical_selection.json").write_text(
+            json.dumps({"schema_version": selection_value["schema_version"]}),
+            encoding="utf-8",
+        )
+        convergence = {
+            "schema_version": "stage2_ontology_supervisor_convergence_v1",
+            "status": "converged",
+            "converged": True,
+            "review_rounds": 1,
+            "maximum_review_rounds": 2,
+            "continued_with_latest_ontology": False,
+            "history": [{"round": 1}],
+        }
+        (outer_dir / "final_definitions.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": selection_value["schema_version"],
+                    "features": source_features,
+                    "all_candidate_features": 1,
+                    "review_rounds": 1,
+                    "evaluation_rounds": 1,
+                    "review_converged": True,
+                    "review_convergence": convergence,
+                    "ontology_refinement_rounds": 0,
+                    "harmonization_validation_fallbacks": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (outer_dir / "complete.json").write_text(
+            json.dumps({"status": "complete", "phase": "causal_estimation"}),
+            encoding="utf-8",
+        )
+        estimation_dir = outer_dir / "estimation"
+        estimation_dir.mkdir()
+        (estimation_dir / "complete.json").write_text(
+            json.dumps({"status": "complete"}),
+            encoding="utf-8",
+        )
+        heldout_dir = outer_dir / "extraction" / "heldout"
+        heldout_dir.mkdir()
+        pd.DataFrame(
+            {
+                "_oci_row_id": [4, 5],
+                "baseline_status": ["Present", "Absent"],
+            }
+        ).to_csv(heldout_dir / "extracted.csv", index=False)
+        (heldout_dir / "complete.json").write_text("{}\n", encoding="utf-8")
+        interpretation_dir = outer_dir / "interpretations" / "cached"
+        interpretation_dir.mkdir(parents=True)
+        (interpretation_dir / "complete.json").write_text("{}\n", encoding="utf-8")
+    return config
+
+
+def test_stage2_reselection_archives_downstream_and_freezes_preselection(tmp_path):
+    config = _completed_stage2_reselection_fixture(tmp_path)
+
+    state = all_evidence_workflow.prepare_stage2_reselection(config=config)
+
+    stage2_dir = config.output_dir / "stage2"
+    assert state["status"] == "prepared"
+    assert not (stage2_dir / "complete.json").exists()
+    archive_dir = stage2_dir / state["archive_path"] / "artifacts"
+    assert (archive_dir / "complete.json").is_file()
+    for outer_fold in range(1, config.outer_folds + 1):
+        outer_dir = stage2_dir / f"outer_{outer_fold:03d}"
+        assert (outer_dir / "feature_definitions.json").is_file()
+        assert (outer_dir / "definitions_complete.json").is_file()
+        assert (outer_dir / "interpretations" / "cached" / "complete.json").is_file()
+        assert (
+            outer_dir / "extraction" / "all_candidates_fit" / "extracted.csv"
+        ).is_file()
+        assert (outer_dir / "preselection" / "complete.json").is_file()
+        snapshot = json.loads(
+            (outer_dir / "preselection" / "input.json").read_text(encoding="utf-8")
+        )
+        heldout_cache = snapshot["heldout_measurement_cache"]
+        assert heldout_cache["schema_version"] == (
+            all_evidence_workflow.HELDOUT_MEASUREMENT_CACHE_SCHEMA_VERSION
+        )
+        assert heldout_cache["heldout_row_ids"] == [4, 5]
+        assert heldout_cache["measurement_definitions"][0]["name"] == (
+            "baseline_status"
+        )
+        assert not (outer_dir / "selection").exists()
+        assert (archive_dir / outer_dir.name / "selection").is_dir()
+        assert (
+            archive_dir
+            / outer_dir.name
+            / "extraction"
+            / "heldout"
+            / "extracted.csv"
+        ).is_file()
+
+    (stage2_dir / "config.json").write_text(
+        json.dumps({"new_reselection_checkpoint": True}), encoding="utf-8"
+    )
+    resumed = all_evidence_workflow.prepare_stage2_reselection(config=config)
+    assert resumed["reselection_id"] == state["reselection_id"]
+    assert json.loads((stage2_dir / "config.json").read_text(encoding="utf-8")) == {
+        "new_reselection_checkpoint": True
+    }
+    assert len(list((stage2_dir / "reselection_archives").iterdir())) == 1
+
+    (stage2_dir / "complete.json").write_text(
+        json.dumps({"status": "complete", "phase": "causal_estimation"}),
+        encoding="utf-8",
+    )
+    finalized = all_evidence_workflow.finalize_stage2_reselection(config=config)
+    assert finalized is not None
+    assert finalized["status"] == "complete"
+    repeated = all_evidence_workflow.prepare_stage2_reselection(config=config)
+    assert repeated["reselection_id"] == state["reselection_id"]
+    assert len(list((stage2_dir / "reselection_archives").iterdir())) == 1
+
+
+def test_stage2_reselection_backfills_heldout_cache_for_prepared_migration(tmp_path):
+    config = _completed_stage2_reselection_fixture(tmp_path)
+    state = all_evidence_workflow.prepare_stage2_reselection(config=config)
+    stage2_dir = config.output_dir / "stage2"
+    snapshot_path = stage2_dir / "outer_001" / "preselection" / "input.json"
+    completion_path = stage2_dir / "outer_001" / "preselection" / "complete.json"
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    snapshot.pop("input_fingerprint")
+    snapshot.pop("heldout_measurement_cache")
+    legacy_fingerprint = all_evidence_workflow._stage2_value_fingerprint(snapshot)
+    snapshot_path.write_text(
+        json.dumps({**snapshot, "input_fingerprint": legacy_fingerprint}),
+        encoding="utf-8",
+    )
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["input_fingerprint"] = legacy_fingerprint
+    completion.pop("heldout_measurement_cache_schema_version", None)
+    completion_path.write_text(json.dumps(completion), encoding="utf-8")
+
+    resumed = all_evidence_workflow.prepare_stage2_reselection(config=config)
+
+    upgraded = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert resumed["reselection_id"] == state["reselection_id"]
+    assert upgraded["heldout_measurement_cache"]["heldout_row_ids"] == [4, 5]
+    assert upgraded["input_fingerprint"] == (
+        all_evidence_workflow._stage2_value_fingerprint(
+            {
+                key: value
+                for key, value in upgraded.items()
+                if key != "input_fingerprint"
+            }
+        )
+    )
+
+
+def test_stage2_reselection_fails_before_moving_incompatible_definitions(tmp_path):
+    config = _completed_stage2_reselection_fixture(tmp_path)
+    stage2_dir = config.output_dir / "stage2"
+    definitions_complete = stage2_dir / "outer_001" / "definitions_complete.json"
+    definitions_complete.write_text(
+        json.dumps({"status": "complete", "evidence_input_fingerprint": "wrong"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="feature definitions do not match"):
+        all_evidence_workflow.prepare_stage2_reselection(config=config)
+
+    assert (stage2_dir / "complete.json").is_file()
+    assert (stage2_dir / "outer_001" / "selection").is_dir()
+    assert not (stage2_dir / "reselection_state.json").exists()
+
+
 def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path, monkeypatch):
     raw, _config = _inputs(tmp_path, components=())
     raw["run"]["mode"] = "stage2"
@@ -769,6 +1149,70 @@ def test_stage2_only_runs_from_saved_handoff_and_resumes(tmp_path, monkeypatch):
     second = workflow.run()
     assert second["components"]["stage2"]["status"] == "already_complete"
     assert len(calls) == 1
+
+
+def test_completed_stage2_with_legacy_infrastructure_missingness_is_repaired(
+    tmp_path,
+    monkeypatch,
+):
+    raw, _config = _inputs(tmp_path, components=())
+    raw["run"]["mode"] = "stage2"
+    raw["stage2"] = {
+        "endpoint": "http://stage2.test/v1",
+        "model": "test-model",
+    }
+    config = compile_config(raw, config_dir=tmp_path)
+    handoff = config.output_dir / "handoff" / "evidence.jsonl"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text('{"source":"tfidf"}\n', encoding="utf-8")
+    (handoff.parent / "complete.json").write_text("{}", encoding="utf-8")
+    stage2_dir = config.output_dir / "stage2"
+    stage2_dir.mkdir(parents=True)
+    for name, content in (
+        ("causal_estimate.json", "{}"),
+        ("cross_fitted_predictions.csv", "_oci_row_id,aipw_score\n"),
+        ("posthoc_oracle_ite_metrics.json", '{"available":false}\n'),
+    ):
+        (stage2_dir / name).write_text(content, encoding="utf-8")
+    (stage2_dir / "complete.json").write_text(
+        json.dumps({"phase": "causal_estimation"}),
+        encoding="utf-8",
+    )
+    failure = (
+        stage2_dir
+        / "outer_001"
+        / "extraction"
+        / "heldout"
+        / "batches"
+        / "batch_00001"
+        / "extraction_failure.json"
+    )
+    failure.parent.mkdir(parents=True)
+    failure.write_text(
+        json.dumps(
+            {
+                "resolution": "conservative_all_null",
+                "validation_error": "Stage2RequestExhaustedError: endpoint unavailable",
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def repair_stage2(*, output_dir, **kwargs):
+        calls.append(kwargs)
+        failure.rename(
+            failure.with_name("superseded_infrastructure_extraction_failure.json")
+        )
+        return {"phase": "causal_estimation"}
+
+    monkeypatch.setattr(all_evidence_workflow, "run_plain_handoff_stage2", repair_stage2)
+
+    result = ResearchAllEvidenceWorkflow(config).run()
+
+    assert result["components"]["stage2"]["status"] == "complete"
+    assert len(calls) == 1
+    assert (stage2_dir / "superseded_infrastructure_complete.json").is_file()
 
 
 def test_definition_only_stage2_marker_is_continued_after_upgrade(tmp_path, monkeypatch):
@@ -889,6 +1333,18 @@ def test_saved_run_config_can_start_stage2_with_endpoint_only(tmp_path):
             "http://stage2.test/v1",
             "--stage2-extraction-feature-batch-size",
             "7",
+            "--stage2-cluster-similarity-threshold",
+            "0.7",
+            "--stage2-max-tokens",
+            "150000",
+            "--stage2-extraction-max-tokens",
+            "70000",
+            "--stage2-extraction-chunk-size-tokens",
+            "45000",
+            "--stage2-extraction-context-window-tokens",
+            "140000",
+            "--stage2-extraction-context-margin-tokens",
+            "1500",
         ]
     )
 
@@ -901,9 +1357,56 @@ def test_saved_run_config_can_start_stage2_with_endpoint_only(tmp_path):
     assert resumed.stage2.endpoint == "http://stage2.test/v1"
     assert resumed.stage2.model == ""
     assert resumed.stage2.extraction_feature_batch_size == 7
+    assert resumed.stage2.agentic_selection.cluster_similarity_threshold == 0.7
+    assert resumed.stage2.max_tokens == 150_000
+    assert resumed.stage2.extraction_max_tokens == 70_000
+    assert resumed.stage2.extraction_chunk_size_tokens == 45_000
+    assert resumed.stage2.extraction_context_window_tokens == 140_000
+    assert resumed.stage2.extraction_context_margin_tokens == 1_500
     assert resumed.clinical_question == original.clinical_question
     assert resumed.unit_id_column == original.unit_id_column
     assert resumed.htr_enabled == original.htr_enabled
+
+
+def test_reselection_migrates_retired_screen_fields_in_saved_full_run_config(tmp_path):
+    _raw, original = _inputs(tmp_path)
+    saved = original.as_dict()
+    saved["components"] = [*saved["components"], "stage2"]
+    saved["mode"] = "full"
+    saved["stage2"] = {
+        "endpoint": "http://stage2.test/v1",
+        "model": "primary-model",
+        "extraction_llm": {
+            "endpoint": "http://extract.test/v1",
+            "model": "extractor-model",
+        },
+        "selection_workers": 8,
+        "confounder_p_value_threshold": 0.05,
+        "confounder_min_inner_fold_fraction": 0.75,
+        "effect_modifier_p_value_threshold": 0.05,
+        "effect_modifier_min_inner_fold_fraction": 0.75,
+    }
+    saved_path = tmp_path / "completed_run_config.json"
+    saved_path.write_text(json.dumps(saved, default=str), encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "--config",
+            str(saved_path),
+            "--stage2-only",
+            "--stage2-reselect",
+        ]
+    )
+
+    raw, config_dir = _raw_config_from_args(args)
+    resumed = compile_config(raw, config_dir=config_dir)
+
+    assert resumed.components == ("stage2",)
+    assert resumed.stage2 is not None
+    assert resumed.stage2.agentic_selection.cluster_similarity_threshold == 0.60
+    assert resumed.stage2.input_temporal_scope == "pre_index_treatment"
+    assert not set(raw["stage2"]).intersection(
+        all_evidence_workflow.RETIRED_STAGE2_SCREEN_CONFIG_KEYS
+    )
 
 
 def test_old_stage2_command_is_rejected_instead_of_silently_ignored(tmp_path):

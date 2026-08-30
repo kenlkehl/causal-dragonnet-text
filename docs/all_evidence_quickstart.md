@@ -30,7 +30,10 @@ Use `--stage1-only` to stop at the handoff or `--stage2-only` to consume an
 existing handoff. Setting `stage2.endpoint` or `stage2.vllm` in the config makes
 an unflagged invocation run both phases. `stage2.model` may be omitted when an
 external endpoint's `/models` API advertises exactly one model ID; it is required
-when the pipeline launches vLLM itself.
+when the pipeline launches vLLM itself. Dataset-backed Stage 2 always requires a
+`stage2.extraction_llm` configuration. It may point to a different endpoint or
+the same multi-model endpoint; its model is auto-discovered only when that
+endpoint advertises exactly one model.
 
 To run a scientific subset of Stage 1, add (for example)
 `--architectures bow_nuisance,tfidf_topics`. Private prerequisites are resolved
@@ -38,19 +41,31 @@ automatically and Stage 2 receives only those selected lanes. Keep the same
 selection when resuming; changing it requires a fresh output directory. Omit
 the option for legacy all-enabled behavior.
 
-Stage 2 does not stop at variable definitions. For each outer fold it extracts
-the proposed variables on training records, reviews their empirical behavior by
-inner validation, freezes the retained definitions, extracts the held-out
-records, and computes held-out nuisance predictions, AIPW scores, and treatment
-effect estimates. The common controls are:
+Stage 2 does not stop at variable definitions. For each outer fold it exhaustively
+lists clinical features from every semantic evidence card, performs merge-only
+consolidation, uses a separate small model to extract all candidates on training
+records, and lets the primary model review only aggregate extraction ontologies.
+Fold-local regressions, mixed-type associations, consensus clustering, and
+bounded role agents then assign confounder and effect-modifier roles before a
+causal forest is fit and evaluated on outer-held-out records. The common controls
+are:
 
 ```json
 {
   "stage2": {
     "endpoint": "http://127.0.0.1:8010/v1",
-    "model": "Qwen/Qwen3-32B",
+    "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
-    "max_tokens": 50000,
+    "extraction_llm": {
+      "endpoint": "http://127.0.0.1:8020/v1",
+      "model": "small-extractor",
+      "workers": 32
+    },
+    "request_timeout": 900,
+    "request_attempt_timeout": 300,
+    "transport_max_attempts": 3,
+    "max_tokens": 100000,
+    "extraction_max_tokens": 75000,
     "max_response_repairs": 10,
     "thinking_after_response_repairs": 5,
     "repetition_penalty": 1.1,
@@ -58,34 +73,59 @@ effect estimates. The common controls are:
     "extraction_reasoning_effort": "none",
     "evidence_compiler": "semantic_cluster_cards_v2",
     "evidence_max_cards_per_fold": 400,
-    "max_candidates_per_fold": 50,
-    "candidate_selection_top_n": 50,
-    "candidate_registry_embedding_model": "Qwen/Qwen3-Embedding-0.6B",
-    "candidate_registry_embedding_device": "cpu",
-    "candidate_registry_similarity_threshold": 0.94,
-    "candidate_selection_method": "late_interaction",
-    "candidate_selection_late_interaction_model": "answerdotai/answerai-colbert-small-v1",
-    "candidate_selection_late_interaction_device": "cpu",
-    "candidate_selection_top_evidence_packets": 3,
+    "extraction_feature_batch_size": 10,
+    "extraction_chunk_size_tokens": 50000,
+    "extraction_context_window_tokens": 131072,
+    "extraction_context_margin_tokens": 1024,
     "max_review_rounds": 2,
-    "max_evaluation_rounds": 10,
-    "screening_trees": 200,
-    "stability_selection_rounds": 3,
-    "stability_selection_frequency": 0.6666666667,
-    "effect_modifier_negative_margin_fraction": 0.01,
-    "effect_modifier_negative_fold_fraction": 0.6,
+    "input_temporal_scope": "pre_index_treatment",
+    "selection_consolidation": {
+      "enabled": true,
+      "neighbor_count": 10,
+      "embedding_model": "Qwen/Qwen3-Embedding-0.6B",
+      "embedding_device": "cpu",
+      "max_latents_per_cluster": 2,
+      "minimum_pairwise_association": 0.85
+    },
+    "statistical_selection": {
+      "l1_ratio": 0.8,
+      "nuisance_selection_rule": "any_inner_fold_union",
+      "modifier_selection_rule": "any_inner_fold_union",
+      "one_standard_error_rule": true,
+      "nuisance_prediction_one_standard_error_rule": false,
+      "modifier_top_n_per_inner_fold": 10,
+      "modifier_ridge_alpha": 10.0,
+      "modifier_continuous_winsor_quantile": 0.005
+    },
     "estimation_trees": 200,
     "explicit_features": []
   }
 }
 ```
 
-Interpretation, consolidation, operationalization, and review requests send
-`reasoning_effort: "high"` and do not send an output-token cap. Patient
-extraction sends `reasoning_effort: "none"`; `max_tokens` is its response cap.
+Interpretation, consolidation, operationalization, category mapping, and
+aggregate ontology-review requests go to the primary model with
+`reasoning_effort: "high"`. One-patient value extraction alone goes to the
+configured `extraction_llm` model with `reasoning_effort: "none"`. The two
+models may use different endpoints or the same multi-model endpoint.
+`max_tokens` is the primary model's 100,000-token output ceiling;
+`extraction_max_tokens` is the patient extractor's 75,000-token ceiling. Neither
+asks nor forces a model to generate that many tokens, and normal EOS stopping
+applies. The extraction ceiling may be lowered to 4,096 tokens to bound a
+runaway response without invalidating completed scientific checkpoints. Long
+patient records are processed serially in lossless source chunks
+of at most 50,000 tokens, carrying the validated structured extraction into the
+next chunk. The planner shrinks chunks as needed to preserve the model context,
+and checkpoints every chunk for restart.
 All Stage 2 completion requests send `repetition_penalty: 1.1` by default.
-Managed Gemma 4 servers therefore use the `gemma4` reasoning parser without a
-server-wide `enable_thinking` default.
+Stage 2 probes `/models`, recognizes Qwen 3 (including 3.8), Gemma 4, and LFM
+2.5 IDs, and sends family-appropriate per-request thinking controls. It accepts
+either server-parsed reasoning fields or inline reasoning delimiters.
+For Qwen 3.8, configured `high` is sent as `reasoning_effort: "xhigh"`;
+thinking-off extraction requests omit that enabled-only wire enum.
+The selected IDs are persisted in `stage2/model_identity.json`: endpoint URL
+changes may resume, but changing either running model ID raises an error.
+Transport failures receive up to 10 attempts by default.
 Invalid completed responses receive up to 10 validator-guided repair retries.
 The first five repairs retain the request's normal reasoning policy; repairs
 6–10 force `reasoning_effort` to at least `high`, enabling thinking.
@@ -95,24 +135,64 @@ definitions. Each entry must include its complete extraction ontology and
 causal roles; see the complete workflow guide for the schema. Configured
 features join Stage 2 alias consolidation in every outer fold, so an
 automatically discovered alias does not create a second variable. They remain
-fixed, required definitions during empirical review.
+fixed and required regardless of evidence strength. Configure either role or
+both; their ontologies and roles cannot be changed by the models.
 
-Independent outer folds run concurrently, and their combined interpretation and
-extraction request concurrency is bounded by `stage2.workers`. Each extraction
-request contains exactly one patient's text; this isolation is an invariant
-rather than a configurable batch-size choice.
+Independent outer folds run concurrently. Primary request concurrency is bounded
+by `stage2.workers`, and patient extraction by
+`stage2.extraction_llm.workers`. Each extraction request contains exactly one
+patient's text; this isolation is invariant. Before supervised selection, the
+optional `stage2.selection_consolidation` pass walks the extracted candidates,
+retrieves the ten nearest currently active features by default, calculates
+mixed-type association evidence on outer-training rows, and asks the primary
+model whether to leave them separate or replace disjoint subsets with canonical
+versions of the same measurement. Replacement requires every source pair to
+meet `minimum_pairwise_association` (0.85 by default), but high association is
+only a necessary condition: broader/narrower concepts and merely related
+variables must remain separate. Accepted aliases immediately replace their
+sources in later retrievals. Lossless nominal-category unions are allowed, and
+continuous coalescing skips malformed nonnumeric values in favor of the next
+valid alias; the original extraction dependencies remain recorded. Separate treatment and outcome
+group elastic nets run inside each outer fold. A candidate selected in any inner
+fold for either task enters one shared confounder union used by both nuisance
+models. Ordered measurements use one standardized score; nominal factor
+contrasts and missingness are selected as one group. Inner-fold grouped elastic
+nets generate cross-fitted treatment and outcome predictions. Candidate-specific
+grouped elastic nets then augment both nuisances before a ridge-stabilized
+R-learner scores each candidate on untouched inner-heldout rows. Categorical
+interaction contrasts enter together and receive one held-out R-loss score. The
+ten largest gains per inner fold enter the deduplicated causal-forest modifier
+union by default, with no sign threshold. Binary nuisance reports include AUROC
+and log loss.
+Consolidation receives neither treatment nor outcome and is not a role-selection
+screen. Outer-heldout rows remain inaccessible until selection is frozen;
+selected latent states are then applied to their held-out measurement dependencies.
 
-For eight independent vLLM replicas on eight GPUs, replace `endpoint` in the
-example above with:
+For pipeline-managed orchestrator and extractor roles, replace both endpoints
+in the example above with nested vLLM configurations. Their GPU lists define the
+allowed union used by each alternately loaded model. Here the orchestrator's
+tensor-parallel width is two, while the extractor's width is one:
 
 ```json
 {
   "stage2": {
-    "model": "google/gemma-4-31B-it",
+    "model": "Qwen/Qwen3.8-27B",
     "workers": 32,
+    "vllm_rapid_switch_seconds": 900,
+    "extraction_llm": {
+      "model": "LiquidAI/LFM2.5-2.6B",
+      "workers": 64,
+      "vllm": {
+        "gpus": [2, 3],
+        "gpus_per_server": 1,
+        "base_port": 8110,
+        "extra_args": ["--gpu-memory-utilization", "0.80"]
+      }
+    },
     "vllm": {
-      "server_count": 8,
-      "gpus": [0, 1, 2, 3, 4, 5, 6, 7],
+      "gpus": [0, 1],
+      "gpus_per_server": 2,
+      "base_port": 8010,
       "download_dir": "/models/huggingface",
       "extra_args": ["--gpu-memory-utilization", "0.90"]
     }
@@ -120,27 +200,47 @@ example above with:
 }
 ```
 
-Stage 2 starts the servers, waits for all eight model endpoints, round-robins
-work across them, and stops them on exit. Gemma defaults to the `gemma4`
-reasoning parser and language-model-only mode; thinking is selected per request
-as described above. Qwen defaults to the `qwen3` reasoning parser and
-language-model-only mode. See the complete
-workflow guide for GPU partition rules and all managed-server settings.
+When both roles are managed, Stage 2 initially starts only the orchestrator
+model and gives it the ordered union of the orchestrator and extractor GPU
+lists. It completes every fold's interpretation and feature definitions, then
+alternates the extractor and orchestrator over that union as checkpoints require
+each model. If two switches occur less than
+`vllm_rapid_switch_seconds` apart (15 minutes by default), Stage 2 instead keeps
+both servers resident on their original configured GPU allocations for the
+rest of the run and on resume. Set the cutoff to `0` to always alternate. A
+feature-definition-only run never loads the extractor. `gpus_per_server` sets
+each role's configured tensor-parallel width and derives its replica count; an
+explicit `server_count` must agree. Gemma defaults to the `gemma4` reasoning
+parser, Qwen to `qwen3`, and both default to language-model-only mode. See the
+complete workflow guide for all-GPU pool derivation, GPU partition rules, and
+all managed-server settings.
 
-Before interpretation, Stage 2 compiles the raw handoff into fold-local,
-provenance-preserving semantic cards under `stage2/evidence_compilation/`.
-After interpretation, Stage 2 first collapses exact normalized names, then uses
-the registry embedding model for conservative, lexically anchored alias
-merges. Each canonical name is rendered as natural language (`patient_age`
-becomes `Patient Age`) and scored only against the evidence packets that cited
-it. The default ColBERT-style scorer keeps at most five candidates per evidence
-axis, and `max_candidates_per_fold` supplies a hard overall cap before global
-LLM alias consolidation. Provenance associations are retained; the three
-highest-scoring packets are separately chosen as ontology evidence. This means
-2,000 packets can create 10,000 scored candidate-packet associations, but they
-cannot send 10,000 candidate features downstream.
+Stage 2 compiles the raw handoff into fold-local, provenance-preserving semantic
+cards under `stage2/evidence_compilation/`, and candidate discovery reads all of
+them. There is no ColBERT interaction filter, evidence-community graph,
+candidate reranking, or feature-count cap. Discovery-time consolidation may only
+merge aliases, so every unmerged candidate proceeds to extraction. The distinct
+post-extraction selection-consolidation pass may replace empirically populated
+aliases with a canonical, information-preserving measurement before fold-local
+group-elastic-net selection.
 Each completed request is saved beneath the relevant outer-fold directory, so
 the same command resumes after interruption without repeating it.
+
+To apply the group-elastic-net selector to a completed legacy run without repeating
+interpretation or all-candidate training extraction:
+
+```bash
+uv run python scripts/run_all_evidence.py \
+  --config /path/to/completed_run/run_config.json \
+  --stage2-only --stage2-reselect
+```
+
+The command verifies all reusable inputs before archiving the previous selector
+and downstream results under `stage2/reselection_archives/`. It redoes nuisance
+and top-N interaction selection, then reuses archived held-out measurements
+whose row, text, model, frame, and definition fingerprints still match. Only
+newly required or incompatible components are extracted. Estimation is then rerun.
+Keep the original primary and extraction model IDs; endpoints may change.
 
 The Stage 2 input is always:
 

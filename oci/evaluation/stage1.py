@@ -281,11 +281,31 @@ def _materialize_or_load_manifest(run_dir: Path) -> dict[str, Any]:
         for occurrence in occurrences
     }
     selected = tuple(name for name in STAGE1_ARCHITECTURES if name in present)
-    source_artifacts = {
-        path.stem: path
-        for path in handoff_path.parent.glob("*.jsonl")
-        if path.name != handoff_path.name
-    }
+    source_artifacts: dict[str, Path] = {}
+    index_path = handoff_path.parent / "index.json"
+    if index_path.is_file():
+        try:
+            source_references = _read_json(index_path).get("sources") or {}
+        except (OSError, ValueError, json.JSONDecodeError):
+            source_references = {}
+        if isinstance(source_references, Mapping):
+            for source, raw_path in source_references.items():
+                if not isinstance(raw_path, (str, os.PathLike)):
+                    continue
+                path = Path(raw_path).expanduser()
+                if not path.is_absolute():
+                    path = handoff_path.parent / path
+                try:
+                    path = path.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    continue
+                if path.is_file():
+                    source_artifacts[str(source)] = path
+    # Retain compatibility with handoffs written before sources were kept by
+    # reference in index.json.
+    for path in handoff_path.parent.glob("*.jsonl"):
+        if path.name != handoff_path.name:
+            source_artifacts.setdefault(path.stem, path)
     _rows, manifest = materialize_stage1_architecture_artifacts(
         output_dir=run_dir,
         raw_handoff_rows=rows,
@@ -310,7 +330,21 @@ def _load_score_frames(
     architecture_entry = (manifest.get("architectures") or {}).get(architecture) or {}
     output: list[tuple[Path, pd.DataFrame, pd.DataFrame]] = []
     cache = cache if cache is not None else {}
-    for relative in architecture_entry.get("score_artifacts") or []:
+    score_artifacts = list(architecture_entry.get("score_artifacts") or [])
+    if STAGE1_ARCHITECTURE_REGISTRY[architecture].component == "tfidf":
+        # Older manifests registered every context parquet.  Those paths mix
+        # inner heldouts with a duplicate full-outer nuisance file, whereas
+        # predictions.parquet is the single canonical outer-heldout sidecar.
+        if architecture != TFIDF_TOPICS:
+            score_artifacts = []
+        else:
+            canonical = (run_dir / "components" / "tfidf" / "predictions.parquet").resolve()
+            score_artifacts = [
+                relative
+                for relative in score_artifacts
+                if (run_dir / str(relative)).resolve() == canonical
+            ]
+    for relative in score_artifacts:
         path = run_dir / str(relative)
         if not path.is_file():
             continue
@@ -368,10 +402,25 @@ def _annotate_metric_source(
 
 def _outer_heldout(frame: pd.DataFrame) -> pd.DataFrame:
     selected = frame
+    outer_context_columns = {
+        "scope",
+        "inner_fold",
+        "split_role",
+        "honest_outer_holdout",
+    }
+    if "prediction_scope" in selected.columns and not (
+        outer_context_columns & set(selected.columns)
+    ):
+        # external_heldout means only "held out from this fit".  Without an
+        # enclosing scope it also describes candidate-selection inner folds,
+        # so it is not sufficient evidence of an outer holdout.
+        return selected.iloc[0:0].copy()
     if "scope" in selected.columns:
         selected = selected.loc[selected["scope"] == "full_outer_train"]
     if "inner_fold" in selected.columns:
         selected = selected.loc[selected["inner_fold"].isna()]
+    if "honest_outer_holdout" in selected.columns:
+        selected = selected.loc[selected["honest_outer_holdout"] == True]  # noqa: E712
     if "split_role" in selected.columns:
         heldout_roles = {"test_outer_train_fit", "heldout_query_projection"}
         selected = selected.loc[selected["split_role"].isin(heldout_roles)]
@@ -404,6 +453,62 @@ def _score_columns(frame: pd.DataFrame) -> list[str]:
     ]
 
 
+def _occurrence_count(occurrence: Mapping[str, Any]) -> int:
+    raw = occurrence.get("raw_occurrence_count", 1)
+    if isinstance(raw, bool):
+        raise ValueError("evidence raw_occurrence_count must be a positive integer")
+    try:
+        count = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("evidence raw_occurrence_count must be a positive integer") from exc
+    if count < 1:
+        raise ValueError("evidence raw_occurrence_count must be a positive integer")
+    return count
+
+
+def _occurrence_reference_summaries(
+    occurrence: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return occurrence-aware references for compact schema v2 or legacy rows."""
+
+    raw_summaries = occurrence.get("reference_summaries")
+    if isinstance(raw_summaries, Sequence) and not isinstance(
+        raw_summaries, (str, bytes)
+    ):
+        summaries = [dict(value) for value in raw_summaries if isinstance(value, Mapping)]
+    else:
+        summaries = [dict(occurrence.get("reference") or {})]
+        summaries[0]["occurrence_count"] = _occurrence_count(occurrence)
+    details = occurrence.get("details")
+    if isinstance(details, Mapping):
+        for summary in summaries:
+            for key in ("query_id", "bank"):
+                if summary.get(key) in (None, "") and details.get(key) not in (None, ""):
+                    summary[key] = details[key]
+    total = 0
+    for summary in summaries:
+        raw_count = summary.get("occurrence_count", 1)
+        if isinstance(raw_count, bool):
+            raise ValueError("evidence reference occurrence_count must be positive")
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("evidence reference occurrence_count must be positive") from exc
+        if count < 1:
+            raise ValueError("evidence reference occurrence_count must be positive")
+        summary["occurrence_count"] = count
+        total += count
+    if total != _occurrence_count(occurrence):
+        raise ValueError(
+            "evidence reference occurrence counts do not equal raw_occurrence_count"
+        )
+    return summaries
+
+
+def _evidence_occurrence_count(evidence: Sequence[Mapping[str, Any]]) -> int:
+    return sum(_occurrence_count(row.get("occurrence") or {}) for row in evidence)
+
+
 def _lexical_metrics(
     architecture: str,
     evidence: Sequence[Mapping[str, Any]],
@@ -412,12 +517,13 @@ def _lexical_metrics(
     factory = _MetricFactory(architecture)
     texts = [str((row.get("occurrence") or {}).get("text") or "") for row in evidence]
     text_tokens = [set(_TOKEN.findall(text.lower())) - _STOPWORDS for text in texts]
+    occurrence_count = _evidence_occurrence_count(evidence)
     rows = [
         factory.row(
             metric_family="evidence_inventory",
             metric="occurrence_count",
-            value=float(len(evidence)),
-            n=len(evidence),
+            value=float(occurrence_count),
+            n=occurrence_count,
         )
     ]
     for feature in features:
@@ -433,7 +539,7 @@ def _lexical_metrics(
                 metric="best_lexical_token_recall",
                 value=best,
                 target=str(feature["name"]),
-                n=len(evidence),
+                n=occurrence_count,
                 reason="metadata feature has no evaluable lexical tokens",
             )
         )
@@ -447,13 +553,15 @@ def _stability_metrics(
     factory = _MetricFactory(architecture)
     grouped: dict[int, dict[int, set[str]]] = {}
     for row in evidence:
-        inner = row.get("inner_fold")
-        if inner is None:
-            continue
         outer = int(row["outer_fold"])
-        text = str((row.get("occurrence") or {}).get("text") or "").strip().casefold()
-        if text:
-            grouped.setdefault(outer, {}).setdefault(int(inner), set()).add(text)
+        occurrence = row.get("occurrence") or {}
+        text = str(occurrence.get("text") or "").strip().casefold()
+        if not text:
+            continue
+        for reference in _occurrence_reference_summaries(occurrence):
+            inner = reference.get("inner_fold", row.get("inner_fold"))
+            if inner is not None:
+                grouped.setdefault(outer, {}).setdefault(int(inner), set()).add(text)
     values: list[float] = []
     for folds in grouped.values():
         for left, right in combinations(folds.values(), 2):
@@ -479,26 +587,43 @@ def _native_evidence_metrics(
 
     factory = _MetricFactory(architecture)
     occurrences = [dict(row.get("occurrence") or {}) for row in evidence]
+    occurrence_count = sum(_occurrence_count(occurrence) for occurrence in occurrences)
     axes = {str(axis) for occurrence in occurrences for axis in occurrence.get("axes") or []}
     patient_rows = {
-        int(occurrence["patient_row_id"])
+        int(row_id)
         for occurrence in occurrences
-        if occurrence.get("patient_row_id") is not None
+        for row_id in [
+            occurrence.get("patient_row_id"),
+            *[
+                reference.get("row_id")
+                for reference in _occurrence_reference_summaries(occurrence)
+            ],
+        ]
+        if row_id is not None
     }
-    scored = [occurrence for occurrence in occurrences if occurrence.get("scores")]
+    scored_count = 0
+    for occurrence in occurrences:
+        has_compact_summaries = isinstance(
+            occurrence.get("reference_summaries"), Sequence
+        ) and not isinstance(occurrence.get("reference_summaries"), (str, bytes))
+        for reference in _occurrence_reference_summaries(occurrence):
+            if reference.get("scores") or (
+                not has_compact_summaries and occurrence.get("scores")
+            ):
+                scored_count += int(reference["occurrence_count"])
     primary_family = STAGE1_ARCHITECTURE_REGISTRY[architecture].native_metric_families[0]
     rows = [
         factory.row(
             metric_family=primary_family,
             metric="evidence_axis_coverage",
             value=float(len(axes)),
-            n=len(occurrences),
+            n=occurrence_count,
         ),
         factory.row(
             metric_family=primary_family,
             metric="scored_evidence_fraction",
-            value=(float(len(scored) / len(occurrences)) if occurrences else None),
-            n=len(occurrences),
+            value=(float(scored_count / occurrence_count) if occurrence_count else None),
+            n=occurrence_count,
             reason="architecture emitted no canonical evidence occurrences",
         ),
     ]
@@ -508,7 +633,7 @@ def _native_evidence_metrics(
                 metric_family=primary_family,
                 metric="witness_patient_coverage",
                 value=float(len(patient_rows)),
-                n=len(occurrences),
+                n=occurrence_count,
             )
         )
     if architecture == EMBEDDING_CLUSTERED:
@@ -523,12 +648,16 @@ def _native_evidence_metrics(
                 metric_family="cluster_stability",
                 metric="represented_cluster_count",
                 value=float(len(clusters)),
-                n=len(occurrences),
+                n=occurrence_count,
             )
         )
     details = [dict(occurrence.get("details") or {}) for occurrence in occurrences]
     axis_counts = {
-        axis: sum(axis in (occurrence.get("axes") or []) for occurrence in occurrences)
+        axis: sum(
+            _occurrence_count(occurrence)
+            for occurrence in occurrences
+            if axis in (occurrence.get("axes") or [])
+        )
         for axis in ("treatment", "outcome", "residual_effect", "matched_pair")
     }
     if architecture == BOW_NUISANCE:
@@ -542,7 +671,7 @@ def _native_evidence_metrics(
                     if denominator
                     else None
                 ),
-                n=len(occurrences),
+                n=occurrence_count,
                 reason="no treatment or outcome evidence was emitted",
             )
         )
@@ -551,8 +680,12 @@ def _native_evidence_metrics(
             factory.row(
                 metric_family="r_loss",
                 metric="residual_effect_evidence_fraction",
-                value=(axis_counts["residual_effect"] / len(occurrences) if occurrences else None),
-                n=len(occurrences),
+                value=(
+                    axis_counts["residual_effect"] / occurrence_count
+                    if occurrence_count
+                    else None
+                ),
+                n=occurrence_count,
                 reason="no sparse residual-effect evidence was emitted",
             )
         )
@@ -567,15 +700,19 @@ def _native_evidence_metrics(
                 factory.row(
                     metric_family="matching",
                     metric="matched_pair_evidence_fraction",
-                    value=(axis_counts["matched_pair"] / len(occurrences) if occurrences else None),
-                    n=len(occurrences),
+                    value=(
+                        axis_counts["matched_pair"] / occurrence_count
+                        if occurrence_count
+                        else None
+                    ),
+                    n=occurrence_count,
                     reason="no matched-pair evidence was emitted",
                 ),
                 factory.row(
                     metric_family="matching",
                     metric="represented_pair_side_count",
                     value=float(len(pair_sides)),
-                    n=len(occurrences),
+                    n=occurrence_count,
                 ),
             ]
         )
@@ -586,7 +723,7 @@ def _native_evidence_metrics(
                 metric_family="oracle_attribution",
                 metric="represented_htr_stage_count",
                 value=float(len(stages)),
-                n=len(occurrences),
+                n=occurrence_count,
             )
         )
     elif architecture in {EMBEDDING_WHOLE_COHORT, EMBEDDING_CLUSTERED}:
@@ -606,13 +743,13 @@ def _native_evidence_metrics(
                     ),
                     metric="represented_contrast_count",
                     value=float(len(contrasts)),
-                    n=len(occurrences),
+                    n=occurrence_count,
                 ),
                 factory.row(
                     metric_family="semantic_recovery",
                     metric="contrast_polarity_coverage",
                     value=float(len(polarities) / 2.0),
-                    n=len(occurrences),
+                    n=occurrence_count,
                 ),
             ]
         )
@@ -627,7 +764,7 @@ def _native_evidence_metrics(
                 metric_family="retrieval",
                 metric="represented_parent_contrast_count",
                 value=float(len(parents)),
-                n=len(occurrences),
+                n=occurrence_count,
             )
         )
     elif architecture == TFIDF_TOPICS:
@@ -639,13 +776,13 @@ def _native_evidence_metrics(
                     metric_family="topic_stability",
                     metric="represented_topic_count",
                     value=float(len(topics)),
-                    n=len(occurrences),
+                    n=occurrence_count,
                 ),
                 factory.row(
                     metric_family="topic_stability",
                     metric="topic_bank_coverage",
                     value=float(len(banks) / 3.0),
-                    n=len(occurrences),
+                    n=occurrence_count,
                 ),
             ]
         )
@@ -656,25 +793,38 @@ def _native_evidence_metrics(
                 metric_family="ngram_recovery",
                 metric="represented_orphan_cluster_count",
                 value=float(len(clusters)),
-                n=len(occurrences),
+                n=occurrence_count,
             )
         )
     elif architecture == NEURAL_QUERY_MOMENTS:
-        query_ids = {str(detail.get("query_id")) for detail in details if detail.get("query_id")}
-        banks = {str(detail.get("bank")) for detail in details if detail.get("bank")}
+        references = [
+            reference
+            for occurrence in occurrences
+            for reference in _occurrence_reference_summaries(occurrence)
+        ]
+        query_ids = {
+            str(reference.get("query_id"))
+            for reference in references
+            if reference.get("query_id")
+        }
+        banks = {
+            str(reference.get("bank"))
+            for reference in references
+            if reference.get("bank")
+        }
         rows.extend(
             [
                 factory.row(
                     metric_family="query_stability",
                     metric="represented_query_count",
                     value=float(len(query_ids)),
-                    n=len(occurrences),
+                    n=occurrence_count,
                 ),
                 factory.row(
                     metric_family="query_stability",
                     metric="query_bank_coverage",
                     value=float(len(banks) / 3.0),
-                    n=len(occurrences),
+                    n=occurrence_count,
                 ),
             ]
         )

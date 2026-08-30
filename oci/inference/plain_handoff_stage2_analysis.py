@@ -16,6 +16,8 @@ import logging
 import math
 import os
 import re
+import threading
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,27 +25,71 @@ from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 import numpy as np
 import pandas as pd
+from joblib.externals.loky import ProcessPoolExecutor as LokyProcessPoolExecutor
+
+from ..models.causal_forest_head import CausalForestHead
+from ..models.elastic_net_nuisance import (
+    ElasticNetLogisticClassifier,
+    ElasticNetRegressor,
+)
+from .stage2_elastic_net_selection import (
+    SCHEMA_VERSION as ELASTIC_NET_COMPONENT_SCHEMA_VERSION,
+    TEMPORAL_SCOPE,
+    select_stage2_features_elastic_net,
+)
+from .stage2_sequential_consolidation import (
+    SELECTION_SCHEMA_VERSION,
+    consolidate_stage2_candidates,
+    latent_states_for_selected,
+    materialize_selected_latents,
+    measurement_definitions_for_selected,
+)
 
 LOGGER = logging.getLogger(__name__)
 
+# Large selectors spend most of their time in Python-level proximal-gradient
+# loops. Outer folds are otherwise orchestrated by threads, which makes those
+# loops contend on the GIL. Isolating one large selector per outer fold keeps
+# the scientific computation unchanged while allowing the independent folds
+# to use separate cores. Small selectors stay in-process to avoid spawn cost.
+STATISTICAL_SELECTION_PROCESS_ISOLATION_MIN_CANDIDATES = 64
+
 EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_extraction_v4_continuous_category_fallback"
+    "stage2_single_patient_extraction_v6_conflict_resolution_independent_small_model"
 )
 EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_feature_batch_extraction_v3_continuous_category_fallback"
+    "stage2_single_patient_feature_batch_extraction_v5_conflict_resolution_independent_small_model"
 )
 PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_single_patient_page_extraction_v3_continuous_category_fallback"
+    "stage2_single_patient_page_observations_v5_provenance"
+)
+PAGE_OBSERVATION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_single_patient_page_observation_feature_batch_v1_provenance"
 )
 PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_lossless_feature_partition_reconciliation_v4_continuous_category_fallback"
+    "stage2_deterministic_page_reconciliation_v6_provenance"
 )
-REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_feature_partition_review_v4_stable_forest_pruning"
-REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_review_convergence_v1"
-ESTIMATION_CHECKPOINT_SCHEMA_VERSION = "stage2_outer_estimation_v3_all_forest_models"
+REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_aggregate_ontology_supervisor_v1"
+REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_ontology_supervisor_convergence_v1"
+ESTIMATION_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_outer_estimation_v7_elastic_net_nuisance"
+)
+STAGE2_ROLE_SELECTION_SCHEMA_VERSION = SELECTION_SCHEMA_VERSION
+PRESELECTION_SNAPSHOT_SCHEMA_VERSION = "stage2_frozen_preselection_snapshot_v1"
+HELDOUT_MEASUREMENT_CACHE_SCHEMA_VERSION = (
+    "stage2_frozen_heldout_measurement_cache_v1"
+)
+HELDOUT_MEASUREMENT_REUSE_SCHEMA_VERSION = (
+    "stage2_heldout_measurement_reuse_v1"
+)
+STAGE2_RESELECTION_MIGRATION_SCHEMA_VERSION = "stage2_reselection_migration_v1"
 EXTRACTION_ISSUE_SCHEMA_VERSION = "stage2_extraction_issues_v1"
+PENDING_CATEGORY_ONTOLOGY_SCHEMA_VERSION = "stage2_pending_category_ontology_v1"
 ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION = (
     "stage2_training_failure_ontology_refinement_v2_request_policy"
+)
+INCREMENTAL_REFINEMENT_EXTRACTION_SCHEMA_VERSION = (
+    "stage2_incremental_refinement_extraction_v1_feature_delta"
 )
 HARMONIZATION_CHECKPOINT_SCHEMA_VERSION = "stage2_mixed_value_harmonization_v1_llm_training_only"
 HARMONIZATION_FALLBACK_SCHEMA_VERSION = "stage2_mixed_value_harmonization_fallback_v1"
@@ -53,6 +99,17 @@ HARMONIZATION_FALLBACK_SCHEMA_VERSION = "stage2_mixed_value_harmonization_fallba
 DEFAULT_ONTOLOGY_REFINEMENT_MIN_FAILURE_PATIENTS = 3
 DEFAULT_MAX_ONTOLOGY_REFINEMENT_ROUNDS = 2
 DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE = 10
+DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS = 50_000
+DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS = 131_072
+DEFAULT_EXTRACTION_MAX_TOKENS = 75_000
+DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS = 1_024
+SERIAL_EXTRACTION_CHUNK_CHECKPOINT_SCHEMA_VERSION = (
+    "stage2_serial_patient_feature_chunk_v1_carried_validated_state"
+)
+SERIAL_EXTRACTION_MANIFEST_SCHEMA_VERSION = (
+    "stage2_serial_patient_feature_extraction_v1_lossless_ordered_chunks"
+)
+MAX_SERIAL_FEATURE_STATE_CHARS = 2_048
 DEFAULT_SCREENING_TREES = 200
 DEFAULT_MAX_EVALUATION_ROUNDS = 10
 DEFAULT_STABILITY_SELECTION_ROUNDS = 3
@@ -71,6 +128,22 @@ class RequestJSON(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class Stage2InfrastructureError(RuntimeError):
+    """A Stage 2 request failed without producing a scientific response."""
+
+
+class Stage2RequestExhaustedError(Stage2InfrastructureError):
+    """A request exhausted its bounded transport or deadline budget."""
+
+
+class Stage2ResponseValidationError(ValueError):
+    """A completed model response remained semantically invalid after repairs."""
+
+
+class _ExtractionCancelledError(RuntimeError):
+    """Cooperatively stop sibling extraction tasks after one task fails."""
+
+
 _SCALAR_EXTRACTION_RULES = (
     "Return one scalar value or null per feature; never return an object or array.",
     "For a continuous feature, return one JSON number whenever the record supplies the "
@@ -79,6 +152,18 @@ _SCALAR_EXTRACTION_RULES = (
     "instead of discarding it or inventing a number. From a composite such as 147/93, use "
     "only a component explicitly named by the feature; if the definition requests multiple "
     "components, return null rather than a ratio string or aggregate.",
+)
+
+CONFLICT_RESOLUTION_STRATEGIES = frozenset(
+    {
+        "latest",
+        "earliest",
+        "maximum",
+        "minimum",
+        "mode",
+        "any_positive",
+        "single_or_null",
+    }
 )
 
 CONTINUOUS_MODELING_STRATEGIES = frozenset(
@@ -109,6 +194,102 @@ def _write_frame(path: Path, frame: pd.DataFrame) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     frame.to_csv(temporary, index=False)
     os.replace(temporary, path)
+
+
+_INFRASTRUCTURE_FAILURE_MARKERS = (
+    "Stage2InfrastructureError",
+    "Stage2RequestExhaustedError",
+    "Stage 2 logical request deadline",
+    "Stage 2 transport exhausted",
+)
+_INFRASTRUCTURE_AUDIT_FILENAMES = {
+    "extraction_failure.json",
+    "category_ontology_repair.json",
+    "fallback.json",
+}
+
+
+def _records_infrastructure_failure(path: Path) -> bool:
+    try:
+        rendered = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(marker in rendered for marker in _INFRASTRUCTURE_FAILURE_MARKERS)
+
+
+def _is_archived_audit_path(path: Path, *, root: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts[:-1]
+    except ValueError:
+        return False
+    for part in parts:
+        normalized = part.lower()
+        if "archive" in normalized or "backup" in normalized:
+            return True
+    return False
+
+
+def infrastructure_failure_audit_paths(root: Path) -> tuple[Path, ...]:
+    """Find legacy checkpoints that mislabeled request failure as model output."""
+
+    root = Path(root)
+    if not root.is_dir():
+        return ()
+    paths: list[Path] = []
+    for current, directory_names, filenames in os.walk(root):
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if "archive" not in name.lower() and "backup" not in name.lower()
+        ]
+        current_path = Path(current)
+        candidates = set(filenames).intersection(_INFRASTRUCTURE_AUDIT_FILENAMES)
+        if (
+            "result.json" in filenames
+            and current_path.name.startswith("feature_")
+            and current_path.parent.name == "supervisor"
+        ):
+            candidates.add("result.json")
+        for name in candidates:
+            path = current_path / name
+            if (
+                not _is_archived_audit_path(path, root=root)
+                and _records_infrastructure_failure(path)
+            ):
+                paths.append(path)
+    return tuple(sorted(paths))
+
+
+def _infrastructure_affected_directories(root: Path) -> set[Path]:
+    root = Path(root)
+    affected: set[Path] = set()
+    for audit_path in infrastructure_failure_audit_paths(root):
+        directory = audit_path.parent
+        while directory == root or root in directory.parents:
+            affected.add(directory)
+            if directory == root:
+                break
+            directory = directory.parent
+    return affected
+
+
+def _supersede_infrastructure_checkpoint(directory: Path) -> None:
+    """Retain a legacy bad leaf for audit while making it ineligible for reuse."""
+
+    for name in (
+        "complete.json",
+        "result.json",
+        "extraction_failure.json",
+        "extraction_issues.json",
+        "category_ontology_repair.json",
+        "fallback.json",
+    ):
+        path = directory / name
+        if path.is_file():
+            os.replace(
+                path,
+                path.with_name(f"superseded_infrastructure_{name}"),
+            )
 
 
 def _ontology_refinement_limits(config: Any) -> tuple[int, int]:
@@ -164,6 +345,27 @@ def _configured_extraction_feature_batch_size(config: Any) -> int:
     )
 
 
+def _configured_serial_extraction(config: Any) -> dict[str, int]:
+    """Read token-window settings from current or pre-serial configs."""
+
+    defaults = {
+        "chunk_size_tokens": DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS,
+        "context_window_tokens": DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS,
+        "max_output_tokens": DEFAULT_EXTRACTION_MAX_TOKENS,
+        "context_margin_tokens": DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS,
+    }
+    names = {
+        "chunk_size_tokens": "extraction_chunk_size_tokens",
+        "context_window_tokens": "extraction_context_window_tokens",
+        "max_output_tokens": "extraction_max_tokens",
+        "context_margin_tokens": "extraction_context_margin_tokens",
+    }
+    return {
+        key: int(getattr(config, attribute, defaults[key]))
+        for key, attribute in names.items()
+    }
+
+
 def _value_fingerprint(value: Any) -> str:
     encoded = json.dumps(
         value,
@@ -191,6 +393,247 @@ def _frame_fingerprint(frame: pd.DataFrame) -> str:
     )
     digest.update(pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes())
     return digest.hexdigest()
+
+
+def frozen_preselection_review_policy(config: Any) -> dict[str, Any]:
+    """Return the ontology-review policy that produced a reusable fit matrix."""
+
+    minimum_failure_patients, maximum_refinement_rounds = (
+        _ontology_refinement_limits(config)
+    )
+    return {
+        "review_schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+        "review_convergence_schema_version": REVIEW_CONVERGENCE_SCHEMA_VERSION,
+        "ontology_refinement_schema_version": (
+            ONTOLOGY_REFINEMENT_CHECKPOINT_SCHEMA_VERSION
+        ),
+        "harmonization_schema_version": HARMONIZATION_CHECKPOINT_SCHEMA_VERSION,
+        "max_review_rounds": int(getattr(config, "max_review_rounds", 1)),
+        "ontology_refinement_min_failure_patients": int(
+            minimum_failure_patients
+        ),
+        "max_ontology_refinement_rounds": int(maximum_refinement_rounds),
+    }
+
+
+def _load_frozen_preselection_snapshot(
+    *,
+    output_dir: Path,
+    dataset: pd.DataFrame,
+    definitions: Sequence[Mapping[str, Any]],
+    fit_ids: Sequence[int],
+    heldout_ids: Sequence[int],
+    inner_splits: Sequence[Mapping[str, Any]],
+    unit_id_column: str,
+    text_column: str,
+    treatment_column: str,
+    outcome_column: str,
+    outcome_type: str,
+    stage1_packets: Sequence[Mapping[str, Any]],
+    config: Any,
+) -> tuple[
+    pd.DataFrame,
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any] | None,
+] | None:
+    """Load a migration-validated post-ontology matrix without re-extraction."""
+
+    snapshot_dir = Path(output_dir) / "preselection"
+    input_path = snapshot_dir / "input.json"
+    complete_path = snapshot_dir / "complete.json"
+    if not input_path.is_file() and not complete_path.is_file():
+        return None
+    if not input_path.is_file() or not complete_path.is_file():
+        raise RuntimeError(
+            f"incomplete frozen preselection snapshot under {snapshot_dir}; restore "
+            "the archived run or rerun --stage2-reselect"
+        )
+    try:
+        snapshot = json.loads(input_path.read_text(encoding="utf-8"))
+        completion = json.loads(complete_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"invalid frozen preselection snapshot under {snapshot_dir}"
+        ) from exc
+    if not isinstance(snapshot, Mapping) or not isinstance(completion, Mapping):
+        raise RuntimeError(f"invalid frozen preselection snapshot under {snapshot_dir}")
+    if (
+        snapshot.get("schema_version") != PRESELECTION_SNAPSHOT_SCHEMA_VERSION
+        or completion.get("schema_version") != PRESELECTION_SNAPSHOT_SCHEMA_VERSION
+        or completion.get("status") != "complete"
+    ):
+        raise RuntimeError(
+            f"incompatible frozen preselection snapshot under {snapshot_dir}"
+        )
+    snapshot_value = {
+        str(key): copy.deepcopy(value)
+        for key, value in snapshot.items()
+        if key != "input_fingerprint"
+    }
+    input_fingerprint = _value_fingerprint(snapshot_value)
+    if (
+        snapshot.get("input_fingerprint") != input_fingerprint
+        or completion.get("input_fingerprint") != input_fingerprint
+    ):
+        raise RuntimeError(
+            f"frozen preselection snapshot fingerprint mismatch under {snapshot_dir}"
+        )
+
+    expected_checks = {
+        "source_feature_definitions_fingerprint": _value_fingerprint(
+            [dict(feature) for feature in definitions]
+        ),
+        "fit_row_ids_fingerprint": _value_fingerprint([int(value) for value in fit_ids]),
+        "inner_splits_fingerprint": _value_fingerprint(list(inner_splits)),
+        "treatment_outcome_fingerprint": _frame_fingerprint(
+            dataset.iloc[list(fit_ids)][[treatment_column, outcome_column]].reset_index(
+                drop=True
+            )
+        ),
+        "fit_source_text_fingerprint": _frame_fingerprint(
+            dataset.iloc[list(fit_ids)][[unit_id_column, text_column]].reset_index(
+                drop=True
+            )
+        ),
+        "stage1_packets_fingerprint": _value_fingerprint(list(stage1_packets)),
+        "review_policy_fingerprint": _value_fingerprint(
+            frozen_preselection_review_policy(config)
+        ),
+    }
+    mismatches = sorted(
+        key for key, expected in expected_checks.items() if snapshot.get(key) != expected
+    )
+    if str(snapshot.get("outcome_type") or "") != str(outcome_type):
+        mismatches.append("outcome_type")
+    if mismatches:
+        raise RuntimeError(
+            "frozen preselection snapshot does not match the current run inputs: "
+            + ", ".join(mismatches)
+        )
+
+    matrix_relative = str(snapshot.get("matrix_path") or "").strip()
+    if not matrix_relative:
+        raise RuntimeError("frozen preselection snapshot has no matrix_path")
+    matrix_path = (Path(output_dir) / matrix_relative).resolve()
+    resolved_output = Path(output_dir).resolve()
+    if matrix_path != resolved_output and resolved_output not in matrix_path.parents:
+        raise RuntimeError("frozen preselection matrix_path escapes its outer-fold directory")
+    if not matrix_path.is_file():
+        raise RuntimeError(f"frozen preselection matrix is missing: {matrix_path}")
+    matrix = pd.read_csv(matrix_path)
+    if _frame_fingerprint(matrix) != snapshot.get("matrix_snapshot_fingerprint"):
+        raise RuntimeError(f"frozen preselection matrix changed after migration: {matrix_path}")
+
+    raw_snapshot_definitions = snapshot.get("definitions")
+    if not isinstance(raw_snapshot_definitions, list) or not all(
+        isinstance(feature, Mapping) for feature in raw_snapshot_definitions
+    ):
+        raise RuntimeError("frozen preselection snapshot definitions are invalid")
+    snapshot_definitions = [dict(feature) for feature in raw_snapshot_definitions]
+    names = [str(feature.get("name") or "") for feature in snapshot_definitions]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        raise RuntimeError("frozen preselection snapshot contains invalid feature names")
+    expected_columns = ["_oci_row_id", *names]
+    if list(matrix.columns) != expected_columns:
+        raise RuntimeError(
+            "frozen preselection matrix columns do not match its definitions"
+        )
+    numeric_ids = pd.to_numeric(matrix["_oci_row_id"], errors="coerce")
+    if numeric_ids.isna().any() or not np.allclose(
+        numeric_ids.to_numpy(dtype=float),
+        np.rint(numeric_ids.to_numpy(dtype=float)),
+    ):
+        raise RuntimeError("frozen preselection matrix contains invalid row identifiers")
+    matrix_ids = numeric_ids.astype(int).tolist()
+    if matrix_ids != [int(value) for value in fit_ids] or len(set(matrix_ids)) != len(
+        matrix_ids
+    ):
+        raise RuntimeError(
+            "frozen preselection matrix rows do not match the current outer-training rows"
+        )
+    matrix["_oci_row_id"] = numeric_ids.astype(int)
+    metadata = snapshot.get("review_metadata")
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError("frozen preselection snapshot review_metadata is invalid")
+    raw_heldout_cache = snapshot.get("heldout_measurement_cache")
+    heldout_cache: dict[str, Any] | None = None
+    if raw_heldout_cache is not None:
+        if not isinstance(raw_heldout_cache, Mapping):
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache is invalid"
+            )
+        heldout_cache = copy.deepcopy(dict(raw_heldout_cache))
+        if (
+            heldout_cache.get("schema_version")
+            != HELDOUT_MEASUREMENT_CACHE_SCHEMA_VERSION
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache has an "
+                "incompatible schema"
+            )
+        raw_cache_row_ids = heldout_cache.get("heldout_row_ids")
+        if not isinstance(raw_cache_row_ids, list):
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache has no row IDs"
+            )
+        try:
+            cache_row_ids = [int(value) for value in raw_cache_row_ids]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache row IDs are invalid"
+            ) from exc
+        expected_heldout_ids = [int(value) for value in heldout_ids]
+        if (
+            cache_row_ids != expected_heldout_ids
+            or len(cache_row_ids) != len(set(cache_row_ids))
+            or heldout_cache.get("heldout_row_ids_fingerprint")
+            != _value_fingerprint(cache_row_ids)
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out measurement cache rows do not match "
+                "the current outer-heldout rows"
+            )
+        current_heldout_source_fingerprint = _frame_fingerprint(
+            dataset.iloc[cache_row_ids][[unit_id_column, text_column]].reset_index(
+                drop=True
+            )
+        )
+        if (
+            heldout_cache.get("heldout_source_text_fingerprint")
+            != current_heldout_source_fingerprint
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out source text changed after migration"
+            )
+        extraction_llm = getattr(config, "extraction_llm", None)
+        current_extraction_model = str(getattr(extraction_llm, "model", "") or "")
+        if str(heldout_cache.get("extraction_model") or "") != current_extraction_model:
+            raise RuntimeError(
+                "frozen preselection held-out cache extraction model does not match "
+                "the current extraction model"
+            )
+        cached_definitions = heldout_cache.get("measurement_definitions")
+        if not isinstance(cached_definitions, list) or not all(
+            isinstance(value, Mapping) for value in cached_definitions
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out cache definitions are invalid"
+            )
+        cache_names = [str(value.get("name") or "") for value in cached_definitions]
+        cache_ids = [
+            str(value.get("feature_id") or "") for value in cached_definitions
+        ]
+        if (
+            any(not value for value in cache_names)
+            or any(not value for value in cache_ids)
+            or len(cache_names) != len(set(cache_names))
+            or len(cache_ids) != len(set(cache_ids))
+        ):
+            raise RuntimeError(
+                "frozen preselection held-out cache feature identities are invalid"
+            )
+    return matrix, snapshot_definitions, dict(metadata), heldout_cache
 
 
 def _clean_scalar(value: Any) -> Any:
@@ -328,7 +771,12 @@ def _declared_categories(definition: Mapping[str, Any]) -> list[str]:
 def _prompt_feature_definitions(
     definitions: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Project frozen definitions to fields needed for patient measurement."""
+    """Project frozen definitions to fields needed for patient measurement.
+
+    Normal single-patient extraction returns one scalar directly, so it must
+    receive the same explicit longitudinal conflict policy that the richer
+    page-observation path later applies deterministically.
+    """
 
     output: list[dict[str, Any]] = []
     for definition in definitions:
@@ -350,8 +798,153 @@ def _prompt_feature_definitions(
                 "one JSON number, or one documented categorical/threshold string when "
                 "the numeric measurement is unavailable"
             )
+        row["conflict_resolution"] = _resolved_conflict_resolution(definition)
         output.append(row)
     return output
+
+
+def frozen_measurement_definition_identity(
+    definition: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Identify exactly the feature measurement prompt represented by a cache column."""
+
+    prompt_definition = _prompt_feature_definitions([definition])[0]
+    return {
+        "feature_id": str(definition.get("feature_id") or ""),
+        "name": str(definition.get("name") or ""),
+        "prompt_definition": prompt_definition,
+        "prompt_definition_fingerprint": _value_fingerprint(prompt_definition),
+    }
+
+
+def _likely_positive_category(categories: Sequence[str]) -> str | None:
+    """Return the affirmative member of a binary ontology when identifiable."""
+
+    if len(categories) != 2:
+        return None
+    negative = re.compile(
+        r"^(?:0|false|no|none|never|absent|negative|not\s+(?:present|documented|detected)|"
+        r"undocumented|unknown)$",
+        flags=re.IGNORECASE,
+    )
+    negative_matches = [category for category in categories if negative.fullmatch(category.strip())]
+    if len(negative_matches) != 1:
+        return None
+    return next(category for category in categories if category != negative_matches[0])
+
+
+def _resolved_conflict_resolution(definition: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a validated, explicit rule for reducing longitudinal observations.
+
+    New ontologies persist ``conflict_resolution``.  Historical definitions are
+    interpreted conservatively from their measurement text so completed
+    interpretation checkpoints remain reusable.
+    """
+
+    raw = definition.get("conflict_resolution")
+    if isinstance(raw, str):
+        raw = {"strategy": raw}
+    if raw is not None and not isinstance(raw, Mapping):
+        raise ValueError("conflict_resolution must be an object or strategy string")
+
+    value_type = str(definition.get("value_type") or "ambiguous").strip().lower()
+    categories = _declared_categories(definition)
+    measurement_text = " ".join(
+        str(definition.get(key) or "")
+        for key in ("measurement_definition", "description", "missing_value_rule")
+    ).lower()
+
+    strategy_source = "explicit_ontology"
+    strategy = str((raw or {}).get("strategy") or "").strip().lower().replace("-", "_")
+    strategy_aliases = {
+        "most_recent": "latest",
+        "last": "latest",
+        "first": "earliest",
+        "max": "maximum",
+        "min": "minimum",
+        "majority": "mode",
+        "present_if_ever": "any_positive",
+        "null_on_conflict": "single_or_null",
+    }
+    strategy = strategy_aliases.get(strategy, strategy)
+    if not strategy:
+        strategy_source = "inferred_measurement_definition"
+        if re.search(r"\b(?:maximum|maximal|highest|peak)\b", measurement_text):
+            strategy = "maximum"
+        elif re.search(r"\b(?:minimum|minimal|lowest)\b", measurement_text):
+            strategy = "minimum"
+        elif re.search(r"\b(?:earliest|first)\b", measurement_text):
+            strategy = "earliest"
+        elif re.search(r"\b(?:mode|most frequent|majority)\b", measurement_text):
+            strategy = "mode"
+        elif (
+            value_type == "binary"
+            and re.search(r"\b(?:ever|history of|any occurrence|presence or absence)\b", measurement_text)
+            and _likely_positive_category(categories) is not None
+        ):
+            strategy = "any_positive"
+        elif re.search(r"\b(?:single unambiguous|conflict[^.]{0,40}(?:null|missing))\b", measurement_text):
+            strategy = "single_or_null"
+        else:
+            # The historical behavior used document order.  Make that fallback
+            # explicit and auditable while preferring verified dates when present.
+            strategy = "latest"
+            strategy_source = "compatibility_default_latest"
+
+    if strategy not in CONFLICT_RESOLUTION_STRATEGIES:
+        raise ValueError(
+            "conflict_resolution.strategy must be one of "
+            f"{sorted(CONFLICT_RESOLUTION_STRATEGIES)}; received {strategy!r}"
+        )
+    if strategy in {"maximum", "minimum"} and value_type != "continuous":
+        if raw is not None:
+            raise ValueError(
+                f"conflict_resolution strategy {strategy!r} requires a continuous feature"
+            )
+        strategy = "latest"
+        strategy_source = "compatibility_default_latest_incompatible_inference"
+
+    positive_category: str | None = None
+    if strategy == "any_positive":
+        raw_positive = str((raw or {}).get("positive_category") or "").strip()
+        if raw_positive:
+            positive_category = _canonical_category(raw_positive, categories)
+        else:
+            positive_category = _likely_positive_category(categories)
+        if positive_category is None:
+            raise ValueError(
+                "any_positive conflict resolution requires one exact positive_category "
+                "from a binary ontology"
+            )
+
+    return {
+        "strategy": strategy,
+        "positive_category": positive_category,
+        "strategy_source": strategy_source,
+        "dated_observations_precede_undated": strategy in {"latest", "earliest"},
+        "source_order_tie_breaker": "last" if strategy != "earliest" else "first",
+    }
+
+
+def _page_prompt_feature_definitions(
+    definitions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project definitions to the richer oversized-note observation contract."""
+
+    return _prompt_feature_definitions(definitions)
+
+
+def _refresh_conflict_resolution(definition: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-derive and persist a policy after a measurement ontology is revised."""
+
+    refreshed = dict(definition)
+    refreshed.pop("conflict_resolution", None)
+    policy = _resolved_conflict_resolution(refreshed)
+    refreshed["conflict_resolution"] = {
+        "strategy": policy["strategy"],
+        "positive_category": policy["positive_category"],
+    }
+    return refreshed
 
 
 def _stale_category_ontology_audit(path: Path) -> dict[str, Any] | None:
@@ -703,21 +1296,86 @@ def _request_validated_extraction(
     definitions: Sequence[Mapping[str, Any]],
     request_json: RequestJSON,
     ontology_audit_path: Path,
+    validate_response: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Extract rows, then recover closed-category failures without resending notes."""
 
     issue_audit_path = ontology_audit_path.with_name("extraction_issues.json")
+    pending_path = ontology_audit_path.with_name("pending_category_ontology.json")
+    pending_input_fingerprint = _value_fingerprint(
+        {
+            "row_ids": [int(row_id) for row_id in row_ids],
+            "definitions": _prompt_feature_definitions(definitions),
+        }
+    )
     issue_events: list[dict[str, Any]] = []
-    try:
-        validated = request_json(
+    pending_value_repair_audit: dict[str, Any] | None = None
+
+    def validate_candidate(value: Mapping[str, Any]) -> dict[str, Any]:
+        if validate_response is not None:
+            return validate_response(value)
+        return _validate_extraction(
+            value,
+            row_ids=row_ids,
+            definitions=definitions,
+        )
+
+    def request_or_resume_pending_category() -> dict[str, Any]:
+        nonlocal pending_value_repair_audit
+        if pending_path.is_file():
+            try:
+                pending = json.loads(pending_path.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(pending, Mapping)
+                    or pending.get("schema_version")
+                    != PENDING_CATEGORY_ONTOLOGY_SCHEMA_VERSION
+                    or pending.get("input_fingerprint") != pending_input_fingerprint
+                    or not isinstance(pending.get("issues"), list)
+                    or not isinstance(pending.get("response"), Mapping)
+                ):
+                    raise ValueError("incompatible pending category ontology checkpoint")
+                prior_events = pending.get("prior_issue_events") or []
+                if not isinstance(prior_events, list):
+                    raise ValueError("invalid pending category issue events")
+                issue_events.extend(
+                    dict(event) for event in prior_events if isinstance(event, Mapping)
+                )
+                raw_value_repair = pending.get("value_repair_audit")
+                pending_value_repair_audit = (
+                    dict(raw_value_repair)
+                    if isinstance(raw_value_repair, Mapping)
+                    else None
+                )
+                LOGGER.info(
+                    "resume pending Stage 2 category ontology mapping without "
+                    "repeating patient-note extraction: %s",
+                    pending_path,
+                )
+                pending_issues = [
+                    dict(issue)
+                    for issue in pending["issues"]
+                    if isinstance(issue, Mapping)
+                ]
+                if not pending_issues:
+                    raise ValueError("pending category ontology checkpoint has no issues")
+                raise _ExtractionCategoryError(
+                    issues=pending_issues,
+                    response=pending["response"],
+                )
+            except _ExtractionCategoryError:
+                raise
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                pending_path.unlink(missing_ok=True)
+        validated_response = request_json(
             messages,
-            lambda value: _validate_extraction(
-                value,
-                row_ids=row_ids,
-                definitions=definitions,
-            ),
+            validate_candidate,
             request_kind="extraction",
         )
+        pending_path.unlink(missing_ok=True)
+        return validated_response
+
+    try:
+        validated = request_or_resume_pending_category()
         _write_json(
             issue_audit_path,
             {
@@ -727,9 +1385,13 @@ def _request_validated_extraction(
             },
         )
         return validated
-    except ValueError as exc:
+    except (
+        Stage2ResponseValidationError,
+        _ExtractionCategoryError,
+        _ExtractionValueError,
+    ) as exc:
         value_error = _value_error_from_exception(exc)
-        value_repair_audit: dict[str, Any] | None = None
+        value_repair_audit: dict[str, Any] | None = pending_value_repair_audit
         category_error = _category_error_from_exception(exc)
         if value_error is not None:
             issue_events.extend(
@@ -750,11 +1412,7 @@ def _request_validated_extraction(
                 "issues": [dict(issue) for issue in value_error.issues],
             }
             try:
-                validated = _validate_extraction(
-                    patched,
-                    row_ids=row_ids,
-                    definitions=definitions,
-                )
+                validated = validate_candidate(patched)
             except _ExtractionCategoryError as patched_category_error:
                 category_error = patched_category_error
             else:
@@ -849,14 +1507,33 @@ def _request_validated_extraction(
         len(category_error.issues),
     )
     ontology_error: str | None = None
+    _write_json(
+        pending_path,
+        {
+            "schema_version": PENDING_CATEGORY_ONTOLOGY_SCHEMA_VERSION,
+            "status": "awaiting_interpretation",
+            "input_fingerprint": pending_input_fingerprint,
+            "recorded_at": _now(),
+            "issues": [dict(issue) for issue in category_error.issues],
+            "response": copy.deepcopy(category_error.response),
+            "prior_issue_events": [
+                copy.deepcopy(event)
+                for event in issue_events
+                if event.get("failure_kind") != "out_of_ontology_category"
+            ],
+            "value_repair_audit": copy.deepcopy(value_repair_audit),
+        },
+    )
     try:
         corrections = request_json(
             _category_ontology_prompt(items),
             lambda value: _validate_category_ontology(value, items=items),
-            request_kind="extraction",
+            # This is ontology judgment over aggregate invalid values, not raw
+            # patient extraction, so it belongs to the primary supervisor.
+            request_kind="interpretation",
         )
         resolution = "llm_category_ontology"
-    except ValueError as exc:
+    except Stage2ResponseValidationError as exc:
         ontology_error = f"{type(exc).__name__}: {exc}"
         resolution = "conservative_null"
         corrections = {
@@ -876,11 +1553,7 @@ def _request_validated_extraction(
         corrections=corrections,
         targets=targets,
     )
-    validated = _validate_extraction(
-        patched,
-        row_ids=row_ids,
-        definitions=definitions,
-    )
+    validated = validate_candidate(patched)
     if value_repair_audit is not None:
         _write_json(
             ontology_audit_path.with_name("invalid_feature_value_repair.json"),
@@ -906,6 +1579,7 @@ def _request_validated_extraction(
             "events": issue_events,
         },
     )
+    pending_path.unlink(missing_ok=True)
     return validated
 
 
@@ -1030,6 +1704,16 @@ def _extraction_prompt(
         "rules": [
             "Use only the supplied clinical text for the patient in that row.",
             "Apply the measurement definition and missing-value rule literally.",
+            "Consider every explicitly supported observation for a feature before "
+            "selecting its one output value.",
+            "When multiple supported observations remain, apply that feature's "
+            "conflict_resolution policy literally. The conflict_resolution policy "
+            "governs if prose in the measurement definition is ambiguous or inconsistent "
+            "about how to choose among observations.",
+            "For latest or earliest conflict resolution, prefer observations with an "
+            "explicit governing date or time. If none are dated, use clinical-text source "
+            "order and the declared source_order_tie_breaker; do not treat the first mention, "
+            "diagnosis value, or demographics value as automatically authoritative.",
             "For a binary, categorical, or ordinal feature, return one declared category exactly.",
             "Do not substitute 0/1 or true/false for a declared category unless that "
             "exact value is declared.",
@@ -1063,40 +1747,62 @@ def _extraction_prompt(
     ]
 
 
-def _prompt_chars(messages: Sequence[Mapping[str, str]]) -> int:
-    """Return the exact rendered content characters sent to the endpoint."""
-
-    return sum(len(str(message.get("content") or "")) for message in messages)
-
-
-def _page_reconciliation_prompt(
+def _serial_extraction_prompt(
     *,
     definitions: Sequence[Mapping[str, Any]],
     row_id: int,
-    page_results: Sequence[Mapping[str, Any]],
+    chunk_text: str,
+    prior_values: Mapping[str, Any],
+    prior_feature_state: Mapping[str, Any],
+    chunk_index: int,
+    char_start: int,
+    char_end: int,
+    document_chars: int,
 ) -> list[dict[str, str]]:
+    """Update one validated cumulative extraction with the next source chunk."""
+
     body = {
-        "job": "reconcile_stage2_patient_variable_pages",
+        "job": "update_stage2_patient_variables_serially",
         "rules": [
-            "Every supplied page was extracted from a lossless contiguous span of one note.",
-            "Review every page result and apply each feature's measurement and missing-value rules.",
-            "A null page does not override a supported value on another page.",
-            "Resolve multiple supported values using document order and the specified temporal or aggregation rule.",
-            "Do not invent evidence that is absent from all page results.",
+            "Process this clinical-text chunk after every earlier chunk and before every later chunk.",
+            "prior_extraction contains the validated cumulative scalar values from all earlier contiguous chunks; it is state, not additional clinical text.",
+            "prior_feature_state contains concise decision metadata retained from earlier chunks, such as the governing date and source order for latest/earliest or value counts for mode.",
+            "Use only prior_extraction and the supplied current_chunk. Never infer evidence from a feature description or from chunk metadata.",
+            "For each feature, combine supported evidence in the current chunk with the prior cumulative value and apply that feature's conflict_resolution policy literally.",
+            "Preserve a nonnull prior value exactly when this chunk supplies no evidence that changes the policy-selected cumulative value.",
+            "A null prior value means no supported cumulative value has been retained yet; it is not evidence of a negative clinical finding.",
+            "For latest or earliest, compare explicit governing dates when available. Otherwise treat current_chunk as later in source order than prior_extraction and apply source_order_tie_breaker.",
+            "For maximum, minimum, mode, any_positive, and single_or_null, update the cumulative value according to the named policy rather than automatically preferring the current chunk.",
+            "Return carry_forward_state for every feature as a concise string or null. Preserve enough metadata to apply its conflict policy in later chunks, but do not quote or summarize unrelated record text.",
+            f"Each carry_forward_state string must be at most {MAX_SERIAL_FEATURE_STATE_CHARS} characters.",
             "For a binary, categorical, or ordinal feature, return one declared category exactly.",
-            "Do not substitute 0/1 or true/false for a declared category unless that "
-            "exact value is declared.",
+            "Do not substitute 0/1 or true/false for a declared category unless that exact value is declared.",
             *_SCALAR_EXTRACTION_RULES,
-            "Return every feature exactly once for the original row_id.",
+            "Return null only when the combined prior state and current chunk do not support a retained value under the feature policy.",
+            "Return the row and every supplied feature exactly once.",
         ],
         "features": _prompt_feature_definitions(definitions),
-        "row_id": int(row_id),
-        "page_results": list(page_results),
+        "patient": {
+            "row_id": int(row_id),
+            "prior_extraction": dict(prior_values),
+            "prior_feature_state": dict(prior_feature_state),
+            "current_chunk": chunk_text,
+            "chunk": {
+                "chunk_index": int(chunk_index),
+                "char_start": int(char_start),
+                "char_end": int(char_end),
+                "document_chars": int(document_chars),
+                "is_final_chunk": int(char_end) == int(document_chars),
+            },
+        },
         "response": {
             "rows": [
                 {
-                    "row_id": int(row_id),
-                    "values": {"every supplied feature name": "scalar value or null"},
+                    "row_id": "the supplied integer row_id",
+                    "values": {"every supplied feature name": "cumulative scalar value or null"},
+                    "carry_forward_state": {
+                        "every supplied feature name": "concise policy state string or null"
+                    },
                 }
             ]
         },
@@ -1105,31 +1811,123 @@ def _page_reconciliation_prompt(
         {
             "role": "system",
             "content": (
-                "You reconcile complete-note page extractions without dropping any page. "
-                "Return JSON only."
+                "You update a validated structured patient extraction from consecutive "
+                "clinical-record chunks. Return JSON only."
             ),
         },
-        {
-            "role": "user",
-            "content": json.dumps(body, sort_keys=True, ensure_ascii=False),
-        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True, ensure_ascii=False)},
     ]
 
 
-def _page_results_for_definitions(
-    page_results: Sequence[Mapping[str, Any]],
+def _page_extraction_prompt(
+    *,
     definitions: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Retain every page while projecting values to one feature subset."""
+    row: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Request every supported page observation with verifiable provenance."""
 
-    feature_names = [str(definition["name"]) for definition in definitions]
+    body = {
+        "job": "extract_stage2_patient_variable_observations",
+        "rules": [
+            "Use only the supplied clinical-text page for this patient.",
+            "Return every distinct explicitly supported observation for every supplied feature; do not collapse conflicting or repeated longitudinal values.",
+            "conflict_resolution is applied later by deterministic code. Do not apply it within this page and do not discard an otherwise supported observation because another value is newer, earlier, larger, smaller, or more frequent.",
+            "Do not return an observation when the page does not support a nonmissing value.",
+            "Each value must be one scalar. For closed ontologies, use one declared category exactly.",
+            "For each observation, quote a short exact contiguous evidence substring from patient.text.",
+            "evidence_start and evidence_end are zero-based Python-style character offsets into patient.text, with evidence_end exclusive.",
+            "Set recorded_at only when a date or time explicitly governs that observation, such as an encounter, specimen, measurement, or result date.",
+            "When recorded_at is set, normalize it to ISO-8601 and provide the exact source date text plus its offsets. Do not borrow an unrelated date.",
+            "Use null for recorded_at and recorded_at_evidence when no governing date is explicit on this page.",
+            "Return an empty observations array when no supplied feature has supported evidence on this page.",
+        ],
+        "features": _page_prompt_feature_definitions(definitions),
+        "patient": dict(row),
+        "response": {
+            "rows": [
+                {
+                    "row_id": "the supplied integer row_id",
+                    "observations": [
+                        {
+                            "feature_name": "one supplied feature name",
+                            "value": "one supported scalar value",
+                            "evidence": "exact quote from patient.text",
+                            "evidence_start": "zero-based inclusive integer",
+                            "evidence_end": "zero-based exclusive integer",
+                            "recorded_at": "ISO-8601 date/time, year-month, year, or null",
+                            "recorded_at_evidence": "exact source date/time quote or null",
+                            "recorded_at_start": "inclusive integer or null",
+                            "recorded_at_end": "exclusive integer or null",
+                        }
+                    ],
+                }
+            ]
+        },
+    }
     return [
         {
-            **{key: value for key, value in page.items() if key != "values"},
-            "values": {name: dict(page.get("values") or {}).get(name) for name in feature_names},
-        }
-        for page in page_results
+            "role": "system",
+            "content": (
+                "You extract all supported clinical variable observations with exact "
+                "source provenance. Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True, ensure_ascii=False)},
     ]
+
+
+def _prompt_chars(messages: Sequence[Mapping[str, str]]) -> int:
+    """Return the exact rendered content characters sent to the endpoint."""
+
+    return sum(len(str(message.get("content") or "")) for message in messages)
+
+
+def _token_id_count(encoded: Any) -> int:
+    """Count one unbatched token-id sequence from common tokenizer outputs."""
+
+    if isinstance(encoded, Mapping):
+        encoded = encoded.get("input_ids")
+    shape = getattr(encoded, "shape", None)
+    if shape is not None and len(shape):
+        return int(shape[-1])
+    if hasattr(encoded, "tolist") and not isinstance(encoded, list):
+        encoded = encoded.tolist()
+    if isinstance(encoded, Sequence) and not isinstance(encoded, (str, bytes, bytearray)):
+        if encoded and isinstance(encoded[0], Sequence):
+            return len(encoded[0])
+        return len(encoded)
+    raise TypeError("tokenizer did not return a countable input_ids sequence")
+
+
+def prompt_token_count(
+    tokenizer: Any,
+    messages: Sequence[Mapping[str, str]],
+) -> int:
+    """Count the endpoint-ready chat prompt, including generation framing."""
+
+    if tokenizer is None:
+        raise ValueError("a tokenizer is required for token-bounded Stage 2 extraction")
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(apply_chat_template):
+        raise TypeError(
+            "the extraction tokenizer must implement apply_chat_template so Stage 2 "
+            "can enforce the model context window exactly"
+        )
+    encoded = apply_chat_template(
+        [dict(message) for message in messages],
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    return _token_id_count(encoded)
+
+
+def _text_token_count(tokenizer: Any, text: str) -> int:
+    encoded = tokenizer(
+        text,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    )
+    return _token_id_count(encoded)
 
 
 def _partition_feature_definitions(
@@ -1149,52 +1947,6 @@ def _partition_feature_definitions(
         list(definitions[start : start + feature_batch_size])
         for start in range(0, len(definitions), feature_batch_size)
     ]
-
-
-def _partition_page_reconciliation_definitions(
-    *,
-    definitions: Sequence[Mapping[str, Any]],
-    row_id: int,
-    page_results: Sequence[Mapping[str, Any]],
-    max_prompt_chars: int,
-    feature_batch_size: int,
-) -> list[list[Mapping[str, Any]]]:
-    """Partition only features; every batch continues to see every note page."""
-
-    batches: list[list[Mapping[str, Any]]] = []
-    current: list[Mapping[str, Any]] = []
-    for definition in definitions:
-        singleton_results = _page_results_for_definitions(page_results, [definition])
-        singleton_messages = _page_reconciliation_prompt(
-            definitions=[definition],
-            row_id=row_id,
-            page_results=singleton_results,
-        )
-        singleton_prompt_chars = _prompt_chars(singleton_messages)
-        if singleton_prompt_chars > int(max_prompt_chars):
-            raise ValueError(
-                "Stage 2 cannot reconcile every lossless note page for one feature "
-                f"within max_prompt_chars ({singleton_prompt_chars} > {max_prompt_chars}); "
-                "increase the prompt budget"
-            )
-        proposed = [*current, definition]
-        proposed_results = _page_results_for_definitions(page_results, proposed)
-        messages = _page_reconciliation_prompt(
-            definitions=proposed,
-            row_id=row_id,
-            page_results=proposed_results,
-        )
-        prompt_chars = _prompt_chars(messages)
-        if current and (
-            len(proposed) > int(feature_batch_size) or prompt_chars > int(max_prompt_chars)
-        ):
-            batches.append(current)
-            current = [definition]
-        else:
-            current = proposed
-    if current:
-        batches.append(current)
-    return batches
 
 
 def _validate_extraction(
@@ -1287,6 +2039,10 @@ def _validate_extraction(
                     extracted = canonical
             clean_values[name] = extracted
         by_row[row_id] = {"row_id": row_id, "values": clean_values}
+        if "carry_forward_state" in raw:
+            by_row[row_id]["carry_forward_state"] = copy.deepcopy(
+                raw.get("carry_forward_state")
+            )
     if set(by_row) != expected_rows:
         raise ValueError("extraction response omitted one or more supplied rows")
     normalized_response = {"rows": [by_row[int(row_id)] for row_id in row_ids]}
@@ -1298,6 +2054,695 @@ def _validate_extraction(
     if category_issues:
         raise _ExtractionCategoryError(issues=category_issues, response=normalized_response)
     return normalized_response
+
+
+def _validate_serial_extraction(
+    value: Mapping[str, Any],
+    *,
+    row_id: int,
+    definitions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate cumulative values plus bounded policy metadata for the next chunk."""
+
+    validated = _validate_extraction(
+        value,
+        row_ids=[row_id],
+        definitions=definitions,
+    )
+    feature_names = [str(definition["name"]) for definition in definitions]
+    row = validated["rows"][0]
+    raw_state = row.get("carry_forward_state")
+    if not isinstance(raw_state, Mapping):
+        raise ValueError("serial extraction row requires a carry_forward_state object")
+    if set(map(str, raw_state)) != set(feature_names):
+        raise ValueError(
+            "serial extraction carry_forward_state must contain every supplied feature exactly"
+        )
+    state: dict[str, str | None] = {}
+    for name in feature_names:
+        raw = raw_state.get(name)
+        if raw is None:
+            state[name] = None
+            continue
+        if isinstance(raw, bool):
+            raw = "true" if raw else "false"
+        elif isinstance(raw, int):
+            raw = str(raw)
+        elif isinstance(raw, float) and math.isfinite(raw):
+            raw = json.dumps(raw, ensure_ascii=False, allow_nan=False)
+        if not isinstance(raw, str):
+            # Carry-forward state is bounded prompt metadata, not an extracted
+            # scientific value. Preserve scalar evidence losslessly as text and
+            # conservatively drop malformed containers/non-finite values rather
+            # than crashing after an otherwise valid ontology correction.
+            state[name] = None
+            continue
+        rendered = raw.strip()
+        if len(rendered) > MAX_SERIAL_FEATURE_STATE_CHARS:
+            raise ValueError(
+                f"serial carry_forward_state for {name!r} exceeds "
+                f"{MAX_SERIAL_FEATURE_STATE_CHARS} characters"
+            )
+        state[name] = rendered or None
+    row["carry_forward_state"] = state
+    return validated
+
+
+class _PageObservationValidationError(ValueError):
+    """Invalid provenance rows while retaining every independently valid observation."""
+
+    def __init__(
+        self,
+        *,
+        issues: Sequence[Mapping[str, Any]],
+        response: Mapping[str, Any],
+    ) -> None:
+        self.issues = tuple(dict(issue) for issue in issues)
+        self.response = copy.deepcopy(dict(response))
+        first = self.issues[0]
+        suffix = f"; {len(self.issues) - 1} additional issue(s)" if len(self.issues) > 1 else ""
+        super().__init__(
+            f"page observation {first.get('observation_index')} for feature "
+            f"{first.get('feature_name')!r} is invalid: {first.get('reason')}{suffix}"
+        )
+
+
+def _page_observation_error_from_exception(
+    exc: BaseException,
+) -> _PageObservationValidationError | None:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, _PageObservationValidationError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _exact_quote_span(
+    *,
+    text: str,
+    quote: Any,
+    reported_start: Any,
+    reported_end: Any,
+    label: str,
+) -> tuple[str, int, int, str]:
+    """Resolve a model-provided exact quote to deterministic page offsets."""
+
+    if not isinstance(quote, str) or not quote:
+        raise ValueError(f"{label} must be a nonempty exact quote")
+    start: int | None = None
+    end: int | None = None
+    if not isinstance(reported_start, bool) and isinstance(reported_start, int):
+        start = int(reported_start)
+    if not isinstance(reported_end, bool) and isinstance(reported_end, int):
+        end = int(reported_end)
+    if (
+        start is not None
+        and end is not None
+        and 0 <= start < end <= len(text)
+        and text[start:end] == quote
+    ):
+        return quote, start, end, "reported_exact"
+
+    matches: list[int] = []
+    cursor = 0
+    while True:
+        match = text.find(quote, cursor)
+        if match < 0:
+            break
+        matches.append(match)
+        cursor = match + 1
+    if not matches:
+        raise ValueError(f"{label} is not an exact substring of the supplied page")
+    if start is None:
+        if len(matches) != 1:
+            raise ValueError(
+                f"{label} occurs more than once; exact offsets are required to prove provenance"
+            )
+        selected = matches[0]
+        method = "unique_exact_match"
+    else:
+        ranked = sorted(matches, key=lambda candidate: (abs(candidate - start), candidate))
+        if len(ranked) > 1 and abs(ranked[0] - start) == abs(ranked[1] - start):
+            raise ValueError(
+                f"{label} offsets are equidistant from repeated exact quotes; "
+                "return the exact occurrence offsets"
+            )
+        selected = ranked[0]
+        method = "nearest_exact_match"
+    return quote, selected, selected + len(quote), method
+
+
+def _canonical_observation_time(value: Any) -> str | None:
+    if value is None or _is_missing_scalar(value):
+        return None
+    if not isinstance(value, str):
+        raise ValueError("recorded_at must be an ISO-8601 string or null")
+    text = value.strip()
+    if re.fullmatch(r"\d{4}", text):
+        return text
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        try:
+            datetime.strptime(text, "%Y-%m")
+        except ValueError as exc:
+            raise ValueError("recorded_at must be a valid ISO-8601 month") from exc
+        return text
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            datetime.fromisoformat(text)
+        except ValueError as exc:  # pragma: no cover - guarded by datetime
+            raise ValueError("recorded_at must be a valid ISO-8601 date") from exc
+        return text
+    rendered = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(rendered)
+    except ValueError as exc:
+        raise ValueError("recorded_at must be a valid ISO-8601 date or datetime") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def _canonical_time_evidence(value: str) -> str:
+    """Normalize an exact source date quote locally instead of trusting the model."""
+
+    text = value.strip()
+    if re.fullmatch(r"\d{4}", text):
+        return text
+    if re.fullmatch(r"\d{4}[-/]\d{1,2}", text):
+        year, month = (int(part) for part in re.split(r"[-/]", text))
+        if not 1 <= month <= 12:
+            raise ValueError("recorded_at_evidence contains an invalid calendar month")
+        return f"{year:04d}-{month:02d}"
+    numeric_month_year = re.fullmatch(r"(\d{1,2})[-/](\d{4})", text)
+    if numeric_month_year is not None:
+        month, year = (int(part) for part in numeric_month_year.groups())
+        if not 1 <= month <= 12:
+            raise ValueError("recorded_at_evidence contains an invalid calendar month")
+        return f"{year:04d}-{month:02d}"
+    month_year = re.fullmatch(
+        r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"
+        r"Dec(?:ember)?)\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if month_year is not None:
+        parsed_month = datetime.strptime(month_year.group(1)[:3].title(), "%b").month
+        return f"{int(month_year.group(2)):04d}-{parsed_month:02d}"
+    try:
+        parsed = pd.to_datetime(text, errors="raise", utc=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "recorded_at_evidence must itself be a parseable date or datetime quote"
+        ) from exc
+    if isinstance(parsed, pd.DatetimeIndex):
+        if len(parsed) != 1:  # pragma: no cover - scalar input invariant
+            raise ValueError("recorded_at_evidence must contain one date or datetime")
+        parsed = parsed[0]
+    timestamp = pd.Timestamp(parsed)
+    if not re.search(r"\d{1,2}:\d{2}", text):
+        return timestamp.date().isoformat()
+    return timestamp.isoformat().replace("+00:00", "Z")
+
+
+def _validate_page_observations(
+    value: Mapping[str, Any],
+    *,
+    page: Mapping[str, Any],
+    definitions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate values and prove each observation against an exact page quote."""
+
+    rows = value.get("rows")
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+        raise ValueError("page extraction response requires exactly one row object")
+    expected_row_id = int(page["row_id"])
+    try:
+        row_id = int(rows[0].get("row_id"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("page extraction row_id must be the supplied integer") from exc
+    if row_id != expected_row_id:
+        raise ValueError("page extraction returned an unknown row_id")
+    raw_observations = rows[0].get("observations")
+    if not isinstance(raw_observations, list):
+        raise ValueError("page extraction row requires an observations array")
+
+    text = str(page.get("text") or "")
+    page_meta = dict(page.get("page") or {})
+    page_index = int(page_meta.get("page_index"))
+    page_char_start = int(page_meta.get("char_start"))
+    definition_by_name = {str(definition["name"]): definition for definition in definitions}
+    normalized: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+
+    for observation_index, raw in enumerate(raw_observations, start=1):
+        feature_name = ""
+        try:
+            if not isinstance(raw, Mapping):
+                raise ValueError("observation must be an object")
+            feature_name = str(raw.get("feature_name") or "")
+            if feature_name not in definition_by_name:
+                raise ValueError("feature_name is not one of the supplied features")
+            scalar_response = _validate_extraction(
+                {
+                    "rows": [
+                        {
+                            "row_id": row_id,
+                            "values": {feature_name: raw.get("value")},
+                        }
+                    ]
+                },
+                row_ids=[row_id],
+                definitions=[definition_by_name[feature_name]],
+            )
+            scalar = scalar_response["rows"][0]["values"][feature_name]
+            if scalar is None:
+                raise ValueError("a page observation must contain a supported nonmissing value")
+
+            evidence, evidence_start, evidence_end, evidence_offset_resolution = (
+                _exact_quote_span(
+                    text=text,
+                    quote=raw.get("evidence"),
+                    reported_start=raw.get("evidence_start"),
+                    reported_end=raw.get("evidence_end"),
+                    label="evidence",
+                )
+            )
+            recorded_at = _canonical_observation_time(raw.get("recorded_at"))
+            recorded_at_evidence: str | None = None
+            recorded_at_start: int | None = None
+            recorded_at_end: int | None = None
+            recorded_at_offset_resolution: str | None = None
+            if recorded_at is not None:
+                (
+                    recorded_at_evidence,
+                    recorded_at_start,
+                    recorded_at_end,
+                    recorded_at_offset_resolution,
+                ) = _exact_quote_span(
+                    text=text,
+                    quote=raw.get("recorded_at_evidence"),
+                    reported_start=raw.get("recorded_at_start"),
+                    reported_end=raw.get("recorded_at_end"),
+                    label="recorded_at_evidence",
+                )
+                source_recorded_at = _canonical_time_evidence(recorded_at_evidence)
+                if recorded_at != source_recorded_at:
+                    raise ValueError(
+                        "recorded_at does not match its exact recorded_at_evidence quote"
+                    )
+                recorded_at = source_recorded_at
+            elif any(
+                raw.get(key) is not None
+                for key in (
+                    "recorded_at_evidence",
+                    "recorded_at_start",
+                    "recorded_at_end",
+                )
+            ):
+                raise ValueError(
+                    "recorded_at evidence and offsets must be null when recorded_at is null"
+                )
+
+            identity_value = {
+                "row_id": row_id,
+                "feature_name": feature_name,
+                "value": scalar,
+                "source_start": page_char_start + evidence_start,
+                "source_end": page_char_start + evidence_end,
+                "recorded_at": recorded_at,
+            }
+            normalized.append(
+                {
+                    "observation_id": f"observation_{_value_fingerprint(identity_value)[:20]}",
+                    "feature_name": feature_name,
+                    "value": scalar,
+                    "evidence": evidence,
+                    "evidence_start": evidence_start,
+                    "evidence_end": evidence_end,
+                    "source_start": page_char_start + evidence_start,
+                    "source_end": page_char_start + evidence_end,
+                    "page_index": page_index,
+                    "recorded_at": recorded_at,
+                    "recorded_at_evidence": recorded_at_evidence,
+                    "recorded_at_start": recorded_at_start,
+                    "recorded_at_end": recorded_at_end,
+                    "recorded_at_source_start": (
+                        page_char_start + recorded_at_start
+                        if recorded_at_start is not None
+                        else None
+                    ),
+                    "recorded_at_source_end": (
+                        page_char_start + recorded_at_end
+                        if recorded_at_end is not None
+                        else None
+                    ),
+                    "offset_resolution": evidence_offset_resolution,
+                    "recorded_at_offset_resolution": recorded_at_offset_resolution,
+                }
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            issues.append(
+                {
+                    "observation_index": observation_index,
+                    "feature_name": feature_name or None,
+                    "reason": str(exc),
+                    "raw_observation": copy.deepcopy(raw),
+                }
+            )
+
+    by_id = {str(observation["observation_id"]): observation for observation in normalized}
+    normalized_response = {
+        "rows": [
+            {
+                "row_id": row_id,
+                "observations": sorted(
+                    by_id.values(),
+                    key=lambda observation: (
+                        int(observation["source_start"]),
+                        str(observation["feature_name"]),
+                        str(observation["observation_id"]),
+                    ),
+                ),
+            }
+        ]
+    }
+    if issues:
+        raise _PageObservationValidationError(issues=issues, response=normalized_response)
+    return normalized_response
+
+
+def _request_validated_page_observations(
+    *,
+    messages: Sequence[Mapping[str, str]],
+    page: Mapping[str, Any],
+    definitions: Sequence[Mapping[str, Any]],
+    request_json: RequestJSON,
+    audit_dir: Path,
+) -> dict[str, Any]:
+    """Request page observations, retaining valid provenance after exhausted repairs."""
+
+    issue_path = audit_dir / "extraction_issues.json"
+    try:
+        validated = request_json(
+            messages,
+            lambda candidate: _validate_page_observations(
+                candidate,
+                page=page,
+                definitions=definitions,
+            ),
+            request_kind="extraction",
+        )
+        _write_json(
+            issue_path,
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [],
+            },
+        )
+        return validated
+    except (Stage2ResponseValidationError, _PageObservationValidationError) as exc:
+        observation_error = _page_observation_error_from_exception(exc)
+        row_id = int(page["row_id"])
+        if observation_error is not None:
+            events = [
+                {
+                    "failure_kind": "invalid_page_observation_provenance",
+                    "row_id": row_id,
+                    "feature_name": issue.get("feature_name"),
+                    "reason": str(issue.get("reason") or ""),
+                    "observation_index": int(issue.get("observation_index") or 0),
+                }
+                for issue in observation_error.issues
+            ]
+            _write_json(
+                audit_dir / "invalid_page_observation_repair.json",
+                {
+                    "schema_version": "stage2_invalid_page_observation_repair_v1",
+                    "resolution": "retain_valid_drop_unverifiable",
+                    "original_validation_error": str(exc),
+                    "issues": [dict(issue) for issue in observation_error.issues],
+                },
+            )
+            _write_json(
+                issue_path,
+                {
+                    "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                    "completed_at": _now(),
+                    "events": events,
+                },
+            )
+            LOGGER.warning(
+                "Stage 2 page extraction retained valid observations and dropped %s "
+                "unverifiable observation(s) for row %s",
+                len(observation_error.issues),
+                row_id,
+            )
+            return copy.deepcopy(observation_error.response)
+
+        conservative = {"rows": [{"row_id": row_id, "observations": []}]}
+        _write_json(
+            audit_dir / "extraction_failure.json",
+            {
+                "schema_version": "stage2_page_observation_failure_v1",
+                "resolution": "conservative_no_observations",
+                "failed_at": _now(),
+                "row_id": row_id,
+                "feature_names": [str(definition["name"]) for definition in definitions],
+                "validation_error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        _write_json(
+            issue_path,
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [
+                    {
+                        "failure_kind": "structural_page_observation_failure",
+                        "row_id": row_id,
+                        "feature_name": None,
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+                ],
+            },
+        )
+        LOGGER.warning(
+            "Stage 2 page observation response remained structurally invalid; "
+            "using no observations for row %s (%s: %s)",
+            row_id,
+            type(exc).__name__,
+            exc,
+        )
+        return conservative
+
+
+def _observation_value_key(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _observation_time_sort_value(observation: Mapping[str, Any]) -> int | None:
+    recorded_at = observation.get("recorded_at")
+    if not recorded_at:
+        return None
+    timestamp = pd.Timestamp(str(recorded_at))
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return int(timestamp.value)
+
+
+def _select_temporal_observation(
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    latest: bool,
+) -> tuple[dict[str, Any], str]:
+    dated = [
+        (observation, _observation_time_sort_value(observation))
+        for observation in observations
+        if observation.get("recorded_at")
+    ]
+    if dated:
+        if latest:
+            selected, _timestamp = max(
+                dated,
+                key=lambda item: (
+                    int(item[1]),
+                    int(item[0]["source_end"]),
+                    str(item[0]["observation_id"]),
+                ),
+            )
+        else:
+            selected, _timestamp = min(
+                dated,
+                key=lambda item: (
+                    int(item[1]),
+                    int(item[0]["source_start"]),
+                    str(item[0]["observation_id"]),
+                ),
+            )
+        return dict(selected), "verified_recorded_at"
+    selected = (max if latest else min)(
+        observations,
+        key=lambda observation: (
+            int(observation["source_end"] if latest else observation["source_start"]),
+            str(observation["observation_id"]),
+        ),
+    )
+    return dict(selected), "absolute_source_order"
+
+
+def _resolve_feature_observations(
+    *,
+    definition: Mapping[str, Any],
+    observations: Sequence[Mapping[str, Any]],
+) -> tuple[Any, dict[str, Any]]:
+    policy = _resolved_conflict_resolution(definition)
+    unique = {
+        str(observation["observation_id"]): dict(observation) for observation in observations
+    }
+    ordered = sorted(
+        unique.values(),
+        key=lambda observation: (
+            int(observation["source_start"]),
+            int(observation["source_end"]),
+            str(observation["observation_id"]),
+        ),
+    )
+    decision: dict[str, Any] = {
+        "feature_name": str(definition["name"]),
+        "policy": policy,
+        "observation_count": len(ordered),
+        "distinct_value_count": len(
+            {_observation_value_key(observation.get("value")) for observation in ordered}
+        ),
+        "observations": ordered,
+        "selected_observation_id": None,
+        "resolution": "no_observations",
+        "value": None,
+    }
+    if not ordered:
+        return None, decision
+
+    values_by_key: dict[str, list[dict[str, Any]]] = {}
+    for observation in ordered:
+        values_by_key.setdefault(_observation_value_key(observation["value"]), []).append(
+            observation
+        )
+    if len(values_by_key) == 1:
+        selected, basis = _select_temporal_observation(ordered, latest=True)
+        decision.update(
+            {
+                "selected_observation_id": selected["observation_id"],
+                "resolution": "unanimous_value",
+                "selection_basis": basis,
+                "value": selected["value"],
+            }
+        )
+        return selected["value"], decision
+
+    strategy = str(policy["strategy"])
+    selected: dict[str, Any] | None = None
+    basis = ""
+    if strategy in {"latest", "earliest"}:
+        selected, basis = _select_temporal_observation(
+            ordered,
+            latest=strategy == "latest",
+        )
+    elif strategy in {"maximum", "minimum"}:
+        numeric = [
+            observation
+            for observation in ordered
+            if isinstance(observation.get("value"), (int, float))
+            and not isinstance(observation.get("value"), bool)
+        ]
+        if numeric:
+            target_value = (max if strategy == "maximum" else min)(
+                float(observation["value"]) for observation in numeric
+            )
+            extrema = [
+                observation
+                for observation in numeric
+                if float(observation["value"]) == target_value
+            ]
+            selected, temporal_basis = _select_temporal_observation(extrema, latest=True)
+            basis = f"{strategy}_numeric_then_{temporal_basis}"
+    elif strategy == "mode":
+        largest_count = max(len(group) for group in values_by_key.values())
+        modal = [
+            observation
+            for group in values_by_key.values()
+            if len(group) == largest_count
+            for observation in group
+        ]
+        selected, temporal_basis = _select_temporal_observation(modal, latest=True)
+        basis = f"mode_then_{temporal_basis}"
+    elif strategy == "any_positive":
+        positive = str(policy["positive_category"])
+        matching = [observation for observation in ordered if observation["value"] == positive]
+        selected, temporal_basis = _select_temporal_observation(
+            matching or ordered,
+            latest=True,
+        )
+        basis = (
+            f"any_positive_then_{temporal_basis}"
+            if matching
+            else f"no_positive_then_{temporal_basis}"
+        )
+    elif strategy == "single_or_null":
+        basis = "conflicting_values_are_null"
+
+    if selected is None:
+        decision.update(
+            {
+                "resolution": "conflict_null",
+                "selection_basis": basis or "no_valid_deterministic_selection",
+            }
+        )
+        return None, decision
+    decision.update(
+        {
+            "selected_observation_id": selected["observation_id"],
+            "resolution": "selected_by_policy",
+            "selection_basis": basis,
+            "value": selected["value"],
+        }
+    )
+    return selected["value"], decision
+
+
+def _resolve_page_observations(
+    *,
+    definitions: Sequence[Mapping[str, Any]],
+    page_results: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    observations_by_feature: dict[str, list[dict[str, Any]]] = {
+        str(definition["name"]): [] for definition in definitions
+    }
+    for page_result in page_results:
+        for observation in page_result.get("observations") or []:
+            feature_name = str(observation.get("feature_name") or "")
+            if feature_name not in observations_by_feature:
+                raise ValueError("page result contains an observation for an unknown feature")
+            observations_by_feature[feature_name].append(dict(observation))
+
+    values: dict[str, Any] = {}
+    decisions: dict[str, Any] = {}
+    for definition in definitions:
+        feature_name = str(definition["name"])
+        value, decision = _resolve_feature_observations(
+            definition=definition,
+            observations=observations_by_feature[feature_name],
+        )
+        values[feature_name] = value
+        decisions[feature_name] = decision
+    return values, decisions
 
 
 def _partition_rows_for_prompt(
@@ -1331,6 +2776,28 @@ def _partition_rows_for_prompt(
         else:
             batches.append([row])
     return batches, oversized
+
+
+def _preferred_lossless_page_end(source: str, *, start: int, hard_end: int) -> tuple[int, str]:
+    """Prefer a nearby clinical-note or text boundary without dropping characters."""
+
+    if hard_end >= len(source):
+        return len(source), "document_end"
+    width = hard_end - start
+    if width <= 1:
+        return hard_end, "hard_character_limit"
+    minimum = start + max(1, int(width * 0.8))
+    for separator, label in (
+        ("\n\n<new_note>\n\n", "new_note_separator"),
+        ("\n\n", "paragraph_boundary"),
+        ("\n", "line_boundary"),
+        (". ", "sentence_boundary"),
+        (" ", "word_boundary"),
+    ):
+        position = source.rfind(separator, minimum, hard_end)
+        if position >= minimum:
+            return position + len(separator), label
+    return hard_end, "hard_character_limit"
 
 
 def _lossless_extraction_pages(
@@ -1368,9 +2835,9 @@ def _lossless_extraction_pages(
             }
             prompt_sizes = (
                 _prompt_chars(
-                    _extraction_prompt(
+                    _page_extraction_prompt(
                         definitions=batch_definitions,
-                        rows=[candidate],
+                        row=candidate,
                     )
                 )
                 for batch_definitions in definition_batches
@@ -1386,11 +2853,409 @@ def _lossless_extraction_pages(
                 "one source character; increase stage2.extraction_max_prompt_chars or "
                 "shorten the feature definitions"
             )
+        preferred_end, _boundary = _preferred_lossless_page_end(
+            source,
+            start=cursor,
+            hard_end=int(best["page"]["char_end"]),
+        )
+        if preferred_end != int(best["page"]["char_end"]):
+            best = {
+                "row_id": row_id,
+                "text": source[cursor:preferred_end],
+                "page": {
+                    "page_index": len(pages) + 1,
+                    "char_start": cursor,
+                    "char_end": preferred_end,
+                    "document_chars": len(source),
+                },
+            }
         pages.append(best)
         cursor = int(best["page"]["char_end"])
     if "".join(str(page["text"]) for page in pages) != source:
         raise RuntimeError("Stage 2 lossless page planner changed patient text")
     return pages
+
+
+def _serial_extraction_required(
+    *,
+    row: Mapping[str, Any],
+    definitions: Sequence[Mapping[str, Any]],
+    tokenizer: Any,
+    chunk_size_tokens: int,
+    input_token_budget: int,
+    max_prompt_chars: int,
+) -> bool:
+    """Return whether one patient/feature slice needs an ordered serial pass."""
+
+    text = str(row.get("text") or "")
+    messages = _extraction_prompt(definitions=definitions, rows=[row])
+    return (
+        _text_token_count(tokenizer, text) > int(chunk_size_tokens)
+        or prompt_token_count(tokenizer, messages) > int(input_token_budget)
+        or _prompt_chars(messages) > int(max_prompt_chars)
+    )
+
+
+def _next_serial_extraction_chunk(
+    *,
+    source: str,
+    cursor: int,
+    row_id: int,
+    definitions: Sequence[Mapping[str, Any]],
+    prior_values: Mapping[str, Any],
+    prior_feature_state: Mapping[str, Any],
+    chunk_index: int,
+    tokenizer: Any,
+    chunk_size_tokens: int,
+    input_token_budget: int,
+    max_prompt_chars: int,
+) -> dict[str, Any]:
+    """Find the largest exact contiguous source prefix inside every prompt cap."""
+
+    def candidate(end: int) -> dict[str, Any]:
+        chunk_text = source[cursor:end]
+        messages = _serial_extraction_prompt(
+            definitions=definitions,
+            row_id=row_id,
+            chunk_text=chunk_text,
+            prior_values=prior_values,
+            prior_feature_state=prior_feature_state,
+            chunk_index=chunk_index,
+            char_start=cursor,
+            char_end=end,
+            document_chars=len(source),
+        )
+        return {
+            "text": chunk_text,
+            "char_start": int(cursor),
+            "char_end": int(end),
+            "source_tokens": _text_token_count(tokenizer, chunk_text),
+            "prompt_tokens": prompt_token_count(tokenizer, messages),
+            "prompt_chars": _prompt_chars(messages),
+            "messages": messages,
+        }
+
+    def fits(value: Mapping[str, Any]) -> bool:
+        return (
+            int(value["source_tokens"]) <= int(chunk_size_tokens)
+            and int(value["prompt_tokens"]) <= int(input_token_budget)
+            and int(value["prompt_chars"]) <= int(max_prompt_chars)
+        )
+
+    low = int(cursor) + 1
+    high = len(source)
+    best: dict[str, Any] | None = None
+    while low <= high:
+        end = (low + high) // 2
+        value = candidate(end)
+        if fits(value):
+            best = value
+            low = end + 1
+        else:
+            high = end - 1
+    if best is None:
+        empty = candidate(cursor)
+        raise ValueError(
+            "Stage 2 serial extraction prompt leaves no room for one source character: "
+            f"empty_prompt_tokens={empty['prompt_tokens']}, "
+            f"input_token_budget={input_token_budget}, "
+            f"empty_prompt_chars={empty['prompt_chars']}, "
+            f"max_prompt_chars={max_prompt_chars}. Reduce the feature batch size or "
+            "extraction_max_tokens, or increase the configured context window."
+        )
+
+    preferred_end, boundary = _preferred_lossless_page_end(
+        source,
+        start=cursor,
+        hard_end=int(best["char_end"]),
+    )
+    if preferred_end != int(best["char_end"]):
+        preferred = candidate(preferred_end)
+        if fits(preferred):
+            best = preferred
+        else:  # Token counts can very rarely be non-monotonic at a BPE boundary.
+            boundary = "hard_token_limit"
+    else:
+        boundary = "document_end" if preferred_end == len(source) else "hard_token_limit"
+    best["boundary"] = boundary
+    return best
+
+
+def _serial_extract_feature_batch(
+    *,
+    parent_dir: Path,
+    row: Mapping[str, Any],
+    definitions: Sequence[Mapping[str, Any]],
+    request_json: RequestJSON,
+    request_identity: Mapping[str, Any],
+    tokenizer: Any,
+    chunk_size_tokens: int,
+    context_window_tokens: int,
+    max_output_tokens: int,
+    context_margin_tokens: int,
+    max_prompt_chars: int,
+) -> dict[str, Any]:
+    """Process one patient's feature slice serially with resumable carried state."""
+
+    input_token_budget = (
+        int(context_window_tokens)
+        - int(max_output_tokens)
+        - int(context_margin_tokens)
+    )
+    if input_token_budget < 1:
+        raise ValueError(
+            "Stage 2 extraction context window leaves no input-token budget after "
+            "reserving the configured output ceiling and safety margin"
+        )
+    row_id = int(row["row_id"])
+    source = str(row.get("text") or "")
+    feature_names = [str(definition["name"]) for definition in definitions]
+    prior_values: dict[str, Any] = {name: None for name in feature_names}
+    prior_feature_state: dict[str, str | None] = {
+        name: None for name in feature_names
+    }
+    serial_input = {
+        "schema_version": SERIAL_EXTRACTION_MANIFEST_SCHEMA_VERSION,
+        "request_identity": dict(request_identity),
+        "definitions": _prompt_feature_definitions(definitions),
+        "row_id": row_id,
+        "document_chars": len(source),
+        "document_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "chunk_size_tokens": int(chunk_size_tokens),
+        "context_window_tokens": int(context_window_tokens),
+        "max_output_tokens": int(max_output_tokens),
+        "context_margin_tokens": int(context_margin_tokens),
+        "input_token_budget": int(input_token_budget),
+        "max_prompt_chars": int(max_prompt_chars),
+    }
+    serial_fingerprint = _value_fingerprint(serial_input)
+    if not source:
+        raise ValueError(
+            "an empty Stage 2 record exceeded the one-shot token envelope before "
+            "clinical text was added; reduce the feature batch size or extraction output cap"
+        )
+
+    cursor = 0
+    chunk_index = 1
+    chunk_manifest: list[dict[str, Any]] = []
+    while cursor < len(source):
+        planned = _next_serial_extraction_chunk(
+            source=source,
+            cursor=cursor,
+            row_id=row_id,
+            definitions=definitions,
+            prior_values=prior_values,
+            prior_feature_state=prior_feature_state,
+            chunk_index=chunk_index,
+            tokenizer=tokenizer,
+            chunk_size_tokens=chunk_size_tokens,
+            input_token_budget=input_token_budget,
+            max_prompt_chars=max_prompt_chars,
+        )
+        chunk_dir = parent_dir / "serial_chunks" / f"chunk_{chunk_index:05d}"
+        result_path = chunk_dir / "result.json"
+        complete_path = chunk_dir / "complete.json"
+        input_path = chunk_dir / "input.json"
+        ontology_audit_path = chunk_dir / "category_ontology_repair.json"
+        failure_path = chunk_dir / "extraction_failure.json"
+        if any(
+            _records_infrastructure_failure(chunk_dir / name)
+            for name in (
+                "extraction_failure.json",
+                "category_ontology_repair.json",
+                "fallback.json",
+            )
+        ):
+            _supersede_infrastructure_checkpoint(chunk_dir)
+        chunk_input = {
+            "schema_version": SERIAL_EXTRACTION_CHUNK_CHECKPOINT_SCHEMA_VERSION,
+            "serial_input_fingerprint": serial_fingerprint,
+            "request_identity": dict(request_identity),
+            "definitions": _prompt_feature_definitions(definitions),
+            "row_id": row_id,
+            "prior_values": copy.deepcopy(prior_values),
+            "prior_feature_state": copy.deepcopy(prior_feature_state),
+            "chunk": {
+                "chunk_index": chunk_index,
+                "char_start": int(planned["char_start"]),
+                "char_end": int(planned["char_end"]),
+                "document_chars": len(source),
+                "source_tokens": int(planned["source_tokens"]),
+                "prompt_tokens": int(planned["prompt_tokens"]),
+                "prompt_chars": int(planned["prompt_chars"]),
+                "boundary": str(planned["boundary"]),
+                "text": str(planned["text"]),
+            },
+        }
+        input_fingerprint = _value_fingerprint(chunk_input)
+        stale_audit = _stale_category_ontology_audit(ontology_audit_path)
+        result: dict[str, Any] | None = None
+        if complete_path.is_file() and result_path.is_file() and stale_audit is None:
+            try:
+                completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                cached = json.loads(result_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(completion, Mapping)
+                    and completion.get("schema_version")
+                    == SERIAL_EXTRACTION_CHUNK_CHECKPOINT_SCHEMA_VERSION
+                    and completion.get("input_fingerprint") == input_fingerprint
+                    and isinstance(cached, Mapping)
+                ):
+                    result = _validate_extraction(
+                        cached,
+                        row_ids=[row_id],
+                        definitions=definitions,
+                    )
+                    result = _validate_serial_extraction(
+                        result,
+                        row_id=row_id,
+                        definitions=definitions,
+                    )
+                    _ensure_extraction_issue_audit(chunk_dir)
+            except (
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                result = None
+            if result is None:
+                LOGGER.info("rerun incompatible Stage 2 serial chunk: %s", chunk_dir)
+        if result is None:
+            same_incomplete_input = False
+            if input_path.is_file():
+                try:
+                    prior_input = json.loads(input_path.read_text(encoding="utf-8"))
+                    same_incomplete_input = (
+                        isinstance(prior_input, Mapping)
+                        and prior_input.get("input_fingerprint") == input_fingerprint
+                    )
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            if not same_incomplete_input:
+                for stale_name in (
+                    "category_ontology_repair.json",
+                    "extraction_failure.json",
+                    "extraction_issues.json",
+                    "invalid_feature_value_repair.json",
+                    "pending_category_ontology.json",
+                ):
+                    (chunk_dir / stale_name).unlink(missing_ok=True)
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(input_path, {**chunk_input, "input_fingerprint": input_fingerprint})
+            result = _request_validated_extraction(
+                messages=planned["messages"],
+                row_ids=[row_id],
+                definitions=definitions,
+                request_json=request_json,
+                ontology_audit_path=ontology_audit_path,
+                validate_response=lambda value: _validate_serial_extraction(
+                    value,
+                    row_id=row_id,
+                    definitions=definitions,
+                ),
+            )
+            if failure_path.is_file():
+                # A malformed later response must not erase validated state from
+                # earlier chunks. The failure remains in its audit ledger.
+                result = _validate_serial_extraction(
+                    {
+                        "rows": [
+                            {
+                                "row_id": row_id,
+                                "values": prior_values,
+                                "carry_forward_state": prior_feature_state,
+                            }
+                        ]
+                    },
+                    row_id=row_id,
+                    definitions=definitions,
+                )
+            _write_json(result_path, result)
+            _supersede_stale_category_ontology_audit(
+                ontology_audit_path,
+                previous=stale_audit,
+            )
+            _write_json(
+                complete_path,
+                {
+                    "status": "complete",
+                    "schema_version": SERIAL_EXTRACTION_CHUNK_CHECKPOINT_SCHEMA_VERSION,
+                    "input_fingerprint": input_fingerprint,
+                    "completed_at": _now(),
+                    "row_id": row_id,
+                    "chunk_index": chunk_index,
+                    "char_start": int(planned["char_start"]),
+                    "char_end": int(planned["char_end"]),
+                    "source_tokens": int(planned["source_tokens"]),
+                    "prompt_tokens": int(planned["prompt_tokens"]),
+                    "structural_failure_carried_prior_state": failure_path.is_file(),
+                },
+            )
+        prior_values = dict(result["rows"][0]["values"])
+        prior_feature_state = dict(result["rows"][0]["carry_forward_state"])
+        chunk_manifest.append(
+            {
+                "chunk_index": chunk_index,
+                "char_start": int(planned["char_start"]),
+                "char_end": int(planned["char_end"]),
+                "source_tokens": int(planned["source_tokens"]),
+                "prompt_tokens": int(planned["prompt_tokens"]),
+                "boundary": str(planned["boundary"]),
+                "input_fingerprint": input_fingerprint,
+            }
+        )
+        cursor = int(planned["char_end"])
+        chunk_index += 1
+
+    result = _validate_extraction(
+        {"rows": [{"row_id": row_id, "values": prior_values}]},
+        row_ids=[row_id],
+        definitions=definitions,
+    )
+    lossless_source_coverage = (
+        bool(chunk_manifest)
+        and int(chunk_manifest[0]["char_start"]) == 0
+        and int(chunk_manifest[-1]["char_end"]) == len(source)
+        and all(
+            int(left["char_end"]) == int(right["char_start"])
+            for left, right in zip(chunk_manifest, chunk_manifest[1:])
+        )
+    )
+    if not lossless_source_coverage:  # pragma: no cover - planner invariant
+        raise RuntimeError("Stage 2 serial extraction did not cover the source contiguously")
+    _write_json(
+        parent_dir / "serial_extraction.json",
+        {
+            **serial_input,
+            "input_fingerprint": serial_fingerprint,
+            "chunks": chunk_manifest,
+            "lossless_source_coverage": lossless_source_coverage,
+        },
+    )
+    _write_json(
+        parent_dir / "serial_complete.json",
+        {
+            "status": "complete",
+            "schema_version": SERIAL_EXTRACTION_MANIFEST_SCHEMA_VERSION,
+            "input_fingerprint": serial_fingerprint,
+            "completed_at": _now(),
+            "row_id": row_id,
+            "chunks": len(chunk_manifest),
+            "document_chars": len(source),
+        },
+    )
+    _write_json(
+        parent_dir / "extraction_issues.json",
+        {
+            "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+            "completed_at": _now(),
+            "events": [],
+            "delegated_to_serial_chunks": True,
+        },
+    )
+    return result
 
 
 def _summarize_extraction_failures(
@@ -1503,10 +3368,43 @@ def extract_rows(
     workers: int,
     max_prompt_chars: int,
     feature_batch_size: int = DEFAULT_EXTRACTION_FEATURE_BATCH_SIZE,
+    request_identity: Mapping[str, Any] | None = None,
+    tokenizer: Any | None = None,
+    chunk_size_tokens: int = DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS,
+    context_window_tokens: int = DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS,
+    max_output_tokens: int = DEFAULT_EXTRACTION_MAX_TOKENS,
+    context_margin_tokens: int = DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS,
 ) -> pd.DataFrame:
-    """Extract one patient per prompt in bounded feature slices, then merge them."""
+    """Extract one patient at a time, serializing long records across token chunks."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    infrastructure_affected = _infrastructure_affected_directories(output_dir)
+    if infrastructure_affected:
+        LOGGER.warning(
+            "superseding legacy Stage 2 infrastructure-failure checkpoints "
+            "directories=%s root=%s",
+            len(infrastructure_affected),
+            output_dir,
+        )
+        _supersede_infrastructure_checkpoint(output_dir)
+    cancellation = threading.Event()
+
+    def guarded_request_json(
+        messages: Sequence[Mapping[str, str]],
+        validate: Callable[[Mapping[str, Any]], dict[str, Any]],
+        *,
+        request_kind: str = "interpretation",
+    ) -> dict[str, Any]:
+        if cancellation.is_set():
+            raise _ExtractionCancelledError(
+                "Stage 2 extraction cancelled after a sibling task failed"
+            )
+        return request_json(
+            messages,
+            validate,
+            request_kind=request_kind,
+        )
+    extraction_request_identity = dict(request_identity or {})
     feature_names = [str(feature["name"]) for feature in definitions]
     definition_batches = _partition_feature_definitions(
         definitions,
@@ -1542,11 +3440,29 @@ def extract_rows(
         for row_id in row_ids
     ]
     extraction_definitions = _prompt_feature_definitions(definitions)
-    batches, oversized_rows = _partition_rows_for_prompt(
-        request_rows,
-        max_prompt_chars=int(max_prompt_chars),
-        definition_batches=definition_batches,
-    )
+    page_extraction_definitions = _page_prompt_feature_definitions(definitions)
+    if tokenizer is not None:
+        if int(chunk_size_tokens) < 1:
+            raise ValueError("chunk_size_tokens must be positive")
+        if int(context_margin_tokens) < 0:
+            raise ValueError("context_margin_tokens must be nonnegative")
+        if int(context_window_tokens) - int(max_output_tokens) - int(
+            context_margin_tokens
+        ) < 1:
+            raise ValueError(
+                "serial extraction context window leaves no input-token budget"
+            )
+        # Token-aware serial extraction supersedes the older character-page
+        # fallback. Every patient remains one independent outer task; chunks
+        # within that task execute strictly in source order.
+        batches = [[row] for row in request_rows]
+        oversized_rows: list[Mapping[str, Any]] = []
+    else:
+        batches, oversized_rows = _partition_rows_for_prompt(
+            request_rows,
+            max_prompt_chars=int(max_prompt_chars),
+            definition_batches=definition_batches,
+        )
 
     page_requests: list[dict[str, Any]] = []
     for row in oversized_rows:
@@ -1576,6 +3492,9 @@ def extract_rows(
     singleton_checkpoints: dict[int, list[dict[str, Any]]] = {}
     for saved_dir in sorted((output_dir / "batches").glob("batch_*")):
         if not saved_dir.is_dir() or saved_dir.is_symlink():
+            continue
+        if saved_dir in infrastructure_affected:
+            _supersede_infrastructure_checkpoint(saved_dir)
             continue
         saved_complete_path = saved_dir / "complete.json"
         saved_result_path = saved_dir / "result.json"
@@ -1645,12 +3564,15 @@ def extract_rows(
             start=1,
         ):
             feature_dir = parent_dir / "feature_batches" / f"batch_{feature_batch_index:05d}"
+            if feature_dir in infrastructure_affected:
+                _supersede_infrastructure_checkpoint(feature_dir)
             result_path = feature_dir / "result.json"
             complete_path = feature_dir / "complete.json"
             ontology_audit_path = feature_dir / "category_ontology_repair.json"
             batch_input = {
                 "schema_version": EXTRACTION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION,
                 "parent_schema_version": parent_schema_version,
+                "request_identity": extraction_request_identity,
                 "definitions": _prompt_feature_definitions(batch_definitions),
                 "row": dict(row),
             }
@@ -1698,21 +3620,48 @@ def extract_rows(
                     feature_dir / "input.json",
                     {**batch_input, "input_fingerprint": input_fingerprint},
                 )
-                messages = _extraction_prompt(
+                use_serial = tokenizer is not None and _serial_extraction_required(
+                    row=row,
                     definitions=batch_definitions,
-                    rows=[row],
+                    tokenizer=tokenizer,
+                    chunk_size_tokens=int(chunk_size_tokens),
+                    input_token_budget=(
+                        int(context_window_tokens)
+                        - int(max_output_tokens)
+                        - int(context_margin_tokens)
+                    ),
+                    max_prompt_chars=int(max_prompt_chars),
                 )
-                if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
-                    raise RuntimeError(
-                        "Stage 2 extraction planner emitted an oversized feature batch"
+                if use_serial:
+                    result = _serial_extract_feature_batch(
+                        parent_dir=feature_dir,
+                        row=row,
+                        definitions=batch_definitions,
+                        request_json=guarded_request_json,
+                        request_identity=extraction_request_identity,
+                        tokenizer=tokenizer,
+                        chunk_size_tokens=int(chunk_size_tokens),
+                        context_window_tokens=int(context_window_tokens),
+                        max_output_tokens=int(max_output_tokens),
+                        context_margin_tokens=int(context_margin_tokens),
+                        max_prompt_chars=int(max_prompt_chars),
                     )
-                result = _request_validated_extraction(
-                    messages=messages,
-                    row_ids=[row_id],
-                    definitions=batch_definitions,
-                    request_json=request_json,
-                    ontology_audit_path=ontology_audit_path,
-                )
+                else:
+                    messages = _extraction_prompt(
+                        definitions=batch_definitions,
+                        rows=[row],
+                    )
+                    if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+                        raise RuntimeError(
+                            "Stage 2 extraction planner emitted an oversized feature batch"
+                        )
+                    result = _request_validated_extraction(
+                        messages=messages,
+                        row_ids=[row_id],
+                        definitions=batch_definitions,
+                        request_json=guarded_request_json,
+                        ontology_audit_path=ontology_audit_path,
+                    )
                 _write_json(result_path, result)
                 _supersede_stale_category_ontology_audit(
                     ontology_audit_path,
@@ -1750,10 +3699,126 @@ def extract_rows(
         )
         return merged
 
+    def request_page_feature_batches(
+        *,
+        parent_dir: Path,
+        page: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Extract provenance observations for each feature slice of one page."""
+
+        if len(definition_batches) < 2:  # pragma: no cover - caller invariant
+            raise RuntimeError("page feature batching requires multiple feature batches")
+        row_id = int(page["row_id"])
+        merged_observations: list[dict[str, Any]] = []
+        for feature_batch_index, batch_definitions in enumerate(
+            definition_batches,
+            start=1,
+        ):
+            feature_dir = parent_dir / "feature_batches" / f"batch_{feature_batch_index:05d}"
+            if feature_dir in infrastructure_affected:
+                _supersede_infrastructure_checkpoint(feature_dir)
+            result_path = feature_dir / "result.json"
+            complete_path = feature_dir / "complete.json"
+            batch_input = {
+                "schema_version": PAGE_OBSERVATION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION,
+                "parent_schema_version": PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                "request_identity": extraction_request_identity,
+                "definitions": _page_prompt_feature_definitions(batch_definitions),
+                "page": dict(page),
+            }
+            input_fingerprint = _value_fingerprint(batch_input)
+            result: dict[str, Any] | None = None
+            if complete_path.is_file() and result_path.is_file():
+                try:
+                    completion = json.loads(complete_path.read_text(encoding="utf-8"))
+                    cached = json.loads(result_path.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(completion, Mapping)
+                        and completion.get("schema_version")
+                        == PAGE_OBSERVATION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION
+                        and completion.get("input_fingerprint") == input_fingerprint
+                        and isinstance(cached, Mapping)
+                    ):
+                        result = _validate_page_observations(
+                            cached,
+                            page=page,
+                            definitions=batch_definitions,
+                        )
+                        _ensure_extraction_issue_audit(feature_dir)
+                except (
+                    KeyError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    result = None
+                if result is None:
+                    LOGGER.info(
+                        "rerun incompatible Stage 2 page observation feature batch: %s",
+                        feature_dir,
+                    )
+            if result is None:
+                feature_dir.mkdir(parents=True, exist_ok=True)
+                _write_json(
+                    feature_dir / "input.json",
+                    {**batch_input, "input_fingerprint": input_fingerprint},
+                )
+                messages = _page_extraction_prompt(
+                    definitions=batch_definitions,
+                    row=page,
+                )
+                if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+                    raise RuntimeError(
+                        "Stage 2 page observation planner emitted an oversized feature batch"
+                    )
+                result = _request_validated_page_observations(
+                    messages=messages,
+                    page=page,
+                    definitions=batch_definitions,
+                    request_json=guarded_request_json,
+                    audit_dir=feature_dir,
+                )
+                _write_json(result_path, result)
+                _write_json(
+                    complete_path,
+                    {
+                        "status": "complete",
+                        "schema_version": (
+                            PAGE_OBSERVATION_FEATURE_BATCH_CHECKPOINT_SCHEMA_VERSION
+                        ),
+                        "input_fingerprint": input_fingerprint,
+                        "completed_at": _now(),
+                        "row_id": row_id,
+                        "features": len(batch_definitions),
+                        "feature_batch": feature_batch_index,
+                        "observations": len(result["rows"][0]["observations"]),
+                    },
+                )
+            merged_observations.extend(result["rows"][0]["observations"])
+
+        merged = _validate_page_observations(
+            {"rows": [{"row_id": row_id, "observations": merged_observations}]},
+            page=page,
+            definitions=definitions,
+        )
+        _write_json(
+            parent_dir / "extraction_issues.json",
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [],
+                "delegated_to_page_feature_batches": True,
+            },
+        )
+        return merged
+
     def run_batch(index: int, batch: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         if len(batch) != 1:  # pragma: no cover - enforced by the planner
             raise RuntimeError("Stage 2 extraction planner created a multi-patient batch")
         batch_dir = output_dir / "batches" / f"batch_{index:05d}"
+        if batch_dir in infrastructure_affected:
+            _supersede_infrastructure_checkpoint(batch_dir)
         result_path = batch_dir / "result.json"
         complete_path = batch_dir / "complete.json"
         ontology_audit_path = batch_dir / "category_ontology_repair.json"
@@ -1761,6 +3826,7 @@ def extract_rows(
         input_fingerprint = _value_fingerprint(
             {
                 "schema_version": EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                "request_identity": extraction_request_identity,
                 "definitions": extraction_definitions,
                 "rows": list(batch),
             }
@@ -1860,19 +3926,46 @@ def extract_rows(
         batch_dir.mkdir(parents=True, exist_ok=True)
         _write_json(batch_dir / "row_ids.json", row_ids)
         if len(definition_batches) == 1:
-            messages = _extraction_prompt(
+            use_serial = tokenizer is not None and _serial_extraction_required(
+                row=batch[0],
                 definitions=definitions,
-                rows=batch,
+                tokenizer=tokenizer,
+                chunk_size_tokens=int(chunk_size_tokens),
+                input_token_budget=(
+                    int(context_window_tokens)
+                    - int(max_output_tokens)
+                    - int(context_margin_tokens)
+                ),
+                max_prompt_chars=int(max_prompt_chars),
             )
-            result = _request_validated_extraction(
-                messages=messages,
-                row_ids=row_ids,
-                definitions=definitions,
-                request_json=request_json,
-                ontology_audit_path=ontology_audit_path,
-            )
-            if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
-                raise RuntimeError("Stage 2 extraction planner emitted an oversized batch")
+            if use_serial:
+                result = _serial_extract_feature_batch(
+                    parent_dir=batch_dir,
+                    row=batch[0],
+                    definitions=definitions,
+                    request_json=guarded_request_json,
+                    request_identity=extraction_request_identity,
+                    tokenizer=tokenizer,
+                    chunk_size_tokens=int(chunk_size_tokens),
+                    context_window_tokens=int(context_window_tokens),
+                    max_output_tokens=int(max_output_tokens),
+                    context_margin_tokens=int(context_margin_tokens),
+                    max_prompt_chars=int(max_prompt_chars),
+                )
+            else:
+                messages = _extraction_prompt(
+                    definitions=definitions,
+                    rows=batch,
+                )
+                result = _request_validated_extraction(
+                    messages=messages,
+                    row_ids=row_ids,
+                    definitions=definitions,
+                    request_json=guarded_request_json,
+                    ontology_audit_path=ontology_audit_path,
+                )
+                if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
+                    raise RuntimeError("Stage 2 extraction planner emitted an oversized batch")
         else:
             result = request_feature_batches(
                 parent_dir=batch_dir,
@@ -1904,14 +3997,17 @@ def extract_rows(
         row_id = int(page["row_id"])
         page_index = int(page_meta["page_index"])
         page_dir = output_dir / "pages" / f"row_{row_id:08d}" / f"page_{page_index:05d}"
+        if page_dir in infrastructure_affected:
+            _supersede_infrastructure_checkpoint(page_dir)
         result_path = page_dir / "result.json"
         complete_path = page_dir / "complete.json"
         ontology_audit_path = page_dir / "category_ontology_repair.json"
         input_fingerprint = _value_fingerprint(
             {
                 "schema_version": PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
-                "definitions": extraction_definitions,
-                "row": dict(page),
+                "request_identity": extraction_request_identity,
+                "definitions": page_extraction_definitions,
+                "page": dict(page),
             }
         )
         stale_audit = _stale_category_ontology_audit(ontology_audit_path)
@@ -1923,9 +4019,9 @@ def extract_rows(
                     completion.get("schema_version") == PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION
                     and completion.get("input_fingerprint") == input_fingerprint
                 ):
-                    validated = _validate_extraction(
+                    validated = _validate_page_observations(
                         stored,
-                        row_ids=[row_id],
+                        page=page,
                         definitions=definitions,
                     )
                     _ensure_extraction_issue_audit(page_dir)
@@ -1938,24 +4034,25 @@ def extract_rows(
         page_dir.mkdir(parents=True, exist_ok=True)
         _write_json(page_dir / "page.json", page_meta)
         if len(definition_batches) == 1:
-            messages = _extraction_prompt(
+            messages = _page_extraction_prompt(
                 definitions=definitions,
-                rows=[page],
+                row=page,
             )
             if _prompt_chars(messages) > int(max_prompt_chars):  # pragma: no cover
-                raise RuntimeError("Stage 2 extraction planner emitted an oversized page")
-            result = _request_validated_extraction(
+                raise RuntimeError(
+                    "Stage 2 page observation planner emitted an oversized page"
+                )
+            result = _request_validated_page_observations(
                 messages=messages,
-                row_ids=[row_id],
+                page=page,
                 definitions=definitions,
-                request_json=request_json,
-                ontology_audit_path=ontology_audit_path,
+                request_json=guarded_request_json,
+                audit_dir=page_dir,
             )
         else:
-            result = request_feature_batches(
+            result = request_page_feature_batches(
                 parent_dir=page_dir,
-                row=page,
-                parent_schema_version=PAGE_EXTRACTION_CHECKPOINT_SCHEMA_VERSION,
+                page=page,
             )
         _write_json(result_path, result)
         _supersede_stale_category_ontology_audit(
@@ -1972,6 +4069,7 @@ def extract_rows(
                 "features": len(definitions),
                 "feature_batches": len(definition_batches),
                 "feature_batch_size": feature_batch_size,
+                "observations": len(result["rows"][0]["observations"]),
                 **page_meta,
             },
         )
@@ -1990,12 +4088,19 @@ def extract_rows(
         page_futures = {
             executor.submit(run_page, page): int(page["row_id"]) for page in page_requests
         }
-        for future in concurrent.futures.as_completed([*batch_futures, *page_futures]):
-            if future in batch_futures:
-                completed.append((batch_futures[future], future.result()))
-            else:
-                row_id = page_futures[future]
-                completed_pages.setdefault(row_id, []).append(future.result())
+        all_futures = [*batch_futures, *page_futures]
+        try:
+            for future in concurrent.futures.as_completed(all_futures):
+                if future in batch_futures:
+                    completed.append((batch_futures[future], future.result()))
+                else:
+                    row_id = page_futures[future]
+                    completed_pages.setdefault(row_id, []).append(future.result())
+        except BaseException:
+            cancellation.set()
+            for pending in all_futures:
+                pending.cancel()
+            raise
     values_by_row = {
         int(row["row_id"]): dict(row["values"])
         for _index, rows in sorted(completed)
@@ -2008,29 +4113,35 @@ def extract_rows(
     ) -> dict[str, Any]:
         reconciliation_dir = output_dir / "pages" / f"row_{row_id:08d}" / "reconciliation"
         result_path = reconciliation_dir / "result.json"
+        decisions_path = reconciliation_dir / "decisions.json"
         complete_path = reconciliation_dir / "complete.json"
-        ontology_audit_path = reconciliation_dir / "category_ontology_repair.json"
-        stale_audit = _stale_category_ontology_audit(ontology_audit_path)
         ordered = sorted(page_values, key=lambda item: int(item[0]["page_index"]))
         page_results = [
-            {**dict(meta), "values": dict(result["values"])} for meta, result in ordered
+            {
+                **dict(meta),
+                "observations": [dict(value) for value in result["observations"]],
+            }
+            for meta, result in ordered
         ]
         reconciliation_fingerprint = _value_fingerprint(
             {
                 "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
+                "request_identity": extraction_request_identity,
                 "row_id": int(row_id),
-                "definitions": extraction_definitions,
+                "definitions": page_extraction_definitions,
                 "page_results": page_results,
             }
         )
-        if complete_path.is_file() and result_path.is_file() and stale_audit is None:
+        if complete_path.is_file() and result_path.is_file() and decisions_path.is_file():
             try:
                 completion = json.loads(complete_path.read_text(encoding="utf-8"))
                 stored = json.loads(result_path.read_text(encoding="utf-8"))
+                decisions = json.loads(decisions_path.read_text(encoding="utf-8"))
                 if (
                     completion.get("schema_version")
                     == PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION
                     and completion.get("input_fingerprint") == reconciliation_fingerprint
+                    and isinstance(decisions, Mapping)
                 ):
                     validated = _validate_extraction(
                         stored,
@@ -2045,120 +4156,10 @@ def extract_rows(
                 "rerun incompatible Stage 2 page reconciliation: %s",
                 reconciliation_dir,
             )
-        if stale_audit is not None:
-            LOGGER.info(
-                "retry stale Stage 2 category ontology reconciliation: %s",
-                reconciliation_dir,
-            )
-        definition_batches = _partition_page_reconciliation_definitions(
+        merged_values, decisions = _resolve_page_observations(
             definitions=definitions,
-            row_id=row_id,
             page_results=page_results,
-            max_prompt_chars=int(max_prompt_chars),
-            feature_batch_size=feature_batch_size,
         )
-        if len(definition_batches) > 1:
-            LOGGER.info(
-                "Stage 2 lossless page reconciliation row_id=%s pages=%s features=%s "
-                "feature_batches=%s",
-                row_id,
-                len(page_results),
-                len(definitions),
-                len(definition_batches),
-            )
-
-        merged_values: dict[str, Any] = {}
-        for batch_index, batch_definitions in enumerate(definition_batches, start=1):
-            batch_page_results = _page_results_for_definitions(
-                page_results,
-                batch_definitions,
-            )
-            messages = _page_reconciliation_prompt(
-                definitions=batch_definitions,
-                row_id=row_id,
-                page_results=batch_page_results,
-            )
-            prompt_chars = _prompt_chars(messages)
-            if prompt_chars > int(max_prompt_chars):  # pragma: no cover - planner invariant
-                raise RuntimeError(
-                    "Stage 2 feature-partitioned page reconciliation exceeded " "max_prompt_chars"
-                )
-            if len(definition_batches) == 1:
-                batch_dir = reconciliation_dir
-                batch_ontology_audit_path = ontology_audit_path
-            else:
-                batch_dir = reconciliation_dir / "feature_batches" / f"batch_{batch_index:05d}"
-                batch_ontology_audit_path = batch_dir / "category_ontology_repair.json"
-            batch_result_path = batch_dir / "result.json"
-            batch_complete_path = batch_dir / "complete.json"
-            batch_stale_audit = _stale_category_ontology_audit(batch_ontology_audit_path)
-            batch_input = {
-                "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
-                "row_id": int(row_id),
-                "definitions": _prompt_feature_definitions(batch_definitions),
-                "page_results": batch_page_results,
-            }
-            batch_fingerprint = _value_fingerprint(batch_input)
-            batch_result: dict[str, Any] | None = None
-            if (
-                batch_complete_path.is_file()
-                and batch_result_path.is_file()
-                and batch_stale_audit is None
-            ):
-                try:
-                    completion = json.loads(batch_complete_path.read_text(encoding="utf-8"))
-                    cached = json.loads(batch_result_path.read_text(encoding="utf-8"))
-                    if completion.get("input_fingerprint") == batch_fingerprint:
-                        batch_result = _validate_extraction(
-                            cached,
-                            row_ids=[row_id],
-                            definitions=batch_definitions,
-                        )
-                        _ensure_extraction_issue_audit(batch_dir)
-                except (
-                    KeyError,
-                    OSError,
-                    TypeError,
-                    ValueError,
-                    json.JSONDecodeError,
-                ):
-                    batch_result = None
-            if batch_result is None:
-                if batch_stale_audit is not None:
-                    LOGGER.info(
-                        "retry stale Stage 2 category ontology reconciliation batch: %s",
-                        batch_dir,
-                    )
-                batch_dir.mkdir(parents=True, exist_ok=True)
-                _write_json(
-                    batch_dir / "input.json",
-                    {**batch_input, "input_fingerprint": batch_fingerprint},
-                )
-                batch_result = _request_validated_extraction(
-                    messages=messages,
-                    row_ids=[row_id],
-                    definitions=batch_definitions,
-                    request_json=request_json,
-                    ontology_audit_path=batch_ontology_audit_path,
-                )
-                _write_json(batch_result_path, batch_result)
-                _supersede_stale_category_ontology_audit(
-                    batch_ontology_audit_path,
-                    previous=batch_stale_audit,
-                )
-                _write_json(
-                    batch_complete_path,
-                    {
-                        "status": "complete",
-                        "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
-                        "input_fingerprint": batch_fingerprint,
-                        "completed_at": _now(),
-                        "pages": len(batch_page_results),
-                        "features": len(batch_definitions),
-                    },
-                )
-            merged_values.update(dict(batch_result["rows"][0]["values"]))
-
         result = _validate_extraction(
             {"rows": [{"row_id": int(row_id), "values": merged_values}]},
             row_ids=[row_id],
@@ -2166,10 +4167,23 @@ def extract_rows(
         )
         reconciliation_dir.mkdir(parents=True, exist_ok=True)
         _write_json(reconciliation_dir / "page_manifest.json", page_results)
+        _write_json(
+            decisions_path,
+            {
+                "schema_version": PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION,
+                "row_id": int(row_id),
+                "decisions": decisions,
+            },
+        )
         _write_json(result_path, result)
-        _supersede_stale_category_ontology_audit(
-            ontology_audit_path,
-            previous=stale_audit,
+        _write_json(
+            reconciliation_dir / "extraction_issues.json",
+            {
+                "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "events": [],
+                "deterministic_reconciliation": True,
+            },
         )
         _write_json(
             complete_path,
@@ -2179,8 +4193,19 @@ def extract_rows(
                 "input_fingerprint": reconciliation_fingerprint,
                 "completed_at": _now(),
                 "pages": len(page_results),
-                "feature_batches": len(definition_batches),
-                "feature_batch_size": feature_batch_size,
+                "observations": sum(
+                    len(page_result["observations"]) for page_result in page_results
+                ),
+                "features": len(definitions),
+                "conflicts": sum(
+                    int(decision["distinct_value_count"] > 1)
+                    for decision in decisions.values()
+                ),
+                "null_conflicts": sum(
+                    int(decision["resolution"] == "conflict_null")
+                    for decision in decisions.values()
+                ),
+                "reconciliation_method": "deterministic_provenance",
             },
         )
         return dict(result["rows"][0]["values"])
@@ -2219,6 +4244,9 @@ def extract_rows(
             "batches": len(batches),
             "paged_rows": len(oversized_rows),
             "pages": len(page_requests),
+            "serial_patient_feature_passes": len(
+                list((output_dir / "batches").glob("**/serial_complete.json"))
+            ),
             "feature_failure_patterns": len(failure_summary["feature_failure_patterns"]),
             "structural_failure_patients": failure_summary["structural_failure_patient_count"],
         },
@@ -2919,6 +4947,8 @@ def _request_harmonization_plan(
     result_path = output_dir / "result.json"
     fallback_path = output_dir / "fallback.json"
     complete_path = output_dir / "complete.json"
+    if _records_infrastructure_failure(fallback_path):
+        _supersede_infrastructure_checkpoint(output_dir)
     if complete_path.is_file():
         try:
             completion = json.loads(complete_path.read_text(encoding="utf-8"))
@@ -3049,7 +5079,7 @@ def _request_harmonization_plan(
                 ),
                 request_kind="interpretation",
             )
-    except ValueError as exc:
+    except Stage2ResponseValidationError as exc:
         validation_error = exc
 
     fallback: dict[str, Any] | None = None
@@ -3481,6 +5511,40 @@ def _definitions_for_roles(
     ]
 
 
+def _definitions_for_nuisance_role(
+    definitions: Sequence[Mapping[str, Any]],
+    role: str,
+) -> list[Mapping[str, Any]]:
+    """Use persisted treatment/outcome supports with legacy-safe fallbacks."""
+
+    if role not in {"treatment", "outcome"}:
+        raise ValueError("nuisance role must be treatment or outcome")
+    definitions = list(definitions)
+    has_separate_supports = any(
+        "nuisance_model_roles" in feature for feature in definitions
+    )
+    if not has_separate_supports:
+        return (
+            _definitions_for_roles(definitions, {"confounder"})
+            if role == "treatment"
+            else definitions
+        )
+    selected = [
+        feature
+        for feature in definitions
+        if role in set(map(str, feature.get("nuisance_model_roles") or []))
+    ]
+    if role == "outcome":
+        selected_ids = {str(feature.get("feature_id") or feature["name"]) for feature in selected}
+        selected.extend(
+            feature
+            for feature in definitions
+            if "effect_modifier" in set(map(str, feature.get("roles") or []))
+            and str(feature.get("feature_id") or feature["name"]) not in selected_ids
+        )
+    return selected
+
+
 class _ConstantClassifier:
     classes_ = np.asarray([0, 1], dtype=int)
 
@@ -3505,24 +5569,10 @@ def _fit_classifier(
     y: np.ndarray,
     *,
     seed: int,
-    trees: int | None = None,
 ) -> Any:
     if len(np.unique(y)) < 2 or x.shape[1] == 0:
         return _ConstantClassifier(float(np.mean(y)))
-    if trees is None:
-        from sklearn.linear_model import LogisticRegression
-
-        model: Any = LogisticRegression(max_iter=2_000, C=1.0, random_state=seed)
-    else:
-        from sklearn.ensemble import RandomForestClassifier
-
-        model = RandomForestClassifier(
-            n_estimators=int(trees),
-            min_samples_leaf=max(2, min(20, len(y) // 10)),
-            max_features="sqrt",
-            n_jobs=1,
-            random_state=seed,
-        )
+    model: Any = ElasticNetLogisticClassifier(random_state=seed, n_jobs=1)
     model.fit(x, y.astype(int))
     return model
 
@@ -3540,24 +5590,10 @@ def _fit_regressor(
     y: np.ndarray,
     *,
     seed: int,
-    trees: int | None = None,
 ) -> Any:
     if x.shape[1] == 0:
         return _ConstantRegressor(float(np.mean(y)))
-    if trees is None:
-        from sklearn.linear_model import Ridge
-
-        model: Any = Ridge(alpha=1.0)
-    else:
-        from sklearn.ensemble import RandomForestRegressor
-
-        model = RandomForestRegressor(
-            n_estimators=int(trees),
-            min_samples_leaf=max(2, min(20, len(y) // 10)),
-            max_features="sqrt",
-            n_jobs=1,
-            random_state=seed,
-        )
+    model: Any = ElasticNetRegressor(random_state=seed, n_jobs=1)
     model.fit(x, y)
     return model
 
@@ -3576,7 +5612,6 @@ def _fit_outcome_models(
     *,
     binary: bool,
     seed: int,
-    trees: int | None = None,
 ) -> _OutcomeModels:
     models = []
     for arm in (0, 1):
@@ -3589,7 +5624,6 @@ def _fit_outcome_models(
                     x[mask],
                     outcome[mask],
                     seed=seed + arm,
-                    trees=trees,
                 )
             )
         else:
@@ -3598,7 +5632,6 @@ def _fit_outcome_models(
                     x[mask],
                     outcome[mask],
                     seed=seed + arm,
-                    trees=trees,
                 )
             )
     return _OutcomeModels(control=models[0], treated=models[1], binary=binary)
@@ -4001,7 +6034,9 @@ def _update_stability_selection(
         )
     return {
         "schema_version": "stage2_role_stability_selection_v1",
-        "model_family": "random_forest",
+        "model_family": "elastic_net_nuisance_plus_random_forest_effect_model",
+        "nuisance_model_family": "elastic_net",
+        "effect_model_family": "random_forest",
         "evaluation_round": int(evaluation_round),
         "policy": policy,
         "features": features,
@@ -4130,7 +6165,6 @@ def evaluate_definitions(
             base_x_train,
             t_train,
             seed=seed + fold_index,
-            trees=forest_trees,
         )
         base_outcome = _fit_outcome_models(
             base_x_train,
@@ -4138,7 +6172,6 @@ def evaluate_definitions(
             y_train,
             binary=binary,
             seed=seed + fold_index,
-            trees=forest_trees,
         )
         base_e_train = _predict_probability(base_t_model, base_x_train)
         base_e_valid = _predict_probability(base_t_model, base_x_valid)
@@ -4172,7 +6205,6 @@ def evaluate_definitions(
             x_t_train,
             t_train,
             seed=seed + 100 + fold_index,
-            trees=forest_trees,
         )
         feature_outcome = _fit_outcome_models(
             x_y_train,
@@ -4180,7 +6212,6 @@ def evaluate_definitions(
             y_train,
             binary=binary,
             seed=seed + 100 + fold_index,
-            trees=forest_trees,
         )
         feature_e_train = _predict_probability(feature_t_model, x_t_train)
         feature_e_valid = _predict_probability(feature_t_model, x_t_valid)
@@ -4281,7 +6312,9 @@ def evaluate_definitions(
     enhanced["effect_model_r_loss"] = float(np.mean(joined["feature_r_residual"] ** 2))
     improvements = _metric_improvements(base, enhanced)
     result: dict[str, Any] = {
-        "model_family": "random_forest",
+        "model_family": "elastic_net_nuisance_plus_random_forest_effect_model",
+        "nuisance_model_family": "elastic_net",
+        "effect_model_family": "random_forest",
         "forest_trees": int(forest_trees),
         "evaluation_rows": int(len(joined["t"])),
         "inner_folds": int(len(fold_performance)),
@@ -4980,6 +7013,7 @@ def _apply_review(
                 "missing_value_rule",
             ):
                 updated[key] = decision[key]
+            updated = _refresh_conflict_resolution(updated)
         if "modeling_strategy" in decision:
             updated["modeling_strategy"] = decision["modeling_strategy"]
         revised.append(_normalized_feature_modeling_definition(updated))
@@ -5154,7 +7188,6 @@ def _ontology_refinement_prompt(
                 "categories_or_unit",
                 "measurement_definition",
                 "missing_value_rule",
-                "roles",
             )
         },
         "repeated_failure_patterns": [
@@ -5260,6 +7293,372 @@ def _validate_ontology_refinement(
     return decision
 
 
+def _aggregate_ontology_supervisor_prompt(
+    *,
+    feature: Mapping[str, Any],
+    summary: Mapping[str, Any],
+    failure_patterns: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Ask the primary model to audit one small-model extraction schema."""
+
+    body = {
+        "job": "review_stage2_small_model_extraction_ontology",
+        "information_boundary": (
+            "Only aggregate extraction values and validation failures from outer-training "
+            "patients are supplied. No patient text, treatment values, outcome values, "
+            "causal-role evidence, model performance, or p-values are supplied."
+        ),
+        "feature": {
+            key: copy.deepcopy(feature.get(key))
+            for key in (
+                "feature_id",
+                "name",
+                "description",
+                "value_type",
+                "categories_or_unit",
+                "measurement_definition",
+                "missing_value_rule",
+            )
+        },
+        "aggregate_extraction_summary": copy.deepcopy(dict(summary)),
+        "aggregate_validation_failures": [
+            {
+                key: copy.deepcopy(pattern.get(key))
+                for key in (
+                    "failure_kind",
+                    "reason",
+                    "patient_count",
+                    "example_values",
+                    "allowed_categories",
+                )
+            }
+            for pattern in failure_patterns
+        ],
+        "rules": [
+            "Return keep unless the aggregates demonstrate a correctable extraction-schema mismatch.",
+            "You may revise only description, value_type, categories_or_unit, measurement_definition, and missing_value_rule.",
+            "Never add, drop, split, merge, or rename a feature and never infer or change a causal role.",
+            "A revision must remain one reusable pretreatment patient-level scalar variable.",
+            "Do not optimize for association with treatment or outcome; neither is available.",
+            "For binary variables return exactly two distinct scalar categories; for categorical or ordinal variables return at least two.",
+            "Return JSON only.",
+        ],
+        "response": {
+            "action": "keep|revise",
+            "reason": "schema-quality rationale",
+            "description": "required for revise",
+            "value_type": "binary|categorical|continuous|ordinal; required for revise",
+            "categories_or_unit": ["required for revise"],
+            "measurement_definition": "required for revise",
+            "missing_value_rule": "required for revise",
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You supervise extraction ontologies using aggregate small-model outputs. "
+                "You cannot select features or causal roles. Return JSON only."
+            ),
+        },
+        {"role": "user", "content": json.dumps(body, sort_keys=True, ensure_ascii=False)},
+    ]
+
+
+def _request_aggregate_ontology_supervisor(
+    *,
+    definitions: Sequence[Mapping[str, Any]],
+    summaries: Sequence[Mapping[str, Any]],
+    failure_summary: Mapping[str, Any],
+    output_dir: Path,
+    request_json: RequestJSON,
+    workers: int,
+    request_identity: Mapping[str, Any] | None = None,
+    cache_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
+    """Review changed schemas and reuse identical feature reviews across rounds."""
+
+    summaries_by_id = {str(row["feature_id"]): dict(row) for row in summaries}
+    failures_by_name: dict[str, list[dict[str, Any]]] = {}
+    for pattern in failure_summary.get("feature_failure_patterns") or []:
+        if isinstance(pattern, Mapping) and str(pattern.get("feature_name") or ""):
+            failures_by_name.setdefault(str(pattern["feature_name"]), []).append(dict(pattern))
+    identity = dict(request_identity or {})
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shared_cache_dir = (
+        Path(cache_dir)
+        if cache_dir is not None
+        else output_dir.parent.parent / "supervisor_cache"
+    )
+
+    # Adopt valid leaf checkpoints from earlier rounds as well as the new
+    # content-addressed cache.  This makes the optimization effective for a
+    # run that was started before the cache directory existed.
+    cached_dirs_by_fingerprint: dict[str, Path] = {}
+    supervision_root = output_dir.parent.parent
+    checkpoint_paths = [
+        *sorted(supervision_root.glob("round_*/supervisor/feature_*/complete.json")),
+        *sorted(shared_cache_dir.glob("*/*/complete.json")),
+    ]
+    for cached_complete_path in checkpoint_paths:
+        cached_feature_dir = cached_complete_path.parent
+        if cached_feature_dir == output_dir or output_dir in cached_feature_dir.parents:
+            continue
+        try:
+            cached_completion = json.loads(
+                cached_complete_path.read_text(encoding="utf-8")
+            )
+            cached_fingerprint = str(
+                cached_completion.get("input_fingerprint") or ""
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if cached_fingerprint:
+            cached_dirs_by_fingerprint.setdefault(
+                cached_fingerprint,
+                cached_feature_dir,
+            )
+
+    jobs: list[tuple[int, dict[str, Any]]] = []
+    decisions: dict[str, dict[str, Any]] = {}
+    for index, raw_feature in enumerate(definitions, start=1):
+        feature = dict(raw_feature)
+        feature_id = str(feature["feature_id"])
+        if feature.get("configured_explicit_feature") is True:
+            decisions[feature_id] = {
+                "feature_id": feature_id,
+                "feature_name": str(feature["name"]),
+                "action": "keep",
+                "reason": "Investigator-specified ontology is locked.",
+                "configured_explicit_feature": True,
+            }
+        else:
+            jobs.append((index, feature))
+
+    def cached_decision(
+        directory: Path,
+        *,
+        fingerprint: str,
+        feature: Mapping[str, Any],
+        permit_validation_fallback: bool,
+    ) -> dict[str, Any] | None:
+        result_path = directory / "result.json"
+        complete_path = directory / "complete.json"
+        if not result_path.is_file() or not complete_path.is_file():
+            return None
+        if _records_infrastructure_failure(result_path):
+            _supersede_infrastructure_checkpoint(directory)
+            return None
+        try:
+            completion = json.loads(complete_path.read_text(encoding="utf-8"))
+            if completion.get("input_fingerprint") != fingerprint:
+                return None
+            cached = json.loads(result_path.read_text(encoding="utf-8"))
+            validated = _validate_ontology_refinement(cached, feature=feature)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not permit_validation_fallback and validated.get("validation_fallback") is True:
+            return None
+        return validated
+
+    def write_checkpoint(
+        directory: Path,
+        *,
+        input_value: Mapping[str, Any],
+        fingerprint: str,
+        decision: Mapping[str, Any],
+        reuse_source: str | None,
+    ) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            directory / "input.json",
+            {**dict(input_value), "input_fingerprint": fingerprint},
+        )
+        _write_json(directory / "result.json", decision)
+        _write_json(
+            directory / "complete.json",
+            {
+                "status": "complete",
+                "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+                "input_fingerprint": fingerprint,
+                "completed_at": _now(),
+                "action": decision["action"],
+                "reused": reuse_source is not None,
+                "reuse_source": reuse_source,
+            },
+        )
+
+    def request_one(
+        job: tuple[int, dict[str, Any]],
+    ) -> tuple[str, dict[str, Any], str]:
+        index, feature = job
+        feature_id = str(feature["feature_id"])
+        summary = summaries_by_id.get(feature_id, {})
+        failures = failures_by_name.get(str(feature["name"]), [])
+        input_value = {
+            "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+            "primary_request_identity": identity,
+            "feature": {
+                key: copy.deepcopy(feature.get(key))
+                for key in (
+                    "feature_id",
+                    "name",
+                    "description",
+                    "value_type",
+                    "categories_or_unit",
+                    "measurement_definition",
+                    "missing_value_rule",
+                )
+            },
+            "aggregate_extraction_summary": summary,
+            "aggregate_validation_failures": failures,
+        }
+        fingerprint = _value_fingerprint(input_value)
+        feature_dir = output_dir / f"feature_{index:04d}"
+        local = cached_decision(
+            feature_dir,
+            fingerprint=fingerprint,
+            feature=feature,
+            permit_validation_fallback=True,
+        )
+        if local is not None:
+            return feature_id, local, "local_checkpoint"
+
+        cache_feature_dir = (
+            shared_cache_dir / fingerprint[:2] / fingerprint
+        )
+        reusable = cached_decision(
+            cache_feature_dir,
+            fingerprint=fingerprint,
+            feature=feature,
+            permit_validation_fallback=False,
+        )
+        reuse_source = "content_addressed_cache"
+        if reusable is None:
+            adopted_dir = cached_dirs_by_fingerprint.get(fingerprint)
+            if adopted_dir is not None:
+                reusable = cached_decision(
+                    adopted_dir,
+                    fingerprint=fingerprint,
+                    feature=feature,
+                    permit_validation_fallback=False,
+                )
+                reuse_source = "prior_round_checkpoint"
+        if reusable is not None:
+            write_checkpoint(
+                feature_dir,
+                input_value=input_value,
+                fingerprint=fingerprint,
+                decision=reusable,
+                reuse_source=reuse_source,
+            )
+            if not (cache_feature_dir / "complete.json").is_file():
+                write_checkpoint(
+                    cache_feature_dir,
+                    input_value=input_value,
+                    fingerprint=fingerprint,
+                    decision=reusable,
+                    reuse_source=reuse_source,
+                )
+            return feature_id, reusable, reuse_source
+
+        feature_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(feature_dir / "input.json", {**input_value, "input_fingerprint": fingerprint})
+        try:
+            decision = request_json(
+                _aggregate_ontology_supervisor_prompt(
+                    feature=feature,
+                    summary=summary,
+                    failure_patterns=failures,
+                ),
+                lambda value: _validate_ontology_refinement(value, feature=feature),
+                request_kind="interpretation",
+            )
+        except Stage2ResponseValidationError as exc:
+            decision = {
+                "feature_id": feature_id,
+                "feature_name": str(feature["name"]),
+                "action": "keep",
+                "reason": f"Invalid supervisor response; conservative keep: {exc}",
+                "validation_fallback": True,
+            }
+        write_checkpoint(
+            feature_dir,
+            input_value=input_value,
+            fingerprint=fingerprint,
+            decision=decision,
+            reuse_source=None,
+        )
+        if decision.get("validation_fallback") is not True:
+            write_checkpoint(
+                cache_feature_dir,
+                input_value=input_value,
+                fingerprint=fingerprint,
+                decision=decision,
+                reuse_source=None,
+            )
+        return feature_id, decision, "model"
+
+    request_sources: Counter[str] = Counter()
+    if jobs:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(int(workers), len(jobs)))
+        ) as executor:
+            futures = [executor.submit(request_one, job) for job in jobs]
+            for future in concurrent.futures.as_completed(futures):
+                feature_id, decision, source = future.result()
+                decisions[feature_id] = decision
+                request_sources[source] += 1
+
+    updated: list[dict[str, Any]] = []
+    changed_ids: list[str] = []
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        decision = decisions[str(feature["feature_id"])]
+        if decision["action"] == "revise":
+            before = {
+                key: copy.deepcopy(feature.get(key))
+                for key in (
+                    "description",
+                    "value_type",
+                    "categories_or_unit",
+                    "measurement_definition",
+                    "missing_value_rule",
+                )
+            }
+            for key in before:
+                feature[key] = copy.deepcopy(decision[key])
+            after = {key: copy.deepcopy(feature.get(key)) for key in before}
+            if _value_fingerprint(before) != _value_fingerprint(after):
+                feature.pop("harmonization_plan", None)
+                feature.pop("harmonization_fallback", None)
+                feature = _refresh_conflict_resolution(feature)
+                changed_ids.append(str(feature["feature_id"]))
+        updated.append(feature)
+
+    report = {
+        "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+        "completed_at": _now(),
+        "features_reviewed": len(definitions),
+        "review_candidate_features": len(jobs),
+        "model_requested_features": int(request_sources["model"]),
+        "cache_reused_features": int(
+            request_sources["content_addressed_cache"]
+            + request_sources["prior_round_checkpoint"]
+        ),
+        "local_checkpoint_reused_features": int(
+            request_sources["local_checkpoint"]
+        ),
+        "review_request_sources": dict(sorted(request_sources.items())),
+        "changed_feature_ids": changed_ids,
+        "decisions": [decisions[str(feature["feature_id"])] for feature in definitions],
+        "prohibited_information_supplied": False,
+    }
+    _write_json(output_dir / "result.json", {"definitions": updated, **report})
+    _write_json(output_dir / "complete.json", {"status": "complete", **report})
+    return updated, bool(changed_ids), report
+
+
 def _repeated_ontology_failure_patterns(
     summary: Mapping[str, Any],
     *,
@@ -5354,6 +7753,8 @@ def _request_ontology_refinements(
         result_path = feature_dir / "result.json"
         complete_path = feature_dir / "complete.json"
         if result_path.is_file() and complete_path.is_file():
+            if _records_infrastructure_failure(result_path):
+                _supersede_infrastructure_checkpoint(feature_dir)
             try:
                 completion = json.loads(complete_path.read_text(encoding="utf-8"))
                 cached = json.loads(result_path.read_text(encoding="utf-8"))
@@ -5371,7 +7772,7 @@ def _request_ontology_refinements(
                 messages,
                 lambda value: _validate_ontology_refinement(value, feature=feature),
             )
-        except ValueError as exc:
+        except Stage2ResponseValidationError as exc:
             decision = {
                 "feature_id": str(feature["feature_id"]),
                 "feature_name": name,
@@ -5441,6 +7842,7 @@ def _request_ontology_refinements(
             if _value_fingerprint(before) != _value_fingerprint(after):
                 feature.pop("harmonization_plan", None)
                 feature.pop("harmonization_fallback", None)
+                feature = _refresh_conflict_resolution(feature)
                 changed_names.append(name)
         updated.append(feature)
 
@@ -5466,6 +7868,343 @@ def _request_ontology_refinements(
     return updated, bool(changed_names), report
 
 
+def _feature_extraction_fingerprint(feature: Mapping[str, Any]) -> str:
+    """Fingerprint only fields that can change a patient extraction prompt."""
+
+    return _value_fingerprint(_prompt_feature_definitions([feature])[0])
+
+
+def _features_requiring_reextraction(
+    *,
+    prior_definitions: Sequence[Mapping[str, Any]],
+    definitions: Sequence[Mapping[str, Any]],
+    prior_extracted: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    """Return current definitions whose patient-measurement prompt changed."""
+
+    prior_by_id: dict[str, Mapping[str, Any]] = {}
+    for feature in prior_definitions:
+        feature_id = str(feature["feature_id"])
+        if feature_id in prior_by_id:
+            raise ValueError(f"duplicate prior feature_id {feature_id!r}")
+        prior_by_id[feature_id] = feature
+
+    changed: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for raw_feature in definitions:
+        feature = dict(raw_feature)
+        feature_id = str(feature["feature_id"])
+        name = str(feature["name"])
+        if feature_id in seen_ids:
+            raise ValueError(f"duplicate current feature_id {feature_id!r}")
+        if name in seen_names:
+            raise ValueError(f"duplicate current feature name {name!r}")
+        seen_ids.add(feature_id)
+        seen_names.add(name)
+        prior = prior_by_id.get(feature_id)
+        if (
+            prior is None
+            or str(prior.get("name") or "") != name
+            or name not in prior_extracted.columns
+            or _feature_extraction_fingerprint(prior)
+            != _feature_extraction_fingerprint(feature)
+        ):
+            changed.append(feature)
+    return changed
+
+
+def _validated_extraction_index(
+    frame: pd.DataFrame,
+    *,
+    row_ids: Sequence[int],
+    required_feature_names: Sequence[str],
+    source: str,
+) -> pd.DataFrame:
+    """Validate and index one extraction matrix without changing row identity."""
+
+    if "_oci_row_id" not in frame.columns:
+        raise ValueError(f"{source} extraction is missing _oci_row_id")
+    missing = [name for name in required_feature_names if name not in frame.columns]
+    if missing:
+        raise ValueError(f"{source} extraction is missing feature columns: {missing}")
+    indexed = frame.copy()
+    try:
+        indexed["_oci_row_id"] = indexed["_oci_row_id"].map(int)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source} extraction has invalid row identifiers") from exc
+    if indexed["_oci_row_id"].duplicated().any():
+        raise ValueError(f"{source} extraction has duplicate row identifiers")
+    expected = [int(row_id) for row_id in row_ids]
+    if len(expected) != len(set(expected)):
+        raise ValueError("refinement extraction received duplicate requested row identifiers")
+    observed = set(indexed["_oci_row_id"].tolist())
+    if observed != set(expected):
+        raise ValueError(
+            f"{source} extraction row identifiers do not match the requested patients"
+        )
+    return indexed.set_index("_oci_row_id", drop=False).loc[expected]
+
+
+def _merge_incremental_failure_summaries(
+    *,
+    prior_summary: Mapping[str, Any],
+    delta_summary: Mapping[str, Any],
+    current_feature_names: Sequence[str],
+    changed_feature_names: Sequence[str],
+) -> dict[str, Any]:
+    """Replace changed-feature failures while retaining reused-feature provenance."""
+
+    current = set(map(str, current_feature_names))
+    changed = set(map(str, changed_feature_names))
+    if not changed.issubset(current):
+        raise ValueError("changed refinement features are not present in current definitions")
+
+    patterns: list[dict[str, Any]] = []
+    for raw_pattern in prior_summary.get("feature_failure_patterns") or []:
+        if not isinstance(raw_pattern, Mapping):
+            continue
+        name = str(raw_pattern.get("feature_name") or "")
+        if name in current and name not in changed:
+            patterns.append(copy.deepcopy(dict(raw_pattern)))
+    for raw_pattern in delta_summary.get("feature_failure_patterns") or []:
+        if not isinstance(raw_pattern, Mapping):
+            continue
+        name = str(raw_pattern.get("feature_name") or "")
+        if name not in changed:
+            raise ValueError(
+                "delta extraction reported a failure for a feature that was not "
+                f"re-extracted: {name!r}"
+            )
+        patterns.append(copy.deepcopy(dict(raw_pattern)))
+    patterns.sort(
+        key=lambda pattern: (
+            -int(pattern.get("patient_count") or 0),
+            str(pattern.get("feature_name") or ""),
+            str(pattern.get("failure_kind") or ""),
+            str(pattern.get("reason") or ""),
+        )
+    )
+
+    structural_rows = {
+        int(row_id)
+        for summary in (prior_summary, delta_summary)
+        for row_id in summary.get("structural_failure_patient_row_ids") or []
+    }
+    return {
+        "schema_version": EXTRACTION_ISSUE_SCHEMA_VERSION,
+        "completed_at": _now(),
+        "issue_files": int(prior_summary.get("issue_files") or 0)
+        + int(delta_summary.get("issue_files") or 0),
+        "feature_failure_patterns": patterns,
+        "structural_failure_patient_count": len(structural_rows),
+        "structural_failure_patient_row_ids": sorted(structural_rows),
+        "incremental_refinement": {
+            "schema_version": INCREMENTAL_REFINEMENT_EXTRACTION_SCHEMA_VERSION,
+            "reextracted_feature_names": sorted(changed),
+            "reused_feature_names": sorted(current - changed),
+            "structural_failure_policy": "union_reused_and_delta_patient_rows",
+        },
+    }
+
+
+def _has_legacy_full_refinement_checkpoints(output_dir: Path) -> bool:
+    """Detect a full re-extraction started by code predating feature deltas."""
+
+    if (output_dir / "changed_features").exists():
+        return False
+    return any(
+        (output_dir / name).exists()
+        for name in (
+            "batches",
+            "pages",
+            "extracted.csv",
+            "failure_summary.json",
+            "complete.json",
+        )
+    )
+
+
+def _extract_changed_features_and_merge(
+    *,
+    dataset: pd.DataFrame,
+    row_ids: Sequence[int],
+    text_column: str,
+    definitions: Sequence[Mapping[str, Any]],
+    prior_extracted: pd.DataFrame,
+    prior_definitions: Sequence[Mapping[str, Any]],
+    prior_failure_summary: Mapping[str, Any],
+    output_dir: Path,
+    request_json: RequestJSON,
+    workers: int,
+    max_prompt_chars: int,
+    feature_batch_size: int,
+    request_identity: Mapping[str, Any] | None,
+    tokenizer: Any | None,
+    chunk_size_tokens: int,
+    context_window_tokens: int,
+    max_output_tokens: int,
+    context_margin_tokens: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Extract changed features only and materialize a complete merged matrix."""
+
+    current = [dict(feature) for feature in definitions]
+    current_names = [str(feature["name"]) for feature in current]
+
+    # A long-running workflow may already have started a full pass under the
+    # historical directory layout.  Resume that work rather than abandoning
+    # valid checkpoints halfway through a patient cohort.
+    if _has_legacy_full_refinement_checkpoints(output_dir):
+        LOGGER.info(
+            "resume legacy full Stage 2 refinement extraction before enabling "
+            "feature-delta checkpoints: %s",
+            output_dir,
+        )
+        extracted = extract_rows(
+            dataset=dataset,
+            row_ids=row_ids,
+            text_column=text_column,
+            definitions=current,
+            output_dir=output_dir,
+            request_json=request_json,
+            workers=workers,
+            max_prompt_chars=max_prompt_chars,
+            feature_batch_size=feature_batch_size,
+            request_identity=request_identity,
+            tokenizer=tokenizer,
+            chunk_size_tokens=chunk_size_tokens,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            context_margin_tokens=context_margin_tokens,
+        )
+        summary = json.loads(
+            (output_dir / "failure_summary.json").read_text(encoding="utf-8")
+        )
+        return extracted, summary
+
+    changed_definitions = _features_requiring_reextraction(
+        prior_definitions=prior_definitions,
+        definitions=current,
+        prior_extracted=prior_extracted,
+    )
+    changed_names = [str(feature["name"]) for feature in changed_definitions]
+    delta_dir = output_dir / "changed_features"
+    LOGGER.info(
+        "Stage 2 incremental refinement re-extracting features=%s/%s names=%s",
+        len(changed_definitions),
+        len(current),
+        changed_names,
+    )
+    delta = extract_rows(
+        dataset=dataset,
+        row_ids=row_ids,
+        text_column=text_column,
+        definitions=changed_definitions,
+        output_dir=delta_dir,
+        request_json=request_json,
+        workers=workers,
+        max_prompt_chars=max_prompt_chars,
+        feature_batch_size=feature_batch_size,
+        request_identity=request_identity,
+        tokenizer=tokenizer,
+        chunk_size_tokens=chunk_size_tokens,
+        context_window_tokens=context_window_tokens,
+        max_output_tokens=max_output_tokens,
+        context_margin_tokens=context_margin_tokens,
+    )
+    prior_names = [str(feature["name"]) for feature in prior_definitions]
+    prior_indexed = _validated_extraction_index(
+        prior_extracted,
+        row_ids=row_ids,
+        required_feature_names=[
+            name for name in current_names if name not in set(changed_names)
+        ],
+        source="prior",
+    )
+    delta_indexed = _validated_extraction_index(
+        delta,
+        row_ids=row_ids,
+        required_feature_names=changed_names,
+        source="delta",
+    )
+    ordered_row_ids = [int(row_id) for row_id in row_ids]
+    merged = pd.DataFrame({"_oci_row_id": ordered_row_ids})
+    changed = set(changed_names)
+    for name in current_names:
+        source = delta_indexed if name in changed else prior_indexed
+        merged[name] = source.loc[ordered_row_ids, name].tolist()
+
+    delta_summary = json.loads(
+        (delta_dir / "failure_summary.json").read_text(encoding="utf-8")
+    )
+    merged_summary = _merge_incremental_failure_summaries(
+        prior_summary=prior_failure_summary,
+        delta_summary=delta_summary,
+        current_feature_names=current_names,
+        changed_feature_names=changed_names,
+    )
+    merge_input = {
+        "schema_version": INCREMENTAL_REFINEMENT_EXTRACTION_SCHEMA_VERSION,
+        "prior_definition_fingerprints": {
+            str(feature["feature_id"]): _feature_extraction_fingerprint(feature)
+            for feature in prior_definitions
+        },
+        "current_definition_fingerprints": {
+            str(feature["feature_id"]): _feature_extraction_fingerprint(feature)
+            for feature in current
+        },
+        "prior_feature_names": prior_names,
+        "current_feature_names": current_names,
+        "reextracted_feature_names": changed_names,
+        "prior_frame_fingerprint": _frame_fingerprint(prior_extracted),
+        "delta_frame_fingerprint": _frame_fingerprint(delta),
+    }
+    input_fingerprint = _value_fingerprint(merge_input)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        output_dir / "incremental_merge_input.json",
+        {**merge_input, "input_fingerprint": input_fingerprint},
+    )
+    _write_frame(output_dir / "extracted.csv", merged)
+    _write_json(output_dir / "failure_summary.json", merged_summary)
+    delta_completion = json.loads(
+        (delta_dir / "complete.json").read_text(encoding="utf-8")
+    )
+    _write_json(
+        output_dir / "complete.json",
+        {
+            "status": "complete",
+            "schema_version": INCREMENTAL_REFINEMENT_EXTRACTION_SCHEMA_VERSION,
+            "input_fingerprint": input_fingerprint,
+            "completed_at": _now(),
+            "rows": len(merged),
+            "features": len(current),
+            "reextraction_scope": "changed_features_only",
+            "reextracted_features": len(changed_names),
+            "reextracted_feature_names": changed_names,
+            "reused_features": len(current) - len(changed_names),
+            "feature_batch_size": feature_batch_size,
+            "feature_batches_per_patient": int(
+                delta_completion.get("feature_batches_per_patient") or 0
+            ),
+            "batches": int(delta_completion.get("batches") or len(row_ids)),
+            "paged_rows": int(delta_completion.get("paged_rows") or 0),
+            "pages": int(delta_completion.get("pages") or 0),
+            "serial_patient_feature_passes": int(
+                delta_completion.get("serial_patient_feature_passes") or 0
+            ),
+            "feature_failure_patterns": len(
+                merged_summary["feature_failure_patterns"]
+            ),
+            "structural_failure_patients": merged_summary[
+                "structural_failure_patient_count"
+            ],
+            "delta_extraction_dir": str(delta_dir),
+        },
+    )
+    return merged, merged_summary
+
+
 def _extract_training_with_ontology_feedback(
     *,
     dataset: pd.DataFrame,
@@ -5480,27 +8219,91 @@ def _extract_training_with_ontology_feedback(
     feature_batch_size: int,
     minimum_failure_patients: int,
     max_refinement_rounds: int,
+    request_identity: Mapping[str, Any] | None = None,
+    tokenizer: Any | None = None,
+    chunk_size_tokens: int = DEFAULT_EXTRACTION_CHUNK_SIZE_TOKENS,
+    context_window_tokens: int = DEFAULT_EXTRACTION_CONTEXT_WINDOW_TOKENS,
+    max_output_tokens: int = DEFAULT_EXTRACTION_MAX_TOKENS,
+    context_margin_tokens: int = DEFAULT_EXTRACTION_CONTEXT_MARGIN_TOKENS,
+    prior_extracted: pd.DataFrame | None = None,
+    prior_definitions: Sequence[Mapping[str, Any]] | None = None,
+    prior_failure_summary: Mapping[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], int]:
-    """Extract training rows and re-extract after repeated-failure ontology repairs."""
+    """Extract training rows and incrementally repair changed feature ontologies."""
+
+    supplied_prior = (
+        prior_extracted is not None,
+        prior_definitions is not None,
+        prior_failure_summary is not None,
+    )
+    if any(supplied_prior) and not all(supplied_prior):
+        raise ValueError(
+            "incremental refinement requires prior_extracted, prior_definitions, "
+            "and prior_failure_summary together"
+        )
 
     current = [dict(feature) for feature in definitions]
     extraction_dir = output_dir
     rounds: list[dict[str, Any]] = []
     stopped_reason = "maximum_refinement_rounds_reached"
     extracted: pd.DataFrame | None = None
+    summary: dict[str, Any] | None = None
+    source_extracted = prior_extracted
+    source_definitions = (
+        [dict(feature) for feature in prior_definitions]
+        if prior_definitions is not None
+        else None
+    )
+    source_summary = (
+        copy.deepcopy(dict(prior_failure_summary))
+        if prior_failure_summary is not None
+        else None
+    )
     for pass_index in range(0, int(max_refinement_rounds) + 1):
-        extracted = extract_rows(
-            dataset=dataset,
-            row_ids=row_ids,
-            text_column=text_column,
-            definitions=current,
-            output_dir=extraction_dir,
-            request_json=request_json,
-            workers=workers,
-            max_prompt_chars=max_prompt_chars,
-            feature_batch_size=feature_batch_size,
-        )
-        summary = json.loads((extraction_dir / "failure_summary.json").read_text(encoding="utf-8"))
+        if source_extracted is None:
+            extracted = extract_rows(
+                dataset=dataset,
+                row_ids=row_ids,
+                text_column=text_column,
+                definitions=current,
+                output_dir=extraction_dir,
+                request_json=request_json,
+                workers=workers,
+                max_prompt_chars=max_prompt_chars,
+                feature_batch_size=feature_batch_size,
+                request_identity=request_identity,
+                tokenizer=tokenizer,
+                chunk_size_tokens=chunk_size_tokens,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                context_margin_tokens=context_margin_tokens,
+            )
+            summary = json.loads(
+                (extraction_dir / "failure_summary.json").read_text(encoding="utf-8")
+            )
+        else:
+            if source_definitions is None or source_summary is None:  # pragma: no cover
+                raise RuntimeError("incremental refinement source state is incomplete")
+            extracted, summary = _extract_changed_features_and_merge(
+                dataset=dataset,
+                row_ids=row_ids,
+                text_column=text_column,
+                definitions=current,
+                prior_extracted=source_extracted,
+                prior_definitions=source_definitions,
+                prior_failure_summary=source_summary,
+                output_dir=extraction_dir,
+                request_json=request_json,
+                workers=workers,
+                max_prompt_chars=max_prompt_chars,
+                feature_batch_size=feature_batch_size,
+                request_identity=request_identity,
+                tokenizer=tokenizer,
+                chunk_size_tokens=chunk_size_tokens,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                context_margin_tokens=context_margin_tokens,
+            )
         repeated = _repeated_ontology_failure_patterns(
             summary,
             minimum_patients=minimum_failure_patients,
@@ -5531,10 +8334,13 @@ def _extract_training_with_ontology_feedback(
         if not changed:
             stopped_reason = "no_ontology_changes"
             break
+        source_extracted = extracted
+        source_definitions = current
+        source_summary = summary
         current = updated
         extraction_dir = round_dir / "extraction"
 
-    if extracted is None:  # pragma: no cover - loop always runs once
+    if extracted is None or summary is None:  # pragma: no cover - loop always runs once
         raise RuntimeError("ontology feedback loop did not perform extraction")
     feedback_dir.mkdir(parents=True, exist_ok=True)
     feedback_result = {
@@ -5547,6 +8353,7 @@ def _extract_training_with_ontology_feedback(
         "rounds": rounds,
         "definitions": current,
     }
+    _write_json(feedback_dir / "final_failure_summary.json", summary)
     _write_json(feedback_dir / "result.json", feedback_result)
     _write_json(feedback_dir / "complete.json", {"status": "complete", **feedback_result})
     return extracted, current, len(rounds)
@@ -5563,7 +8370,6 @@ def _cross_fitted_nuisance(
     outcome_column: str,
     binary: bool,
     seed: int,
-    forest_trees: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     fit_ids = [int(value) for value in fit_ids]
     position = {row_id: index for index, row_id in enumerate(fit_ids)}
@@ -5571,7 +8377,8 @@ def _cross_fitted_nuisance(
     mu0 = np.full(len(fit_ids), np.nan)
     mu1 = np.full(len(fit_ids), np.nan)
     extracted_by_id = extracted.set_index("_oci_row_id", drop=False)
-    propensity_defs = _definitions_for_roles(definitions, {"confounder"})
+    propensity_defs = _definitions_for_nuisance_role(definitions, "treatment")
+    outcome_defs = _definitions_for_nuisance_role(definitions, "outcome")
     for fold_index, fold in enumerate(inner_splits, start=1):
         train_ids = [int(value) for value in fold["fit_row_ids"] if int(value) in position]
         valid_ids = [int(value) for value in fold["heldout_row_ids"] if int(value) in position]
@@ -5583,7 +8390,7 @@ def _cross_fitted_nuisance(
         t_train = train_data[treatment_column].to_numpy(dtype=float)
         y_train = train_data[outcome_column].to_numpy(dtype=float)
         t_encoder = _FeatureEncoder(propensity_defs).fit(train_features)
-        y_encoder = _FeatureEncoder(definitions).fit(train_features)
+        y_encoder = _FeatureEncoder(outcome_defs).fit(train_features)
         x_t_train = t_encoder.transform(train_features)
         x_t_valid = t_encoder.transform(valid_features)
         x_y_train = y_encoder.transform(train_features)
@@ -5592,7 +8399,6 @@ def _cross_fitted_nuisance(
             x_t_train,
             t_train,
             seed=seed + fold_index,
-            trees=forest_trees,
         )
         outcome_models = _fit_outcome_models(
             x_y_train,
@@ -5600,7 +8406,6 @@ def _cross_fitted_nuisance(
             y_train,
             binary=binary,
             seed=seed + fold_index,
-            trees=forest_trees,
         )
         fold_mu0, fold_mu1 = _predict_outcomes(outcome_models, x_y_valid)
         valid_positions = [position[row_id] for row_id in valid_ids]
@@ -5673,22 +8478,7 @@ def estimate_outer_fold(
     output_dir.mkdir(parents=True, exist_ok=True)
     fit_ids = [int(value) for value in split["fit_row_ids"]]
     heldout_ids = [int(value) for value in split["heldout_row_ids"]]
-    inner = list(split.get("inner_splits") or []) or _fallback_inner_splits(
-        fit_ids, folds=inner_folds, seed=seed
-    )
     binary = str(outcome_type) == "binary"
-    e_oof, mu0_oof, mu1_oof = _cross_fitted_nuisance(
-        dataset=dataset,
-        extracted=extracted_fit,
-        definitions=definitions,
-        fit_ids=fit_ids,
-        inner_splits=inner,
-        treatment_column=treatment_column,
-        outcome_column=outcome_column,
-        binary=binary,
-        seed=seed,
-        forest_trees=estimation_trees,
-    )
     fit_data = dataset.iloc[fit_ids]
     heldout_data = dataset.iloc[heldout_ids]
     t_fit = fit_data[treatment_column].to_numpy(dtype=float)
@@ -5696,22 +8486,32 @@ def estimate_outer_fold(
     t_heldout = heldout_data[treatment_column].to_numpy(dtype=float)
     y_heldout = heldout_data[outcome_column].to_numpy(dtype=float)
 
-    propensity_defs = _definitions_for_roles(definitions, {"confounder"})
+    adjustment_defs = _definitions_for_roles(definitions, {"confounder"})
+    propensity_defs = _definitions_for_nuisance_role(definitions, "treatment")
+    outcome_defs = _definitions_for_nuisance_role(definitions, "outcome")
     effect_defs = _definitions_for_roles(definitions, {"effect_modifier"})
+    effect_ids = {str(feature["feature_id"]) for feature in effect_defs}
+    pure_confounder_defs = [
+        feature
+        for feature in adjustment_defs
+        if str(feature["feature_id"]) not in effect_ids
+    ]
     t_encoder = _FeatureEncoder(propensity_defs).fit(extracted_fit)
-    y_encoder = _FeatureEncoder(definitions).fit(extracted_fit)
+    y_encoder = _FeatureEncoder(outcome_defs).fit(extracted_fit)
     effect_encoder = _FeatureEncoder(effect_defs).fit(extracted_fit)
+    control_encoder = _FeatureEncoder(pure_confounder_defs).fit(extracted_fit)
     x_t_fit = t_encoder.transform(extracted_fit)
     x_t_heldout = t_encoder.transform(extracted_heldout)
     x_y_fit = y_encoder.transform(extracted_fit)
     x_y_heldout = y_encoder.transform(extracted_heldout)
     x_effect_fit = effect_encoder.transform(extracted_fit)
     x_effect_heldout = effect_encoder.transform(extracted_heldout)
+    w_fit = control_encoder.transform(extracted_fit)
+    w_heldout = control_encoder.transform(extracted_heldout)
     treatment_model = _fit_classifier(
         x_t_fit,
         t_fit,
         seed=seed + 10_000,
-        trees=estimation_trees,
     )
     outcome_models = _fit_outcome_models(
         x_y_fit,
@@ -5719,25 +8519,62 @@ def estimate_outer_fold(
         y_fit,
         binary=binary,
         seed=seed + 10_000,
-        trees=estimation_trees,
     )
     propensity = _predict_probability(treatment_model, x_t_heldout)
     mu0, mu1 = _predict_outcomes(outcome_models, x_y_heldout)
-    pseudo_fit = _dr_score(
-        y_fit,
-        t_fit,
-        mu0_oof,
-        mu1_oof,
-        e_oof,
-        clip=propensity_clip,
+    if x_effect_fit.shape[1] == 0:
+        # EconML requires X for heterogeneous-effect prediction. A constant X
+        # yields one fold-level treatment effect when no modifier survived.
+        x_effect_fit = np.ones((len(extracted_fit), 1), dtype=float)
+        x_effect_heldout = np.ones((len(extracted_heldout), 1), dtype=float)
+        constant_effect_design = True
+    else:
+        constant_effect_design = False
+    controls_fit = w_fit if w_fit.shape[1] else None
+    causal_forest = CausalForestHead(
+        n_estimators=int(estimation_trees),
+        max_depth=None,
+        min_samples_leaf=10,
+        max_features="sqrt",
+        honest=True,
+        inference=True,
+        random_state=seed + 20_000,
+        tune_model=False,
+        subforest_size=next(
+            size for size in (4, 3, 2, 1) if int(estimation_trees) % size == 0
+        ),
+        n_jobs=1,
+        outcome_type=outcome_type,
     )
-    effect_model = _fit_effect_model(
+    causal_forest.fit(
         x_effect_fit,
-        pseudo_fit,
-        seed=seed + 20_000,
-        trees=estimation_trees,
+        t_fit,
+        y_fit,
+        W=controls_fit,
     )
-    cate = effect_model.predict(x_effect_heldout)
+    causal_forest_predictions = causal_forest.predict(
+        x_effect_heldout,
+        return_ci=True,
+    )
+    cate = np.asarray(causal_forest_predictions["tau_pred"], dtype=float)
+    cate_lower = causal_forest_predictions.get("tau_lower")
+    cate_upper = causal_forest_predictions.get("tau_upper")
+    cate_std = causal_forest_predictions.get("tau_std")
+    cate_lower_values = (
+        np.asarray(cate_lower, dtype=float)
+        if cate_lower is not None
+        else np.full(len(cate), np.nan)
+    )
+    cate_upper_values = (
+        np.asarray(cate_upper, dtype=float)
+        if cate_upper is not None
+        else np.full(len(cate), np.nan)
+    )
+    cate_std_values = (
+        np.asarray(cate_std, dtype=float)
+        if cate_std is not None
+        else np.full(len(cate), np.nan)
+    )
     aipw = _dr_score(
         y_heldout,
         t_heldout,
@@ -5757,6 +8594,9 @@ def estimate_outer_fold(
             "mu1": mu1,
             "aipw_score": aipw,
             "estimated_cate": cate,
+            "estimated_cate_lower_95": cate_lower_values,
+            "estimated_cate_upper_95": cate_upper_values,
+            "estimated_cate_standard_error": cate_std_values,
         }
     )
     _write_frame(output_dir / "predictions.csv", predictions)
@@ -5768,13 +8608,36 @@ def estimate_outer_fold(
         float(np.std(finite, ddof=1) / math.sqrt(len(finite))) if len(finite) > 1 else None
     )
     diagnostics = {
-        "model_family": "random_forest",
-        "forest_trees": int(estimation_trees),
+        "model_family": "causal_forest_dml",
+        "primary_ate_estimator": "outer_cross_fitted_aipw",
+        "nuisance_model_family": "elastic_net",
+        "binary_nuisance_model": (
+            "oci.models.elastic_net_nuisance.ElasticNetLogisticClassifier"
+        ),
+        "continuous_nuisance_model": (
+            "oci.models.elastic_net_nuisance.ElasticNetRegressor"
+        ),
+        "causal_forest_trees": int(estimation_trees),
+        "causal_forest_honest": True,
+        "causal_forest_inference": True,
+        "causal_forest_tuned": False,
+        "causal_forest_fit_audit": causal_forest.fit_audit(),
         "rows": len(heldout_ids),
         "fit_rows": len(fit_ids),
         "features": len(definitions),
-        "confounders": len(propensity_defs),
+        "confounders": len(adjustment_defs),
+        "treatment_nuisance_features": len(propensity_defs),
+        "outcome_nuisance_features": len(outcome_defs),
         "effect_modifiers": len(effect_defs),
+        "pure_confounders_in_w": len(pure_confounder_defs),
+        "dual_role_features_in_x_only": len(
+            [
+                feature
+                for feature in adjustment_defs
+                if str(feature["feature_id"]) in effect_ids
+            ]
+        ),
+        "constant_effect_design": constant_effect_design,
         "ate_aipw": ate,
         "standard_error": standard_error,
         "confidence_interval_95": (
@@ -5783,6 +8646,17 @@ def estimate_outer_fold(
             else None
         ),
         "mean_estimated_cate": float(np.mean(cate)) if len(cate) else None,
+        "mean_causal_forest_effect": float(np.mean(cate)) if len(cate) else None,
+        "mean_causal_forest_lower_95": (
+            float(np.nanmean(cate_lower_values))
+            if np.isfinite(cate_lower_values).any()
+            else None
+        ),
+        "mean_causal_forest_upper_95": (
+            float(np.nanmean(cate_upper_values))
+            if np.isfinite(cate_upper_values).any()
+            else None
+        ),
         "propensity_min": float(np.min(propensity)) if len(propensity) else None,
         "propensity_max": float(np.max(propensity)) if len(propensity) else None,
         "propensity_clip": propensity_clip,
@@ -5797,6 +8671,10 @@ def estimate_outer_fold(
             "status": "complete",
             "schema_version": ESTIMATION_CHECKPOINT_SCHEMA_VERSION,
             "input_fingerprint": estimation_input_fingerprint,
+            "outcome_type": outcome_type,
+            "outcome_model_contract": diagnostics["causal_forest_fit_audit"][
+                "outcome_model_contract"
+            ],
             "completed_at": _now(),
             "rows": len(heldout_ids),
         },
@@ -5804,7 +8682,7 @@ def estimate_outer_fold(
     return diagnostics
 
 
-def run_fold_analysis(
+def _run_fold_analysis_legacy(
     *,
     dataset: pd.DataFrame,
     definitions: Sequence[Mapping[str, Any]],
@@ -6158,7 +9036,9 @@ def run_fold_analysis(
             "review_converged": review_converged,
             "review_convergence": review_convergence,
             "ontology_refinement_rounds": ontology_refinement_rounds,
-            "screening_model_family": "random_forest",
+            "screening_model_family": (
+                "elastic_net_nuisance_plus_random_forest_effect_model"
+            ),
             "screening_trees": screening_trees,
             "stability_selection_policy": selection_policy,
             "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
@@ -6229,7 +9109,9 @@ def run_fold_analysis(
         "review_converged": review_converged,
         "review_convergence": review_convergence,
         "ontology_refinement_rounds": ontology_refinement_rounds,
-        "screening_model_family": "random_forest",
+        "screening_model_family": (
+            "elastic_net_nuisance_plus_random_forest_effect_model"
+        ),
         "screening_trees": screening_trees,
         "stability_selection_policy": selection_policy,
         "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
@@ -6237,4 +9119,946 @@ def run_fold_analysis(
     }
 
 
-__all__ = ["run_fold_analysis"]
+def _validated_heldout_measurement_frame(
+    frame: pd.DataFrame,
+    *,
+    heldout_ids: Sequence[int],
+    feature_names: Sequence[str],
+    source: str,
+) -> pd.DataFrame:
+    expected_columns = ["_oci_row_id", *map(str, feature_names)]
+    if list(frame.columns) != expected_columns:
+        raise ValueError(
+            f"{source} columns do not match its measurement definitions: "
+            f"expected={expected_columns!r}, actual={list(frame.columns)!r}"
+        )
+    numeric_ids = pd.to_numeric(frame["_oci_row_id"], errors="coerce")
+    if numeric_ids.isna().any() or not np.allclose(
+        numeric_ids.to_numpy(dtype=float),
+        np.rint(numeric_ids.to_numpy(dtype=float)),
+    ):
+        raise ValueError(f"{source} contains invalid row identifiers")
+    actual_ids = numeric_ids.astype(int).tolist()
+    expected_ids = [int(value) for value in heldout_ids]
+    if actual_ids != expected_ids or len(actual_ids) != len(set(actual_ids)):
+        raise ValueError(f"{source} rows do not match the outer-heldout partition")
+    validated = frame.copy()
+    validated["_oci_row_id"] = numeric_ids.astype(int)
+    return validated
+
+
+def _load_reusable_archived_heldout_measurements(
+    *,
+    output_dir: Path,
+    heldout_ids: Sequence[int],
+    measurement_definitions: Sequence[Mapping[str, Any]],
+    cache: Mapping[str, Any],
+) -> tuple[pd.DataFrame, set[str], dict[str, Any]]:
+    """Load only definition-identical raw measurements from the reselection archive."""
+
+    empty = pd.DataFrame({"_oci_row_id": [int(value) for value in heldout_ids]})
+    audit: dict[str, Any] = {
+        "schema_version": HELDOUT_MEASUREMENT_REUSE_SCHEMA_VERSION,
+        "status": "cache_rejected",
+        "cache_schema_version": cache.get("schema_version"),
+        "required_features": len(measurement_definitions),
+        "cache_available_features": 0,
+        "reused_features": [],
+        "definition_incompatible_features": [],
+    }
+    try:
+        stage2_dir = Path(output_dir).parent.resolve()
+        state_path = stage2_dir / "reselection_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, Mapping):
+            raise ValueError("reselection state is not an object")
+        if (
+            state.get("schema_version")
+            != STAGE2_RESELECTION_MIGRATION_SCHEMA_VERSION
+            or state.get("status") not in {"prepared", "complete"}
+        ):
+            raise ValueError("reselection state is not a prepared compatible migration")
+        archive_relative = Path(str(state.get("archive_path") or ""))
+        if (
+            not archive_relative.parts
+            or archive_relative.is_absolute()
+            or ".." in archive_relative.parts
+        ):
+            raise ValueError("reselection archive path is invalid")
+        archive_dir = (stage2_dir / archive_relative).resolve()
+        if stage2_dir not in archive_dir.parents:
+            raise ValueError("reselection archive escapes the Stage 2 directory")
+        manifest = json.loads((archive_dir / "manifest.json").read_text(encoding="utf-8"))
+        if (
+            not isinstance(manifest, Mapping)
+            or manifest.get("reselection_id") != state.get("reselection_id")
+            or manifest.get("policy_fingerprint") != state.get("policy_fingerprint")
+        ):
+            raise ValueError("reselection archive manifest does not match its state")
+        source_relative = Path(str(cache.get("source_artifact_path") or ""))
+        if (
+            not source_relative.parts
+            or source_relative.is_absolute()
+            or ".." in source_relative.parts
+        ):
+            raise ValueError("cached held-out artifact path is invalid")
+        archive_artifacts = (archive_dir / "artifacts").resolve()
+        source_path = (archive_artifacts / source_relative).resolve()
+        if archive_artifacts not in source_path.parents:
+            raise ValueError("cached held-out artifact escapes its archive")
+        cached_frame = pd.read_csv(source_path)
+        if _frame_fingerprint(cached_frame) != cache.get("raw_frame_fingerprint"):
+            raise ValueError("cached held-out artifact fingerprint changed")
+        raw_cached_definitions = cache.get("measurement_definitions")
+        if not isinstance(raw_cached_definitions, list) or not all(
+            isinstance(value, Mapping) for value in raw_cached_definitions
+        ):
+            raise ValueError("cached held-out measurement definitions are invalid")
+        cached_definitions = [dict(value) for value in raw_cached_definitions]
+        cached_names = [str(value.get("name") or "") for value in cached_definitions]
+        cached_frame = _validated_heldout_measurement_frame(
+            cached_frame,
+            heldout_ids=heldout_ids,
+            feature_names=cached_names,
+            source="archived held-out measurement cache",
+        )
+        audit["cache_available_features"] = len(cached_definitions)
+        audit["source_artifact_path"] = str(source_relative)
+        audit["source_frame_fingerprint"] = cache.get("raw_frame_fingerprint")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        audit["rejection_reason"] = f"{type(exc).__name__}: {exc}"
+        LOGGER.warning(
+            "Stage 2 held-out measurement cache rejected; extracting all required "
+            "components instead: %s",
+            audit["rejection_reason"],
+        )
+        return empty, set(), audit
+
+    cached_by_id = {
+        str(value.get("feature_id") or ""): value for value in cached_definitions
+    }
+    reusable_names: list[str] = []
+    incompatible_names: list[str] = []
+    for definition in measurement_definitions:
+        current_identity = frozen_measurement_definition_identity(definition)
+        cached_identity = cached_by_id.get(current_identity["feature_id"])
+        name = str(definition["name"])
+        if cached_identity == current_identity and name in cached_frame.columns:
+            reusable_names.append(name)
+        elif cached_identity is not None:
+            incompatible_names.append(name)
+    audit["status"] = "cache_accepted"
+    audit["reused_features"] = reusable_names
+    audit["definition_incompatible_features"] = incompatible_names
+    return (
+        cached_frame[["_oci_row_id", *reusable_names]].copy(),
+        set(reusable_names),
+        audit,
+    )
+
+
+def _extract_outer_heldout_measurements(
+    *,
+    dataset: pd.DataFrame,
+    heldout_ids: Sequence[int],
+    text_column: str,
+    measurement_definitions: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    request_json: RequestJSON,
+    workers: int,
+    max_prompt_chars: int,
+    feature_batch_size: int,
+    request_identity: Mapping[str, Any],
+    tokenizer: Any | None,
+    frozen_cache: Mapping[str, Any] | None,
+    serial_extraction: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Reuse archived raw components and extract only cache misses."""
+
+    heldout_dir = Path(output_dir) / "extraction" / "heldout"
+    if frozen_cache is None:
+        return extract_rows(
+            dataset=dataset,
+            row_ids=heldout_ids,
+            text_column=text_column,
+            definitions=measurement_definitions,
+            output_dir=heldout_dir,
+            request_json=request_json,
+            workers=workers,
+            max_prompt_chars=max_prompt_chars,
+            feature_batch_size=feature_batch_size,
+            request_identity=request_identity,
+            tokenizer=tokenizer,
+            **dict(serial_extraction),
+        )
+
+    cached_frame, reused_names, audit = (
+        _load_reusable_archived_heldout_measurements(
+            output_dir=output_dir,
+            heldout_ids=heldout_ids,
+            measurement_definitions=measurement_definitions,
+            cache=frozen_cache,
+        )
+    )
+    missing_definitions = [
+        definition
+        for definition in measurement_definitions
+        if str(definition["name"]) not in reused_names
+    ]
+    missing_names = [str(definition["name"]) for definition in missing_definitions]
+    if missing_definitions:
+        newly_extracted = extract_rows(
+            dataset=dataset,
+            row_ids=heldout_ids,
+            text_column=text_column,
+            definitions=missing_definitions,
+            output_dir=heldout_dir / "new_measurements",
+            request_json=request_json,
+            workers=workers,
+            max_prompt_chars=max_prompt_chars,
+            feature_batch_size=feature_batch_size,
+            request_identity=request_identity,
+            tokenizer=tokenizer,
+            **dict(serial_extraction),
+        )
+        newly_extracted = _validated_heldout_measurement_frame(
+            newly_extracted,
+            heldout_ids=heldout_ids,
+            feature_names=missing_names,
+            source="new held-out measurements",
+        )
+    else:
+        newly_extracted = pd.DataFrame(
+            {"_oci_row_id": [int(value) for value in heldout_ids]}
+        )
+
+    combined = cached_frame.merge(
+        newly_extracted,
+        on="_oci_row_id",
+        how="inner",
+        sort=False,
+        validate="one_to_one",
+    )
+    required_names = [str(definition["name"]) for definition in measurement_definitions]
+    combined = _validated_heldout_measurement_frame(
+        combined[["_oci_row_id", *required_names]],
+        heldout_ids=heldout_ids,
+        feature_names=required_names,
+        source="combined held-out measurements",
+    )
+    _write_frame(heldout_dir / "extracted.csv", combined)
+    audit.update(
+        {
+            "completed_at": _now(),
+            "rows": len(combined),
+            "required_features": len(required_names),
+            "reused_feature_count": len(reused_names),
+            "newly_extracted_feature_count": len(missing_names),
+            "newly_extracted_features": missing_names,
+            "reused_measurement_model": str(
+                frozen_cache.get("extraction_model") or ""
+            ),
+            "new_measurement_request_identity": dict(request_identity),
+            "mixed_extractor_models": bool(
+                missing_names
+                and reused_names
+                and str(frozen_cache.get("extraction_model") or "")
+                != str(request_identity.get("model") or "")
+            ),
+            "combined_frame_fingerprint": _frame_fingerprint(combined),
+        }
+    )
+    _write_json(heldout_dir / "measurement_reuse.json", audit)
+    _write_json(
+        heldout_dir / "complete.json",
+        {
+            "status": "complete",
+            "schema_version": HELDOUT_MEASUREMENT_REUSE_SCHEMA_VERSION,
+            "completed_at": _now(),
+            "rows": len(combined),
+            "features": len(required_names),
+            "reused_features": len(reused_names),
+            "newly_extracted_features": len(missing_names),
+            "combined_frame_fingerprint": _frame_fingerprint(combined),
+        },
+    )
+    return combined
+
+
+def _run_stage2_statistical_selection(
+    selector_arguments: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], list[Any]]:
+    """Run a large fold selector outside the thread-orchestration GIL."""
+
+    arguments = dict(selector_arguments)
+    candidate_count = len(arguments.get("definitions") or [])
+    if candidate_count < STATISTICAL_SELECTION_PROCESS_ISOLATION_MIN_CANDIDATES:
+        return select_stage2_features_elastic_net(**arguments)
+    LOGGER.info(
+        "Stage 2 statistical selection process isolation candidates=%s threshold=%s",
+        candidate_count,
+        STATISTICAL_SELECTION_PROCESS_ISOLATION_MIN_CANDIDATES,
+    )
+    # Loky serializes the submitted callable and does not re-import an
+    # interactive ``__main__`` module.  The large-candidate path therefore
+    # remains process isolated when called from notebooks, ``python -c``, or
+    # stdin, where the stdlib spawn executor cannot safely bootstrap.
+    with LokyProcessPoolExecutor(max_workers=1) as executor:
+        return executor.submit(
+            select_stage2_features_elastic_net,
+            **arguments,
+        ).result()
+
+
+def run_fold_analysis(
+    *,
+    dataset: pd.DataFrame,
+    definitions: Sequence[Mapping[str, Any]],
+    split: Mapping[str, Any],
+    clinical_question: str,
+    unit_id_column: str,
+    text_column: str,
+    treatment_column: str,
+    outcome_column: str,
+    outcome_type: str,
+    inner_folds: int,
+    seed: int,
+    output_dir: Path,
+    request_json: RequestJSON,
+    selection_consolidation_request_json: RequestJSON | None = None,
+    config: Any,
+    extraction_tokenizer: Any | None = None,
+    stage1_packets: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Run extraction supervision, fold-local selection, and causal-forest estimation."""
+
+    del clinical_question  # Deliberately excluded from extraction-supervisor prompts.
+    (
+        ontology_refinement_min_failure_patients,
+        max_ontology_refinement_rounds,
+    ) = _ontology_refinement_limits(config)
+    extraction_feature_batch_size = _configured_extraction_feature_batch_size(config)
+    serial_extraction = _configured_serial_extraction(config)
+    fit_ids = [int(value) for value in split["fit_row_ids"]]
+    heldout_ids = [int(value) for value in split["heldout_row_ids"]]
+    inner_splits = list(split.get("inner_splits") or []) or _fallback_inner_splits(
+        fit_ids,
+        folds=inner_folds,
+        seed=seed,
+    )
+    extraction_llm = getattr(config, "extraction_llm", None)
+    configured_extraction_model = str(getattr(extraction_llm, "model", ""))
+    runtime_extraction_model = str(
+        getattr(extraction_llm, "runtime_model", "") or ""
+    ).strip()
+    extraction_identity = {
+        "model": runtime_extraction_model or configured_extraction_model,
+        "configured_checkpoint_model": configured_extraction_model,
+        "runtime_continuation_model": runtime_extraction_model or None,
+    }
+    primary_identity = {
+        "model": str(getattr(config, "model", "")),
+    }
+    extraction_workers = int(
+        getattr(extraction_llm, "workers", getattr(config, "workers", 1))
+    )
+
+    maximum_review_rounds = int(getattr(config, "max_review_rounds", 1))
+    frozen_snapshot = _load_frozen_preselection_snapshot(
+        output_dir=output_dir,
+        dataset=dataset,
+        definitions=definitions,
+        fit_ids=fit_ids,
+        heldout_ids=heldout_ids,
+        inner_splits=inner_splits,
+        unit_id_column=unit_id_column,
+        text_column=text_column,
+        treatment_column=treatment_column,
+        outcome_column=outcome_column,
+        outcome_type=outcome_type,
+        stage1_packets=stage1_packets,
+        config=config,
+    )
+    frozen_review_convergence: dict[str, Any] | None = None
+    frozen_heldout_measurement_cache: dict[str, Any] | None = None
+    if frozen_snapshot is None:
+        current: list[dict[str, Any]] = []
+        for raw_feature in definitions:
+            feature = dict(raw_feature)
+            value_type = str(feature.get("value_type") or "ambiguous").strip().lower()
+            if value_type in {"binary", "categorical", "ordinal"}:
+                feature["categories_or_unit"] = _validated_closed_category_values(
+                    value_type=value_type,
+                    values=feature.get("categories_or_unit") or [],
+                    source=f"feature {feature.get('name')!r}",
+                )
+            current.append(_normalized_feature_modeling_definition(feature))
+        review_rounds = 0
+        ontology_refinement_rounds = 0
+        review_converged = False
+        review_history: list[dict[str, Any]] = []
+        final_fit_all: pd.DataFrame | None = None
+        final_fit_raw: pd.DataFrame | None = None
+        final_fit_definitions: list[dict[str, Any]] | None = None
+        final_fit_failure_summary: dict[str, Any] | None = None
+    else:
+        (
+            frozen_matrix,
+            frozen_definitions,
+            frozen_metadata,
+            frozen_heldout_measurement_cache,
+        ) = frozen_snapshot
+        current = [
+            _normalized_feature_modeling_definition(feature)
+            for feature in frozen_definitions
+        ]
+        review_rounds = int(frozen_metadata.get("review_rounds") or 0)
+        ontology_refinement_rounds = int(
+            frozen_metadata.get("ontology_refinement_rounds") or 0
+        )
+        review_converged = bool(frozen_metadata.get("review_converged"))
+        stored_convergence = frozen_metadata.get("review_convergence")
+        frozen_review_convergence = (
+            copy.deepcopy(dict(stored_convergence))
+            if isinstance(stored_convergence, Mapping)
+            else None
+        )
+        review_history = list(
+            (frozen_review_convergence or {}).get("history") or []
+        )
+        final_fit_all = frozen_matrix
+        final_fit_raw = frozen_matrix.copy()
+        final_fit_definitions = copy.deepcopy(current)
+        final_fit_failure_summary = {}
+        LOGGER.info(
+            "reuse frozen Stage 2 preselection snapshot: %s",
+            Path(output_dir) / "preselection",
+        )
+
+    review_round_indices = (
+        range(1, maximum_review_rounds + 1) if frozen_snapshot is None else ()
+    )
+    for round_index in review_round_indices:
+        review_rounds = round_index
+        round_dir = output_dir / "ontology_supervision" / f"round_{round_index:03d}"
+        _write_json(round_dir / "definitions_before_extraction.json", {"features": current})
+        raw_extracted, extracted_definitions, feedback_rounds = (
+            _extract_training_with_ontology_feedback(
+                dataset=dataset,
+                row_ids=fit_ids,
+                text_column=text_column,
+                definitions=current,
+                output_dir=round_dir / "extraction",
+                feedback_dir=round_dir / "failure_ontology_refinement",
+                request_json=request_json,
+                workers=extraction_workers,
+                max_prompt_chars=int(config.extraction_max_prompt_chars),
+                feature_batch_size=extraction_feature_batch_size,
+                minimum_failure_patients=ontology_refinement_min_failure_patients,
+                max_refinement_rounds=max_ontology_refinement_rounds,
+                request_identity=extraction_identity,
+                tokenizer=extraction_tokenizer,
+                prior_extracted=final_fit_raw,
+                prior_definitions=final_fit_definitions,
+                prior_failure_summary=final_fit_failure_summary,
+                **serial_extraction,
+            )
+        )
+        ontology_refinement_rounds += feedback_rounds
+        extracted_definitions = [
+            _normalized_feature_modeling_definition(feature)
+            for feature in extracted_definitions
+        ]
+        failure_summary = json.loads(
+            (
+                round_dir
+                / "failure_ontology_refinement"
+                / "final_failure_summary.json"
+            ).read_text(encoding="utf-8")
+        )
+        extracted, extracted_definitions, harmonization = _harmonize_training_extraction(
+            extracted=raw_extracted,
+            definitions=extracted_definitions,
+            output_dir=round_dir / "harmonization",
+            request_json=request_json,
+            max_prompt_chars=int(config.max_prompt_chars),
+        )
+        summaries = feature_summaries(extracted, extracted_definitions)
+        _write_json(round_dir / "aggregate_extraction_summary.json", summaries)
+        reviewed, changed, review_report = _request_aggregate_ontology_supervisor(
+            definitions=extracted_definitions,
+            summaries=summaries,
+            failure_summary=failure_summary,
+            output_dir=round_dir / "supervisor",
+            request_json=request_json,
+            workers=int(getattr(config, "workers", 1)),
+            request_identity=primary_identity,
+        )
+        final_fit_all = extracted
+        final_fit_raw = raw_extracted
+        final_fit_definitions = extracted_definitions
+        final_fit_failure_summary = failure_summary
+        current = [
+            _normalized_feature_modeling_definition(feature) for feature in reviewed
+        ]
+        review_history.append(
+            {
+                "round": round_index,
+                "failure_ontology_refinement_rounds": feedback_rounds,
+                "harmonization": harmonization,
+                "supervisor_changed_feature_ids": list(
+                    review_report["changed_feature_ids"]
+                ),
+            }
+        )
+        _write_json(
+            round_dir / "complete.json",
+            {
+                "status": "complete",
+                "schema_version": REVIEW_CHECKPOINT_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "ontology_changed": changed,
+                "features": len(current),
+            },
+        )
+        if not changed:
+            review_converged = True
+            break
+
+    if (
+        final_fit_all is None
+        or final_fit_raw is None
+        or final_fit_definitions is None
+        or final_fit_failure_summary is None
+    ):
+        raise RuntimeError("Stage 2 ontology supervision did not perform extraction")
+
+    # A revision in the last allowed supervisor round has not yet been applied
+    # to patient text. Re-extract only changed candidates before statistical tests.
+    if frozen_snapshot is not None:
+        pass
+    elif _value_fingerprint(final_fit_definitions) != _value_fingerprint(current):
+        final_fit_raw, current, feedback_rounds = _extract_training_with_ontology_feedback(
+            dataset=dataset,
+            row_ids=fit_ids,
+            text_column=text_column,
+            definitions=current,
+            output_dir=output_dir / "extraction" / "all_candidates_fit",
+            feedback_dir=output_dir / "extraction" / "all_candidates_fit_refinement",
+            request_json=request_json,
+            workers=extraction_workers,
+            max_prompt_chars=int(config.extraction_max_prompt_chars),
+            feature_batch_size=extraction_feature_batch_size,
+            minimum_failure_patients=ontology_refinement_min_failure_patients,
+            max_refinement_rounds=max_ontology_refinement_rounds,
+            request_identity=extraction_identity,
+            tokenizer=extraction_tokenizer,
+            prior_extracted=final_fit_raw,
+            prior_definitions=final_fit_definitions,
+            prior_failure_summary=final_fit_failure_summary,
+            **serial_extraction,
+        )
+        ontology_refinement_rounds += feedback_rounds
+        final_fit_all, current, _ = _harmonize_training_extraction(
+            extracted=final_fit_raw,
+            definitions=current,
+            output_dir=output_dir / "extraction" / "all_candidates_fit_harmonization",
+            request_json=request_json,
+            max_prompt_chars=int(config.max_prompt_chars),
+        )
+    else:
+        _write_frame(
+            output_dir / "extraction" / "all_candidates_fit" / "extracted.csv",
+            final_fit_all,
+        )
+
+    selection_dir = output_dir / "selection"
+    legacy_selection_path = selection_dir / "statistical_selection.json"
+    if legacy_selection_path.exists():
+        raise RuntimeError(
+            "this outer fold contains a retired Stage 2 p-value-screen checkpoint. "
+            "Preserve it for audit and use guarded reselection for the group-elastic-net "
+            "selection schema."
+        )
+    if str(getattr(config, "input_temporal_scope", "")) != TEMPORAL_SCOPE:
+        raise ValueError(
+            f"Stage 2 requires input_temporal_scope={TEMPORAL_SCOPE!r}; it does not "
+            "perform semantic temporal filtering"
+        )
+    statistical_policy = getattr(config, "statistical_selection", None)
+    if statistical_policy is None:
+        raise ValueError("Stage 2 config is missing statistical_selection policy")
+    consolidation_policy = getattr(config, "selection_consolidation", None)
+    if consolidation_policy is None:
+        raise ValueError("Stage 2 config is missing selection_consolidation policy")
+    selection_input = {
+        "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+        "temporal_scope": TEMPORAL_SCOPE,
+        "extracted_fit_fingerprint": _frame_fingerprint(final_fit_all),
+        "treatment_outcome_fingerprint": _frame_fingerprint(
+            dataset.iloc[fit_ids][[treatment_column, outcome_column]].reset_index(drop=True)
+        ),
+        "stage1_packets_fingerprint": _value_fingerprint(list(stage1_packets)),
+        "definitions": current,
+        "inner_splits": inner_splits,
+        "outcome_type": outcome_type,
+        "selection_consolidation_policy": consolidation_policy.scientific_dict(),
+        "selection_consolidation_llm_model": str(getattr(config, "model", "")),
+        "statistical_selection_policy": statistical_policy.public_dict(),
+    }
+    selection_fingerprint = _value_fingerprint(selection_input)
+    selection_report_path = selection_dir / "elastic_net_selection.json"
+    selected_path = selection_dir / "selected_definitions.json"
+    dependencies_path = selection_dir / "measurement_definitions.json"
+    latent_states_path = selection_dir / "selected_latent_states.json"
+    selection_complete_path = selection_dir / "complete.json"
+    selection_input_path = selection_dir / "input.json"
+    selection_report: dict[str, Any] | None = None
+    selected: list[dict[str, Any]] | None = None
+    measurement_definitions: list[dict[str, Any]] | None = None
+    latent_states: list[dict[str, Any]] | None = None
+    modeling_fit_frame: pd.DataFrame | None = None
+    if (
+        selection_report_path.is_file()
+        and selected_path.is_file()
+        and dependencies_path.is_file()
+        and latent_states_path.is_file()
+        and selection_complete_path.is_file()
+        and selection_input_path.is_file()
+    ):
+        try:
+            completion = json.loads(selection_complete_path.read_text(encoding="utf-8"))
+            prior_input = json.loads(selection_input_path.read_text(encoding="utf-8"))
+            cached_report = json.loads(selection_report_path.read_text(encoding="utf-8"))
+            cached_selected = json.loads(selected_path.read_text(encoding="utf-8"))
+            cached_dependencies = json.loads(dependencies_path.read_text(encoding="utf-8"))
+            cached_latent_states = json.loads(latent_states_path.read_text(encoding="utf-8"))
+            if (
+                completion.get("input_fingerprint") == selection_fingerprint
+                and prior_input.get("input_fingerprint") == selection_fingerprint
+                and cached_report.get("schema_version")
+                == STAGE2_ROLE_SELECTION_SCHEMA_VERSION
+                and isinstance(cached_selected.get("features"), list)
+                and isinstance(cached_dependencies.get("features"), list)
+                and isinstance(cached_latent_states.get("latents"), list)
+            ):
+                selection_report = dict(cached_report)
+                selected = [dict(feature) for feature in cached_selected["features"]]
+                measurement_definitions = [
+                    dict(feature) for feature in cached_dependencies["features"]
+                ]
+                latent_states = [dict(item) for item in cached_latent_states["latents"]]
+                modeling_fit_frame = materialize_selected_latents(
+                    frame=final_fit_all,
+                    latent_states=latent_states,
+                    measurement_definitions=measurement_definitions,
+                )
+                LOGGER.info(
+                    "skip completed Stage 2 group-elastic-net selection: %s",
+                    selection_dir,
+                )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            selection_report = None
+            selected = None
+            measurement_definitions = None
+            latent_states = None
+    elif selection_complete_path.is_file():
+        try:
+            incompatible = json.loads(
+                selection_complete_path.read_text(encoding="utf-8")
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            incompatible = {}
+        if incompatible.get("schema_version") not in {
+            None,
+            STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+        }:
+            raise RuntimeError(
+                "this outer fold contains an incompatible Stage 2 selection schema. "
+                "Preserve it for audit and use a fresh Stage 2 output directory."
+            )
+    if (
+        selection_report is None
+        or selected is None
+        or measurement_definitions is None
+        or latent_states is None
+    ):
+        _write_json(
+            selection_input_path,
+            {**selection_input, "input_fingerprint": selection_fingerprint},
+        )
+        (
+            consolidated_fit,
+            consolidated_definitions,
+            consolidation_report,
+            all_latent_entries,
+        ) = consolidate_stage2_candidates(
+            extracted_fit=final_fit_all,
+            definitions=current,
+            request_json=selection_consolidation_request_json or request_json,
+            policy=consolidation_policy,
+            output_dir=selection_dir / "candidate_consolidation",
+            request_model=str(getattr(config, "model", "")),
+            request_runtime_identity=(
+                {
+                    "endpoint": str(consolidation_policy.runtime_llm_endpoint),
+                    "model": str(consolidation_policy.runtime_llm_model),
+                }
+                if str(consolidation_policy.runtime_llm_endpoint).strip()
+                else None
+            ),
+        )
+        (
+            selected,
+            elastic_net_report,
+            _elastic_net_dependencies,
+            _elastic_net_latent_states,
+        ) = _run_stage2_statistical_selection(
+            {
+                "dataset": dataset,
+                "extracted_fit": consolidated_fit,
+                "definitions": consolidated_definitions,
+                "inner_splits": inner_splits,
+                "treatment_column": treatment_column,
+                "outcome_column": outcome_column,
+                "outcome_type": outcome_type,
+                "seed": seed,
+                "policy": statistical_policy,
+            }
+        )
+        measurement_definitions = measurement_definitions_for_selected(
+            selected,
+            current,
+        )
+        latent_states = latent_states_for_selected(selected, all_latent_entries)
+        selection_report = {
+            **elastic_net_report,
+            "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+            "elastic_net_component_schema_version": ELASTIC_NET_COMPONENT_SCHEMA_VERSION,
+            "latent_construction": (
+                "sequential_semantic_association_consolidation"
+                if consolidation_policy.enabled
+                else "disabled"
+            ),
+            "pairwise_association_screen": (
+                "unsupervised_preselection_consolidation_only"
+                if consolidation_policy.enabled
+                else "disabled"
+            ),
+            "preselection_consolidation": consolidation_report,
+            "candidate_counts": {
+                "before_consolidation": len(current),
+                "after_consolidation": len(consolidated_definitions),
+                "selected": len(selected),
+            },
+            "measurement_dependency_feature_ids": [
+                str(feature["feature_id"]) for feature in measurement_definitions
+            ],
+            "selected_latent_ids": [
+                str(item["latent_id"]) for item in latent_states
+            ],
+        }
+        modeling_fit_frame = consolidated_fit
+        _write_json(selection_report_path, selection_report)
+        _write_json(selected_path, {"features": selected})
+        _write_json(dependencies_path, {"features": measurement_definitions})
+        _write_json(latent_states_path, {"latents": latent_states})
+        _write_json(
+            selection_complete_path,
+            {
+                "status": "complete",
+                "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+                "completed_at": _now(),
+                "input_fingerprint": selection_fingerprint,
+                "retained_features": len(selected),
+                "measurement_dependencies": len(measurement_definitions),
+                "selected_latents": len(latent_states),
+            },
+        )
+
+    if modeling_fit_frame is None:
+        raise RuntimeError("Stage 2 selection did not produce a modeling fit frame")
+    selected_names = [str(feature["name"]) for feature in selected]
+    fit_selected = modeling_fit_frame[["_oci_row_id", *selected_names]].copy()
+    _write_frame(output_dir / "extraction" / "fit" / "extracted.csv", fit_selected)
+    _write_frame(output_dir / "extraction" / "fit" / "harmonized.csv", fit_selected)
+    if selected:
+        _assert_extraction_health(
+            fit_selected,
+            selected,
+            scope="training",
+            minimum_row_nonmissing_fraction=float(config.min_nonmissing_fraction),
+            audit_path=output_dir / "extraction" / "fit_health.json",
+        )
+    else:
+        _write_json(
+            output_dir / "extraction" / "fit_health.json",
+            {
+                "schema_version": "stage2_final_extraction_health_v1",
+                "status": "not_applicable_no_selected_features",
+                "scope": "training",
+                "rows": len(fit_selected),
+                "features": 0,
+            },
+        )
+
+    heldout_raw = _extract_outer_heldout_measurements(
+        dataset=dataset,
+        heldout_ids=heldout_ids,
+        text_column=text_column,
+        measurement_definitions=measurement_definitions,
+        output_dir=output_dir,
+        request_json=request_json,
+        workers=extraction_workers,
+        max_prompt_chars=int(config.extraction_max_prompt_chars),
+        feature_batch_size=extraction_feature_batch_size,
+        request_identity=extraction_identity,
+        tokenizer=extraction_tokenizer,
+        frozen_cache=frozen_heldout_measurement_cache,
+        serial_extraction=serial_extraction,
+    )
+    heldout_measurements, heldout_harmonization = _apply_harmonization_plans(
+        heldout_raw,
+        measurement_definitions,
+        scope="outer_heldout",
+    )
+    _write_frame(
+        output_dir / "extraction" / "heldout" / "measurement_harmonized.csv",
+        heldout_measurements,
+    )
+    _write_json(
+        output_dir / "extraction" / "heldout" / "harmonization.json",
+        heldout_harmonization,
+    )
+    heldout_with_latents = materialize_selected_latents(
+        frame=heldout_measurements,
+        latent_states=latent_states,
+        measurement_definitions=measurement_definitions,
+    )
+    heldout_extraction = heldout_with_latents[["_oci_row_id", *selected_names]].copy()
+    _write_frame(
+        output_dir / "extraction" / "heldout" / "harmonized.csv",
+        heldout_extraction,
+    )
+    if selected:
+        _assert_extraction_health(
+            heldout_extraction,
+            selected,
+            scope="heldout",
+            minimum_row_nonmissing_fraction=float(config.min_nonmissing_fraction),
+            audit_path=output_dir / "extraction" / "heldout_health.json",
+        )
+    else:
+        _write_json(
+            output_dir / "extraction" / "heldout_health.json",
+            {
+                "schema_version": "stage2_final_extraction_health_v1",
+                "status": "not_applicable_no_selected_features",
+                "scope": "heldout",
+                "rows": len(heldout_extraction),
+                "features": 0,
+            },
+        )
+
+    harmonization_validation_fallbacks = [
+        {
+            "feature_id": str(feature["feature_id"]),
+            "name": str(feature["name"]),
+            **copy.deepcopy(feature["harmonization_fallback"]),
+        }
+        for feature in measurement_definitions
+        if isinstance(feature.get("harmonization_fallback"), Mapping)
+    ]
+    review_convergence = frozen_review_convergence or {
+        "schema_version": REVIEW_CONVERGENCE_SCHEMA_VERSION,
+        "status": "converged" if review_converged else "maximum_rounds_reached",
+        "converged": review_converged,
+        "review_rounds": review_rounds,
+        "maximum_review_rounds": maximum_review_rounds,
+        "continued_with_latest_ontology": not review_converged,
+        "history": review_history,
+    }
+    if frozen_review_convergence is not None:
+        review_convergence = {
+            **review_convergence,
+            "reused_frozen_preselection_snapshot": True,
+        }
+    _write_json(output_dir / "ontology_supervision" / "convergence.json", review_convergence)
+    _write_json(
+        output_dir / "final_definitions.json",
+        {
+            "schema_version": STAGE2_ROLE_SELECTION_SCHEMA_VERSION,
+            "features": selected,
+            "measurement_dependencies": measurement_definitions,
+            "selected_latent_states_artifact": str(latent_states_path),
+            "all_candidate_features": len(current),
+            "active_candidates_after_consolidation": int(
+                selection_report.get("candidate_counts", {}).get(
+                    "after_consolidation", len(current)
+                )
+            ),
+            "selection_consolidation_artifact": str(
+                selection_dir / "candidate_consolidation" / "report.json"
+            ),
+            "review_rounds": review_rounds,
+            "evaluation_rounds": review_rounds,
+            "review_converged": review_converged,
+            "review_convergence": review_convergence,
+            "ontology_refinement_rounds": ontology_refinement_rounds,
+            "selection_artifact": str(selection_dir / "elastic_net_selection.json"),
+            "screening_model_family": (
+                "group_elastic_net_nuisance_and_candidate_augmented_rlearner"
+            ),
+            "final_model_family": "causal_forest_dml",
+            "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
+        },
+    )
+    combined = pd.concat([fit_selected, heldout_extraction], ignore_index=True).sort_values(
+        "_oci_row_id"
+    )
+    _write_frame(output_dir / "extraction" / "extracted_features.csv", combined)
+    diagnostics = estimate_outer_fold(
+        dataset=dataset,
+        extracted_fit=fit_selected,
+        extracted_heldout=heldout_extraction,
+        definitions=selected,
+        split=split,
+        unit_id_column=unit_id_column,
+        treatment_column=treatment_column,
+        outcome_column=outcome_column,
+        outcome_type=outcome_type,
+        inner_folds=inner_folds,
+        seed=seed,
+        propensity_clip=float(config.propensity_clip),
+        estimation_trees=int(config.estimation_trees),
+        output_dir=output_dir / "estimation",
+    )
+    return {
+        "features": selected,
+        "review_rounds": review_rounds,
+        "evaluation_rounds": review_rounds,
+        "review_converged": review_converged,
+        "review_convergence": review_convergence,
+        "ontology_refinement_rounds": ontology_refinement_rounds,
+        "screening_model_family": (
+            "group_elastic_net_nuisance_and_candidate_augmented_rlearner"
+        ),
+        "selection": selection_report,
+        "measurement_dependencies": measurement_definitions,
+        "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
+        "estimation": diagnostics,
+    }
+
+
+__all__ = [
+    "HELDOUT_MEASUREMENT_CACHE_SCHEMA_VERSION",
+    "HELDOUT_MEASUREMENT_REUSE_SCHEMA_VERSION",
+    "PRESELECTION_SNAPSHOT_SCHEMA_VERSION",
+    "Stage2InfrastructureError",
+    "Stage2RequestExhaustedError",
+    "Stage2ResponseValidationError",
+    "frozen_measurement_definition_identity",
+    "frozen_preselection_review_policy",
+    "infrastructure_failure_audit_paths",
+    "run_fold_analysis",
+]

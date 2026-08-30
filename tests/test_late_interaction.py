@@ -97,3 +97,69 @@ def test_late_interaction_pair_scorer_deduplicates_and_chunks(monkeypatch):
     assert encoder.query_calls == [["Age", "Renal"]]
     assert len(encoder.document_calls) == 1
     assert len(encoder.document_calls[0]) > 2
+
+
+def test_document_only_encoder_deduplicates_and_can_strip_colbert_framing(monkeypatch):
+    class Tokenizer:
+        def __init__(self):
+            self.tokens = {}
+            self.reverse = {}
+
+        def encode(self, text, add_special_tokens=False):
+            values = []
+            for token in text.split():
+                if token not in self.tokens:
+                    token_id = len(self.tokens) + 1
+                    self.tokens[token] = token_id
+                    self.reverse[token_id] = token
+                values.append(self.tokens[token])
+            return values
+
+        def decode(self, token_ids, **_kwargs):
+            return " ".join(self.reverse[token_id] for token_id in token_ids)
+
+        def num_special_tokens_to_add(self, pair=False):
+            return 2
+
+    class Encoder:
+        document_length = 12
+        document_encoding_prefix = "[DOC] "
+
+        def __init__(self):
+            self.tokenizer = Tokenizer()
+            self.document_calls = []
+
+        def encode_documents(self, texts):
+            self.document_calls.append(list(texts))
+            return [
+                np.asarray(
+                    [
+                        [1.0, 0.0],  # CLS
+                        [1.0, 0.0],  # document marker
+                        [0.0, 1.0],  # content
+                        [1.0, 0.0],  # SEP
+                    ],
+                    dtype=np.float32,
+                )
+                for _text in texts
+            ]
+
+    encoder = Encoder()
+    monkeypatch.setattr(late_interaction, "_load_encoder", lambda *_args: encoder)
+    monkeypatch.setattr(
+        late_interaction,
+        "_StanfordColbertCompatibilityAdapter",
+        Encoder,
+    )
+
+    matrices = late_interaction.encode_late_interaction_documents(
+        ["same evidence", "same evidence"],
+        "test-model",
+        strip_common_framing_tokens=True,
+    )
+
+    assert len(encoder.document_calls) == 1
+    assert encoder.document_calls == [["same evidence"]]
+    assert len(matrices) == 2
+    assert matrices[0].tolist() == [[0.0, 1.0]]
+    assert matrices[1].tolist() == [[0.0, 1.0]]

@@ -1,0 +1,208 @@
+STAGE 2 PIPELINE REPORT
+=======================
+
+Current implementation as of 30 August 2026
+
+
+PURPOSE
+-------
+
+Stage 2 turns fold-scoped Stage 1 evidence into measured pretreatment variables
+and held-out causal estimates. It is an outer-cross-fitting workflow: every
+decision that can adapt to the data is learned inside one outer-training
+partition, frozen, and only then applied to that fold's held-out patients.
+
+The workflow requires the Stage 1 handoff, a stable patient identifier, clinical
+text, binary treatment, numeric outcome, and outer/inner split provenance. A
+definition-only run may stop before patient extraction and estimation.
+
+Oracle columns never participate in evidence compilation, discovery,
+operationalization, extraction, supervision, selection, or fitting. If an
+oracle individual effect is available, it is loaded only for post-run
+evaluation of already-frozen artifacts.
+
+
+CURRENT FLOW FOR ONE OUTER FOLD
+-------------------------------
+
+1. Compile Stage 1 evidence
+
+   The only supported compiler is semantic_cluster_cards_v2. It applies the
+   scientific allowlist, removes exact duplicates while retaining provenance,
+   and creates a fold-local semantic-card atlas. It verifies that every frozen
+   Stage 1 architecture selected for the run is present. Cards, exact members,
+   lineage, and the reduction summary are written under
+   stage2/evidence_compilation/.
+
+2. Discover candidates exhaustively
+
+   Every compiled card is sent to primary-model feature discovery. The model
+   lists all pretreatment patient-level features supported or implied by the
+   supplied evidence. One card may support more than one candidate.
+
+   There is no evidence-community graph, ColBERT candidate router, candidate
+   retrieval filter, hard candidate cap, or discovery-time causal-role filter.
+   Documentation or artifacts describing selected_candidates.json or a
+   candidate-registry ranking refer to an older pipeline and are not current.
+
+3. Merge aliases and operationalize every candidate
+
+   Exact normalized names are coalesced first. The remaining names enter
+   repeated merge-only batches: shifted alphabetical batches in early rounds
+   and deterministic shuffled batches later. A directive may merge aliases but
+   cannot exclude a candidate; every unmentioned candidate passes through.
+
+   Explicit investigator definitions are protected. They cannot be renamed,
+   merged with a distinct configured feature, revised, or stripped of their
+   configured roles.
+
+   The primary model then receives one canonical candidate and its readable
+   supporting evidence. It supplies the value type, unit or categories,
+   measurement rule, and missing-value rule. Invalid responses receive bounded
+   repair; persistent failure is recorded and uses a conservative ambiguous
+   ontology instead of silently dropping the feature.
+
+4. Extract all candidates on outer-training patients
+
+   The extraction model receives exactly one patient per prompt, with bounded
+   feature batches and document chunks. Every candidate is extracted before
+   statistical selection. Each batch has ordinary input/result/completion
+   checkpoints.
+
+   Continuous definitions may preserve a documented categorical or threshold
+   value when no exact number exists. Mixed numeric/categorical training values
+   receive a training-only harmonization plan. That plan is frozen and applied
+   deterministically to later rows; ambiguous mappings become null and are
+   audited.
+
+5. Supervise the extraction ontology
+
+   The primary model reviews aggregate training values and validation failures,
+   not patient text, treatment, outcomes, roles, metrics, or p-values. It may
+   keep or revise the same feature's extraction schema, but may not add, drop,
+   split, merge, rename, or role-label features. A revision triggers incremental
+   re-extraction only for changed definitions. Supervision is bounded and
+   explicit ontologies stay locked.
+
+6. Optionally consolidate equivalent extracted measurements
+
+   selection/candidate_consolidation/ is an unsupervised, outer-training-only
+   alias pass. In original-candidate order, an embedding retrieves nearby active
+   definitions and Python computes mixed-type pairwise association evidence.
+   The model may leave them separate or propose a canonical measurement.
+
+   A replacement is accepted only when every source pair is evaluable and
+   clears the configured association threshold (0.85 by default), the sources
+   describe the same attribute at the same scope and granularity, and the rule
+   is demonstrably information preserving. Sources and output must retain value
+   type, unit/category granularity, and missingness. Continuous aliases may only
+   coalesce. Categorical aliases may coalesce identical vocabularies or use an
+   injective synonymous-category recode.
+
+   Crucially, whenever two aliases are nonmissing on the same training row,
+   their numeric values or their canonical recoded categories must agree.
+   Conflicting overlaps reject the proposal; source order may not silently win.
+   Malformed values that violate a continuous ontology retain the documented
+   behavior of being treated as missing before coalescing.
+
+   Accepted latents enter later retrievals immediately. Original columns and
+   recursive measurement lineage remain available for audit and held-out
+   reconstruction. Disabled or trivial consolidation still writes the report
+   referenced by final definitions.
+
+7. Assign roles with group elastic nets and held-out R-loss
+
+   Every inner-training partition fits a logistic group elastic net for
+   treatment and a separate group elastic net for marginal outcome. A nominal
+   factor's contrasts and missingness indicator form one all-in/all-out group;
+   continuous and ordered measurements use standardized score groups.
+
+   A feature selected in at least one inner fold for either nuisance task enters
+   the outer-fold confounder union. There is no intersection or vote-frequency
+   gate. Both nuisance tasks use that common union.
+
+   Candidate-specific cross-fitted nuisance calibrations feed a
+   ridge-stabilized R-learner. Each candidate is scored by the held-out R-loss
+   gain from adding all estimable treatment interactions for that candidate.
+   The ten largest gains per inner fold are retained by default, even if a gain
+   is nonpositive; the deduplicated union (at most 50 for five folds) supplies
+   final effect modifiers.
+
+   Large candidate sets run their CPU-bound selector in a loky process. This
+   process isolation is safe for CLI, notebook, python -c, and stdin callers and
+   does not require the caller to wrap execution in an __main__ guard.
+
+8. Freeze definitions and extract held-out dependencies
+
+   final_definitions.json records selected roles, original measurement
+   dependencies, latent states, and consolidation-report provenance. Only the
+   dependencies required by selected definitions are extracted on held-out
+   notes. Frozen harmonization and latent states are applied without seeing
+   held-out outcomes.
+
+9. Estimate effects
+
+   An honest EconML CausalForestDML uses effect modifiers in X and pure
+   confounders in W; a dual-role variable appears once in X. If no modifier is
+   selected, a constant-effect design preserves the causal-forest estimator.
+
+   The supported nuisance family is cross-validated elastic net: logistic for
+   treatment and binary outcome, squared-error for continuous outcome. The
+   former strict random-forest runtime-config contract has been retired and is
+   not an alternate estimator path. Diagnostics audit configured parameters and
+   every fitted EconML nuisance clone, including the selected regularization,
+   effective CV folds, and whether its optimizer reached the iteration limit.
+
+   Each held-out row receives propensity, mu0, mu1, AIPW score, conditional
+   effect, and available causal-forest uncertainty bounds.
+
+10. Aggregate outer folds
+
+   Exactly one held-out prediction per patient is combined into
+   cross_fitted_predictions.csv. The cross-fitted AIPW scores produce the
+   reported average treatment effect, standard error, and confidence interval.
+   Feature and role stability are summarized across folds.
+
+
+IMPORTANT OUTPUTS
+-----------------
+
+stage2/evidence_compilation/
+    Compiled cards, exact members, lineage, and reduction audit.
+
+stage2/outer_NNN/feature_definitions.json
+    Operationalized definitions before training extraction.
+
+stage2/outer_NNN/ontology_supervision/
+    Aggregate review rounds, incremental re-extraction, and convergence.
+
+stage2/outer_NNN/selection/candidate_consolidation/
+    Sequential alias inputs, per-pivot decisions, repair/fallback events,
+    report.json, registry.json, and completion marker.
+
+stage2/outer_NNN/selection/elastic_net_selection.json
+    Inner-fold nuisance votes, cross-fitted diagnostics, candidate R-loss
+    comparisons, selected confounder union, and modifier union.
+
+stage2/outer_NNN/final_definitions.json
+    Frozen selected roles and measurement/latent dependencies.
+
+stage2/outer_NNN/estimation/{predictions.csv,diagnostics.json,complete.json}
+    Held-out fold predictions and audited fitted estimator details.
+
+stage2/{cross_fitted_predictions.csv,causal_estimate.json,summary.json}
+    Cross-fold results.
+
+
+RESUME AND RESELECTION
+----------------------
+
+Scientific leaves use semantic input fingerprints and write completion markers.
+Rerunning the same command resumes at the first incomplete or invalidated leaf.
+Endpoint URLs and worker counts are transport details; model identities and
+scientific settings remain part of the relevant checkpoint decisions.
+
+Use --stage2-reselect for the guarded workflow that preserves post-ontology
+definitions and all-candidate training extraction, archives selection and later
+artifacts, and recomputes selection, held-out extraction, and estimation. It is
+not a general request to reuse scientifically incompatible checkpoints.
