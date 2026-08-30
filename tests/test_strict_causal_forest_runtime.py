@@ -5,11 +5,16 @@ import numpy as np
 import pytest
 from econml.dml import CausalForestDML
 from econml.grf import CausalForest as EconMLCausalForest
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import StratifiedKFold
 
 import oci.models.causal_forest_head as head_module
 from oci.models.causal_forest_head import CausalForestHead
+from oci.models.elastic_net_nuisance import (
+    ElasticNetLogisticClassifier,
+    ElasticNetRegressor,
+)
 from oci.models.strict_causal_forest_runtime import (
     CAUSAL_FOREST_IMPLEMENTATION,
     OUTCOME_FOREST_IMPLEMENTATION,
@@ -418,8 +423,8 @@ def test_prediction_calls_explicit_binary_treatment_contrast():
 @pytest.mark.parametrize(
     ("outcome_type", "expected_class", "discrete_outcome", "prediction_interface"),
     [
-        ("binary", RandomForestClassifier, True, "predict_proba"),
-        ("continuous", RandomForestRegressor, False, "predict"),
+        ("binary", ElasticNetLogisticClassifier, True, "predict_proba"),
+        ("continuous", ElasticNetRegressor, False, "predict"),
     ],
 )
 def test_convenience_head_uses_outcome_typed_nuisance_model(
@@ -433,7 +438,8 @@ def test_convenience_head_uses_outcome_typed_nuisance_model(
         n_estimators=8,
         subforest_size=4,
         min_samples_leaf=2,
-        nuisance_n_estimators=5,
+        nuisance_regularization_grid_size=5,
+        nuisance_max_iter=500,
         tune_model=False,
         n_jobs=1,
     )
@@ -449,6 +455,56 @@ def test_convenience_head_uses_outcome_typed_nuisance_model(
         ]
         == prediction_interface
     )
+
+
+def test_fitted_causal_forest_crossfits_elastic_net_nuisance_models():
+    effect, control, treatment, outcome = _data()
+    head = CausalForestHead(
+        outcome_type="binary",
+        n_estimators=8,
+        subforest_size=4,
+        min_samples_leaf=2,
+        nuisance_regularization_grid_size=5,
+        nuisance_maximum_log10_c=2.0,
+        nuisance_max_iter=10_000,
+        nuisance_tolerance=1e-4,
+        tune_model=False,
+        n_jobs=1,
+    ).fit(
+        X=effect,
+        W=control,
+        T=treatment,
+        Y=outcome,
+    )
+
+    assert all(
+        type(model) is ElasticNetLogisticClassifier
+        for monte_carlo_models in head.model.models_t
+        for model in monte_carlo_models
+    )
+    assert all(
+        type(model) is ElasticNetLogisticClassifier
+        for monte_carlo_models in head.model.models_y
+        for model in monte_carlo_models
+    )
+    assert head.fit_audit()["effective_nuisance_parameters"]["model_family"] == (
+        "elastic_net"
+    )
+
+
+def test_elastic_net_nuisance_wrappers_are_clone_safe_and_handle_empty_designs():
+    design = np.empty((4, 0), dtype=float)
+    classifier = clone(ElasticNetLogisticClassifier()).fit(
+        design,
+        np.array([0, 1, 0, 1]),
+    )
+    regressor = clone(ElasticNetRegressor()).fit(
+        design,
+        np.array([1.0, 2.0, 3.0, 4.0]),
+    )
+
+    np.testing.assert_allclose(classifier.predict_proba(design)[:, 1], 0.5)
+    np.testing.assert_allclose(regressor.predict(design), 2.5)
 
 
 def test_binary_convenience_head_rejects_nonbinary_outcomes():
@@ -495,6 +551,7 @@ def test_explicit_crossfit_preserves_implicit_cv2_predictions_and_n_jobs():
         random_state=42,
         tune_model=False,
         subforest_size=4,
+        nuisance_model_family="random_forest",
         nuisance_n_estimators=5,
         nuisance_max_depth=None,
         nuisance_min_samples_leaf=2,
@@ -518,6 +575,7 @@ def test_explicit_crossfit_preserves_implicit_cv2_predictions_and_n_jobs():
         random_state=42,
         tune_model=False,
         subforest_size=4,
+        nuisance_model_family="random_forest",
         nuisance_n_estimators=5,
         nuisance_max_depth=None,
         nuisance_min_samples_leaf=2,

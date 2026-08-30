@@ -216,8 +216,10 @@ An external endpoint configuration is:
       "internal_cv_folds": 3,
       "regularization_grid_size": 16,
       "one_standard_error_rule": true,
-      "nuisance_forest_trees": 200,
-      "modifier_top_n_per_inner_fold": 5
+      "nuisance_prediction_one_standard_error_rule": false,
+      "modifier_top_n_per_inner_fold": 10,
+      "modifier_ridge_alpha": 10.0,
+      "modifier_continuous_winsor_quantile": 0.005
     },
     "estimation_trees": 200,
     "explicit_features": [
@@ -953,20 +955,20 @@ penalized as one group, so its selection does not depend on one surviving dummy
 coefficient. Feature groups earn treatment and outcome votes separately. A
 single vote in either task places the feature in the outer-fold confounder
 union; their intersection and higher vote thresholds are never required. Both
-the propensity and marginal-outcome nuisance forests use that common union.
+the propensity and marginal-outcome grouped elastic nets use that common union.
 For binary targets, the report records inner-heldout and pooled out-of-fold
 AUROC alongside log loss.
 
-Those forests generate one inner-heldout propensity and outcome prediction for
-every outer-training row. Within each inner fold, a separate outcome regression
-is fit for every candidate using the two cross-fitted nuisance predictions,
-observed treatment, the candidate main effect, and the observed-treatment-by-
-candidate interaction. Binary outcomes use logistic regression. All estimable
-interaction contrasts for a categorical candidate receive one joint likelihood-
-ratio test; continuous outcomes retain the analogous grouped partial-F test.
-The five candidates with the smallest raw interaction p-values per inner fold
-are selected by default, and their union enters the final causal forest. The
-nuisance screens continue to use the one-standard-error rule. Pairwise
+Those elastic nets generate one inner-heldout propensity and outcome prediction
+for every outer-training row. Within each inner fold, candidate-specific grouped
+elastic-net calibrations augment both nuisances using nested cross-fitting. A
+ridge-stabilized R-learner compares constant and candidate-varying treatment-
+effect models on untouched inner-heldout rows. All estimable interaction
+contrasts for a categorical candidate enter together and receive one held-out
+R-loss score. The ten largest gains per inner fold are selected by default,
+without a positive-gain gate, and their deduplicated union enters the final
+causal forest. The nuisance screens continue to use the one-standard-error rule.
+Pairwise
 associations and the LLM are confined to the preceding unsupervised
 consolidation; they do not assign roles or gate statistical support.
 
@@ -975,9 +977,9 @@ outer-heldout partition is inaccessible during selection and receives only the
 selected original measurement dependencies afterward. Fitted latent states are
 then applied in creation order, including recursive latent ancestors.
 
-The nuisance votes, cross-fitted nuisance diagnostics, candidate interaction
-p-values, grouped categorical tests, and final decisions are checkpointed under
-`selection/`.
+The nuisance votes, cross-fitted elastic-net diagnostics, candidate-specific
+held-out R-loss comparisons, grouped categorical interactions, and final
+decisions are checkpointed under `selection/`.
 Changing only endpoint URLs does not invalidate completed scientific
 checkpoints. `model_identity.json` records the model IDs actually advertised at
 startup. Changing the primary model raises an error before interpretation

@@ -27,6 +27,10 @@ import numpy as np
 import pandas as pd
 
 from ..models.causal_forest_head import CausalForestHead
+from ..models.elastic_net_nuisance import (
+    ElasticNetLogisticClassifier,
+    ElasticNetRegressor,
+)
 from .stage2_elastic_net_selection import (
     SCHEMA_VERSION as ELASTIC_NET_COMPONENT_SCHEMA_VERSION,
     TEMPORAL_SCOPE,
@@ -60,7 +64,7 @@ PAGE_RECONCILIATION_CHECKPOINT_SCHEMA_VERSION = (
 REVIEW_CHECKPOINT_SCHEMA_VERSION = "stage2_aggregate_ontology_supervisor_v1"
 REVIEW_CONVERGENCE_SCHEMA_VERSION = "stage2_ontology_supervisor_convergence_v1"
 ESTIMATION_CHECKPOINT_SCHEMA_VERSION = (
-    "stage2_outer_estimation_v6_separate_nuisance_supports"
+    "stage2_outer_estimation_v7_elastic_net_nuisance"
 )
 STAGE2_ROLE_SELECTION_SCHEMA_VERSION = SELECTION_SCHEMA_VERSION
 PRESELECTION_SNAPSHOT_SCHEMA_VERSION = "stage2_frozen_preselection_snapshot_v1"
@@ -5557,24 +5561,10 @@ def _fit_classifier(
     y: np.ndarray,
     *,
     seed: int,
-    trees: int | None = None,
 ) -> Any:
     if len(np.unique(y)) < 2 or x.shape[1] == 0:
         return _ConstantClassifier(float(np.mean(y)))
-    if trees is None:
-        from sklearn.linear_model import LogisticRegression
-
-        model: Any = LogisticRegression(max_iter=2_000, C=1.0, random_state=seed)
-    else:
-        from sklearn.ensemble import RandomForestClassifier
-
-        model = RandomForestClassifier(
-            n_estimators=int(trees),
-            min_samples_leaf=max(2, min(20, len(y) // 10)),
-            max_features="sqrt",
-            n_jobs=1,
-            random_state=seed,
-        )
+    model: Any = ElasticNetLogisticClassifier(random_state=seed, n_jobs=1)
     model.fit(x, y.astype(int))
     return model
 
@@ -5592,24 +5582,10 @@ def _fit_regressor(
     y: np.ndarray,
     *,
     seed: int,
-    trees: int | None = None,
 ) -> Any:
     if x.shape[1] == 0:
         return _ConstantRegressor(float(np.mean(y)))
-    if trees is None:
-        from sklearn.linear_model import Ridge
-
-        model: Any = Ridge(alpha=1.0)
-    else:
-        from sklearn.ensemble import RandomForestRegressor
-
-        model = RandomForestRegressor(
-            n_estimators=int(trees),
-            min_samples_leaf=max(2, min(20, len(y) // 10)),
-            max_features="sqrt",
-            n_jobs=1,
-            random_state=seed,
-        )
+    model: Any = ElasticNetRegressor(random_state=seed, n_jobs=1)
     model.fit(x, y)
     return model
 
@@ -5628,7 +5604,6 @@ def _fit_outcome_models(
     *,
     binary: bool,
     seed: int,
-    trees: int | None = None,
 ) -> _OutcomeModels:
     models = []
     for arm in (0, 1):
@@ -5641,7 +5616,6 @@ def _fit_outcome_models(
                     x[mask],
                     outcome[mask],
                     seed=seed + arm,
-                    trees=trees,
                 )
             )
         else:
@@ -5650,7 +5624,6 @@ def _fit_outcome_models(
                     x[mask],
                     outcome[mask],
                     seed=seed + arm,
-                    trees=trees,
                 )
             )
     return _OutcomeModels(control=models[0], treated=models[1], binary=binary)
@@ -6053,7 +6026,9 @@ def _update_stability_selection(
         )
     return {
         "schema_version": "stage2_role_stability_selection_v1",
-        "model_family": "random_forest",
+        "model_family": "elastic_net_nuisance_plus_random_forest_effect_model",
+        "nuisance_model_family": "elastic_net",
+        "effect_model_family": "random_forest",
         "evaluation_round": int(evaluation_round),
         "policy": policy,
         "features": features,
@@ -6182,7 +6157,6 @@ def evaluate_definitions(
             base_x_train,
             t_train,
             seed=seed + fold_index,
-            trees=forest_trees,
         )
         base_outcome = _fit_outcome_models(
             base_x_train,
@@ -6190,7 +6164,6 @@ def evaluate_definitions(
             y_train,
             binary=binary,
             seed=seed + fold_index,
-            trees=forest_trees,
         )
         base_e_train = _predict_probability(base_t_model, base_x_train)
         base_e_valid = _predict_probability(base_t_model, base_x_valid)
@@ -6224,7 +6197,6 @@ def evaluate_definitions(
             x_t_train,
             t_train,
             seed=seed + 100 + fold_index,
-            trees=forest_trees,
         )
         feature_outcome = _fit_outcome_models(
             x_y_train,
@@ -6232,7 +6204,6 @@ def evaluate_definitions(
             y_train,
             binary=binary,
             seed=seed + 100 + fold_index,
-            trees=forest_trees,
         )
         feature_e_train = _predict_probability(feature_t_model, x_t_train)
         feature_e_valid = _predict_probability(feature_t_model, x_t_valid)
@@ -6333,7 +6304,9 @@ def evaluate_definitions(
     enhanced["effect_model_r_loss"] = float(np.mean(joined["feature_r_residual"] ** 2))
     improvements = _metric_improvements(base, enhanced)
     result: dict[str, Any] = {
-        "model_family": "random_forest",
+        "model_family": "elastic_net_nuisance_plus_random_forest_effect_model",
+        "nuisance_model_family": "elastic_net",
+        "effect_model_family": "random_forest",
         "forest_trees": int(forest_trees),
         "evaluation_rows": int(len(joined["t"])),
         "inner_folds": int(len(fold_performance)),
@@ -8389,7 +8362,6 @@ def _cross_fitted_nuisance(
     outcome_column: str,
     binary: bool,
     seed: int,
-    forest_trees: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     fit_ids = [int(value) for value in fit_ids]
     position = {row_id: index for index, row_id in enumerate(fit_ids)}
@@ -8419,7 +8391,6 @@ def _cross_fitted_nuisance(
             x_t_train,
             t_train,
             seed=seed + fold_index,
-            trees=forest_trees,
         )
         outcome_models = _fit_outcome_models(
             x_y_train,
@@ -8427,7 +8398,6 @@ def _cross_fitted_nuisance(
             y_train,
             binary=binary,
             seed=seed + fold_index,
-            trees=forest_trees,
         )
         fold_mu0, fold_mu1 = _predict_outcomes(outcome_models, x_y_valid)
         valid_positions = [position[row_id] for row_id in valid_ids]
@@ -8534,7 +8504,6 @@ def estimate_outer_fold(
         x_t_fit,
         t_fit,
         seed=seed + 10_000,
-        trees=estimation_trees,
     )
     outcome_models = _fit_outcome_models(
         x_y_fit,
@@ -8542,7 +8511,6 @@ def estimate_outer_fold(
         y_fit,
         binary=binary,
         seed=seed + 10_000,
-        trees=estimation_trees,
     )
     propensity = _predict_probability(treatment_model, x_t_heldout)
     mu0, mu1 = _predict_outcomes(outcome_models, x_y_heldout)
@@ -8634,6 +8602,13 @@ def estimate_outer_fold(
     diagnostics = {
         "model_family": "causal_forest_dml",
         "primary_ate_estimator": "outer_cross_fitted_aipw",
+        "nuisance_model_family": "elastic_net",
+        "binary_nuisance_model": (
+            "oci.models.elastic_net_nuisance.ElasticNetLogisticClassifier"
+        ),
+        "continuous_nuisance_model": (
+            "oci.models.elastic_net_nuisance.ElasticNetRegressor"
+        ),
         "causal_forest_trees": int(estimation_trees),
         "causal_forest_honest": True,
         "causal_forest_inference": True,
@@ -9053,7 +9028,9 @@ def _run_fold_analysis_legacy(
             "review_converged": review_converged,
             "review_convergence": review_convergence,
             "ontology_refinement_rounds": ontology_refinement_rounds,
-            "screening_model_family": "random_forest",
+            "screening_model_family": (
+                "elastic_net_nuisance_plus_random_forest_effect_model"
+            ),
             "screening_trees": screening_trees,
             "stability_selection_policy": selection_policy,
             "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
@@ -9124,7 +9101,9 @@ def _run_fold_analysis_legacy(
         "review_converged": review_converged,
         "review_convergence": review_convergence,
         "ontology_refinement_rounds": ontology_refinement_rounds,
-        "screening_model_family": "random_forest",
+        "screening_model_family": (
+            "elastic_net_nuisance_plus_random_forest_effect_model"
+        ),
         "screening_trees": screening_trees,
         "stability_selection_policy": selection_policy,
         "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
@@ -9993,7 +9972,7 @@ def run_fold_analysis(
             "ontology_refinement_rounds": ontology_refinement_rounds,
             "selection_artifact": str(selection_dir / "elastic_net_selection.json"),
             "screening_model_family": (
-                "group_elastic_net_nuisance_and_univariable_interaction"
+                "group_elastic_net_nuisance_and_candidate_augmented_rlearner"
             ),
             "final_model_family": "causal_forest_dml",
             "harmonization_validation_fallbacks": harmonization_validation_fallbacks,
@@ -10027,7 +10006,7 @@ def run_fold_analysis(
         "review_convergence": review_convergence,
         "ontology_refinement_rounds": ontology_refinement_rounds,
         "screening_model_family": (
-            "group_elastic_net_nuisance_and_univariable_interaction"
+            "group_elastic_net_nuisance_and_candidate_augmented_rlearner"
         ),
         "selection": selection_report,
         "measurement_dependencies": measurement_definitions,

@@ -5,6 +5,8 @@ import logging
 from typing import Optional, Dict, Any
 import numpy as np
 
+from .elastic_net_nuisance import ElasticNetLogisticClassifier, ElasticNetRegressor
+
 from .strict_causal_forest_runtime import (
     StrictCausalForestRuntimeConfig,
     assert_supported_constructor_signatures,
@@ -114,6 +116,16 @@ class CausalForestHead:
         random_state: int = 42,
         tune_model: bool = True,
         subforest_size: int = 4,
+        nuisance_model_family: str = "elastic_net",
+        nuisance_l1_ratio: float = 0.8,
+        nuisance_cv_folds: int = 3,
+        nuisance_regularization_grid_size: int = 16,
+        nuisance_minimum_log10_c: float = -2.0,
+        nuisance_maximum_log10_c: float = 4.0,
+        nuisance_minimum_log10_alpha: float = -5.0,
+        nuisance_maximum_log10_alpha: float = -1.0,
+        nuisance_max_iter: int = 5_000,
+        nuisance_tolerance: float = 1e-4,
         nuisance_n_estimators: Optional[int] = None,
         nuisance_max_depth: Optional[int] = None,
         nuisance_min_samples_leaf: Optional[int] = None,
@@ -138,25 +150,28 @@ class CausalForestHead:
                 remains enabled by default for backward compatibility; callers
                 with a fixed, pre-evaluated configuration can disable it.
             subforest_size: Number of trees in each inference subforest.
-            nuisance_n_estimators: Number of trees in each nuisance forest.
-                ``None`` preserves the legacy derived value.
-            nuisance_max_depth: Maximum depth of both nuisance forests.
-            nuisance_min_samples_leaf: Minimum nuisance-forest leaf size.
-                ``None`` preserves the legacy coupling to ``min_samples_leaf``.
-            nuisance_treatment_max_features: Feature sampling policy for the
-                treatment nuisance classifier.
-            nuisance_outcome_max_features: Feature sampling policy for the
-                outcome nuisance model.
-            n_jobs: Operational CPU parallelism for all three forests.  This
-                setting does not change the portable scientific identity.
-            outcome_type: ``"binary"`` selects a random-forest classifier and
+            nuisance_model_family: ``"elastic_net"`` for the current nuisance
+                contract. ``"random_forest"`` is retained only to replay legacy
+                and strict portable configurations.
+            nuisance_l1_ratio: Elastic-net L1 share for both nuisance tasks.
+            nuisance_cv_folds: Internal folds used to select regularization.
+            nuisance_regularization_grid_size: Number of regularization values.
+            nuisance_n_estimators, nuisance_max_depth,
+                nuisance_min_samples_leaf, nuisance_treatment_max_features,
+                nuisance_outcome_max_features: Legacy random-forest nuisance
+                settings, used only when nuisance_model_family is
+                ``"random_forest"``.
+            n_jobs: Operational CPU parallelism for the causal forest and
+                nuisance estimators. This setting does not change the portable
+                scientific identity.
+            outcome_type: ``"binary"`` selects logistic elastic net and
                 EconML's discrete-outcome probability contract;
-                ``"continuous"`` selects a random-forest regressor. ``None``
+                ``"continuous"`` selects squared-error elastic net. ``None``
                 preserves the historical convenience-path default of binary,
                 or derives the value from a strict runtime configuration.
 
-        Note: Nuisance functions (propensity, outcome) are estimated using sklearn
-        random forests on the neural network's learned features.
+        Note: The default nuisance functions are cross-validated elastic nets.
+        The heterogeneous-effect model remains an honest causal forest.
         """
         if not ECONML_AVAILABLE:
             raise ImportError(
@@ -191,6 +206,22 @@ class CausalForestHead:
             self.random_state = int(scientific.random_seed)
             self.tune_model = bool(scientific.tune_model)
             self.subforest_size = int(scientific.subforest_size)
+            self.nuisance_model_family = "random_forest"
+            self.nuisance_l1_ratio = float(nuisance_l1_ratio)
+            self.nuisance_cv_folds = int(nuisance_cv_folds)
+            self.nuisance_regularization_grid_size = int(
+                nuisance_regularization_grid_size
+            )
+            self.nuisance_minimum_log10_c = float(nuisance_minimum_log10_c)
+            self.nuisance_maximum_log10_c = float(nuisance_maximum_log10_c)
+            self.nuisance_minimum_log10_alpha = float(
+                nuisance_minimum_log10_alpha
+            )
+            self.nuisance_maximum_log10_alpha = float(
+                nuisance_maximum_log10_alpha
+            )
+            self.nuisance_max_iter = int(nuisance_max_iter)
+            self.nuisance_tolerance = float(nuisance_tolerance)
             self.nuisance_n_estimators = int(scientific.treatment_model.n_estimators)
             self.nuisance_max_depth = scientific.treatment_model.max_depth
             self.nuisance_min_samples_leaf = scientific.treatment_model.min_samples_leaf
@@ -242,6 +273,55 @@ class CausalForestHead:
                 raise TypeError(f"{name} must be boolean")
         if isinstance(random_state, bool) or not isinstance(random_state, int):
             raise TypeError("random_state must be an integer")
+        if nuisance_model_family not in {"elastic_net", "random_forest"}:
+            raise ValueError(
+                "nuisance_model_family must be 'elastic_net' or 'random_forest'"
+            )
+        for name, value, minimum in (
+            ("nuisance_cv_folds", nuisance_cv_folds, 2),
+            (
+                "nuisance_regularization_grid_size",
+                nuisance_regularization_grid_size,
+                3,
+            ),
+            ("nuisance_max_iter", nuisance_max_iter, 1),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or int(value) < minimum
+            ):
+                raise ValueError(f"{name} must be an integer of at least {minimum}")
+        for name, value in (
+            ("nuisance_l1_ratio", nuisance_l1_ratio),
+            ("nuisance_minimum_log10_c", nuisance_minimum_log10_c),
+            ("nuisance_maximum_log10_c", nuisance_maximum_log10_c),
+            ("nuisance_minimum_log10_alpha", nuisance_minimum_log10_alpha),
+            ("nuisance_maximum_log10_alpha", nuisance_maximum_log10_alpha),
+            ("nuisance_tolerance", nuisance_tolerance),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not np.isfinite(float(value))
+            ):
+                raise ValueError(f"{name} must be finite")
+        if not 0.0 < float(nuisance_l1_ratio) <= 1.0:
+            raise ValueError("nuisance_l1_ratio must be in (0, 1]")
+        if float(nuisance_tolerance) <= 0.0:
+            raise ValueError("nuisance_tolerance must be positive")
+        if float(nuisance_minimum_log10_c) >= float(nuisance_maximum_log10_c):
+            raise ValueError(
+                "nuisance_minimum_log10_c must be smaller than "
+                "nuisance_maximum_log10_c"
+            )
+        if float(nuisance_minimum_log10_alpha) >= float(
+            nuisance_maximum_log10_alpha
+        ):
+            raise ValueError(
+                "nuisance_minimum_log10_alpha must be smaller than "
+                "nuisance_maximum_log10_alpha"
+            )
         if nuisance_n_estimators is None:
             nuisance_n_estimators = max(50, n_estimators // 2)
         if (
@@ -294,6 +374,18 @@ class CausalForestHead:
         self.random_state = random_state
         self.tune_model = bool(tune_model)
         self.subforest_size = subforest_size
+        self.nuisance_model_family = nuisance_model_family
+        self.nuisance_l1_ratio = float(nuisance_l1_ratio)
+        self.nuisance_cv_folds = int(nuisance_cv_folds)
+        self.nuisance_regularization_grid_size = int(
+            nuisance_regularization_grid_size
+        )
+        self.nuisance_minimum_log10_c = float(nuisance_minimum_log10_c)
+        self.nuisance_maximum_log10_c = float(nuisance_maximum_log10_c)
+        self.nuisance_minimum_log10_alpha = float(nuisance_minimum_log10_alpha)
+        self.nuisance_maximum_log10_alpha = float(nuisance_maximum_log10_alpha)
+        self.nuisance_max_iter = int(nuisance_max_iter)
+        self.nuisance_tolerance = float(nuisance_tolerance)
         self.nuisance_n_estimators = nuisance_n_estimators
         self.nuisance_max_depth = nuisance_max_depth
         self.nuisance_min_samples_leaf = nuisance_min_samples_leaf
@@ -304,7 +396,11 @@ class CausalForestHead:
         self.discrete_outcome = normalized_outcome_type == "binary"
         self.requested_host_cpu_budget = None
         self.runtime_config = None
-        self.runtime_mode = "legacy_compatibility_shim_v1"
+        self.runtime_mode = (
+            "elastic_net_nuisance_v1"
+            if nuisance_model_family == "elastic_net"
+            else "legacy_random_forest_compatibility_v1"
+        )
 
         # The CausalForestDML model (created during fit)
         self.model = None
@@ -332,25 +428,85 @@ class CausalForestHead:
 
     def _outcome_model_contract(self) -> Dict[str, Any]:
         binary = self.outcome_type == "binary"
-        criterion = (
-            self.runtime_config.causal_forest.outcome_model.criterion
-            if self.runtime_config is not None
-            else ("gini" if binary else "squared_error")
+        random_forest_nuisance = (
+            self.runtime_config is not None
+            or self.nuisance_model_family == "random_forest"
         )
-        return {
-            "outcome_type": self.outcome_type,
-            "discrete_outcome": bool(self.discrete_outcome),
-            "model_class": (
+        if random_forest_nuisance:
+            criterion = (
+                self.runtime_config.causal_forest.outcome_model.criterion
+                if self.runtime_config is not None
+                else ("gini" if binary else "squared_error")
+            )
+            model_class = (
                 "sklearn.ensemble.RandomForestClassifier"
                 if binary
                 else "sklearn.ensemble.RandomForestRegressor"
-            ),
+            )
+            penalty = None
+        else:
+            criterion = "log_loss" if binary else "squared_error"
+            model_class = (
+                "oci.models.elastic_net_nuisance.ElasticNetLogisticClassifier"
+                if binary
+                else "oci.models.elastic_net_nuisance.ElasticNetRegressor"
+            )
+            penalty = "elastic_net"
+        result = {
+            "outcome_type": self.outcome_type,
+            "discrete_outcome": bool(self.discrete_outcome),
+            "model_class": model_class,
             "prediction_interface": "predict_proba" if binary else "predict",
             "criterion": criterion,
         }
+        if penalty is not None:
+            result["penalty"] = penalty
+        return result
+
+    def _elastic_classifier_kwargs(self) -> Dict[str, Any]:
+        return {
+            "l1_ratio": float(self.nuisance_l1_ratio),
+            "cv_folds": int(self.nuisance_cv_folds),
+            "regularization_grid_size": int(
+                self.nuisance_regularization_grid_size
+            ),
+            "minimum_log10_c": float(self.nuisance_minimum_log10_c),
+            "maximum_log10_c": float(self.nuisance_maximum_log10_c),
+            "max_iter": int(self.nuisance_max_iter),
+            "tolerance": float(self.nuisance_tolerance),
+            "random_state": int(self.random_state),
+            "n_jobs": int(self.n_jobs),
+        }
+
+    def _elastic_regressor_kwargs(self) -> Dict[str, Any]:
+        return {
+            "l1_ratio": float(self.nuisance_l1_ratio),
+            "cv_folds": int(self.nuisance_cv_folds),
+            "regularization_grid_size": int(
+                self.nuisance_regularization_grid_size
+            ),
+            "minimum_log10_alpha": float(self.nuisance_minimum_log10_alpha),
+            "maximum_log10_alpha": float(self.nuisance_maximum_log10_alpha),
+            "max_iter": int(self.nuisance_max_iter),
+            "tolerance": float(self.nuisance_tolerance),
+            "random_state": int(self.random_state),
+            "n_jobs": int(self.n_jobs),
+        }
 
     def _configured_nuisance_parameters(self) -> Dict[str, Any]:
+        if self.nuisance_model_family == "elastic_net":
+            return {
+                "model_family": "elastic_net",
+                "treatment_model": self._elastic_classifier_kwargs(),
+                "outcome_model": (
+                    self._elastic_classifier_kwargs()
+                    if self.discrete_outcome
+                    else self._elastic_regressor_kwargs()
+                ),
+                "outcome_model_contract": self._outcome_model_contract(),
+            }
         return {
+            "model_family": "random_forest",
             "n_estimators": int(self.nuisance_n_estimators),
             "max_depth": self.nuisance_max_depth,
             "min_samples_leaf": int(self.nuisance_min_samples_leaf),
@@ -386,7 +542,35 @@ class CausalForestHead:
         model_t: Any,
         model_y: Any,
     ) -> Dict[str, Any]:
+        if self.nuisance_model_family == "elastic_net":
+            expected_outcome_class = (
+                ElasticNetLogisticClassifier
+                if self.discrete_outcome
+                else ElasticNetRegressor
+            )
+            if type(model_t) is not ElasticNetLogisticClassifier:
+                raise RuntimeError(
+                    "treatment nuisance model is not the configured elastic net"
+                )
+            if type(model_y) is not expected_outcome_class:
+                raise RuntimeError(
+                    "outcome nuisance model class does not match the configured "
+                    "elastic-net outcome type"
+                )
+            result = {
+                "model_family": "elastic_net",
+                "treatment_model": model_t.get_params(deep=False),
+                "outcome_model": model_y.get_params(deep=False),
+                "outcome_model_contract": self._outcome_model_contract(),
+            }
+            if result != self._configured_nuisance_parameters():
+                raise RuntimeError(
+                    "effective nuisance elastic-net parameters differ from the "
+                    "configured settings"
+                )
+            return result
         result = {
+            "model_family": "random_forest",
             "n_estimators": self._estimator_parameter(model_t, "n_estimators"),
             "max_depth": self._estimator_parameter(model_t, "max_depth"),
             "min_samples_leaf": self._estimator_parameter(model_t, "min_samples_leaf"),
@@ -422,7 +606,7 @@ class CausalForestHead:
                 )
         if result != self._configured_nuisance_parameters():
             raise RuntimeError(
-                "effective nuisance-forest parameters differ from the configured "
+                "effective nuisance random-forest parameters differ from the configured "
                 "scientific settings"
             )
         for estimator, label in ((model_t, "treatment"), (model_y, "outcome")):
@@ -457,33 +641,55 @@ class CausalForestHead:
         if self.runtime_config is not None:
             return self._create_strict_model()
 
-        model_t = RandomForestClassifier(
-            n_estimators=self.nuisance_n_estimators,
-            max_depth=self.nuisance_max_depth,
-            min_samples_leaf=self.nuisance_min_samples_leaf,
-            max_features=self.nuisance_treatment_max_features,
-            random_state=self.random_state,
-            n_jobs=self.n_jobs,
-        )
-        logger.info("Using random forest for propensity estimation (on neural features)")
-
-        outcome_model_class = (
-            RandomForestClassifier if self.discrete_outcome else RandomForestRegressor
-        )
-        model_y = outcome_model_class(
-            n_estimators=self.nuisance_n_estimators,
-            criterion=self._outcome_model_contract()["criterion"],
-            max_depth=self.nuisance_max_depth,
-            min_samples_leaf=self.nuisance_min_samples_leaf,
-            max_features=self.nuisance_outcome_max_features,
-            random_state=self.random_state,
-            n_jobs=self.n_jobs,
-        )
-        logger.info(
-            "Using %s for %s outcome estimation (on neural features)",
-            outcome_model_class.__name__,
-            self.outcome_type,
-        )
+        if self.nuisance_model_family == "elastic_net":
+            model_t = ElasticNetLogisticClassifier(
+                **self._elastic_classifier_kwargs()
+            )
+            outcome_model_class = (
+                ElasticNetLogisticClassifier
+                if self.discrete_outcome
+                else ElasticNetRegressor
+            )
+            model_y = outcome_model_class(
+                **(
+                    self._elastic_classifier_kwargs()
+                    if self.discrete_outcome
+                    else self._elastic_regressor_kwargs()
+                )
+            )
+            logger.info(
+                "Using cross-validated elastic nets for treatment and %s "
+                "outcome nuisance estimation",
+                self.outcome_type,
+            )
+        else:
+            model_t = RandomForestClassifier(
+                n_estimators=self.nuisance_n_estimators,
+                max_depth=self.nuisance_max_depth,
+                min_samples_leaf=self.nuisance_min_samples_leaf,
+                max_features=self.nuisance_treatment_max_features,
+                random_state=self.random_state,
+                n_jobs=self.n_jobs,
+            )
+            outcome_model_class = (
+                RandomForestClassifier
+                if self.discrete_outcome
+                else RandomForestRegressor
+            )
+            model_y = outcome_model_class(
+                n_estimators=self.nuisance_n_estimators,
+                criterion=self._outcome_model_contract()["criterion"],
+                max_depth=self.nuisance_max_depth,
+                min_samples_leaf=self.nuisance_min_samples_leaf,
+                max_features=self.nuisance_outcome_max_features,
+                random_state=self.random_state,
+                n_jobs=self.n_jobs,
+            )
+            logger.info(
+                "Using legacy random forests for treatment and %s outcome "
+                "nuisance estimation",
+                self.outcome_type,
+            )
 
         model = CausalForestDML(
             model_t=model_t,
@@ -813,6 +1019,22 @@ class CausalForestHead:
             "subforest_size": self.subforest_size,
             "random_state": self.random_state,
             "tune_model": self.tune_model,
+            "nuisance_model_family": self.nuisance_model_family,
+            "nuisance_l1_ratio": self.nuisance_l1_ratio,
+            "nuisance_cv_folds": self.nuisance_cv_folds,
+            "nuisance_regularization_grid_size": (
+                self.nuisance_regularization_grid_size
+            ),
+            "nuisance_minimum_log10_c": self.nuisance_minimum_log10_c,
+            "nuisance_maximum_log10_c": self.nuisance_maximum_log10_c,
+            "nuisance_minimum_log10_alpha": (
+                self.nuisance_minimum_log10_alpha
+            ),
+            "nuisance_maximum_log10_alpha": (
+                self.nuisance_maximum_log10_alpha
+            ),
+            "nuisance_max_iter": self.nuisance_max_iter,
+            "nuisance_tolerance": self.nuisance_tolerance,
             "nuisance_n_estimators": self.nuisance_n_estimators,
             "nuisance_max_depth": self.nuisance_max_depth,
             "nuisance_min_samples_leaf": self.nuisance_min_samples_leaf,

@@ -7915,7 +7915,7 @@ def test_inner_heldout_signal_pruning_keeps_causal_roles_and_drops_noise():
     assert report["features_dropped"] == 1
 
 
-def test_stage2_feature_models_use_forests_for_both_causal_roles():
+def test_stage2_nuisance_models_use_elastic_nets_and_effect_model_remains_forest():
     rng = np.random.default_rng(123)
     features = rng.normal(size=(80, 3))
     binary = rng.binomial(1, 0.5, size=80)
@@ -7925,13 +7925,11 @@ def test_stage2_feature_models_use_forests_for_both_causal_roles():
         features,
         binary,
         seed=11,
-        trees=10,
     )
     outcome_regressor = stage2_analysis._fit_regressor(
         features,
         continuous,
         seed=12,
-        trees=10,
     )
     effect_model = stage2_analysis._fit_effect_model(
         features,
@@ -7940,8 +7938,8 @@ def test_stage2_feature_models_use_forests_for_both_causal_roles():
         trees=10,
     )
 
-    assert classifier.__class__.__name__ == "RandomForestClassifier"
-    assert outcome_regressor.__class__.__name__ == "RandomForestRegressor"
+    assert classifier.__class__.__name__ == "ElasticNetLogisticClassifier"
+    assert outcome_regressor.__class__.__name__ == "ElasticNetRegressor"
     assert effect_model.model.__class__.__name__ == "RandomForestRegressor"
 
 
@@ -9123,10 +9121,14 @@ def test_plain_stage2_finishes_extraction_review_and_causal_estimation(
     assert diagnostics["causal_forest_fit_audit"]["outcome_model_contract"] == {
         "outcome_type": "binary",
         "discrete_outcome": True,
-        "model_class": "sklearn.ensemble.RandomForestClassifier",
+        "model_class": (
+            "oci.models.elastic_net_nuisance.ElasticNetLogisticClassifier"
+        ),
         "prediction_interface": "predict_proba",
-        "criterion": "gini",
+        "criterion": "log_loss",
+        "penalty": "elastic_net",
     }
+    assert diagnostics["nuisance_model_family"] == "elastic_net"
     assert "extract_stage2_patient_variables" not in primary_calls
     assert "analyze_stage2_variable_cluster" not in primary_calls
     assert "adjudicate_stage2_variable_role" not in primary_calls

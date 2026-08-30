@@ -92,8 +92,10 @@ are:
       "nuisance_selection_rule": "any_inner_fold_union",
       "modifier_selection_rule": "any_inner_fold_union",
       "one_standard_error_rule": true,
-      "nuisance_forest_trees": 200,
-      "modifier_top_n_per_inner_fold": 5
+      "nuisance_prediction_one_standard_error_rule": false,
+      "modifier_top_n_per_inner_fold": 10,
+      "modifier_ridge_alpha": 10.0,
+      "modifier_continuous_winsor_quantile": 0.005
     },
     "estimation_trees": 200,
     "explicit_features": []
@@ -154,13 +156,14 @@ valid alias; the original extraction dependencies remain recorded. Separate trea
 group elastic nets run inside each outer fold. A candidate selected in any inner
 fold for either task enters one shared confounder union used by both nuisance
 models. Ordered measurements use one standardized score; nominal factor
-contrasts and missingness are selected as one group. Inner-fold nuisance forests
-generate out-of-fold treatment and outcome predictions. One outcome regression
-per candidate then includes those two predictions, observed treatment, the
-candidate, and its treatment interaction. For binary outcomes this is logistic
-regression, and categorical interaction contrasts receive one grouped test. The
-five smallest interaction p-values per inner fold enter the causal-forest
-modifier union by default. Binary nuisance reports include AUROC and log loss.
+contrasts and missingness are selected as one group. Inner-fold grouped elastic
+nets generate cross-fitted treatment and outcome predictions. Candidate-specific
+grouped elastic nets then augment both nuisances before a ridge-stabilized
+R-learner scores each candidate on untouched inner-heldout rows. Categorical
+interaction contrasts enter together and receive one held-out R-loss score. The
+ten largest gains per inner fold enter the deduplicated causal-forest modifier
+union by default, with no sign threshold. Binary nuisance reports include AUROC
+and log loss.
 Consolidation receives neither treatment nor outcome and is not a role-selection
 screen. Outer-heldout rows remain inaccessible until selection is frozen;
 selected latent states are then applied to their held-out measurement dependencies.

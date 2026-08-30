@@ -1,19 +1,20 @@
-"""Fold-local nuisance selection and interaction screening for Stage 2.
+"""Fold-local elastic-net nuisance selection and candidate-wise R-learning.
 
 The selector has one deliberately narrow job: turn the frozen, extracted
 outer-training candidate matrix into three empirical feature sets without
 consulting the outer-heldout partition:
 
 * predictors selected in any inner fold for treatment or marginal outcome;
-* candidate modifiers with a top-ranked treatment interaction in any inner fold.
+* candidate modifiers with a top-ranked held-out R-loss gain in any inner fold.
 
 The union of treatment and outcome selections is the outer-fold confounder set
-and is used by both nuisance models.  Those models produce cross-fitted
-treatment and outcome predictions.  Within each inner fold, every candidate is
-then screened in its own outcome model containing those predictions, observed
-treatment, the candidate main effect, and the treatment-by-candidate
-interaction.  The candidates with the N smallest interaction p-values are
-retained, with categorical interactions tested jointly.  The union of those
+and is used by both base nuisance models.  Every nuisance fit in this selector
+uses the grouped elastic-net family.  Within each inner fold, every candidate
+gets its own cross-fitted elastic-net calibration layer that augments both base
+nuisances with that candidate.  A ridge-stabilized R-learner then compares a
+constant treatment effect with candidate-varying treatment effects on untouched
+inner-heldout rows.  The N largest held-out R-loss gains are retained, with
+categorical interactions added and scored as one group.  The union of those
 inner-fold top-N sets is passed to the final causal forest.  No pairwise
 clustering or latent construction occurs here.
 """
@@ -23,21 +24,19 @@ from __future__ import annotations
 import copy
 import logging
 import math
-import warnings
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
-from scipy import stats
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import Ridge
 from sklearn.metrics import log_loss, mean_squared_error, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold
 
 LOGGER = logging.getLogger(__name__)
 
 SCHEMA_VERSION = (
-    "stage2_group_elastic_net_univariable_modifier_selection_v4_top_n_union"
+    "stage2_group_elastic_net_candidate_augmented_rlearner_v9_top_n_union"
 )
 TEMPORAL_SCOPE = "pre_index_treatment"
 
@@ -62,13 +61,19 @@ class Stage2ElasticNetSelectionConfig:
     categorical_min_count: int = 5
     max_iter: int = 5_000
     one_standard_error_rule: bool = True
+    nuisance_prediction_one_standard_error_rule: bool = False
     modifier_one_standard_error_rule: bool = False
+    # Retained only so older configuration files remain loadable. Nuisance
+    # prediction is now performed by the same grouped elastic-net family used
+    # for screening; these forest settings no longer affect computation.
     nuisance_forest_trees: int = 200
     nuisance_forest_min_samples_leaf: int = 10
-    modifier_top_n_per_inner_fold: int = 5
-    # Retained only so configurations written for the R-learner selector remain
-    # loadable.  These settings no longer affect modifier discovery and are
-    # omitted from public_dict so they do not misdescribe the scientific policy.
+    modifier_top_n_per_inner_fold: int = 10
+    modifier_ridge_alpha: float = 10.0
+    modifier_continuous_winsor_quantile: float = 0.005
+    # Retained only so configurations written for earlier R-learner selectors
+    # remain loadable. They do not gate the per-fold top-N union.
+    modifier_min_fold_r_loss_improvement: float = 0.0
     modifier_min_mean_r_loss_improvement: float = 0.0
     modifier_min_positive_fold_fraction: float = 0.4
 
@@ -98,8 +103,6 @@ class Stage2ElasticNetSelectionConfig:
             "regularization_grid_size",
             "categorical_min_count",
             "max_iter",
-            "nuisance_forest_trees",
-            "nuisance_forest_min_samples_leaf",
             "modifier_top_n_per_inner_fold",
         ):
             value = getattr(self, name)
@@ -115,15 +118,14 @@ class Stage2ElasticNetSelectionConfig:
             raise ValueError(
                 "stage2.statistical_selection.regularization_grid_size must be at least 3"
             )
-        if self.nuisance_forest_trees < 10:
-            raise ValueError(
-                "stage2.statistical_selection.nuisance_forest_trees must be at least 10"
-            )
         for name in (
             "minimum_log10_alpha",
             "maximum_log10_alpha",
             "coefficient_tolerance",
             "optimization_tolerance",
+            "modifier_ridge_alpha",
+            "modifier_continuous_winsor_quantile",
+            "modifier_min_fold_r_loss_improvement",
             "modifier_min_mean_r_loss_improvement",
         ):
             value = getattr(self, name)
@@ -153,7 +155,25 @@ class Stage2ElasticNetSelectionConfig:
                 "stage2.statistical_selection.modifier_min_mean_r_loss_improvement "
                 "must be nonnegative"
             )
-        for name in ("one_standard_error_rule", "modifier_one_standard_error_rule"):
+        if self.modifier_min_fold_r_loss_improvement < 0.0:
+            raise ValueError(
+                "stage2.statistical_selection.modifier_min_fold_r_loss_improvement "
+                "must be nonnegative"
+            )
+        if self.modifier_ridge_alpha <= 0.0:
+            raise ValueError(
+                "stage2.statistical_selection.modifier_ridge_alpha must be positive"
+            )
+        if not 0.0 <= self.modifier_continuous_winsor_quantile < 0.25:
+            raise ValueError(
+                "stage2.statistical_selection.modifier_continuous_winsor_quantile "
+                "must be in [0, 0.25)"
+            )
+        for name in (
+            "one_standard_error_rule",
+            "nuisance_prediction_one_standard_error_rule",
+            "modifier_one_standard_error_rule",
+        ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(
                     f"stage2.statistical_selection.{name} must be boolean"
@@ -165,6 +185,9 @@ class Stage2ElasticNetSelectionConfig:
             "nuisance_selection_frequency",
             "modifier_selection_frequency",
             "modifier_one_standard_error_rule",
+            "nuisance_forest_trees",
+            "nuisance_forest_min_samples_leaf",
+            "modifier_min_fold_r_loss_improvement",
             "modifier_min_mean_r_loss_improvement",
             "modifier_min_positive_fold_fraction",
         ):
@@ -821,6 +844,7 @@ def _logistic_elastic_net(
     *,
     config: Stage2ElasticNetSelectionConfig,
     seed: int,
+    one_standard_error_rule: bool | None = None,
 ) -> _PenalizedFit:
     train_y = np.asarray(train_y, dtype=int)
     if train_x.shape[1] == 0 or len(np.unique(train_y)) < 2:
@@ -831,6 +855,11 @@ def _logistic_elastic_net(
             binary=True,
             status="constant_or_empty_design",
         )
+    use_one_standard_error_rule = (
+        config.one_standard_error_rule
+        if one_standard_error_rule is None
+        else bool(one_standard_error_rule)
+    )
     return _group_elastic_net_cv(
         train_x,
         train_y,
@@ -840,7 +869,7 @@ def _logistic_elastic_net(
         seed=seed,
         binary=True,
         fit_intercept=True,
-        one_standard_error_rule=bool(config.one_standard_error_rule),
+        one_standard_error_rule=use_one_standard_error_rule,
     )
 
 
@@ -901,69 +930,6 @@ def _selected_in_any_inner_fold(votes: Mapping[str, int]) -> set[str]:
     return {key for key, value in votes.items() if int(value) >= 1}
 
 
-class _ConstantProbabilityModel:
-    def __init__(self, probability: float) -> None:
-        self.probability = float(np.clip(probability, 1e-6, 1 - 1e-6))
-
-    def predict(self, rows: int) -> np.ndarray:
-        return np.full(rows, self.probability, dtype=float)
-
-
-def _forest_probability(
-    train_x: np.ndarray,
-    train_y: np.ndarray,
-    valid_x: np.ndarray,
-    *,
-    config: Stage2ElasticNetSelectionConfig,
-    seed: int,
-) -> np.ndarray:
-    if train_x.shape[1] == 0 or len(np.unique(train_y)) < 2:
-        return _ConstantProbabilityModel(float(np.mean(train_y))).predict(len(valid_x))
-    model = RandomForestClassifier(
-        n_estimators=int(config.nuisance_forest_trees),
-        min_samples_leaf=int(config.nuisance_forest_min_samples_leaf),
-        max_features="sqrt",
-        n_jobs=1,
-        random_state=seed,
-    )
-    model.fit(train_x, np.asarray(train_y, dtype=int))
-    classes = list(model.classes_)
-    if 1 not in classes:
-        return np.zeros(len(valid_x), dtype=float)
-    return np.clip(model.predict_proba(valid_x)[:, classes.index(1)], 1e-6, 1 - 1e-6)
-
-
-def _forest_outcome(
-    train_x: np.ndarray,
-    train_y: np.ndarray,
-    valid_x: np.ndarray,
-    *,
-    binary: bool,
-    config: Stage2ElasticNetSelectionConfig,
-    seed: int,
-) -> np.ndarray:
-    if train_x.shape[1] == 0:
-        mean = float(np.mean(train_y))
-        return np.full(len(valid_x), mean, dtype=float)
-    if binary:
-        return _forest_probability(
-            train_x,
-            train_y,
-            valid_x,
-            config=config,
-            seed=seed,
-        )
-    model = RandomForestRegressor(
-        n_estimators=int(config.nuisance_forest_trees),
-        min_samples_leaf=int(config.nuisance_forest_min_samples_leaf),
-        max_features="sqrt",
-        n_jobs=1,
-        random_state=seed,
-    )
-    model.fit(train_x, np.asarray(train_y, dtype=float))
-    return np.asarray(model.predict(valid_x), dtype=float)
-
-
 def _loss(observed: np.ndarray, predicted: np.ndarray, *, binary: bool) -> float:
     if binary:
         return float(
@@ -1003,189 +969,528 @@ def _rank_safe_columns(
     return current, kept
 
 
-def _binary_nested_interaction_p_value(
-    target: np.ndarray,
-    reduced: np.ndarray,
-    interactions: np.ndarray,
-) -> tuple[float | None, dict[str, Any]]:
-    """Likelihood-ratio p-value for one or more logistic interaction terms."""
+def _rank_safe_column_pairs(
+    train_base: np.ndarray,
+    valid_base: np.ndarray,
+    train_additions: np.ndarray,
+    valid_additions: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """Append train-rank-safe columns and mirror them in validation data."""
 
-    target = np.asarray(target, dtype=float)
-    if len(np.unique(target)) != 2:
-        return None, {"status": "not_evaluable", "reason": "outcome_has_one_class"}
-    full, kept = _rank_safe_columns(reduced, interactions)
-    degrees = int(full.shape[1] - reduced.shape[1])
-    if degrees < 1:
-        return None, {
-            "status": "not_evaluable",
-            "reason": "no_independent_interaction_columns",
-        }
-    try:
-        import statsmodels.api as sm
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            reduced_fit = sm.GLM(
-                target,
-                reduced,
-                family=sm.families.Binomial(),
-            ).fit(disp=0)
-            full_fit = sm.GLM(
-                target,
-                full,
-                family=sm.families.Binomial(),
-            ).fit(disp=0)
-        if not bool(getattr(reduced_fit, "converged", True)) or not bool(
-            getattr(full_fit, "converged", True)
-        ):
-            raise ValueError("logistic regression did not converge")
-        reduced_llf = float(reduced_fit.llf)
-        full_llf = float(full_fit.llf)
-        if not math.isfinite(reduced_llf) or not math.isfinite(full_llf):
-            raise ValueError("nonfinite logistic log likelihood")
-        statistic = max(0.0, 2.0 * (full_llf - reduced_llf))
-        p_value = float(stats.chi2.sf(statistic, degrees))
-        if not math.isfinite(p_value):
-            raise ValueError("nonfinite likelihood-ratio p-value")
-    except Exception as exc:
-        return None, {
-            "status": "not_evaluable",
-            "reason": f"{type(exc).__name__}: {exc}",
-        }
-    return p_value, {
-        "status": "ok",
-        "test": "likelihood_ratio_chi_square",
-        "statistic": statistic,
-        "degrees_of_freedom": degrees,
-        "tested_column_indices": kept,
-    }
+    train_result, kept = _rank_safe_columns(train_base, train_additions)
+    valid_result = np.column_stack(
+        [
+            np.asarray(valid_base, dtype=float),
+            np.asarray(valid_additions, dtype=float)[:, kept],
+        ]
+    )
+    return train_result, valid_result, kept
 
 
-def _continuous_nested_interaction_p_value(
-    target: np.ndarray,
-    reduced: np.ndarray,
-    interactions: np.ndarray,
-) -> tuple[float | None, dict[str, Any]]:
-    """Partial-F p-value preserving support for continuous-outcome workflows."""
-
-    target = np.asarray(target, dtype=float)
-    full, kept = _rank_safe_columns(reduced, interactions)
-    degrees = int(full.shape[1] - reduced.shape[1])
-    residual_degrees = int(len(target) - full.shape[1])
-    if degrees < 1 or residual_degrees < 1:
-        return None, {
-            "status": "not_evaluable",
-            "reason": "insufficient_independent_columns_or_residual_degrees_of_freedom",
-        }
-    try:
-        reduced_coefficients = np.linalg.lstsq(reduced, target, rcond=None)[0]
-        full_coefficients = np.linalg.lstsq(full, target, rcond=None)[0]
-        reduced_residual = target - reduced @ reduced_coefficients
-        full_residual = target - full @ full_coefficients
-        reduced_ss = float(reduced_residual @ reduced_residual)
-        full_ss = float(full_residual @ full_residual)
-        if full_ss <= 1e-15:
-            statistic = math.inf if reduced_ss > full_ss + 1e-15 else 0.0
-        else:
-            numerator = max(0.0, (reduced_ss - full_ss) / degrees)
-            statistic = numerator / (full_ss / residual_degrees)
-        p_value = float(stats.f.sf(statistic, degrees, residual_degrees))
-        if not math.isfinite(p_value):
-            raise ValueError("nonfinite partial-F p-value")
-    except Exception as exc:
-        return None, {
-            "status": "not_evaluable",
-            "reason": f"{type(exc).__name__}: {exc}",
-        }
-    return p_value, {
-        "status": "ok",
-        "test": "partial_f",
-        "statistic": statistic,
-        "degrees_of_freedom": [degrees, residual_degrees],
-        "tested_column_indices": kept,
-    }
-
-
-def _modifier_interaction_test(
+def _winsorize_modifier_design(
+    design: _EncodedDesign,
     *,
-    frame: pd.DataFrame,
+    quantile: float,
+) -> _EncodedDesign:
+    """Fold-locally bound continuous candidate values against outliers."""
+
+    if float(quantile) <= 0.0 or design.train.shape[1] == 0:
+        return design
+    train = np.asarray(design.train, dtype=float).copy()
+    valid = np.asarray(design.valid, dtype=float).copy()
+    for index, name in enumerate(design.column_names):
+        if not str(name).endswith(":value"):
+            continue
+        lower, upper = np.quantile(
+            train[:, index],
+            [float(quantile), 1.0 - float(quantile)],
+        )
+        if not math.isfinite(float(lower)) or not math.isfinite(float(upper)):
+            continue
+        train[:, index] = np.clip(train[:, index], lower, upper)
+        valid[:, index] = np.clip(valid[:, index], lower, upper)
+        mean = float(np.mean(train[:, index]))
+        scale = float(np.std(train[:, index], ddof=0))
+        if scale > 1e-12 and math.isfinite(scale):
+            train[:, index] = (train[:, index] - mean) / scale
+            valid[:, index] = (valid[:, index] - mean) / scale
+    return _EncodedDesign(
+        train=train,
+        valid=valid,
+        column_feature_ids=design.column_feature_ids,
+        column_names=design.column_names,
+    )
+
+
+def _crossfit_indices(
+    treatment: np.ndarray,
+    *,
+    requested_folds: int,
+    seed: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Create deterministic subfolds contained in one modifier-fit set."""
+
+    treatment = np.asarray(treatment, dtype=int)
+    if len(treatment) < 2:
+        return []
+    class_counts = np.bincount(treatment, minlength=2)
+    if len(np.unique(treatment)) == 2 and int(class_counts.min()) >= 2:
+        fold_count = min(int(requested_folds), int(class_counts.min()))
+        splitter: Any = StratifiedKFold(
+            n_splits=fold_count,
+            shuffle=True,
+            random_state=seed,
+        )
+        return [
+            (np.asarray(fit, dtype=int), np.asarray(heldout, dtype=int))
+            for fit, heldout in splitter.split(np.zeros(len(treatment)), treatment)
+        ]
+    fold_count = min(int(requested_folds), len(treatment))
+    if fold_count < 2:
+        return []
+    splitter = KFold(n_splits=fold_count, shuffle=True, random_state=seed)
+    return [
+        (np.asarray(fit, dtype=int), np.asarray(heldout, dtype=int))
+        for fit, heldout in splitter.split(np.zeros(len(treatment)))
+    ]
+
+
+def _cross_fitted_base_nuisances(
+    *,
+    treatment_design: np.ndarray,
+    treatment_column_feature_ids: Sequence[str],
+    outcome_design: np.ndarray,
+    outcome_column_feature_ids: Sequence[str],
     treatment: np.ndarray,
     outcome: np.ndarray,
-    reduced_base: np.ndarray,
+    binary_outcome: bool,
+    config: Stage2ElasticNetSelectionConfig,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, list[tuple[np.ndarray, np.ndarray]]]:
+    """Cross-fit grouped elastic-net base nuisances inside a modifier fold."""
+
+    splits = _crossfit_indices(
+        treatment,
+        requested_folds=int(config.internal_cv_folds),
+        seed=seed,
+    )
+    base_e = np.full(len(treatment), np.nan, dtype=float)
+    base_m = np.full(len(outcome), np.nan, dtype=float)
+    for subfold, (fit, heldout) in enumerate(splits, start=1):
+        treatment_fit = _logistic_elastic_net(
+            treatment_design[fit],
+            treatment[fit],
+            treatment_design[heldout],
+            treatment_column_feature_ids,
+            config=config,
+            seed=seed + 100 * subfold,
+            one_standard_error_rule=(
+                config.nuisance_prediction_one_standard_error_rule
+            ),
+        )
+        outcome_fit = (
+            _logistic_elastic_net(
+                outcome_design[fit],
+                outcome[fit],
+                outcome_design[heldout],
+                outcome_column_feature_ids,
+                config=config,
+                seed=seed + 100 * subfold + 1,
+                one_standard_error_rule=(
+                    config.nuisance_prediction_one_standard_error_rule
+                ),
+            )
+            if binary_outcome
+            else _squared_error_elastic_net(
+                outcome_design[fit],
+                outcome[fit],
+                outcome_design[heldout],
+                outcome_column_feature_ids,
+                config=config,
+                seed=seed + 100 * subfold + 1,
+                one_standard_error_rule=(
+                    config.nuisance_prediction_one_standard_error_rule
+                ),
+            )
+        )
+        base_e[heldout] = treatment_fit.valid_prediction
+        base_m[heldout] = outcome_fit.valid_prediction
+    if splits and (np.isnan(base_e).any() or np.isnan(base_m).any()):
+        raise ValueError("nested nuisance subfolds did not predict every fit row")
+    return base_e, base_m, splits
+
+
+def _nuisance_calibration_prediction(
+    *,
+    target: np.ndarray,
+    base_train_prediction: np.ndarray,
+    candidate_train: np.ndarray,
+    base_valid_prediction: np.ndarray,
+    candidate_valid: np.ndarray,
+    candidate_column_feature_ids: Sequence[str],
+    binary: bool,
+    config: Stage2ElasticNetSelectionConfig,
+    seed: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Augment one base nuisance with a candidate using grouped elastic net."""
+
+    base_train = np.asarray(base_train_prediction, dtype=float)
+    base_valid = np.asarray(base_valid_prediction, dtype=float)
+    if binary:
+        base_train = np.log(
+            np.clip(base_train, 1e-6, 1 - 1e-6)
+            / np.clip(1.0 - base_train, 1e-6, 1 - 1e-6)
+        )
+        base_valid = np.log(
+            np.clip(base_valid, 1e-6, 1 - 1e-6)
+            / np.clip(1.0 - base_valid, 1e-6, 1 - 1e-6)
+        )
+        base_name = "base_logit"
+    else:
+        base_name = "base_prediction"
+    train_additions = np.column_stack([base_train, candidate_train])
+    valid_additions = np.column_stack([base_valid, candidate_valid])
+    _, _, kept = _rank_safe_column_pairs(
+        np.ones((len(target), 1), dtype=float),
+        np.ones((len(base_valid), 1), dtype=float),
+        train_additions,
+        valid_additions,
+    )
+    input_names = [base_name] + [
+        f"candidate_column_{index}" for index in range(candidate_train.shape[1])
+    ]
+    group_ids = ["__base_nuisance_prediction__"] + list(
+        map(str, candidate_column_feature_ids)
+    )
+    train_x = train_additions[:, kept]
+    valid_x = valid_additions[:, kept]
+    kept_group_ids = [group_ids[index] for index in kept]
+    try:
+        fit = (
+            _logistic_elastic_net(
+                train_x,
+                target,
+                valid_x,
+                kept_group_ids,
+                config=config,
+                seed=seed,
+                one_standard_error_rule=(
+                    config.nuisance_prediction_one_standard_error_rule
+                ),
+            )
+            if binary
+            else _squared_error_elastic_net(
+                train_x,
+                target,
+                valid_x,
+                kept_group_ids,
+                config=config,
+                seed=seed,
+                one_standard_error_rule=(
+                    config.nuisance_prediction_one_standard_error_rule
+                ),
+            )
+        )
+        prediction = np.asarray(fit.valid_prediction, dtype=float)
+        if binary:
+            prediction = np.clip(prediction, 1e-6, 1 - 1e-6)
+        selected, magnitudes = _selected_feature_ids(
+            fit.coefficients,
+            kept_group_ids,
+            tolerance=float(config.coefficient_tolerance),
+        )
+        return prediction, {
+            "status": fit.status,
+            "model_family": "group_elastic_net",
+            "regularization": fit.regularization,
+            "input_columns": [input_names[index] for index in kept],
+            "selected_input_groups": selected,
+            "input_group_l2_norms": magnitudes,
+        }
+    except Exception as exc:
+        prediction = np.asarray(base_valid_prediction, dtype=float)
+        if binary:
+            prediction = np.clip(prediction, 1e-6, 1 - 1e-6)
+        return prediction, {
+            "status": f"base_prediction_fallback: {type(exc).__name__}: {exc}",
+            "model_family": "group_elastic_net",
+            "input_columns": [input_names[index] for index in kept],
+        }
+
+
+def _candidate_r_learner_test(
+    *,
+    train: pd.DataFrame,
+    valid: pd.DataFrame,
+    treatment_train: np.ndarray,
+    treatment_valid: np.ndarray,
+    outcome_train: np.ndarray,
+    outcome_valid: np.ndarray,
+    base_e_train: np.ndarray,
+    base_e_valid: np.ndarray,
+    base_m_train: np.ndarray,
+    base_m_valid: np.ndarray,
+    augmentation_splits: Sequence[tuple[np.ndarray, np.ndarray]],
     feature: Mapping[str, Any],
     binary_outcome: bool,
-    categorical_min_count: int,
+    config: Stage2ElasticNetSelectionConfig,
+    seed: int,
 ) -> dict[str, Any]:
-    """Fit the candidate-specific outcome model and test its interaction group."""
+    """Score one candidate using elastic-net nuisances and held-out R-loss."""
 
+    strategy = _feature_strategy(feature)
+    result: dict[str, Any] = {
+        "feature_id": _feature_key(feature),
+        "name": str(feature["name"]),
+        "candidate_strategy": strategy,
+        "categorical_interactions_are_grouped": strategy == "categorical",
+        "missingness_interactions": False,
+    }
     design = _encode_design(
-        frame,
-        frame,
+        train,
+        valid,
         [feature],
-        categorical_min_count=int(categorical_min_count),
+        categorical_min_count=int(config.categorical_min_count),
     )
-    reduced, kept_main = _rank_safe_columns(reduced_base, design.train)
-    interaction_indices = [
+    design = _winsorize_modifier_design(
+        design,
+        quantile=float(config.modifier_continuous_winsor_quantile),
+    )
+    candidate_interaction_indices = [
         index
         for index, name in enumerate(design.column_names)
         if not str(name).endswith(":missing")
     ]
-    interaction_columns = (
-        treatment.reshape(-1, 1) * design.train[:, interaction_indices]
-        if interaction_indices
-        else np.empty((len(frame), 0), dtype=float)
+    interaction_indices: list[int] = []
+    excluded_low_support: list[int] = []
+    for index in candidate_interaction_indices:
+        name = str(design.column_names[index])
+        if ":level=" not in name and ":fallback=" not in name:
+            interaction_indices.append(index)
+            continue
+        values = design.train[:, index]
+        present = values == float(np.max(values))
+        treated = int(np.sum(present & (treatment_train == 1)))
+        untreated = int(np.sum(present & (treatment_train == 0)))
+        if min(treated, untreated) >= int(config.categorical_min_count):
+            interaction_indices.append(index)
+        else:
+            excluded_low_support.append(index)
+    result["encoded_main_columns"] = list(map(str, design.column_names))
+    result["candidate_interaction_columns"] = [
+        str(design.column_names[index]) for index in candidate_interaction_indices
+    ]
+    result["excluded_interaction_columns_low_treatment_arm_support"] = [
+        str(design.column_names[index]) for index in excluded_low_support
+    ]
+    if not augmentation_splits:
+        return {
+            **result,
+            "status": "not_evaluable",
+            "reason": "insufficient_rows_for_nested_cross_fitting",
+        }
+    if not interaction_indices:
+        return {
+            **result,
+            "status": "not_evaluable",
+            "reason": "no_nonconstant_candidate_interaction_columns",
+        }
+
+    e_train = np.full(len(train), np.nan, dtype=float)
+    m_train = np.full(len(train), np.nan, dtype=float)
+    treatment_calibration_statuses: list[str] = []
+    outcome_calibration_statuses: list[str] = []
+    for subfold, (fit, heldout) in enumerate(augmentation_splits, start=1):
+        e_train[heldout], e_status = _nuisance_calibration_prediction(
+            target=treatment_train[fit],
+            base_train_prediction=base_e_train[fit],
+            candidate_train=design.train[fit],
+            base_valid_prediction=base_e_train[heldout],
+            candidate_valid=design.train[heldout],
+            candidate_column_feature_ids=design.column_feature_ids,
+            binary=True,
+            config=config,
+            seed=seed + 100 * subfold,
+        )
+        m_train[heldout], m_status = _nuisance_calibration_prediction(
+            target=outcome_train[fit],
+            base_train_prediction=base_m_train[fit],
+            candidate_train=design.train[fit],
+            base_valid_prediction=base_m_train[heldout],
+            candidate_valid=design.train[heldout],
+            candidate_column_feature_ids=design.column_feature_ids,
+            binary=binary_outcome,
+            config=config,
+            seed=seed + 100 * subfold + 1,
+        )
+        treatment_calibration_statuses.append(str(e_status["status"]))
+        outcome_calibration_statuses.append(str(m_status["status"]))
+    if np.isnan(e_train).any() or np.isnan(m_train).any():
+        return {
+            **result,
+            "status": "not_evaluable",
+            "reason": "candidate_nuisance_cross_fitting_was_incomplete",
+        }
+    e_valid, e_valid_status = _nuisance_calibration_prediction(
+        target=treatment_train,
+        base_train_prediction=base_e_train,
+        candidate_train=design.train,
+        base_valid_prediction=base_e_valid,
+        candidate_valid=design.valid,
+        candidate_column_feature_ids=design.column_feature_ids,
+        binary=True,
+        config=config,
+        seed=seed + 10_000,
     )
-    if binary_outcome:
-        p_value, test = _binary_nested_interaction_p_value(
-            outcome,
-            reduced,
-            interaction_columns,
+    m_valid, m_valid_status = _nuisance_calibration_prediction(
+        target=outcome_train,
+        base_train_prediction=base_m_train,
+        candidate_train=design.train,
+        base_valid_prediction=base_m_valid,
+        candidate_valid=design.valid,
+        candidate_column_feature_ids=design.column_feature_ids,
+        binary=binary_outcome,
+        config=config,
+        seed=seed + 10_001,
+    )
+
+    rt_train = np.asarray(treatment_train - e_train, dtype=float)
+    rt_valid = np.asarray(treatment_valid - e_valid, dtype=float)
+    ry_train = np.asarray(outcome_train - m_train, dtype=float)
+    ry_valid = np.asarray(outcome_valid - m_valid, dtype=float)
+    reduced_train, reduced_valid, kept_main = _rank_safe_column_pairs(
+        np.ones((len(train), 1), dtype=float),
+        np.ones((len(valid), 1), dtype=float),
+        design.train,
+        design.valid,
+    )
+    reduced_train, reduced_valid, kept_treatment = _rank_safe_column_pairs(
+        reduced_train,
+        reduced_valid,
+        rt_train.reshape(-1, 1),
+        rt_valid.reshape(-1, 1),
+    )
+    if not kept_treatment:
+        return {
+            **result,
+            "status": "not_evaluable",
+            "reason": "residualized_treatment_has_no_independent_variation",
+        }
+    interaction_train = (
+        rt_train.reshape(-1, 1) * design.train[:, interaction_indices]
+    )
+    interaction_valid = (
+        rt_valid.reshape(-1, 1) * design.valid[:, interaction_indices]
+    )
+    full_train, full_valid, kept_interactions = _rank_safe_column_pairs(
+        reduced_train,
+        reduced_valid,
+        interaction_train,
+        interaction_valid,
+    )
+    if not kept_interactions:
+        return {
+            **result,
+            "status": "not_evaluable",
+            "reason": "no_independent_residual_treatment_interaction_columns",
+        }
+    try:
+        reduced_model = Ridge(
+            alpha=float(config.modifier_ridge_alpha),
+            fit_intercept=False,
         )
-    else:
-        p_value, test = _continuous_nested_interaction_p_value(
-            outcome,
-            reduced,
-            interaction_columns,
+        full_model = Ridge(
+            alpha=float(config.modifier_ridge_alpha),
+            fit_intercept=False,
         )
+        reduced_model.fit(reduced_train, ry_train)
+        full_model.fit(full_train, ry_train)
+        reduced_prediction = reduced_model.predict(reduced_valid)
+        full_prediction = full_model.predict(full_valid)
+        reduced_loss = float(mean_squared_error(ry_valid, reduced_prediction))
+        full_loss = float(mean_squared_error(ry_valid, full_prediction))
+        improvement = float(reduced_loss - full_loss)
+        relative_improvement = float(improvement / max(reduced_loss, 1e-15))
+        if not all(
+            math.isfinite(value)
+            for value in (reduced_loss, full_loss, improvement, relative_improvement)
+        ):
+            raise ValueError("nonfinite held-out R-loss")
+    except Exception as exc:
+        return {
+            **result,
+            "status": "not_evaluable",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
     interaction_names = [
         str(design.column_names[index]) for index in interaction_indices
     ]
-    tested_indices = [int(value) for value in test.get("tested_column_indices") or []]
-    strategy = _feature_strategy(feature)
     return {
-        "feature_id": _feature_key(feature),
-        "name": str(feature["name"]),
-        "candidate_strategy": strategy,
+        **result,
+        "status": "ok",
         "encoded_main_columns": [
             str(design.column_names[index]) for index in kept_main
         ],
-        "candidate_interaction_columns": interaction_names,
         "tested_interaction_columns": [
-            interaction_names[index]
-            for index in tested_indices
-            if 0 <= index < len(interaction_names)
+            interaction_names[index] for index in kept_interactions
         ],
-        "categorical_interactions_are_grouped": strategy == "categorical",
-        "missingness_interactions": False,
-        "interaction_p_value": p_value,
-        "interaction_test": test,
+        "interaction_degrees_of_freedom": len(kept_interactions),
+        "ridge_alpha": float(config.modifier_ridge_alpha),
+        "constant_effect_coefficient": float(reduced_model.coef_[-1]),
+        "heldout_reduced_r_loss": reduced_loss,
+        "heldout_full_r_loss": full_loss,
+        "heldout_r_loss_improvement": improvement,
+        "heldout_relative_r_loss_improvement": relative_improvement,
+        "candidate_augmented_nuisance_models": {
+            "model_family": "group_elastic_net",
+            "training_predictions_are_cross_fitted": True,
+            "crossfit_folds": len(augmentation_splits),
+            "treatment_calibration_statuses": treatment_calibration_statuses,
+            "outcome_calibration_statuses": outcome_calibration_statuses,
+            "heldout_treatment_calibration_status": e_valid_status["status"],
+            "heldout_outcome_calibration_status": m_valid_status["status"],
+            "heldout_base_treatment_log_loss": float(
+                log_loss(treatment_valid, base_e_valid, labels=[0, 1])
+            ),
+            "heldout_augmented_treatment_log_loss": float(
+                log_loss(treatment_valid, e_valid, labels=[0, 1])
+            ),
+            "heldout_base_outcome_loss": _loss(
+                outcome_valid, base_m_valid, binary=binary_outcome
+            ),
+            "heldout_augmented_outcome_loss": _loss(
+                outcome_valid, m_valid, binary=binary_outcome
+            ),
+        },
     }
 
 
 def _rank_modifier_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    evaluable = [row for row in rows if row.get("interaction_p_value") is not None]
+    evaluable = [
+        row
+        for row in rows
+        if row.get("status") == "ok"
+        and row.get("heldout_r_loss_improvement") is not None
+    ]
     return [
         {
             "rank": rank,
             "feature_id": str(row["feature_id"]),
             "name": str(row["name"]),
-            "p_value": float(row["interaction_p_value"]),
+            "heldout_r_loss_improvement": float(
+                row["heldout_r_loss_improvement"]
+            ),
+            "heldout_relative_r_loss_improvement": float(
+                row["heldout_relative_r_loss_improvement"]
+            ),
+            "heldout_reduced_r_loss": float(row["heldout_reduced_r_loss"]),
+            "heldout_full_r_loss": float(row["heldout_full_r_loss"]),
         }
         for rank, row in enumerate(
             sorted(
                 evaluable,
                 key=lambda row: (
-                    float(row["interaction_p_value"]),
+                    -float(row["heldout_r_loss_improvement"]),
                     str(row["feature_id"]),
                 ),
             ),
@@ -1376,6 +1681,7 @@ def select_stage2_features_elastic_net(
     oof_e = np.full(len(all_fit_ids), np.nan, dtype=float)
     oof_m = np.full(len(all_fit_ids), np.nan, dtype=float)
     nuisance_folds: list[dict[str, Any]] = []
+    modifier_contexts: list[dict[str, Any]] = []
     for position, split in enumerate(folds, start=1):
         train_ids = [int(value) for value in split.get("fit_row_ids") or []]
         valid_ids = [int(value) for value in split.get("heldout_row_ids") or []]
@@ -1397,20 +1703,66 @@ def select_stage2_features_elastic_net(
         t_valid = dataset.iloc[valid_ids][treatment_column].to_numpy(dtype=float)
         y_train = dataset.iloc[train_ids][outcome_column].to_numpy(dtype=float)
         y_valid = dataset.iloc[valid_ids][outcome_column].to_numpy(dtype=float)
-        e_valid = _forest_probability(
+        treatment_nuisance_fit = _logistic_elastic_net(
             t_design.train,
             t_train,
             t_design.valid,
+            t_design.column_feature_ids,
             config=policy,
             seed=seed + 10_000 + position,
+            one_standard_error_rule=(
+                policy.nuisance_prediction_one_standard_error_rule
+            ),
         )
-        m_valid = _forest_outcome(
-            y_design.train,
-            y_train,
-            y_design.valid,
-            binary=binary_outcome,
-            config=policy,
-            seed=seed + 20_000 + position,
+        outcome_nuisance_fit = (
+            _logistic_elastic_net(
+                y_design.train,
+                y_train,
+                y_design.valid,
+                y_design.column_feature_ids,
+                config=policy,
+                seed=seed + 20_000 + position,
+                one_standard_error_rule=(
+                    policy.nuisance_prediction_one_standard_error_rule
+                ),
+            )
+            if binary_outcome
+            else _squared_error_elastic_net(
+                y_design.train,
+                y_train,
+                y_design.valid,
+                y_design.column_feature_ids,
+                config=policy,
+                seed=seed + 20_000 + position,
+                one_standard_error_rule=(
+                    policy.nuisance_prediction_one_standard_error_rule
+                ),
+            )
+        )
+        e_valid = treatment_nuisance_fit.valid_prediction
+        m_valid = outcome_nuisance_fit.valid_prediction
+        treatment_nuisance_selected, _ = _selected_feature_ids(
+            treatment_nuisance_fit.coefficients,
+            t_design.column_feature_ids,
+            tolerance=float(policy.coefficient_tolerance),
+        )
+        outcome_nuisance_selected, _ = _selected_feature_ids(
+            outcome_nuisance_fit.coefficients,
+            y_design.column_feature_ids,
+            tolerance=float(policy.coefficient_tolerance),
+        )
+        nested_e_train, nested_m_train, augmentation_splits = (
+            _cross_fitted_base_nuisances(
+                treatment_design=t_design.train,
+                treatment_column_feature_ids=t_design.column_feature_ids,
+                outcome_design=y_design.train,
+                outcome_column_feature_ids=y_design.column_feature_ids,
+                treatment=t_train,
+                outcome=y_train,
+                binary_outcome=binary_outcome,
+                config=policy,
+                seed=seed + 30_000 + 1_000 * position,
+            )
         )
         locations = [id_position[row_id] for row_id in valid_ids]
         if np.isfinite(oof_e[locations]).any() or np.isfinite(oof_m[locations]).any():
@@ -1426,6 +1778,14 @@ def select_stage2_features_elastic_net(
                 "outcome_features": len(outcome_definitions),
                 "treatment_encoded_columns": int(t_design.train.shape[1]),
                 "outcome_encoded_columns": int(y_design.train.shape[1]),
+                "treatment_status": treatment_nuisance_fit.status,
+                "outcome_status": outcome_nuisance_fit.status,
+                "treatment_regularization_alpha": (
+                    treatment_nuisance_fit.regularization
+                ),
+                "outcome_regularization_alpha": outcome_nuisance_fit.regularization,
+                "treatment_selected_feature_ids": treatment_nuisance_selected,
+                "outcome_selected_feature_ids": outcome_nuisance_selected,
                 "heldout_treatment_log_loss": float(
                     log_loss(t_valid, e_valid, labels=[0, 1])
                 ),
@@ -1434,6 +1794,25 @@ def select_stage2_features_elastic_net(
                 "heldout_outcome_auroc": (
                     _safe_auroc(y_valid, m_valid) if binary_outcome else None
                 ),
+                "nested_modifier_training_crossfit_folds": len(
+                    augmentation_splits
+                ),
+            }
+        )
+        modifier_contexts.append(
+            {
+                "split": split,
+                "train": train,
+                "valid": valid,
+                "treatment_train": t_train,
+                "treatment_valid": t_valid,
+                "outcome_train": y_train,
+                "outcome_valid": y_valid,
+                "base_e_train": nested_e_train,
+                "base_e_valid": e_valid,
+                "base_m_train": nested_m_train,
+                "base_m_valid": m_valid,
+                "augmentation_splits": augmentation_splits,
             }
         )
     if np.isnan(oof_e).any() or np.isnan(oof_m).any():
@@ -1445,37 +1824,31 @@ def select_stage2_features_elastic_net(
     y_all = dataset.iloc[all_fit_ids][outcome_column].to_numpy(dtype=float)
 
     modifier_votes = {feature_id: 0 for feature_id in by_id}
-    modifier_p_values = {feature_id: [] for feature_id in by_id}
+    modifier_r_loss_improvements = {feature_id: [] for feature_id in by_id}
     modifier_folds: list[dict[str, Any]] = []
-    for position, split in enumerate(folds, start=1):
-        train_ids = [int(value) for value in split.get("fit_row_ids") or []]
-        valid_ids = [int(value) for value in split.get("heldout_row_ids") or []]
-        train = extracted_by_id.loc[train_ids].reset_index(drop=True)
-        train_positions = np.asarray(
-            [id_position[row_id] for row_id in train_ids],
-            dtype=int,
-        )
-        treatment = dataset.iloc[train_ids][treatment_column].to_numpy(dtype=float)
-        outcome = dataset.iloc[train_ids][outcome_column].to_numpy(dtype=float)
-        base_names = ["treatment_prediction", "outcome_prediction", "treatment"]
-        base_inputs = np.column_stack(
-            [oof_e[train_positions], oof_m[train_positions], treatment]
-        )
-        reduced_base, kept_base = _rank_safe_columns(
-            np.ones((len(train), 1), dtype=float),
-            base_inputs,
-        )
+    for position, context in enumerate(modifier_contexts, start=1):
+        split = context["split"]
+        train = context["train"]
+        valid = context["valid"]
         tests = [
-            _modifier_interaction_test(
-                frame=train,
-                treatment=treatment,
-                outcome=outcome,
-                reduced_base=reduced_base,
+            _candidate_r_learner_test(
+                train=train,
+                valid=valid,
+                treatment_train=context["treatment_train"],
+                treatment_valid=context["treatment_valid"],
+                outcome_train=context["outcome_train"],
+                outcome_valid=context["outcome_valid"],
+                base_e_train=context["base_e_train"],
+                base_e_valid=context["base_e_valid"],
+                base_m_train=context["base_m_train"],
+                base_m_valid=context["base_m_valid"],
+                augmentation_splits=context["augmentation_splits"],
                 feature=feature,
                 binary_outcome=binary_outcome,
-                categorical_min_count=int(policy.categorical_min_count),
+                config=policy,
+                seed=seed + 100_000 * position + candidate_position,
             )
-            for feature in original
+            for candidate_position, feature in enumerate(original, start=1)
         ]
         ranking = _rank_modifier_rows(tests)
         selected_ids = [
@@ -1491,31 +1864,28 @@ def select_stage2_features_elastic_net(
             feature_id = str(row["feature_id"])
             row["rank"] = rank_by_id.get(feature_id)
             row["selected_top_n"] = feature_id in selected_set
-            p_value = row.get("interaction_p_value")
-            if p_value is not None:
-                modifier_p_values[feature_id].append(float(p_value))
+            improvement = row.get("heldout_r_loss_improvement")
+            if improvement is not None:
+                modifier_r_loss_improvements[feature_id].append(float(improvement))
         for feature_id in selected_ids:
             modifier_votes[feature_id] += 1
         modifier_folds.append(
             {
                 "inner_fold": int(split.get("inner_fold", position)),
-                "fit_rows": len(train_ids),
-                "excluded_inner_heldout_rows": len(valid_ids),
-                "model_family": (
-                    "binomial_logistic_regression"
-                    if binary_outcome
-                    else "gaussian_linear_regression"
-                ),
-                "base_input_columns": [
-                    base_names[index] for index in kept_base
-                ],
-                "nuisance_predictions_are_cross_fitted": True,
+                "fit_rows": len(train),
+                "heldout_rows": len(valid),
+                "model_family": "candidate_augmented_univariable_r_learner",
+                "base_nuisance_model_family": "group_elastic_net",
+                "candidate_nuisance_model_family": "group_elastic_net",
+                "base_nuisance_predictions_for_fit_are_nested_cross_fitted": True,
+                "candidate_nuisance_augmentations_are_cross_fitted": True,
+                "modifier_evaluation_rows_are_untouched_inner_heldout": True,
                 "candidate_models": len(tests),
                 "evaluable_candidates": len(ranking),
                 "requested_top_n": int(policy.modifier_top_n_per_inner_fold),
                 "selected_feature_ids": selected_ids,
                 "selected_count": len(selected_ids),
-                "interaction_p_value_ranking": ranking,
+                "heldout_r_loss_improvement_ranking": ranking,
                 "tests": tests,
             }
         )
@@ -1572,9 +1942,14 @@ def select_stage2_features_elastic_net(
                 "modifier_selection_frequency": float(
                     modifier_votes[feature_id] / len(folds)
                 ),
-                "modifier_min_interaction_p_value": (
-                    float(min(modifier_p_values[feature_id]))
-                    if modifier_p_values[feature_id]
+                "modifier_max_heldout_r_loss_improvement": (
+                    float(max(modifier_r_loss_improvements[feature_id]))
+                    if modifier_r_loss_improvements[feature_id]
+                    else None
+                ),
+                "modifier_mean_heldout_r_loss_improvement": (
+                    float(np.mean(modifier_r_loss_improvements[feature_id]))
+                    if modifier_r_loss_improvements[feature_id]
                     else None
                 ),
                 "nuisance_model_roles": nuisance_roles,
@@ -1584,8 +1959,8 @@ def select_stage2_features_elastic_net(
                     "investigator_locked"
                     if configured
                     else (
-                        "group_elastic_net_nuisance_and_univariable_"
-                        "interaction_any_inner_fold_union"
+                        "group_elastic_net_nuisance_and_candidate_augmented_"
+                        "rlearner_any_inner_fold_union"
                     )
                 ),
             }
@@ -1598,8 +1973,8 @@ def select_stage2_features_elastic_net(
                 "investigator_locked"
                 if configured
                 else (
-                    "group_elastic_net_nuisance_and_univariable_"
-                    "interaction_any_inner_fold_union"
+                    "group_elastic_net_nuisance_and_candidate_augmented_"
+                    "rlearner_any_inner_fold_union"
                 )
             )
             selected.append(updated)
@@ -1610,11 +1985,12 @@ def select_stage2_features_elastic_net(
         "status": "complete",
         "selection_method": (
             "any_inner_fold_union_group_elastic_net_nuisance_and_top_n_"
-            "univariable_treatment_interactions"
+            "candidate_augmented_univariable_rlearners"
         ),
         "penalized_nuisance_screen_model_family": "group_lasso_plus_ridge",
-        # Backward-compatible report key; penalization applies to nuisance
-        # screening only, not to the candidate-wise modifier regressions.
+        # Backward-compatible report key; group elastic-net penalization applies
+        # to nuisance selection and prediction, while the R-effect comparison
+        # itself is ridge stabilized.
         "penalized_model_family": "group_lasso_plus_ridge",
         "encoding": {
             "ordinal": "single_training_standardized_ordered_score",
@@ -1651,7 +2027,13 @@ def select_stage2_features_elastic_net(
             ),
         },
         "cross_fitted_nuisance_models": {
-            "model_family": "random_forest",
+            "model_family": "group_elastic_net",
+            "penalty": "group_lasso_plus_ridge",
+            "l1_ratio": float(policy.l1_ratio),
+            "regularization_selected_by_internal_cv": True,
+            "one_standard_error_rule": bool(
+                policy.nuisance_prediction_one_standard_error_rule
+            ),
             "treatment_feature_ids": sorted(confounder_union),
             "outcome_feature_ids": sorted(confounder_union),
             "folds": nuisance_folds,
@@ -1669,41 +2051,54 @@ def select_stage2_features_elastic_net(
         },
         "effect_modifier_screen": {
             "objective": (
-                "candidate-wise outcome regression adjusted for cross-fitted "
-                "treatment and outcome predictions, observed treatment, and the "
-                "candidate main effect"
+                "candidate-wise held-out squared R-loss gain after augmenting "
+                "both elastic-net nuisance models with the candidate"
             ),
-            "model_family": (
-                "binomial_logistic_regression"
-                if binary_outcome
-                else "gaussian_linear_regression"
+            "model_family": "candidate_augmented_univariable_r_learner",
+            "nuisance_model_family": "group_elastic_net",
+            "nuisance_augmentation": (
+                "cross-fitted candidate-specific grouped elastic-net calibration "
+                "for treatment and outcome"
             ),
-            "binary_outcome_formula": (
-                "outcome ~ treatment_prediction + outcome_prediction + treatment + "
-                "candidate + treatment:candidate"
+            "r_learner_regularization": {
+                "family": "ridge",
+                "alpha": float(policy.modifier_ridge_alpha),
+            },
+            "continuous_candidate_winsorization": {
+                "fit_scope": "modifier_inner_fold_training_rows_only",
+                "two_sided_quantile": float(
+                    policy.modifier_continuous_winsor_quantile
+                ),
+            },
+            "r_learner_comparison": (
+                "reduced residual-outcome model has candidate main effects and a "
+                "constant residual-treatment effect; full model jointly adds all "
+                "residual-treatment-by-candidate terms"
             ),
-            "categorical_interaction_test": (
-                "one_joint_likelihood_ratio_test_over_all_estimable_"
-                "treatment_by_nonreference_level_terms"
-                if binary_outcome
-                else (
-                    "one_joint_partial_f_test_over_all_estimable_treatment_by_"
-                    "nonreference_level_terms"
-                )
+            "categorical_interaction_handling": (
+                "all estimable nonreference-level interactions enter the full "
+                "candidate model together and receive one held-out R-loss score"
+            ),
+            "categorical_interaction_minimum_rows_per_treatment_arm": int(
+                policy.categorical_min_count
             ),
             "candidate_scope": "one_candidate_group_per_model",
-            "screening_rows": (
-                "inner_fold_fit_rows_with_cross_fitted_nuisance_predictions"
+            "training_rows": (
+                "inner-fold fit rows with base and candidate-augmented elastic-net "
+                "nuisance predictions cross-fitted entirely inside those rows"
+            ),
+            "evaluation_rows": (
+                "untouched inner-heldout rows excluded from nuisance augmentation "
+                "and R-learner fitting"
             ),
             "folds": modifier_folds,
             "selection_rule": (
-                "union_of_top_n_interaction_p_values_from_each_inner_fold"
+                "union_of_top_n_heldout_r_loss_gains_from_each_inner_fold"
             ),
             "top_n_per_inner_fold": int(policy.modifier_top_n_per_inner_fold),
             "required_votes": 1,
             "votes": dict(sorted(modifier_votes.items())),
-            "p_values_are_raw": True,
-            "p_value_threshold_is_not_a_selection_gate": True,
+            "r_loss_improvement_threshold_is_not_a_selection_gate": True,
             "non_evaluable_candidates_are_not_ranked": True,
             "missingness_interactions": False,
             "stable_effect_modifier_feature_ids": sorted(modifier_union),

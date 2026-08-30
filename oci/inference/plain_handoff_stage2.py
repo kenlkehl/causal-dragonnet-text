@@ -8320,7 +8320,7 @@ class PlainHandoffStage2:
             LOGGER.info(
                 "Stage 2 outer-fold execution folds=%s fold_workers=%s "
                 "global_request_workers=%s "
-                "statistical_selection=group_elastic_net_univariable_interaction",
+                "statistical_selection=group_elastic_net_candidate_augmented_rlearner",
                 len(outer_fold_ids),
                 fold_workers,
                 self.config.workers,

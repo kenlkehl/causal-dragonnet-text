@@ -39,7 +39,7 @@ def _categorical(feature_id: str, name: str, levels: list[str]) -> dict[str, obj
     }
 
 
-def test_any_fold_nuisance_union_and_univariable_modifier_selection():
+def test_any_fold_nuisance_union_and_candidate_augmented_rlearner_selection():
     rng = np.random.default_rng(141)
     rows = 700
     confounder = rng.normal(size=rows)
@@ -93,8 +93,6 @@ def test_any_fold_nuisance_union_and_univariable_modifier_selection():
         l1_ratio=0.9,
         internal_cv_folds=3,
         regularization_grid_size=8,
-        nuisance_forest_trees=60,
-        nuisance_forest_min_samples_leaf=6,
         modifier_top_n_per_inner_fold=1,
         max_iter=3_000,
     )
@@ -144,19 +142,34 @@ def test_any_fold_nuisance_union_and_univariable_modifier_selection():
         assert fold["outcome"]["heldout_auroc"] is None
     assert "effect_modifier" in selected_by_id["mod"]["roles"]
     assert report["effect_modifier_screen"]["model_family"] == (
-        "gaussian_linear_regression"
+        "candidate_augmented_univariable_r_learner"
+    )
+    assert report["effect_modifier_screen"]["nuisance_model_family"] == (
+        "group_elastic_net"
     )
     assert report["effect_modifier_screen"]["top_n_per_inner_fold"] == 1
     assert report["effect_modifier_screen"]["required_votes"] == 1
-    assert report["effect_modifier_screen"]["p_value_threshold_is_not_a_selection_gate"]
+    assert report["effect_modifier_screen"][
+        "r_loss_improvement_threshold_is_not_a_selection_gate"
+    ]
     assert all(
         fold["selected_count"] == 1
-        and fold["nuisance_predictions_are_cross_fitted"] is True
+        and fold["base_nuisance_model_family"] == "group_elastic_net"
+        and fold["candidate_nuisance_model_family"] == "group_elastic_net"
+        and fold["base_nuisance_predictions_for_fit_are_nested_cross_fitted"] is True
+        and fold["candidate_nuisance_augmentations_are_cross_fitted"] is True
+        and fold["modifier_evaluation_rows_are_untouched_inner_heldout"] is True
         for fold in report["effect_modifier_screen"]["folds"]
     )
     assert report["cross_fitted_nuisance_models"][
         "predictions_are_inner_fold_out_of_fold"
     ] is True
+    assert report["cross_fitted_nuisance_models"]["model_family"] == (
+        "group_elastic_net"
+    )
+    assert report["cross_fitted_nuisance_models"][
+        "one_standard_error_rule"
+    ] is False
     assert [row["feature_id"] for row in dependencies] == [
         row["feature_id"] for row in selected
     ]
@@ -195,8 +208,6 @@ def test_investigator_locked_roles_are_preserved_without_latents():
     ]
     policy = Stage2ElasticNetSelectionConfig(
         regularization_grid_size=5,
-        nuisance_forest_trees=20,
-        nuisance_forest_min_samples_leaf=5,
     )
 
     selected, _report, dependencies, latent_states = select_stage2_features_elastic_net(
@@ -275,8 +286,6 @@ def test_nominal_factor_is_selected_as_one_group_in_both_nuisance_tasks():
     ]
     policy = Stage2ElasticNetSelectionConfig(
         regularization_grid_size=7,
-        nuisance_forest_trees=20,
-        nuisance_forest_min_samples_leaf=5,
         max_iter=2_000,
     )
 
@@ -303,7 +312,7 @@ def test_nominal_factor_is_selected_as_one_group_in_both_nuisance_tasks():
         assert "factor" in fold["outcome"]["feature_group_l2_norms"]
 
 
-def test_categorical_modifier_uses_one_grouped_interaction_p_value():
+def test_categorical_modifier_uses_one_grouped_heldout_r_loss_score():
     rng = np.random.default_rng(733)
     rows = 900
     levels = np.asarray(["A", "B", "C"])
@@ -348,8 +357,6 @@ def test_categorical_modifier_uses_one_grouped_interaction_p_value():
         seed=8,
         policy=Stage2ElasticNetSelectionConfig(
             regularization_grid_size=5,
-            nuisance_forest_trees=20,
-            nuisance_forest_min_samples_leaf=5,
             modifier_top_n_per_inner_fold=1,
             max_iter=2_000,
         ),
@@ -358,7 +365,7 @@ def test_categorical_modifier_uses_one_grouped_interaction_p_value():
     selected_factor = next(row for row in selected if row["feature_id"] == "factor")
     assert "effect_modifier" in selected_factor["roles"]
     assert report["effect_modifier_screen"]["model_family"] == (
-        "binomial_logistic_regression"
+        "candidate_augmented_univariable_r_learner"
     )
     for fold in report["effect_modifier_screen"]["folds"]:
         assert fold["selected_feature_ids"] == ["factor"]
@@ -367,16 +374,101 @@ def test_categorical_modifier_uses_one_grouped_interaction_p_value():
         )
         assert factor_test["categorical_interactions_are_grouped"] is True
         assert len(factor_test["tested_interaction_columns"]) == 2
-        assert factor_test["interaction_test"]["test"] == (
-            "likelihood_ratio_chi_square"
-        )
-        assert factor_test["interaction_test"]["degrees_of_freedom"] == 2
+        assert factor_test["interaction_degrees_of_freedom"] == 2
+        assert factor_test["candidate_augmented_nuisance_models"][
+            "model_family"
+        ] == "group_elastic_net"
+        assert factor_test["candidate_augmented_nuisance_models"][
+            "training_predictions_are_cross_fitted"
+        ] is True
 
 
-def test_modifier_top_n_defaults_to_five_and_must_be_positive():
-    assert Stage2ElasticNetSelectionConfig().modifier_top_n_per_inner_fold == 5
+def test_modifier_top_n_defaults_to_ten_and_has_no_score_gate():
+    policy = Stage2ElasticNetSelectionConfig()
+    assert policy.modifier_top_n_per_inner_fold == 10
+    assert policy.public_dict()["modifier_top_n_per_inner_fold"] == 10
+    assert (
+        "modifier_min_fold_r_loss_improvement" not in policy.public_dict()
+    )
     with pytest.raises(ValueError, match="modifier_top_n_per_inner_fold"):
         Stage2ElasticNetSelectionConfig(modifier_top_n_per_inner_fold=0).validate()
+    with pytest.raises(ValueError, match="modifier_ridge_alpha"):
+        Stage2ElasticNetSelectionConfig(modifier_ridge_alpha=0.0).validate()
+    with pytest.raises(ValueError, match="modifier_continuous_winsor_quantile"):
+        Stage2ElasticNetSelectionConfig(
+            modifier_continuous_winsor_quantile=0.25
+        ).validate()
+
+
+def test_modifier_continuous_values_are_winsorized_from_training_only():
+    rng = np.random.default_rng(5)
+    train = pd.DataFrame({"lab": rng.normal(7.5, 1.2, size=800)})
+    valid = pd.DataFrame({"lab": [7.0, 7_200.0]})
+    design = _encode_design(
+        train,
+        valid,
+        [_continuous("lab", "lab")],
+        categorical_min_count=5,
+    )
+
+    bounded = selection_module._winsorize_modifier_design(
+        design,
+        quantile=0.005,
+    )
+
+    assert bounded.valid[-1, 0] <= np.max(bounded.train[:, 0])
+    assert bounded.valid[-1, 0] < design.valid[-1, 0]
+
+
+def test_candidate_augmented_nuisances_are_group_elastic_nets():
+    rng = np.random.default_rng(921)
+    rows = 600
+    candidate = rng.normal(size=rows)
+    treatment_probability = 1.0 / (1.0 + np.exp(-1.8 * candidate))
+    treatment = rng.binomial(1, treatment_probability, size=rows).astype(float)
+    outcome = 3.0 * candidate + 1.5 * treatment + rng.normal(scale=0.25, size=rows)
+    fit = np.arange(450)
+    heldout = np.arange(450, rows)
+    augmentation_splits = [
+        (train.astype(int), valid.astype(int))
+        for train, valid in KFold(
+            n_splits=3,
+            shuffle=True,
+            random_state=8,
+        ).split(fit)
+    ]
+
+    result = selection_module._candidate_r_learner_test(
+        train=pd.DataFrame({"candidate": candidate[fit]}),
+        valid=pd.DataFrame({"candidate": candidate[heldout]}),
+        treatment_train=treatment[fit],
+        treatment_valid=treatment[heldout],
+        outcome_train=outcome[fit],
+        outcome_valid=outcome[heldout],
+        base_e_train=np.full(len(fit), 0.5),
+        base_e_valid=np.full(len(heldout), 0.5),
+        base_m_train=np.full(len(fit), float(np.mean(outcome[fit]))),
+        base_m_valid=np.full(len(heldout), float(np.mean(outcome[fit]))),
+        augmentation_splits=augmentation_splits,
+        feature=_continuous("candidate", "candidate"),
+        binary_outcome=False,
+        config=Stage2ElasticNetSelectionConfig(
+            regularization_grid_size=5,
+            max_iter=3_000,
+        ),
+        seed=17,
+    )
+
+    assert result["status"] == "ok"
+    augmentation = result["candidate_augmented_nuisance_models"]
+    assert augmentation["model_family"] == "group_elastic_net"
+    assert augmentation["training_predictions_are_cross_fitted"] is True
+    assert augmentation["heldout_augmented_treatment_log_loss"] < (
+        augmentation["heldout_base_treatment_log_loss"]
+    )
+    assert augmentation["heldout_augmented_outcome_loss"] < (
+        augmentation["heldout_base_outcome_loss"]
+    )
 
 
 def test_binary_nuisance_screens_report_inner_and_pooled_aurocs():
@@ -410,8 +502,6 @@ def test_binary_nuisance_screens_report_inner_and_pooled_aurocs():
         seed=73,
         policy=Stage2ElasticNetSelectionConfig(
             regularization_grid_size=5,
-            nuisance_forest_trees=20,
-            nuisance_forest_min_samples_leaf=5,
             max_iter=2_000,
         ),
     )
@@ -490,38 +580,36 @@ def test_outer_modifier_set_is_union_of_each_inner_folds_top_n(monkeypatch):
 
     monkeypatch.setattr(selection_module, "_logistic_elastic_net", constant_logistic)
     monkeypatch.setattr(selection_module, "_squared_error_elastic_net", controlled_squared)
-    p_values = iter(
+    improvements = iter(
         [
-            0.01, 0.20, 0.30,
-            0.20, 0.01, 0.30,
-            0.30, 0.20, 0.01,
+            -0.01, -0.20, -0.30,
+            -0.20, -0.01, -0.30,
+            -0.30, -0.20, -0.01,
         ]
     )
 
-    def controlled_interaction_test(*, feature, **_kwargs):
-        p_value = next(p_values)
+    def controlled_r_learner_test(*, feature, **_kwargs):
+        improvement = next(improvements)
         return {
             "feature_id": feature["feature_id"],
             "name": feature["name"],
+            "status": "ok",
             "candidate_strategy": "continuous",
             "encoded_main_columns": [feature["name"]],
             "candidate_interaction_columns": [feature["name"]],
             "tested_interaction_columns": [feature["name"]],
             "categorical_interactions_are_grouped": False,
             "missingness_interactions": False,
-            "interaction_p_value": p_value,
-            "interaction_test": {
-                "status": "ok",
-                "test": "partial_f",
-                "degrees_of_freedom": [1, 50],
-                "tested_column_indices": [0],
-            },
+            "heldout_reduced_r_loss": 1.0,
+            "heldout_full_r_loss": 1.0 - improvement,
+            "heldout_r_loss_improvement": improvement,
+            "heldout_relative_r_loss_improvement": improvement,
         }
 
     monkeypatch.setattr(
         selection_module,
-        "_modifier_interaction_test",
-        controlled_interaction_test,
+        "_candidate_r_learner_test",
+        controlled_r_learner_test,
     )
 
     selected, report, _dependencies, _latents = select_stage2_features_elastic_net(
@@ -539,8 +627,6 @@ def test_outer_modifier_set_is_union_of_each_inner_folds_top_n(monkeypatch):
         seed=15,
         policy=Stage2ElasticNetSelectionConfig(
             regularization_grid_size=5,
-            nuisance_forest_trees=20,
-            nuisance_forest_min_samples_leaf=5,
             modifier_top_n_per_inner_fold=1,
         ),
     )
@@ -551,6 +637,9 @@ def test_outer_modifier_set_is_union_of_each_inner_folds_top_n(monkeypatch):
         for feature_id in ("candidate_a", "candidate_b", "candidate_c")
     )
     assert report["effect_modifier_screen"]["required_votes"] == 1
+    assert report["effect_modifier_screen"][
+        "r_loss_improvement_threshold_is_not_a_selection_gate"
+    ] is True
     assert report["effect_modifier_screen"]["votes"] == {
         "candidate_a": 1,
         "candidate_b": 1,

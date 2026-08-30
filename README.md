@@ -273,8 +273,9 @@ A complete Stage 2 analysis ordinarily performs the following sequence:
 5. The primary model reviews only aggregate small-model outputs and validation
    failures. It may revise the same ontology but cannot add, drop, rename, or
    role-label a feature.
-6. Inner-fold regressions select discovered confounders from joint treatment and
-   outcome prediction and modifiers from treatment-interaction p-values.
+6. Inner-fold group elastic nets select discovered confounders from treatment
+   or outcome prediction. Candidate-augmented R-learners rank modifiers by
+   held-out R-loss gain.
    Investigator-configured roles bypass these gates.
 7. It freezes the retained definitions, applies them to the outer-held-out
    records, and fits the fold-honest nuisance models and causal forest.
@@ -761,8 +762,10 @@ supplied through `OCI_STAGE2_API_KEY`. For example:
       "regularization_grid_size": 16,
       "optimization_tolerance": 1e-6,
       "one_standard_error_rule": true,
-      "nuisance_forest_trees": 200,
-      "modifier_top_n_per_inner_fold": 5
+      "nuisance_prediction_one_standard_error_rule": false,
+      "modifier_top_n_per_inner_fold": 10,
+      "modifier_ridge_alpha": 10.0,
+      "modifier_continuous_winsor_quantile": 0.005
     },
     "estimation_trees": 200,
     "explicit_features": []
@@ -1115,16 +1118,17 @@ thresholds are not gates. Both the propensity and outcome nuisance models use
 that same union. Reports include inner-heldout and pooled out-of-fold AUROC as
 well as log loss for binary nuisance tasks.
 
-Inner-fold random forests then produce one out-of-fold propensity and marginal
-outcome prediction for every outer-training patient. Within each inner fold,
-Stage 2 fits one outcome regression per candidate with the propensity
-prediction, outcome prediction, observed treatment, candidate main effect, and
-observed-treatment-by-candidate interaction as inputs. Binary outcomes use
-logistic regression. A nominal candidate's interaction contrasts are tested as
-one grouped likelihood-ratio term rather than as independent dummies. The five
-candidates with the smallest raw interaction p-values enter that inner fold's
-set by default; their union becomes the outer fold's causal-forest modifier set.
-The nuisance screens continue to use the one-standard-error rule for sparsity.
+Inner-fold grouped elastic nets produce cross-fitted propensity and marginal-
+outcome predictions. For every candidate, candidate-specific grouped elastic-
+net calibration layers augment both nuisances using only inner-fold training
+data. A ridge-stabilized R-learner compares a constant-effect model with a model
+that jointly adds all estimable candidate interaction contrasts, and scores the
+gain on untouched inner-heldout rows. The ten largest held-out R-loss gains enter
+each inner fold's set by default, without a sign or p-value gate; their
+deduplicated union (at most 50 candidates for five inner folds) becomes the outer
+fold's causal-forest modifier set. The nuisance screens continue to use the
+one-standard-error rule for sparse confounder discovery, while nuisance
+prediction defaults to the minimum-CV-loss elastic net.
 
 The consolidation agent never receives treatment, outcome, or outer-heldout
 rows; pairwise associations are used only for this unsupervised replacement
@@ -1164,12 +1168,13 @@ applied to outer-held-out records. The final heterogeneous-effect model is an
 honest `CausalForestDML`: effect modifiers form its heterogeneity matrix and
 pure confounders form its controls (a dual-role variable is represented once in
 the heterogeneity matrix). If no modifier survives, a constant effect design
-keeps the final model a causal forest. Separate nuisance forests are fit without
-using outer-held-out outcomes and produce held-out propensities, potential-outcome
-predictions, and AIPW scores. The causal forest supplies held-out conditional
-effects and confidence intervals; combining outer-held-out AIPW scores across
-folds supplies the reported cross-fitted average treatment effect and confidence
-interval.
+keeps the final model a causal forest. Cross-validated elastic-net nuisance
+models are fit without using outer-held-out outcomes and produce held-out
+propensities, potential-outcome predictions, and AIPW scores. `CausalForestDML`
+cross-fits the same nuisance family internally. The causal forest supplies
+held-out conditional effects and confidence intervals; combining outer-held-out
+AIPW scores across folds supplies the reported cross-fitted average treatment
+effect and confidence interval.
 
 ```mermaid
 flowchart LR
